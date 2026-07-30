@@ -38,6 +38,24 @@ def _expand_user(path: str) -> Path:
     return Path(path).expanduser()
 
 
+def native_io_path(path: str | Path) -> Path:
+    """Return an internal path spelling that bypasses Windows ``MAX_PATH``.
+
+    Callers must keep their public/configured path logical and use this value
+    only at the filesystem or SQLite boundary.
+    """
+
+    logical = Path(path).expanduser()
+    if os.name != "nt":
+        return logical
+    absolute = os.path.abspath(os.fspath(logical))
+    if absolute.startswith("\\\\?\\"):
+        return Path(absolute)
+    if absolute.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{absolute[2:]}")
+    return Path(f"\\\\?\\{absolute}")
+
+
 def is_valid_profile_name(name: str) -> bool:
     """Return True when ``name`` is safe to use as one profile path segment."""
     return bool(_PROFILE_RE.fullmatch(name))

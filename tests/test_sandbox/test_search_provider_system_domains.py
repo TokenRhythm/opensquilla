@@ -94,3 +94,77 @@ def test_system_domain_grants_cover_active_keyed_provider(
         assert _system_domain_grants_for_request(request) == expected  # type: ignore[arg-type]
     finally:
         web.reset_search_runtime()
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "providers", "expected"),
+    [
+        (
+            "web_search",
+            "bocha,tavily",
+            ("api.bochaai.com", "api.tavily.com"),
+        ),
+        (
+            "web_discover",
+            "exa,duckduckgo",
+            ("api.exa.ai", "html.duckduckgo.com"),
+        ),
+        ("web_search", "duckduckgo", ("html.duckduckgo.com",)),
+    ],
+)
+def test_system_domain_grants_follow_bounded_search_execution_plan(
+    tool_name: str,
+    providers: str,
+    expected: tuple[str, ...],
+) -> None:
+    request = SimpleNamespace(argv=(tool_name, "query", f"providers={providers}"))
+
+    assert _system_domain_grants_for_request(request) == expected  # type: ignore[arg-type]
+
+
+def test_web_search_sandbox_argv_uses_runtime_execution_plan(monkeypatch) -> None:
+    from opensquilla.tools.builtin import web
+
+    for key in (
+        "BOCHA_SEARCH_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "IQS_SEARCH_API_KEY",
+        "TAVILY_API_KEY",
+        "EXA_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("BOCHA_SEARCH_API_KEY", "bocha-key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    web.configure_search("duckduckgo", fallback_policy="network")
+    try:
+        argv = web._web_search_sandbox_argv({"query": "python release"})
+        request = SimpleNamespace(argv=argv)
+
+        assert argv[-1] == "providers=bocha,tavily"
+        assert _system_domain_grants_for_request(request) == (  # type: ignore[arg-type]
+            "api.bochaai.com",
+            "api.tavily.com",
+        )
+    finally:
+        web.reset_search_runtime()
+
+
+def test_discover_plan_token_honors_explicit_provider_override(monkeypatch) -> None:
+    from opensquilla.tools.builtin import web
+
+    monkeypatch.setenv("EXA_API_KEY", "exa-key")
+    web.configure_search("duckduckgo", fallback_policy="network")
+    try:
+        token = web._search_plan_argv_token(
+            {"query": "python release", "provider": "exa"},
+            tool_name="web_discover",
+        )
+        request = SimpleNamespace(argv=("web_search", "python release", token))
+
+        assert token == "providers=exa,duckduckgo"
+        assert _system_domain_grants_for_request(request) == (  # type: ignore[arg-type]
+            "api.exa.ai",
+            "html.duckduckgo.com",
+        )
+    finally:
+        web.reset_search_runtime()

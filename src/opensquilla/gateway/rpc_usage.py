@@ -6,7 +6,14 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.rpc import (
+    RpcContext,
+    RpcHandlerError,
+    RpcUnavailableError,
+    get_dispatcher,
+)
+from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.usage_query import UsageQueryValidationError, query_usage_ledger
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
@@ -332,7 +339,15 @@ def _tracker_rows(ctx: RpcContext, *, now_ms: int) -> list[dict[str, Any]]:
         usage_cost_source = str(
             getattr(usage, "cost_source", "opensquilla_estimate") or "opensquilla_estimate"
         )
-        if usage_billed > 0:
+        provider_billed_entries = max(
+            0,
+            int(getattr(usage, "provider_billed_entries", 0) or 0),
+        )
+        has_billed_receipt = (
+            provider_billed_entries > 0
+            or usage_cost_source in {"provider_billed", "mixed"}
+        )
+        if has_billed_receipt:
             # Real billed available — surface the mixed total (billed +
             # estimate-fallback for any unbilled model) as the row's
             # canonical cost so it matches the breakdown sum exactly.
@@ -359,6 +374,7 @@ def _tracker_rows(ctx: RpcContext, *, now_ms: int) -> list[dict[str, Any]]:
             updated_at=now_ms,
         )
         row["modelBreakdown"] = getattr(usage, "model_breakdown", [])
+        row["deploymentBreakdown"] = getattr(usage, "deployment_breakdown", [])
         rows.append(row)
     return rows
 
@@ -559,6 +575,12 @@ def _append_tracker_only_rows(
             and not row.get("modelBreakdown")
         ):
             row["modelBreakdown"] = tracker_row["modelBreakdown"]
+        if (
+            tracker_row
+            and tracker_row.get("deploymentBreakdown")
+            and not row.get("deploymentBreakdown")
+        ):
+            row["deploymentBreakdown"] = tracker_row["deploymentBreakdown"]
         if tracker_row and _row_can_overlay_tracker_totals(row, tracker_row):
             _overlay_tracker_totals(row, tracker_row)
         _reconcile_breakdown_to_row(row)
@@ -596,6 +618,7 @@ async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str
             "totalCacheWriteTokens": totals["cache_write"],
             "sessions": tracker_rows,
         }
+
     try:
         requested_session_key = None
         if isinstance(params, Mapping):
@@ -673,6 +696,26 @@ async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str
             "totalCacheWriteTokens": totals["cache_write"],
             "sessions": tracker_rows,
         }
+
+
+@_d.method("usage.query", scope="operator.read")
+async def _handle_usage_query(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Aggregate timestamped usage events for one explicit calendar range.
+
+    This is intentionally additive.  ``usage.status`` and ``usage.cost`` keep
+    their session-lifetime wire contracts for older clients while new clients
+    opt in after discovering this method in the WebSocket hello payload.
+    """
+
+    if ctx.session_manager is None:
+        raise RpcUnavailableError("Durable usage accounting is not configured")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None or not hasattr(storage, "query_usage_events"):
+        raise RpcUnavailableError("Durable usage accounting is not available")
+    try:
+        return await query_usage_ledger(storage, params)
+    except UsageQueryValidationError as exc:
+        raise RpcHandlerError("INVALID_REQUEST", str(exc)) from exc
 
 
 @_d.method("usage.cost", scope="operator.read")

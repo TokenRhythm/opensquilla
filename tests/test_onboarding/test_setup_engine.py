@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import tomllib
 
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.config_store import load_config
+from opensquilla.onboarding.section_status import SectionStatus
 from opensquilla.onboarding.setup_engine import SetupEngine
+from opensquilla.onboarding.status import get_onboarding_status
 
 
 def test_setup_engine_applies_provider_and_router_without_persisting_secret(tmp_path):
@@ -30,6 +33,43 @@ def test_setup_engine_applies_provider_and_router_without_persisting_secret(tmp_
     assert "api_key" not in data["llm"]
     assert data["squilla_router"]["tier_profile"] == "deepseek"
     assert "tiers" not in data["squilla_router"]
+
+
+def test_setup_engine_optional_key_preservation_is_explicit_and_legacy_safe():
+    def configured_engine() -> SetupEngine:
+        return SetupEngine(
+            config=GatewayConfig(
+                llm={
+                    "provider": "custom",
+                    "model": "model-a",
+                    "api_key": "sk-optional",
+                    "base_url": "https://llm.example.test/v1",
+                }
+            )
+        )
+
+    legacy = configured_engine()
+    legacy.apply(
+        "provider",
+        {
+            "providerId": "custom",
+            "model": "model-b",
+            "baseUrl": "https://llm.example.test/v1",
+        },
+    )
+    assert legacy.config.llm.api_key == ""
+
+    preserving = configured_engine()
+    preserving.apply(
+        "provider",
+        {
+            "providerId": "custom",
+            "model": "model-b",
+            "baseUrl": "https://llm.example.test/v1",
+            "preserveApiKey": True,
+        },
+    )
+    assert preserving.config.llm.api_key == "sk-optional"
 
 
 def test_setup_engine_can_derive_provider_model_from_router_default_tier(tmp_path):
@@ -79,7 +119,7 @@ def test_setup_engine_passes_preset_id_through_to_provider_upsert(tmp_path):
     assert tier["model"] == "llama-3.3-70b"
 
 
-def test_setup_engine_router_tier_override_updates_direct_fallback_model(tmp_path):
+def test_setup_engine_router_tier_override_keeps_direct_fallback_model(tmp_path):
     target = tmp_path / "config.toml"
     engine = SetupEngine(path=target)
 
@@ -90,6 +130,7 @@ def test_setup_engine_router_tier_override_updates_direct_fallback_model(tmp_pat
             "apiKeyEnv": "OPENAI_API_KEY",
         },
     )
+    assert engine.config.llm.model == "gpt-5.4-mini"
     engine.apply(
         "router",
         {
@@ -104,10 +145,11 @@ def test_setup_engine_router_tier_override_updates_direct_fallback_model(tmp_pat
             },
         },
     )
+    assert engine.config.llm.model == "gpt-5.4-mini"
     engine.persist()
 
     data = tomllib.loads(target.read_text())
-    assert data["llm"]["model"] == "gpt-5.5-custom"
+    assert data["llm"]["model"] == "gpt-5.4-mini"
     assert "tier_profile" not in data["squilla_router"]
     assert data["squilla_router"]["default_tier"] == "c2"
     assert data["squilla_router"]["tiers"]["c2"]["model"] == "gpt-5.5-custom"
@@ -155,6 +197,42 @@ def test_setup_engine_image_generation_can_use_custom_env_reference(
     provider = data["image_generation"]["providers"]["openrouter"]
     assert load_config(target).image_generation.providers.openrouter.api_key == ""
     assert provider["api_key_env"] == "OPENSQUILLA_TEST_IMAGE_KEY"
+
+
+def test_setup_engine_forwards_image_format_size_fallbacks_and_explicit_resets(tmp_path):
+    target = tmp_path / "config.toml"
+    engine = SetupEngine(path=target)
+
+    engine.apply(
+        "image-generation",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "apiKey": "sk-first",
+            "baseUrl": "https://images.example.test/v1",
+            "size": "1536x1024",
+            "outputFormat": "webp",
+            "fallbacks": ["openai/gpt-image-1"],
+        },
+    )
+    engine.apply(
+        "image-generation",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "apiKey": "sk-second",
+            "baseUrl": "",
+            "fallbacks": [],
+            "clearFallbacks": True,
+        },
+    )
+    engine.persist()
+
+    saved = load_config(target).image_generation
+    assert saved.size == "1536x1024"
+    assert saved.output_format == "webp"
+    assert saved.fallbacks == []
+    assert saved.providers.openrouter.base_url == "https://openrouter.ai/api/v1"
 
 
 def test_setup_engine_accepts_short_capability_section_aliases(tmp_path, monkeypatch):
@@ -371,3 +449,25 @@ def test_setup_engine_image_enabled_none_defaults_to_enabled_for_fresh_config(
     engine.persist()
 
     assert load_config(target).image_generation.enabled is True
+
+
+def test_setup_engine_loads_legacy_image_endpoint_mismatch_as_degraded(tmp_path):
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "[image_generation]\n"
+        "enabled = true\n"
+        'primary = "openrouter/google/gemini-3.1-flash-image-preview"\n'
+        "\n"
+        "[image_generation.providers.openrouter]\n"
+        'api_key = "sk-synthetic-image"\n'
+        'base_url = "https://api.openai.com/v1"\n',
+        encoding="utf-8",
+    )
+
+    engine = SetupEngine(path=target)
+    status = get_onboarding_status(engine.config)
+
+    assert engine.config.image_generation.enabled is True
+    assert status.sections["image_generation"] is SectionStatus.DEGRADED
+    assert status.image_generation_configured is False
+    assert status.section_details["image_generation"]["actionRequired"] is True

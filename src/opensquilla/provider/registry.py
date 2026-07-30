@@ -12,28 +12,33 @@ from .context_capabilities import (
     OPENROUTER_CONTEXT_PROFILE,
     ProviderContextProfile,
 )
+from .qwen_token_plan import (
+    QWEN_TOKEN_PLAN_ANTHROPIC_BASE_URL,
+    QWEN_TOKEN_PLAN_API_KEY_ENV,
+    QWEN_TOKEN_PLAN_MODEL_IDS,
+    QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
+)
 
 # ---------------------------------------------------------------------------
 # Named local-provider sets. ONE home, TWO deliberately distinct sets — they
 # answer different questions and must not be merged:
 #
 # - KEYLESS_PROVIDERS: providers whose API key is optional even when an
-#   env_key is declared — local runtimes plus the generic self-hosted
-#   ``custom`` endpoint (many self-hosted servers run without
-#   authentication). Drives ``ProviderSpec.requires_api_key``.
-# - LOCAL_RUNTIME_PROVIDERS: the superset the model catalog's context-window
-#   heuristic uses (model_catalog.py): runtimes that serve models from the
-#   local machine, whose unqualified model ids miss every catalog and would
-#   otherwise inherit the 200k cloud default. ``vllm`` and the bare
-#   ``local`` alias belong here but stay OUT of KEYLESS_PROVIDERS: local
-#   serving does not imply keyless onboarding (a vLLM deployment can front
-#   real auth), so folding them in would silently weaken requires_api_key.
+#   env_key is declared — local runtimes plus generic custom endpoints (many
+#   self-hosted servers run without authentication). Drives
+#   ``ProviderSpec.requires_api_key``.
+# - LOCAL_RUNTIME_PROVIDERS: providers whose unknown model ids keep the
+#   conservative 8k context fallback. Generic custom endpoints remain here
+#   for upgrade compatibility: existing installations have always received
+#   that bound, whether the configured endpoint is local or remote.
 #
-# The derivation is explicit (superset = keyless | extras) so the two sets
-# can never drift apart by accident.
+# Keyless and local-runtime status still answer independent questions;
+# today's local-window set happens to include every keyless provider.
 # ---------------------------------------------------------------------------
 
-KEYLESS_PROVIDERS: frozenset[str] = frozenset({"ollama", "lm_studio", "ovms", "custom"})
+KEYLESS_PROVIDERS: frozenset[str] = frozenset(
+    {"ollama", "lm_studio", "ovms", "custom", "custom_anthropic"}
+)
 
 LOCAL_RUNTIME_PROVIDERS: frozenset[str] = KEYLESS_PROVIDERS | {"vllm", "local"}
 
@@ -97,6 +102,14 @@ class ProviderSpec:
     live_catalog_url: str = ""
     live_catalog_shape: str = ""
     selectable_model_catalog: SelectableModelCatalog = "none"
+    # A protocol-specific profile can discover the same account entitlements
+    # through a sibling provider whose official endpoint exposes /models.
+    # Empty means use this provider directly.
+    selectable_model_discovery_provider_id: str = ""
+    # Optional exact model list for compatibility transports that do not
+    # expose a trustworthy model-list endpoint (notably Anthropic Messages
+    # gateways). Empty means the backend's normal listing behavior.
+    static_model_ids: tuple[str, ...] = ()
 
     def requires_api_key(self) -> bool:
         """True if onboarding must collect an API key for this provider."""
@@ -138,6 +151,8 @@ def _spec(
     live_catalog_url: str = "",
     live_catalog_shape: str = "",
     selectable_model_catalog: SelectableModelCatalog = "none",
+    selectable_model_discovery_provider_id: str = "",
+    static_model_ids: tuple[str, ...] = (),
 ) -> ProviderSpec:
     if required_fields is None:
         required_fields = frozenset({"api_key", "model"}) if env_key else frozenset({"model"})
@@ -159,6 +174,10 @@ def _spec(
         live_catalog_url=live_catalog_url,
         live_catalog_shape=live_catalog_shape,
         selectable_model_catalog=selectable_model_catalog,
+        selectable_model_discovery_provider_id=(
+            selectable_model_discovery_provider_id
+        ),
+        static_model_ids=static_model_ids,
     )
 
 
@@ -253,6 +272,38 @@ for _provider_spec in [
         "BAILIAN_API_KEY",
         "https://coding-intl.dashscope.aliyuncs.com/v1",
         catalog_source=("alibaba", "alibaba-cn"),
+    ),
+    _spec(
+        "bailian_coding_cn",
+        "openai_compat",
+        "bailian_coding",
+        "BAILIAN_API_KEY",
+        "https://coding.dashscope.aliyuncs.com/v1",
+        catalog_source=("alibaba-cn", "alibaba"),
+    ),
+    # Qwen Token Plan uses a dedicated sk-sp key and service host; neither is
+    # interchangeable with regular DashScope pay-as-you-go credentials.
+    _spec(
+        "qwen_token_plan",
+        "openai_compat",
+        "qwen_token_plan",
+        QWEN_TOKEN_PLAN_API_KEY_ENV,
+        QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
+        capabilities=frozenset({"chat", "coding_plan"}),
+        selectable_model_catalog="verified_live",
+    ),
+    _spec(
+        "qwen_token_plan_anthropic",
+        "anthropic",
+        "qwen_token_plan",
+        QWEN_TOKEN_PLAN_API_KEY_ENV,
+        QWEN_TOKEN_PLAN_ANTHROPIC_BASE_URL,
+        failure_family="anthropic",
+        auth_header_style="bearer",
+        capabilities=frozenset({"chat", "coding_plan"}),
+        selectable_model_catalog="verified_live",
+        selectable_model_discovery_provider_id="qwen_token_plan",
+        static_model_ids=QWEN_TOKEN_PLAN_MODEL_IDS,
     ),
     _spec(
         "moonshot",
@@ -517,6 +568,18 @@ for _provider_spec in [
         "CUSTOM_LLM_API_KEY",
         required_fields=frozenset({"model", "base_url"}),
         failure_family="openai_compat",
+    ),
+    # Anthropic Messages counterpart to ``custom``.  Keeping a separate
+    # provider id preserves the existing OpenAI-compatible default while
+    # making protocol selection explicit and upgrade-safe.
+    _spec(
+        "custom_anthropic",
+        "anthropic",
+        "anthropic",
+        "CUSTOM_ANTHROPIC_API_KEY",
+        required_fields=frozenset({"model", "base_url"}),
+        failure_family="anthropic",
+        auth_header_style="bearer",
     ),
     _spec("vllm", "openai_compat", "openai"),
     _spec("lm_studio", "openai_compat", "lm_studio", default_base_url="http://localhost:1234/v1"),

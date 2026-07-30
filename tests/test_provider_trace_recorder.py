@@ -26,7 +26,14 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
     )
     recorder.record_request(
         payload={"model": "qwen3.6-flash", "messages": [{"role": "user", "content": "hi"}]},
-        headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+            "X-OpenSquilla-Session-Id": "session-1",
+            "X-OpenSquilla-Turn-Id": "turn-1",
+            "X-OpenSquilla-Execution-Id": "execution-1",
+            "X-OpenSquilla-Call-Kind": "agent.chat",
+        },
     )
     recorder.record_chunk({"id": "chatcmpl-1", "choices": [{"delta": {"content": "ok"}}]})
     recorder.record_response(
@@ -45,6 +52,15 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
     ]
     assert rows[0]["payload"]["messages"][0]["content"] == "hi"
     assert rows[0]["headers"]["Authorization"] == "[REDACTED]"
+    assert rows[0]["headers"]["X-OpenSquilla-Session-Id"] == "[PRESENT]"
+    assert rows[0]["headers"]["X-OpenSquilla-Turn-Id"] == "[PRESENT]"
+    assert rows[0]["headers"]["X-OpenSquilla-Execution-Id"] == "[PRESENT]"
+    assert rows[0]["headers"]["X-OpenSquilla-Call-Kind"] == "[PRESENT]"
+    serialized = json.dumps(rows[0]["headers"], sort_keys=True)
+    assert "session-1" not in serialized
+    assert "turn-1" not in serialized
+    assert "execution-1" not in serialized
+    assert "agent.chat" not in serialized
     assert rows[2]["usage"]["cached_tokens"] == 2
 
 

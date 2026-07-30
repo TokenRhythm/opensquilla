@@ -44,6 +44,66 @@ def test_observation_flags_polluted_final_diff_with_source_patch() -> None:
     assert "scratch_artifact_in_final_diff" in observation.triggers
 
 
+def test_observation_uses_configured_hidden_scratch_paths() -> None:
+    observation = build_final_diff_contract_observation(
+        diff_paths=[".artifacts/repro.py"],
+        known_scratch_paths=[".artifacts/repro.py"],
+        mutation_records=[
+            {
+                "paths": [
+                    {
+                        "relative_path": ".artifacts/repro.py",
+                        "classification": "scratch",
+                    }
+                ]
+            }
+        ],
+    )
+
+    assert observation.source_paths == []
+    assert observation.scratch_paths == [".artifacts/repro.py"]
+    assert observation.candidate_source_paths == []
+    assert observation.candidate_source_missing_paths == []
+    assert observation.triggers == [
+        "final_diff_without_source",
+        "scratch_artifact_in_final_diff",
+    ]
+
+
+def test_scratch_only_records_without_diff_do_not_claim_lost_workspace_writes() -> None:
+    observation = build_final_diff_contract_observation(
+        diff_paths=[],
+        known_scratch_paths=[".artifacts/direct.py", ".artifacts/shell.py"],
+        write_records=[
+            {
+                "relative_path": ".artifacts/direct.py",
+                "classification": "scratch",
+            }
+        ],
+        mutation_records=[
+            {
+                "paths": [
+                    {
+                        "relative_path": ".artifacts/shell.py",
+                        "classification": "scratch",
+                    }
+                ]
+            }
+        ],
+        mutation_receipts=[
+            {
+                "relative_path": ".artifacts/direct.py",
+                "classification": "scratch",
+                "changed": True,
+            }
+        ],
+    )
+
+    assert observation.candidate_source_paths == []
+    assert observation.triggers == []
+    assert observation.suspicious is False
+
+
 def test_observation_flags_candidate_source_drift_to_test_only_patch() -> None:
     observation = build_final_diff_contract_observation(
         diff_paths=["tests/test_issue.py"],
@@ -268,13 +328,13 @@ def test_observation_flags_diagnostic_source_like_paths_with_source_patch() -> N
 
     assert observation.source_paths == [
         "src/Fixer/PhpTag/BlankLineAfterOpeningTagFixer.php",
-        "php_cs.php",
+        ".php_cs.php",
         "check_whitespace.php",
         "long_test_path/a/b/c/d/e/file.txt",
         "this/is/a/very/deep/path/structure/with/file.txt",
     ]
     assert observation.diagnostic_source_like_paths == [
-        "php_cs.php",
+        ".php_cs.php",
         "check_whitespace.php",
         "long_test_path/a/b/c/d/e/file.txt",
         "this/is/a/very/deep/path/structure/with/file.txt",

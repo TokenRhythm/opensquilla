@@ -29,6 +29,7 @@ def test_exit_restores_primary_screen_and_shell(
     artifact_root: Path,
     tui_backend: str,
     tui_driver: str,
+    pytestconfig: pytest.Config,
 ) -> None:
     """/exit must hand a usable terminal back: primary screen, live shell, echo.
 
@@ -42,11 +43,9 @@ def test_exit_restores_primary_screen_and_shell(
     if tui_driver == "pty":
         pytest.skip("exit-restoration requires tmux, not PTY")
     if not probe_terminal_capabilities().tmux_available:
+        if pytestconfig.getoption("--tui-require-capabilities"):
+            pytest.fail("required real-terminal capability is unavailable: tmux")
         pytest.skip("exit-restoration requires tmux")
-    host_skip_reason = opentui_host_skip_reason()
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
-
     evidence = EvidenceBundle.create(
         artifact_root,
         scenario_id="exit_restoration",
@@ -61,6 +60,9 @@ def test_exit_restores_primary_screen_and_shell(
             size=TerminalSize(cols=100, rows=30),
         ),
     )
+    host_skip_reason = opentui_host_skip_reason(target.env)
+    if host_skip_reason is not None:
+        pytest.skip(host_skip_reason)
     shell_script = (
         f"{shlex.join(target.command)}; "
         f"printf '\\n{_EXIT_MARKER} status=%s\\n' \"$?\"; "
@@ -76,9 +78,7 @@ def test_exit_restores_primary_screen_and_shell(
     )
     session.start()
     try:
-        ready = session.wait_for_text(
-            "OPEN_SQUILLA_TUI_READY", timeout_s=15.0, checkpoint="ready"
-        )
+        ready = session.wait_for_text("OPEN_SQUILLA_TUI_READY", timeout_s=15.0, checkpoint="ready")
         evidence.record_frame(ready)
         assert session.alternate_screen_active(), (
             "the opentui host should run on the alternate screen"
@@ -110,9 +110,7 @@ def test_exit_restores_primary_screen_and_shell(
     # runtime hands /exit to the app, which acknowledges before shutting down).
     app_events = [
         json.loads(line)
-        for line in (evidence.run_dir / "opentui-app.log")
-        .read_text(encoding="utf-8")
-        .splitlines()
+        for line in (evidence.run_dir / "opentui-app.log").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     assert any(event["event"] == "exit" for event in app_events)

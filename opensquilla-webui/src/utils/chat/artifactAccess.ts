@@ -9,6 +9,9 @@ export interface ArtifactAuthContext {
 
 export interface ArtifactFetchOptions extends ArtifactAuthContext {
   fetchImpl?: typeof fetch
+  signal?: AbortSignal
+  /** Require authenticated same-origin HTTP(S) bytes and reject redirects. */
+  requireSameOrigin?: boolean
 }
 
 type ArtifactWindowHandle = Pick<Window, 'close'> & {
@@ -50,6 +53,10 @@ function resolveFetch(fetchImpl?: typeof fetch): typeof fetch | null {
   if (fetchImpl) return fetchImpl
   if (typeof fetch !== 'undefined') return fetch.bind(globalThis)
   return null
+}
+
+function isAbortError(error: unknown): boolean {
+  return !!error && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
 }
 
 function safeTitle(artifact: ArtifactPayload): string {
@@ -99,6 +106,16 @@ export function isActiveDocumentArtifact(artifact: ArtifactPayload, blob: Blob):
 export function isSameOriginArtifactUrl(url: string, baseOrigin: string): boolean {
   try {
     return new URL(url, baseOrigin).origin === new URL(baseOrigin).origin
+  } catch {
+    return false
+  }
+}
+
+function isSameOriginHttpArtifactUrl(url: string, baseOrigin: string): boolean {
+  try {
+    const resolved = new URL(url, baseOrigin)
+    return (resolved.protocol === 'http:' || resolved.protocol === 'https:')
+      && resolved.origin === new URL(baseOrigin).origin
   } catch {
     return false
   }
@@ -202,11 +219,16 @@ export async function fetchArtifactBlob(
   }
 
   const sameOrigin = isSameOriginArtifactUrl(url, baseOrigin)
+  if (options.requireSameOrigin && !isSameOriginHttpArtifactUrl(url, baseOrigin)) {
+    return { ok: false, status: 0, url, message: artifactOpenFailureMessage(0, title) }
+  }
   try {
     const response = await fetchImpl(url, {
       method: 'GET',
       headers: artifactAccessHeaders(url, options),
       credentials: sameOrigin ? 'same-origin' : 'omit',
+      signal: options.signal,
+      ...(options.requireSameOrigin ? { redirect: 'error' as const } : {}),
     })
     if (!response.ok) {
       return {
@@ -217,7 +239,8 @@ export async function fetchArtifactBlob(
       }
     }
     return { ok: true, status: response.status, url, blob: await response.blob() }
-  } catch {
+  } catch (error) {
+    if (isAbortError(error)) throw error
     return { ok: false, status: 0, url, message: artifactOpenFailureMessage(0, title) }
   }
 }

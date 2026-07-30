@@ -148,8 +148,10 @@ async def test_tavily_missing_api_key_raises_auth_error(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("status_code", "kind", "retryable"),
     [
+        (400, "http", False),
         (401, "auth", False),
         (403, "auth", False),
+        (408, "http", True),
         (429, "rate_limit", True),
         (432, "rate_limit", False),
         (433, "rate_limit", False),
@@ -161,7 +163,10 @@ async def test_tavily_http_errors_are_classified(
     kind: str,
     retryable: bool,
 ) -> None:
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(status_code, json={"error": "nope"})
 
     provider = TavilySearchProvider(
@@ -176,11 +181,15 @@ async def test_tavily_http_errors_are_classified(
     assert exc_info.value.kind == kind
     assert exc_info.value.retryable is retryable
     assert exc_info.value.status_code == status_code
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
 async def test_tavily_timeout_is_retryable_timeout() -> None:
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         raise httpx.ReadTimeout("timed out", request=request)
 
     provider = TavilySearchProvider(
@@ -193,11 +202,15 @@ async def test_tavily_timeout_is_retryable_timeout() -> None:
 
     assert exc_info.value.kind == "timeout"
     assert exc_info.value.retryable is True
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
 async def test_tavily_network_error_is_retryable_network() -> None:
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         raise httpx.ConnectError("network down", request=request)
 
     provider = TavilySearchProvider(
@@ -210,3 +223,25 @@ async def test_tavily_network_error_is_retryable_network() -> None:
 
     assert exc_info.value.kind == "network"
     assert exc_info.value.retryable is True
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_tavily_malformed_json_is_terminal_parse_error() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="not json")
+
+    provider = TavilySearchProvider(
+        api_key="dummy-tavily-key",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        await provider.search("python")
+
+    assert exc_info.value.kind == "parse"
+    assert exc_info.value.retryable is False
+    assert len(requests) == 1

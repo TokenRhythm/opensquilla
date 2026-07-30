@@ -13,6 +13,7 @@ import opensquilla.engine.tokenjuice_adapter as tokenjuice_adapter_mod
 from opensquilla.engine import Agent, AgentConfig, ToolCall, ToolResult
 from opensquilla.engine.tool_result_store import ToolResultStore
 from opensquilla.engine.types import ToolResultEvent, ToolUseDeltaEvent
+from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.plugins.tokenjuice import reduce_tool_result as backend_reduce_tool_result
 from opensquilla.provider import (
     ContentBlockThinking,
@@ -1428,10 +1429,20 @@ async def test_json_guard_preserves_raw_content_when_store_budget_rejects_snapsh
 
 @pytest.mark.asyncio
 async def test_approval_retry_clears_stale_tool_result_projection() -> None:
+    reset_approval_queue()
+    approval_id = get_approval_queue().request(
+        "exec",
+        {
+            "toolName": "exec_command",
+            "command": "pytest -q",
+            "args": {"command": "pytest -q", "workdir": "/repo"},
+        },
+    )
+    get_approval_queue().resolve(approval_id, True)
     approval_payload = json.dumps(
         {
             "status": "approval_required",
-            "approval_id": "approval-1",
+            "approval_id": approval_id,
             "message": "Approve this command.",
             "lines": [str(index) for index in range(80)],
         },
@@ -1448,7 +1459,8 @@ async def test_approval_retry_clears_stale_tool_result_projection() -> None:
                 tool_name=tool_call.tool_name,
                 content=approval_payload,
             )
-        assert tool_call.arguments["approval_id"] == "approval-1"
+        assert tool_call.continuation is not None
+        assert tool_call.continuation.approval_id == approval_id
         return ToolResult(
             tool_use_id=tool_call.tool_use_id,
             tool_name=tool_call.tool_name,
@@ -1463,7 +1475,10 @@ async def test_approval_retry_clears_stale_tool_result_projection() -> None:
         tool_handler=handler,
     )
 
-    events = [event async for event in agent.run_turn("run risky command")]
+    try:
+        events = [event async for event in agent.run_turn("run risky command")]
+    finally:
+        reset_approval_queue()
 
     assert calls == 2
     assert len(provider.calls) == 2
@@ -1472,7 +1487,7 @@ async def test_approval_retry_clears_stale_tool_result_projection() -> None:
     tool_result_events = [event for event in events if isinstance(event, ToolResultEvent)]
     approval_event_payload = json.loads(tool_result_events[0].result)
     assert approval_event_payload["status"] == "approval_required"
-    assert approval_event_payload["approval_id"] == "approval-1"
+    assert approval_event_payload["approval_id"] == approval_id
     assert tool_result_events[-1].result == "FINAL_OK"
 
 

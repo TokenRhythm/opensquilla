@@ -9,13 +9,10 @@ import { getPlatform } from '@/platform'
 // exists; here we render an unobtrusive, dismissible card for it. No download
 // or install happens from the web — the link points at the release page.
 //
-// Suppressed only where the host applies updates NATIVELY (electron-updater on
-// macOS, via the "Check for Updates…" menu + native prompts), to avoid a double
-// notice. On hosts without native auto-update — the browser, and desktop
-// platforms not yet covered (e.g. unsigned Windows) — the banner stays, guiding
-// the user to the release page. When Windows native update is later enabled,
-// nativeAutoUpdateEnabled() flips to true there and the banner self-suppresses
-// with no change here.
+// Suppressed wherever the desktop shell manages update discovery and actions.
+// That includes native electron-updater on macOS and the versioned manual
+// installer flow on unsigned Windows. Browser surfaces keep this passive banner;
+// older Windows shells without the managed capability retain their legacy banner.
 
 const { t } = useI18n()
 const platform = getPlatform()
@@ -80,11 +77,9 @@ function normalizeUpdateStatus(payload: unknown): UpdateInfo | null | undefined 
 
 const info = ref<UpdateInfo | null>(readUpdate())
 
-// True where the host applies updates natively. Assume native on desktop until
-// the shell confirms otherwise, so macOS never flashes the web banner; the
-// browser starts false and shows immediately. Windows (pre-signing) resolves to
-// false → banner appears; (post-signing) resolves to true → banner stays hidden.
-const nativeUpdate = ref(isDesktop)
+// Assume managed on desktop until the shell confirms otherwise, preventing a
+// native/manual desktop notice from flashing beside the passive banner.
+const managedUpdate = ref(isDesktop)
 let mounted = false
 let pollingEnabled = false
 let pollTimer: number | null = null
@@ -165,7 +160,7 @@ onMounted(async () => {
   mounted = true
   let enabled: boolean
   try {
-    enabled = await platform.nativeAutoUpdateEnabled()
+    enabled = await platform.desktopUpdateManaged()
   } catch {
     // Capability failures are conservative: keep the bootstrap behavior, but
     // do not start a second update channel that might duplicate native UI.
@@ -173,7 +168,7 @@ onMounted(async () => {
   }
   if (!mounted) return
 
-  nativeUpdate.value = enabled
+  managedUpdate.value = enabled
   if (enabled) return
 
   pollingEnabled = true
@@ -205,7 +200,7 @@ function readDismissed(): string | null {
 // Dismissal is keyed to the version, so a future release re-arms the notice.
 const dismissedVersion = ref<string | null>(readDismissed())
 const visible = computed(
-  () => !!info.value && !nativeUpdate.value && dismissedVersion.value !== info.value.latest,
+  () => !!info.value && !managedUpdate.value && dismissedVersion.value !== info.value.latest,
 )
 const releaseUrl = computed(() => info.value?.url || RELEASES_FALLBACK)
 

@@ -14,6 +14,7 @@ from opensquilla.cli.chat.turn import TurnResult
 from opensquilla.cli.tui.adapters import slash_bridge as _slash_bridge
 from opensquilla.cli.tui.adapters import slash_gateway as _slash_gateway
 from opensquilla.cli.tui.adapters import slash_standalone as _slash_standalone
+from opensquilla.cli.tui.adapters.commands import is_exit_command
 from opensquilla.cli.tui.adapters.slash_common import (
     record_turn,
     registry_handler_words,
@@ -75,9 +76,21 @@ class _StubGatewayClient:
         self.calls: list[tuple[str, Any]] = []
         self.created: list[dict[str, Any]] = []
         self.resolve_payloads: dict[str, dict[str, Any]] = {}
+        self.bootstrap_payloads: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
+        self.history_pages: dict[str | None, dict[str, Any]] = {}
         self.raise_map: dict[str, Exception] = {}
+        self.session_rows: list[dict[str, Any]] = []
+        self.model_rows: list[dict[str, Any]] = []
         self._counter = 0
+        self.model_routing: dict[str, Any] = {
+            "mode": "direct",
+            "router_enabled": False,
+            "ensemble_enabled": False,
+            "rollout_phase": "observe",
+            "selection_mode": "router_dynamic",
+            "applies_to": "next_accepted_turn",
+        }
 
     def _maybe_raise(self, method: str) -> None:
         exc = self.raise_map.get(method)
@@ -105,7 +118,7 @@ class _StubGatewayClient:
 
     async def list_sessions(self, limit: int = 50) -> dict[str, Any]:
         self._maybe_raise("list_sessions")
-        return {"sessions": []}
+        return {"sessions": list(self.session_rows[:limit])}
 
     async def resolve_session(self, key: str) -> dict[str, Any]:
         self._maybe_raise("resolve_session")
@@ -113,6 +126,35 @@ class _StubGatewayClient:
         if payload is not None:
             return dict(payload)
         return {"session_key": key, "model": None}
+
+    async def bootstrap_session(
+        self,
+        key: str,
+        *,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        self._maybe_raise("bootstrap_session")
+        self.calls.append(("bootstrap_session", (key, limit)))
+        if key in self.bootstrap_payloads:
+            return dict(self.bootstrap_payloads[key])
+        resolved = dict(self.resolve_payloads.get(key) or {})
+        created = next((item for item in self.created if item["key"] == key), None)
+        return {
+            "session": {
+                "session_key": resolved.get("session_key") or resolved.get("key") or key,
+                "model": resolved.get("model")
+                if "model" in resolved
+                else (created.get("model") if created is not None else None),
+            },
+            "history": {
+                "messages": list(self.history),
+                "history_scope": "complete",
+                "loaded_count": len(self.history),
+                "has_more": False,
+                "canonical_available": True,
+                "compaction_summaries": [],
+            },
+        }
 
     async def delete_sessions(self, keys: list[str]) -> dict[str, Any]:
         self._maybe_raise("delete_sessions")
@@ -133,7 +175,7 @@ class _StubGatewayClient:
         capabilities: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         self._maybe_raise("list_models")
-        return []
+        return list(self.model_rows)
 
     async def patch_session(self, key: str, **fields: Any) -> dict[str, Any]:
         self._maybe_raise("patch_session")
@@ -171,9 +213,33 @@ class _StubGatewayClient:
     async def abort_session(self, key: str) -> dict[str, Any]:
         return {"ok": True}
 
-    async def session_history(self, session_key: str, limit: int = 1000) -> dict[str, Any]:
+    async def session_history(
+        self,
+        session_key: str,
+        limit: int = 1000,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        include_canonical: bool | None = None,
+        include_summaries: bool | None = None,
+    ) -> dict[str, Any]:
         self._maybe_raise("session_history")
-        return {"messages": list(self.history)}
+        self.calls.append(
+            (
+                "session_history",
+                {
+                    "session_key": session_key,
+                    "limit": limit,
+                    "before": before,
+                    "after": after,
+                    "include_canonical": include_canonical,
+                    "include_summaries": include_summaries,
+                },
+            )
+        )
+        if self.history_pages:
+            return dict(self.history_pages[before])
+        return {"messages": list(self.history), "has_more": False}
 
     async def forget_approvals(self, target: str | None = None) -> dict[str, Any]:
         self.calls.append(("forget_approvals", target))
@@ -186,19 +252,94 @@ class _StubGatewayClient:
         self.calls.append(("set_approval_mode", mode))
         return {"ok": True}
 
+    async def get_model_routing(self) -> dict[str, Any]:
+        self._maybe_raise("get_model_routing")
+        self.calls.append(("get_model_routing", None))
+        return dict(self.model_routing)
+
+    async def set_model_routing(self, mode: str) -> dict[str, Any]:
+        self._maybe_raise("set_model_routing")
+        self.calls.append(("set_model_routing", mode))
+        self.model_routing.update(
+            mode=mode,
+            router_enabled=mode == "router",
+            ensemble_enabled=mode == "ensemble",
+            rollout_phase="full" if mode != "direct" else "observe",
+        )
+        return dict(self.model_routing)
+
 
 def _gateway_context(
     client: _StubGatewayClient | None = None,
     *,
     model: str | None = "openai/test",
     requested_model: str | None = None,
+    tui_output: Any | None = None,
+    stream_response: Any | None = None,
 ) -> GatewaySlashContext:
     return GatewaySlashContext(
         state=ChatSessionState(session_key="agent:main:test:0", model=model),
         client=client or _StubGatewayClient(),
         elevated_state={"mode": None},
         requested_model=requested_model,
+        tui_output=tui_output,
+        stream_response=stream_response,
     )
+
+
+class _StructuredOutput:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, dict[str, Any]]] = []
+        self.attachment_events: list[tuple[str, dict[str, Any]]] = []
+        self._attachment_seq = 0
+
+    async def send_message(self, message_type: str, payload: dict[str, Any]) -> None:
+        self.messages.append((message_type, payload))
+
+    @property
+    def supports_send_message(self) -> bool:
+        return True
+
+    async def add_attachment(
+        self,
+        *,
+        kind: str,
+        label: str,
+        status: str,
+    ) -> str:
+        self._attachment_seq += 1
+        attachment_id = f"attachment-{self._attachment_seq}"
+        self.attachment_events.append(
+            (
+                "add",
+                {
+                    "id": attachment_id,
+                    "kind": kind,
+                    "label": label,
+                    "status": status,
+                },
+            )
+        )
+        return attachment_id
+
+    async def update_attachment(
+        self,
+        attachment_id: str,
+        *,
+        status: str,
+        message: str = "",
+    ) -> bool:
+        self.attachment_events.append(
+            (
+                "update",
+                {"id": attachment_id, "status": status, "message": message},
+            )
+        )
+        return True
+
+    async def clear_attachments(self, *, status: str | None = None) -> int:
+        self.attachment_events.append(("clear", {"status": status}))
+        return 1
 
 
 class _StandaloneHarness:
@@ -397,6 +538,67 @@ async def test_gateway_save_bad_path_renders_error_panel(
     assert not target.exists()
 
 
+async def test_gateway_save_reads_all_canonical_history_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.history_pages = {
+        None: {
+            "messages": [
+                {"message_id": "m3", "role": "user", "text": "later question"},
+                {"message_id": "m4", "role": "assistant", "text": "later answer"},
+            ],
+            "has_more": True,
+            "oldest_cursor": "3|3",
+            "newest_cursor": "4|4",
+        },
+        "3|3": {
+            "messages": [
+                {"message_id": "m1", "role": "user", "text": "earliest question"},
+                {"message_id": "m2", "role": "assistant", "text": "earliest answer"},
+            ],
+            "has_more": False,
+            "oldest_cursor": "1|1",
+            "newest_cursor": "2|2",
+        },
+    }
+    target = tmp_path / "all-history.md"
+
+    handled = await handle_gateway_slash_command(f"/save {target}", _gateway_context(client))
+
+    assert handled is True
+    saved = target.read_text(encoding="utf-8")
+    assert saved.index("earliest question") < saved.index("later question")
+    history_calls = [call for call in client.calls if call[0] == "session_history"]
+    assert [call[1]["before"] for call in history_calls] == [None, "3|3"]
+    assert all(call[1]["include_canonical"] is True for call in history_calls)
+    assert all(call[1]["include_summaries"] is False for call in history_calls)
+
+
+async def test_gateway_save_does_not_write_partial_file_when_cursor_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    stalled_page = {
+        "messages": [{"message_id": "m1", "role": "user", "text": "partial"}],
+        "has_more": True,
+        "oldest_cursor": "1|1",
+        "newest_cursor": "1|1",
+    }
+    client.history_pages = {None: stalled_page, "1|1": stalled_page}
+    target = tmp_path / "partial.md"
+
+    handled = await handle_gateway_slash_command(f"/save {target}", _gateway_context(client))
+
+    assert handled is True
+    assert not target.exists()
+    assert "cursor did not advance" in recorder.text()
+
+
 async def test_standalone_save_bad_path_renders_error_panel(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -537,6 +739,243 @@ async def test_gateway_new_warns_when_pin_read_fails(
     assert "/model" in output
 
 
+async def test_gateway_resume_hydrates_canonical_history_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    output = _StructuredOutput()
+    target = "agent:main:resumed"
+    client.bootstrap_payloads[target] = {
+        "session": {"session_key": target, "model": "openai/resumed"},
+        "history": {
+            "messages": [
+                {"message_id": "m1", "role": "user", "text": "old question"},
+                {"message_id": "m2", "role": "assistant", "text": "old answer"},
+            ],
+            "history_scope": "latest_window",
+            "has_more": True,
+            "loaded_count": 2,
+            "canonical_available": True,
+            "compaction_summaries": [],
+        },
+    }
+    context = _gateway_context(client, tui_output=output)
+    context.state.transcript.add("user", "stale")
+
+    handled = await handle_gateway_slash_command(f"/resume {target}", context)
+
+    assert handled is True
+    assert context.state.session_key == target
+    assert context.state.model == "openai/resumed"
+    assert [turn.content for turn in context.state.transcript.turns] == [
+        "old question",
+        "old answer",
+    ]
+    assert [message_type for message_type, _payload in output.messages] == [
+        "composer.set",
+        "history.replace",
+        "context.update",
+        "composer.set",
+    ]
+    context_payload = output.messages[2][1]
+    assert context_payload["task"] == "Session"
+    assert context_payload["model"] == "openai/resumed"
+    assert target not in repr(context_payload)
+    assert output.messages[1][1]["history_scope"] == "latest_window"
+    assert [item["id"] for item in output.messages[1][1]["messages"]] == ["m1", "m2"]
+
+
+async def test_gateway_resume_without_id_opens_searchable_session_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.session_rows = [
+        {
+            "key": "agent:main:one",
+            "display_name": "Daily coding",
+            "model": "router/default",
+            "status": "running",
+            "message_count": 12,
+        },
+        {
+            "session_key": "agent:main:malformed-count",
+            "title": "Recoverable row",
+            "entry_count": "unknown",
+        },
+        {"title": "missing key is ignored"},
+    ]
+    output = _StructuredOutput()
+    context = _gateway_context(client, tui_output=output)
+
+    assert await handle_gateway_slash_command("/resume", context) is True
+    assert output.messages == [
+        (
+            "session.pick",
+            {
+                "current_key": "agent:main:test:0",
+                "sessions": [
+                    {
+                        "key": "agent:main:one",
+                        "title": "Daily coding",
+                        "status": "running",
+                        "model": "router/default",
+                        "message_count": 12,
+                    },
+                    {
+                        "key": "agent:main:malformed-count",
+                        "title": "Recoverable row",
+                        "status": "",
+                        "model": "",
+                        "message_count": 0,
+                    },
+                ],
+            },
+        )
+    ]
+
+
+async def test_gateway_reset_replaces_transcript_with_empty_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    output = _StructuredOutput()
+    context = _gateway_context(client, tui_output=output)
+    context.state.transcript.add("user", "stale")
+
+    handled = await handle_gateway_slash_command("/reset", context)
+
+    assert handled is True
+    assert context.state.transcript.turns == []
+    assert output.messages[1][0] == "history.replace"
+    assert output.messages[1][1]["messages"] == ()
+
+
+async def test_gateway_file_attachment_reports_upload_progress_and_clears_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    output = _StructuredOutput()
+
+    async def fake_prepare(
+        command: str,
+        *,
+        upload_callable: Any,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        assert command == "/file /private/brief.pdf summarize"
+        file_uuid = await upload_callable(
+            Path("/private/brief.pdf"),
+            "application/pdf",
+            "brief.pdf",
+        )
+        return "summarize", [{"type": "application/pdf", "file_uuid": file_uuid}]
+
+    async def fake_stream(*_args: Any, **_kwargs: Any) -> TurnResult:
+        return TurnResult(text="done")
+
+    monkeypatch.setattr(_slash_gateway, "_async_file_prompt_and_attachments", fake_prepare)
+    context = _gateway_context(
+        client,
+        tui_output=output,
+        stream_response=fake_stream,
+    )
+
+    handled = await handle_gateway_slash_command(
+        "/file /private/brief.pdf summarize",
+        context,
+    )
+
+    assert handled is True
+    assert [(kind, event.get("status")) for kind, event in output.attachment_events] == [
+        ("add", "reading"),
+        ("update", "uploading"),
+        ("update", "ready"),
+        ("clear", "ready"),
+    ]
+    assert output.attachment_events[0][1]["label"] == "brief.pdf"
+    assert "/private" not in str(output.attachment_events)
+
+
+async def test_gateway_image_and_path_attachments_show_ready_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.is_local_gateway = True
+    output = _StructuredOutput()
+
+    monkeypatch.setattr(
+        _slash_gateway,
+        "_image_prompt_and_attachments",
+        lambda _cmd: ("describe", [{"type": "image/png", "data": "hidden"}]),
+    )
+    monkeypatch.setattr(
+        _slash_gateway,
+        "path_prompt_and_attachments",
+        lambda _cmd: ("inspect", []),
+    )
+
+    async def fake_stream(*_args: Any, **_kwargs: Any) -> TurnResult:
+        return TurnResult(text="done")
+
+    context = _gateway_context(
+        client,
+        tui_output=output,
+        stream_response=fake_stream,
+    )
+
+    assert await handle_gateway_slash_command(
+        "/image /private/chart.png describe",
+        context,
+    )
+    assert await handle_gateway_slash_command(
+        "/path /private/report.md inspect",
+        context,
+    )
+
+    add_events = [event for kind, event in output.attachment_events if kind == "add"]
+    assert [(event["kind"], event["label"]) for event in add_events] == [
+        ("image", "chart.png"),
+        ("path", "report.md"),
+    ]
+    updates = [event.get("status") for kind, event in output.attachment_events if kind == "update"]
+    assert updates == [
+        "ready",
+        "ready",
+    ]
+    assert "/private" not in str(output.attachment_events)
+
+
+async def test_gateway_attachment_failure_stays_visible_without_path_or_size_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    output = _StructuredOutput()
+
+    def fail_prepare(_command: str) -> tuple[str, list[dict[str, Any]]]:
+        raise ValueError("File not found: /private/tmp/redaction-fixture/private.png (12345 bytes)")
+
+    monkeypatch.setattr(_slash_gateway, "_image_prompt_and_attachments", fail_prepare)
+    context = _gateway_context(tui_output=output)
+
+    handled = await handle_gateway_slash_command(
+        "/image /private/tmp/redaction-fixture/private.png describe",
+        context,
+    )
+
+    assert handled is True
+    assert [kind for kind, _event in output.attachment_events] == ["add", "update"]
+    failure = output.attachment_events[-1][1]
+    assert failure["status"] == "failed"
+    assert failure["message"] == ("Could not prepare private.png; check the file and retry /image.")
+    combined = f"{output.attachment_events}\n{recorder.text()}"
+    assert "/private/tmp/redaction-fixture" not in combined
+    assert "12345" not in combined
+
+
 async def test_gateway_model_records_explicit_request_on_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -550,6 +989,135 @@ async def test_gateway_model_records_explicit_request_on_context(
     assert context.requested_model == "openai/chosen"
     assert context.state.model == "openai/chosen"
     assert ("patch_session", ("agent:main:test:0", {"model": "openai/chosen"})) in client.calls
+
+
+async def test_gateway_model_bare_command_opens_model_picker() -> None:
+    client = _StubGatewayClient()
+    client.resolve_payloads["agent:main:test:0"] = {
+        "model": "openai/chosen",
+        "effective_model": "router/last-pick",
+    }
+    client.model_rows = [
+        {
+            "id": "openai/chosen",
+            "provider": "openai",
+            "contextWindow": 128_000,
+        }
+    ]
+    output = _StructuredOutput()
+
+    handled = await handle_gateway_slash_command(
+        "/model",
+        _gateway_context(client, model="router/last-pick", requested_model=None, tui_output=output),
+    )
+
+    assert handled is True
+    assert output.messages == [
+        (
+            "model.picker",
+            {
+                "current": "openai/chosen",
+                "options": [
+                    {
+                        "id": "openai/chosen",
+                        "provider": "openai",
+                        "context_window": 128_000,
+                    }
+                ],
+            },
+        )
+    ]
+
+
+async def test_gateway_model_bare_command_plain_fallback_lists_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    listed: list[dict[str, Any]] = []
+    monkeypatch.setattr(_slash_gateway, "_print_models_table", listed.extend)
+    client = _StubGatewayClient()
+    client.resolve_payloads["agent:main:test:0"] = {"model": None}
+    client.model_rows = [
+        {
+            "id": "openai/example",
+            "provider": "openai",
+            "contextWindow": 128_000,
+            "capabilities": ["text"],
+        }
+    ]
+
+    handled = await handle_gateway_slash_command("/model", _gateway_context(client))
+
+    assert handled is True
+    assert "model pin" in recorder.text()
+    assert "auto" in recorder.text()
+    assert listed == client.model_rows
+
+
+async def test_gateway_model_status_reads_canonical_pin_not_routed_display_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.resolve_payloads["agent:main:test:0"] = {
+        "model": "openai/pinned",
+        "effective_model": "router/last-pick",
+    }
+
+    handled = await handle_gateway_slash_command(
+        "/model status",
+        _gateway_context(client, model="router/last-pick", requested_model=None),
+    )
+
+    assert handled is True
+    assert "openai/pinned" in recorder.text()
+    assert "router/last-pick" not in recorder.text()
+
+
+async def test_gateway_resume_refreshes_in_context_model_pin_from_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    target = "agent:main:resumed"
+    client.bootstrap_payloads[target] = {
+        "session": {
+            "session_key": target,
+            "model": "openai/resumed-pin",
+            "effective_model": "router/resumed-pick",
+        },
+        "history": {"messages": [], "history_scope": "complete"},
+    }
+    context = _gateway_context(
+        client,
+        requested_model="openai/old-pin",
+        tui_output=_StructuredOutput(),
+    )
+
+    handled = await handle_gateway_slash_command(f"/resume {target}", context)
+
+    assert handled is True
+    assert context.requested_model == "openai/resumed-pin"
+    assert context.state.model == "router/resumed-pick"
+
+
+async def test_gateway_model_auto_clears_explicit_session_pin() -> None:
+    client = _StubGatewayClient()
+    output = _StructuredOutput()
+    context = _gateway_context(
+        client,
+        model="openai/chosen",
+        requested_model="openai/chosen",
+        tui_output=output,
+    )
+
+    handled = await handle_gateway_slash_command("/model auto", context)
+
+    assert handled is True
+    assert context.requested_model is None
+    assert context.state.model is None
+    assert ("patch_session", ("agent:main:test:0", {"model": None})) in client.calls
+    assert output.messages[-1] == ("context.update", {"model": "default"})
 
 
 # --------------------------------------------------------------------------- #
@@ -681,6 +1249,129 @@ def test_classify_exit_variants_enqueue_for_runtime_interception(command: str) -
     assert category is not SlashCategory.NON_SLASH
 
 
+@pytest.mark.parametrize("command", ["/EXIT", "/exit now", "/Quit"])
+def test_runtime_exit_interception_rejects_malformed_slash_variants(command: str) -> None:
+    """Command-plane input must not bypass the exact drain-and-exit policy."""
+    assert is_exit_command(command, Surface.CLI_GATEWAY) is False
+    assert is_exit_command(command, Surface.CLI_STANDALONE) is False
+
+
+@pytest.mark.parametrize("command", ["exit", "EXIT", "quit", "QUIT", ":q", ":Q"])
+def test_runtime_exit_interception_preserves_bare_exit_compatibility(command: str) -> None:
+    assert is_exit_command(command, Surface.CLI_GATEWAY) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["/router", "/router on", "/router status", "/ensemble", "/ensemble off"],
+)
+def test_classify_model_strategy_as_immediate_control(command: str) -> None:
+    assert classify(command) is SlashCategory.CONTROL
+
+
+@pytest.mark.parametrize("command", ["/strategy", "/router on", "/ensemble", "/meta foo"])
+def test_standalone_gateway_only_commands_stay_off_the_turn_plane(command: str) -> None:
+    assert classify(command, surface=Surface.CLI_STANDALONE) is SlashCategory.COMMAND
+
+
+async def test_gateway_model_strategy_bare_command_opens_shared_picker() -> None:
+    client = _StubGatewayClient()
+    output = _StructuredOutput()
+
+    handled = await handle_gateway_slash_command(
+        "/router",
+        _gateway_context(client, tui_output=output),
+    )
+
+    assert handled is True
+    assert output.messages == [
+        (
+            "model.routing.picker",
+            {
+                "current": "direct",
+                "options": ["direct", "router", "ensemble"],
+            },
+        )
+    ]
+    assert ("set_model_routing", "router") not in client.calls
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("/router on", "router"),
+        ("/router off", "direct"),
+        ("/ensemble on", "ensemble"),
+        ("/ensemble off", "direct"),
+        ("/strategy direct", "direct"),
+        ("/strategy router", "router"),
+        ("/strategy ensemble", "ensemble"),
+    ],
+)
+async def test_gateway_model_strategy_command_sets_canonical_mode(
+    command: str,
+    expected: str,
+) -> None:
+    client = _StubGatewayClient()
+    output = _StructuredOutput()
+
+    handled = await handle_gateway_slash_command(
+        command,
+        _gateway_context(client, tui_output=output),
+    )
+
+    assert handled is True
+    assert ("set_model_routing", expected) in client.calls
+    assert output.messages[-1][0] == "model.routing.state"
+    assert output.messages[-1][1]["mode"] == expected
+
+
+async def test_gateway_model_strategy_missing_control_rpc_is_explicit_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.raise_map["get_model_routing"] = RuntimeError("METHOD_NOT_FOUND")
+
+    handled = await handle_gateway_slash_command(
+        "/router on",
+        _gateway_context(client, tui_output=_StructuredOutput()),
+    )
+
+    assert handled is True
+    assert "read-only" in recorder.text()
+    assert ("set_model_routing", "router") not in client.calls
+
+
+async def test_gateway_model_strategy_failed_write_reprojects_canonical_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.raise_map["set_model_routing"] = RuntimeError("operator.write required")
+    output = _StructuredOutput()
+
+    handled = await handle_gateway_slash_command(
+        "/ensemble on",
+        _gateway_context(client, tui_output=output),
+    )
+
+    assert handled is True
+    assert "strategy remains direct" in recorder.text()
+    assert output.messages[-1] == (
+        "model.routing.state",
+        {
+            "mode": "direct",
+            "router_enabled": False,
+            "ensemble_enabled": False,
+            "selection_mode": "router_dynamic",
+            "rollout_phase": "observe",
+            "applies_to": "next_accepted_turn",
+            "busy": False,
+        },
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Protocol double works for approval-flavored commands                         #
 # --------------------------------------------------------------------------- #
@@ -735,3 +1426,41 @@ def test_record_turn_updates_transcript_and_usage() -> None:
     assert [turn.role for turn in state.transcript.turns] == ["user", "assistant"]
     assert state.transcript.turns[0].content == "ask"
     assert state.transcript.turns[1].content == "answer"
+
+
+class _HostCapableOutput:
+    supports_send_message = True
+
+    async def send_message(self, *_args: Any) -> None:
+        return None
+
+
+async def test_keys_dispatch_selects_cheatsheet_by_backend_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Binds the wiring, not the parts: a host-capable output must get the
+    # OpenTUI chords, and a native/absent output must get only the honest
+    # plain-mode rows — never OpenTUI-only shortcuts it cannot deliver.
+    gateway_recorder = _patch_gateway_io(monkeypatch)
+    handled = await handle_gateway_slash_command(
+        "/keys", _gateway_context(tui_output=_HostCapableOutput())
+    )
+    assert handled is True
+    table = gateway_recorder.entries[-1]
+    opentui_rows = "\n".join(str(cell) for column in table.columns for cell in column.cells)
+    assert "Ctrl+O" in opentui_rows
+
+    gateway_recorder.entries.clear()
+    handled = await handle_gateway_slash_command("/keys", _gateway_context(tui_output=None))
+    assert handled is True
+    table = gateway_recorder.entries[-1]
+    native_rows = "\n".join(str(cell) for column in table.columns for cell in column.cells)
+    assert "Ctrl+O" not in native_rows
+    assert "Ctrl+C" in native_rows
+
+    standalone_recorder = _patch_standalone_io(monkeypatch)
+    handled = await handle_standalone_slash_command("/shortcuts", _standalone_context())
+    assert handled is True
+    table = standalone_recorder.entries[-1]
+    native_rows = "\n".join(str(cell) for column in table.columns for cell in column.cells)
+    assert "Ctrl+O" not in native_rows

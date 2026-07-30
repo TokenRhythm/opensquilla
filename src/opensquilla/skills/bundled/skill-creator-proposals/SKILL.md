@@ -1,6 +1,7 @@
 ---
 name: skill-creator-proposals
 description: "Internal tool (not user-invocable). Called by meta-skill-creator's persist step and by `opensquilla meta accept` CLI (Phase 2) to manage `~/.opensquilla/proposals/`: write_proposal / list / accept. Returns JSON."
+description_zh: "内部工具（不可由用户直接调用）。由meta-skill-creator的persist步骤及 opensquilla meta accept CLI（第二阶段）调用，用于管理 ~/.opensquilla/proposals/：write_proposal / list / accept。返回JSON。"
 user-invocable: false
 disable-model-invocation: true
 provenance:

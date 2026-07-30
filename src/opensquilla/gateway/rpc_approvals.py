@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from opensquilla.application.approval_queue import get_approval_queue
 from opensquilla.application.approval_rpc import (
     approval_extend_rpc_payload,
     approval_forget_rpc_payload,
+    approval_lookup_status_rpc_payload,
     approval_request_rpc_payload,
     approval_resolve_rpc_payload,
     approval_settings_rpc_payload,
@@ -16,9 +18,11 @@ from opensquilla.application.approval_rpc import (
     approval_wait_decision_rpc_payload,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.escalation import (
     apply_sandbox_approval_choice,
     deny_matching_pending_sandbox_approvals,
+    discard_approval_run_context_authority,
     is_sandbox_approval_kind,
     remember_sandbox_approval_denial,
     validate_sandbox_approval_choice,
@@ -33,6 +37,9 @@ _NON_OWNER_SANDBOX_APPROVAL_CHOICES = frozenset(
         "deny",
     }
 )
+
+_APPROVAL_CLAIM_JOIN_TIMEOUT_SECONDS = 0.5
+_APPROVAL_CLAIM_POLL_SECONDS = 0.01
 
 
 def _sandbox_choice_requires_owner(choice: str | None) -> bool:
@@ -75,6 +82,25 @@ def _complete_sandbox_resolution_claim(
             approval_id,
             claim_token,
         )
+
+
+async def _join_active_resolution(queue: Any, approval_id: str) -> Any:
+    """Wait briefly for another surface's claimed decision to become canonical.
+
+    Sandbox resolution keeps a claim while it persists the decision and applies
+    its side effect. A losing surface should observe that result, not race a
+    second claim and surface a false failure. If the first claim is released
+    after an apply error, returning the reopened entry lets this resolver try
+    normally. The bounded wait keeps an abandoned claim from hanging the RPC.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _APPROVAL_CLAIM_JOIN_TIMEOUT_SECONDS
+    pending = queue.get(approval_id)
+    while pending.claim_token is not None and loop.time() < deadline:
+        await asyncio.sleep(_APPROVAL_CLAIM_POLL_SECONDS)
+        pending = queue.get(approval_id)
+    return pending
 
 
 @_d.method("exec.approvals.get", scope="operator.approvals")
@@ -154,6 +180,17 @@ async def _handle_exec_approval_wait_decision(
     )
 
 
+@_d.method("exec.approval.status", scope="operator.approvals")
+async def _handle_exec_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict) or not str(params.get("id") or "").strip():
+        raise ValueError("params.id is required")
+    return approval_lookup_status_rpc_payload(
+        get_approval_queue(),
+        str(params["id"]).strip(),
+        namespace="exec",
+    )
+
+
 @_d.method("exec.approval.snapshot", scope="operator.approvals")
 async def _handle_exec_approval_snapshot(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Return a diagnostic snapshot for approval state."""
@@ -193,6 +230,26 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
     queue = get_approval_queue()
     approved = bool(params["approved"])
     pending = queue.get(params["id"])
+    if pending.claim_token is not None:
+        pending = await _join_active_resolution(queue, params["id"])
+        if pending.claim_token is not None:
+            payload = approval_status_rpc_payload(
+                queue,
+                params["id"],
+                queue.get_settings().mode,
+            )
+            payload["resolutionInProgress"] = True
+            return payload
+    # Cross-surface first-valid-resolution wins.  A WebUI decision can land
+    # after the TUI keypress future completes but before this RPC reaches the
+    # queue.  Return the canonical result instead of presenting the losing
+    # surface with a false red failure (and never replay sandbox side effects).
+    if pending.resolved:
+        return approval_status_rpc_payload(
+            queue,
+            params["id"],
+            queue.get_settings().mode,
+        )
     normalized_choice = str(choice).strip() if isinstance(choice, str) and choice.strip() else None
     sandbox_approval = is_sandbox_approval_kind(pending.params.get("approvalKind"))
     if sandbox_approval and approved:
@@ -219,10 +276,21 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
         try:
             await apply_sandbox_approval_choice(
                 pending.params,
+                approval_id=params["id"],
                 choice=normalized_choice,
                 approved=True,
                 session_manager=ctx.session_manager,
                 config=ctx.config,
+            )
+        except ProjectWorkspaceStateError:
+            # This exact execution/session/workspace authority is gone.
+            # Reopening can never make the card actionable again.
+            discard_approval_run_context_authority(params["id"])
+            queue.expire_claimed_resolution(params["id"], claim_token)
+            return approval_status_rpc_payload(
+                queue,
+                params["id"],
+                queue.get_settings().mode,
             )
         except Exception:
             queue.reopen_resolved_approval(params["id"], expected_approved=True)
@@ -313,6 +381,17 @@ async def _handle_plugin_approval_wait_decision(
     )
 
 
+@_d.method("plugin.approval.status", scope="operator.approvals")
+async def _handle_plugin_approval_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict) or not str(params.get("id") or "").strip():
+        raise ValueError("params.id is required")
+    return approval_lookup_status_rpc_payload(
+        get_approval_queue(),
+        str(params["id"]).strip(),
+        namespace="plugin",
+    )
+
+
 @_d.method("plugin.approval.resolve", scope="operator.approvals")
 async def _handle_plugin_approval_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
@@ -320,4 +399,16 @@ async def _handle_plugin_approval_resolve(params: dict | None, ctx: RpcContext) 
     if "approved" not in params:
         raise ValueError("params.approved is required")
     queue = get_approval_queue()
-    return approval_resolve_rpc_payload(queue, params["id"], bool(params["approved"]))
+    approval_id = params["id"]
+    # Match exec approvals' cross-surface contract: the first valid decision is
+    # canonical, and a later surface receives that outcome even if its stale
+    # click requested the opposite result.
+    if queue.get(approval_id).resolved:
+        return approval_status_rpc_payload(queue, approval_id, queue.get_settings().mode)
+    try:
+        return approval_resolve_rpc_payload(queue, approval_id, bool(params["approved"]))
+    except ValueError:
+        # Close the get/resolve race without hiding an unrelated queue error.
+        if queue.get(approval_id).resolved:
+            return approval_status_rpc_payload(queue, approval_id, queue.get_settings().mode)
+        raise

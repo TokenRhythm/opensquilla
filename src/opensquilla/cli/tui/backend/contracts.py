@@ -27,7 +27,7 @@ class TuiApplication(Protocol):
 class TuiSurface(Protocol):
     """Submitted-line and output surface used by the backend runtime."""
 
-    async def next_line(self) -> str | None: ...
+    async def next_line(self) -> TuiSubmittedInput | str | None: ...
 
     def set_cancel_callback(self, cb: Callable[[], None] | None) -> None: ...
 
@@ -58,6 +58,8 @@ class TuiRenderer(Protocol):
     """Async renderer API a future full-screen renderer can implement."""
 
     async def aappend_text(self, delta: str, *, presentation: str = "answer") -> None: ...
+
+    async def areconcile_final_text(self, text: str) -> None: ...
 
     async def aappend_reasoning(self, delta: str) -> None: ...
 
@@ -98,6 +100,52 @@ class TuiInputKind(Enum):
     # Host-only UI command (e.g. /theme): runs immediately, never echoed as a
     # prompt and never queued behind an in-flight turn.
     LOCAL = "local"
+    # Gateway-owned control-plane command (e.g. /router, /ensemble): runs
+    # immediately while a turn streams, but unlike LOCAL it may persist shared
+    # product state. It is never echoed, steered, or placed in the turn queue.
+    CONTROL = "control"
+    # Deterministic slash command handled by the local/Gateway command plane.
+    # Commands never become prompt cards, steering text, or queued turns.
+    COMMAND = "command"
+    # Command-plane operation that is safe only when no turn is active. The
+    # runtime rejects it with a notice while busy instead of silently enqueueing
+    # it as conversation input.
+    COMMAND_REQUIRES_IDLE = "command_requires_idle"
+
+
+@dataclass(frozen=True, eq=False)
+class TuiSubmittedInput:
+    """One submitted composer value plus its busy-turn disposition.
+
+    ``auto`` preserves the historical FIFO behaviour for older surfaces.
+    OpenTUI sends ``steer`` for Enter and ``queue`` for Tab while a turn is
+    active; the backend remains the authority that decides whether steering is
+    currently possible.
+    """
+
+    text: str
+    intent: str = "auto"
+    client_message_id: str | None = None
+
+    def __eq__(self, other: object) -> bool:
+        """Keep the pre-identity string comparison contract additive."""
+
+        if isinstance(other, str):
+            return self.text == other
+        if isinstance(other, TuiSubmittedInput):
+            return (
+                self.text,
+                self.intent,
+                self.client_message_id,
+            ) == (
+                other.text,
+                other.intent,
+                other.client_message_id,
+            )
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.text, self.intent, self.client_message_id))
 
 
 def _default_classify_input(_user_input: str) -> TuiInputKind:
@@ -148,6 +196,10 @@ async def _noop_cancel_active_turn() -> None:
     return None
 
 
+async def _noop_steer_active_turn(_text: str) -> bool:
+    return False
+
+
 @dataclass(frozen=True)
 class TuiRuntimeHooks:
     """Adapter-provided hooks for runtime side effects."""
@@ -160,6 +212,7 @@ class TuiRuntimeHooks:
     clear_current_cancel: Callable[[], None] = _noop_clear_current_cancel
     notice: Callable[[str], None] | None = None
     on_cancel_active_turn: Callable[[], Awaitable[None]] = _noop_cancel_active_turn
+    on_steer_active_turn: Callable[[str], Awaitable[bool]] = _noop_steer_active_turn
     expose_surface: Callable[[TuiSurface], None] | None = None
     clear_exposed_surface: Callable[[], None] | None = None
 

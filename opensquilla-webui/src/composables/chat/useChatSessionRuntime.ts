@@ -4,6 +4,7 @@ import type {
   ChatRunStatusSource,
 } from '@/types/chat'
 import type { PersistSessionOptions } from '@/composables/chat/useChatSessionRoute'
+import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -13,6 +14,11 @@ export interface ChatUsageAccumulator {
   cost: number | null
   routedTurns: number
   sessionSaved: number
+}
+
+export interface ResponseSessionAdoptionResult {
+  authoritativeIdle: boolean
+  backgroundOnly: boolean
 }
 
 export interface UseChatSessionRuntimeOptions {
@@ -30,17 +36,22 @@ export interface UseChatSessionRuntimeOptions {
   usageModel: Ref<string>
   createSessionKey: (agentId?: string) => string
   persistSession: (key: string, options?: PersistSessionOptions) => void
-  unsubscribeSession: () => void | Promise<void>
-  subscribeSession: () => void | Promise<void>
-  loadHistory: () => void | Promise<void>
+  cancelSessionBootstrap: () => void
+  startSessionBootstrap: (options?: {
+    includeHistory?: boolean
+    force?: boolean
+  }) => SessionBootstrapRun
   loadCurrentSessionUsage: () => void | Promise<void>
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   setCompactInFlight: (active: boolean, key?: string) => void
   hideCompactStatus: () => void
   clearPendingQueue: () => void
+  switchPendingQueue: (targetSessionKey: string) => void
+  adoptPendingQueue: (targetSessionKey: string, ownerRequestId: string) => void
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
+  resetDraftComposer?: () => void
 }
 
 const EMPTY_USAGE: ChatUsageAccumulator = {
@@ -80,50 +91,84 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.resetSavingsPopupCooldown()
   }
 
-  function resetCompactAndQueueState() {
+  function resetCompactState() {
     options.setCompactInFlight(false)
     options.hideCompactStatus()
-    options.clearPendingQueue()
   }
 
   function resetCurrentSessionAfterSlash() {
     resetSessionRuntimeState()
-    resetCompactAndQueueState()
+    resetCompactState()
+    options.clearPendingQueue()
     resetSessionViewState()
   }
 
-  function switchToSession(key: string) {
+  async function switchSession(
+    key: string,
+    pendingQueuePolicy:
+      | { kind: 'navigate' }
+      | { kind: 'response_handoff'; ownerRequestId: string },
+  ): Promise<ResponseSessionAdoptionResult | undefined> {
     if (!key || key === options.sessionKey.value) return
 
-    options.unsubscribeSession()
+    options.cancelSessionBootstrap()
+    resetCompactState()
+    if (pendingQueuePolicy.kind === 'response_handoff') {
+      options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
+    } else {
+      options.switchPendingQueue(key)
+    }
     options.persistSession(key, { source: 'runtime.switchToSession' })
     resetSessionRuntimeState()
     options.pendingSessionIntent.value = null
-    resetCompactAndQueueState()
     options.applySessionRunState({ run_status: 'idle' })
     resetSessionViewState()
     options.restoreWidgetState()
-    options.loadCurrentSessionUsage()
-    options.subscribeSession()
-    options.loadHistory()
+    // History and live are launched together by the coordinator but remain
+    // orthogonal. Response hand-off only waits for the authoritative live
+    // snapshot; history can recover independently without blocking adoption.
+    const bootstrap = options.startSessionBootstrap({ includeHistory: true })
+    // Usage is optional metadata. Start it once the critical request frames are
+    // queued; a slow history response must not withhold the rest of the UI.
+    void bootstrap.criticalRequestsQueued.then(() => {
+      if (options.sessionKey.value === key) void options.loadCurrentSessionUsage()
+    })
+    const subscriptionOutcome = await bootstrap.live
+    return {
+      authoritativeIdle: subscriptionOutcome?.authoritative === true
+        && subscriptionOutcome.live === false,
+      backgroundOnly: subscriptionOutcome?.authoritative === true
+        && subscriptionOutcome.backgroundOnly === true,
+    }
+  }
+
+  function switchToSession(key: string) {
+    return switchSession(key, { kind: 'navigate' })
+  }
+
+  function adoptResponseSession(key: string, ownerRequestId: string) {
+    return switchSession(key, { kind: 'response_handoff', ownerRequestId })
   }
 
   // Drafts keep their provisional key out of the URL and local storage; it
   // only persists once the first message actually goes out.
   function startDraftSession(agentId?: string) {
-    options.unsubscribeSession()
+    options.cancelSessionBootstrap()
     const key = options.createSessionKey(agentId)
+    resetCompactState()
+    options.switchPendingQueue(key)
     options.sessionKey.value = key
     resetSessionRuntimeState()
-    resetCompactAndQueueState()
     options.pendingSessionIntent.value = 'new_chat'
+    options.resetDraftComposer?.()
     resetSessionViewState()
-    options.subscribeSession()
+    options.startSessionBootstrap({ includeHistory: false })
   }
 
   return {
     resetCurrentSessionAfterSlash,
     startDraftSession,
     switchToSession,
+    adoptResponseSession,
   }
 }

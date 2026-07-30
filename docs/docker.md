@@ -30,7 +30,7 @@ Python, no Git, no build tools.
 
 Prebuilt multi-arch images are published to
 [`ghcr.io/opensquilla/opensquilla`](https://github.com/opensquilla/opensquilla/pkgs/container/opensquilla)
-for each release tag. The immutable `v0.5.0rc4` tag identifies Preview 4, while
+for each release tag. The immutable `v0.5.2` tag identifies the 0.5.2 stable release, while
 `latest` follows the most recently pushed release tag, including previews and
 backports. If a backport moves `latest`, the newest release workflow is rerun to
 restore the intended ordering. If the release you want predates image
@@ -45,8 +45,8 @@ Create a directory for the deployment and write this `compose.yaml`:
 ```yaml
 services:
   gateway:
-    # Pin v0.5.0rc4 for reproducibility; latest follows the most recent tag push.
-    image: ghcr.io/opensquilla/opensquilla:latest
+    # Pin v0.5.2 for reproducibility; latest follows the most recent tag push.
+    image: ghcr.io/opensquilla/opensquilla:v0.5.2
     environment:
       # In-container bind. Keep it 0.0.0.0 — what the network can reach is
       # decided by `ports` below, not by this value.
@@ -243,6 +243,12 @@ git lfs pull --include="src/opensquilla/squilla_router/models/**"
 docker build -t opensquilla:local .
 docker compose up -d
 ```
+
+The Dockerfile builds the Vue console in a pinned Node.js build stage, so the
+host does not need Node.js or npm. The first source image build does download
+frontend packages and uses additional build time, network transfer, and cache
+space. Published images already contain the console and have none of that
+client-side build cost.
 
 On a low-power or `arm64` NAS this build is slow; prefer the prebuilt image
 and keep source builds for development machines.

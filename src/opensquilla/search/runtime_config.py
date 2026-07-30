@@ -7,7 +7,14 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
-from opensquilla.search.types import SearchOptions, SearchProvider, SearchProviderError
+from opensquilla.search.retry_policy import is_retryable_http_status
+from opensquilla.search.types import (
+    SearchExecutionPlan,
+    SearchFallbackMode,
+    SearchOptions,
+    SearchProvider,
+    SearchProviderError,
+)
 
 CredentialSource = Literal["configured", "configured_env", "spec_env", "none"]
 
@@ -141,6 +148,40 @@ class ResolvedSearchRuntime:
             ),
         )
 
+    def execution_plan(self, options: SearchOptions) -> SearchExecutionPlan:
+        """Build the bounded, duplicate-free provider sequence for one request."""
+
+        ranked_names = tuple(dict.fromkeys(self.provider_order(options)))
+        # Automatic mode preselects one backup even with fallback disabled so a
+        # provider that discovers a missing key locally can be skipped without
+        # turning that skip into a second network attempt. All other failures
+        # still stop immediately under the ``off`` policy.
+        max_attempts = (
+            2
+            if self.fallback_policy == "network" or options.provider is None
+            else 1
+        )
+        provider_names = list(ranked_names[:max_attempts])
+        if (
+            (self.fallback_policy == "network" or options.provider is None)
+            and len(provider_names) == 1
+            and provider_names[0] != "duckduckgo"
+        ):
+            duckduckgo = self.providers.get("duckduckgo")
+            if duckduckgo is not None and duckduckgo.available:
+                provider_names.append("duckduckgo")
+        planned_provider_names = tuple(provider_names)
+        fallback_mode: SearchFallbackMode = "none"
+        if len(planned_provider_names) > 1:
+            fallback_mode = (
+                "network" if self.fallback_policy == "network" else "auth_missing"
+            )
+        return SearchExecutionPlan(
+            provider_names=planned_provider_names,
+            selection_mode="explicit" if options.provider is not None else "automatic",
+            fallback_mode=fallback_mode,
+        )
+
     def should_fallback(
         self,
         error: SearchProviderError,
@@ -153,7 +194,15 @@ class ResolvedSearchRuntime:
             return (not explicit_provider) and _is_missing_key_error(error)
         if self.fallback_policy != "network":
             return False
-        return error.retryable or error.kind in {"network", "timeout", "rate_limit", "http"}
+        if not error.retryable:
+            return False
+        if error.kind not in {"timeout", "network", "rate_limit", "http"}:
+            return False
+        if error.kind in {"timeout", "network"}:
+            return True
+        if error.status_code is not None:
+            return is_retryable_http_status(error.status_code)
+        return False
 
     def _explicit_provider_order(self, provider_id: str, *, recency: str | None) -> tuple[str, ...]:
         if (

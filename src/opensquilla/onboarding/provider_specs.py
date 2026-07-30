@@ -37,6 +37,7 @@ class ProviderSetupSpec:
     verification: Verification
     env_key: str
     default_base_url: str
+    accepts_api_key: bool
     requires_api_key: bool
     requires_base_url: bool
     router_supported: bool
@@ -59,7 +60,10 @@ _PROVIDER_LABELS: dict[str, str] = {
     "deepseek": "DeepSeek",
     "gemini": "Google Gemini",
     "dashscope": "Aliyun DashScope",
-    "bailian_coding": "Bailian Coding",
+    "bailian_coding": "Bailian Coding (International)",
+    "bailian_coding_cn": "Bailian Coding (Mainland China)",
+    "qwen_token_plan": "Qwen Token Plan",
+    "qwen_token_plan_anthropic": "Qwen Token Plan (Anthropic)",
     "moonshot": "Moonshot AI",
     "kimi_coding_openai": "Kimi Coding OpenAI-compatible",
     "kimi_coding_anthropic": "Kimi Coding Anthropic-compatible",
@@ -87,6 +91,7 @@ _PROVIDER_LABELS: dict[str, str] = {
     "tokenrhythm": "TokenRhythm",
     "vllm": "vLLM (self-hosted)",
     "custom": "Custom OpenAI-compatible endpoint",
+    "custom_anthropic": "Custom Anthropic-compatible endpoint",
     "litellm_proxy": "LiteLLM Proxy",
     "lm_studio": "LM Studio (local)",
     "ovms": "OpenVINO Model Server",
@@ -134,6 +139,8 @@ _ONBOARDING_VERIFIED_PROVIDER_IDS = frozenset(
         "deepseek",
         "gemini",
         "dashscope",
+        "qwen_token_plan",
+        "qwen_token_plan_anthropic",
         "moonshot",
         "zhipu",
         "qianfan",
@@ -145,6 +152,17 @@ _ONBOARDING_VERIFIED_PROVIDER_IDS = frozenset(
 
 _LOCAL_PROVIDER_IDS = frozenset({"ollama", "vllm", "lm_studio", "ovms"})
 _OAUTH_PROVIDER_IDS = frozenset({"openai_codex", "github_copilot"})
+_BAILIAN_CODING_PROVIDER_IDS = frozenset({"bailian_coding", "bailian_coding_cn"})
+_DEDICATED_SK_SP_PROVIDER_IDS = _BAILIAN_CODING_PROVIDER_IDS | {
+    "qwen_token_plan",
+    "qwen_token_plan_anthropic",
+}
+_DIRECT_MODEL_DEFAULTS = {
+    "bailian_coding": "qwen3.7-plus",
+    "bailian_coding_cn": "qwen3.7-plus",
+    "qwen_token_plan": "qwen3.8-max-preview",
+    "qwen_token_plan_anthropic": "qwen3.8-max-preview",
+}
 
 
 def _deployment_for(spec: ProviderSpec) -> Deployment:
@@ -183,11 +201,14 @@ def _what_you_need(spec: ProviderSpec) -> tuple[str, ...]:
             else "A provider model id."
         )
     if spec.requires_api_key():
-        needs.append(
-            f"API key via {spec.env_key} or a one-time paste."
-            if spec.env_key
-            else "Provider API key."
-        )
+        if spec.provider_id in _DEDICATED_SK_SP_PROVIDER_IDS:
+            needs.append("A dedicated plan API key starting with sk-sp-.")
+        else:
+            needs.append(
+                f"API key via {spec.env_key} or a one-time paste."
+                if spec.env_key
+                else "Provider API key."
+            )
     if spec.requires_base_url():
         needs.append("Provider base URL.")
     if spec.provider_id in _LOCAL_PROVIDER_IDS:
@@ -198,6 +219,8 @@ def _what_you_need(spec: ProviderSpec) -> tuple[str, ...]:
 
 
 def _default_direct_model(provider_id: str) -> str:
+    if default_model := _DIRECT_MODEL_DEFAULTS.get(provider_id):
+        return default_model
     preset = get_preset(provider_id)
     if preset is None or preset.synthesized:
         if provider_id in _INLINE_ROUTER_SUPPORTED_PROVIDER_IDS and preset is not None:
@@ -215,8 +238,8 @@ def _default_direct_model(provider_id: str) -> str:
 def _model_description(spec: ProviderSpec, *, router_supported: bool) -> str:
     if router_supported:
         return (
-            "Optional direct fallback model. Leave blank to use the selected "
-            "SquillaRouter default tier."
+            "Optional direct fallback model. Leave blank to use this provider's "
+            "default direct model. SquillaRouter tiers are configured separately."
         )
     if spec.provider_id in _LOCAL_PROVIDER_IDS:
         return "Required local model id. Use a model available from your local model server."
@@ -225,6 +248,21 @@ def _model_description(spec: ProviderSpec, *, router_supported: bool) -> str:
 
 def _fields_for(spec: ProviderSpec) -> tuple[ProviderSetupField, ...]:
     router_supported = _is_router_supported_provider(spec.provider_id)
+    api_key_description = (
+        (
+            "Use the dedicated plan API key starting with sk-sp-. "
+            "Standard Model Studio keys are not interchangeable. "
+        )
+        if spec.provider_id in _DEDICATED_SK_SP_PROVIDER_IDS
+        else ""
+    )
+    api_key_description += (
+        "Saved as plaintext api_key in the config file and used "
+        f"ahead of {spec.env_key}. Leave blank to read "
+        f"{spec.env_key} from the environment instead."
+        if spec.env_key
+        else "Saved as plaintext api_key in the config file."
+    )
     return (
         ProviderSetupField(
             name="model",
@@ -240,15 +278,7 @@ def _fields_for(spec: ProviderSpec) -> tuple[ProviderSetupField, ...]:
             field_type="password",
             required=spec.requires_api_key(),
             default="",
-            description=(
-                (
-                    "Saved as plaintext api_key in the config file and used "
-                    f"ahead of {spec.env_key}. Leave blank to read "
-                    f"{spec.env_key} from the environment instead."
-                )
-                if spec.env_key
-                else "Saved as plaintext api_key in the config file."
-            ),
+            description=api_key_description,
             secret=True,
         ),
         *(
@@ -310,13 +340,20 @@ def _to_setup_spec(spec: ProviderSpec) -> ProviderSetupSpec:
         verification=verification,
         env_key=spec.env_key,
         default_base_url=spec.default_base_url,
+        # ``requires_api_key`` answers whether setup is blocked without a
+        # key; it does not answer whether the transport accepts an optional
+        # Bearer credential.  Local/custom OpenAI-compatible endpoints often
+        # support both authenticated and unauthenticated deployments.  OAuth
+        # is the one registry credential mode that is not an API-key field.
+        accepts_api_key=spec.env_key != "OAuth",
         requires_api_key=spec.requires_api_key(),
         requires_base_url=spec.requires_base_url(),
         router_supported=_is_router_supported_provider(spec.provider_id),
         deployment=_deployment_for(spec),
         blocking=True,
-        # Runtime-supported providers can be probed live (one-token chat via
-        # onboarding.provider.probe) before the config is saved.
+        # Runtime-supported providers can be probed live (a small,
+        # provider-bounded chat via onboarding.provider.probe) before the
+        # config is saved.
         can_probe=runtime_supported,
         readme_scenarios=("first-run setup", "quick terminal install"),
         what_you_need=_what_you_need(spec),
@@ -387,6 +424,7 @@ def _provider_entry_payload(s: ProviderSetupSpec) -> dict[str, Any]:
         "verification": s.verification,
         "envKey": s.env_key,
         "defaultBaseUrl": s.default_base_url,
+        "acceptsApiKey": s.accepts_api_key,
         "requiresApiKey": s.requires_api_key,
         "requiresBaseUrl": s.requires_base_url,
         "routerSupported": s.router_supported,

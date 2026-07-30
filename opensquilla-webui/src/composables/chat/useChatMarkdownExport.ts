@@ -6,12 +6,14 @@ import { artifactMeta, artifactName } from '@/utils/chat/artifacts'
 export interface UseChatMarkdownExportOptions {
   messages: Readonly<Ref<ChatRenderedMessage[]>>
   currentTitle: Readonly<Ref<string>>
+  aiGeneratedLabel: Readonly<Ref<string>>
 }
 
 export interface BuildChatMarkdownOptions {
   messages: readonly ChatRenderedMessage[]
   title: string
   exportedAt: string
+  aiGeneratedLabel: string
 }
 
 function markdownFilename(title: string): string {
@@ -74,6 +76,7 @@ export function buildChatMarkdown(options: BuildChatMarkdownOptions): string {
     }
     lines.push('')
   }
+  lines.push('---', '', `> ${markdownEscape(options.aiGeneratedLabel)}`, '')
   return lines.join('\n')
 }
 
@@ -83,6 +86,7 @@ export function useChatMarkdownExport(options: UseChatMarkdownExportOptions) {
       title: options.currentTitle.value,
       exportedAt: new Date().toISOString(),
       messages: options.messages.value,
+      aiGeneratedLabel: options.aiGeneratedLabel.value,
     })
     downloadText(markdownFilename(options.currentTitle.value), 'text/markdown;charset=utf-8', markdown)
   }

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+from opensquilla.sandbox.backend import linux_helper
 from opensquilla.sandbox.backend.linux_payload import (
     FilesystemHelperPayload,
     HelperPayload,
@@ -12,7 +16,14 @@ from opensquilla.sandbox.backend.linux_payload import (
     decode_payload,
     encode_payload,
 )
+from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.operation_runtime import SandboxOperation
+from opensquilla.sandbox.permissions import (
+    FileSystemAccess,
+    FileSystemPermissionEntry,
+    FileSystemPermissionProfile,
+)
+from opensquilla.sandbox.policy import build_policy
 from opensquilla.sandbox.types import (
     MountSpec,
     NetworkMode,
@@ -33,9 +44,7 @@ def test_process_payload_round_trips() -> None:
         env={"PATH": "/usr/bin"},
         policy={
             "network": "none",
-            "mounts": [
-                {"host": "/repo", "sandbox": "/workspace", "mode": "rw", "required": True}
-            ],
+            "mounts": [{"host": "/repo", "sandbox": "/workspace", "mode": "rw", "required": True}],
             "envAllowlist": ["PATH"],
             "tmpWritable": True,
             "wallTimeoutS": 30.0,
@@ -65,9 +74,7 @@ def test_filesystem_payload_round_trips() -> None:
         env={"PATH": "/usr/bin", "PYTHONPATH": "/repo/src"},
         policy={
             "network": "none",
-            "mounts": [
-                {"host": "/repo", "sandbox": "/repo", "mode": "rw", "required": True}
-            ],
+            "mounts": [{"host": "/repo", "sandbox": "/repo", "mode": "rw", "required": True}],
             "envAllowlist": ["PATH", "PYTHONPATH"],
             "tmpWritable": True,
             "wallTimeoutS": 30.0,
@@ -160,6 +167,164 @@ def test_build_process_helper_payload_from_sandbox_request(tmp_path: Path) -> No
     assert payload.policy["wallTimeoutS"] == 30
 
 
+def test_process_payload_preserves_canonical_filesystem_profile(tmp_path: Path) -> None:
+    policy = build_policy(
+        SecurityLevel.STANDARD,
+        "shell.exec",
+        tmp_path,
+        SandboxSettings(),
+    )
+    request = SandboxRequest(
+        argv=("/bin/true",),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=policy,
+    )
+
+    payload = decode_payload(encode_payload(build_process_helper_payload(request)))
+    restored = linux_helper._policy_from_payload(payload.policy)
+
+    assert restored.file_system is not None
+    assert restored.file_system == policy.file_system
+
+
+def test_process_payload_round_trips_complete_filesystem_profile(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(Path(tmp_path.anchor), FileSystemAccess.READ),
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(workspace / "readonly", FileSystemAccess.READ),
+            FileSystemPermissionEntry(workspace / "secret", FileSystemAccess.DENY),
+        ),
+        denied_read_globs=(str(workspace / "**" / ".env"),),
+    )
+    request = SandboxRequest(
+        argv=("/bin/true",),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=replace(_policy(tmp_path), file_system=profile),
+    )
+
+    payload = decode_payload(encode_payload(build_process_helper_payload(request)))
+    restored = linux_helper._policy_from_payload(payload.policy)
+
+    assert payload.policy["fileSystem"] == {
+        "entries": [
+            {"path": str(entry.path), "access": entry.access.value} for entry in profile.entries
+        ],
+        "deniedReadGlobs": list(profile.denied_read_globs),
+        "defaultAccess": "deny",
+    }
+    assert restored.file_system == profile
+    assert restored.file_system.unsandboxed_execution_allowed is False
+
+
+def test_process_payload_round_trips_optional_logical_profile_path(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = tmp_path / "metadata-target"
+    logical = workspace / ".git"
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(
+                target,
+                FileSystemAccess.READ,
+                logical_path=logical,
+            ),
+        )
+    )
+    request = SandboxRequest(
+        argv=("/bin/true",),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=replace(_policy(tmp_path), file_system=profile),
+    )
+
+    payload = decode_payload(encode_payload(build_process_helper_payload(request)))
+    restored = linux_helper._policy_from_payload(payload.policy)
+
+    assert payload.policy["fileSystem"]["entries"] == [
+        {"path": str(workspace), "access": "write"},
+        {
+            "path": str(target),
+            "access": "read",
+            "logicalPath": str(logical),
+        },
+    ]
+    assert restored.file_system == profile
+
+
+@pytest.mark.parametrize("logical_path", ("", "relative/.git", 17))
+def test_linux_helper_rejects_invalid_present_logical_profile_path(
+    tmp_path: Path,
+    logical_path: object,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="logicalPath must be a non-empty absolute path",
+    ):
+        linux_helper._policy_from_payload(
+            {
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": str(tmp_path / "metadata-target"),
+                            "access": "read",
+                            "logicalPath": logical_path,
+                        }
+                    ],
+                    "deniedReadGlobs": [],
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "include_null_logical_path",
+    (False, True),
+)
+def test_linux_helper_accepts_legacy_missing_or_null_logical_profile_path(
+    tmp_path: Path,
+    include_null_logical_path: bool,
+) -> None:
+    entry: dict[str, object] = {
+        "path": str(tmp_path / "metadata-target"),
+        "access": "read",
+    }
+    if include_null_logical_path:
+        entry["logicalPath"] = None
+    policy = linux_helper._policy_from_payload(
+        {
+            "fileSystem": {
+                "entries": [entry],
+                "deniedReadGlobs": [],
+            }
+        }
+    )
+
+    assert policy.file_system is not None
+    assert policy.file_system.entries[0].logical_path is None
+
+
+def test_process_payload_round_trips_full_access_default_write(tmp_path: Path) -> None:
+    profile = FileSystemPermissionProfile.full_access()
+    request = SandboxRequest(
+        argv=("/bin/true",),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=replace(_policy(tmp_path), file_system=profile),
+    )
+
+    payload = decode_payload(encode_payload(build_process_helper_payload(request)))
+    restored = linux_helper._policy_from_payload(payload.policy)
+
+    assert payload.policy["fileSystem"]["defaultAccess"] == "write"
+    assert restored.file_system == profile
+
+
 def test_build_process_helper_payload_filters_env_allowlist(tmp_path: Path) -> None:
     request = SandboxRequest(
         argv=("sh", "-lc", "echo ok"),
@@ -197,3 +362,50 @@ def test_build_filesystem_helper_payload_from_operation(tmp_path: Path) -> None:
     assert payload.filesystem is not None
     assert payload.filesystem.worker_payload["kind"] == "write_text"
     assert payload.filesystem.worker_payload["content"] == "hello"
+    assert payload.filesystem.worker_payload["workspace"] == str(tmp_path.resolve())
+
+
+@pytest.mark.parametrize("relative_field", ("path", "root"))
+def test_filesystem_payload_uses_canonical_workspace_cwd_for_relative_requests(
+    tmp_path: Path,
+    relative_field: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    nested = workspace / "nested"
+    nested.mkdir(parents=True)
+    noncanonical_workspace = nested / ".."
+    relative_target = Path("src") / "out.txt"
+    if relative_field == "path":
+        operation = SandboxOperation.filesystem(
+            kind="write_text",
+            workspace=noncanonical_workspace,
+            run_mode="trusted",
+            path=relative_target,
+            paths=(relative_target,),
+            content="hello",
+        )
+    else:
+        operation = SandboxOperation.filesystem(
+            kind="apply_patch",
+            workspace=noncanonical_workspace,
+            run_mode="trusted",
+            root=Path("."),
+            paths=(relative_target,),
+            patch="*** Begin Patch\n*** End Patch",
+        )
+    worker_payload_path = (tmp_path / "transport" / "payload.json").resolve()
+
+    payload = build_filesystem_helper_payload(
+        operation,
+        policy=_policy(workspace),
+        session_id="s1",
+        worker_payload_path=worker_payload_path,
+    )
+
+    assert Path(payload.cwd) == workspace.resolve()
+    assert Path(payload.cwd).is_absolute()
+    assert payload.filesystem is not None
+    assert Path(payload.filesystem.worker_payload_path) == worker_payload_path
+    assert Path(payload.filesystem.worker_payload_path).is_absolute()
+    expected_relative = str(relative_target) if relative_field == "path" else "."
+    assert payload.filesystem.worker_payload[relative_field] == expected_relative

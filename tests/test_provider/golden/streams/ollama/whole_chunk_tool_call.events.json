@@ -26,13 +26,15 @@
     "cost_source": "none",
     "ensemble_trace": null,
     "input_tokens": 9,
-    "model": "",
+    "model": "test-model",
     "model_usage_breakdown": [],
     "output_tokens": 2,
+    "provider": "ollama",
     "reasoning_content": null,
     "reasoning_tokens": 0,
     "stop_reason": "stop",
     "thinking_signature": null,
-    "type": "DoneEvent"
+    "type": "DoneEvent",
+    "usage_missing_count": 0
   }
 ]

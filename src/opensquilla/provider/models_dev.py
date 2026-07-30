@@ -27,6 +27,15 @@ log = structlog.get_logger(__name__)
 # would be actively wrong rather than conservative).
 _COST_KEYS = ("in_mtok", "out_mtok", "cr_mtok", "cw_mtok")
 
+# Region-specific provider ids can share an identical model surface while
+# keeping distinct endpoints and configuration identities. Prefer a future
+# provider-specific snapshot table when present; until the next snapshot
+# refresh, reuse the established sibling table instead of falling through to
+# a cross-provider merge that would discard costs and AND capabilities.
+_PROVIDER_TABLE_ALIASES = {
+    "bailian_coding_cn": "bailian_coding",
+}
+
 
 @cache
 def _snapshot_providers() -> dict[str, dict[str, dict[str, Any]]]:
@@ -68,7 +77,10 @@ def lookup_model(provider_id: str, model_id: str) -> dict[str, Any] | None:
     model_l = (model_id or "").strip().lower()
     if not model_l:
         return None
-    entry = _entry_from_table(providers.get((provider_id or "").strip().lower()), model_l)
+    provider_l = (provider_id or "").strip().lower()
+    entry = _entry_from_table(providers.get(provider_l), model_l)
+    if entry is None and (alias := _PROVIDER_TABLE_ALIASES.get(provider_l)):
+        entry = _entry_from_table(providers.get(alias), model_l)
     if entry is not None:
         return entry
 

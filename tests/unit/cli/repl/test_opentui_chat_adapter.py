@@ -104,12 +104,14 @@ async def test_opentui_chat_runtime_exposes_tui_output_and_reuses_runtime(
         queue_max_size=8,
     )
 
-    assert captured["surface_kwargs"] == {
-        "surface": Surface.CLI_GATEWAY,
-        "model": "model-a",
-        "session_id": "session-a",
-        "workspace_dir": "/tmp/opentui-workspace",
-    }
+    assert captured["surface_kwargs"]["surface"] is Surface.CLI_GATEWAY
+    assert captured["surface_kwargs"]["model"] == "model-a"
+    assert captured["surface_kwargs"]["session_id"] == "session-a"
+    assert captured["surface_kwargs"]["workspace_dir"] == "/tmp/opentui-workspace"
+    context_update = captured["surface_kwargs"]["context_update"]
+    assert context_update.task == "Session"
+    assert context_update.surface == "Web + TUI"
+    assert context_update.workspace == "opentui-workspace"
     assert captured["runtime_kwargs"]["dispatch"] is fake_dispatch
     assert captured["runtime_kwargs"]["config"].concurrent_input_during_turn is True
     assert opentui_runtime.get_tui_output(scope) is None

@@ -88,3 +88,5 @@ async def test_qq_streamed_reply_targets_sender_even_after_newer_inbound() -> No
     assert "answer for a" in kwargs["content"]
     assert kwargs["openid"] == "openid-a"
     assert kwargs["msg_id"] == "m-a"
+    assert kwargs["msg_seq"] == 1
+    assert isinstance(kwargs["msg_seq"], int)

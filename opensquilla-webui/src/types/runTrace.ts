@@ -10,6 +10,7 @@ export interface NodeStep {
   id: string
   parentId?: string | null
   title: string                 // displayName
+  toolName?: string             // original tool identity; survives flat history traces
   operationKey: string          // e.g. 'web.search' — drives icon + grouping
   state: ToolPartState          // single status enum (see runTrace.ts map)
   tokens?: number | null        // per-step token cost when known

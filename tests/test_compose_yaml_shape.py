@@ -52,6 +52,57 @@ def _load_dockerfile() -> str:
     return (_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
 
+def _load_dockerignore_rules() -> set[str]:
+    lines = (_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    return {
+        line
+        for raw_line in lines
+        if (line := raw_line.strip()) and not line.startswith("#")
+    }
+
+
+def test_docker_build_validates_generated_webui_before_python_packaging() -> None:
+    dockerfile = _load_dockerfile()
+
+    assert (
+        "FROM --platform=$BUILDPLATFORM node:22.12.0-bookworm-slim AS webui-builder"
+        in dockerfile
+    )
+    assert "--mount=type=cache,target=/root/.npm,sharing=locked npm ci" in dockerfile
+    assert "RUN npm run build:artifact" in dockerfile
+    assert "ARG OPENSQUILLA_FORBID_PERSONAL_BGM=0" in dockerfile
+    assert "npm run verify:release-dist" in dockerfile
+    assert "COPY hatch_build.py ./" in dockerfile
+    assert "COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py" in dockerfile
+    assert "COPY opensquilla-webui/ ./opensquilla-webui/" in dockerfile
+    assert "COPY --from=webui-builder" in dockerfile
+    assert dockerfile.index("COPY --from=webui-builder") < dockerfile.index(
+        'RUN pip install ".[recommended]"'
+    )
+    assert "rm -rf hatch_build.py scripts opensquilla-webui" in dockerfile
+    assert "!scripts/verify_webui_artifact.py" in _load_dockerignore_rules()
+
+
+def test_dockerignore_prevents_stale_webui_and_nested_secrets_from_entering_context() -> None:
+    rules = _load_dockerignore_rules()
+
+    assert {
+        "src/opensquilla/gateway/static/dist",
+        ".env*",
+        "**/.env*",
+        ".npmrc",
+        "**/.npmrc",
+        "*.pem",
+        "**/*.pem",
+        "*.key",
+        "**/*.key",
+    } <= rules
+    assert "!opensquilla-webui/.node-version" not in rules, (
+        "The root-only hidden-file rule does not exclude the nested .node-version; "
+        "keeping a negation for it incorrectly documents Docker ignore semantics."
+    )
+
+
 def test_dockerfile_gateway_port_matches_compose() -> None:
     """Dockerfile's container gateway port must match compose's 18791.
 

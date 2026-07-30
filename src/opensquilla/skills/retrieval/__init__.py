@@ -9,7 +9,11 @@ import structlog
 
 from opensquilla.skills.retrieval.embedder import get_embedder
 from opensquilla.skills.retrieval.fusion import rrf
-from opensquilla.skills.retrieval.lexical import LexicalIndex, _skill_id
+from opensquilla.skills.retrieval.lexical import (
+    LexicalIndex,
+    _skill_cache_fingerprint,
+    _skill_id,
+)
 from opensquilla.skills.types import SkillSpec
 
 log = structlog.get_logger(__name__)
@@ -33,7 +37,7 @@ class HybridRetriever:
     set for the turn); "hybrid" runs both and fuses via RRF.
 
     Indexes are rebuilt automatically when the input skill set changes
-    (fingerprinted by skill id tuple). Retrievals never raise; if the
+    (fingerprinted by retrieval-relevant metadata). Retrievals never raise; if the
     semantic path is unavailable (embedding backend missing or model
     load failure), the retriever degrades to lexical-only and stays
     that way for the rest of the process lifetime."""
@@ -101,7 +105,7 @@ class HybridRetriever:
         strategy="semantic"). When False is returned for a transient
         failure, _semantic_fp stays stale so the NEXT retrieve on the
         same skill set re-attempts the build."""
-        fp = tuple(_skill_id(s) for s in skills)
+        fp = tuple(_skill_cache_fingerprint(s) for s in skills)
         with self._lock:
             # Lexical: always build on fingerprint mismatch. FTS table
             # population for ~44 skills is sub-millisecond, and even

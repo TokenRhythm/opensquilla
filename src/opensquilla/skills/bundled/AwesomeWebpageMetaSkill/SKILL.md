@@ -1,6 +1,7 @@
 ---
 name: AwesomeWebpageMetaSkill
 description: "Build a local multimedia webpage project from a user topic, audience, language, style, and media preferences by framing requirements, researching, planning, acquiring media, generating files, packaging, validating, repairing, and delivering usage guidance."
+description_zh: "根据用户给定的主题、受众、语言、风格和媒体偏好，通过梳理需求、调研、规划、获取媒体、生成文件、打包、校验、修复并交付使用指引，构建一个本地多媒体网页项目。"
 kind: meta
 meta_priority: 65
 always: false
@@ -888,9 +889,20 @@ composition:
           Media bind/validate output:
           {{ outputs.media_bind_validate | truncate(3500) }}
 
+    - id: publish_webpage
+      kind: tool_call
+      tool: publish_artifact
+      tool_allowlist: [publish_artifact]
+      depends_on: [quick_validate]
+      tool_args:
+        path: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('output_dir') or (inputs.workspace_dir ~ '/awesome-webpage-output') }}/{{ outputs.project_slug | slugify }}/project/index.html"
+        mime: "text/html"
+        bundle: "directory"
+        bundle_root: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('output_dir') or (inputs.workspace_dir ~ '/awesome-webpage-output') }}/{{ outputs.project_slug | slugify }}/project"
+
     - id: delivery_guide
       kind: llm_chat
-      depends_on: [quick_validate]
+      depends_on: [quick_validate, publish_webpage]
       with:
         system: |
           You are the Delivery Guide stage for AwesomeWebpageMetaSkill.
@@ -904,6 +916,8 @@ composition:
           - how to replace images, audio, and video assets
           - how to edit content in index.html, style.css, and script.js
           - what was validated, including the deterministic media bind gate
+          - confirm that the complete project was published as one webpage
+            bundle; do not invent or print an artifact URL
           - any CONFIG_NEEDED items if config values were missing
           - do not claim a requested media modality is available unless the
             media bind report says it is present and referenced
@@ -913,6 +927,9 @@ composition:
 
           Media bind report:
           {{ outputs.media_bind_validate | truncate(5000) }}
+
+          Webpage bundle publication:
+          {{ outputs.publish_webpage | truncate(1500) }}
 ---
 
 # AwesomeWebpageMetaSkill
@@ -931,7 +948,8 @@ Pipeline:
 7. Deterministic Webpage Write
 8. Deterministic Media Bind + Validation
 9. Local Validation
-10. Delivery Guide
+10. Publish Complete Webpage Bundle
+11. Delivery Guide
 
 Provider, OpenRouter model, API key, output directory, and media strategy are
 configuration-owned. The meta-skill may pass the config contract through the

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 
 
 def _execution_status_module():
@@ -93,3 +94,69 @@ def test_legacy_non_error_normalizes_to_unknown_normal_status() -> None:
     assert status["source"] == "legacy"
     assert status["reason"] == "legacy_missing_status"
     assert status["preservation_class"] == "normal"
+
+
+def test_web_search_explicit_failure_maps_to_error_status() -> None:
+    module = _execution_status_module()
+
+    status = module.execution_status_for_tool_result(
+        "web_search",
+        json.dumps(
+            {
+                "ok": False,
+                "error_kind": "blocked",
+                "retry_allowed": False,
+                "results": [],
+            }
+        ),
+    )
+
+    assert status is not None
+    assert status["status"] == "error"
+    assert status["reason"] == "search_blocked"
+    assert status["source"] == "adapter"
+    assert status["preservation_class"] == "diagnostic"
+    assert module.derive_is_error(status) is True
+
+
+def test_web_discover_explicit_timeout_maps_to_timeout_status() -> None:
+    module = _execution_status_module()
+
+    status = module.execution_status_for_tool_result(
+        "web_discover",
+        json.dumps(
+            {
+                "ok": False,
+                "error_kind": "timeout",
+                "retry_allowed": True,
+                "results": [],
+            }
+        ),
+    )
+
+    assert status is not None
+    assert status["status"] == "timeout"
+    assert status["timed_out"] is True
+    assert status["reason"] == "search_timeout"
+    assert module.derive_is_error(status) is True
+
+
+def test_web_outcome_mapper_only_trusts_explicit_failures_from_search_tools() -> None:
+    module = _execution_status_module()
+    failure = json.dumps({"ok": False, "error_kind": "network"})
+
+    assert module.execution_status_for_tool_result("untrusted_tool", failure) is None
+    assert (
+        module.execution_status_for_tool_result(
+            "web_search",
+            json.dumps({"ok": True, "results": []}),
+        )
+        is None
+    )
+    assert (
+        module.execution_status_for_tool_result(
+            "web_search",
+            json.dumps({"error_kind": "network", "results": []}),
+        )
+        is None
+    )

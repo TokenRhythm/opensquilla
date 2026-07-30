@@ -68,6 +68,8 @@ BUILD_ARTIFACT_EXCLUDES = [
     "/dist/",
     "/out/",
     "/build/",
+    "!*/build/",
+    "!*/build/**",
     "/htmlcov/",
 ]
 

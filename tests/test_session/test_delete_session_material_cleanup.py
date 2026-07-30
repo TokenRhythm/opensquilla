@@ -1,4 +1,4 @@
-"""Deleting a session cascades to its on-disk material stores (F-WS-2)."""
+"""Deleting a session cascades to attachment and artifact material stores."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.artifacts import ArtifactStore
 from opensquilla.attachment_refs import transcript_material_dir, write_transcript_material
 from opensquilla.attachment_workspace import _safe_path_segment
 from opensquilla.gateway.boot import build_session_material_cleanup
@@ -38,6 +39,14 @@ async def _seed_material(media_root: Path, workspace: Path, session_id: str) -> 
     att_dir = _workspace_attachment_dir(workspace, session_id)
     att_dir.mkdir(parents=True, exist_ok=True)
     (att_dir / "doc.pdf").write_bytes(b"%PDF-1.4\n")
+    ArtifactStore(media_root).publish_bytes(
+        b"<!doctype html><title>preview</title>",
+        session_id=session_id,
+        session_key=f"agent:main:webchat:{session_id}",
+        name="index.html",
+        mime="text/html",
+        source="test",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +57,7 @@ def _reset_hook():
 
 
 @pytest.mark.asyncio
-async def test_delete_session_removes_both_material_stores(tmp_path: Path) -> None:
+async def test_delete_session_removes_all_material_stores(tmp_path: Path) -> None:
     media_root = tmp_path / "media"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -66,11 +75,13 @@ async def test_delete_session_removes_both_material_stores(tmp_path: Path) -> No
 
     assert transcript_material_dir(media_root, "sid-a").is_dir()
     assert _workspace_attachment_dir(workspace, "sid-a").is_dir()
+    assert list((media_root / "artifacts").rglob("meta.json"))
 
     await storage.delete_session("agent:main:webchat:a")
 
     assert not transcript_material_dir(media_root, "sid-a").exists()
     assert not _workspace_attachment_dir(workspace, "sid-a").exists()
+    assert not list((media_root / "artifacts").rglob("meta.json"))
     # Shared authored file at the workspace root is untouched.
     assert (workspace / "authored.txt").read_text() == "keep me"
     await storage.close()
@@ -100,6 +111,9 @@ async def test_delete_session_leaves_other_sessions_material(tmp_path: Path) -> 
     # Sibling session B's material must survive.
     assert transcript_material_dir(media_root, "sid-b").is_dir()
     assert _workspace_attachment_dir(workspace, "sid-b").is_dir()
+    remaining_artifact_meta = list((media_root / "artifacts").rglob("meta.json"))
+    assert len(remaining_artifact_meta) == 1
+    assert '"session_id": "sid-b"' in remaining_artifact_meta[0].read_text()
     await storage.close()
 
 

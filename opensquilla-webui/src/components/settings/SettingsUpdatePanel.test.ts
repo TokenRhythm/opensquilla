@@ -10,6 +10,7 @@ function setDesktopApi(api: unknown): void {
 function desktopUpdateApi(state: Record<string, unknown>, overrides: Record<string, unknown> = {}) {
   return {
     isAutoUpdateEnabled: async () => true,
+    isDesktopUpdateManaged: async () => true,
     getUpdateState: async () => ({
       status: 'available',
       currentVersion: '1.0.0',
@@ -17,9 +18,14 @@ function desktopUpdateApi(state: Record<string, unknown>, overrides: Record<stri
       progress: null,
       checkedAt: null,
       error: null,
+      errorCode: null,
       snoozedUntil: null,
+      canCheck: true,
       canNativeInstall: true,
+      installMode: 'native',
       releaseUrl: null,
+      source: null,
+      fallbackUsed: false,
       ...state,
     }),
     checkForUpdates: vi.fn(async () => ({ ok: true })),
@@ -76,6 +82,54 @@ describe('SettingsUpdatePanel', () => {
     await settle()
 
     expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
+
+  it('shows the manual Windows installer action and selected fallback source', async () => {
+    const api = desktopUpdateApi({
+      status: 'available',
+      canNativeInstall: false,
+      installMode: 'manual',
+      source: 'github',
+      fallbackUsed: true,
+    }, {
+      isAutoUpdateEnabled: async () => false,
+    })
+    const { app, el } = await mountPanel(api)
+
+    expect(el.textContent).toContain('Manual install')
+    expect(el.textContent).toContain('GitHub Releases')
+    expect(el.textContent).toContain('Switched to backup source')
+    const download = el.querySelector('[data-testid="settings-update-download"]') as HTMLButtonElement
+    expect(download.textContent).toContain('Download installer')
+    download.click()
+    await settle()
+
+    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    expect(el.querySelector('[data-testid="settings-update-relaunch"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('shows the verified Windows installer again without a relaunch action', async () => {
+    const api = desktopUpdateApi({
+      status: 'downloaded',
+      canNativeInstall: false,
+      installMode: 'manual',
+      source: 'oss',
+    }, {
+      isAutoUpdateEnabled: async () => false,
+    })
+    const { app, el } = await mountPanel(api)
+
+    expect(el.textContent).toContain('Verified')
+    expect(el.textContent).toContain('verified against the canonical GitHub checksum')
+    const show = el.querySelector('[data-testid="settings-update-download"]') as HTMLButtonElement
+    expect(show.textContent).toContain('Show installer')
+    show.click()
+    await settle()
+
+    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    expect(el.querySelector('[data-testid="settings-update-relaunch"]')).toBeNull()
     app.unmount()
   })
 })

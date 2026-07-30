@@ -37,6 +37,7 @@ from starlette.routing import Route
 from opensquilla.channels._util import ChannelAccessPolicy, EventDedupeCache
 from opensquilla.channels.contract import (
     ChannelCapabilityProfile,
+    ChannelLengthUnit,
     ChannelPlatformCapability,
     ChannelPlatformCapabilityStatus,
     ChannelPlatformCategories,
@@ -130,6 +131,9 @@ class MSTeamsChannel:
     def capability_profile(self) -> ChannelCapabilityProfile:
         return ChannelCapabilityProfile(
             channel_type="msteams",
+            max_message_len=20000,
+            length_unit=ChannelLengthUnit.CODE_POINTS,
+            splits_natively=False,
             group_chat=True,
             mentions=True,
             reply=True,
@@ -436,6 +440,26 @@ class MSTeamsChannel:
             return next(reversed(self._references.values()))
         return None
 
+    def build_reply_message(
+        self,
+        content: str,
+        inbound: IncomingMessage,
+    ) -> OutgoingMessage:
+        """Pin a batch reply to the triggering Teams conversation."""
+        return OutgoingMessage(content=content, reply_to=inbound.channel_id)
+
+    def streaming_reply_kwargs(self, inbound: IncomingMessage) -> dict[str, Any]:
+        """Pin streaming updates and terminal replacement to one conversation."""
+        return {"reply_to": inbound.channel_id}
+
+    def _operation_reference(self, reply_to: str | None) -> Any | None:
+        key = (reply_to or "").strip()
+        if key:
+            return self._references.get(key)
+        # Preserve the legacy direct edit/delete fallback for callers that do
+        # not have route context. Dispatcher-owned replacements always pass it.
+        return next(iter(self._references.values()), None)
+
     async def send(self, message: OutgoingMessage) -> None:
         if self._adapter is None:
             raise RuntimeError("MSTeamsChannel.send requires start() first")
@@ -456,15 +480,20 @@ class MSTeamsChannel:
             conversation_id=getattr(getattr(ref, "conversation", None), "id", ""),
         )
 
-    async def edit(self, message_id: str, content: str) -> None:
+    async def edit(
+        self,
+        message_id: str,
+        content: str,
+        *,
+        reply_to: str | None = None,
+    ) -> None:
         if self._adapter is None:
             raise RuntimeError("MSTeamsChannel.edit requires start() first")
-        # Resolve a reference: prefer one whose activity_id matches — fall
-        # back to the most-recent ref since Teams edits are scoped per
-        # conversation, not per channel.
-        ref = next(iter(self._references.values()), None)
+        ref = self._operation_reference(reply_to)
         if ref is None:
-            raise RuntimeError("MSTeamsChannel.edit has no conversation reference cached")
+            raise RuntimeError(
+                "MSTeamsChannel.edit has no matching conversation reference cached"
+            )
 
         from botbuilder.schema import Activity  # noqa: PLC0415
 
@@ -474,12 +503,19 @@ class MSTeamsChannel:
 
         await self._adapter.continue_conversation(ref, _callback, bot_id=self._bot_id)
 
-    async def delete(self, message_id: str) -> None:
+    async def delete(
+        self,
+        message_id: str,
+        *,
+        reply_to: str | None = None,
+    ) -> None:
         if self._adapter is None:
             raise RuntimeError("MSTeamsChannel.delete requires start() first")
-        ref = next(iter(self._references.values()), None)
+        ref = self._operation_reference(reply_to)
         if ref is None:
-            raise RuntimeError("MSTeamsChannel.delete has no conversation reference cached")
+            raise RuntimeError(
+                "MSTeamsChannel.delete has no matching conversation reference cached"
+            )
 
         async def _callback(turn_context: Any) -> None:
             await turn_context.delete_activity(message_id)

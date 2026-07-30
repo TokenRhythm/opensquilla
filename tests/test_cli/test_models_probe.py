@@ -174,6 +174,92 @@ def test_probe_json_shape(tmp_path: Path, monkeypatch) -> None:
     assert row["latency_ms"] == 123
 
 
+def test_probe_draft_reads_unsaved_credential_from_stdin(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "opensquilla.cli.models_cmd.probe_llm_provider",
+        _fake_probe(
+            {
+                "tokenrhythm": ProviderProbeResult(
+                    ok=True,
+                    provider_id="tokenrhythm",
+                    model="deepseek-v4-pro",
+                    latency_ms=87,
+                )
+            },
+            calls,
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        ["models", "probe-draft"],
+        input=json.dumps(
+            {
+                "providerId": "tokenrhythm",
+                "model": "deepseek-v4-pro",
+                "apiKey": SENTINEL_SECRET,
+                "baseUrl": "https://tokenrhythm.studio/v1",
+            }
+        ),
+    )
+
+    assert result.exit_code == 0, result.output
+    row = json.loads(result.stdout)
+    assert row["ok"] is True
+    assert row["source"] == "draft"
+    assert row["latency_ms"] == 87
+    assert calls == [
+        {
+            "provider_id": "tokenrhythm",
+            "model": "deepseek-v4-pro",
+            "api_key": SENTINEL_SECRET,
+            "api_key_env": "",
+            "base_url": "https://tokenrhythm.studio/v1",
+            "proxy": "",
+            "timeout": 30.0,
+        }
+    ]
+
+
+def test_probe_draft_redacts_failed_provider_detail(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "opensquilla.cli.models_cmd.probe_llm_provider",
+        _fake_probe(
+            {
+                "openai": ProviderProbeResult(
+                    ok=False,
+                    provider_id="openai",
+                    model="gpt-test-dummy",
+                    failure_kind="auth_invalid",
+                    message=f"Rejected Bearer {SENTINEL_SECRET}",
+                    code="401",
+                )
+            },
+            [],
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        ["models", "probe-draft"],
+        input=json.dumps(
+            {
+                "providerId": "openai",
+                "model": "gpt-test-dummy",
+                "apiKey": SENTINEL_SECRET,
+            }
+        ),
+    )
+
+    assert result.exit_code == 1
+    assert SENTINEL_SECRET not in result.stdout
+    row = json.loads(result.stdout)
+    assert row["ok"] is False
+    assert row["kind"] == "auth_invalid"
+    assert "***" in row["detail"]
+
+
 def test_probe_unknown_provider_filter_exits_two(tmp_path: Path) -> None:
     config = _primary_openai_config(tmp_path)
 

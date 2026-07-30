@@ -5,9 +5,9 @@ import { isRestorableRoute, saveLastRoute, readLastRoute, LAST_ROUTE_KEY } from 
 beforeEach(() => localStorage.clear())
 
 describe('isRestorableRoute', () => {
-  it('accepts the known top-level views (incl. the Monitor-hub tab routes)', () => {
+  it('accepts the known top-level views, including both route hubs', () => {
     for (const p of [
-      '/chat', '/sessions', '/agents', '/channels',
+      '/chat', '/sessions', '/channels',
       '/cron', '/skills', '/overview', '/usage', '/logs',
     ]) {
       expect(isRestorableRoute(p)).toBe(true)
@@ -16,7 +16,7 @@ describe('isRestorableRoute', () => {
 
   it('rejects root, the chat draft, the settings overlay, and unknown/removed paths', () => {
     for (const p of [
-      '/', '/chat/new', '/settings', '/settings/router', '/settings/auto',
+      '/', '/chat/new', '/agents', '/settings', '/settings/router', '/settings/auto',
       // /approvals now redirects to /sessions — restoring it would loop the
       // saved value through a redirect on every launch, so it is not saved.
       '/approvals',
@@ -53,6 +53,11 @@ describe('saveLastRoute / readLastRoute', () => {
 
   it('re-validates on read: a stale/removed saved value yields null (falls back to default)', () => {
     localStorage.setItem(LAST_ROUTE_KEY, '/removed-view')
+    expect(readLastRoute()).toBeNull()
+  })
+
+  it('drops an Agent page saved by an older build so cold start uses the default', () => {
+    localStorage.setItem(LAST_ROUTE_KEY, '/agents')
     expect(readLastRoute()).toBeNull()
   })
 })

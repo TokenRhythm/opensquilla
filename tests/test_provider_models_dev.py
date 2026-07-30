@@ -51,6 +51,14 @@ def test_case_insensitive_lookup() -> None:
     assert lookup_model("minimax", "MiniMax-M2.5") is not None
 
 
+def test_mainland_bailian_reuses_coding_plan_snapshot_until_refresh() -> None:
+    international = lookup_model("bailian_coding", "qwen3.7-plus")
+    mainland = lookup_model("bailian_coding_cn", "qwen3.7-plus")
+
+    assert international is not None
+    assert mainland == international
+
+
 def test_unknown_model_returns_none() -> None:
     assert lookup_model("openai", "no-such-model-xyz") is None
     assert lookup_limits("openai", "no-such-model-xyz") is None

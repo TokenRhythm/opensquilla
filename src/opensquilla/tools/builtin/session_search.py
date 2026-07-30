@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from opensquilla.tools.registry import ToolRegistry, tool
-from opensquilla.tools.types import ToolError
+from opensquilla.tools.types import PlanAccess, ToolError
 
 if TYPE_CHECKING:
     from opensquilla.session.storage import SessionStorage
@@ -58,6 +58,7 @@ def create_session_search_tool(
         },
         required=["query"],
         owner_only=True,
+        plan_access=PlanAccess.READ_ONLY,
         registry=registry,
     )
     async def session_search(

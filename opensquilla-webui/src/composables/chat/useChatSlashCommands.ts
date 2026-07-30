@@ -1,9 +1,21 @@
-import { ref, type Ref } from 'vue'
+import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
+import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 
 type RpcClient = {
-  waitForConnection: () => Promise<void>
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  waitForConnection: (
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    actions?: RpcConnectionWaitOptions,
+  ) => Promise<void>
+  call: <T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ) => Promise<T>
 }
 
 export interface ArgumentChoice {
@@ -50,6 +62,7 @@ interface UsageStatusResult {
 
 export interface UseChatSlashCommandsOptions {
   rpc: RpcClient
+  catalogCallOptions?: RpcCallOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
   autoResizeTextarea: () => void
@@ -62,12 +75,25 @@ export interface UseChatSlashCommandsOptions {
   // Send a turn whose provider text bypasses slash parsing (mirrors the TUI
   // override path). Used by /meta <name> to trigger the launch after meta.run.
   dispatchHidden: (providerText: string, displayText: string) => void
+  // Send the optional text after "/plan" through the normal composer path so
+  // attachments, intent, optimistic rendering, and retry restoration are kept.
+  dispatchPlanPrompt: (prompt: string, composerText: string) => void
+  activatePlanMode?: () => boolean | Promise<boolean>
+  planModeAvailable?: () => boolean
+  codingModeEnabled: Ref<boolean>
+  setCodingModeEnabled: (enabled: boolean) => Promise<boolean>
 }
 
 function slashCommandKey(value: string): string {
   const raw = String(value || '').trim().split(/\s+/, 1)[0].toLowerCase()
   if (!raw) return ''
   return raw.startsWith('/') ? raw : '/' + raw
+}
+
+function slashCommandKeys(command: Pick<ChatSlashCommand, 'aliases' | 'cmd' | 'name'>): string[] {
+  return [command.name, command.cmd, ...command.aliases]
+    .map(slashCommandKey)
+    .filter(Boolean)
 }
 
 function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
@@ -94,11 +120,23 @@ function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): Cha
     name: full,
     cmd: full,
     label: full,
-    desc: choice.description,
+    desc: localizedMetaDescription(choice),
     aliases: [],
     execution: parent.execution,
     argValue: choice.value,
   }
+}
+
+function localizedMetaDescription(choice: ArgumentChoice): string {
+  const keys: Record<string, string> = {
+    AwesomeWebpageMetaSkill: 'chat.metaDescriptions.webpage',
+    'meta-kid-project-planner': 'chat.metaDescriptions.kidsProject',
+    'meta-short-drama': 'chat.metaDescriptions.shortDrama',
+    'meta-skill-creator': 'chat.metaDescriptions.skillCreator',
+    'meta-paper-write': 'chat.metaDescriptions.paperWriting',
+  }
+  const key = keys[choice.value]
+  return key ? i18n.global.t(key) : choice.description
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
@@ -107,13 +145,52 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   const slashCmds = ref<ChatSlashCommand[]>([])
   const filteredSlashCmds = ref<ChatSlashCommand[]>([])
   const slashCatalogLoaded = ref(false)
+  const metaSkillChoices = computed(() => {
+    const command = slashCmds.value.find(c => slashCommandKey(c.name) === '/meta')
+    const choices = command?.argumentChoices || []
+    const preferred = [
+      'AwesomeWebpageMetaSkill',
+      'meta-short-drama',
+      'meta-paper-write',
+    ]
+    return preferred
+      .map(name => choices.find(choice => choice.value === name))
+      .filter((choice): choice is ArgumentChoice => Boolean(choice))
+  })
 
   async function loadSlashCommands() {
     try {
-      await options.rpc.waitForConnection()
-      const res = await options.rpc.call<{ commands?: ChatSlashCommand[] }>('commands.list_for_surface', { surface: 'web_chat' })
+      await waitForSessionRpcConnection(options.rpc, options.catalogCallOptions)
+      const params = { surface: 'web_chat' }
+      const res = options.catalogCallOptions
+        ? await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
+            'commands.list_for_surface',
+            params,
+            options.catalogCallOptions,
+          )
+        : await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
+            'commands.list_for_surface',
+            params,
+          )
       slashCmds.value = (Array.isArray(res?.commands) ? res.commands : []).map(normalizeSlashCommand)
+      if (
+        options.activatePlanMode
+        && (options.planModeAvailable?.() ?? true)
+        && !slashCmds.value.some(command => slashCommandKeys(command).includes('/plan'))
+      ) {
+        slashCmds.value.push({
+          name: '/plan',
+          cmd: '/plan',
+          label: '/plan',
+          desc: i18n.global.t('chat.planMode.commandDescription'),
+          aliases: [],
+          execution: { action: 'plans.setMode' },
+        })
+      }
       slashCatalogLoaded.value = true
+      if (options.inputText.value.startsWith('/') && !options.inputText.value.startsWith('//')) {
+        handleSlashInput()
+      }
     } catch {
       slashCmds.value = []
       slashCatalogLoaded.value = false
@@ -140,7 +217,14 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     if (firstSpace === -1) {
       // Command-name completion: "/me" -> matching commands.
       const query = val.slice(1).toLowerCase()
-      openWith(slashCmds.value.filter(c => c.cmd.slice(1).startsWith(query)))
+      const matches = slashCmds.value.filter(command =>
+        slashCommandKeys(command).some(key => key.slice(1).startsWith(query)),
+      )
+      const exactKey = slashCommandKey(val)
+      const exactMatches = matches.filter(command =>
+        slashCommandKeys(command).includes(exactKey),
+      )
+      openWith(exactMatches.length > 0 ? exactMatches : matches)
       return
     }
     // Argument completion: "/meta <partial>" -> the command's argument choices.
@@ -165,6 +249,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   function selectSlashCmd(cmd: ChatSlashCommand, args = '') {
+    const action = cmd?.execution?.action || cmd.cmd || cmd.name
     // Argument candidate ("/meta <skill>"): Tab-completes into the composer;
     // the user presses Enter to run it.
     if (cmd.argValue) {
@@ -175,7 +260,12 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
     // A command that takes arguments, selected with none yet: complete to
     // "/cmd " and reopen the menu showing its argument candidates.
-    if (!args && (cmd.argumentChoices?.length ?? 0) > 0) {
+    if (
+      action !== 'coding.mode'
+      && action !== '/coding'
+      && !args
+      && (cmd.argumentChoices?.length ?? 0) > 0
+    ) {
       closeSlashMenu()
       options.inputText.value = cmd.cmd + ' '
       options.autoResizeTextarea()
@@ -183,11 +273,56 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       return
     }
 
+    if (
+      action === 'plans.toggleMode'
+      || action === 'plans.setMode'
+      || action === '/plan'
+    ) {
+      closeSlashMenu()
+      const originalInput = options.inputText.value
+      const planPrompt = String(args || '').trim()
+      void Promise.resolve(options.activatePlanMode?.() ?? false).then((accepted) => {
+        if (!accepted || options.inputText.value !== originalInput) return
+        if (planPrompt) {
+          options.dispatchPlanPrompt(planPrompt, originalInput)
+          return
+        }
+        options.inputText.value = ''
+        options.autoResizeTextarea()
+      })
+      return
+    }
+    if (action === 'coding.mode' || action === '/coding') {
+      closeSlashMenu()
+      const mode = String(args || 'on').trim().toLowerCase()
+      options.inputText.value = ''
+      options.autoResizeTextarea()
+      if (mode === 'status') {
+        options.notify(i18n.global.t(
+          options.codingModeEnabled.value
+            ? 'chat.codingMode.enabled'
+            : 'chat.codingMode.disabled',
+        ))
+        return
+      }
+      if (mode !== 'on' && mode !== 'off') {
+        options.notify(i18n.global.t('chat.codingMode.usage'))
+        return
+      }
+      void options.setCodingModeEnabled(mode === 'on').then((updated) => {
+        options.notify(i18n.global.t(
+          updated
+            ? (mode === 'on' ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
+            : 'chat.codingMode.updateFailed',
+        ))
+      })
+      return
+    }
+
     closeSlashMenu()
     options.inputText.value = ''
     options.autoResizeTextarea()
 
-    const action = cmd?.execution?.action || cmd.cmd || cmd.name
     switch (action) {
       case 'new_chat':
       case '/new':
@@ -236,26 +371,39 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         // run path, with a skill name supplied (e.g. Enter on "/meta <skill>").
         const skillName = String(args || '').trim()
         if (!skillName) break
-        // Stamp the launch, then trigger a turn so the pipeline seeds the
-        // marker and the orchestrator runs the skill.
-        options.rpc.call<{ ok?: boolean; error?: string }>('meta.run', { name: skillName, sessionKey: options.sessionKey.value })
-          .then((result) => {
-            if (result?.ok) {
-              options.dispatchHidden('/meta ' + skillName, '/meta ' + skillName)
-            } else {
-              options.notify(result?.error || i18n.global.t('chat.metaRuns.couldNotRunSkill', { skill: skillName }))
-            }
-          })
-          .catch((err: unknown) => options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', { error: err instanceof Error ? err.message : String(err) })))
+        void runMetaSkill(skillName)
         break
       }
+    }
+  }
+
+  async function runMetaSkill(skillName: string): Promise<void> {
+    const name = String(skillName || '').trim()
+    if (!name) return
+    try {
+      const result = await options.rpc.call<{ ok?: boolean; error?: string }>('meta.run', {
+        name,
+        sessionKey: options.sessionKey.value,
+      })
+      if (result?.ok) {
+        options.dispatchHidden('/meta ' + name, '/meta ' + name)
+      } else {
+        options.notify(result?.error || i18n.global.t('chat.metaRuns.couldNotRunSkill', { skill: name }))
+      }
+    } catch (err: unknown) {
+      options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
+        error: err instanceof Error ? err.message : String(err),
+      }))
     }
   }
 
   async function executeSlashCommand(text: string): Promise<boolean> {
     if (!slashCatalogLoaded.value) await loadSlashCommands()
     const [cmdText, ...rest] = text.trim().split(/\s+/)
-    const cmd = slashCmds.value.find(c => slashCommandKey(c.name) === slashCommandKey(cmdText))
+    const commandKey = slashCommandKey(cmdText)
+    const cmd = slashCmds.value.find(command =>
+      slashCommandKeys(command).includes(commandKey),
+    )
     if (!cmd) {
       closeSlashMenu()
       console.warn('Unsupported command:', cmdText)
@@ -268,11 +416,13 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   return {
     slashOpen,
     slashIdx,
+    metaSkillChoices,
     filteredSlashCmds,
     loadSlashCommands,
     handleSlashInput,
     closeSlashMenu,
     selectSlashCmd,
     executeSlashCommand,
+    runMetaSkill,
   }
 }

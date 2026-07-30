@@ -29,6 +29,7 @@ _PLACEHOLDER_VALUES = {
 
 _COMMAND_HELP_PATHS = (
     ("channels", "enable"),
+    ("channels", "pairings", "list"),
     ("channels", "restart"),
     ("channels", "status"),
     ("config", "set"),
@@ -293,6 +294,21 @@ def _sample_findings() -> list[HealthFinding]:
                         "configured": True,
                         "status": "dead",
                         "connected": False,
+                    }
+                ]
+            }
+        ),
+        evaluate_channels(
+            {
+                "channels": [
+                    {
+                        "name": "tele gram",
+                        "type": "telegram",
+                        "enabled": True,
+                        "configured": True,
+                        "status": "connected",
+                        "connected": True,
+                        "pendingPairings": 2,
                     }
                 ]
             }

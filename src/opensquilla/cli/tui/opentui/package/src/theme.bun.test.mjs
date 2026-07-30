@@ -39,9 +39,9 @@ afterEach(() => {
 
 // The render tokens every block/composer consumer relies on.
 const REQUIRED_TOKENS = [
-  "brandAccent", "brandAccentSoft", "text", "muted", "detailText",
+  "brandAccent", "brandShadow", "brandAccentSoft", "text", "muted", "detailText",
   "appBg", "overlayBg", "footerBg", "composerBorder", "composerDisabledBorder",
-  "answerFrame", "thinkingAccent", "routeText", "promptAccent",
+  "answerFrame", "thinkingAccent", "routeText", "promptAccent", "promptSurface", "promptText",
   "success", "warning", "error", "metricPositive",
 ];
 const HEX = /^#[0-9a-fA-F]{6}$/;
@@ -79,12 +79,21 @@ test("theme resolution is forgiving and defaults safely", () => {
 test("applyTheme mutates the live THEME and tracks the active name", () => {
   applyTheme("opensquilla-dark");
   expect(THEME.appBg).toBe("#121212");
+  expect(THEME.brandShadow).toBe("#6A300C");
   expect(activeThemeName()).toBe("opensquilla-dark");
   applyTheme("midnight");
   expect(THEME.appBg).toBe("#0B1021");
   expect(THEME.brandAccent).toBe("#EC6A1A");
   expect(activeThemeName()).toBe("midnight");
   applyTheme(DEFAULT_THEME);
+});
+
+test("every truecolor theme keeps the wordmark fill and shadow distinct", () => {
+  setColorMode("truecolor");
+  for (const name of THEME_NAMES) {
+    applyTheme(name);
+    expect(THEME.brandShadow, `${name}.brandShadow`).not.toBe(THEME.brandAccent);
+  }
 });
 
 test("a non-default theme paints its own footer background when rendered", async () => {

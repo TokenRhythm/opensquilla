@@ -90,6 +90,15 @@ def test_rpc_skill_install_uses_loader_managed_dir_and_list_sees_skill(
         monkeypatch.setattr(rpc_skills, "build_default_skill_installer", fake_builder)
         assert await rpc_skills._handle_skills_list(None, ctx) == {"skills": []}
         assert loader._cached is not None
+        rebuilds = 0
+        original_build = loader._build_catalog
+
+        def counted_build(*args, **kwargs):
+            nonlocal rebuilds
+            rebuilds += 1
+            return original_build(*args, **kwargs)
+
+        monkeypatch.setattr(loader, "_build_catalog", counted_build)
 
         installed = await rpc_skills._handle_skills_install(
             {"identifier": "plotter", "source": "clawhub"},
@@ -103,6 +112,7 @@ def test_rpc_skill_install_uses_loader_managed_dir_and_list_sees_skill(
         row = next(skill for skill in listed["skills"] if skill["name"] == "plotter")
         assert row["layer"] == "managed"
         assert row["description"] == "Installed from chat"
+        assert rebuilds == 1
 
     asyncio.run(run())
 
@@ -238,6 +248,11 @@ metadata:
     loader = SkillLoader(bundled_dir=tmp_path, snapshot_path=tmp_path / "snapshot.json")
     ctx = RpcContext(conn_id="test", skill_loader=loader)
 
+    from opensquilla.engine.steps import skills_filter
+
+    skills_filter._elig_ctx.has_bin_cache["helper"] = False
+    skills_filter._elig_ctx.env_cache["HELPER_TOKEN"] = None
+
     async def fake_install_deps(_specs: list[object]) -> list[DepResult]:
         return [DepResult(kind="uv", identifier="helper", success=True, message="Installed")]
 
@@ -250,6 +265,9 @@ metadata:
 
     assert result["success"] is True
     assert result["missing_still"]["env_any"] == [["OPENROUTER_API_KEY", "ARK_API_KEY"]]
+    assert loader._dirty is False
+    assert skills_filter._elig_ctx.has_bin_cache == {}
+    assert skills_filter._elig_ctx.env_cache == {}
 
 
 def test_skill_payload_rolls_up_meta_subskill_requirements() -> None:

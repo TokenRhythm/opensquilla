@@ -12,6 +12,8 @@ from opensquilla.gateway.routing import (
     build_web_route_envelope,
     tool_context_from_envelope,
 )
+from opensquilla.sandbox.run_context import RunContext
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.scheduler.handlers import _build_cron_tool_context
 from opensquilla.scheduler.types import CronJob, SessionTarget
 from opensquilla.tools.policy import ToolSurfaceCapabilities, resolve_runtime_tool_surface
@@ -108,7 +110,8 @@ def test_default_elevated_mode_only_keeps_full_for_owner_tool_context() -> None:
         default_elevated="full",
     )
 
-    assert bypass_ctx.elevated is None
+    assert bypass_ctx.elevated == "full"
+    assert bypass_ctx.run_mode == "full"
     assert owner_ctx.elevated == "full"
     assert owner_ctx.run_mode == "full"
     assert non_owner_ctx.elevated is None
@@ -137,7 +140,8 @@ def test_cron_default_elevated_resolves_at_context_build_time() -> None:
 
     assert first_ctx.elevated == "full"
     assert first_ctx.run_mode == "full"
-    assert second_ctx.elevated is None
+    assert second_ctx.elevated == "full"
+    assert second_ctx.run_mode == "full"
 
 
 def test_route_run_mode_metadata_reaches_tool_context() -> None:
@@ -164,6 +168,33 @@ def test_non_owner_full_run_mode_metadata_coerces_to_trusted() -> None:
     assert ctx.elevated is None
 
 
+def test_owner_subagent_route_preserves_full_host_run_context() -> None:
+    run_context = RunContext(
+        run_mode=RunMode.FULL,
+        workspace="/tmp/opensquilla-workspace",
+    )
+
+    envelope = build_subagent_route_envelope(
+        session_key="agent:main:subagent:child",
+        parent_session_key="agent:main:webchat:parent",
+        run_mode="full",
+        sandbox_run_context=run_context,
+        principal_is_owner=True,
+    )
+    ctx = tool_context_from_envelope(envelope, is_owner=True)
+
+    assert envelope.metadata["principal_is_owner"] is True
+    assert envelope.metadata["run_mode"] == "full"
+    assert envelope.metadata["elevated"] == "full"
+    assert envelope.metadata["sandbox_run_context"]["run_mode"] == "full"
+    assert envelope.sandbox_run_context_fresh is True
+    assert ctx.caller_kind is CallerKind.SUBAGENT
+    assert ctx.run_mode == "full"
+    assert ctx.elevated == "full"
+    assert ctx.sandbox_run_context is not None
+    assert ctx.sandbox_run_context.run_mode is RunMode.FULL
+
+
 def test_owner_cron_route_carries_owner_principal_for_task_runtime() -> None:
     cron_job = SimpleNamespace(id="job-owner", name="owner", creator_is_owner=True)
 
@@ -174,7 +205,14 @@ def test_owner_cron_route_carries_owner_principal_for_task_runtime() -> None:
 
 
 def test_owner_cron_route_uses_owner_grade_tool_boundary() -> None:
-    cron_job = SimpleNamespace(id="job-owner", name="owner", creator_is_owner=True)
+    cron_job = SimpleNamespace(
+        id="job-owner",
+        name="owner",
+        creator_is_owner=True,
+        run_mode="full",
+        elevated="full",
+        execution_target="host",
+    )
     envelope = build_cron_route_envelope(cron_job, session_key="cron:job-owner")
 
     ctx = tool_context_from_envelope(
@@ -187,6 +225,10 @@ def test_owner_cron_route_uses_owner_grade_tool_boundary() -> None:
     assert ctx.allowed_tools is None
     assert "exec_command" not in ctx.denied_tools
     assert "write_file" not in ctx.denied_tools
+    assert envelope.metadata["run_mode"] == "full"
+    assert envelope.metadata["execution_target"] == "host"
+    assert ctx.run_mode == "full"
+    assert ctx.elevated == "full"
 
 
 def test_non_owner_cron_route_keeps_restricted_tool_boundary() -> None:

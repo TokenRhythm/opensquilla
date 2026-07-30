@@ -30,6 +30,7 @@ import sys
 from pathlib import Path
 from typing import IO, Any, cast
 
+from opensquilla.recovery.atomic import _native_io_path
 from opensquilla.recovery.locking import (
     GatewayLegacyLease,
     acquire_gateway_legacy_lease,
@@ -70,7 +71,7 @@ class GatewayPidLock:
         3. Write pid + start_ts (ISO 8601) to gateway.pid, fsync.
         4. Register atexit + SIGTERM/SIGINT cleanup.
         """
-        self._state_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(_native_io_path(self._state_dir), exist_ok=True)
 
         # ── Step 1: exclusive OS lock on the lock file ────────────────
         lock_lease = acquire_gateway_legacy_lease(self._state_dir)
@@ -91,14 +92,18 @@ class GatewayPidLock:
 
         # ── Step 2: clear stale pid file now that this process owns the lock ─
         self._lock_lease = lock_lease
-        existing_pid = _read_pid_from_path(self._pid_path) if self._pid_path.exists() else None
+        existing_pid = (
+            _read_pid_from_path(self._pid_path)
+            if os.path.exists(_native_io_path(self._pid_path))
+            else None
+        )
         if existing_pid is not None:
             log.warning(
                 "gateway.pidlock.stale_overwritten",
                 extra={"stale_pid": existing_pid, "state_dir": str(self._state_dir)},
             )
         try:
-            self._pid_path.unlink(missing_ok=True)
+            os.unlink(_native_io_path(self._pid_path))
         except OSError:
             pass
 
@@ -121,7 +126,7 @@ class GatewayPidLock:
         self._lock_lease = None
         release_gateway_legacy_lease(lease)
         try:
-            self._pid_path.unlink(missing_ok=True)
+            os.unlink(_native_io_path(self._pid_path))
         except OSError:
             pass
 
@@ -146,7 +151,7 @@ class GatewayPidLock:
         }
         payload = json.dumps(self._written).encode()
         # Write to the pid file (not the lock file) so readers can open it freely.
-        with open(str(self._pid_path), "wb") as f:
+        with open(_native_io_path(self._pid_path), "wb") as f:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
@@ -215,7 +220,8 @@ def _unlock(fh: IO[bytes]) -> None:
 
 def _read_pid_from_path(path: Path) -> int | None:
     try:
-        info = json.loads(path.read_bytes())
+        with open(_native_io_path(path), "rb") as handle:
+            info = json.load(handle)
         return int(info["pid"])
     except Exception:  # noqa: BLE001
         return None

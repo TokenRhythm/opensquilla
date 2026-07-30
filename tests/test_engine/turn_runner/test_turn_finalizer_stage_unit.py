@@ -20,6 +20,7 @@ import pytest
 
 from opensquilla.engine.turn_runner.turn_finalizer_stage import (
     CostRollupResult,
+    TranscriptAppendResult,
     TurnFinalizerStage,
     TurnFinalizerStageInput,
 )
@@ -32,7 +33,12 @@ from opensquilla.engine.types import DoneEvent, ErrorEvent
 
 @dataclass
 class _RecordingTranscriptAppend:
-    return_value: bool = True
+    return_value: TranscriptAppendResult | bool = field(
+        default_factory=lambda: TranscriptAppendResult(
+            appended=True,
+            message_id="assistant-message-1",
+        )
+    )
     raises: type[BaseException] | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -46,7 +52,7 @@ class _RecordingTranscriptAppend:
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
-    ) -> bool:
+    ) -> TranscriptAppendResult | bool:
         self.calls.append(
             {
                 "session_key": session_key,
@@ -227,6 +233,8 @@ async def test_simple_text_no_done_event_appends_and_captures() -> None:
     out = outcome.output
     assert out.final_text == "hi"
     assert out.transcript_appended is True
+    assert out.assistant_message_id == "assistant-message-1"
+    assert out.assistant_message_content == "hi"
     assert out.memory_captured is True
     assert out.cost_rollup is None
     assert len(recs["transcript_append"].calls) == 1
@@ -238,6 +246,93 @@ async def test_simple_text_no_done_event_appends_and_captures() -> None:
     assert len(recs["turn_memory_capture"].calls) == 1
     assert recs["turn_error_persist"].calls == []
     assert recs["session_totals"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_tool_boundary_text_is_persisted_as_readable_paragraphs() -> None:
+    stage, recs = _make_stage()
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=["Starting check.", "Check complete.", "Final answer."],
+            turn_segments=[
+                {"type": "text", "text": "Starting check."},
+                {"type": "tool_use", "name": "exec_command", "tool_use_id": "call-1"},
+                {
+                    "type": "tool_result",
+                    "name": "exec_command",
+                    "tool_use_id": "call-1",
+                    "result": "ok",
+                },
+                {"type": "text", "text": "Check complete."},
+                {"type": "tool_use", "name": "read_file", "tool_use_id": "call-2"},
+                {
+                    "type": "tool_result",
+                    "name": "read_file",
+                    "tool_use_id": "call-2",
+                    "result": "ok",
+                },
+                {"type": "text", "text": "Final answer."},
+            ],
+        )
+    )
+
+    expected = "Starting check.\n\nCheck complete.\n\nFinal answer."
+    assert outcome.output.final_text == expected
+    assert outcome.output.assistant_message_content == expected
+    assert recs["transcript_append"].calls[0]["content"] == expected
+
+
+@pytest.mark.asyncio
+async def test_model_call_segments_rebase_over_persistence_paragraphs() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(
+        text="前😀后续",
+        text_snapshot="前😀后续",
+        model_call_segments=[
+            {
+                "model_call_id": "2.0",
+                "iteration": 2,
+                "start_codepoint": 2,
+                "end_codepoint": 4,
+            }
+        ],
+    )
+
+    await stage.run(
+        _make_input(
+            final_text_parts=["前😀", "后续"],
+            turn_segments=[
+                {"type": "text", "text": "前😀"},
+                {"type": "text", "text": "后续"},
+            ],
+            done_event=done,
+        )
+    )
+
+    transcript_call = recs["transcript_append"].calls[0]
+    assert transcript_call["content"] == "前😀\n\n后续"
+    assert transcript_call["turn_usage"]["model_call_segments"] == [
+        {
+            "model_call_id": "2.0",
+            "iteration": 2,
+            "start_codepoint": 2,
+            "end_codepoint": 6,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_boolean_transcript_port_remains_compatible() -> None:
+    stage, _ = _make_stage(
+        transcript_append=_RecordingTranscriptAppend(return_value=True),
+    )
+
+    outcome = await stage.run(_make_input(final_text_parts=["legacy adapter reply"]))
+
+    assert outcome.output.transcript_appended is True
+    assert outcome.output.assistant_message_id is None
+    assert outcome.output.assistant_message_content == "legacy adapter reply"
+    assert outcome.output.memory_captured is True
 
 
 @pytest.mark.asyncio
@@ -261,12 +356,21 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
     )
     done = DoneEvent(
         text="hi",
+        text_snapshot="hi",
         input_tokens=5,
         output_tokens=3,
         model="synthetic-turn-model-4.5",
         routed_tier="c2",
         routing_applied=False,
         rollout_phase="observe",
+        model_call_segments=[
+            {
+                "model_call_id": "2.0",
+                "iteration": 2,
+                "start_codepoint": 1,
+                "end_codepoint": 2,
+            }
+        ],
     )
     inp = _make_input(final_text_parts=["hi"], done_event=done)
     outcome = await stage.run(inp)
@@ -283,6 +387,45 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
     assert recs["transcript_append"].calls[0]["turn_usage"]["routed_tier"] == "c2"
     assert recs["transcript_append"].calls[0]["turn_usage"]["routing_applied"] is False
     assert recs["transcript_append"].calls[0]["turn_usage"]["rollout_phase"] == "observe"
+    assert recs["transcript_append"].calls[0]["turn_usage"]["model_call_segments"] == [
+        {
+            "model_call_id": "2.0",
+            "iteration": 2,
+            "start_codepoint": 1,
+            "end_codepoint": 2,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_aggregated_usage_keeps_parent_message_token_count() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(
+        text="parent answer",
+        input_tokens=1070,
+        output_tokens=207,
+        message_output_tokens=7,
+        cost_usd=0.57,
+        billed_cost=0.57,
+        cost_source="provider_billed",
+        missing_cost_entries=0,
+        model="fake/parent-model",
+    )
+
+    await stage.run(
+        _make_input(
+            final_text_parts=["parent answer"],
+            done_event=done,
+        )
+    )
+
+    transcript_call = recs["transcript_append"].calls[0]
+    assert transcript_call["token_count"] == 7
+    assert transcript_call["turn_usage"]["input_tokens"] == 1070
+    assert transcript_call["turn_usage"]["output_tokens"] == 207
+    assert transcript_call["turn_usage"]["cost_usd"] == pytest.approx(0.57)
+    assert transcript_call["turn_usage"]["missing_cost_entries"] == 0
+    assert recs["session_totals"].calls[0]["done_event"] is done
 
 
 @pytest.mark.asyncio
@@ -525,6 +668,68 @@ async def test_heartbeat_empty_clears_text_and_segments() -> None:
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_long_think_block_before_ack_is_not_delivered() -> None:
+    """OSQ-505: private reasoning must not bypass heartbeat ACK suppression."""
+
+    stage, recs = _make_stage()
+    private_reasoning = "internal reasoning must stay private. " * 20
+    model_output = f"<think>{private_reasoning}</think>\nHEARTBEAT_OK"
+    segments: list[dict[str, Any]] = [{"type": "text", "text": model_output}]
+    inp = _make_input(
+        final_text_parts=[model_output],
+        turn_segments=segments,
+        run_kind="heartbeat",
+    )
+
+    outcome = await stage.run(inp)
+
+    assert outcome.output.final_text == ""
+    assert outcome.output.turn_segments == []
+    assert recs["transcript_append"].calls == []
+    assert recs["turn_memory_capture"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_think_block_is_removed_from_real_alert() -> None:
+    stage, recs = _make_stage()
+    model_output = "<think>check disk usage</think>\nDisk usage reached 95%."
+    inp = _make_input(
+        final_text_parts=[model_output],
+        turn_segments=[{"type": "text", "text": model_output}],
+        run_kind="heartbeat",
+    )
+
+    outcome = await stage.run(inp)
+
+    assert outcome.output.final_text == "Disk usage reached 95%."
+    assert outcome.output.turn_segments == [
+        {"type": "text", "text": "Disk usage reached 95%."}
+    ]
+    assert recs["transcript_append"].calls[0]["content"] == "Disk usage reached 95%."
+    assert recs["transcript_append"].calls[0]["tool_calls"] == [
+        {"type": "text", "text": "Disk usage reached 95%."}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_heartbeat_think_block_is_unchanged() -> None:
+    stage, recs = _make_stage()
+    model_output = "<think>visible protocol text</think>\nRegular reply."
+    segments = [{"type": "text", "text": model_output}]
+    inp = _make_input(
+        final_text_parts=[model_output],
+        turn_segments=segments,
+        run_kind="default",
+    )
+
+    outcome = await stage.run(inp)
+
+    assert outcome.output.final_text == model_output
+    assert outcome.output.turn_segments == segments
+    assert recs["transcript_append"].calls[0]["content"] == model_output
+
+
+@pytest.mark.asyncio
 async def test_reasoning_content_included_for_deepseek_model() -> None:
     stage, recs = _make_stage()
     done = DoneEvent(
@@ -565,7 +770,9 @@ async def test_reasoning_content_excluded_for_non_deepseek_model() -> None:
 @pytest.mark.asyncio
 async def test_no_session_manager_skips_all_writes() -> None:
     stage, recs = _make_stage(
-        transcript_append=_RecordingTranscriptAppend(return_value=False),
+        transcript_append=_RecordingTranscriptAppend(
+            return_value=TranscriptAppendResult(appended=False)
+        ),
     )
     done = DoneEvent(text="hi", input_tokens=1, output_tokens=1)
     inp = _make_input(
@@ -577,6 +784,8 @@ async def test_no_session_manager_skips_all_writes() -> None:
     outcome = await stage.run(inp)
     out = outcome.output
     assert out.transcript_appended is False
+    assert out.assistant_message_id is None
+    assert out.assistant_message_content is None
     # Memory NOT captured because transcript port returned False (no manager).
     assert out.memory_captured is False
     assert recs["turn_memory_capture"].calls == []

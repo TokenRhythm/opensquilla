@@ -50,6 +50,30 @@ assertPresent(
   'artifact previews must render fetched blob object URLs.',
 )
 
+assertPresent(
+  'src/utils/chat/attachmentAccess.ts',
+  /url\.protocol !== 'http:'[\s\S]+url\.protocol !== 'https:'[\s\S]+url\.origin !== base\.origin/,
+  'attachment downloads must reject non-HTTP(S) and cross-origin staged URLs.',
+)
+
+assertPresent(
+  'src/utils/chat/attachmentAccess.ts',
+  /CREDENTIAL_QUERY_KEYS[\s\S]+url\.searchParams\.delete\(key\)/,
+  'attachment downloads must strip token and session query credentials.',
+)
+
+assertAbsent(
+  'src/components/chat/UserMessage.vue',
+  /:src="(?:attachment\.)?(?:downloadData|download_url|localFile)/,
+  'download-only attachment sources must never be rendered directly into the DOM.',
+)
+
+assertPresent(
+  'src/utils/chat/attachments.ts',
+  /essence !== 'image\/svg\+xml'/,
+  'SVG user attachments must remain download-only active documents.',
+)
+
 // Assistant markdown is sanitized before it reaches the DOM: the renderer must
 // not bypass DOMPurify, and must never let assistant text render arbitrary form
 // controls. The only <input> markdown produces is a disabled task-list checkbox.

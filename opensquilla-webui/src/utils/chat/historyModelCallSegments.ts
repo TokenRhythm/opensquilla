@@ -1,0 +1,204 @@
+import type {
+  ChatMessage,
+  ChatModelCallSegment,
+  ChatUsagePayload,
+} from '@/types/chat'
+
+interface NormalizedModelCallSegment {
+  modelCallId: string
+  iteration: number
+  startCodepoint: number
+  endCodepoint: number
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  const number = Number(value)
+  return Number.isInteger(number) && number >= 0 ? number : undefined
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  const number = nonNegativeInteger(value)
+  return number !== undefined && number > 0 ? number : undefined
+}
+
+function usageSegments(usage: ChatUsagePayload | undefined): ChatModelCallSegment[] {
+  const value = usage?.model_call_segments ?? usage?.modelCallSegments
+  return Array.isArray(value) ? value : []
+}
+
+function normalizedSegments(
+  message: ChatMessage,
+  codepointLength: number,
+): NormalizedModelCallSegment[] {
+  const seenCallIds = new Set<string>()
+  const normalized: NormalizedModelCallSegment[] = []
+  for (const raw of usageSegments(message.usage || message.turn_usage)) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return []
+    const modelCallId = String(raw.model_call_id || raw.modelCallId || '').trim()
+    const iteration = positiveInteger(raw.iteration)
+    const startCodepoint = nonNegativeInteger(
+      raw.start_codepoint ?? raw.startCodepoint,
+    )
+    const endCodepoint = nonNegativeInteger(raw.end_codepoint ?? raw.endCodepoint)
+    if (
+      !modelCallId
+      || seenCallIds.has(modelCallId)
+      || iteration === undefined
+      || startCodepoint === undefined
+      || endCodepoint === undefined
+      || endCodepoint < startCodepoint
+      || endCodepoint > codepointLength
+      || (
+        normalized.length > 0
+        && startCodepoint !== normalized[normalized.length - 1]!.endCodepoint
+      )
+    ) {
+      return []
+    }
+    seenCallIds.add(modelCallId)
+    normalized.push({
+      modelCallId,
+      iteration,
+      startCodepoint,
+      endCodepoint,
+    })
+  }
+  if (
+    normalized.length === 0
+    || normalized[normalized.length - 1]!.endCodepoint !== codepointLength
+  ) {
+    return []
+  }
+  return normalized
+}
+
+function matchesSegment(message: ChatMessage, segment: NormalizedModelCallSegment): boolean {
+  if (
+    message.role !== 'user'
+    || message.inputDisposition !== 'applied'
+    || message.steerModelCallId !== segment.modelCallId
+  ) {
+    return false
+  }
+  return message.steerAppliedIteration === undefined
+    || message.steerAppliedIteration === segment.iteration
+}
+
+function syntheticAssistantSegment(
+  source: ChatMessage,
+  text: string,
+  segmentKey: string,
+): ChatMessage {
+  return {
+    role: 'assistant',
+    text,
+    ts: source.ts,
+    clientId: `history-model-call-segment:${source.messageId || source.clientId || 'assistant'}:${segmentKey}`,
+    turnId: source.turnId,
+    restoredFromHistory: true,
+  }
+}
+
+function interleaveAssistantAt(
+  messages: ChatMessage[],
+  assistantIndex: number,
+): ChatMessage[] | null {
+  const assistant = messages[assistantIndex]
+  if (
+    !assistant
+    || assistant.role !== 'assistant'
+    || !assistant.turnId
+    || !assistant.text
+  ) {
+    return null
+  }
+  const codepoints = Array.from(assistant.text)
+  const segments = normalizedSegments(assistant, codepoints.length)
+  if (segments.length === 0) return null
+
+  const matchedByCall = new Map<string, Array<{ index: number; message: ChatMessage }>>()
+  for (const segment of segments) matchedByCall.set(segment.modelCallId, [])
+  for (let index = 0; index < assistantIndex; index++) {
+    const message = messages[index]
+    if (message?.turnId !== assistant.turnId) continue
+    const segment = segments.find(candidate => matchesSegment(message, candidate))
+    if (!segment) continue
+    matchedByCall.get(segment.modelCallId)!.push({ index, message })
+  }
+  if ([...matchedByCall.values()].some(rows => rows.length === 0)) return null
+
+  const segmentRowIndexes = segments.map(segment =>
+    matchedByCall.get(segment.modelCallId)!.map(row => row.index),
+  )
+  let previousIndex = -1
+  for (const indexes of segmentRowIndexes) {
+    if (indexes[0]! <= previousIndex) return null
+    previousIndex = indexes[indexes.length - 1]!
+  }
+  const firstSteerIndex = segmentRowIndexes[0]![0]!
+  const matchedIndexes = new Set(segmentRowIndexes.flat())
+
+  // Fail closed if another durable row sits inside the aggregate block. The
+  // transform must never move unrelated history merely to obtain a prettier
+  // ordering.
+  for (let index = firstSteerIndex; index < assistantIndex; index++) {
+    if (!matchedIndexes.has(index)) return null
+  }
+
+  const replacement: ChatMessage[] = []
+  const firstStart = segments[0]!.startCodepoint
+  if (firstStart > 0) {
+    replacement.push(
+      syntheticAssistantSegment(
+        assistant,
+        codepoints.slice(0, firstStart).join(''),
+        `prefix-${firstStart}`,
+      ),
+    )
+  }
+  segments.forEach((segment, segmentIndex) => {
+    replacement.push(
+      ...matchedByCall.get(segment.modelCallId)!.map(row => row.message),
+    )
+    const text = codepoints
+      .slice(segment.startCodepoint, segment.endCodepoint)
+      .join('')
+    const isLast = segmentIndex === segments.length - 1
+    if (isLast) {
+      replacement.push({ ...assistant, text })
+    } else if (text) {
+      replacement.push(
+        syntheticAssistantSegment(
+          assistant,
+          text,
+          `${segment.modelCallId}-${segment.startCodepoint}-${segment.endCodepoint}`,
+        ),
+      )
+    }
+  })
+
+  return [
+    ...messages.slice(0, firstSteerIndex),
+    ...replacement,
+    ...messages.slice(assistantIndex + 1),
+  ]
+}
+
+/**
+ * Reconstruct the visible same-turn chronology from one aggregated assistant
+ * transcript row plus durable steer application metadata.
+ */
+export function interleaveHistoryModelCallSegments(
+  messages: ChatMessage[],
+): ChatMessage[] {
+  let result = messages
+  for (let index = 0; index < result.length; index++) {
+    const transformed = interleaveAssistantAt(result, index)
+    if (!transformed) continue
+    result = transformed
+    // The canonical assistant row has moved to the end of the replacement.
+    // Rescanning it is harmless (its shortened text fails range validation),
+    // and lets later turns in the same page be transformed as well.
+  }
+  return result
+}

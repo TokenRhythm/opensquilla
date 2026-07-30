@@ -5,13 +5,13 @@ import i18n from '@/i18n'
 import UpdateBanner from './UpdateBanner.vue'
 
 const platformMocks = vi.hoisted(() => ({
-  nativeAutoUpdateEnabled: vi.fn(),
+  desktopUpdateManaged: vi.fn(),
 }))
 
 vi.mock('@/platform', () => ({
   getPlatform: () => ({
     id: 'web',
-    nativeAutoUpdateEnabled: platformMocks.nativeAutoUpdateEnabled,
+    desktopUpdateManaged: platformMocks.desktopUpdateManaged,
   }),
 }))
 
@@ -93,7 +93,7 @@ beforeEach(() => {
   sessionStorage.clear()
   setVisibility('visible')
   i18n.global.locale.value = 'en'
-  platformMocks.nativeAutoUpdateEnabled.mockReset().mockResolvedValue(false)
+  platformMocks.desktopUpdateManaged.mockReset().mockResolvedValue(false)
   fetchMock = vi.fn()
   vi.stubGlobal('fetch', fetchMock)
 })
@@ -292,7 +292,7 @@ describe('UpdateBanner live update polling', () => {
 
   it('does not start polling if unmounted before capability detection resolves', async () => {
     let resolveCapability!: (enabled: boolean) => void
-    platformMocks.nativeAutoUpdateEnabled.mockImplementation(
+    platformMocks.desktopUpdateManaged.mockImplementation(
       () => new Promise<boolean>((resolve) => { resolveCapability = resolve }),
     )
 
@@ -304,9 +304,9 @@ describe('UpdateBanner live update polling', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('does not poll and hides bootstrap information when native updates are enabled', async () => {
+  it('does not poll and hides bootstrap information when the desktop owns updates', async () => {
     injectBootstrap()
-    platformMocks.nativeAutoUpdateEnabled.mockResolvedValue(true)
+    platformMocks.desktopUpdateManaged.mockResolvedValue(true)
 
     const { el } = await mountBanner()
 
@@ -314,9 +314,9 @@ describe('UpdateBanner live update polling', () => {
     expect(el.querySelector('[data-testid="update-banner"]')).toBeNull()
   })
 
-  it('does not poll when native capability detection fails', async () => {
+  it('does not poll when managed capability detection fails', async () => {
     injectBootstrap()
-    platformMocks.nativeAutoUpdateEnabled.mockRejectedValue(new Error('bridge unavailable'))
+    platformMocks.desktopUpdateManaged.mockRejectedValue(new Error('bridge unavailable'))
 
     await mountBanner()
 

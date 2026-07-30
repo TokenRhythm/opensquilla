@@ -279,6 +279,13 @@ class _AsyncConnection:
                 deterministic=deterministic,
             )
 
+    async def set_trace_callback(
+        self,
+        handler: Callable[[str], Any] | None,
+    ) -> None:
+        async with self._locked:
+            await asyncio.to_thread(self._conn.set_trace_callback, handler)
+
     async def __aenter__(self) -> _AsyncConnection:
         return self
 

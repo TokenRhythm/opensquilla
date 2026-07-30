@@ -69,13 +69,14 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { IconName } from '@/utils/icons'
 import type { SessionItem, SessionLedgerEntry } from '@/composables/useSessions'
-import { formatRelativeTime, sessionStatusBadge, subagentRowTitle } from './sessionDisplay'
+import { formatRelativeTime, sessionAgentIdentity, sessionStatusBadge, subagentRowTitle } from './sessionDisplay'
 
 const { t } = useI18n()
 
 const props = defineProps<{
   entries: SessionLedgerEntry[]
   agentNames: Map<string, string>
+  agentsLoaded: boolean
   needsInputKeys: Set<string>
 }>()
 
@@ -103,9 +104,10 @@ function surfaceIcon(item: SessionItem): IconName {
 }
 
 function agentName(item: SessionItem): string {
-  const id = item.effectiveAgentId
-  if (!id || id === 'unknown') return t('sessions.unknownAgent')
-  return props.agentNames.get(id) || id
+  const identity = sessionAgentIdentity(item.effectiveAgentId, props.agentNames, props.agentsLoaded)
+  if (identity.kind === 'unknown') return t('sessions.unknownAgent')
+  if (identity.kind === 'deleted') return t('sessions.deletedAgent', { id: identity.value })
+  return identity.value
 }
 
 function statusBadge(item: SessionItem): { label: string; cls: string } | null {

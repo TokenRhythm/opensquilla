@@ -1,6 +1,7 @@
 ---
 name: paper-refbib-stub
 description: "Convert multi-search-engine JSON to a minimal BibTeX file (@misc{} entries). Demo-only."
+description_zh: "将multi-search-engine的JSON转换为最小化的BibTeX文件（@misc{}条目）。仅供演示。"
 user-invocable: false
 disable-model-invocation: true
 provenance:

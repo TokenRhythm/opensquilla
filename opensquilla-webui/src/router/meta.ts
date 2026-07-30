@@ -1,10 +1,7 @@
 import 'vue-router'
 
-/** Sidebar grouping bands, ordered top→bottom in the Console fold. */
+/** Stable route taxonomy used by navigation and settings surfaces. */
 export type NavGroup = 'Work' | 'Operate' | 'Observe' | 'Settings'
-
-/** Console fold renders these bands as labeled sub-sections, in this order. */
-export const CONSOLE_GROUP_ORDER: readonly NavGroup[] = ['Operate', 'Observe'] as const
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -13,6 +10,12 @@ declare module 'vue-router' {
     icon?: import('@/utils/icons').IconName
     nav?: 'primary' | 'bottom'
     navOrder?: number
+    /** Optional i18n key for navigation surfaces when the rail label differs
+     *  from the route's page/document title. */
+    navLabelKey?: string
+    /** Optional i18n key for the page/document title when it differs from the
+     *  route-name token used by navigation surfaces. */
+    titleKey?: string
     platforms?: Array<'web' | 'desktop'>
     /** Stable route-view identity for sibling routes that must not remount when
      *  only route params change the internal view state. */
@@ -20,9 +23,9 @@ declare module 'vue-router' {
     /** App-level route transition override. Use for route-mounted overlays that
      *  already own their own enter/leave motion. */
     routeTransition?: 'none'
-    /** Keep this view mounted across visits so it does not re-run its polling
-     *  and RPC fan-out on every navigation. Reserved for poll-heavy observe
-     *  views; chat is excluded (it re-inits per session). */
+    /** Keep this view mounted across visits so stateful or poll-heavy views do
+     *  not restart on every navigation. Chat is excluded (it re-inits per
+     *  session). */
     keepAlive?: boolean
     /** Axis-B expressive skin (a registered `kind:'expressive'` theme id) to
      *  apply to this route's content area only. Composes over the active

@@ -173,20 +173,77 @@ export function toolCallGroups(calls: ChatToolCall[] | undefined, ownerKey: stri
   return groups
 }
 
-export function toolResultCount(raw: string): number | null {
+const PLAIN_TEXT_RESULT_TOOL_TOKENS = new Set([
+  'discover',
+  'search',
+])
+const RAW_TEXT_SEARCH_TOOLS = new Set([
+  'glob_search',
+  'grep_search',
+])
+
+function supportsPlainTextResultCount(toolName: string): boolean {
+  const tokens = String(toolName || '')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+  if (RAW_TEXT_SEARCH_TOOLS.has(tokens.join('_'))) return false
+  return tokens.some(token => PLAIN_TEXT_RESULT_TOOL_TOKENS.has(token))
+}
+
+function isLikelyYear(value: string): boolean {
+  if (!/^\d{4}$/.test(value)) return false
+  const year = Number(value)
+  return year >= 1900 && year <= 2199
+}
+
+function plainTextResultCount(text: string): number | null {
+  const lines = text
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+  if (!lines.length) return null
+  const line = /^\[[^\]]+\]$/.test(lines[0]) && lines[1] ? lines[1] : lines[0]
+
+  const explicitPatterns = [
+    /^(?:(?:web\s+)?search\s+)?(?:found|returned|showing)\s*:?\s*(\d{1,4})\s+results?(?:\s+(?:for|matching)\b.*)?[.!]?$/i,
+    /^showing\s+\d+\s*[-–]\s*\d+\s+of\s+(\d{1,4})\s+results?[.!]?$/i,
+    /^(?:搜索\s*)?(?:共\s*)?(?:找到|返回|显示)\s*[:：]?\s*(\d{1,4})\s*(?:条|个)?\s*结果[。！.!]?$/,
+  ]
+  for (const pattern of explicitPatterns) {
+    const match = pattern.exec(line)
+    if (match) return Number(match[1])
+  }
+
+  const bareMatch = /^(?:about\s+)?(\d{1,4})\s*(?:results?|(?:条|个)?\s*结果)(?:\s+(?:found|returned|shown))?[.!。！:]?$/i.exec(line)
+  if (!bareMatch || isLikelyYear(bareMatch[1])) return null
+  return Number(bareMatch[1])
+}
+
+export function toolResultCount(raw: string, toolName: string): number | null {
   const text = String(raw || '').trim()
   if (!text) return null
-  // 结果 is the CJK word for "results", kept to parse localized tool output.
-  const match = /(?:^|\D)(\d{1,4})\s*(?:results?|结果)(?:\D|$)/i.exec(text)
-  if (match) return Number(match[1])
+  let summaryText = text
   try {
     const parsed = JSON.parse(text)
     if (Array.isArray(parsed)) return parsed.length
     for (const key of ['results', 'items', 'data', 'matches']) {
       if (Array.isArray(parsed?.[key])) return parsed[key].length
     }
+    // Structured tool payloads often contain arbitrary page or command output.
+    // Never infer a count from those nested strings: a phrase such as
+    // "2026 results" may be a year plus a heading, not a result summary.
+    if (parsed && typeof parsed === 'object') return null
+    if (typeof parsed === 'string') summaryText = parsed.trim()
+    else return null
   } catch {}
-  return null
+  // Preserve text summaries only for search operations, and only when the
+  // first summary line has an explicit count shape. Content-producing tools
+  // and arbitrary result bodies must not reinterpret years as metadata.
+  if (!supportsPlainTextResultCount(toolName)) return null
+  return plainTextResultCount(summaryText)
 }
 
 export function toolResultIsError(payload: unknown): boolean {
@@ -202,7 +259,7 @@ export function toolStatusText(toolCall: ChatToolCall): string {
   const t = i18n.global.t
   if (toolCall.isRunning) return t('chat.tool.running')
   if (toolCall.status === 'error') return t('chat.tool.failed')
-  const count = toolResultCount(toolCall.result)
+  const count = toolResultCount(toolCall.result, toolCall.name)
   if (count !== null) return t('chat.tool.results', { count })
   if (toolCall.status === 'success') return t('chat.tool.done')
   return t('chat.tool.pending')
@@ -212,7 +269,9 @@ export function toolGroupStatusText(group: ChatToolCallGroup): string {
   const t = i18n.global.t
   if (group.isRunning) return t('chat.tool.running')
   if (group.isError) return t('chat.tool.failed')
-  const counts = group.calls.map(toolCall => toolResultCount(toolCall.result)).filter((count): count is number => count !== null)
+  const counts = group.calls
+    .map(toolCall => toolResultCount(toolCall.result, toolCall.name))
+    .filter((count): count is number => count !== null)
   if (counts.length && group.calls.length === 1) return t('chat.tool.results', { count: counts[0] })
   if (counts.length) return t('chat.tool.results', { count: counts.reduce((sum, count) => sum + count, 0) })
   if (group.status === 'success') return t('chat.tool.done')

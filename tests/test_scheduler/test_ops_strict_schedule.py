@@ -7,6 +7,7 @@ and reject anything that is not a valid expression for the declared kind.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -61,8 +62,64 @@ async def test_ops_add_persists_creator_owner_boundary(tmp_path: Path) -> None:
 
         assert reloaded is not None
         assert reloaded.creator_is_owner is True
+        assert reloaded.run_mode == "full"
+        assert reloaded.elevated == "full"
+        assert reloaded.execution_target == "host"
     finally:
         await store.close()
+
+
+async def test_ops_add_is_atomic_and_idempotent_under_concurrency(tmp_path: Path) -> None:
+    store, ops = await _open_ops(tmp_path)
+    try:
+
+        async def add_once():
+            return await ops.add(
+                name="deduplicated",
+                handler_key="agent_run",
+                payload=make_agent_turn_payload("ping"),
+                session_target=SessionTarget.ISOLATED,
+                schedule_kind=ScheduleKind.CRON,
+                schedule_value="*/5 * * * *",
+                creator_is_owner=True,
+                idempotency_key="cron-tool:task-1:same",
+            )
+
+        jobs = await asyncio.gather(*(add_once() for _ in range(30)))
+        active = await store.list_active()
+    finally:
+        await store.close()
+
+    assert len({job.id for job in jobs}) == 1
+    assert len(active) == 1
+    assert sum(job.deduplicated for job in jobs) == 29
+
+
+async def test_ops_add_keeps_different_idempotency_keys_distinct(tmp_path: Path) -> None:
+    store, ops = await _open_ops(tmp_path)
+    try:
+        first = await ops.add(
+            name="first",
+            handler_key="agent_run",
+            payload=make_agent_turn_payload("ping"),
+            session_target=SessionTarget.ISOLATED,
+            schedule_kind=ScheduleKind.CRON,
+            schedule_value="*/5 * * * *",
+            idempotency_key="cron-tool:task-1:same",
+        )
+        second = await ops.add(
+            name="second",
+            handler_key="agent_run",
+            payload=make_agent_turn_payload("ping"),
+            session_target=SessionTarget.ISOLATED,
+            schedule_kind=ScheduleKind.CRON,
+            schedule_value="*/5 * * * *",
+            idempotency_key="cron-tool:task-2:same",
+        )
+    finally:
+        await store.close()
+
+    assert first.id != second.id
 
 
 async def test_ops_add_every_seconds_records_anchor(tmp_path: Path) -> None:

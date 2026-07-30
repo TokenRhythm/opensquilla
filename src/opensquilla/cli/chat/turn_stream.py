@@ -29,6 +29,7 @@ from opensquilla.cli.tui.backend.domain_events import (
     now_ms,
 )
 from opensquilla.cli.tui.backend.streaming import StreamingPlane
+from opensquilla.engine.types import done_text_snapshot
 from opensquilla.execution_status import derive_is_error
 from opensquilla.router_tiers import tier_index
 from opensquilla.session.terminal_reply import build_terminal_reply
@@ -98,6 +99,9 @@ class _BackendFallbackRenderer:
     async def aappend_text(self, delta: str, *, presentation: str = "answer") -> None:
         del presentation
         self.buffer += delta
+
+    async def areconcile_final_text(self, text: str) -> None:
+        self.buffer = text
 
     def pulse(self) -> None:
         return None
@@ -313,6 +317,30 @@ def normalize_router_decision_payload(payload: Mapping[str, Any]) -> dict[str, A
         "routing_applied": _bool_field(payload, "routing_applied", True),
         "rollout_phase": _string_field(payload, "rollout_phase", "full"),
         "context_window": _optional_int_field(payload, "context_window"),
+    }
+
+
+def normalize_ensemble_progress_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the renderer-facing subset of a real ensemble progress event.
+
+    Gateway frames also carry session/turn identities while TurnRunner events
+    carry a ``kind`` field.  Keeping only the provider lifecycle payload gives
+    both paths one stable renderer contract without inferring execution from
+    the current Gateway configuration.
+    """
+
+    return {
+        "event_type": _string_field(payload, "event_type", "proposer_start"),
+        "proposer_index": _int_field(payload, "proposer_index", -1),
+        "proposer_label": _string_field(payload, "proposer_label"),
+        "proposer_model": _string_field(payload, "proposer_model"),
+        "proposer_provider": _string_field(payload, "proposer_provider"),
+        "sample_index": _int_field(payload, "sample_index", 0),
+        "elapsed_ms": _int_field(payload, "elapsed_ms", 0),
+        "input_tokens": _int_field(payload, "input_tokens", 0),
+        "output_tokens": _int_field(payload, "output_tokens", 0),
+        "cost_usd": _float_field(payload, "cost_usd") or 0.0,
+        "error": _string_field(payload, "error"),
     }
 
 
@@ -658,6 +686,17 @@ async def renderer_status(
         stream_deps.output_console.print(f"[{style}]{message}[/]")
 
 
+async def renderer_ensemble_progress(
+    renderer: Any,
+    payload: dict[str, Any],
+) -> None:
+    """Forward ensemble lifecycle data when the renderer opts into the hook."""
+
+    method = getattr(renderer, "aensemble_progress", None)
+    if callable(method):
+        await _async_renderer_method(method)(payload)
+
+
 async def renderer_tool_start(
     renderer: Any,
     name: str,
@@ -720,6 +759,22 @@ async def renderer_close(renderer: Any) -> None:
     aclose = getattr(renderer, "aclose", None)
     if callable(aclose):
         await _async_renderer_method(aclose)()
+
+
+async def renderer_reconcile_final_text(renderer: Any, text: str) -> None:
+    """Replace a renderer's logical answer with an authoritative terminal snapshot.
+
+    Renderers may provide an async reconciliation hook when their UI can replace a
+    live preview. The shared fallback still rewrites ``buffer`` so every caller's
+    ``TurnResult`` observes the canonical terminal value, including an explicit
+    empty snapshot.
+    """
+
+    reconcile = getattr(renderer, "areconcile_final_text", None)
+    if callable(reconcile):
+        await _async_renderer_method(reconcile)(text)
+        return
+    renderer.buffer = text
 
 
 def artifact_event_payload(event: Any) -> dict[str, Any]:
@@ -800,11 +855,40 @@ async def stream_response_gateway(
         )
         try:
             try:
-                async for event in client.send_message(
-                    session_key, message, attachments=attachments, elevated=elevated
-                ):
+                from opensquilla.cli.tui.backend.input_identity import (
+                    tui_turn_identity_sink_scope,
+                )
+
+                async def _bind_turn_identity(
+                    turn_id: str,
+                    client_message_id: str,
+                ) -> None:
+                    bind_identity = getattr(renderer, "aset_turn_identity", None)
+                    if callable(bind_identity):
+                        await bind_identity(turn_id, client_message_id)
+
+                async def _identity_bound_events() -> AsyncIterator[dict[str, Any]]:
+                    with tui_turn_identity_sink_scope(_bind_turn_identity):
+                        async for item in client.send_message(
+                            session_key,
+                            message,
+                            attachments=attachments,
+                            elevated=elevated,
+                        ):
+                            yield item
+
+                async for event in _identity_bound_events():
                     event_name = event.get("event", "")
-                    if event_name == "session.event.text_delta":
+                    if event_name == "session.event.accepted":
+                        bind_identity = getattr(renderer, "aset_turn_identity", None)
+                        if callable(bind_identity):
+                            turn_id = event.get("turn_id") or event.get("task_id")
+                            client_message_id = event.get("client_message_id")
+                            if isinstance(turn_id, str) and isinstance(
+                                client_message_id, str
+                            ):
+                                await bind_identity(turn_id, client_message_id)
+                    elif event_name == "session.event.text_delta":
                         await _append_text_delta(
                             renderer,
                             stream_deps,
@@ -817,11 +901,11 @@ async def stream_response_gateway(
                     elif event_name == "session.event.thinking":
                         # The agent re-emits reasoning as ThinkingEvent, which
                         # rpc_sessions broadcasts as session.event.thinking. The
-                        # renderer collapses it to a "Thinking…" marker (the
-                        # verbatim process is not shown), so no coalescing plane
-                        # is needed — drive the marker directly. The marker is
-                        # retired when the next text/tool opens (aappend_text /
-                        # atool_start close the reasoning block).
+                        # Gateway path already emits each provider delta as an
+                        # event, so drive the live transcript block directly.
+                        # The renderer retains the complete safe text, shows a
+                        # rolling stream while active, then folds it behind
+                        # Ctrl+O when the next text/tool closes the block.
                         await _append_reasoning_delta(
                             renderer,
                             stream_deps,
@@ -844,6 +928,11 @@ async def stream_response_gateway(
                             source="gateway",
                             payload=normalize_router_decision_payload(event),
                             turn_id=session_key,
+                        )
+                    elif event_name == "session.event.ensemble_progress":
+                        await renderer_ensemble_progress(
+                            renderer,
+                            normalize_ensemble_progress_payload(event),
                         )
                     elif event_name == "session.event.tool_use_start":
                         await _finish_text_delta_stream(
@@ -998,6 +1087,7 @@ async def stream_response_gateway(
                         usage = UsageSummary.from_gateway_payload(event)
                         cancelled = event.get("reason") == "aborted"
                         model_after = event.get("routed_model") or event.get("model") or None
+                        snapshot_present, snapshot_text = done_text_snapshot(event)
                         await _finish_text_delta_stream(
                             renderer,
                             stream_deps,
@@ -1005,15 +1095,20 @@ async def stream_response_gateway(
                             source="gateway",
                             turn_id=session_key,
                         )
+                        if snapshot_present:
+                            await renderer_reconcile_final_text(renderer, snapshot_text)
+                        done_payload: dict[str, Any] = {
+                            "model": model_after,
+                            "cancelled": cancelled,
+                            "reason": event.get("reason"),
+                        }
+                        if snapshot_present:
+                            done_payload["text_snapshot"] = snapshot_text
                         _emit_tui_domain_event(
                             stream_deps,
                             kind=KIND_DONE,
                             source="gateway",
-                            payload={
-                                "model": model_after,
-                                "cancelled": cancelled,
-                                "reason": event.get("reason"),
-                            },
+                            payload=done_payload,
                             turn_id=session_key,
                         )
             except (KeyboardInterrupt, asyncio.CancelledError):
@@ -1103,6 +1198,7 @@ async def stream_response_turnrunner(
     from opensquilla.engine.types import (
         ArtifactEvent,
         DoneEvent,
+        EnsembleProgressEvent,
         ErrorEvent,
         RouterDecisionEvent,
         RunHeartbeatEvent,
@@ -1217,6 +1313,11 @@ async def stream_response_turnrunner(
                             source="turn_runner",
                             payload=normalize_router_decision_payload(event.__dict__),
                             turn_id=session_key,
+                        )
+                    elif isinstance(event, EnsembleProgressEvent):
+                        await renderer_ensemble_progress(
+                            renderer,
+                            normalize_ensemble_progress_payload(event.__dict__),
                         )
                     elif isinstance(event, RunHeartbeatEvent):
                         renderer.pulse()
@@ -1369,6 +1470,7 @@ async def stream_response_turnrunner(
                     elif isinstance(event, DoneEvent):
                         usage = UsageSummary.from_done_event(event)
                         model_after = usage.model or None
+                        snapshot_present, snapshot_text = done_text_snapshot(event)
                         await _finish_text_delta_stream(
                             renderer,
                             stream_deps,
@@ -1376,15 +1478,20 @@ async def stream_response_turnrunner(
                             source="turn_runner",
                             turn_id=session_key,
                         )
+                        if snapshot_present:
+                            await renderer_reconcile_final_text(renderer, snapshot_text)
+                        done_payload: dict[str, Any] = {
+                            "model": model_after,
+                            "cancelled": False,
+                            "stop_reason": getattr(event, "stop_reason", None),
+                        }
+                        if snapshot_present:
+                            done_payload["text_snapshot"] = snapshot_text
                         _emit_tui_domain_event(
                             stream_deps,
                             kind=KIND_DONE,
                             source="turn_runner",
-                            payload={
-                                "model": model_after,
-                                "cancelled": False,
-                                "stop_reason": getattr(event, "stop_reason", None),
-                            },
+                            payload=done_payload,
                             turn_id=session_key,
                         )
             except (KeyboardInterrupt, asyncio.CancelledError):
@@ -1453,6 +1560,7 @@ async def handle_image_command_turnrunner(
     from opensquilla.engine.runtime import TurnRunner
     from opensquilla.engine.types import (
         DoneEvent,
+        EnsembleProgressEvent,
         ErrorEvent,
         RouterDecisionEvent,
         RunHeartbeatEvent,
@@ -1532,6 +1640,11 @@ async def handle_image_command_turnrunner(
                             payload=normalize_router_decision_payload(event.__dict__),
                             turn_id=session_key,
                         )
+                    elif isinstance(event, EnsembleProgressEvent):
+                        await renderer_ensemble_progress(
+                            renderer,
+                            normalize_ensemble_progress_payload(event.__dict__),
+                        )
                     elif isinstance(event, RunHeartbeatEvent):
                         renderer.pulse()
                         await _drain_stalled_text_plane(renderer, streaming_plane)
@@ -1581,6 +1694,7 @@ async def handle_image_command_turnrunner(
                     elif isinstance(event, DoneEvent):
                         usage = UsageSummary.from_done_event(event)
                         model_after = usage.model or None
+                        snapshot_present, snapshot_text = done_text_snapshot(event)
                         await _finish_text_delta_stream(
                             renderer,
                             stream_deps,
@@ -1588,15 +1702,20 @@ async def handle_image_command_turnrunner(
                             source="turn_runner",
                             turn_id=session_key,
                         )
+                        if snapshot_present:
+                            await renderer_reconcile_final_text(renderer, snapshot_text)
+                        done_payload: dict[str, Any] = {
+                            "model": model_after,
+                            "cancelled": False,
+                            "stop_reason": getattr(event, "stop_reason", None),
+                        }
+                        if snapshot_present:
+                            done_payload["text_snapshot"] = snapshot_text
                         _emit_tui_domain_event(
                             stream_deps,
                             kind=KIND_DONE,
                             source="turn_runner",
-                            payload={
-                                "model": model_after,
-                                "cancelled": False,
-                                "stop_reason": getattr(event, "stop_reason", None),
-                            },
+                            payload=done_payload,
                             turn_id=session_key,
                         )
             except TimeoutError as exc:

@@ -14,7 +14,7 @@ pytestmark = [
 ]
 
 
-def test_live_opentui_real_cli_runs_architecture_prompt_in_tmux(
+def test_bare_chat_default_runs_live_opentui_architecture_prompt_in_tmux(
     run_real_terminal_scenario,
     tui_backend: str,
     tui_driver: str,
@@ -34,13 +34,14 @@ def test_live_opentui_real_cli_runs_architecture_prompt_in_tmux(
     assert (result.run_dir / "terminal.log").exists()
     scrollback_path = result.run_dir / "scrollback.txt"
     assert scrollback_path.exists()
-    # The scenario's wait step matched either a completed turn (the usage
-    # separator) or the runtime's own timeout notice; the final scrollback must
-    # still show that state rather than an empty or crashed pane.
+    # The scenario's wait step matched either a completed turn's usage receipt
+    # or the runtime's own timeout notice; the final scrollback must still show
+    # that state rather than an empty or crashed pane. Keep the receipt marker
+    # specific: the welcome chrome contains many generic middle-dot separators.
     scrollback = scrollback_path.read_text(encoding="utf-8")
     assert scrollback.strip()
     assert "Traceback (most recent call last)" not in scrollback
     assert (
-        " · " in scrollback
+        "╰ in " in scrollback
         or "The task timed out before it could finish." in scrollback
     )

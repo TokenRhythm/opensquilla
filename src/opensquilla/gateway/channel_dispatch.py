@@ -14,18 +14,34 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import re
-import weakref
+import time
+import uuid
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
 from opensquilla.agents.scope import resolve_agent_model
 from opensquilla.artifacts import artifact_payload
-from opensquilla.channels._util import ChannelAccessPolicy, evaluate_policy
+from opensquilla.channels._util import (
+    measured_len,
+    sender_is_channel_admin,
+    split_text_for_channel,
+    truncate_to_limit,
+)
+from opensquilla.channels.admission import (
+    CHANNEL_ADMIN_VERIFIED_METADATA_KEY,
+    ChannelAdmissionDecision,
+    decide_channel_admission,
+    has_verified_channel_admin_stamp,
+    is_authenticated_channel_admin,
+)
 from opensquilla.channels.artifact_delivery import (
     artifact_delivery_key as _artifact_delivery_key,
 )
@@ -44,12 +60,19 @@ from opensquilla.channels.artifact_delivery import (
 from opensquilla.channels.artifact_delivery import (
     strip_delivered_artifact_image_references as _strip_delivered_artifact_image_references,
 )
-from opensquilla.channels.contract import channel_capability_profile
+from opensquilla.channels.contract import (
+    REQUIRED_RETRYABLE_ERROR_CLASSES,
+    UNCLASSIFIED_ERROR_CLASS,
+    channel_capability_profile,
+    classify_channel_send_error,
+)
 from opensquilla.channels.stream_policy import resolve_channel_stream_policy
+from opensquilla.channels.system_messages import render_channel_message
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
-from opensquilla.engine.start_turn import start_turn_via_runtime
+from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
 from opensquilla.engine.types import (
     ArtifactEvent,
+    DoneEvent,
     EnsembleProgressEvent,
     ErrorEvent,
     RouterDecisionEvent,
@@ -57,11 +80,13 @@ from opensquilla.engine.types import (
     TextDeltaEvent,
     ToolResultEvent,
     ToolUseStartEvent,
+    done_text_snapshot,
 )
 from opensquilla.execution_status import normalize_execution_status
 from opensquilla.gateway.attachment_ingest import AttachmentIngestResult, ingest_attachments
 from opensquilla.gateway.config import effective_agent_stream_idle_timeout_seconds
 from opensquilla.gateway.session_events import build_sessions_changed_payload
+from opensquilla.gateway.turn_ingress import complete_durable_ingress
 from opensquilla.paths import media_root_from_config
 from opensquilla.permissions import configured_default_elevated
 from opensquilla.session.terminal_reply import append_error_ref, build_terminal_reply
@@ -70,6 +95,103 @@ if TYPE_CHECKING:
     from opensquilla.gateway.event_bridge import EventBridge
 
 log = structlog.get_logger(__name__)
+
+_CHANNEL_BUSY_INPUT_MODES = frozenset({"followup", "queue", "steer", "interrupt"})
+
+
+@dataclass(frozen=True)
+class _StreamedMessageHandle:
+    """A platform message id pinned to the route that created it.
+
+    Built-in adapters intentionally keep returning their historical string
+    ids.  Dispatch wraps that result with the exact ``send_streaming`` route
+    kwargs so a later terminal edit/delete cannot fall back to mutable
+    adapter-global state or a statically configured default conversation.
+    """
+
+    message_id: str
+    route_kwargs: dict[str, Any]
+
+
+def _streamed_message_handle(
+    result: Any,
+    route_kwargs: dict[str, Any],
+) -> _StreamedMessageHandle | None:
+    if isinstance(result, _StreamedMessageHandle):
+        return result
+    if not isinstance(result, str) or not result:
+        return None
+    return _StreamedMessageHandle(
+        message_id=result,
+        route_kwargs=dict(route_kwargs),
+    )
+
+
+def _channel_can_replace_streamed_text(channel: Any) -> bool:
+    """Whether a live preview can be replaced by its terminal snapshot.
+
+    Generic edit support is insufficient: ``send_streaming`` must also promise
+    a stable id for the message it created. Unknown/custom adapters and typed
+    adapters without that stronger declaration buffer deltas until Done, so a
+    conflicting or explicitly empty snapshot cannot leave stale output behind.
+    """
+
+    if resolve_channel_stream_policy(channel).mode == "final_only":
+        return False
+    has_edit = callable(getattr(channel, "edit", None))
+    profile = channel_capability_profile(channel)
+    return bool(
+        profile is not None and profile.edit and profile.streamed_message_replacement and has_edit
+    )
+
+
+def _sanitize_streamed_channel_text(text: str) -> str:
+    sanitizer = _DirectiveTagStreamSanitizer()
+    cleaned = sanitizer.clean(_strip_artifact_markers_from_channel_text(text))
+    return cleaned + sanitizer.flush()
+
+
+async def _replace_streamed_channel_text(
+    channel: Any,
+    raw_handle: Any,
+    text: str,
+) -> bool:
+    """Best-effort route-pinned replacement of an already delivered preview."""
+
+    handle = (
+        raw_handle
+        if isinstance(raw_handle, _StreamedMessageHandle)
+        else _streamed_message_handle(raw_handle, {})
+    )
+    if handle is None:
+        return False
+
+    def _route_kwargs(operation: Any) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in handle.route_kwargs.items()
+            if _accepts_keyword_arg(operation, key)
+        }
+
+    try:
+        if not text:
+            delete = getattr(channel, "delete", None)
+            if callable(delete):
+                await delete(handle.message_id, **_route_kwargs(delete))
+                return True
+        edit = getattr(channel, "edit", None)
+        if not callable(edit):
+            return False
+        await edit(handle.message_id, text, **_route_kwargs(edit))
+        return True
+    except Exception as exc:  # noqa: BLE001 - caller has a canonical batch fallback.
+        log.warning(
+            "channel_dispatch.stream_terminal_reconcile_failed",
+            channel_type=type(channel).__name__,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return False
 
 
 def _terminal_payload_from_exception(exc: BaseException) -> dict[str, str]:
@@ -129,6 +251,37 @@ def _resolve_channel_overflow_policy(channel: Any, config: Any) -> str | None:
     if not isinstance(value, str) or not value:
         return None
     return value
+
+
+def _resolve_channel_busy_input_mode(task_runtime: Any, configured_mode: str) -> str:
+    """Resolve a channel busy-input policy against runtime capabilities.
+
+    Invalid adapter state and runtimes that do not advertise exact support
+    fail closed to the historical ``followup`` behavior.
+    """
+    mode = str(configured_mode or "followup").strip().lower()
+    if mode not in _CHANNEL_BUSY_INPUT_MODES:
+        log.warning(
+            "channel_dispatch.invalid_busy_input_mode",
+            configured_mode=mode,
+            fallback="followup",
+        )
+        return "followup"
+    supports_mode = getattr(task_runtime, "supports_queue_mode", None)
+    if callable(supports_mode):
+        try:
+            if supports_mode(mode):
+                return mode
+        except Exception:
+            pass
+    elif mode == "followup":
+        return mode
+    log.warning(
+        "channel_dispatch.unsupported_busy_input_mode",
+        configured_mode=mode,
+        fallback="followup",
+    )
+    return "followup"
 
 
 class _ChannelInFlightSet:
@@ -207,9 +360,8 @@ def _compute_channel_cap(config: Any) -> int:
     formula_cap = max(2 * max_concurrency, 1)
     return min(raw_cap, formula_cap)
 
-_DIRECTIVE_TAG_RE = re.compile(
-    r"\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*"
-)
+
+_DIRECTIVE_TAG_RE = re.compile(r"\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*")
 _INTERNAL_COMPACTION_MARKER_RE = re.compile(
     r"(?m)^[ \t]*\["
     r"(?:opensquilla_compacted:[^\]\r\n]*|"
@@ -252,9 +404,7 @@ def _split_pending_internal_compaction_marker(content: str) -> tuple[str, str]:
 
 
 def _sanitize_outgoing_message(message: OutgoingMessage) -> OutgoingMessage:
-    cleaned = _strip_internal_compaction_markers(
-        _strip_inline_directive_tags(message.content)
-    )
+    cleaned = _strip_internal_compaction_markers(_strip_inline_directive_tags(message.content))
     if cleaned == message.content:
         return message
     return message.model_copy(update={"content": cleaned})
@@ -269,23 +419,15 @@ class _DirectiveTagStreamSanitizer:
     def clean(self, chunk: str) -> str:
         text = self._pending + chunk
         self._pending = ""
-        cleaned = _strip_internal_compaction_markers(
-            _strip_inline_directive_tags(text)
-        )
+        cleaned = _strip_internal_compaction_markers(_strip_inline_directive_tags(text))
         start = cleaned.rfind("[[")
         if start == -1:
-            cleaned, pending_marker = _split_pending_internal_compaction_marker(
-                cleaned
-            )
+            cleaned, pending_marker = _split_pending_internal_compaction_marker(cleaned)
             if pending_marker:
                 self._pending = pending_marker
             return cleaned
         suffix = cleaned[start:]
-        if (
-            "]]" not in suffix
-            and "\n" not in suffix
-            and len(suffix) <= _DIRECTIVE_TAG_BUFFER_LIMIT
-        ):
+        if "]]" not in suffix and "\n" not in suffix and len(suffix) <= _DIRECTIVE_TAG_BUFFER_LIMIT:
             self._pending = suffix
             return cleaned[:start]
         cleaned, pending_marker = _split_pending_internal_compaction_marker(cleaned)
@@ -324,6 +466,16 @@ async def _maybe_lock(lock: asyncio.Lock | None) -> AsyncIterator[None]:
         yield
 
 
+def _channel_acceptance_lock(
+    session_lock: asyncio.Lock | None,
+    *,
+    atomic: bool,
+) -> contextlib.AbstractAsyncContextManager[None]:
+    """Keep filesystem validation out of the legacy per-session runner lock."""
+
+    return _maybe_lock(None if atomic else session_lock)
+
+
 # ── Main dispatch loop (thin orchestrator) ───────────────────────────────
 
 
@@ -340,6 +492,7 @@ async def run_channel_dispatch(
     channel_rpc_context_factory: Callable[[Any], Any] | None = None,
     debounce_coordinator: Any = None,
     debounce_window_s: float = 0.0,
+    busy_input_mode: str = "followup",
     _in_flight: _ChannelInFlightSet | None = None,
 ) -> None:
     """Receive-dispatch-respond loop for a channel adapter.
@@ -356,7 +509,73 @@ async def run_channel_dispatch(
         _in_flight = _ChannelInFlightSet(cap)
     while True:
         msg = await channel.receive()
+        delivery_store = getattr(channel, "_delivery_store", None)
+        delivery_channel_name = str(
+            getattr(channel, "_delivery_channel_name", session_prefix) or session_prefix
+        )
+        ingress_claim = None
+        if delivery_store is not None:
+            ingress_claim = delivery_store.claim_inbound(delivery_channel_name, msg)
+            if ingress_claim is None:
+                log.info(
+                    "channel.ingress_duplicate_skipped",
+                    channel=delivery_channel_name,
+                )
+                continue
         session_key = session_key_builder(msg)
+        admission = decide_channel_admission(
+            channel,
+            msg,
+            session_key,
+            config=config,
+            channel_name=session_prefix,
+        )
+        if not admission.admit:
+            log.info(
+                "channel.admission_denied",
+                channel=session_prefix,
+                reason=admission.reason,
+                is_group=admission.is_group,
+            )
+            if (
+                admission.reason == "pairing_required"
+                and admission.pairing_notice
+                and admission.pairing_id
+            ):
+                from opensquilla.gateway.routing import build_channel_route_envelope
+
+                route_envelope = build_channel_route_envelope(
+                    msg,
+                    session_key=session_key,
+                    session_prefix=session_prefix,
+                )
+                pairing_code = admission.pairing_id[:8]
+
+                notice = _route_envelope_reply_message(
+                    render_channel_message(
+                        "pairing_required",
+                        config=config,
+                        pairing_code=pairing_code,
+                    ),
+                    route_envelope,
+                    metadata={"pairing_required": True, "pairing_code": pairing_code},
+                )
+                try:
+                    await channel.send(notice)
+                except Exception as exc:
+                    log.warning(
+                        "channel.pairing_notice_failed",
+                        channel=session_prefix,
+                        error_type=type(exc).__name__,
+                    )
+            if delivery_store is not None:
+                delivery_store.complete_inbound(
+                    ingress_claim,
+                    "admission_denied",
+                    reason=admission.reason,
+                    scrub_payload=True,
+                )
+            continue
         raw_content = msg.content
         from opensquilla.gateway.routing import build_channel_route_envelope
 
@@ -365,14 +584,35 @@ async def run_channel_dispatch(
             session_key=session_key,
             session_prefix=session_prefix,
         )
-        approval_reply = _maybe_resolve_channel_approval(msg=msg, session_key=session_key)
+        principal_is_owner = _stamp_channel_admin_principal(config, route_envelope, msg)
+        approval_reply = await _maybe_resolve_channel_approval(
+            msg=msg,
+            session_key=session_key,
+            config=config,
+            session_manager=session_manager,
+            route_envelope=route_envelope,
+        )
         if approval_reply is not None:
-            await channel.send(_preserve_route_channel_metadata(approval_reply, route_envelope))
+            try:
+                await channel.send(_preserve_route_channel_metadata(approval_reply, route_envelope))
+            except Exception as exc:  # noqa: BLE001 - reply delivery is best-effort
+                # The approval outcome is already recorded; a failed reply
+                # send must not escape the loop and burn the channel's
+                # restart budget.
+                log.warning(
+                    "channel.approval_reply_send_failed",
+                    channel=session_prefix,
+                    error_type=type(exc).__name__,
+                )
+            if delivery_store is not None:
+                delivery_store.complete_inbound(
+                    ingress_claim, "approval_resolved", reason=admission.reason
+                )
             continue
         # fmt: off
         if getattr(channel, "supports_slash_commands", False) and rpc_dispatcher is not None and channel_rpc_context_factory is not None:  # noqa: E501
             command_reply = await _dispatch_channel_slash_command(
-                route_envelope=route_envelope, msg=msg, session_manager=session_manager, session_key=session_key, session_prefix=session_prefix, rpc_dispatcher=rpc_dispatcher, context_factory=channel_rpc_context_factory  # noqa: E501
+                route_envelope=route_envelope, msg=msg, session_manager=session_manager, session_key=session_key, session_prefix=session_prefix, rpc_dispatcher=rpc_dispatcher, context_factory=channel_rpc_context_factory, config=config  # noqa: E501
             )
             if command_reply is not None:
                 emit = log.warning if command_reply.metadata.get("denied") else log.info
@@ -383,18 +623,30 @@ async def run_channel_dispatch(
                 else:
                     event = "channel.command_intercepted"
                 emit(event, command=command_reply.metadata.get("command"), method=command_reply.metadata.get("method"), session_key=session_key)  # noqa: E501
-                await channel.send(command_reply)
+                # Guarded like turn replies: a provider send failure here must
+                # not escape the loop and burn the channel's restart budget.
+                await _deliver_reply_or_notify(
+                    channel,
+                    command_reply,
+                    route_envelope=route_envelope,
+                    session_key=session_key,
+                )
+                if delivery_store is not None:
+                    delivery_store.complete_inbound(
+                        ingress_claim, "command_dispatched", reason=admission.reason
+                    )
                 continue
         # fmt: on
 
         # fmt: off
-        if task_runtime is not None and debounce_window_s > 0.0 and debounce_coordinator is not None:  # noqa: E501
+        if task_runtime is not None and debounce_window_s > 0.0 and debounce_coordinator is not None and delivery_store is None:  # noqa: E501
             async def _on_debounce_fire(
                 combined: Any,
                 key: str = session_key,
                 _ifl: _ChannelInFlightSet = cast(_ChannelInFlightSet, _in_flight),
+                _admission: ChannelAdmissionDecision = admission,
             ) -> None:
-                await _dispatch_combined_message_after_debounce(channel, combined, turn_runner, session_manager, key, session_prefix, task_runtime, config, event_bridge, _ifl, channel_rpc_context_factory=channel_rpc_context_factory)  # noqa: E501
+                await _dispatch_combined_message_after_debounce(channel, combined, turn_runner, session_manager, key, session_prefix, task_runtime, config, event_bridge, _ifl, channel_rpc_context_factory=channel_rpc_context_factory, admission_decision=_admission, busy_input_mode=busy_input_mode)  # noqa: E501
 
             await debounce_coordinator.schedule(session_key, msg, window_s=debounce_window_s, on_fire=_on_debounce_fire)  # noqa: E501
             continue
@@ -410,41 +662,46 @@ async def run_channel_dispatch(
         session_lock = _get_lock(session_key) if callable(_get_lock) else None
         if session_lock is not None and session_lock.locked():
             log.info("channel_dispatch.session_lock_wait", session_key=session_key)
+        atomic_channel_acceptance = _supports_atomic_channel_acceptance(
+            session_manager,
+            task_runtime,
+        )
 
         async with _maybe_lock(session_lock):
-            # Gap 1: Record delivery context + ensure session exists
-            _session, _created = await _record_delivery_context(
-                session_manager,
-                session_key,
-                msg,
-                session_prefix,
-                route_envelope=route_envelope,
-            )
-
-            # Gap 2: Skip unmentioned group messages
-            if _should_skip_unmentioned(channel, msg, session_key):
-                continue
+            # Mention gating already ran as part of decide_channel_admission
+            # at the top of the loop; denied messages never reach this point.
+            if not atomic_channel_acceptance:
+                # Legacy runners need the session before execution. Production
+                # TaskRuntime creates it inside the acceptance transaction.
+                await _record_delivery_context(
+                    session_manager,
+                    session_key,
+                    msg,
+                    session_prefix,
+                    route_envelope=route_envelope,
+                )
 
         await _apply_saved_channel_run_context(
             route_envelope,
             session_manager=session_manager,
             config=config,
             workspace_dir=None,
-            principal_is_owner=_is_channel_admin_sender(config, route_envelope),
+            principal_is_owner=principal_is_owner,
         )
 
         ingested = await _ingest_channel_message_attachments(
             channel=channel, msg=msg, config=config
         )
 
-        async with _maybe_lock(session_lock):
-            await _record_delivery_context(
-                session_manager,
-                session_key,
-                msg,
-                session_prefix,
-                route_envelope=route_envelope,
-            )
+        if not atomic_channel_acceptance:
+            async with _maybe_lock(session_lock):
+                await _record_delivery_context(
+                    session_manager,
+                    session_key,
+                    msg,
+                    session_prefix,
+                    route_envelope=route_envelope,
+                )
 
         status_reactor = _status_reactor(channel)
         await status_reactor.received(msg)
@@ -466,63 +723,156 @@ async def run_channel_dispatch(
                     session_key=session_key,
                     cap=_in_flight.cap,
                 )
-                await channel.send(
-                    _route_envelope_reply_message(
-                        "Server busy, please retry",
-                        route_envelope,
+                try:
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            "Server busy, please retry",
+                            route_envelope,
+                        )
                     )
-                )
+                except Exception as exc:  # noqa: BLE001 - notice is best-effort
+                    # The rejection is already decided; a failed busy notice
+                    # must not escape the loop and burn the channel's restart
+                    # budget while the adapter is already saturated.
+                    log.warning(
+                        "channel_dispatch.busy_notice_send_failed",
+                        session_key=session_key,
+                        error_type=type(exc).__name__,
+                    )
                 await status_reactor.completed(msg)
+                if delivery_store is not None:
+                    delivery_store.complete_inbound(
+                        ingress_claim, "capacity_rejected", reason=admission.reason
+                    )
                 continue
 
             transcript_watermark = await _transcript_watermark(session_manager, session_key)
-            stream_relay = _RuntimeChannelStreamRelay.maybe_start(
-                channel,
-                msg,
-                task_runtime,
-                config,
-            )
-            # Ghost-turn fix: enqueue BEFORE appending to transcript.
-            # If enqueue raises TaskQueueFullError the user message is never
-            # written, so no orphaned "ghost" turn is left in the transcript.
-            # Both enqueue and append run inside the per-session lock so that
-            # concurrent senders cannot interleave between the two steps.
+            stream_relay = None
+            replayed = False
             try:
-                async with _maybe_lock(session_lock):
-                    channel_overflow_policy = _resolve_channel_overflow_policy(
-                        channel, config
-                    )
-                    if channel_overflow_policy is not None:
-                        apply_policy = getattr(
-                            task_runtime, "apply_overflow_policy", None
+                async with _channel_acceptance_lock(
+                    session_lock,
+                    atomic=atomic_channel_acceptance,
+                ):
+                    if atomic_channel_acceptance:
+                        (
+                            handle,
+                            persisted_content,
+                            stream_relay,
+                            replayed,
+                        ) = await _accept_channel_runtime_turn(
+                            channel=channel,
+                            msg=msg,
+                            session_manager=session_manager,
+                            session_key=session_key,
+                            route_envelope=route_envelope,
+                            task_runtime=task_runtime,
+                            ingested=ingested,
+                            raw_content=raw_content,
+                            config=config,
+                            busy_input_mode=busy_input_mode,
                         )
-                        if callable(apply_policy):
-                            await apply_policy(
-                                session_key, policy=channel_overflow_policy
-                            )
-                    handle = await start_turn_via_runtime(
-                        task_runtime,
-                        route_envelope,
-                        msg.content,
-                        attachments=ingested.attachments,
-                        mode="followup",
-                        run_kind="channel_turn",
-                        semantic_message=raw_content,
-                        stream_event_sink=stream_relay.emit if stream_relay is not None else None,
-                    )
-                    _persisted, persisted_content = await _append_channel_user_message(
-                        session_manager=session_manager,
-                        session_key=session_key,
-                        text=ingested.text,
-                        attachments=ingested.attachments,
-                        config=config,
-                    )
+                    else:
+                        stream_relay = _RuntimeChannelStreamRelay.maybe_start(
+                            channel,
+                            msg,
+                            task_runtime,
+                            config,
+                        )
+                        channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
+                        if channel_overflow_policy is not None:
+                            apply_policy = getattr(task_runtime, "apply_overflow_policy", None)
+                            if callable(apply_policy):
+                                await apply_policy(session_key, policy=channel_overflow_policy)
+                        handle = await start_turn_via_runtime(
+                            task_runtime,
+                            route_envelope,
+                            msg.content,
+                            attachments=ingested.attachments,
+                            mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
+                            run_kind="channel_turn",
+                            semantic_message=raw_content,
+                            stream_event_sink=(
+                                stream_relay.emit if stream_relay is not None else None
+                            ),
+                        )
+                        _persisted, persisted_content = await _append_channel_user_message(
+                            session_manager=session_manager,
+                            session_key=session_key,
+                            text=ingested.text,
+                            attachments=ingested.attachments,
+                            config=config,
+                        )
                     msg.content = persisted_content
             except Exception as exc:
                 if stream_relay is not None:
                     await stream_relay.close()
 
+                from opensquilla.project_workspaces import ProjectWorkspaceStateError
+                from opensquilla.session.storage import (
+                    StaleEpochError,
+                    StorageBusyError,
+                    TurnIngressConflictError,
+                )
+
+                if isinstance(exc, StorageBusyError):
+                    await status_reactor.failed(msg)
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            "Session storage is busy. Please retry this message.",
+                            route_envelope,
+                        )
+                    )
+                    if delivery_store is not None:
+                        delivery_store.fail_inbound(ingress_claim, exc)
+                    continue
+                if isinstance(exc, StaleEpochError):
+                    await status_reactor.failed(msg)
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            "The session changed while accepting this message. Please retry.",
+                            route_envelope,
+                        )
+                    )
+                    if delivery_store is not None:
+                        delivery_store.fail_inbound(ingress_claim, exc)
+                    continue
+                if isinstance(exc, TurnIngressConflictError):
+                    await status_reactor.failed(msg)
+                    log.warning(
+                        "channel.ingress_idempotency_conflict",
+                        session_key=session_key,
+                    )
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            "This channel message id was already used; the duplicate was ignored.",
+                            route_envelope,
+                        )
+                    )
+                    if delivery_store is not None:
+                        delivery_store.complete_inbound(
+                            ingress_claim, "ingress_conflict", reason=admission.reason
+                        )
+                    continue
+                if isinstance(exc, ProjectWorkspaceStateError):
+                    await status_reactor.failed(msg)
+                    workspace_message = (
+                        "Project workspace not found. Restore it and retry."
+                        if exc.reason in {"not_found", "removed"}
+                        else "The project workspace is unavailable. Restore access and retry."
+                    )
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            workspace_message,
+                            route_envelope,
+                        )
+                    )
+                    if delivery_store is not None:
+                        delivery_store.fail_inbound(ingress_claim, exc)
+                    continue
                 if not isinstance(exc, TaskQueueFullError):
+                    if delivery_store is not None:
+                        delivery_store.fail_inbound(ingress_claim, exc)
                     raise
                 await status_reactor.failed(msg)
                 await channel.send(
@@ -534,20 +884,35 @@ async def run_channel_dispatch(
                         route_envelope,
                     )
                 )
+                if delivery_store is not None:
+                    delivery_store.complete_inbound(
+                        ingress_claim, "queue_rejected", reason=admission.reason
+                    )
             else:
-                await status_reactor.running(msg)
+                if replayed and handle is None:
+                    await status_reactor.completed(msg)
+                    if delivery_store is not None:
+                        delivery_store.complete_inbound(
+                            ingress_claim, "turn_replayed", reason=admission.reason
+                        )
+                    continue
+                assert handle is not None
+                task_id = handle.task_id
+                if not replayed:
+                    await status_reactor.running(msg)
 
-                typing_task = _start_typing_keepalive(channel, msg)
+                typing_task = None if replayed else _start_typing_keepalive(channel, msg)
 
                 async def _reply_task_body(
                     _channel: Any = channel,
                     _task_runtime: Any = task_runtime,
                     _session_manager: Any = session_manager,
                     _session_key: str = session_key,
-                    _task_id: str = handle.task_id,
+                    _task_id: str = task_id,
                     _route_envelope: Any = route_envelope,
                     _inbound: Any = msg,
                     _transcript_watermark: int = transcript_watermark,
+                    _replayed: bool = replayed,
                     _stream_relay: Any = stream_relay,
                     _typing_task: Any = typing_task,
                     _event_bridge: Any = event_bridge,
@@ -563,6 +928,7 @@ async def run_channel_dispatch(
                             route_envelope=_route_envelope,
                             inbound=_inbound,
                             transcript_watermark=_transcript_watermark,
+                            replayed=_replayed,
                             config=config,
                             stream_relay=_stream_relay,
                         )
@@ -602,6 +968,10 @@ async def run_channel_dispatch(
                         )
 
                 reply_task.add_done_callback(_reply_done)
+                if delivery_store is not None:
+                    delivery_store.complete_inbound(
+                        ingress_claim, "turn_dispatched", reason=admission.reason
+                    )
             continue
 
         # Gap 3: Start typing indicator (background task)
@@ -618,7 +988,12 @@ async def run_channel_dispatch(
                 config=config,
                 route_envelope=route_envelope,
                 attachments=ingested.attachments,
+                session_manager=session_manager,
             )
+        except BaseException as exc:
+            if delivery_store is not None:
+                delivery_store.fail_inbound(ingress_claim, exc)
+            raise
         finally:
             if typing_task is not None:
                 typing_task.cancel()
@@ -629,6 +1004,10 @@ async def run_channel_dispatch(
                 event_bridge,
                 session_key,
                 "turn_complete",
+            )
+        if delivery_store is not None:
+            delivery_store.complete_inbound(
+                ingress_claim, "turn_completed", reason=admission.reason
             )
 
 
@@ -641,47 +1020,182 @@ def _slash_command_head(content: str) -> str | None:
     return stripped.split(maxsplit=1)[0]
 
 
-def _maybe_resolve_channel_approval(
+# Failed approval-code attempts per (session, sender). Live-but-unauthorized
+# codes already get the same reply as unknown ones; this budget additionally
+# caps how fast an admitted sender can enumerate the code space at all.
+_APPROVAL_PROBE_WINDOW_S = 60.0
+_APPROVAL_PROBE_LIMIT = 5
+_approval_probe_failures: dict[str, list[float]] = {}
+
+
+def _reset_approval_probe_throttle() -> None:
+    """Clear recorded probe failures (test helper)."""
+    _approval_probe_failures.clear()
+
+
+def _approval_probe_key(session_key: str, sender_id: str) -> str:
+    return f"{session_key}\x00{sender_id}"
+
+
+def _approval_probe_throttled(probe_key: str) -> bool:
+    now = time.monotonic()
+    attempts = [
+        t for t in _approval_probe_failures.get(probe_key, ()) if now - t < _APPROVAL_PROBE_WINDOW_S
+    ]
+    if attempts:
+        _approval_probe_failures[probe_key] = attempts
+    else:
+        _approval_probe_failures.pop(probe_key, None)
+    return len(attempts) >= _APPROVAL_PROBE_LIMIT
+
+
+def _record_approval_probe_failure(probe_key: str) -> None:
+    now = time.monotonic()
+    _approval_probe_failures.setdefault(probe_key, []).append(now)
+    # Opportunistic global prune so abandoned senders cannot grow the map
+    # without bound.
+    if len(_approval_probe_failures) > 1024:
+        for key in list(_approval_probe_failures):
+            kept = [t for t in _approval_probe_failures[key] if now - t < _APPROVAL_PROBE_WINDOW_S]
+            if kept:
+                _approval_probe_failures[key] = kept
+            else:
+                _approval_probe_failures.pop(key, None)
+
+
+class _SandboxChoiceError(Exception):
+    """Sandbox choice validation failed before any queue state changed."""
+
+
+async def _maybe_resolve_channel_approval(
     *,
     msg: IncomingMessage,
     session_key: str,
+    config: Any = None,
+    session_manager: Any = None,
+    route_envelope: Any = None,
 ) -> OutgoingMessage | None:
     """Resolve a channel approval action without starting an agent turn.
 
     Recognises a Feishu ``approval_resolve`` card action or the universal
-    ``/approve <code>`` / ``/deny <code>`` text command, then resolves the
-    bound approval directly so the suspended tool call's ``wait()`` unblocks.
+    ``/approve <code>`` / ``/deny <code>`` / ``/approve <code> always`` text
+    command, then resolves the bound approval so the suspended tool call's
+    ``wait()`` unblocks. Sandbox-kind approvals go through the same
+    claim/finalize/apply-choice sequence as the Web UI resolver so their
+    choice semantics (durable same-type grants) actually take effect.
 
     Security: only the session owner (the ``sender_id`` that started the
     originating turn, recorded on the approval at request time) may resolve.
-    Any other sender is rejected without resolving. A channel approval forces
-    ``elevated_mode=None`` so it permits one gated command, never session-wide
-    elevation. Returns the reply to send, or ``None`` when the message is not
-    an approval action.
+    Any other sender is rejected without resolving. Cross-session and
+    cross-chat attempts get the same reply as an unknown code — response text
+    must not become a short-code existence oracle — and repeated failed
+    attempts per sender hit a cooldown. The ``always`` decision additionally
+    requires the sender to carry the authenticated channel-admin stamp from
+    ingress — the card payload and raw sender ID are never trusted for that.
+    A plain approval
+    forces ``elevated_mode=None`` so it permits one gated command, never
+    session-wide elevation. Returns the reply to send, or ``None`` when the
+    message is not an approval action.
     """
-    from opensquilla.channels.approval_prompt import parse_approval_action, resolve_short_code
+    from opensquilla.channels.approval_prompt import (
+        DECISION_ALWAYS,
+        DECISION_DENY,
+        parse_approval_action,
+        resolve_short_code,
+    )
 
     parsed = parse_approval_action(msg)
     if parsed is None:
         return None
-    code, approved = parsed
+    code, decision = parsed
+    approved = decision != DECISION_DENY
+
+    provenance = getattr(msg, "provenance", None)
+    principal = getattr(provenance, "principal", None)
+    authenticated = bool(getattr(provenance, "authenticated", False))
+    sender_id = (
+        str(getattr(principal, "subject_id", "") or "").strip()
+        if authenticated
+        else (msg.sender_id or "").strip()
+    )
+    probe_key = _approval_probe_key(session_key, sender_id)
+    if _approval_probe_throttled(probe_key):
+        log.warning(
+            "channel.approval_probe_throttled",
+            session_key=session_key,
+            sender_id=sender_id,
+        )
+        # Constant reply regardless of the attempted code: a throttled probe
+        # must learn nothing about code validity.
+        return OutgoingMessage(
+            content=render_channel_message("approval_probe_throttled", config=config)
+        )
+
     binding = resolve_short_code(code)
     if binding is None:
         log.info("channel.approval_unknown_code", code=code, session_key=session_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        _record_approval_probe_failure(probe_key)
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
 
-    sender_id = (msg.sender_id or "").strip()
+    # Cross-session and cross-chat attempts reuse the unknown-code reply on
+    # purpose: distinct texts would confirm that a guessed code is live and
+    # leak where it originates.
+    if binding.session_key and binding.session_key != session_key:
+        log.warning(
+            "channel.approval_session_mismatch",
+            code=code,
+            session_key=session_key,
+        )
+        _record_approval_probe_failure(probe_key)
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
+
+    if binding.origin_channel_id and msg.channel_id != binding.origin_channel_id:
+        log.warning(
+            "channel.approval_origin_mismatch",
+            code=code,
+            session_key=session_key,
+            channel_id=msg.channel_id,
+        )
+        _record_approval_probe_failure(probe_key)
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
+
     if not sender_id or sender_id != binding.owner_sender_id:
+        # Reaching this check requires matching the binding's session AND
+        # origin chat — where the prompt already displays the code — so the
+        # helpful reply reveals nothing that chat cannot already see.
         log.warning(
             "channel.approval_owner_mismatch",
             code=code,
             session_key=session_key,
             sender_id=sender_id,
         )
+        _record_approval_probe_failure(probe_key)
         return OutgoingMessage(
-            content=(
-                "Only the session owner can resolve this. "
-                f"Ask them to reply /approve {code}."
+            content=render_channel_message(
+                "approval_owner_only",
+                config=config,
+                code=code,
+            )
+        )
+
+    if decision == DECISION_ALWAYS and not has_verified_channel_admin_stamp(route_envelope):
+        log.warning(
+            "channel.approval_always_requires_admin",
+            code=code,
+            session_key=session_key,
+            sender_id=sender_id,
+        )
+        return OutgoingMessage(
+            content=render_channel_message(
+                "approval_always_requires_admin",
+                config=config,
+                code=code,
             )
         )
 
@@ -689,27 +1203,178 @@ def _maybe_resolve_channel_approval(
 
     queue = get_approval_queue()
     try:
-        # Force elevated_mode=None: a channel approval permits exactly the one
-        # gated command, never a session-wide bypass regardless of payload.
-        queue.resolve(binding.approval_id, approved, elevated_mode=None)
+        reply = await _resolve_channel_approval_decision(
+            queue,
+            approval_id=binding.approval_id,
+            code=code,
+            decision=decision,
+            approved=approved,
+            config=config,
+            session_manager=session_manager,
+        )
     except KeyError:
         log.info("channel.approval_expired", code=code, session_key=session_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
+    except _SandboxChoiceError as exc:
+        # Malformed/incompatible choice payload — nothing was claimed, the
+        # approval is genuinely still pending (distinct from the resolved
+        # race below, which must stay idempotent).
+        log.warning(
+            "channel.approval_choice_invalid",
+            code=code,
+            session_key=session_key,
+            error=str(exc),
+        )
+        return OutgoingMessage(
+            content=render_channel_message("approval_invalid_choice", config=config, code=code)
+        )
     except ValueError:
         # Already resolved (race) — report idempotently rather than erroring.
         log.info("channel.approval_already_resolved", code=code, session_key=session_key)
-        return OutgoingMessage(content=f"Approval {code} was already resolved.")
+        return OutgoingMessage(
+            content=render_channel_message(
+                "approval_already_resolved", config=config, code=code
+            )
+        )
+    except Exception:
+        # Transient storage/session failures (e.g. a busy SQLite write while
+        # applying a grant) must not escape into the dispatch loop and burn
+        # the channel's restart budget. The decision helper reopens/releases
+        # queue state on failure, so the approval is still pending.
+        log.exception(
+            "channel.approval_resolution_failed",
+            code=code,
+            session_key=session_key,
+        )
+        return OutgoingMessage(
+            content=render_channel_message(
+                "approval_resolution_failed",
+                config=config,
+                code=code,
+            )
+        )
 
     log.info(
         "channel.approval_resolved",
         code=code,
         approved=approved,
+        always=decision == DECISION_ALWAYS,
         session_key=session_key,
         sender_id=sender_id,
     )
-    if approved:
-        return OutgoingMessage(content=f"Approved {code} — running …")
-    return OutgoingMessage(content=f"Denied {code}.")
+    return reply
+
+
+def _sender_is_channel_admin(config: Any, channel_name: str, sender_id: str) -> bool:
+    admin_senders = getattr(config, "channel_admin_senders", None)
+    if not isinstance(admin_senders, dict) or not channel_name or not sender_id:
+        return False
+    return sender_is_channel_admin(sender_id, configured=admin_senders.get(channel_name))
+
+
+async def _resolve_channel_approval_decision(
+    queue: Any,
+    *,
+    approval_id: str,
+    code: str,
+    decision: str,
+    approved: bool,
+    config: Any,
+    session_manager: Any,
+) -> OutgoingMessage:
+    """Apply one parsed approval decision to the queue.
+
+    Sandbox-kind approvals replay the Web UI resolver's claim → finalize →
+    apply-choice → complete sequence so ``always`` (``allow_same_type``)
+    produces its durable grant; everything else keeps the original single
+    ``resolve()``. Raises ``KeyError``/``ValueError`` exactly like
+    ``queue.resolve`` so the caller's reply mapping stays unchanged.
+    """
+    from opensquilla.channels.approval_prompt import DECISION_ALWAYS
+    from opensquilla.sandbox.escalation import (
+        apply_sandbox_approval_choice,
+        deny_matching_pending_sandbox_approvals,
+        is_sandbox_approval_kind,
+        remember_sandbox_approval_denial,
+        validate_sandbox_approval_choice,
+    )
+
+    pending = queue.get(approval_id)
+    sandbox_approval = is_sandbox_approval_kind(pending.params.get("approvalKind"))
+    choice: str | None = None
+    if sandbox_approval and approved:
+        # Sandbox kinds refuse empty choices, so a plain Approve must select
+        # the primary one-shot choice explicitly; "always" selects the
+        # durable same-type grant.
+        choice = "allow_same_type" if decision == DECISION_ALWAYS else "allow_once"
+        try:
+            validate_sandbox_approval_choice(pending.params, choice=choice, approved=True)
+        except ValueError as exc:
+            # Nothing has been claimed yet — surface this as a validation
+            # failure, NOT as the caller's already-resolved ValueError race.
+            raise _SandboxChoiceError(str(exc)) from exc
+        claim_token = queue.claim_resolution(approval_id)
+        try:
+            queue.finalize_claimed_resolution(
+                approval_id,
+                claim_token,
+                True,
+                elevated_mode=None,
+            )
+        except Exception:
+            queue.release_resolution_claim(approval_id, claim_token)
+            raise
+        try:
+            await apply_sandbox_approval_choice(
+                pending.params,
+                approval_id=approval_id,
+                choice=choice,
+                approved=True,
+                session_manager=session_manager,
+                config=config,
+            )
+        except Exception:
+            queue.reopen_resolved_approval(approval_id, expected_approved=True)
+            raise
+        queue.complete_claimed_resolution(approval_id, claim_token)
+    else:
+        # Force elevated_mode=None: a channel approval permits exactly the one
+        # gated command, never a session-wide bypass regardless of payload.
+        queue.resolve(
+            approval_id,
+            approved,
+            elevated_mode=None,
+            allow_idempotent=not sandbox_approval,
+        )
+        if sandbox_approval and not approved:
+            remember_sandbox_approval_denial(pending.params, approval_id)
+            deny_matching_pending_sandbox_approvals(
+                queue,
+                pending.params,
+                exclude_approval_id=approval_id,
+            )
+
+    if not approved:
+        return OutgoingMessage(
+            content=render_channel_message("approval_denied", config=config, code=code)
+        )
+    if choice == "allow_same_type":
+        return OutgoingMessage(
+            content=render_channel_message(
+                "approval_approved_always",
+                config=config,
+                code=code,
+            )
+        )
+    return OutgoingMessage(
+        content=render_channel_message(
+            "approval_approved_once",
+            config=config,
+            code=code,
+        )
+    )
 
 
 async def _dispatch_channel_slash_command(
@@ -721,6 +1386,7 @@ async def _dispatch_channel_slash_command(
     session_prefix: str,
     rpc_dispatcher: Any,
     context_factory: Callable[[Any], Any],
+    config: Any = None,
 ) -> OutgoingMessage | None:
     from opensquilla.channels.command_registry import DEFAULT_COMMAND_REGISTRY
 
@@ -730,7 +1396,7 @@ async def _dispatch_channel_slash_command(
         if head is None:
             return None
         return _route_envelope_reply_message(
-            f"Unsupported command: {head}. Try /help.",
+            render_channel_message("command_unsupported", config=config, command=head),
             route_envelope,
             metadata={"command": head[1:].lower(), "method": None, "unsupported": True},
         )
@@ -745,6 +1411,7 @@ async def _dispatch_channel_slash_command(
             session_prefix=session_prefix,
             rpc_dispatcher=rpc_dispatcher,
             context_factory=context_factory,
+            config=config,
         )
 
     reply = await DEFAULT_COMMAND_REGISTRY.dispatch(
@@ -752,6 +1419,7 @@ async def _dispatch_channel_slash_command(
         message_content=msg.content,
         rpc_dispatcher=rpc_dispatcher,
         context_factory=context_factory,
+        config=config,
     )
     if reply is None:
         return None
@@ -767,6 +1435,7 @@ async def _dispatch_channel_new_command(
     session_prefix: str,
     rpc_dispatcher: Any,
     context_factory: Callable[[Any], Any],
+    config: Any = None,
 ) -> OutgoingMessage:
     from opensquilla.channels.command_registry import DEFAULT_COMMAND_REGISTRY
     from opensquilla.gateway.scopes import WRITE_SCOPE, authorize_call
@@ -780,11 +1449,17 @@ async def _dispatch_channel_new_command(
         getattr(principal, "scopes", frozenset()),
     )
     if not allowed:
-        detail = f": missing {missing}" if missing else ""
+        detail = (
+            render_channel_message("command_missing_scope", config=config, missing=missing)
+            if missing
+            else ""
+        )
         return _route_envelope_reply_message(
-            (
-                "/new denied: Insufficient scope for method: "
-                f"sessions.reset{detail}"
+            render_channel_message(
+                "command_new_denied",
+                config=config,
+                method="sessions.reset",
+                detail=detail,
             ),
             route_envelope,
             metadata={"command": "new", "method": "sessions.reset", "denied": True},
@@ -802,10 +1477,11 @@ async def _dispatch_channel_new_command(
         message_content=msg.content,
         rpc_dispatcher=rpc_dispatcher,
         context_factory=lambda _envelope: ctx,
+        config=config,
     )
     if reply is None:
         return _route_envelope_reply_message(
-            "/new failed: command unavailable",
+            render_channel_message("command_new_unavailable", config=config),
             route_envelope,
             metadata={"command": "new", "method": "sessions.reset", "denied": False},
         )
@@ -813,35 +1489,57 @@ async def _dispatch_channel_new_command(
 
 
 # fmt: off
-async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any, turn_runner: Any, session_manager: Any, session_key: str, session_prefix: str, task_runtime: Any, config: Any = None, event_bridge: EventBridge | None = None, _in_flight: _ChannelInFlightSet | None = None, channel_rpc_context_factory: Callable[[Any], Any] | None = None) -> None:  # noqa: E501
+async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any, turn_runner: Any, session_manager: Any, session_key: str, session_prefix: str, task_runtime: Any, config: Any = None, event_bridge: EventBridge | None = None, _in_flight: _ChannelInFlightSet | None = None, channel_rpc_context_factory: Callable[[Any], Any] | None = None, admission_decision: ChannelAdmissionDecision | None = None, busy_input_mode: str = "followup") -> None:  # noqa: E501
     from opensquilla.gateway.routing import build_channel_route_envelope
 
     msg = combined.message
+    admission = admission_decision or decide_channel_admission(
+        channel,
+        msg,
+        session_key,
+        config=config,
+        channel_name=session_prefix,
+    )
+    if not admission.admit:
+        log.info("channel.admission_denied", channel=session_prefix, reason=admission.reason, is_group=admission.is_group)  # noqa: E501
+        return
     route_envelope = build_channel_route_envelope(msg, session_key=session_key, session_prefix=session_prefix)  # noqa: E501
-    approval_reply = _maybe_resolve_channel_approval(msg=msg, session_key=session_key)
+    principal_is_owner = _stamp_channel_admin_principal(config, route_envelope, msg)
+    approval_reply = await _maybe_resolve_channel_approval(
+        msg=msg,
+        session_key=session_key,
+        config=config,
+        session_manager=session_manager,
+        route_envelope=route_envelope,
+    )
     if approval_reply is not None:
         await channel.send(_preserve_route_channel_metadata(approval_reply, route_envelope))
         return
     _get_lock = getattr(turn_runner, "_get_session_lock", None)
     session_lock = _get_lock(session_key) if callable(_get_lock) else None
+    atomic_channel_acceptance = _supports_atomic_channel_acceptance(
+        session_manager,
+        task_runtime,
+    )
     async with _maybe_lock(session_lock):
-        await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
-
-        if _should_skip_unmentioned(channel, msg, session_key):
-            return
+        # Mention gating already ran via the admission decision at the top of
+        # this function; denied messages never reach this point.
+        if not atomic_channel_acceptance:
+            await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
 
     await _apply_saved_channel_run_context(
         route_envelope,
         session_manager=session_manager,
         config=config,
         workspace_dir=None,
-        principal_is_owner=_is_channel_admin_sender(config, route_envelope),
+        principal_is_owner=principal_is_owner,
     )
 
     ingested = await _ingest_channel_message_attachments(channel=channel, msg=msg, config=config)
 
-    async with _maybe_lock(session_lock):
-        await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+    if not atomic_channel_acceptance:
+        async with _maybe_lock(session_lock):
+            await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
 
     status_reactor = _status_reactor(channel)
     await status_reactor.received(msg)
@@ -877,25 +1575,41 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         _reservation_token = None  # type: ignore[assignment]
 
     transcript_watermark = await _transcript_watermark(session_manager, session_key)
-    stream_relay = _RuntimeChannelStreamRelay.maybe_start(channel, msg, task_runtime, config)
-    # Ghost-turn fix: enqueue BEFORE appending to transcript (same as
-    # run_channel_dispatch). On TaskQueueFullError, transcript is not written.
-    # Reservation is released in the finally block below regardless of outcome.
+    stream_relay = None
+    replayed = False
     try:
-        async with _maybe_lock(session_lock):
-            channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
-            if channel_overflow_policy is not None:
-                apply_policy = getattr(task_runtime, "apply_overflow_policy", None)
-                if callable(apply_policy):
-                    await apply_policy(session_key, policy=channel_overflow_policy)
-            handle = await start_turn_via_runtime(task_runtime, route_envelope, msg.content, attachments=ingested.attachments, mode="followup", run_kind="channel_turn", semantic_message=raw_content, stream_event_sink=stream_relay.emit if stream_relay is not None else None)  # noqa: E501
-            _persisted, persisted_content = await _append_channel_user_message(
-                session_manager=session_manager,
-                session_key=session_key,
-                text=ingested.text,
-                attachments=ingested.attachments,
-                config=config,
-            )
+        async with _channel_acceptance_lock(
+            session_lock,
+            atomic=atomic_channel_acceptance,
+        ):
+            if atomic_channel_acceptance:
+                handle, persisted_content, stream_relay, replayed = await _accept_channel_runtime_turn(  # noqa: E501
+                    channel=channel,
+                    msg=msg,
+                    session_manager=session_manager,
+                    session_key=session_key,
+                    route_envelope=route_envelope,
+                    task_runtime=task_runtime,
+                    ingested=ingested,
+                    raw_content=raw_content,
+                    config=config,
+                    busy_input_mode=busy_input_mode,
+                )
+            else:
+                stream_relay = _RuntimeChannelStreamRelay.maybe_start(channel, msg, task_runtime, config)  # noqa: E501
+                channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
+                if channel_overflow_policy is not None:
+                    apply_policy = getattr(task_runtime, "apply_overflow_policy", None)
+                    if callable(apply_policy):
+                        await apply_policy(session_key, policy=channel_overflow_policy)
+                handle = await start_turn_via_runtime(task_runtime, route_envelope, msg.content, attachments=ingested.attachments, mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode), run_kind="channel_turn", semantic_message=raw_content, stream_event_sink=stream_relay.emit if stream_relay is not None else None)  # noqa: E501
+                _persisted, persisted_content = await _append_channel_user_message(
+                    session_manager=session_manager,
+                    session_key=session_key,
+                    text=ingested.text,
+                    attachments=ingested.attachments,
+                    config=config,
+                )
             msg.content = persisted_content
     except Exception as exc:
         if _in_flight is not None and _reservation_token is not None:
@@ -903,6 +1617,40 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         if stream_relay is not None:
             await stream_relay.close()
 
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
+        from opensquilla.session.storage import (
+            StaleEpochError,
+            StorageBusyError,
+            TurnIngressConflictError,
+        )
+
+        if isinstance(exc, StorageBusyError):
+            await status_reactor.failed(msg)
+            await channel.send(_route_envelope_reply_message("Session storage is busy. Please retry these messages.", route_envelope))  # noqa: E501
+            return
+        if isinstance(exc, StaleEpochError):
+            await status_reactor.failed(msg)
+            await channel.send(_route_envelope_reply_message("The session changed while accepting these messages. Please retry.", route_envelope))  # noqa: E501
+            return
+        if isinstance(exc, TurnIngressConflictError):
+            await status_reactor.failed(msg)
+            log.warning("channel.ingress_idempotency_conflict", session_key=session_key)
+            await channel.send(_route_envelope_reply_message("This channel message id was already used; the duplicate was ignored.", route_envelope))  # noqa: E501
+            return
+        if isinstance(exc, ProjectWorkspaceStateError):
+            await status_reactor.failed(msg)
+            workspace_message = (
+                "Project workspace not found. Restore it and retry."
+                if exc.reason in {"not_found", "removed"}
+                else "The project workspace is unavailable. Restore access and retry."
+            )
+            await channel.send(
+                _route_envelope_reply_message(
+                    workspace_message,
+                    route_envelope,
+                )
+            )
+            return
         if isinstance(exc, TaskQueueFullError):
             await status_reactor.failed(msg)
             log.warning("channel_dispatch.debounce_enqueue_failed", session_key=session_key, reason="queue_full", coalesced_count=combined.coalesced_count)  # noqa: E501
@@ -912,15 +1660,23 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         await status_reactor.failed(msg)
         return
 
+    if replayed and handle is None:
+        if _in_flight is not None and _reservation_token is not None:
+            _in_flight.release(_reservation_token)
+        await status_reactor.completed(msg)
+        return
+    assert handle is not None
+
     # Enqueue succeeded — release the placeholder reservation now that the real
     # reply delivery will proceed (it doesn't use _in_flight in this path).
     if _in_flight is not None and _reservation_token is not None:
         _in_flight.release(_reservation_token)
 
-    await status_reactor.running(msg)
-    typing_task = _start_typing_keepalive(channel, msg)
+    if not replayed:
+        await status_reactor.running(msg)
+    typing_task = None if replayed else _start_typing_keepalive(channel, msg)
     try:
-        await _deliver_runtime_channel_reply(channel=channel, task_runtime=task_runtime, session_manager=session_manager, session_key=session_key, task_id=handle.task_id, route_envelope=route_envelope, inbound=msg, transcript_watermark=transcript_watermark, config=config, stream_relay=stream_relay)  # noqa: E501
+        await _deliver_runtime_channel_reply(channel=channel, task_runtime=task_runtime, session_manager=session_manager, session_key=session_key, task_id=handle.task_id, route_envelope=route_envelope, inbound=msg, transcript_watermark=transcript_watermark, replayed=replayed, config=config, stream_relay=stream_relay)  # noqa: E501
     finally:
         if typing_task is not None:
             typing_task.cancel()
@@ -992,7 +1748,7 @@ async def _apply_saved_channel_run_context(
     workspace_dir: str | None,
     principal_is_owner: bool,
 ) -> None:
-    """Attach saved sandbox run context to a channel route when one exists."""
+    """Attach the effective saved or global sandbox context to a channel route."""
     if route_envelope is None or session_manager is None or config is None:
         return
     try:
@@ -1005,14 +1761,16 @@ async def _apply_saved_channel_run_context(
             config=config,
             workspace=workspace_dir,
         )
+    except KeyError:
+        # First channel message: the atomic acceptance path has intentionally
+        # not created the session yet, so no saved context can exist.
+        return
     except Exception as exc:  # pragma: no cover - defensive channel path
         log.warning(
             "channel_dispatch.run_context_load_failed",
             session_key=getattr(route_envelope, "session_key", ""),
             error_type=type(exc).__name__,
         )
-        return
-    if getattr(run_context, "source", "") != "saved":
         return
     _apply_run_context_route_metadata(
         route_envelope,
@@ -1047,36 +1805,7 @@ async def resolve_delivery_target(
     }
 
 
-# ── Gap 2: Mention gating ────────────────────────────────────────────────
-
-
-_MENTION_GATE_WARNED: dict[int, weakref.ReferenceType[Any] | None] = {}
-
-
-def _warn_missing_mention_hook(channel: Any) -> None:
-    """Emit one warning per channel instance for adapters lacking the hook."""
-    key = id(channel)
-    existing = _MENTION_GATE_WARNED.get(key)
-    if existing is None and key in _MENTION_GATE_WARNED:
-        return
-    if existing is not None:
-        existing_channel = existing()
-        if existing_channel is channel:
-            return
-        if existing_channel is None:
-            _MENTION_GATE_WARNED.pop(key, None)
-
-    def _forget_warned_channel(_ref: weakref.ReferenceType[Any], key: int = key) -> None:
-        _MENTION_GATE_WARNED.pop(key, None)
-
-    try:
-        _MENTION_GATE_WARNED[key] = weakref.ref(channel, _forget_warned_channel)
-    except TypeError:
-        _MENTION_GATE_WARNED[key] = None
-    log.warning(
-        "channel.mention_gate_default_deny",
-        channel_type=type(channel).__name__,
-    )
+# ── Gap 2: Authenticated admission / mention gating ─────────────────────
 
 
 def _should_skip_unmentioned(
@@ -1084,60 +1813,9 @@ def _should_skip_unmentioned(
     msg: IncomingMessage,
     session_key: str,
 ) -> bool:
-    """Return True when channel policy says to skip this inbound message.
+    """Compatibility wrapper around the shared pre-dispatch admission decision."""
 
-    Adapters that declare ``ChannelAccessPolicy`` can choose closed groups,
-    open groups, or mention-only groups. Mention-only groups still fail closed
-    if the adapter forgot to implement ``is_group_mentioned``.
-    """
-    from opensquilla.session.keys import derive_chat_type
-
-    is_group = derive_chat_type(session_key) == "group"
-    policy = getattr(channel, "policy", None)
-    if isinstance(policy, ChannelAccessPolicy):
-        if not is_group:
-            decision = evaluate_policy(
-                policy,
-                is_group=False,
-                mentioned=False,
-                sender_id=msg.sender_id,
-            )
-            return not decision.admit
-        if not policy.group_allowed:
-            decision = evaluate_policy(
-                policy,
-                is_group=True,
-                mentioned=False,
-                sender_id=msg.sender_id,
-            )
-            return not decision.admit
-        if not policy.mention_required_in_group:
-            decision = evaluate_policy(
-                policy,
-                is_group=True,
-                mentioned=True,
-                sender_id=msg.sender_id,
-            )
-            return not decision.admit
-
-    if not is_group:
-        return False  # DMs always processed for legacy adapters.
-
-    hook = getattr(channel, "is_group_mentioned", None)
-    if not callable(hook):
-        _warn_missing_mention_hook(channel)
-        return True  # fail-closed: missing mention hook on a group channel
-
-    mentioned = bool(hook(msg))
-    if isinstance(policy, ChannelAccessPolicy):
-        decision = evaluate_policy(
-            policy,
-            is_group=True,
-            mentioned=mentioned,
-            sender_id=msg.sender_id,
-        )
-        return not decision.admit
-    return not mentioned
+    return not decide_channel_admission(channel, msg, session_key).admit
 
 
 # ── Gap 3: Typing indicator ──────────────────────────────────────────────
@@ -1228,23 +1906,51 @@ async def _emit_run_heartbeat(
 
 
 def _is_channel_admin_sender(config: Any, envelope: Any) -> bool:
-    admin_senders = getattr(config, "channel_admin_senders", None)
-    if not isinstance(admin_senders, dict):
-        return False
+    """Compatibility matcher for callers that only have a route envelope.
+
+    This helper intentionally does not authorize a turn.  Channel dispatch
+    uses ``_stamp_channel_admin_principal`` below, which also proves the
+    authenticated ingress principal.
+    """
 
     source_name = getattr(envelope, "source_name", None)
     sender_id = getattr(envelope, "sender_id", None)
-    if not isinstance(source_name, str) or not source_name:
+    if not isinstance(source_name, str) or not isinstance(sender_id, str):
         return False
-    if not isinstance(sender_id, str) or not sender_id:
-        return False
+    return _sender_is_channel_admin(config, source_name, sender_id)
 
-    configured = admin_senders.get(source_name)
-    if isinstance(configured, str):
-        return sender_id == configured
-    if not isinstance(configured, list | tuple | set | frozenset):
-        return False
-    return sender_id in {str(item) for item in configured}
+
+def _stamp_channel_admin_principal(
+    config: Any,
+    envelope: Any,
+    msg: IncomingMessage,
+) -> bool:
+    """Persist authenticated channel-admin standing on an accepted route.
+
+    TaskRuntime runs after ingress has returned, so it cannot consult the
+    mutable channel configuration safely or infer ownership from a session key.
+    Record only the result of the authenticated ingress check here; raw
+    adapter metadata and a configured sender ID alone are never authorization
+    sources.
+    """
+    source_kind = getattr(envelope, "source_kind", None)
+    source_kind_value = getattr(source_kind, "value", source_kind)
+    source_name = getattr(envelope, "source_name", None)
+    route_sender_id = getattr(envelope, "sender_id", None)
+    is_owner = bool(
+        source_kind_value == "channel"
+        and route_sender_id == msg.sender_id
+        and is_authenticated_channel_admin(
+            config,
+            channel_name=source_name if isinstance(source_name, str) else None,
+            msg=msg,
+        )
+    )
+    metadata = getattr(envelope, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata["principal_is_owner"] = is_owner
+        metadata[CHANNEL_ADMIN_VERIFIED_METADATA_KEY] = is_owner
+    return is_owner
 
 
 async def _run_turn_with_streaming(
@@ -1257,6 +1963,7 @@ async def _run_turn_with_streaming(
     config: Any = None,
     route_envelope: Any = None,
     attachments: list[dict[str, Any]] | None = None,
+    session_manager: Any = None,
 ) -> None:
     """Run the agent turn, sending reply via streaming or batch.
 
@@ -1269,11 +1976,15 @@ async def _run_turn_with_streaming(
     text visible.  Pre-stream errors send a standalone error message.
     """
     from opensquilla.agents.scope import resolve_agent_workspace_dir
+    from opensquilla.gateway.project_workspace_runtime import (
+        authoritative_project_run_context,
+    )
     from opensquilla.gateway.routing import build_channel_route_envelope, tool_context_from_envelope
+    from opensquilla.gateway.session_services import get_session_storage
     from opensquilla.session.keys import parse_agent_id
 
     agent_id = parse_agent_id(session_key)
-    workspace_dir = resolve_agent_workspace_dir(agent_id, config)
+    workspace_dir: Path | str | None = resolve_agent_workspace_dir(agent_id, config)
     workspace_strict = getattr(config, "workspace_strict", None)
     if not isinstance(workspace_strict, bool):
         workspace_strict = bool(workspace_dir)
@@ -1283,10 +1994,39 @@ async def _run_turn_with_streaming(
         session_prefix=getattr(channel, "channel_id", None) or "unknown",
         agent_id=agent_id,
     )
+    principal_is_owner = _stamp_channel_admin_principal(config, envelope, msg)
+    storage = get_session_storage(session_manager)
+    if storage is not None:
+        session = await storage.get_session(session_key)
+        if session is None:
+            raise KeyError(f"Session not found: {session_key}")
+        run_context, workspace_guard = await authoritative_project_run_context(
+            storage=storage,
+            session_manager=session_manager,
+            session=session,
+            config=config,
+            default_workspace=(str(workspace_dir) if workspace_dir is not None else None),
+        )
+        from opensquilla.gateway.rpc_sessions import (
+            _apply_run_context_route_metadata,
+        )
+
+        _apply_run_context_route_metadata(
+            envelope,
+            run_context,
+            principal_is_owner=principal_is_owner,
+        )
+        if run_context.workspace is not None:
+            workspace_dir = run_context.workspace
+        if workspace_guard is not None and not isinstance(
+            getattr(config, "workspace_strict", None),
+            bool,
+        ):
+            workspace_strict = True
     tool_ctx = tool_context_from_envelope(
         envelope,
-        is_owner=_is_channel_admin_sender(config, envelope),
-        workspace_dir=str(workspace_dir),
+        is_owner=principal_is_owner,
+        workspace_dir=(str(workspace_dir) if workspace_dir is not None else None),
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),
     )
@@ -1336,7 +2076,7 @@ def _route_envelope_reply_message(
     """Build a reply that preserves channel id when targeting a thread id."""
     channel_id = getattr(route_envelope, "channel_id", None)
     thread_id = getattr(route_envelope, "thread_id", None)
-    merged_metadata = dict(metadata or {})
+    merged_metadata = _merge_route_reply_metadata(metadata, route_envelope)
     if thread_id and channel_id:
         merged_metadata.setdefault("channel", channel_id)
     return _sanitize_outgoing_message(
@@ -1348,25 +2088,47 @@ def _route_envelope_reply_message(
     )
 
 
+_INTERACTION_REPLY_METADATA_KEYS = (
+    "interaction_token",
+    "application_id",
+    "interaction_deferred",
+)
+
+
+def _merge_route_reply_metadata(
+    metadata: dict[str, Any] | None,
+    route_envelope: Any,
+) -> dict[str, Any]:
+    """Merge only provider callback fields that are safe for an interaction reply."""
+
+    merged = dict(metadata or {})
+    route_metadata = getattr(route_envelope, "metadata", None)
+    if not isinstance(route_metadata, dict):
+        return merged
+    for key in _INTERACTION_REPLY_METADATA_KEYS:
+        value = route_metadata.get(key)
+        if key == "interaction_deferred":
+            if isinstance(value, bool):
+                merged.setdefault(key, value)
+        elif isinstance(value, str) and value:
+            merged.setdefault(key, value)
+    return merged
+
+
 def _preserve_route_channel_metadata(
     reply: OutgoingMessage,
     route_envelope: Any,
 ) -> OutgoingMessage:
-    """Add route channel metadata to thread-targeted replies when needed."""
+    """Preserve thread and allowlisted interaction reply routing metadata."""
+
     channel_id = getattr(route_envelope, "channel_id", None)
     thread_id = getattr(route_envelope, "thread_id", None)
-    if not channel_id or not thread_id or reply.reply_to != thread_id:
+    metadata = _merge_route_reply_metadata(reply.metadata, route_envelope)
+    if channel_id and thread_id and reply.reply_to == thread_id:
+        metadata.setdefault("channel", channel_id)
+    if metadata == reply.metadata:
         return _sanitize_outgoing_message(reply)
-    metadata = dict(reply.metadata or {})
-    metadata.setdefault("channel", channel_id)
-    return _sanitize_outgoing_message(
-        OutgoingMessage(
-            content=reply.content,
-            attachments=list(reply.attachments),
-            metadata=metadata,
-            reply_to=reply.reply_to,
-        )
-    )
+    return _sanitize_outgoing_message(reply.model_copy(update={"metadata": metadata}))
 
 
 def _status_reactor(channel: Any) -> Any:
@@ -1432,6 +2194,11 @@ class _RuntimeChannelStreamRelay:
         self.delivered_artifact_keys: set[str] = set()
         self._task: asyncio.Task[Any] | None = None
         self._closed = False
+        self._live_preview = _channel_can_replace_streamed_text(channel)
+        self._text_deltas: list[str] = []
+        self._done_snapshot_present = False
+        self._done_snapshot_text = ""
+        self._stream_handle: _StreamedMessageHandle | None = None
         self.text_emitted = False
         self.stream_error: BaseException | None = None
         # Buffer of chunks already yielded to ``send_streaming``. If the
@@ -1444,7 +2211,7 @@ class _RuntimeChannelStreamRelay:
         self._coalesce_chars = coalesce_chars
 
     @classmethod
-    def maybe_start(
+    def maybe_create(
         cls,
         channel: Any,
         inbound: IncomingMessage,
@@ -1456,16 +2223,35 @@ class _RuntimeChannelStreamRelay:
         enqueue = getattr(task_runtime, "enqueue", None)
         if not callable(enqueue) or not _accepts_keyword_arg(enqueue, "stream_event_sink"):
             return None
-        relay = cls(channel, inbound, config)
-        relay._task = asyncio.create_task(relay._run())
+        return cls(channel, inbound, config)
+
+    @classmethod
+    def maybe_start(
+        cls,
+        channel: Any,
+        inbound: IncomingMessage,
+        task_runtime: Any,
+        config: Any = None,
+    ) -> _RuntimeChannelStreamRelay | None:
+        relay = cls.maybe_create(channel, inbound, task_runtime, config)
+        if relay is not None:
+            relay.start()
         return relay
 
+    def start(self) -> None:
+        """Start external streaming only after durable turn acceptance."""
+
+        if self._task is None and not self._closed:
+            self._task = asyncio.create_task(self._run())
+
     async def _run(self) -> Any:
+        reply_kwargs = _streaming_reply_kwargs(self._channel, self._inbound)
         try:
-            return await self._channel.send_streaming(
+            result = await self._channel.send_streaming(
                 self._chunks(),
-                **_streaming_reply_kwargs(self._channel, self._inbound),
+                **reply_kwargs,
             )
+            return _streamed_message_handle(result, reply_kwargs)
         except Exception as exc:  # noqa: BLE001 - streaming is best-effort fallback.
             self.stream_error = exc
             log.warning(
@@ -1497,11 +2283,7 @@ class _RuntimeChannelStreamRelay:
         while True:
             if self._coalesce_chars and size >= self._coalesce_chars:
                 return "".join(buffer), None
-            remaining = (
-                deadline - asyncio.get_event_loop().time()
-                if deadline is not None
-                else None
-            )
+            remaining = deadline - asyncio.get_event_loop().time() if deadline is not None else None
             if remaining is not None and remaining <= 0:
                 return "".join(buffer), None
             try:
@@ -1553,14 +2335,48 @@ class _RuntimeChannelStreamRelay:
         if artifact is not None:
             self._artifacts.append(artifact)
             return
+        snapshot_present, snapshot_text = done_text_snapshot(event)
+        if snapshot_present and (
+            isinstance(event, DoneEvent)
+            or getattr(event, "kind", None) == "done"
+            or (isinstance(event, dict) and event.get("kind") == "done")
+        ):
+            self._done_snapshot_present = True
+            self._done_snapshot_text = snapshot_text
+            return
         text = _text_delta_from_event(event)
         if not text:
             return
         text = _strip_artifact_markers_from_channel_text(text)
         if not text:
             return
-        self.text_emitted = True
-        await self._queue.put(text)
+        self._text_deltas.append(text)
+        if self._live_preview:
+            self.text_emitted = True
+            await self._queue.put(text)
+
+    async def reconcile_final_text(self, text: str) -> bool:
+        """Make the delivered channel message equal one canonical final value."""
+
+        canonical = _sanitize_streamed_channel_text(text)
+        streamed = "".join(self._yielded_chunks)
+        if canonical == streamed:
+            self.text_emitted = bool(canonical)
+            return True
+        replaced = await _replace_streamed_channel_text(
+            self._channel,
+            self._stream_handle,
+            canonical,
+        )
+        if replaced:
+            self._yielded_chunks[:] = [canonical] if canonical else []
+            self._undelivered_index = len(self._yielded_chunks)
+            self.text_emitted = bool(canonical)
+        return replaced
+
+    @property
+    def has_terminal_snapshot(self) -> bool:
+        return self._done_snapshot_present
 
     async def close(self, timeout: float = 10.0) -> None:
         if self._closed:
@@ -1571,8 +2387,14 @@ class _RuntimeChannelStreamRelay:
             if _can_deliver_channel_files(self._channel)
             else _artifact_fallback_lines(self._artifacts)
         )
+        terminal_text = (
+            self._done_snapshot_text if self._done_snapshot_present else "".join(self._text_deltas)
+        )
+        if not self._live_preview and terminal_text:
+            await self._queue.put(terminal_text)
+            self.text_emitted = True
         if artifact_lines:
-            prefix = "\n\n" if self.text_emitted else ""
+            prefix = "\n\n" if terminal_text else ""
             artifact_text = "\n".join(artifact_lines)
             await self._queue.put(f"{prefix}{artifact_text}")
             self.text_emitted = True
@@ -1580,7 +2402,9 @@ class _RuntimeChannelStreamRelay:
         if self._task is None:
             return
         try:
-            await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+            self._stream_handle = await asyncio.wait_for(
+                asyncio.shield(self._task), timeout=timeout
+            )
         except TimeoutError as exc:
             self.stream_error = exc
             self._task.cancel()
@@ -1588,6 +2412,18 @@ class _RuntimeChannelStreamRelay:
                 await self._task
         except Exception as exc:  # noqa: BLE001 - error already becomes batch fallback.
             self.stream_error = exc
+
+        if self.stream_error is None and self._done_snapshot_present:
+            canonical_with_artifacts = _sanitize_streamed_channel_text(terminal_text)
+            if artifact_lines:
+                artifact_text = "\n".join(artifact_lines)
+                canonical_with_artifacts = "\n\n".join(
+                    part for part in (canonical_with_artifacts, artifact_text) if part
+                )
+            if not await self.reconcile_final_text(canonical_with_artifacts):
+                self.stream_error = RuntimeError(
+                    "streamed channel reply could not apply terminal text snapshot"
+                )
 
         # Per-event delivery fallback: when send_streaming raised mid-stream,
         # any chunk that was queued but never reached the consumer must
@@ -1606,9 +2442,7 @@ class _RuntimeChannelStreamRelay:
                     continue
                 if isinstance(item, str):
                     queued_remainder.append(item)
-            undelivered_yielded = "".join(
-                self._yielded_chunks[self._undelivered_index :]
-            )
+            undelivered_yielded = "".join(self._yielded_chunks[self._undelivered_index :])
             fallback_text = undelivered_yielded + "".join(queued_remainder)
             if fallback_text:
                 try:
@@ -1737,16 +2571,24 @@ def _tool_result_payload(event: ToolResultEvent) -> dict[str, Any]:
 
 
 def _clarify_tool_arguments(event: ToolResultEvent) -> dict[str, Any] | None:
-    args = event.arguments
-    if not isinstance(args, dict):
-        return None
-    schema = args.get("clarify_schema")
-    if (
-        args.get("kind") == "user_input"
-        and args.get("paused") is True
-        and isinstance(schema, dict)
-    ):
-        return args
+    candidates: list[Any] = [event.arguments]
+    if isinstance(event.result, str):
+        try:
+            candidates.append(json.loads(event.result))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    else:
+        candidates.append(event.result)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        schema = candidate.get("clarify_schema")
+        if (
+            candidate.get("kind") == "user_input"
+            and candidate.get("paused") is True
+            and isinstance(schema, dict)
+        ):
+            return candidate
     return None
 
 
@@ -2007,6 +2849,409 @@ async def _ingest_channel_message_attachments(
     return result
 
 
+def _supports_atomic_channel_acceptance(session_manager: Any, task_runtime: Any) -> bool:
+    """Use the durable path only for the concrete production services."""
+
+    from opensquilla.gateway.task_runtime import TaskRuntime
+    from opensquilla.session.storage import SessionStorage
+
+    return isinstance(getattr(session_manager, "storage", None), SessionStorage) and isinstance(
+        task_runtime, TaskRuntime
+    )
+
+
+def _channel_native_request_id(msg: IncomingMessage) -> str | None:
+    metadata = dict(getattr(msg, "metadata", None) or {})
+    if metadata.get("_opensquilla_debounce_native_ids_incomplete") is True:
+        return None
+    aggregate_ids = metadata.get("_opensquilla_debounce_native_message_ids")
+    if isinstance(aggregate_ids, list) and aggregate_ids:
+        normalized = [str(value).strip() for value in aggregate_ids if str(value).strip()]
+        if normalized:
+            digest = hashlib.sha256(
+                json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode()
+            ).hexdigest()
+            return f"debounce:{digest}"
+
+    aliases = (
+        "native_message_id",
+        "message_id",
+        "msg_id",
+        "event_id",
+        "activity_id",
+        "update_id",
+        "ts",
+    )
+    for name in aliases:
+        value = metadata.get(name)
+        if value is not None and str(value).strip():
+            return f"{name}:{str(value).strip()}"
+    return None
+
+
+def _channel_ingress_identity(
+    *,
+    msg: IncomingMessage,
+    route_envelope: Any,
+    session_key: str,
+    raw_content: str,
+) -> Any:
+    from opensquilla.gateway.turn_ingress import request_identity
+
+    source_name = str(getattr(route_envelope, "source_name", None) or "unknown")
+    account_id = str(getattr(route_envelope, "account_id", None) or "default")
+    raw_scope = f"channel:{source_name}:{account_id}"
+    if len(raw_scope) > 256:
+        raw_scope = f"channel:sha256:{hashlib.sha256(raw_scope.encode()).hexdigest()}"
+
+    params: dict[str, Any] = {
+        "message": raw_content,
+        "attachments": [
+            dumped
+            for attachment in list(getattr(msg, "attachments", None) or [])
+            if (dumped := _dump_attachment(attachment)) is not None
+        ],
+        # Deliberately constant: the resolved busy-input mode depends on
+        # channel config and runtime capabilities, so folding it into the
+        # idempotency fingerprint would break replay matching across restarts
+        # and against receipts recorded before the mode was configurable.
+        "queueMode": "followup",
+        "runKind": "channel_turn",
+        "inputProvenance": dict(getattr(route_envelope, "input_provenance", None) or {}),
+    }
+    native_request_id = _channel_native_request_id(msg)
+    if native_request_id is not None:
+        params["clientRequestId"] = native_request_id
+    else:
+        metadata = getattr(msg, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            msg.metadata = metadata
+        fallback = metadata.get("_opensquilla_client_request_id")
+        if isinstance(fallback, str) and fallback:
+            params["clientRequestId"] = fallback
+
+    identity = request_identity(
+        params,
+        request_session_key=session_key,
+        source_scope=raw_scope,
+    )
+    if native_request_id is None:
+        msg.metadata["_opensquilla_client_request_id"] = identity.client_request_id
+        log.warning(
+            "channel.ingress_missing_native_message_id",
+            session_key=session_key,
+            channel_type=getattr(route_envelope, "channel_type", None),
+        )
+    return identity
+
+
+async def _prepare_channel_user_message(
+    *,
+    session_manager: Any,
+    session_key: str,
+    session_node: Any,
+    text: str,
+    attachments: list[dict[str, Any]],
+    config: Any,
+) -> tuple[Any, int, str]:
+    persist_content = text
+    persisted_text = text
+    if attachments:
+        from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
+
+        if hasattr(session_manager, "stamp_user_text"):
+            stamped = session_manager.stamp_user_text(text)
+            if isinstance(stamped, str):
+                persisted_text = stamped
+
+        attachments_cfg = getattr(config, "attachments", None)
+        persist_enabled = bool(getattr(attachments_cfg, "persist_transcripts", True))
+        media_root = media_root_from_config(config)
+        disk_budget = getattr(attachments_cfg, "transcript_disk_budget_bytes", None)
+        session_id = session_key.split(":")[-1] or session_key
+        persist_content, _writes = build_transcript_attachment_envelope(
+            text=persisted_text,
+            attachments=attachments,
+            session_id=session_id,
+            media_root=media_root,
+            persist_enabled=persist_enabled,
+            disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
+        )
+
+    entry, expected_epoch = await session_manager.prepare_message(
+        session_key,
+        role="user",
+        content=persist_content,
+        session_node=session_node,
+    )
+    if not attachments and isinstance(getattr(entry, "content", None), str):
+        persisted_text = entry.content
+    return entry, expected_epoch, persisted_text
+
+
+async def _record_main_delivery_context_after_acceptance(
+    session_manager: Any,
+    *,
+    session_key: str,
+    route_envelope: Any,
+) -> None:
+    """Maintain the main-session delivery fallback after acceptance commits."""
+
+    from opensquilla.gateway.routing import delivery_fields_from_envelope
+    from opensquilla.session.keys import build_main_key, parse_agent_id
+
+    agent_id = parse_agent_id(session_key)
+    main_session_key = build_main_key(agent_id)
+    if main_session_key == session_key:
+        return
+    fields = delivery_fields_from_envelope(route_envelope)
+    try:
+        _main, created = await session_manager.get_or_create(
+            main_session_key,
+            agent_id=agent_id,
+            **fields,
+        )
+        if not created:
+            await session_manager.update(main_session_key, **fields)
+    except Exception:  # noqa: BLE001 - turn acceptance is already durable.
+        log.warning(
+            "channel.main_delivery_context_update_failed",
+            session_key=session_key,
+            exc_info=True,
+        )
+
+
+async def _accept_channel_runtime_turn(
+    *,
+    channel: Any,
+    msg: IncomingMessage,
+    session_manager: Any,
+    session_key: str,
+    route_envelope: Any,
+    task_runtime: Any,
+    ingested: AttachmentIngestResult,
+    raw_content: str,
+    config: Any,
+    busy_input_mode: str = "followup",
+) -> tuple[Any | None, str, _RuntimeChannelStreamRelay | None, bool]:
+    """Atomically accept a channel message, task, and idempotency receipt."""
+
+    from opensquilla.gateway.routing import delivery_fields_from_envelope
+    from opensquilla.gateway.task_runtime import TaskHandle
+    from opensquilla.session.manager import SessionIntent
+    from opensquilla.session.models import AgentTaskStatus
+
+    def _accepted_replay_handle(acceptance: Any) -> TaskHandle | None:
+        """Attach redelivery to any accepted task instead of silently acking it.
+
+        Channel delivery is intentionally at-least-once: if the first inbound
+        coroutine disappears after durable acceptance but before registering
+        its reply waiter, a duplicate native message must be able to wait for
+        the existing queued/running task. Two live waiters can occasionally
+        duplicate an external send, which is safer than losing the reply.
+        """
+
+        task_id = acceptance.receipt.task_id
+        status = acceptance.task_status
+        if task_id is None or status not in {
+            AgentTaskStatus.QUEUED,
+            AgentTaskStatus.RUNNING,
+            AgentTaskStatus.SUCCEEDED,
+            AgentTaskStatus.FAILED,
+            AgentTaskStatus.CANCELLED,
+            AgentTaskStatus.TIMEOUT,
+            AgentTaskStatus.ABANDONED,
+        }:
+            return None
+        return TaskHandle(
+            task_id=task_id,
+            session_key=acceptance.receipt.accepted_session_key,
+            status=status,
+        )
+
+    storage = session_manager.storage
+    identity = _channel_ingress_identity(
+        msg=msg,
+        route_envelope=route_envelope,
+        session_key=session_key,
+        raw_content=raw_content,
+    )
+    existing = await storage.get_turn_ingress_receipt(
+        source_scope=identity.source_scope,
+        request_session_key=identity.request_session_key,
+        client_request_id=identity.client_request_id,
+    )
+    if existing is not None:
+        if existing.receipt.request_fingerprint != identity.request_fingerprint:
+            from opensquilla.session.storage import TurnIngressConflictError
+
+            raise TurnIngressConflictError(
+                "channel message id was already accepted with different content"
+            )
+        return _accepted_replay_handle(existing), msg.content, None, True
+
+    delivery_fields = delivery_fields_from_envelope(route_envelope)
+    intent_plan = await session_manager.prepare_intent(
+        session_key,
+        SessionIntent.CONTINUE,
+        agent_id=route_envelope.agent_id,
+        **delivery_fields,
+    )
+    workspace_guard = None
+    bound_workspace_id = getattr(intent_plan.node, "workspace_id", None)
+    if isinstance(bound_workspace_id, str) and bound_workspace_id:
+        from opensquilla.project_workspaces import (
+            resolve_validated_project_workspace,
+        )
+
+        validated_workspace = await resolve_validated_project_workspace(
+            storage,
+            bound_workspace_id,
+        )
+        workspace_guard = validated_workspace.guard
+    entry, expected_epoch, persisted_text = await _prepare_channel_user_message(
+        session_manager=session_manager,
+        session_key=session_key,
+        session_node=intent_plan.node,
+        text=ingested.text,
+        attachments=ingested.attachments,
+        config=config,
+    )
+    stream_relay = _RuntimeChannelStreamRelay.maybe_create(
+        channel,
+        msg,
+        task_runtime,
+        config,
+    )
+    overflow_policy = _resolve_channel_overflow_policy(channel, config)
+
+    async def _commit_and_activate() -> tuple[
+        Any | None,
+        str,
+        _RuntimeChannelStreamRelay | None,
+        bool,
+    ]:
+        nonlocal stream_relay
+        reservation = await reserve_turn_via_runtime(
+            task_runtime,
+            route_envelope,
+            msg.content,
+            attachments=ingested.attachments,
+            mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
+            run_kind="channel_turn",
+            semantic_message=raw_content,
+            stream_event_sink=(
+                stream_relay.emit if stream_relay is not None else None
+            ),
+            overflow_policy=overflow_policy,
+        )
+        try:
+            acceptance = await storage.accept_turn(
+                entry,
+                expected_epoch=expected_epoch,
+                updated_at=int(time.time() * 1000),
+                task_record=reservation.task_record,
+                source_scope=identity.source_scope,
+                request_session_key=identity.request_session_key,
+                client_request_id=identity.client_request_id,
+                request_fingerprint=identity.request_fingerprint,
+                session_node=intent_plan.node if intent_plan.action == "create" else None,
+                session_updates=delivery_fields,
+                workspace_guard=workspace_guard,
+            )
+        except BaseException:
+            await task_runtime.abort_reservation(reservation)
+            raise
+
+        if acceptance.replayed:
+            await task_runtime.abort_reservation(reservation)
+            return _accepted_replay_handle(acceptance), persisted_text, None, True
+
+        if stream_relay is not None:
+            try:
+                stream_relay.start()
+            except Exception:  # noqa: BLE001 - turn is already accepted.
+                log.warning(
+                    "channel.stream_relay_start_failed",
+                    session_key=session_key,
+                    task_id=acceptance.receipt.task_id,
+                    exc_info=True,
+                )
+                stream_relay = None
+        try:
+            handle = await task_runtime.activate(
+                reservation,
+                persisted_user_message_id=acceptance.receipt.message_id,
+                fresh_user_session=acceptance.fresh_user_session,
+            )
+        except Exception as exc:  # noqa: BLE001 - acceptance already committed.
+            log.error(
+                "channel.turn_activation_failed",
+                session_key=session_key,
+                task_id=acceptance.receipt.task_id,
+                exc_info=True,
+            )
+            if not reservation.activated:
+                try:
+                    await task_runtime.abort_reservation(reservation)
+                except Exception:  # noqa: BLE001 - preserve accepted channel handling.
+                    log.warning(
+                        "channel.turn_activation_abort_failed",
+                        session_key=session_key,
+                        task_id=acceptance.receipt.task_id,
+                        exc_info=True,
+                    )
+            try:
+                await storage.update_agent_task(
+                    acceptance.receipt.task_id,
+                    status="failed",
+                    finished_at=int(time.time() * 1000),
+                    terminal_reason="activation_failed",
+                    error_class=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception:  # noqa: BLE001 - preserve accepted channel handling.
+                log.warning(
+                    "channel.turn_activation_failure_record_failed",
+                    session_key=session_key,
+                    task_id=acceptance.receipt.task_id,
+                    exc_info=True,
+                )
+            handle = TaskHandle(
+                task_id=acceptance.receipt.task_id,
+                session_key=acceptance.receipt.accepted_session_key,
+                status=AgentTaskStatus.FAILED,
+            )
+
+        try:
+            session_manager.notify_message_appended(entry)
+        except Exception:  # noqa: BLE001 - turn is already accepted.
+            log.warning(
+                "channel.post_accept_notify_failed",
+                session_key=session_key,
+                task_id=acceptance.receipt.task_id,
+                exc_info=True,
+            )
+        await _record_main_delivery_context_after_acceptance(
+            session_manager,
+            session_key=session_key,
+            route_envelope=route_envelope,
+        )
+        return handle, persisted_text, stream_relay, False
+
+    async def _commit_with_session_admission() -> tuple[
+        Any | None,
+        str,
+        _RuntimeChannelStreamRelay | None,
+        bool,
+    ]:
+        async with task_runtime.collect_admission(route_envelope.session_key):
+            return await _commit_and_activate()
+
+    return await complete_durable_ingress(_commit_with_session_admission())
+
+
 async def _append_channel_user_message(
     *,
     session_manager: Any,
@@ -2060,6 +3305,48 @@ async def _latest_assistant_text_after(
     return ""
 
 
+async def _replayed_assistant_text(
+    session_manager: Any,
+    session_key: str,
+    task_record: Any,
+) -> str | None:
+    """Resolve the exact assistant row recorded when a channel task completed."""
+
+    details = getattr(task_record, "details", None)
+    if isinstance(details, dict):
+        durable_content = details.get("terminal_assistant_message_content")
+        if isinstance(durable_content, str):
+            return durable_content
+    message_id = details.get("terminal_assistant_message_id") if isinstance(details, dict) else None
+    if not isinstance(message_id, str) or not message_id:
+        return None
+    get_canonical_transcript = getattr(session_manager, "get_canonical_transcript", None)
+    if not callable(get_canonical_transcript):
+        return None
+    try:
+        rows = await get_canonical_transcript(session_key)
+    except Exception:  # noqa: BLE001 - replay falls back to an actionable notice.
+        log.warning(
+            "channel_dispatch.replay_transcript_read_failed",
+            session_key=session_key,
+            task_id=getattr(task_record, "task_id", None),
+            exc_info=True,
+        )
+        return None
+    for row in rows or []:
+        row_message_id = (
+            row.get("message_id") if isinstance(row, dict) else getattr(row, "message_id", None)
+        )
+        if row_message_id != message_id:
+            continue
+        role = row.get("role") if isinstance(row, dict) else getattr(row, "role", None)
+        content = row.get("content") if isinstance(row, dict) else getattr(row, "content", None)
+        if role == "assistant" and isinstance(content, str):
+            return content
+        return None
+    return None
+
+
 def _status_value(value: Any) -> Any:
     return getattr(value, "value", value)
 
@@ -2102,6 +3389,192 @@ def _build_runtime_reply_message(
     return _build_reply_message(channel, content, inbound)
 
 
+#: Attempts for a user-visible reply whose failure class can still succeed.
+#: Small on purpose: the answer is already computed, the user is waiting, and
+#: an unrecoverable channel should surface fast rather than stall the turn.
+_REPLY_SEND_ATTEMPTS: int = 3
+_REPLY_RETRY_BASE_DELAY_S: float = 1.0
+#: Same defensive ceiling the HTTP retry loop applies: a provider's pacing
+#: hint is honored, but cannot hold a finished answer hostage for hours.
+_REPLY_RETRY_MAX_DELAY_S: float = 60.0
+
+#: Failure classes where *any* send to this target fails, so a delivery-failure
+#: notice would fail identically — attempting one just burns another call.
+_REPLY_NOTICE_HOPELESS_CLASSES: frozenset[str] = frozenset({"auth_invalid", "target_missing"})
+
+
+def _reply_retry_delay(error: BaseException, attempt: int) -> float:
+    """Backoff before re-sending a reply, honoring a provider pacing hint."""
+    hint = getattr(error, "retry_after", None)
+    if isinstance(hint, int | float) and not isinstance(hint, bool) and hint >= 0:
+        return min(float(hint), _REPLY_RETRY_MAX_DELAY_S)
+    backoff: float = _REPLY_RETRY_BASE_DELAY_S * (2**attempt)
+    return min(backoff, _REPLY_RETRY_MAX_DELAY_S)
+
+
+async def _send_channel_reply_guarded(
+    channel: Any,
+    message: OutgoingMessage,
+    *,
+    session_key: str,
+) -> str | None:
+    """Deliver a user-visible reply, surviving a provider send failure.
+
+    An unguarded send loses a fully-computed, already-paid-for answer: the
+    reply task dies, the outbox parks the row, and the user is left unable to
+    tell "still thinking" from "gone" — so they re-ask and buy the turn twice.
+
+    Retries are bounded and only for classes that can plausibly succeed later.
+    All attempts share one durable ``delivery_id`` so the outbox keeps a single
+    row per reply whose final state is the true outcome, rather than one row
+    per attempt.
+
+    Returns ``None`` on delivery, else the taxonomy class of the last failure.
+    """
+    metadata = dict(message.metadata or {})
+    metadata.setdefault("delivery_id", uuid.uuid4().hex)
+    message = message.model_copy(update={"metadata": metadata})
+
+    last_class = UNCLASSIFIED_ERROR_CLASS
+    for attempt in range(_REPLY_SEND_ATTEMPTS):
+        try:
+            await channel.send(message)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - provider boundary
+            last_class = classify_channel_send_error(exc)
+            retryable = last_class in REQUIRED_RETRYABLE_ERROR_CLASSES
+            final = attempt == _REPLY_SEND_ATTEMPTS - 1
+            log.warning(
+                "channel_dispatch.reply_send_failed",
+                session_key=session_key,
+                error_class=last_class,
+                error_type=type(exc).__name__,
+                attempt=attempt,
+                will_retry=retryable and not final,
+            )
+            if not retryable or final:
+                return last_class
+            await asyncio.sleep(_reply_retry_delay(exc, attempt))
+            continue
+        else:
+            return None
+    return last_class
+
+
+async def _notify_channel_reply_lost(
+    channel: Any,
+    *,
+    route_envelope: Any,
+    session_key: str,
+    error_class: str,
+) -> None:
+    """Tell the user their answer exists but could not be delivered.
+
+    Best-effort by construction: this is itself a send on a channel that just
+    failed. It is skipped where every send to the target fails anyway, and it
+    never raises — a failed notice must not replace the failure it reports.
+    """
+    if error_class in _REPLY_NOTICE_HOPELESS_CLASSES:
+        return
+    try:
+        await channel.send(
+            _route_envelope_reply_message(
+                "I finished this reply but could not deliver it to this chat. "
+                "Ask again to have it re-sent, or check the gateway's channel "
+                "diagnostics if it keeps happening.",
+                route_envelope,
+                metadata={"delivery_failure_notice": True, "error_class": error_class},
+            )
+        )
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - best effort by design
+        log.warning(
+            "channel_dispatch.reply_failure_notice_failed",
+            session_key=session_key,
+            error_class=error_class,
+            error_type=type(exc).__name__,
+        )
+
+
+def _plan_outbound_pieces(channel: Any, message: OutgoingMessage) -> list[OutgoingMessage]:
+    """Split a reply to fit the channel's declared length cap.
+
+    A reply over a platform's per-message cap is rejected wholesale, and six
+    adapters declare no cap and pass content straight through. This is the one
+    place that enforces the capability contract's length budget centrally, in
+    the unit the platform counts in. Adapters that split inside their own
+    ``send()`` opt out via ``splits_natively`` and are returned unchanged.
+
+    Chunking is preferred; a single unsplittable unit that still overflows is
+    truncated with a footer — delivered-but-clipped beats platform-rejected.
+    """
+    profile = channel_capability_profile(channel)
+    if profile is None or profile.max_message_len <= 0 or profile.splits_natively:
+        return [message]
+    unit = profile.length_unit
+    limit = profile.max_message_len
+    content = message.content or ""
+    if measured_len(content, unit) <= limit:
+        return [message]
+
+    pieces: list[OutgoingMessage] = []
+    for idx, chunk in enumerate(split_text_for_channel(content, limit, unit=unit)):
+        if measured_len(chunk, unit) > limit:
+            chunk = truncate_to_limit(chunk, limit, unit=unit)
+        pieces.append(_as_chunk_message(message, chunk, first=idx == 0))
+    return pieces
+
+
+def _as_chunk_message(message: OutgoingMessage, chunk: str, *, first: bool) -> OutgoingMessage:
+    """A one-chunk copy of ``message`` with a fresh outbox identity.
+
+    The delivery id is dropped so the outbox mints a distinct one per chunk —
+    otherwise ``begin_send``'s INSERT-OR-IGNORE collapses every chunk into a
+    single row and the last receipt wins. Attachments ride only the first
+    chunk so a long reply's files are not re-sent per piece.
+    """
+    metadata = dict(message.metadata or {})
+    metadata.pop("delivery_id", None)
+    return message.model_copy(
+        update={
+            "content": chunk,
+            "metadata": metadata,
+            "attachments": message.attachments if first else [],
+        }
+    )
+
+
+async def _deliver_reply_or_notify(
+    channel: Any,
+    message: OutgoingMessage,
+    *,
+    route_envelope: Any,
+    session_key: str,
+) -> bool:
+    """Send a reply; on final failure tell the user rather than going silent."""
+    error_class: str | None = None
+    for piece in _plan_outbound_pieces(channel, message):
+        error_class = await _send_channel_reply_guarded(channel, piece, session_key=session_key)
+        if error_class is not None:
+            break
+    if error_class is None:
+        return True
+    log.error(
+        "channel_dispatch.reply_undelivered",
+        session_key=session_key,
+        error_class=error_class,
+    )
+    await _notify_channel_reply_lost(
+        channel,
+        route_envelope=route_envelope,
+        session_key=session_key,
+        error_class=error_class,
+    )
+    return False
+
+
 async def _deliver_runtime_channel_reply(
     *,
     channel: Any,
@@ -2112,6 +3585,7 @@ async def _deliver_runtime_channel_reply(
     route_envelope: Any,
     inbound: IncomingMessage,
     transcript_watermark: int,
+    replayed: bool = False,
     config: Any = None,
     stream_relay: _RuntimeChannelStreamRelay | None = None,
 ) -> None:
@@ -2149,17 +3623,57 @@ async def _deliver_runtime_channel_reply(
 
     status = _status_value(getattr(record, "status", None))
     if status == "succeeded":
+        exact_content = await _replayed_assistant_text(
+            session_manager,
+            session_key,
+            record,
+        )
+        if exact_content is not None:
+            content = exact_content
+        elif replayed:
+            content = "The task completed, but its original channel reply could not be recovered."
+        else:
+            # Compatibility for tasks created before exact channel output was
+            # persisted in task details. Replays never use this heuristic.
+            content = await _latest_assistant_text_after(
+                session_manager,
+                session_key,
+                transcript_watermark,
+            )
         if (
+            stream_relay is not None
+            and stream_relay.stream_error is None
+            and (content or stream_relay.has_terminal_snapshot)
+        ):
+            canonical_content, canonical_artifacts = _split_assistant_artifact_content(content)
+            if stream_relay.delivered_artifact_keys:
+                canonical_artifacts = [
+                    artifact
+                    for artifact in canonical_artifacts
+                    if _artifact_delivery_key(artifact) not in stream_relay.delivered_artifact_keys
+                ]
+            canonical_content = _strip_artifact_markers_from_channel_text(canonical_content)
+            canonical_content = _strip_delivered_artifact_image_references(
+                canonical_content,
+                canonical_artifacts,
+            )
+            if not _can_deliver_channel_files(channel):
+                fallback_lines = _artifact_fallback_lines(canonical_artifacts)
+                if fallback_lines:
+                    canonical_content = "\n\n".join(
+                        part for part in (canonical_content, "\n".join(fallback_lines)) if part
+                    )
+            if await stream_relay.reconcile_final_text(canonical_content):
+                return
+            stream_relay.stream_error = RuntimeError(
+                "streamed channel reply could not apply persisted terminal text"
+            )
+        elif (
             stream_relay is not None
             and stream_relay.text_emitted
             and stream_relay.stream_error is None
         ):
             return
-        content = await _latest_assistant_text_after(
-            session_manager,
-            session_key,
-            transcript_watermark,
-        )
     else:
         content = build_terminal_reply(record)
         if (
@@ -2181,13 +3695,16 @@ async def _deliver_runtime_channel_reply(
         content = _strip_delivered_artifact_image_references(content, artifacts)
         if _can_deliver_channel_files(channel):
             if content:
-                await channel.send(
+                await _deliver_reply_or_notify(
+                    channel,
                     _build_runtime_reply_message(
                         channel,
                         content,
                         inbound,
                         route_envelope,
-                    )
+                    ),
+                    route_envelope=route_envelope,
+                    session_key=session_key,
                 )
             undelivered = await _deliver_artifacts_as_channel_files(
                 channel,
@@ -2197,26 +3714,32 @@ async def _deliver_runtime_channel_reply(
             )
             fallback_lines = _artifact_fallback_lines(undelivered)
             if fallback_lines:
-                await channel.send(
+                await _deliver_reply_or_notify(
+                    channel,
                     _build_runtime_reply_message(
                         channel,
                         "\n".join(fallback_lines),
                         inbound,
                         route_envelope,
-                    )
+                    ),
+                    route_envelope=route_envelope,
+                    session_key=session_key,
                 )
         else:
             fallback_lines = _artifact_fallback_lines(artifacts)
             if fallback_lines:
                 content = "\n\n".join(part for part in (content, "\n".join(fallback_lines)) if part)
             if content:
-                await channel.send(
+                await _deliver_reply_or_notify(
+                    channel,
                     _build_runtime_reply_message(
                         channel,
                         content,
                         inbound,
                         route_envelope,
-                    )
+                    ),
+                    route_envelope=route_envelope,
+                    session_key=session_key,
                 )
 
 
@@ -2255,6 +3778,8 @@ async def _run_turn_batch_path(
 ) -> None:
     """Batch mode: accumulate all text, send once at the end."""
     text_parts: list[str] = []
+    done_snapshot_present = False
+    done_snapshot_text = ""
     artifacts: list[dict[str, Any]] = []
     error_occurred = False
     clarify_card_sent = False
@@ -2290,6 +3815,11 @@ async def _run_turn_batch_path(
                             "presentation": getattr(event, "presentation", "answer"),
                         },
                     )
+            elif isinstance(event, DoneEvent):
+                snapshot_present, snapshot_text = done_text_snapshot(event)
+                if snapshot_present:
+                    done_snapshot_present = True
+                    done_snapshot_text = snapshot_text
             elif artifact := _artifact_event_payload(event):
                 artifacts.append(artifact)
                 if event_bridge is not None:
@@ -2363,7 +3893,7 @@ async def _run_turn_batch_path(
         error_occurred = True
 
     if not error_occurred:
-        content = "".join(text_parts)
+        content = done_snapshot_text if done_snapshot_present else "".join(text_parts)
         content = _strip_artifact_markers_from_channel_text(content)
         content = _strip_delivered_artifact_image_references(content, artifacts)
         if _can_deliver_channel_files(channel):
@@ -2398,9 +3928,15 @@ async def _run_turn_streaming_path(
     channel streamer run concurrently.
     """
     queue: asyncio.Queue[str | None] = asyncio.Queue()
+    live_preview = _channel_can_replace_streamed_text(channel)
     text_emitted = False
+    text_parts: list[str] = []
+    done_snapshot_present = False
+    done_snapshot_text = ""
     stream_error: str | None = None
     stream_task_error: BaseException | None = None
+    stream_handle: _StreamedMessageHandle | None = None
+    terminal_reconcile_fallback = ""
     yielded_stream_chunks: list[str] = []
     stream_delivered_index = 0
     artifacts: list[dict[str, Any]] = []
@@ -2426,10 +3962,11 @@ async def _run_turn_streaming_path(
                 stream_delivered_index = len(yielded_stream_chunks)
 
     # Start the streaming consumer as a background task
+    streaming_reply_kwargs = _streaming_reply_kwargs(channel, msg)
     stream_task = asyncio.create_task(
         channel.send_streaming(
             _chunk_iter(),
-            **_streaming_reply_kwargs(channel, msg),
+            **streaming_reply_kwargs,
         ),
     )
 
@@ -2457,7 +3994,9 @@ async def _run_turn_streaming_path(
                 cleaned = _strip_artifact_markers_from_channel_text(event.text)
                 if cleaned:
                     text_emitted = True
-                    await queue.put(cleaned)
+                    text_parts.append(cleaned)
+                    if live_preview:
+                        await queue.put(cleaned)
                 if event_bridge is not None:
                     await event_bridge.emit(
                         session_key,
@@ -2467,6 +4006,11 @@ async def _run_turn_streaming_path(
                             "presentation": getattr(event, "presentation", "answer"),
                         },
                     )
+            elif isinstance(event, DoneEvent):
+                snapshot_present, snapshot_text = done_text_snapshot(event)
+                if snapshot_present:
+                    done_snapshot_present = True
+                    done_snapshot_text = snapshot_text
             elif artifact := _artifact_event_payload(event):
                 artifacts.append(artifact)
                 if event_bridge is not None:
@@ -2523,11 +4067,19 @@ async def _run_turn_streaming_path(
         log.error("channel_dispatch.agent_stream_timeout", session_key=session_key)
         stream_error = build_terminal_reply(_terminal_payload_from_exception(exc))
     finally:
+        if not live_preview:
+            terminal_text = done_snapshot_text if done_snapshot_present else "".join(text_parts)
+            if terminal_text:
+                await queue.put(terminal_text)
         # Signal end-of-stream to the consumer
         await queue.put(None)
         # Wait for the streaming task to finish
         try:
-            await asyncio.wait_for(stream_task, timeout=10.0)
+            stream_result = await asyncio.wait_for(stream_task, timeout=10.0)
+            stream_handle = _streamed_message_handle(
+                stream_result,
+                streaming_reply_kwargs,
+            )
         except TimeoutError as exc:
             stream_task_error = exc
             log.warning(
@@ -2547,6 +4099,33 @@ async def _run_turn_streaming_path(
             )
             stream_task.cancel()
 
+    if (
+        stream_task_error is None
+        and live_preview
+        and done_snapshot_present
+        and stream_error is None
+    ):
+        canonical_text = _strip_delivered_artifact_image_references(
+            done_snapshot_text,
+            artifacts,
+        )
+        canonical_text = _sanitize_streamed_channel_text(canonical_text)
+        streamed_text = "".join(yielded_stream_chunks)
+        if canonical_text != streamed_text:
+            if await _replace_streamed_channel_text(
+                channel,
+                stream_handle,
+                canonical_text,
+            ):
+                yielded_stream_chunks[:] = [canonical_text] if canonical_text else []
+                stream_delivered_index = len(yielded_stream_chunks)
+                text_emitted = bool(canonical_text)
+            else:
+                stream_task_error = RuntimeError(
+                    "streamed channel reply could not apply terminal text snapshot"
+                )
+                terminal_reconcile_fallback = canonical_text
+
     if stream_task_error is not None and text_emitted:
         queued_remainder: list[str] = []
         while True:
@@ -2561,10 +4140,10 @@ async def _run_turn_streaming_path(
         tail = stream_sanitizer.flush()
         if tail:
             queued_remainder.append(tail)
-        undelivered_yielded = "".join(
-            yielded_stream_chunks[stream_delivered_index:]
+        undelivered_yielded = "".join(yielded_stream_chunks[stream_delivered_index:])
+        fallback_text = terminal_reconcile_fallback or undelivered_yielded + "".join(
+            queued_remainder
         )
-        fallback_text = undelivered_yielded + "".join(queued_remainder)
         if fallback_text:
             try:
                 await channel.send(_build_reply_message(channel, fallback_text, msg))

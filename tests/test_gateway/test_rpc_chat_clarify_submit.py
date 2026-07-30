@@ -183,6 +183,55 @@ async def test_clarify_submit_forwards_to_chat_send(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_clarify_submit_with_request_id_resolves_same_turn(monkeypatch):
+    captured: dict = {}
+
+    class Runtime:
+        async def resolve_user_input(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "resolved": True,
+                "replayed": False,
+                "request_id": kwargs["request_id"],
+            }
+
+    async def _unexpected_send(*_args, **_kwargs):
+        raise AssertionError("deferred input must not create a new chat turn")
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_chat._handle_chat_send",
+        _unexpected_send,
+    )
+    ctx = RpcContext(
+        conn_id="c",
+        principal=SimpleNamespace(role="operator"),
+        task_runtime=Runtime(),
+    )
+
+    result = await _handle_chat_clarify_submit(
+        {
+            "sessionKey": "agent:main:webchat:abc",
+            "request_id": "input-1",
+            "run_id": "task-1",
+            "fields": {"scope": "Core"},
+        },
+        ctx,
+    )
+
+    assert result == {
+        "sessionKey": "agent:main:webchat:abc",
+        "resolved": True,
+        "replayed": False,
+        "request_id": "input-1",
+    }
+    assert captured == {
+        "session_key": "agent:main:webchat:abc",
+        "request_id": "input-1",
+        "fields": {"scope": "Core"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_clarify_submit_logs_safe_entry_metadata(monkeypatch):
     """Entry logging proves the Web UI submit reached RPC without
     exposing field values in gateway logs."""

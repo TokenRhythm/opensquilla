@@ -2,6 +2,9 @@
   <RunTrace
     :items="items"
     :variant="variant"
+    :presentation="presentation"
+    :state-scope="stateScope"
+    :show-bulk-toggle="presentation !== 'activity'"
     :is-tool-group-open="isToolGroupOpen"
     :is-tool-item-open="isToolItemOpen"
     :tool-group-status-text="toolGroupStatusText"
@@ -11,7 +14,11 @@
     @toggle-group="$emit('toggleGroup', $event)"
     @toggle-item="$emit('toggleItem', $event)"
     @show-result="(content, title, context) => $emit('showResult', content, title, context)"
-  />
+  >
+    <template #interrupt="{ part }">
+      <slot name="interrupt" :part="part" />
+    </template>
+  </RunTrace>
 </template>
 
 <script setup lang="ts">
@@ -32,11 +39,19 @@ defineProps<{
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
   toolElapsedText?: (call: ChatToolCallRenderItem) => string
   variant?: 'checklist'
+  presentation?: 'activity'
+  stateScope?: string
 }>()
 
 defineEmits<{
   toggleGroup: [groupId: string]
   toggleItem: [renderKey: string]
   showResult: [content: string, title: string, context?: ToolResultContext]
+}>()
+
+defineSlots<{
+  interrupt?: (props: {
+    part: Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>
+  }) => unknown
 }>()
 </script>

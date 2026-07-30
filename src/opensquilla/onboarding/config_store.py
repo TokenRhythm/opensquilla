@@ -32,13 +32,17 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore[import-not-found, no-redef]
 
-from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config import (
+    LEGACY_DEFAULT_LLM_PROVIDER,
+    GatewayConfig,
+    LlmProviderConfig,
+)
 from opensquilla.gateway.config_migration import (
     backup_and_write_migrated_config,
     make_config_backup,
     migrate_config_payload,
 )
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, native_io_path
 
 log = structlog.get_logger(__name__)
 
@@ -78,6 +82,13 @@ class PersistResult:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class CredentialBackupRedaction:
+    """Provider-scoped credential fields a clear must remove from backups."""
+
+    provider_id: str
+
+
 def resolve_config_path(path: str | Path | None = None) -> tuple[Path, str]:
     """Return (resolved_path, source) using gateway-equivalent precedence.
 
@@ -91,7 +102,7 @@ def resolve_config_path(path: str | Path | None = None) -> tuple[Path, str]:
     if explicit:
         return Path(explicit).expanduser(), "env"
     cwd_candidate = Path.cwd() / "opensquilla.toml"
-    if cwd_candidate.is_file():
+    if native_io_path(cwd_candidate).is_file():
         return cwd_candidate, "cwd"
     return default_opensquilla_home() / "config.toml", "home"
 
@@ -181,13 +192,14 @@ def load_config(
     persist_migrations: bool = True,
 ) -> GatewayConfig:
     target = _resolve_path(path)
-    if not target.exists():
+    target_io = native_io_path(target)
+    if not target_io.exists():
         cfg = GatewayConfig()
         _mark_env_absorbed_runtime_secrets(cfg, None)
         cfg.config_path = str(target)
         _remember_load_baseline(cfg)
         return cfg
-    with target.open("rb") as fh:
+    with target_io.open("rb") as fh:
         data = tomllib.load(fh)
     migration = migrate_config_payload(data)
     cfg = GatewayConfig.model_validate(migration.payload)
@@ -232,6 +244,131 @@ def _config_to_toml_dict(cfg: GatewayConfig) -> dict[str, Any]:
     coerced = _toml_safe(_model_toml_payload(cfg))
     assert isinstance(coerced, dict)
     return coerced
+
+
+def _logical_path_from_io(path: str | Path) -> Path:
+    """Strip an internal Windows extended-length prefix from a public path."""
+
+    value = os.fspath(path)
+    if os.name == "nt":
+        if value.startswith("\\\\?\\UNC\\"):
+            value = "\\\\" + value[len("\\\\?\\UNC\\") :]
+        elif value.startswith("\\\\?\\"):
+            value = value[len("\\\\?\\") :]
+    return Path(value)
+
+
+def _redact_backup_credentials(
+    payload: Any,
+    redaction: CredentialBackupRedaction,
+) -> bool:
+    """Remove one provider's LLM credential fields from a parsed backup."""
+
+    if not isinstance(payload, dict):
+        return False
+    provider = str(redaction.provider_id or "").strip().lower()
+    if not provider:
+        return False
+
+    def clear_section(section: Any) -> bool:
+        if not isinstance(section, dict):
+            return False
+        changed = False
+        for key in ("api_key", "api_key_env", "api_key_env_pool"):
+            if key in section:
+                section.pop(key, None)
+                changed = True
+        return changed
+
+    changed = False
+    llm = payload.get("llm")
+    if isinstance(llm, dict):
+        stored_provider = str(llm.get("provider") or "").strip().lower()
+        if not stored_provider:
+            router = payload.get("squilla_router")
+            tier_profile = (
+                str(router.get("tier_profile") or "").strip().lower()
+                if isinstance(router, dict)
+                else ""
+            )
+            legacy_intent = bool(
+                {"model", "base_url", "api_key", "api_key_env"} & llm.keys()
+            ) or tier_profile == LEGACY_DEFAULT_LLM_PROVIDER
+            default_provider = str(
+                LlmProviderConfig.model_fields["provider"].default or ""
+            ).strip().lower()
+            stored_provider = (
+                LEGACY_DEFAULT_LLM_PROVIDER if legacy_intent else default_provider
+            )
+        if stored_provider == provider:
+            changed = clear_section(llm) or changed
+
+    profiles = payload.get("llm_profiles")
+    if isinstance(profiles, dict):
+        for key, profile in profiles.items():
+            if str(key or "").strip().lower() == provider:
+                changed = clear_section(profile) or changed
+    return changed
+
+
+def _atomic_write_toml(target: Path, payload: dict[str, Any]) -> None:
+    """Replace one TOML file atomically with owner-only permissions."""
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=os.fspath(native_io_path(target.parent)),
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            tomli_w.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, native_io_path(target))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _sanitize_managed_config_backups(
+    target: Path,
+    redaction: CredentialBackupRedaction,
+) -> None:
+    """Remove a cleared credential from every regular managed config backup."""
+
+    prefix = f"{target.name}.backup."
+    backup_paths = sorted(
+        target.parent / candidate.name
+        for candidate in native_io_path(target.parent).iterdir()
+        if candidate.name.startswith(prefix)
+    )
+    for backup_path in backup_paths:
+        backup_io = native_io_path(backup_path)
+        if backup_io.is_symlink() or not backup_io.is_file():
+            raise OSError(f"Refusing to rewrite non-regular config backup: {backup_path}")
+        try:
+            with backup_io.open("rb") as fh:
+                payload = tomllib.load(fh)
+        except (tomllib.TOMLDecodeError, ValueError) as exc:
+            # An unparseable backup is useless as a restore source, yet its
+            # raw bytes may still hold the credential being cleared in plain
+            # text. Deleting it completes the redaction for this file, while
+            # aborting would leave the LIVE config holding the secret the
+            # user explicitly asked to remove.
+            log.warning(
+                "onboarding.config_backup_unparseable_deleted",
+                path=str(backup_path),
+                error=str(exc),
+                action="deleting corrupt managed backup so the credential clear proceeds",
+            )
+            backup_io.unlink(missing_ok=True)
+            continue
+        if _redact_backup_credentials(payload, redaction):
+            _atomic_write_toml(backup_path, payload)
 
 
 def _remember_load_baseline(
@@ -284,7 +421,7 @@ def _unlock_config_file(fh: BinaryIO) -> None:
 def _config_write_lock(target: Path) -> Iterator[None]:
     """Serialize read/merge/replace against every shared persister process."""
     lock_path = target.with_name(f".{target.name}.lock")
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(native_io_path(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     if os.fstat(fd).st_size == 0:
         os.write(fd, b"\0")
     with os.fdopen(fd, "r+b", buffering=0) as fh:
@@ -359,7 +496,9 @@ def restore_runtime_overrides(dump: dict[str, Any], config: GatewayConfig) -> No
     ``llm.proxy``) directly into the live model at boot. Those values must
     never be baked into config.toml by an unrelated save, so each recorded
     override is restored to its stored value — but only while the field
-    still equals the applied env value; an operator edit since boot wins.
+    still equals the applied env value. A missing serialized field also
+    represents an applied empty string because the TOML payload drops empty
+    values; an operator edit since boot still wins.
     Shared by the sparse persister here and the gateway RPC full-dump
     persist (``rpc_config._persist_config``).
     """
@@ -367,7 +506,10 @@ def restore_runtime_overrides(dump: dict[str, Any], config: GatewayConfig) -> No
     if overrides is None:
         return
     for path, (stored, applied) in overrides().items():
-        if _get_dotted(dump, path) == applied:
+        current = _get_dotted(dump, path)
+        if current == applied or (
+            current is None and applied == "" and stored not in (None, "")
+        ):
             _set_dotted(dump, path, stored)
 
 
@@ -471,11 +613,17 @@ def _persist_plan(
     )
     raw: dict[str, Any] | None = None
     disk_usable = True
-    if target.is_file():
+    target_io = native_io_path(target)
+    if target_io.is_file():
         try:
-            with target.open("rb") as fh:
+            with target_io.open("rb") as fh:
                 raw = tomllib.load(fh)
-        except (tomllib.TOMLDecodeError, ValueError) as exc:
+        # UnicodeDecodeError is a ValueError subclass, but list it explicitly:
+        # a config corrupted with non-UTF-8 bytes (seen when an agent edited
+        # the file through a shell with a legacy codepage) must take this
+        # recovery branch — back up the corrupt bytes, then rewrite valid
+        # UTF-8 from the in-memory config — and never propagate as a crash.
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError, ValueError) as exc:
             disk_usable = False
             log.warning(
                 "onboarding.config_persist_unreadable_toml",
@@ -528,6 +676,7 @@ def persist_config(
     path: str | Path | None = None,
     backup: bool = True,
     restart_required: bool = False,
+    backup_credential_redaction: CredentialBackupRedaction | None = None,
 ) -> PersistResult:
     resolved = _resolve_path(path)
     # The instance baseline only describes the file the config was loaded
@@ -537,12 +686,14 @@ def persist_config(
     establish_path = not bool(config.config_path)
     same_path = establish_path or config.config_path == str(resolved)
     target = resolved
-    if target.is_symlink():
+    target_io = native_io_path(target)
+    if target_io.is_symlink():
         # Write through the symlink: update the real file in place so the
         # link (and anything else resolving through it) survives the swap.
-        target = target.resolve()
+        target = _logical_path_from_io(target_io.resolve())
+        target_io = native_io_path(target)
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target_io.parent.mkdir(parents=True, exist_ok=True)
     with _config_write_lock(target):
         baseline_dump, merged = _persist_plan(
             target, config, use_instance_baseline=same_path
@@ -569,12 +720,24 @@ def persist_config(
         next_baseline = copy.deepcopy(current_dump) if same_path else None
         next_raw_base = copy.deepcopy(merged) if same_path else None
 
+        # Credential removal is intentionally stronger than an ordinary config
+        # save: do not create a fresh backup containing the just-cleared secret,
+        # and scrub matching credential fields from every managed backup while
+        # holding the same cross-process config lock.  This runs before the
+        # current-file commit, so a sanitization failure leaves live/disk config
+        # aligned and the RPC can fail closed.
+        if backup_credential_redaction is not None:
+            _sanitize_managed_config_backups(target, backup_credential_redaction)
+            backup = False
+
         backup_path: Path | None = None
-        if backup and target.exists():
+        if backup and target_io.exists():
             backup_path = make_config_backup(target)
 
         fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=os.fspath(native_io_path(target.parent)),
         )
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -588,7 +751,7 @@ def persist_config(
             # is the commit point; no fallible chmod follows it and turns a
             # successful disk commit into an apparent rollback.
             os.chmod(tmp_name, 0o600)
-            os.replace(tmp_name, target)
+            os.replace(tmp_name, native_io_path(target))
         except Exception:
             try:
                 os.unlink(tmp_name)

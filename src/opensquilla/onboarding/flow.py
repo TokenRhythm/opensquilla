@@ -1858,6 +1858,12 @@ def _should_prompt_channel_field(
         return True
     if field.required:
         return True
+    # The interactive channel flow is intentionally a minimal-field wizard.
+    # Optional advanced controls still seed their safe defaults so dependent
+    # fields are evaluated correctly, but they are configured later rather
+    # than expanding every existing add flow with another prompt.
+    if field.advanced:
+        return False
     if field.name in controls:
         return True
     if field.show_when and field.default in (None, ""):
@@ -2018,6 +2024,36 @@ def _print_channel_intro(spec: ChannelSetupSpec) -> None:
     )
 
 
+_RELEASE_VERSION_RE = re.compile(r"^\d+(?:\.\d+)*(?:(?:a|b|rc)\d+)?$")
+
+
+def _installed_reinstall_command_lines() -> str:
+    """Reinstall lines for the running release, never a stale pinned tag.
+
+    A release build reinstalls its own wheel with the ``recommended`` extra so
+    the command adds the missing optional dependency without changing version.
+    Dev or unknown builds cannot map to a published wheel, so they are pointed
+    at the latest-release page instead of a guessed URL.
+    """
+    from opensquilla import __version__
+
+    if _RELEASE_VERSION_RE.match(__version__):
+        wheel_url = (
+            "https://github.com/opensquilla/opensquilla/releases/download/"
+            f"v{__version__}/opensquilla-{__version__}-py3-none-any.whl"
+        )
+        return (
+            "  uv tool install --python 3.12 --force "
+            f"\"opensquilla[recommended] @ {wheel_url}\"\n"
+        )
+    return (
+        "  uv tool install --python 3.12 --force "
+        "\"opensquilla[recommended] @ <wheel-url>\"\n"
+        "  (use the wheel from the latest release: "
+        "https://github.com/opensquilla/opensquilla/releases/latest)\n"
+    )
+
+
 def _warn_channel_dependency_gaps(spec: ChannelSetupSpec, answers: dict[str, Any]) -> None:
     """Warn about optional channel dependencies that will fail at gateway start."""
     if spec.type == "feishu" and answers.get("connection_mode") == "websocket":
@@ -2029,8 +2065,7 @@ def _warn_channel_dependency_gaps(spec: ChannelSetupSpec, answers: dict[str, Any
                     "[bold]Portable zip:[/]\n"
                     "  Use the latest recommended portable package, then restart.\n\n"
                     "[bold]Installed command:[/]\n"
-                    "  irm https://opensquilla.ai/install.ps1 | iex\n"
-                    "  curl -LsSf https://opensquilla.ai/install.sh | bash -s --\n"
+                    + _installed_reinstall_command_lines() +
                     "  opensquilla gateway restart\n\n"
                     "[bold]Development checkout:[/]\n"
                     "  uv sync --extra recommended\n"

@@ -169,10 +169,28 @@ class GatewayRPCClient:
     async def resolve_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self.call("sessions.resolve", {"key": key}))
 
-    async def session_history(self, session_key: str, limit: int = 1000) -> dict[str, Any]:
+    async def session_history(
+        self,
+        session_key: str,
+        limit: int = 1000,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        include_canonical: bool | None = None,
+        include_summaries: bool | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"sessionKey": session_key, "limit": limit}
+        if before is not None:
+            params["before"] = before
+        if after is not None:
+            params["after"] = after
+        if include_canonical is not None:
+            params["includeCanonical"] = include_canonical
+        if include_summaries is not None:
+            params["includeSummaries"] = include_summaries
         return cast(
             dict[str, Any],
-            await self.call("chat.history", {"sessionKey": session_key, "limit": limit}),
+            await self.call("chat.history", params),
         )
 
     async def recv_event(self, timeout: float | None = None) -> dict[str, Any]:

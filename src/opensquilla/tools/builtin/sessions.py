@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import uuid
 
@@ -10,9 +11,15 @@ import structlog
 
 from opensquilla.agents.limits import MAX_SPAWN_DEPTH
 from opensquilla.gateway.routing import build_subagent_route_envelope
+from opensquilla.provider.correlation_context import (
+    current_provider_request_correlation,
+)
+from opensquilla.provider.types import derive_provider_request_correlation
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import SafeToolError, ToolError, current_tool_context
+from opensquilla.tools.run_mode import current_run_mode
+from opensquilla.tools.types import PlanAccess, SafeToolError, ToolError, current_tool_context
 
 _log = structlog.get_logger("opensquilla.tools.sessions")
 
@@ -421,10 +428,41 @@ async def sessions_spawn(
 
         runtime = _get_task_runtime()
         spawn_depth = current_depth + 1
+        subagent_run_id = str(uuid.uuid4())
+        provider_request_correlation = derive_provider_request_correlation(
+            current_provider_request_correlation(),
+            execution_id=subagent_run_id,
+            call_kind="subagent.chat",
+        )
         session_key = build_subagent_session_key(resolved_agent_id, uuid.uuid4().hex[:8])
         grounded_task = (
             _SUBAGENT_SYSTEM_PROMPT + "\n\n" + _normalize_subagent_task_for_execution(task)
         )
+        envelope = build_subagent_route_envelope(
+            session_key=session_key,
+            parent_session_key=parent_session_key,
+            agent_id=resolved_agent_id,
+            run_id=subagent_run_id,
+            parent_task_id=parent_task_id,
+            spawn_depth=spawn_depth,
+            principal_is_owner=getattr(ctx, "is_owner", None) if ctx is not None else None,
+            elevated=getattr(ctx, "elevated", None) if ctx is not None else None,
+            run_mode=current_run_mode(),
+            sandbox_run_context=(
+                getattr(ctx, "sandbox_run_context", None) if ctx is not None else None
+            ),
+            sandbox_mounts=getattr(ctx, "sandbox_mounts", None) if ctx is not None else None,
+        )
+        child_origin: dict[str, object] = {
+            "kind": "subagent",
+            "parent_session_key": parent_session_key,
+            "parent_task_id": parent_task_id,
+            "task": task,
+            "execution_task": grounded_task,
+        }
+        inherited_context = envelope.metadata.get(RUN_CONTEXT_ORIGIN_KEY)
+        if isinstance(inherited_context, dict):
+            child_origin[RUN_CONTEXT_ORIGIN_KEY] = copy.deepcopy(inherited_context)
         create_kwargs = {
             "session_key": session_key,
             "agent_id": resolved_agent_id,
@@ -432,14 +470,17 @@ async def sessions_spawn(
             "spawn_depth": spawn_depth,
             "parent_session_key": parent_session_key,
             "spawned_by": parent_session_key,
-            "origin": {
-                "kind": "subagent",
-                "parent_session_key": parent_session_key,
-                "parent_task_id": parent_task_id,
-                "task": task,
-                "execution_task": grounded_task,
-            },
+            "origin": child_origin,
         }
+        get_parent_session = getattr(mgr, "get_session", None)
+        if callable(get_parent_session):
+            try:
+                parent_session = await get_parent_session(parent_session_key)
+            except (AttributeError, NotImplementedError):
+                parent_session = None
+            workspace_id = getattr(parent_session, "workspace_id", None)
+            if isinstance(workspace_id, str) and workspace_id.strip():
+                create_kwargs["workspace_id"] = workspace_id
         # ── max_children gate + create are serialized per parent session
         # so two concurrent spawns cannot both observe ``active < cap`` and
         # both create children. The lock spans count + create so the new
@@ -464,18 +505,13 @@ async def sessions_spawn(
                 **create_kwargs,
             )
             await mgr.append_message(session_key, role="user", content=grounded_task)
-        envelope = build_subagent_route_envelope(
-            session_key=session_key,
-            parent_session_key=parent_session_key,
-            agent_id=resolved_agent_id,
-            parent_task_id=parent_task_id,
-            spawn_depth=spawn_depth,
-        )
         handle = await runtime.enqueue(
             envelope,
             grounded_task,
             mode="followup",
             run_kind="subagent",
+            task_id=subagent_run_id,
+            provider_request_correlation=provider_request_correlation,
         )
         return json.dumps(
             {
@@ -521,6 +557,7 @@ async def sessions_spawn(
         },
     },
     required=[],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_list(
     agent_id: str | None = None,
@@ -562,6 +599,7 @@ async def sessions_list(
         },
     },
     required=["session_key"],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_history(session_key: str, limit: int = 20) -> str:
     if not (1 <= limit <= 100):
@@ -629,18 +667,42 @@ async def sessions_yield(
         if ctx is not None and ctx.session_key and ctx.task_id:
             try:
                 mgr = _get_session_manager()
-                runtime = _get_task_runtime()
             except ToolError:
                 pass
             else:
-                from opensquilla.gateway.subagent_announce import close_subagent_spawn_group
+                from opensquilla.gateway.subagent_announce import (
+                    close_subagent_spawn_group,
+                    subagent_spawn_group_exists,
+                )
 
-                await close_subagent_spawn_group(
+                has_spawn_group = await subagent_spawn_group_exists(
                     ctx.session_key,
                     ctx.task_id,
                     session_manager=mgr,
-                    task_runtime=runtime,
                 )
+                if not has_spawn_group:
+                    return json.dumps(
+                        {
+                            "status": "no_pending_subagents",
+                            "waited": False,
+                            "message": (
+                                "No subagents were spawned by the current task. Continue the "
+                                "current turn; do not wait for a previous task's subagents."
+                            ),
+                        }
+                    )
+
+                try:
+                    runtime = _get_task_runtime()
+                except ToolError:
+                    pass
+                else:
+                    await close_subagent_spawn_group(
+                        ctx.session_key,
+                        ctx.task_id,
+                        session_manager=mgr,
+                        task_runtime=runtime,
+                    )
         yield_payload: dict[str, object] = {
             "status": "yielded",
             "waited": False,
@@ -747,18 +809,45 @@ async def sessions_yield(
     description="Show current session usage, cost, and model information.",
     params={},
     required=[],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def session_status() -> str:
     try:
         mgr = _get_session_manager()
-        current = await mgr.get_current_session()
+        ctx = current_tool_context.get()
+        session_key = getattr(ctx, "session_key", None)
+        if session_key:
+            current = await mgr.get_session(session_key)
+        else:
+            get_current_session = getattr(mgr, "get_current_session", None)
+            if not callable(get_current_session):
+                raise ToolError("No active session")
+            current = await get_current_session()
         if current is None:
             raise ToolError("No active session")
+        run_mode = current_run_mode()
+        sandbox_enabled = None
+        workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
+        try:
+            from opensquilla.sandbox.integration import get_runtime
+
+            runtime = get_runtime()
+            if runtime is not None:
+                effective = getattr(runtime, "effective", None)
+                sandbox_enabled = bool(getattr(effective, "sandbox_enabled", False))
+                workspace = workspace or str(getattr(runtime, "workspace", "") or "")
+        except Exception:
+            pass
         # Convert session object to dict
         data = {
             "session_key": getattr(current, "session_key", "unknown"),
             "session_id": getattr(current, "session_id", "unknown"),
             "status": getattr(current, "status", "unknown"),
+            "run_mode": run_mode,
+            "run_mode_label": _run_mode_label(run_mode),
+            "full_host_access": run_mode == "full",
+            "sandbox_enabled": sandbox_enabled,
+            "workspace": workspace,
             "model": getattr(current, "model", "unknown"),
             "model_provider": getattr(current, "model_provider", "unknown"),
             "input_tokens": getattr(current, "input_tokens", 0),
@@ -774,8 +863,22 @@ async def session_status() -> str:
             "started_at": getattr(current, "started_at", 0),
             "runtime_ms": getattr(current, "runtime_ms", 0),
         }
+        if ctx is not None:
+            run_mode = getattr(ctx, "run_mode", "trusted")
+            data["run_mode"] = run_mode
+            data["sandbox_enabled"] = run_mode != "full"
         return json.dumps(data)
     except ToolError:
         raise
     except (ImportError, AttributeError, NotImplementedError) as exc:
         raise _manager_unavailable(exc) from exc
+
+
+def _run_mode_label(run_mode: str | None) -> str | None:
+    if run_mode == "full":
+        return "Full Host Access"
+    if run_mode == "trusted":
+        return "Managed Execution"
+    if run_mode == "standard":
+        return "Standard"
+    return None

@@ -44,7 +44,7 @@
     <div class="clarify-card__body">
       <div v-for="field in request.fields" :key="field.name" class="clarify-field">
         <label class="clarify-field__label" :for="fieldId(field.name)">
-          <span class="clarify-field__name">{{ field.name }}</span>
+          <span class="clarify-field__name">{{ field.header || field.name }}</span>
           <span v-if="field.prompt && field.prompt !== field.name" class="clarify-field__prompt">
             {{ field.prompt }}
           </span>
@@ -70,8 +70,25 @@
             @click="values[field.name] = choice"
           >
             <span class="clarify-choice__num">{{ idx + 1 }}</span>
-            <span class="clarify-choice__text">{{ choice }}</span>
+            <span class="clarify-choice__copy">
+              <span class="clarify-choice__text">{{ choice }}</span>
+              <span
+                v-if="optionDescription(field, choice)"
+                class="clarify-choice__description"
+              >{{ optionDescription(field, choice) }}</span>
+            </span>
           </button>
+          <label v-if="field.allowOther" class="clarify-field__other">
+            <span>{{ t('chat.clarify.other') }}</span>
+            <input
+              :id="fieldId(field.name)"
+              v-model="values[field.name]"
+              class="clarify-field__input"
+              type="text"
+              :placeholder="t('chat.clarify.otherPlaceholder')"
+              :disabled="busy"
+            />
+          </label>
         </div>
 
         <!-- Bool: explicit true/false select -->
@@ -150,15 +167,31 @@ const emit = defineEmits<{
 
 const values = reactive<Record<string, string>>({})
 
-watch(() => props.request, request => {
-  for (const key of Object.keys(values)) delete values[key]
-  for (const field of request.fields) {
-    values[field.name] = field.defaultValue || ''
-  }
-}, { immediate: true })
+// The parent rebuilds the request object while messages stream and when the
+// conversation is re-rendered. Watching that object directly used to reset
+// every field to its default even though the user was still answering the same
+// clarify request. Reset only when the logical request itself changes.
+watch(
+  () => `${props.request.runId}\u0000${props.request.step}`,
+  () => {
+    const request = props.request
+    for (const key of Object.keys(values)) delete values[key]
+    for (const field of request.fields) {
+      values[field.name] = field.defaultValue || ''
+    }
+  },
+  { immediate: true },
+)
 
 function fieldId(name: string): string {
   return `clarify-field-${name}`
+}
+
+function optionDescription(
+  field: ChatClarifyRequest['fields'][number],
+  choice: string,
+): string {
+  return field.options?.find(option => option.label === choice)?.description || ''
 }
 
 function onSubmit() {
@@ -284,6 +317,29 @@ function onSubmit() {
   display: flex;
   flex-direction: column;
   gap: var(--sp-1);
+}
+
+.clarify-choice__copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.clarify-choice__description {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+  text-align: left;
+}
+
+.clarify-field__other {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
 }
 
 .clarify-choice {

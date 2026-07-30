@@ -28,7 +28,7 @@ test("themePickerKeyAction navigates, confirms, cancels, and is modal", () => {
 });
 
 test("openThemePicker renders a titled panel listing every theme, active one marked", async () => {
-  applyTheme("opensquilla-dark");
+  applyTheme("opensquilla-dark", { explicit: true });
   const { renderer, renderOnce, captureSpans } = await createTestRenderer({ width: 50, height: 20 });
   const conversationBox = new BoxRenderable(renderer, {
     id: "conversation", position: "absolute", left: 0, top: 0, right: 0, height: 14,
@@ -70,12 +70,12 @@ test("openThemePicker renders a titled panel listing every theme, active one mar
   renderer.destroy?.();
 });
 
-test("picker survives footer re-renders (pulse tick) instead of flashing away", async () => {
-  // Regression: a footer re-render (pulse tick while a turn streams, router
-  // update, keystroke) ran renderCompletionMenu -> clearOverlay, wiping the
+test("picker survives footer/theme re-renders without a duplicate remount", async () => {
+  // Regression: a footer re-render (router update or keystroke) ran
+  // renderCompletionMenu -> clearOverlay, wiping the
   // picker while it stayed modally active — picker flashed once then the TUI
   // looked frozen (keys swallowed by an invisible modal). It must stay mounted.
-  applyTheme("opensquilla-dark");
+  applyTheme("opensquilla-dark", { explicit: true });
   const { renderer, renderOnce, captureSpans } = await createTestRenderer({ width: 50, height: 20 });
   const conversationBox = new BoxRenderable(renderer, {
     id: "conversation", position: "absolute", left: 0, top: 0, right: 0, height: 14,
@@ -101,8 +101,17 @@ test("picker survives footer re-renders (pulse tick) instead of flashing away", 
   }
 
   composer.openThemePicker();
-  // Simulate footer re-renders that previously wiped the picker.
-  composer.rerender();
+  let pickerRemovals = 0;
+  const remove = overlayLayer.remove.bind(overlayLayer);
+  overlayLayer.remove = (node) => {
+    if (node?.id === "theme-picker") pickerRemovals += 1;
+    return remove(node);
+  };
+  // Theme application uses the same footer path: one overlay remount is
+  // sufficient to recolor the picker and reassert the caret.
+  composer.applyHostTheme("midnight");
+  expect(pickerRemovals).toBe(1);
+  // An ordinary later footer update still preserves the active picker.
   composer.rerender();
   await renderOnce();
   const text = captureSpans()
@@ -116,7 +125,7 @@ test("picker survives footer re-renders (pulse tick) instead of flashing away", 
 test("paste while the picker is open never reaches the composer draft", async () => {
   // The picker is modal for keypresses; bracketed paste must be modal too, or
   // pasted text lands invisibly in the draft while the user previews themes.
-  applyTheme("opensquilla-dark");
+  applyTheme("opensquilla-dark", { explicit: true });
   const sent = [];
   const { renderer } = await createTestRenderer({ width: 50, height: 20 });
   const conversationBox = new BoxRenderable(renderer, {
@@ -150,5 +159,50 @@ test("paste while the picker is open never reaches the composer draft", async ()
   renderer.keyInput.emit("keypress", { name: "x", sequence: "X" });
   renderer.keyInput.emit("keypress", { name: "return" });
   expect(sent.find((m) => m.type === "input.submit")?.text).toBe("X");
+  renderer.destroy?.();
+});
+
+test("confirming a picker choice reports theme.selected for CLI-side persistence", async () => {
+  applyTheme("opensquilla-dark", { explicit: true });
+  const sent = [];
+  const { renderer } = await createTestRenderer({ width: 50, height: 20 });
+  const conversationBox = new BoxRenderable(renderer, {
+    id: "conversation", position: "absolute", left: 0, top: 0, right: 0, height: 14,
+  });
+  renderer.root.add(conversationBox);
+  const inputBox = new BoxRenderable(renderer, {
+    id: "input-region", position: "absolute", left: 0, right: 0, bottom: 0, height: 6,
+  });
+  renderer.root.add(inputBox);
+  const overlayLayer = new BoxRenderable(renderer, {
+    id: "overlay-layer", position: "absolute", left: 0, top: 0, right: 0, bottom: 0,
+    zIndex: 1000, shouldFill: false, visible: false,
+  });
+  renderer.root.add(overlayLayer);
+  const composer = createComposer({
+    renderer, BoxRenderable, TextRenderable, conversationBox, inputBox, overlayLayer,
+    footerHeight: 6, sendHostMessage: (m) => sent.push(m),
+  });
+  try {
+    composer.install();
+  } catch {
+    composer.rerender();
+  }
+
+  composer.openThemePicker();
+  renderer.keyInput.emit("keypress", { name: "down" }); // preview the next theme
+  renderer.keyInput.emit("keypress", { name: "return" }); // keep it
+
+  const reported = sent.filter((m) => m.type === "theme.selected");
+  expect(reported.length).toBe(1);
+  // The picker opened on the active theme (index 0) and moved down once, so
+  // the exact next palette must be what gets reported for persistence.
+  expect(reported[0].name).toBe(THEME_NAMES[1]);
+
+  // Escape reverts the live preview — a cancelled picker must persist nothing.
+  composer.openThemePicker();
+  renderer.keyInput.emit("keypress", { name: "down" });
+  renderer.keyInput.emit("keypress", { name: "escape" });
+  expect(sent.filter((m) => m.type === "theme.selected").length).toBe(1);
   renderer.destroy?.();
 });

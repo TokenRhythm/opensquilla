@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useBgm, BGM_LOCAL_TRACK_ID } from '@/composables/useBgm'
 
 // Topbar background-music control: a split button next to the language/theme
@@ -30,6 +31,7 @@ const menuOpen = ref(false)
 const toggleRef = ref<HTMLButtonElement | null>(null)
 const caretRef = ref<HTMLButtonElement | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
+useDialogLayer(computed(() => menuOpen.value))
 
 onMounted(() => { void initBgm() })
 

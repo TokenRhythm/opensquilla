@@ -85,6 +85,31 @@ class _RecordingToolBuilder:
         return list(self.tool_defs), self.tool_handler
 
 
+@dataclass
+class _RecordingCatalogResolver:
+    catalog: Any
+    calls: int = 0
+
+    async def resolve_skill_catalog(self) -> Any:
+        self.calls += 1
+        return self.catalog
+
+
+@dataclass
+class _CatalogAwareToolBuilder(_RecordingToolBuilder):
+    catalogs: list[Any] = field(default_factory=list)
+
+    def build_tools_for_catalog(
+        self,
+        ctx: ToolContext | None,
+        *,
+        skill_catalog: Any | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], Any | None]:
+        self.catalogs.append(skill_catalog)
+        return self.build_tools(ctx, metadata=metadata)
+
+
 def _ctx(kind: CallerKind = CallerKind.AGENT, **extra: Any) -> ToolContext:
     return ToolContext(caller_kind=kind, agent_id="agent:main", **extra)
 
@@ -290,6 +315,35 @@ def test_provider_resolver_port_runtime_checkable() -> None:
 
 def test_tool_builder_port_runtime_checkable() -> None:
     assert isinstance(_RecordingToolBuilder(), ToolBuilderPort)
+
+
+@pytest.mark.asyncio
+async def test_catalog_generation_is_pinned_before_tool_build() -> None:
+    catalog = object()
+    catalog_resolver = _RecordingCatalogResolver(catalog)
+    builder = _CatalogAwareToolBuilder(tool_defs=_DEFS_1)
+    stage = ProviderAndToolsStage(
+        provider_resolver=_RecordingProviderResolver(),
+        tool_builder=builder,
+        skill_catalog_resolver=catalog_resolver,
+    )
+
+    outcome = await stage.run(
+        ProviderAndToolsStageInput(
+            session_key="agent:main:snapshot",
+            agent_id="agent:main",
+            tool_context=_ctx(),
+            run_kind="user",
+            input_mode="user",
+        )
+    )
+
+    assert outcome.output is not None
+    assert outcome.output.skill_catalog is catalog
+    assert outcome.output.effective_tool_context is not None
+    assert outcome.output.effective_tool_context.skill_catalog is catalog
+    assert builder.catalogs == [catalog]
+    assert catalog_resolver.calls == 1
 
 
 def test_stage_name_constant() -> None:

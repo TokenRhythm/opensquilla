@@ -59,6 +59,9 @@ async def test_agent_task_ledger_marks_active_tasks_abandoned_after_restart(tmp_
     restarted = SessionStorage(str(db_path))
     await restarted.connect()
     try:
+        assert restarted.restart_abandoned_session_keys == (key,)
+        assert restarted.take_restart_abandoned_session_keys() == (key,)
+        assert restarted.take_restart_abandoned_session_keys() == ()
         rows = await restarted.list_agent_tasks(session_key=key)
     finally:
         await restarted.close()
@@ -67,11 +70,153 @@ async def test_agent_task_ledger_marks_active_tasks_abandoned_after_restart(tmp_
     assert by_id["queued-task"].status == AgentTaskStatus.ABANDONED
     assert by_id["queued-task"].terminal_reason == "process_restart"
     assert by_id["queued-task"].finished_at is not None
+    assert by_id["queued-task"].details == {
+        "turn_outcome": {
+            "kind": "interrupted",
+            "reason": "process_restart",
+            "error_class": "process_restart",
+            "retryable": True,
+        }
+    }
     assert by_id["running-task"].status == AgentTaskStatus.ABANDONED
     assert by_id["running-task"].terminal_reason == "process_restart"
     assert by_id["running-task"].finished_at is not None
+    assert by_id["running-task"].details == by_id["queued-task"].details
     assert by_id["done-task"].status == AgentTaskStatus.SUCCEEDED
     assert by_id["done-task"].terminal_reason is None
+
+    retried = SessionStorage(str(db_path))
+    await retried.connect()
+    try:
+        assert retried.restart_abandoned_session_keys == (key,)
+    finally:
+        await retried.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_task_abandonment_terminalizes_owning_running_sessions(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "sessions.db"))
+    await storage.connect()
+    running_key = "agent:main:webchat:running-restart"
+    terminal_key = "agent:main:webchat:done-restart"
+    try:
+        await storage.upsert_session(
+            SessionNode(
+                session_key=running_key,
+                session_id="running-session",
+                agent_id="main",
+                created_at=1000,
+                updated_at=1000,
+                started_at=1000,
+                status=SessionStatus.RUNNING,
+            )
+        )
+        await storage.upsert_session(
+            SessionNode(
+                session_key=terminal_key,
+                session_id="done-session",
+                agent_id="main",
+                created_at=1200,
+                updated_at=1800,
+                started_at=1200,
+                ended_at=1800,
+                runtime_ms=600,
+                status=SessionStatus.DONE,
+            )
+        )
+        await storage.create_agent_task(
+            AgentTaskRecord(
+                task_id="running-task",
+                session_key=running_key,
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="web_turn",
+                status=AgentTaskStatus.RUNNING,
+                created_at=1100,
+                updated_at=1100,
+                started_at=1100,
+            )
+        )
+        await storage.create_agent_task(
+            AgentTaskRecord(
+                task_id="terminal-session-task",
+                session_key=terminal_key,
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="web_turn",
+                status=AgentTaskStatus.RUNNING,
+                created_at=1300,
+                updated_at=1300,
+                started_at=1300,
+            )
+        )
+
+        abandoned = await storage.mark_abandoned_agent_tasks(now_ms=2500)
+
+        running = await storage.get_session(running_key)
+        terminal = await storage.get_session(terminal_key)
+    finally:
+        await storage.close()
+
+    assert abandoned == 2
+    assert running is not None
+    assert running.status == SessionStatus.FAILED
+    assert running.ended_at == 2500
+    assert running.runtime_ms == 1500
+    assert running.updated_at == 2500
+    assert terminal is not None
+    assert terminal.status == SessionStatus.DONE
+    assert terminal.ended_at == 1800
+    assert terminal.runtime_ms == 600
+
+
+@pytest.mark.asyncio
+async def test_agent_task_abandonment_repairs_previously_partial_restart_cleanup(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "sessions.db"))
+    await storage.connect()
+    key = "agent:main:webchat:partial-restart"
+    try:
+        await storage.upsert_session(
+            SessionNode(
+                session_key=key,
+                session_id="partial-session",
+                agent_id="main",
+                created_at=1000,
+                updated_at=1000,
+                started_at=1000,
+                status=SessionStatus.RUNNING,
+            )
+        )
+        await storage.create_agent_task(
+            AgentTaskRecord(
+                task_id="already-abandoned-task",
+                session_key=key,
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="web_turn",
+                status=AgentTaskStatus.ABANDONED,
+                created_at=1100,
+                updated_at=1800,
+                started_at=1100,
+                finished_at=1800,
+                terminal_reason="process_restart",
+            )
+        )
+
+        abandoned = await storage.mark_abandoned_agent_tasks(now_ms=2500)
+
+        node = await storage.get_session(key)
+    finally:
+        await storage.close()
+
+    assert abandoned == 0
+    assert node is not None
+    assert node.status == SessionStatus.FAILED
+    assert node.ended_at == 2500
+    assert node.runtime_ms == 1500
+    assert node.updated_at == 2500
 
 
 @pytest.mark.asyncio
@@ -101,6 +246,7 @@ async def test_list_agent_tasks_for_sessions_groups_visible_session_tasks(tmp_pa
                 status=AgentTaskStatus.RUNNING,
                 created_at=200,
                 updated_at=200,
+                details={"terminal_assistant_message_content": "x" * 100_000},
             )
         )
         await storage.create_agent_task(
@@ -132,12 +278,26 @@ async def test_list_agent_tasks_for_sessions_groups_visible_session_tasks(tmp_pa
             ["agent:main:webchat:one", "agent:main:webchat:two"],
             limit_per_session=1,
         )
+        exact = await storage.get_agent_task("one-new")
+        exact_many = await storage.get_agent_tasks_by_ids(
+            ["two-task", "one-new", "missing-task"]
+        )
+        recent = await storage.list_recent_agent_tasks(
+            "agent:main:webchat:one",
+            limit=1,
+        )
     finally:
         await storage.close()
 
     assert set(grouped) == {"agent:main:webchat:one", "agent:main:webchat:two"}
     assert [row.task_id for row in grouped["agent:main:webchat:one"]] == ["one-new"]
     assert [row.task_id for row in grouped["agent:main:webchat:two"]] == ["two-task"]
+    assert grouped["agent:main:webchat:one"][0].details is None
+    assert exact is not None
+    assert exact.details == {"terminal_assistant_message_content": "x" * 100_000}
+    assert [row.task_id for row in exact_many] == ["two-task", "one-new"]
+    assert [row.task_id for row in recent] == ["one-new"]
+    assert recent[0].details == {"terminal_assistant_message_content": "x" * 100_000}
 
 
 @pytest.mark.asyncio

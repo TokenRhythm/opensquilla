@@ -44,4 +44,6 @@ Background music, or via the command palette.
 
 Do not commit or publicly distribute builds containing copyrighted music you
 do not have redistribution rights for. Bundling music for personal use of
-your own build is your responsibility.
+your own build is your responsibility. Standard source archives reject these
+ignored files to reduce accidental disclosure; use a direct local wheel or
+local Docker image for a private customized artifact.

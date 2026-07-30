@@ -43,6 +43,25 @@ def test_lab_script_accepts_opentui_backend_for_manual_render_runs() -> None:
     assert args.backend == "opentui"
 
 
+@pytest.mark.parametrize(
+    ("requested_driver", "scenario_requires_tmux", "expected"),
+    [("auto", False, "auto"), ("pty", False, "pty"), ("auto", True, "tmux")],
+)
+def test_lab_script_selects_driver_for_scenario_requirements(
+    requested_driver: str,
+    scenario_requires_tmux: bool,
+    expected: str,
+) -> None:
+    module = _load_lab_script()
+
+    selected = module._select_driver(  # noqa: SLF001
+        requested_driver,
+        scenario_requires_tmux=scenario_requires_tmux,
+    )
+
+    assert selected == expected
+
+
 @pytest.mark.parametrize("backend", REMOVED_BACKEND_IDS)
 def test_lab_script_rejects_removed_backend_choices(backend: str) -> None:
     module = _load_lab_script()

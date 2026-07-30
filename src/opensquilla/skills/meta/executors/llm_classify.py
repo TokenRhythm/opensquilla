@@ -13,7 +13,13 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from opensquilla.engine.types import AgentEvent, TextDeltaEvent, ToolResultEvent
+from opensquilla.engine.types import (
+    AgentEvent,
+    DoneEvent,
+    TextDeltaEvent,
+    ToolResultEvent,
+    done_text_snapshot,
+)
 from opensquilla.skills.meta.templating import (
     _coerce_to_choice,
     _format_classify_prompt,
@@ -122,16 +128,21 @@ async def _drain_agent_runner(
     """
 
     final_text_parts: list[str] = []
+    done_text_present = False
+    done_text = ""
     last_error_tool_result: str = ""
     async for event in agent_runner(system_prompt, user_message):
         if isinstance(event, TextDeltaEvent):
             final_text_parts.append(event.text)
             continue
+        if isinstance(event, DoneEvent):
+            done_text_present, done_text = done_text_snapshot(event)
+            continue
         elif isinstance(event, ToolResultEvent):
             result_text = event.result if isinstance(event.result, str) else ""
             if result_text.strip() and getattr(event, "is_error", False):
                 last_error_tool_result = result_text
-    text = "".join(final_text_parts).strip()
+    text = (done_text if done_text_present else "".join(final_text_parts)).strip()
     if text:
         return text
     if last_error_tool_result:

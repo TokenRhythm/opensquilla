@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any, Literal, TypedDict
 
+from opensquilla.search_tool_outcome import parse_web_tool_outcome
+
 ExecutionStatusValue = Literal["success", "error", "timeout", "cancelled", "unknown"]
 ExecutionStatusSource = Literal["tool_runtime", "adapter", "replay", "legacy", "unknown"]
 ExecutionStatusPreservation = Literal[
@@ -148,6 +150,20 @@ def compact_provider_status(status: Any) -> dict[str, Any]:
 
 def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionStatus | None:
     """Map trusted built-in tool payloads to canonical execution status."""
+
+    web_outcome = parse_web_tool_outcome(tool_name, content)
+    if web_outcome is not None:
+        timed_out = web_outcome.error_kind == "timeout"
+        return {
+            "version": 1,
+            "status": "timeout" if timed_out else "error",
+            "exit_code": None,
+            "timed_out": timed_out,
+            "truncated": False,
+            "reason": f"search_{web_outcome.error_kind}",
+            "source": "adapter",
+            "preservation_class": "diagnostic",
+        }
 
     if not isinstance(content, str):
         return None

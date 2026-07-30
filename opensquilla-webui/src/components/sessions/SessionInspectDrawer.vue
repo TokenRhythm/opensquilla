@@ -48,7 +48,13 @@
 
       <p v-if="snippetText" class="inspect-snippet">{{ snippetText }}</p>
 
-      <div ref="bodyRef" class="inspect-body" :aria-label="t('sessions.inspect.transcriptPreview')">
+      <div
+        ref="bodyRef"
+        class="inspect-body"
+        role="region"
+        tabindex="0"
+        :aria-label="t('sessions.inspect.transcriptPreview')"
+      >
         <RunTrace v-if="!transcriptError" class="inspect-summary" :summary="summary" />
         <ErrorState
           v-if="transcriptError"
@@ -60,17 +66,25 @@
           <p class="inspect-state__text">{{ t('sessions.inspect.loadingTranscript') }}</p>
         </div>
         <template v-else>
-          <div v-if="hasEarlier" class="inspect-earlier">
-            <button type="button" class="btn btn--ghost" :disabled="loadingEarlier" @click="onLoadEarlier">
-              {{ loadingEarlier ? t('sessions.inspect.loading') : t('sessions.inspect.loadEarlier') }}
-            </button>
-          </div>
+          <HistoryLoadSentinel
+            :scroll-container="bodyRef"
+            :has-more="hasEarlier"
+            :loading="loadingEarlier"
+            :error="loadEarlierError"
+            :canonical-available="canonicalAvailable"
+            :canonical-complete="canonicalComplete"
+            :cursor="oldestCursor"
+            :session-key="item.key"
+            @load-earlier="onLoadEarlier"
+            @retry="onHistoryRetry"
+          />
           <p v-if="transcriptRows.length === 0" class="inspect-empty">{{ t('sessions.inspect.noMessages') }}</p>
           <article
             v-for="row in transcriptRows"
             :key="row.id"
             class="inspect-msg"
             :class="'inspect-msg--' + row.tone"
+            :data-message-id="row.id"
           >
             <div class="inspect-msg__role">{{ row.roleLabel }}</div>
             <!-- eslint-disable-next-line vue/no-v-html — renderMarkdown output is DOMPurify-sanitized -->
@@ -78,6 +92,7 @@
             <RunTrace
               v-if="row.steps.length"
               :steps="row.steps"
+              :state-scope="transcriptToolStateScope(row.id)"
               :is-tool-group-open="rt.isToolGroupOpen"
               :is-tool-item-open="rt.isToolItemOpen"
               @toggle-group="rt.toggleGroup"
@@ -128,6 +143,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
+import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
 import RunTrace from '@/components/run/RunTrace.vue'
 import { useSessionInspect } from '@/composables/sessions/useSessionInspect'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
@@ -135,6 +151,11 @@ import { useRunTrace } from '@/composables/run/useRunTrace'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { copyTextWithFallback } from '@/utils/browser'
+import {
+  captureVisibleMessageAnchor,
+  restoreMessageAnchor,
+  stabilizeMessageAnchor,
+} from '@/utils/chat/scrollAnchor'
 import { nodeStepsFromHistoryMessage } from '@/components/run/runTrace'
 import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace'
 import type { SessionItem } from '@/composables/useSessions'
@@ -168,9 +189,14 @@ const {
   hasEarlier,
   loading,
   loadingEarlier,
+  loadEarlierError,
   transcriptError,
+  canonicalAvailable,
+  canonicalComplete,
+  oldestCursor,
   load,
   loadEarlier,
+  retryHistory,
   abortSession,
   reset,
 } = useSessionInspect()
@@ -181,6 +207,10 @@ const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const rt = useRunTrace()
 
+function transcriptToolStateScope(rowId: string): string {
+  return JSON.stringify([props.item?.key || '', rowId])
+}
+
 const drawerRef = ref<HTMLElement | null>(null)
 const bodyRef = ref<HTMLElement | null>(null)
 const closeBtn = ref<HTMLButtonElement | null>(null)
@@ -190,6 +220,14 @@ const resultView = ref<{ rowId: string; title: string; content: string } | null>
 
 let keyCopiedTimer: ReturnType<typeof setTimeout> | null = null
 let invokerEl: HTMLElement | null = null
+let inspectAnchorGeneration = 0
+let stopInspectAnchorStabilization: () => void = () => {}
+
+function cancelInspectAnchorStabilization() {
+  const stop = stopInspectAnchorStabilization
+  stopInspectAnchorStabilization = () => {}
+  stop()
+}
 
 const badge = computed(() => (props.item ? sessionStatusBadge(props.item, props.needsInput === true) : null))
 const canAbort = computed(() =>
@@ -273,6 +311,7 @@ const summary = computed<RunTraceSummary>(() => ({
 }))
 
 function scrollToBottom() {
+  cancelInspectAnchorStabilization()
   nextTick(() => {
     if (bodyRef.value) bodyRef.value.scrollTop = bodyRef.value.scrollHeight
   })
@@ -280,15 +319,45 @@ function scrollToBottom() {
 
 function reload() {
   if (!props.item) return
-  void load(props.item.key).then(scrollToBottom)
+  cancelInspectAnchorStabilization()
+  const generation = ++inspectAnchorGeneration
+  const key = props.item.key
+  void load(key).then(() => {
+    if (generation === inspectAnchorGeneration && props.open && props.item?.key === key) {
+      scrollToBottom()
+    }
+  })
 }
 
 async function onLoadEarlier() {
-  const el = bodyRef.value
-  const previousHeight = el?.scrollHeight || 0
-  await loadEarlier()
-  nextTick(() => {
-    if (el) el.scrollTop += Math.max(0, el.scrollHeight - previousHeight)
+  cancelInspectAnchorStabilization()
+  const generation = ++inspectAnchorGeneration
+  const key = props.item?.key
+  let anchor: ReturnType<typeof captureVisibleMessageAnchor> = null
+  await loadEarlier(() => { anchor = captureVisibleMessageAnchor(bodyRef.value) })
+  await nextTick()
+  if (generation !== inspectAnchorGeneration || !props.open || props.item?.key !== key) return
+  restoreMessageAnchor(anchor)
+  stopInspectAnchorStabilization = stabilizeMessageAnchor(anchor, {
+    isCurrent: () => props.open
+      && props.item?.key === key
+      && generation === inspectAnchorGeneration,
+  })
+}
+
+async function onHistoryRetry() {
+  cancelInspectAnchorStabilization()
+  const generation = ++inspectAnchorGeneration
+  const key = props.item?.key
+  let anchor: ReturnType<typeof captureVisibleMessageAnchor> = null
+  await retryHistory(() => { anchor = captureVisibleMessageAnchor(bodyRef.value) })
+  await nextTick()
+  if (generation !== inspectAnchorGeneration || !props.open || props.item?.key !== key) return
+  restoreMessageAnchor(anchor)
+  stopInspectAnchorStabilization = stabilizeMessageAnchor(anchor, {
+    isCurrent: () => props.open
+      && props.item?.key === key
+      && generation === inspectAnchorGeneration,
   })
 }
 
@@ -354,6 +423,8 @@ function onDocumentKeydown(event: KeyboardEvent) {
 watch(
   () => [props.open, props.item?.key] as const,
   ([open, key], previous) => {
+    cancelInspectAnchorStabilization()
+    inspectAnchorGeneration += 1
     const wasOpen = previous?.[0] === true
     if (open && key) {
       if (!wasOpen) {
@@ -361,7 +432,12 @@ watch(
         document.addEventListener('keydown', onDocumentKeydown)
       }
       keyCopied.value = false
-      void load(key).then(scrollToBottom)
+      const generation = inspectAnchorGeneration
+      void load(key).then(() => {
+        if (generation === inspectAnchorGeneration && props.open && props.item?.key === key) {
+          scrollToBottom()
+        }
+      })
       nextTick(() => closeBtn.value?.focus())
     } else if (wasOpen && !open) {
       document.removeEventListener('keydown', onDocumentKeydown)
@@ -374,6 +450,8 @@ watch(
 )
 
 onUnmounted(() => {
+  cancelInspectAnchorStabilization()
+  inspectAnchorGeneration += 1
   document.removeEventListener('keydown', onDocumentKeydown)
   if (keyCopiedTimer) clearTimeout(keyCopiedTimer)
 })
@@ -548,6 +626,11 @@ onUnmounted(() => {
   padding: var(--sp-4);
 }
 
+.inspect-body:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--border-focus);
+  outline: none;
+}
+
 .inspect-state {
   align-items: center;
   color: var(--text-muted);
@@ -560,11 +643,6 @@ onUnmounted(() => {
 .inspect-state__text {
   font-size: var(--fs-sm);
   margin: 0;
-}
-
-.inspect-earlier {
-  display: flex;
-  justify-content: center;
 }
 
 .inspect-empty {

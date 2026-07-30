@@ -21,7 +21,12 @@
       <div class="ov-status-actions">
         <span v-if="!healthLoading" class="ov-freshness" aria-live="polite">
           {{ t('sessions.overview.checkedAgo', { time: relTime(healthCheckedAt) }) }} ·
-          <button type="button" class="ov-rerun" :disabled="healthLoading" @click="loadHealth">
+          <button
+            type="button"
+            class="ov-rerun"
+            :disabled="healthLoading"
+            @click="loadHealth({ deep: true })"
+          >
             {{ t('sessions.overview.rerunChecks') }}
           </button>
         </span>
@@ -35,23 +40,12 @@
           <Icon name="chat" :size="14" />
           <span>{{ t('sessions.overview.diagnoseWithAgent') }}</span>
         </button>
+        <!-- "Open chat" retired: the sidebar's New task row and the default
+             landing route both already go there, and it put a second brand
+             button on a status line. Diagnose stays the row's one action. -->
         <button class="btn btn--ghost" :title="t('sessions.refresh')" :disabled="refreshing" @click="refresh">
           <Icon name="refresh" :size="16" />
           <span>{{ refreshing ? t('sessions.refreshing') : t('sessions.refresh') }}</span>
-        </button>
-        <button
-          class="btn btn--ghost"
-          type="button"
-          :title="t('sessions.overview.copyDiagnostics')"
-          :disabled="healthLoading || !healthReport"
-          @click="copyDiagnostics"
-        >
-          <Icon :name="copiedCommandKey === DIAGNOSTICS_COPY_KEY ? 'check' : 'copy'" :size="16" />
-          <span>{{ t('sessions.overview.copyDiagnostics') }}</span>
-        </button>
-        <button class="btn btn--primary" :title="t('sessions.overview.openChat')" @click="router.push('/chat')">
-          <Icon name="chat" :size="16" />
-          <span>{{ t('sessions.overview.openChat') }}</span>
         </button>
       </div>
     </section>
@@ -59,21 +53,24 @@
     <!-- Three real KPIs — quiet Settings-style cards, display numerals. -->
     <section class="ov-kpis" :aria-label="t('sessions.overview.title')">
       <button class="control-stat control-stat--clickable" type="button" @click="router.push('/usage')">
-        <div class="control-stat__icon"><Icon name="usage" :size="18" /></div>
         <div class="control-stat__label">{{ t('sessions.overview.totalTokens') }}</div>
         <div class="control-stat__value">{{ tokensDisplay }}</div>
         <div class="control-stat__hint">{{ costLine }}</div>
       </button>
 
       <button class="control-stat control-stat--clickable" type="button" :title="t('sessions.overview.totalSessionsTitle')" @click="router.push('/sessions')">
-        <div class="control-stat__icon"><Icon name="sessions" :size="18" /></div>
         <div class="control-stat__label">{{ t('sessions.overview.totalSessions') }}</div>
         <div class="control-stat__value">{{ sessionsCount }}</div>
         <div class="control-stat__hint">{{ t('sessions.overview.viewAll') }}</div>
       </button>
 
+      <button v-if="channelStats.total > 0" class="control-stat control-stat--clickable" type="button" @click="router.push('/channels')">
+        <div class="control-stat__label">{{ t('console.overview.channelsChip') }}</div>
+        <div class="control-stat__value">{{ channelStats.total }}</div>
+        <div class="control-stat__hint">{{ channelChipHint }}</div>
+      </button>
+
       <div class="control-stat control-stat--static">
-        <div class="control-stat__icon"><Icon name="cron" :size="18" /></div>
         <div class="control-stat__label">{{ t('sessions.overview.uptime') }}</div>
         <div class="control-stat__value control-stat__value--mono">{{ uptime }}</div>
         <div class="control-stat__hint">{{ versionLine }}</div>
@@ -146,9 +143,8 @@
                 >
                   {{ findingBadgeText(finding) }}
                 </span>
-                <span v-if="finding.restartRequired" class="health-chip">{{ t('sessions.overview.recoveryRestart') }}</span>
                 <button
-                  v-if="settingsLinkForFinding(finding)"
+                  v-if="findingSettingsLink(finding)"
                   type="button"
                   class="health-settings-link"
                   @click="openFindingSettings(finding)"
@@ -160,114 +156,33 @@
                 {{ finding.title || finding.id || t('sessions.overview.findingFallback', { n: fIdx + 1 }) }}
               </div>
               <div v-if="finding.detail" class="health-finding__detail">{{ finding.detail }}</div>
-              <div v-if="visibleEvidenceEntries(finding.evidence).length" class="health-evidence" aria-label="Finding evidence">
-                <span v-for="([key, value], eIdx) in visibleEvidenceEntries(finding.evidence).slice(0, 6)" :key="eIdx">
-                  <b>{{ evidenceLabel(key) }}</b>{{ evidenceValue(value) }}
-                </span>
-              </div>
-              <AdvancedCliSteps
-                v-if="(finding.fixSteps || []).length"
-                :steps="normalizedFixSteps(finding)"
-                :heading="stepsHeading(findingGroupKind(finding))"
-              />
+              <!-- Evidence dump + CLI recipe behind one disclosure. Optional and
+                   ready findings collapse it (reference material you rarely
+                   open); anything blocking or degrading starts expanded, so
+                   nothing actionable is hidden. The summary is the only label —
+                   AdvancedCliSteps' own heading would repeat it. -->
+              <details
+                v-if="hasFindingExtras(finding)"
+                class="health-finding__more"
+                :open="!isMinorFinding(finding)"
+              >
+                <summary>{{ t('sessions.overview.findingDetails') }}</summary>
+                <div v-if="visibleEvidenceEntries(finding.evidence).length" class="health-evidence" aria-label="Finding evidence">
+                  <span v-for="([key, value], eIdx) in visibleEvidenceEntries(finding.evidence).slice(0, 6)" :key="eIdx">
+                    <b>{{ evidenceLabel(key) }}</b>{{ evidenceValue(value) }}
+                  </span>
+                </div>
+                <AdvancedCliSteps
+                  v-if="normalizedFixSteps(finding).length"
+                  :steps="normalizedFixSteps(finding)"
+                />
+              </details>
             </div>
           </article>
         </section>
       </template>
     </section>
 
-    <!-- Grid panels -->
-    <div class="ov-grid">
-      <!-- Recent sessions -->
-      <section class="ov-panel ov-panel--span2 control-panel">
-        <div class="ov-panel__head control-panel__head">
-          <div>
-            <span class="ov-panel__eyebrow control-panel__eyebrow">{{ t('sessions.overview.recentActivity') }}</span>
-            <h2 class="ov-panel__title control-panel__title">{{ t('sessions.title') }}</h2>
-          </div>
-          <button class="ov-link" type="button" @click="router.push('/sessions')">
-            {{ t('sessions.overview.viewAllArrow') }}
-          </button>
-        </div>
-        <div class="ov-recent">
-          <template v-if="loadingSessions">
-            <div class="skeleton-row" />
-          </template>
-          <template v-else-if="sessionsError">
-            <ErrorState :message="sessionsError" :on-retry="refreshSessions" />
-          </template>
-          <template v-else-if="recentSessions.length === 0">
-            <div class="control-empty">
-              <Icon name="sessions" :size="32" class="control-empty__icon" aria-hidden="true" />
-              <div class="control-empty__title">{{ t('sessions.overview.noSessions') }}</div>
-            </div>
-          </template>
-          <template v-else>
-            <button
-              v-for="s in recentSessions"
-              :key="s.key"
-              class="ov-recent__row"
-              type="button"
-              @click="openSession(s.key)"
-            >
-              <span
-                class="dot"
-                :class="sessionStatusClass(s.status)"
-                :aria-label="sessionStatusLabel(s.status)"
-                :title="sessionStatusLabel(s.status)"
-              />
-              <span class="ov-recent__key">{{ s.key }}</span>
-              <span v-if="s.model" class="ov-recent__model">{{ s.model }}</span>
-              <span v-if="s.message_count != null" class="ov-recent__msgs">{{ formatMessageCount(s.message_count) }}</span>
-              <span class="ov-recent__time">{{ relTime(s.updated_at) }}</span>
-              <span class="ov-recent__arrow">&rarr;</span>
-            </button>
-          </template>
-        </div>
-      </section>
-
-      <!-- Connection panel -->
-      <section class="ov-panel control-panel">
-        <div class="ov-panel__head control-panel__head">
-          <div>
-            <span class="ov-panel__eyebrow control-panel__eyebrow">{{ t('sessions.overview.connection') }}</span>
-            <h2 class="ov-panel__title control-panel__title">{{ t('sessions.overview.gateway') }}</h2>
-          </div>
-          <span class="conn-pill" :class="connPillClass">{{ connPillLabel }}</span>
-        </div>
-        <div class="ov-form">
-          <p class="ov-conn-hint">{{ t('sessions.overview.connHint') }}</p>
-          <router-link class="btn btn--ghost btn--sm" to="/settings/connection">{{ t('sessions.overview.manageConnection') }}</router-link>
-        </div>
-      </section>
-
-      <!-- Event stream -->
-      <section class="ov-panel ov-panel--span3 control-panel">
-        <div class="ov-panel__head control-panel__head">
-          <div>
-            <span class="ov-panel__eyebrow control-panel__eyebrow">{{ t('sessions.overview.live') }}</span>
-            <h2 class="ov-panel__title control-panel__title">{{ t('sessions.overview.eventStream') }}</h2>
-          </div>
-          <span class="ov-panel__meta">{{ eventCountText }}</span>
-        </div>
-        <div class="ov-event-log">
-          <div v-if="eventLog.length === 0" class="ov-event-log__empty">
-            <span class="ov-event-log__pulse" />
-            {{ t('sessions.overview.listening') }}
-          </div>
-          <div
-            v-for="(e, i) in eventLog"
-            :key="i"
-            class="ov-event-log__row"
-            :class="{ 'is-fresh': i === 0 }"
-          >
-            <span class="ov-event-log__ts">{{ e.ts }}</span>
-            <span class="ov-event-log__name">{{ e.eventName }}</span>
-            <span class="ov-event-log__payload">{{ e.payloadStr }}</span>
-          </div>
-        </div>
-      </section>
-    </div>
   </div>
 </template>
 
@@ -277,30 +192,28 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { useRpcStore } from '@/stores/rpc'
 import { useRequest } from '@/composables/useRequest'
+import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
+import { effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
+import type { UsageSnapshot } from '@/types/usage'
 import { useToasts } from '@/composables/useToasts'
+import { isOwnedGatewayConnection } from '@/composables/useCliInvocation'
+import { usePlatform } from '@/platform'
 import { copyTextWithFallback } from '@/utils/browser'
 import {
+  buildAgentDiagnosisHandoff,
   formatLatencyLine,
   normalizeHomePaths,
+  withoutLegacyMigrationFinding,
   providerBlocksAgent,
   settingsLinkForFinding,
   xmlEscape,
 } from '@/utils/overviewDiagnostics'
 import Icon from '@/components/Icon.vue'
-import ErrorState from '@/components/ErrorState.vue'
 import AdvancedCliSteps from '@/components/overview/AdvancedCliSteps.vue'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-interface Session {
-  key: string
-  status?: string
-  model?: string
-  message_count?: number
-  updated_at?: string
-}
 
 interface StatusData {
   uptime_ms?: number
@@ -351,10 +264,6 @@ interface UsageData {
   totalCostUsd?: number
 }
 
-interface SessionsListData {
-  sessions?: Session[]
-}
-
 // providers.status row — only the fields the overview reads. `latency` is a
 // newer optional TTFT summary; older gateways omit it entirely.
 interface ProviderStatusRow {
@@ -372,12 +281,6 @@ interface ProvidersStatusData {
   providers?: ProviderStatusRow[]
 }
 
-interface LogEvent {
-  ts: string
-  eventName: string
-  payloadStr: string
-}
-
 // ---------------------------------------------------------------------------
 // Stores & Router
 // ---------------------------------------------------------------------------
@@ -386,6 +289,7 @@ const { t } = useI18n()
 const router = useRouter()
 const rpc = useRpcStore()
 const { pushToast } = useToasts()
+const platform = usePlatform()
 
 // ---------------------------------------------------------------------------
 // State
@@ -399,16 +303,8 @@ const { data: statusData, refresh: refreshStatus } = useRequest<StatusData>(
   undefined,
   { errorLabel: 'Failed to load status', immediate: false },
 )
-const { data: usageData, refresh: refreshUsage } = useRequest<UsageData>(
-  'usage.status',
-  undefined,
-  { errorLabel: 'Failed to load usage', toastOnError: false, immediate: false },
-)
-const { data: sessionsData, loading: loadingSessions, error: sessionsError, refresh: refreshSessions } = useRequest<SessionsListData>(
-  'sessions.list',
-  { limit: 5 },
-  { errorLabel: 'Failed to load sessions', immediate: false },
-)
+const usageData = ref<UsageData | null>(null)
+const usageSnapshot = ref<UsageSnapshot | null>(null)
 
 // Derived display values from status panel
 const uptime = computed<string>(() => {
@@ -432,25 +328,37 @@ const tokensDisplay = computed<string>(() =>
 const costLine = computed<string>(() => {
   const cost = usageData.value?.totalCostUsd
   if (cost == null) return '—'
-  const cnyRate = 7.25
+  // Prefer the ledger's canonical rate; 7.25 is only the legacy display
+  // fallback for gateways that predate served FX rates.
+  const cnyRate = effectiveCnyPerUsd(usageSnapshot.value) ?? 7.25
   const usd = '$' + Number(cost).toFixed(4)
   const cny = '¥' + (Number(cost) * cnyRate).toFixed(4)
   const cur = localStorage.getItem('opensquilla-currency') || 'USD'
   return cur === 'CNY' ? `${cny} · ${usd}` : `${usd} · ${cny}`
 })
 
-// Derived recent sessions
-const recentSessions = computed<Session[]>(() => {
-  const list = sessionsData.value?.sessions || []
-  return list
-    .slice()
-    .sort((a, b) => {
-      const ta = a.updated_at ? new Date(a.updated_at).getTime() : 0
-      const tb = b.updated_at ? new Date(b.updated_at).getTime() : 0
-      return tb - ta
+async function refreshUsage(): Promise<UsageData | null> {
+  try {
+    const snapshot = await requestUsageSnapshot(rpc, 'all', {
+      days: false,
+      models: false,
+      sessions: false,
+      cachedSnapshot: usageSnapshot.value,
     })
-    .slice(0, 6)
-})
+    usageSnapshot.value = snapshot
+    const result = {
+      totalSessions: snapshot.totals.sessions,
+      totalTokens: snapshot.totals.totalTokens,
+      totalCostUsd: snapshot.totals.cost,
+    }
+    usageData.value = result
+    return result
+  } catch {
+    // Overview usage is an optional KPI. Preserve the last good value while
+    // the primary Usage page provides a retryable error state.
+    return null
+  }
+}
 
 // Health panel keeps its own imperative state (special error rendering)
 const healthLoading = ref(true)
@@ -463,33 +371,13 @@ const copiedCommandKey = ref('')
 // the active-provider latency line; failures leave the list empty and silent.
 const providerRows = ref<ProviderStatusRow[]>([])
 
-const eventLog = ref<LogEvent[]>([])
-
 let autoRefreshId: ReturnType<typeof setInterval> | null = null
-let unsubEvents: (() => void) | null = null
 let copiedCommandResetId: ReturnType<typeof setTimeout> | null = null
+let hasActivated = false
 
 // ---------------------------------------------------------------------------
 // Computed
 // ---------------------------------------------------------------------------
-
-const connPillState = computed(() => {
-  if (rpc.isConnecting) return 'connecting'
-  if (rpc.isConnected) return 'connected'
-  return 'disconnected'
-})
-
-const connPillClass = computed(() => {
-  const state = connPillState.value
-  if (state === 'connected') return 'ok'
-  if (state === 'connecting') return 'warn'
-  return 'err'
-})
-
-const connPillLabel = computed(() => t(`sessions.overview.conn.${connPillState.value}`))
-
-const eventCountText = computed(() =>
-  t('sessions.overview.eventCount', { count: eventLog.value.length }))
 
 const stripClass = computed(() => {
   if (healthLoading.value) return 'is-loading'
@@ -615,24 +503,49 @@ const groupedFindings = computed<FindingGroup[]>(() => {
 // ---------------------------------------------------------------------------
 
 onMounted(() => {
-  // Initial data load (readiness loads once; deep doctor checks are heavier
-  // than the 30s status polls, so they only rerun on manual Refresh).
-  // useRequest handles initial load for status/usage/sessions on mount.
-  loadHealth()
   // Latency rides alongside the doctor report but never gates it. Like the
   // deep checks, providers.status is expensive (a client per registered spec),
   // so it loads on mount and manual Refresh only — never from the 30s poll.
   void loadProviderStatus()
 })
 
-// Timers and the event subscription live on activate/deactivate so a kept-alive
-// but hidden Overview stops its 30s/2s polling and event accrual. onActivated
-// fires on first mount too, so the timers are owned entirely here.
+// KeepAlive owns all status loading. The first activation performs one deep
+// doctor pass; returning activations refresh cached data with a shallow pass.
 onActivated(() => {
   startTimers()
-  // A returning view refreshes immediately so cached numbers don't linger.
-  loadData()
+  const initialActivation = !hasActivated
+  hasActivated = true
+  void loadData({ deep: initialActivation, silentHealth: !initialActivation })
+  void loadChannelStats()
 })
+
+// Channels rollup for the KPI chip — best-effort; a failure just hides it.
+const channelStats = ref({ total: 0, connected: 0, failed: 0, pending: 0 })
+const channelChipHint = computed(() => {
+  const parts = [t('console.overview.channelsChipConnected', { connected: channelStats.value.connected })]
+  if (channelStats.value.failed > 0) {
+    parts.push(t('console.overview.channelsChipFailed', { failed: channelStats.value.failed }))
+  }
+  if (channelStats.value.pending > 0) {
+    parts.push(t('console.overview.channelsChipPending', { pending: channelStats.value.pending }))
+  }
+  return parts.join(' · ')
+})
+
+async function loadChannelStats() {
+  try {
+    const res = await rpc.call<{ channels?: Array<{ status?: string; configured?: boolean; pendingPairings?: number }> }>('channels.status')
+    const rows = (res.channels || []).filter(ch => ch && ch.configured !== false)
+    channelStats.value = {
+      total: rows.length,
+      connected: rows.filter(ch => ch.status === 'connected').length,
+      failed: rows.filter(ch => ch.status === 'dead' || ch.status === 'exhausted').length,
+      pending: rows.reduce((sum, ch) => sum + (ch.pendingPairings || 0), 0),
+    }
+  } catch {
+    channelStats.value = { total: 0, connected: 0, failed: 0, pending: 0 }
+  }
+}
 
 onDeactivated(() => {
   stopTimers()
@@ -644,23 +557,17 @@ onUnmounted(() => {
 })
 
 function startTimers() {
-  if (!unsubEvents) {
-    unsubEvents = rpc.on('*', (eventName: string, payload: unknown) => {
-      pushEvent(eventName, payload)
-    })
+  if (!autoRefreshId) {
+    autoRefreshId = setInterval(() => {
+      void loadData({ deep: false, silentHealth: true })
+    }, 30000)
   }
-  // Auto-refresh every 30s (silent background refresh)
-  if (!autoRefreshId) autoRefreshId = setInterval(loadData, 30000)
 }
 
 function stopTimers() {
   if (autoRefreshId) {
     clearInterval(autoRefreshId)
     autoRefreshId = null
-  }
-  if (unsubEvents) {
-    unsubEvents()
-    unsubEvents = null
   }
 }
 
@@ -678,7 +585,7 @@ async function refresh() {
   // Fire-and-forget: latency is optional telemetry and never gates the refresh.
   void loadProviderStatus()
   try {
-    await Promise.all([refreshStatus(), refreshUsage(), refreshSessions(), loadHealth()])
+    await loadData({ deep: true, silentHealth: false })
   } finally {
     refreshing.value = false
   }
@@ -688,21 +595,30 @@ function scrollToHealth() {
   document.getElementById('overview-health')?.scrollIntoView({ block: 'start' })
 }
 
-async function loadHealth() {
-  healthLoading.value = true
-  healthError.value = null
+interface HealthLoadOptions {
+  deep: boolean
+  silent?: boolean
+}
+
+async function loadHealth({ deep, silent = false }: HealthLoadOptions) {
+  if (!silent) {
+    healthLoading.value = true
+    healthError.value = null
+  }
 
   try {
     await rpc.waitForConnection()
-    const data = await rpc.call<HealthReport>('doctor.status', { agentId: 'main', deep: true })
+    const response = await rpc.call<HealthReport>('doctor.status', { agentId: 'main', deep })
+    const data = withoutLegacyMigrationFinding(response)
     if (!data.gatewayUrl) data.gatewayUrl = gatewayContextUrl()
+    healthError.value = null
     healthReport.value = data
     healthCheckedAt.value = new Date().toISOString()
   } catch (err) {
     healthError.value = err instanceof Error ? err : new Error(String(err))
     healthReport.value = null
   } finally {
-    healthLoading.value = false
+    if (!silent) healthLoading.value = false
   }
 }
 
@@ -724,14 +640,22 @@ function clearCopiedCommandTimer() {
 }
 
 function normalizedFixSteps(finding: Finding): Array<{ label: string; command?: string; detail?: string }> {
-  return (finding.fixSteps || []).map(step => ({
+  const targetFresh = finding.evidence?.target_fresh ?? finding.evidence?.targetFresh
+  const hideMigrationApply = finding.id === 'migration.legacy_home_detected'
+    && targetFresh === false
+
+  return (finding.fixSteps || []).filter((step) => {
+    if (!hideMigrationApply) return true
+    const command = String(step.command || '')
+    return !/(?:^|\s)--apply(?:\s|$)/.test(command)
+  }).map(step => ({
     label: step.label || t('sessions.overview.step'),
     command: step.command,
     detail: step.detail,
   }))
 }
 
-// Shared check-icon swap (1600ms) for the command and diagnostics copies.
+// Shared check-icon swap (1600ms) for copyable environment commands.
 function markCopied(key: string) {
   copiedCommandKey.value = key
   clearCopiedCommandTimer()
@@ -755,31 +679,6 @@ async function copyCommand(command: string, key: string) {
   }
 }
 
-const DIAGNOSTICS_COPY_KEY = 'diagnostics-json'
-
-// Full doctor report as pretty JSON for bug reports, with the gateway URL and
-// a copy timestamp attached and local home directories collapsed to `~/`.
-async function copyDiagnostics() {
-  // No live report (doctor failed or still loading) means nothing worth
-  // pasting into a bug report; the button is disabled in that state too.
-  if (!healthReport.value) return
-  const report = {
-    ...healthReport.value,
-    gatewayUrl: healthReport.value.gatewayUrl || gatewayContextUrl(),
-    copiedAt: new Date().toISOString(),
-  }
-  try {
-    await copyTextWithFallback(normalizeHomePaths(JSON.stringify(report, null, 2)))
-    markCopied(DIAGNOSTICS_COPY_KEY)
-    pushToast(t('sessions.overview.copiedDiagnostics'), { tone: 'ok' })
-  } catch (err) {
-    clearCopiedCommandTimer()
-    copiedCommandKey.value = ''
-    const error = err instanceof Error ? err.message : String(err)
-    pushToast(t('setup.toast.copyFailed', { error }), { tone: 'danger' })
-  }
-}
-
 // Hand the trimmed doctor report to a fresh main-agent chat. The report is
 // data, not instructions: it is XML-escaped inside an <untrusted> envelope so
 // finding text cannot inject directives into the prompt.
@@ -794,8 +693,17 @@ function diagnoseWithAgent() {
     impactCounts: report.impactCounts,
     findings: report.findings,
   }
-  const payload = xmlEscape(normalizeHomePaths(JSON.stringify(minReport)))
+  const ownsGatewayConnection = platform.capabilities.ownsGateway && isOwnedGatewayConnection()
+  const handoff = buildAgentDiagnosisHandoff(minReport, {
+    platform: platform.id,
+    hasTerminalWorkflow: platform.capabilities.hasTerminalWorkflow,
+    ownsGateway: platform.capabilities.ownsGateway,
+    ownsGatewayConnection,
+  })
+  const clientContext = xmlEscape(JSON.stringify(handoff.clientContext))
+  const payload = xmlEscape(normalizeHomePaths(JSON.stringify(handoff.report)))
   const text = `${t('sessions.overview.diagnosePrompt')}\n`
+    + `<context source="client:diagnostic-context">${clientContext}</context>\n`
     + `<untrusted source="doctor:report">${payload}</untrusted>`
   router.push({
     path: '/chat/new',
@@ -806,47 +714,34 @@ function diagnoseWithAgent() {
   }).catch(() => {})
 }
 
-function openFindingSettings(finding: Finding) {
-  const link = settingsLinkForFinding(finding)
-  if (!link) return
-  router.push(link.hash ? { path: link.path, hash: link.hash } : { path: link.path }).catch(() => {})
+function findingSettingsLink(finding: Finding) {
+  return settingsLinkForFinding(finding, {
+    isDesktop: platform.capabilities.isDesktop,
+    ownsGatewayConnection: platform.capabilities.ownsGateway && isOwnedGatewayConnection(),
+  })
 }
 
-function openSession(key: string) {
-  router.push({ path: '/chat', query: { session: key } })
+function openFindingSettings(finding: Finding) {
+  const link = findingSettingsLink(finding)
+  if (!link) return
+  router.push({ path: link.path, hash: link.hash, query: link.query }).catch(() => {})
 }
 
 // ---------------------------------------------------------------------------
 // Data loading
 // ---------------------------------------------------------------------------
 
-function loadData() {
-  void refreshStatus()
-  void refreshUsage()
-  void refreshSessions()
-  // Keep the readiness report fresh alongside the stat tiles so the findings and
-  // the "Checked …" line never silently drift; deep checks stay on manual Refresh.
-  void loadHealth()
+interface DataLoadOptions {
+  deep: boolean
+  silentHealth: boolean
 }
 
-// ---------------------------------------------------------------------------
-// Event log
-// ---------------------------------------------------------------------------
-
-function pushEvent(eventName: string, payload: unknown) {
-  const now = new Date()
-  const ts = now.toTimeString().slice(0, 8)
-  let payloadStr = ''
-  try {
-    payloadStr = JSON.stringify(payload)
-    if (payloadStr.length > 80) payloadStr = payloadStr.slice(0, 80) + '…'
-  } catch {
-    payloadStr = String(payload)
-  }
-  eventLog.value.unshift({ ts, eventName, payloadStr })
-  if (eventLog.value.length > 30) {
-    eventLog.value = eventLog.value.slice(0, 30)
-  }
+async function loadData({ deep, silentHealth }: DataLoadOptions) {
+  await Promise.all([
+    refreshStatus(),
+    refreshUsage(),
+    loadHealth({ deep, silent: silentHealth }),
+  ])
 }
 
 // ---------------------------------------------------------------------------
@@ -929,10 +824,15 @@ function visibleEvidenceEntries(evidence: Record<string, unknown> | undefined): 
     .filter(([key, value]) => value !== undefined && value !== null && !HIDDEN_EVIDENCE_KEYS.has(key))
 }
 
-function stepsHeading(kind: 'action' | 'degraded' | 'optional' | 'ready'): string {
-  if (kind === 'optional') return t('sessions.overview.steps.optional')
-  if (kind === 'ready') return t('sessions.overview.steps.reference')
-  return t('sessions.overview.steps.recovery')
+// Optional / already-ready findings are reference reading: their evidence and
+// CLI recipe stay folded. Anything blocking or degrading opens expanded.
+function isMinorFinding(finding: Finding): boolean {
+  return ['optional', 'none'].includes(impactValue(finding))
+}
+
+function hasFindingExtras(finding: Finding): boolean {
+  return visibleEvidenceEntries(finding.evidence).length > 0
+    || normalizedFixSteps(finding).length > 0
 }
 
 function shellArg(value: string | undefined | null): string {
@@ -1065,34 +965,6 @@ function findingBadgeClass(finding: Finding): string {
   return ''
 }
 
-function sessionStatusClass(status: string | undefined): string {
-  const s = (status || 'unknown').toLowerCase()
-  if (s === 'active' || s === 'ready' || s === 'ok') return 'ok'
-  if (s === 'paused' || s === 'degraded' || s === 'warn') return 'warn'
-  if (s === 'error' || s === 'failed' || s === 'err') return 'err'
-  if (s === 'closed' || s === 'ended' || s === 'offline') return 'off'
-  return 'off'
-}
-
-function sessionStatusLabel(status: string | undefined): string {
-  const s = (status || 'unknown').toLowerCase()
-  const keys: Record<string, string> = {
-    active: 'sessions.overview.dotStatus.active',
-    ready: 'sessions.overview.dotStatus.ready',
-    ok: 'sessions.overview.dotStatus.ok',
-    paused: 'sessions.overview.dotStatus.paused',
-    degraded: 'sessions.overview.dotStatus.degraded',
-    warn: 'sessions.overview.dotStatus.warn',
-    error: 'sessions.overview.dotStatus.error',
-    failed: 'sessions.overview.dotStatus.failed',
-    closed: 'sessions.overview.dotStatus.closed',
-    ended: 'sessions.overview.dotStatus.ended',
-    offline: 'sessions.overview.dotStatus.offline',
-    unknown: 'sessions.overview.dotStatus.unknown',
-  }
-  return keys[s] ? t(keys[s]) : s.charAt(0).toUpperCase() + s.slice(1)
-}
-
 function relTime(dateStr: string | undefined): string {
   if (!dateStr) return '—'
   const d = new Date(dateStr)
@@ -1111,10 +983,6 @@ function relTime(dateStr: string | undefined): string {
   if (diffHour < 24) return t('sessions.relTime.hours', { n: diffHour })
   if (diffDay < 7) return t('sessions.relTime.days', { n: diffDay })
   return d.toLocaleDateString()
-}
-
-function formatMessageCount(n: number): string {
-  return t('sessions.msgCount', { count: n.toLocaleString() })
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,7 +1058,7 @@ function gatewayContextUrl(): string {
   gap: var(--sp-3);
   margin-left: auto;
 }
-/* Compact button modifier (status-line diagnose + connection panel link). */
+/* Compact status-line diagnose button. */
 .btn--sm {
   font-size: var(--fs-xs);
   padding: 5px 10px;
@@ -1216,426 +1084,46 @@ function gatewayContextUrl(): string {
 .ov-kpis > .control-stat:nth-child(3) { animation-delay: 80ms; }
 
 /* Environment footer readout: quiet, copyable env detail (not hero content) */
+/* Environment readout is reference material, not content: it sits directly on
+   the canvas with no card shell, and each value is quiet text rather than a
+   filled chip. Six pills in a bordered strip read as six things to attend to;
+   this reads as one footnote. */
 .ov-readout {
   align-items: center;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-card);
-  box-shadow: var(--elev-1);
   color: var(--text-dim);
   column-gap: var(--sp-5);
   display: flex;
   flex-wrap: wrap;
   font-size: var(--fs-xs);
-  padding: 11px var(--sp-4);
+  padding: 2px var(--sp-1);
   row-gap: 6px;
 }
-.ov-readout__kv { align-items: center; display: flex; gap: 7px; min-width: 0; }
-.ov-readout__kv b { color: var(--text-muted); font-weight: 600; }
+.ov-readout__kv { align-items: center; display: flex; gap: 6px; min-width: 0; }
+.ov-readout__kv b { color: var(--text-dim); font-weight: var(--fw-eyebrow); }
 .ov-readout__kv code {
-  background: var(--bg-surface-2);
-  border-radius: var(--radius-sm);
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: 12px;
-  padding: 2px 8px;
   white-space: nowrap;
 }
+/* Bare glyph until hovered — a bordered box per copyable value was most of the
+   strip's visual noise. */
 .ov-readout__copy {
   align-items: center;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   color: var(--text-dim);
   cursor: pointer;
   display: inline-flex;
-  height: 22px;
+  height: 20px;
   justify-content: center;
-  width: 22px;
+  width: 20px;
 }
 .ov-readout__copy:hover { background: var(--bg-hover); color: var(--text); }
 .ov-readout__copy--ok { color: var(--ok); }
 .ov-readout__copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .ov-readout__version { margin-left: auto; white-space: nowrap; }
-
-/* Grid panels */
-.ov-grid {
-  display: grid;
-  grid-template-columns: 2fr 1fr;
-  gap: var(--sp-4);
-}
-.ov-panel--span2 {
-  grid-column: span 1;
-}
-.ov-panel--span3 {
-  grid-column: 1 / -1;
-}
-.ov-panel__meta {
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  font-weight: 600;
-}
-.ov-link {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: 0;
-  min-height: 40px;
-  padding: 0 var(--sp-1);
-  cursor: pointer;
-  color: var(--accent);
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
-}
-.ov-link:hover {
-  color: var(--accent-hover);
-}
-
-/* Connection pill */
-.conn-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 10px;
-  border-radius: var(--radius-full);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-}
-.conn-pill.ok {
-  background: color-mix(in srgb, var(--ok) 12%, transparent);
-  border-color: color-mix(in srgb, var(--ok) 40%, var(--border));
-  color: var(--ok);
-}
-.conn-pill.warn {
-  background: color-mix(in srgb, var(--warn) 12%, transparent);
-  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
-  color: var(--warn);
-}
-.conn-pill.err {
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
-  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
-  color: var(--danger);
-}
-
-/* Recent sessions */
-.ov-recent {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.ov-recent__row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  text-align: left;
-  font: inherit;
-  color: inherit;
-  transition: background var(--transition), border-color var(--transition), transform var(--dur-fast) var(--ease-standard);
-}
-.ov-recent__row:hover {
-  background: var(--bg-elevated);
-  border-color: var(--border);
-  transform: translateX(2px);
-}
-.ov-recent__row:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-.ov-recent__key {
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-.ov-recent__row:hover .ov-recent__key {
-  color: var(--accent);
-}
-.ov-recent__model {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-  padding: 1px 8px;
-  border-radius: var(--radius-sm);
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ov-recent__msgs {
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.ov-recent__time {
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.ov-recent__arrow {
-  color: var(--text-dim);
-  font-size: 12px;
-  opacity: 0;
-  transition: opacity var(--transition), transform var(--dur-fast) var(--ease-standard);
-}
-.ov-recent__row:hover .ov-recent__arrow {
-  opacity: 1;
-  color: var(--accent);
-  transform: translateX(2px);
-}
-/* Skeleton loading */
-.skeleton-row {
-  height: 4rem;
-  background: linear-gradient(90deg, var(--bg-elevated) 25%, var(--bg-surface) 50%, var(--bg-elevated) 75%);
-  background-size: 200% 100%;
-  animation: skeleton-shimmer 1.5s ease-in-out infinite;
-  border-radius: var(--radius-md);
-}
-@keyframes skeleton-shimmer {
-  0% { background-position: 200% 0; }
-  100% { background-position: -200% 0; }
-}
-
-/* Form fields */
-.ov-form {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-}
-.ov-conn-hint {
-  margin: 0;
-  font-size: var(--fs-sm);
-  color: var(--text-muted);
-}
-.ov-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.ov-field__label {
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-.ov-field__optional {
-  color: var(--text-dim);
-  text-transform: none;
-  letter-spacing: 0;
-  font-weight: 500;
-  margin-left: 4px;
-}
-.ov-field__input {
-  width: 100%;
-  min-height: 40px;
-  padding: 8px 12px;
-  font-size: var(--fs-sm);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  color: var(--text);
-  outline: none;
-  transition: border-color var(--transition), box-shadow var(--transition);
-}
-.ov-field__input--mono {
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-}
-.ov-field__input:focus {
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
-}
-.ov-form__actions {
-  display: flex;
-  gap: 6px;
-  margin-top: 4px;
-}
-
-/* Event log */
-.ov-event-log {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  max-height: 320px;
-  overflow-y: auto;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-}
-.ov-event-log__empty {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: var(--sp-4);
-  color: var(--text-muted);
-  font-family: var(--font-sans);
-  font-size: var(--fs-sm);
-}
-.ov-event-log__pulse {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
-  position: relative;
-  display: inline-block;
-  flex-shrink: 0;
-}
-.ov-event-log__pulse::after {
-  content: "";
-  position: absolute;
-  inset: -2px;
-  border-radius: 50%;
-  border: 1px solid var(--accent);
-  opacity: 0.5;
-  animation: ov-listening 1.6s ease-in-out infinite;
-}
-@keyframes ov-listening {
-  0%, 100% { transform: scale(1); opacity: 0.5; }
-  50% { transform: scale(1.8); opacity: 0; }
-}
-.ov-event-log__row {
-  display: grid;
-  grid-template-columns: 80px 200px 1fr;
-  gap: 12px;
-  padding: 5px var(--sp-3);
-  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
-}
-.ov-event-log__row.is-fresh {
-  background: color-mix(in srgb, var(--accent) 6%, transparent);
-  animation: ov-row-flash 1.4s ease-out forwards; /* motion-allow: long one-shot row-flash, outside the transition scale */
-}
-@keyframes ov-row-flash {
-  from { background: color-mix(in srgb, var(--accent) 18%, transparent); }
-  to { background: transparent; }
-}
-.ov-event-log__row:last-child {
-  border-bottom: 0;
-}
-.ov-event-log__ts {
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-}
-.ov-event-log__name {
-  color: var(--accent);
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.ov-event-log__payload {
-  color: var(--text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Status dot */
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-  flex-shrink: 0;
-}
-.dot.ok {
-  background: var(--ok);
-}
-.dot.warn {
-  background: var(--warn-fill);
-}
-.dot.err {
-  background: var(--danger);
-}
-.dot.off {
-  background: var(--text-dim);
-}
-
-/* Animations */
-@keyframes ov-fade-up {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .ov-stat,
-  .ov-panel,
-  .skeleton-row {
-    animation: none !important;
-  }
-  .ov-event-log__pulse::after {
-    animation: none !important;
-  }
-}
-
-/* Responsive */
-@media (max-width: 920px) {
-  .ov-grid {
-    grid-template-columns: 1fr;
-  }
-  .ov-panel--span2 {
-    grid-column: span 1;
-  }
-}
-@media (max-width: 720px) {
-  .ov-stage__header {
-    flex-direction: column;
-    align-items: stretch;
-  }
-  .ov-stage__actions {
-    width: 100%;
-  }
-  .ov-stat__icon {
-    top: 8px;
-    right: 8px;
-  }
-  .ov-recent__row {
-    grid-template-columns: auto 1fr auto;
-    gap: 8px;
-  }
-  .ov-recent__key {
-    max-width: 100%;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    text-overflow: clip;
-  }
-  .ov-recent__arrow {
-    display: none;
-  }
-  .ov-recent__model,
-  .ov-recent__msgs {
-    display: none;
-  }
-  .ov-event-log__row {
-    grid-template-columns: 70px 1fr;
-  }
-  .ov-event-log__payload {
-    grid-column: 1 / -1;
-    padding-left: 82px;
-    color: var(--text-dim);
-  }
-}
 
 /* Readiness hero tone bar reuses control-stat--hero::before; findings keep the
    dot tones below. The former .health-status__rail / .health-score /
@@ -1823,19 +1311,42 @@ function gatewayContextUrl(): string {
   overflow-wrap: anywhere;
 }
 
-.health-evidence {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+/* Details disclosure: one text trigger, no box. Holds the evidence readings and
+   the CLI recipe that used to sit open beneath every finding. */
+.health-finding__more {
   margin-top: var(--sp-3);
   min-width: 0;
+}
+.health-finding__more > summary {
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  list-style: none;
+  width: fit-content;
+}
+.health-finding__more > summary::-webkit-details-marker { display: none; }
+.health-finding__more > summary::before {
+  content: "\25B8";
+  display: inline-block;
+  margin-right: 5px;
+  transition: transform var(--dur-fast);
+}
+.health-finding__more[open] > summary::before { transform: rotate(90deg); }
+.health-finding__more > summary:hover { color: var(--text-muted); }
+
+.health-evidence {
+  column-gap: var(--sp-4);
+  display: flex;
+  flex-wrap: wrap;
+  margin-top: var(--sp-2);
+  min-width: 0;
   overflow-wrap: anywhere;
+  row-gap: 4px;
 }
 
+/* Quiet text, not chips: inside the details disclosure these are readings, and
+   a boxed pill per key/value was the densest thing on the page. */
 .health-evidence span {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
   color: var(--text-muted);
   display: inline-flex;
   font-family: var(--font-mono);
@@ -1845,7 +1356,7 @@ function gatewayContextUrl(): string {
   max-width: 100%;
   min-width: 0;
   overflow-wrap: anywhere;
-  padding: 3px 7px;
+  padding: 0;
 }
 
 .health-evidence span b {

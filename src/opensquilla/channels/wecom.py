@@ -37,6 +37,7 @@ from opensquilla.channels._wecom_crypto import WeComCrypto
 from opensquilla.channels.contract import (
     ChannelCapabilities,
     ChannelCapabilityProfile,
+    ChannelLengthUnit,
     ChannelPlatformCapability,
     ChannelPlatformCapabilityStatus,
     ChannelPlatformCategories,
@@ -44,8 +45,11 @@ from opensquilla.channels.contract import (
     ChannelSendResult,
 )
 from opensquilla.channels.types import (
+    AuthenticatedPrincipal,
     ChannelHealth,
     IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
     OutgoingMessage,
     UnsupportedChannelOperation,
 )
@@ -75,7 +79,7 @@ _APP_CMD_PONG = "pong"
 _MESSAGE_CALLBACK_COMMANDS = frozenset({_APP_CMD_CALLBACK, _APP_CMD_LEGACY_CALLBACK})
 
 # Channel-contract constants pinned by the adapter audit.
-CAPABILITY_TIER = "GREEN-shipping"
+CAPABILITY_TIER = "YELLOW-experimental"
 
 DM_SAFETY_TIERS: tuple[str, ...] = ("safe", "confirm")
 
@@ -192,6 +196,9 @@ class WeComChannel:
         if self.config.connection_mode == "websocket":
             return ChannelCapabilityProfile(
                 channel_type="wecom",
+                max_message_len=2048,
+                length_unit=ChannelLengthUnit.UTF8_BYTES,
+                splits_natively=False,
                 group_chat=True,
                 mentions=True,
                 reply=True,
@@ -203,6 +210,9 @@ class WeComChannel:
             )
         return ChannelCapabilityProfile(
             channel_type="wecom",
+            max_message_len=2048,
+            length_unit=ChannelLengthUnit.UTF8_BYTES,
+            splits_natively=False,
             group_chat=True,
             mentions=True,
             native_file_upload=True,
@@ -279,6 +289,10 @@ class WeComChannel:
     # Token cache + refresh
     # ------------------------------------------------------------------
 
+    def _require_webhook_credentials(self) -> None:
+        if not self.config.corp_id.strip() or not self.config.corp_secret.strip():
+            raise ValueError("wecom webhook mode requires corp_id and corp_secret")
+
     async def _refresh_token(self) -> str:
         """Hit ``cgi-bin/gettoken`` and cache the access_token."""
         client = self._get_client()
@@ -306,6 +320,7 @@ class WeComChannel:
         async with self._token_lock:
             if self._token_state is not None and time.monotonic() < self._token_state.expires_at:
                 return self._token_state.token
+            self._require_webhook_credentials()
             return await self._refresh_token()
 
     async def _refresh_loop(self) -> None:
@@ -319,6 +334,10 @@ class WeComChannel:
                 async with self._token_lock:
                     await self._refresh_token()
         except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._connected = False
+            log.error("wecom.token_refresh_failed", error=str(exc))
             raise
 
     # ------------------------------------------------------------------
@@ -337,6 +356,20 @@ class WeComChannel:
         )
         log.info("wecom.started", name=self.config.name)
 
+    async def probe_connection(self) -> dict[str, Any]:
+        """Validate corp-app credentials without disturbing AI Bot WebSocket ownership."""
+        if self.config.connection_mode == "websocket":
+            return {
+                "authenticated": False,
+                "supported": False,
+                "reason": (
+                    "WeCom AI Bot credentials can only be validated by subscribing; "
+                    "a probe could disconnect the active single-owner connection."
+                ),
+            }
+        await self._get_token()
+        return {"authenticated": True, "supported": True}
+
     async def stop(self) -> None:
         await self._stop_websocket()
         if self._refresh_task is not None:
@@ -352,8 +385,12 @@ class WeComChannel:
         log.info("wecom.stopped", name=self.config.name)
 
     async def health_check(self) -> ChannelHealth:
+        if self.config.connection_mode == "websocket":
+            transport_alive = self._ws_task is not None and not self._ws_task.done()
+        else:
+            transport_alive = self._refresh_task is not None and not self._refresh_task.done()
         return ChannelHealth(
-            connected=self._connected,
+            connected=self._connected and transport_alive,
             last_message_at=self._last_message_at,
             extra={"transport": self.config.connection_mode},
         )
@@ -705,6 +742,14 @@ class WeComChannel:
             channel_id=chat_id,
             content=content,
             metadata=metadata,
+            provenance=IngressProvenance(
+                provider="wecom",
+                account_id=self.config.bot_id,
+                transport="websocket",
+                verification=IngressVerification.SDK_SESSION,
+                event_id=msg_id,
+                principal=AuthenticatedPrincipal(subject_id=from_user),
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -712,7 +757,9 @@ class WeComChannel:
     # ------------------------------------------------------------------
 
     def enqueue(self, message: IncomingMessage) -> None:
-        self._queue.put_nowait(message)
+        from opensquilla.channels.delivery_store import durable_enqueue
+
+        durable_enqueue(self, message, self._queue)
 
     async def receive(self) -> IncomingMessage:
         msg = await self._queue.get()
@@ -851,19 +898,27 @@ class WeComChannel:
             metadata["wecom_protocol"] = "aibot"
             metadata["bot_mentioned"] = True
 
+        sender_id = from_user or "unknown"
         return IncomingMessage(
-            sender_id=from_user or "unknown",
+            sender_id=sender_id,
             channel_id=channel_id or "unknown",
             content=content,
             metadata=metadata,
+            provenance=IngressProvenance(
+                provider="wecom",
+                account_id=self.config.corp_id,
+                transport="webhook",
+                verification=IngressVerification.WEBHOOK_SIGNATURE,
+                event_id=msg_id or None,
+                principal=AuthenticatedPrincipal(subject_id=sender_id),
+            ),
         )
 
     def is_group_mentioned(self, msg: IncomingMessage) -> bool:
         if not bool(msg.metadata.get("is_group")):
             return True
-        return (
-            msg.metadata.get("wecom_protocol") == "aibot"
-            and bool(msg.metadata.get("bot_mentioned"))
+        return msg.metadata.get("wecom_protocol") == "aibot" and bool(
+            msg.metadata.get("bot_mentioned")
         )
 
     def _websocket_reply_metadata(self, inbound: IncomingMessage) -> dict[str, Any]:
@@ -880,7 +935,15 @@ class WeComChannel:
 
     def build_reply_message(self, content: str, inbound: IncomingMessage) -> OutgoingMessage:
         if self.config.connection_mode != "websocket":
-            return OutgoingMessage(content=content)
+            metadata: dict[str, Any] = {}
+            for inherit_key in ("toparty", "totag"):
+                if inherit_key in inbound.metadata:
+                    metadata[inherit_key] = inbound.metadata[inherit_key]
+            return OutgoingMessage(
+                content=content,
+                reply_to=inbound.sender_id,
+                metadata=metadata,
+            )
         return OutgoingMessage(
             content=content,
             reply_to=inbound.channel_id,
@@ -909,22 +972,28 @@ class WeComChannel:
     def _build_send_payload(self, message: OutgoingMessage) -> dict[str, Any]:
         """Translate ``OutgoingMessage`` into a WeCom corp-app message body.
 
-        ``reply_to`` is interpreted as the user / party / tag target. Falls
-        back to ``@all`` when nothing is set, matching Tencent's "broadcast
-        within the configured app" behavior.
+        ``reply_to`` is interpreted as the user target. Party and tag targets
+        may be supplied explicitly via metadata. An omitted recipient is a
+        caller error; it must never turn into an implicit broadcast.
         """
-        target = message.reply_to or message.metadata.get("touser") or "@all"
+        user_target = str(message.reply_to or message.metadata.get("touser") or "").strip()
+        party_target = str(message.metadata.get("toparty") or "").strip()
+        tag_target = str(message.metadata.get("totag") or "").strip()
+        if not any((user_target, party_target, tag_target)):
+            raise WeComApiError("an explicit touser, toparty, or totag target is required")
+
         payload: dict[str, Any] = {
-            "touser": str(target),
             "msgtype": "text",
             "agentid": self.config.agent_id_int,
             "text": {"content": message.content},
             "safe": 0,
         }
-        if "toparty" in message.metadata:
-            payload["toparty"] = str(message.metadata["toparty"])
-        if "totag" in message.metadata:
-            payload["totag"] = str(message.metadata["totag"])
+        if user_target:
+            payload["touser"] = user_target
+        if party_target:
+            payload["toparty"] = party_target
+        if tag_target:
+            payload["totag"] = tag_target
         return payload
 
     async def send(self, message: OutgoingMessage) -> None:

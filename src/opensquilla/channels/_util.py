@@ -14,10 +14,14 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Literal
 
 import httpx
 import structlog
+
+from opensquilla.channels.contract import ChannelLengthUnit
+from opensquilla.http_retry import parse_retry_after
 
 log = structlog.get_logger(__name__)
 
@@ -25,6 +29,14 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Channel access policy
 # ---------------------------------------------------------------------------
+
+
+class ChannelDmAccess(StrEnum):
+    """Typed direct-message admission modes for channel adapters."""
+
+    PAIRING = "pairing"
+    OPEN = "open"
+    ALLOWLIST = "allowlist"
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,9 +51,28 @@ class ChannelAccessPolicy:
     """
 
     dm_allowed: bool = True
+    dm_access: ChannelDmAccess = ChannelDmAccess.PAIRING
     group_allowed: bool = True
     mention_required_in_group: bool = True
     allowlist: frozenset[str] = field(default_factory=frozenset)
+
+
+def sender_is_channel_admin(sender_id: str | None, *, configured: Any) -> bool:
+    """True when ``sender_id`` matches a ``channel_admin_senders`` entry.
+
+    ``configured`` is the raw configured value for one channel: a single
+    string or a collection of ids; anything else fails closed. This is the
+    single matcher shared by operator RPC standing (command registry) and
+    chat-side approval powers (gateway dispatch) so both surfaces always
+    agree on who is a channel admin.
+    """
+    if not isinstance(sender_id, str) or not sender_id:
+        return False
+    if isinstance(configured, str):
+        return sender_id == configured
+    if not isinstance(configured, list | tuple | set | frozenset):
+        return False
+    return sender_id in {str(item) for item in configured}
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +87,8 @@ class AccessDecision:
         "group_denied",
         "not_mentioned_in_group",
         "not_in_allowlist",
+        "pairing_required",
+        "pairing_revoked",
     ]
 
 
@@ -65,6 +98,7 @@ def evaluate_policy(
     is_group: bool,
     mentioned: bool,
     sender_id: str = "",
+    pairing_status: Literal["pending", "approved", "revoked"] | None = None,
 ) -> AccessDecision:
     """Evaluate a single inbound message against a channel's access policy.
 
@@ -83,7 +117,12 @@ def evaluate_policy(
         return AccessDecision(admit=True, reason="group_admitted")
     if not policy.dm_allowed:
         return AccessDecision(admit=False, reason="dm_denied")
-    if policy.allowlist and sender_id not in policy.allowlist:
+    if policy.dm_access == ChannelDmAccess.PAIRING:
+        if pairing_status == "revoked":
+            return AccessDecision(admit=False, reason="pairing_revoked")
+        if pairing_status != "approved":
+            return AccessDecision(admit=False, reason="pairing_required")
+    if policy.dm_access == ChannelDmAccess.ALLOWLIST and sender_id not in policy.allowlist:
         return AccessDecision(admit=False, reason="not_in_allowlist")
     return AccessDecision(admit=True, reason="dm_admitted")
 
@@ -268,6 +307,23 @@ class FloodStrikeBackoff:
         self._fallback = False
 
 
+#: Defensive ceiling for a provider-supplied ``Retry-After``. A broken or
+#: hostile header must not park a channel for hours; generous enough that any
+#: realistic chat-provider hint is honored verbatim.
+MAX_RETRY_AFTER_S: float = 900.0
+
+
+def _retry_after_delay(response: httpx.Response, fallback: float) -> float:
+    """Seconds to wait before retrying, from ``Retry-After`` or ``fallback``.
+
+    Handles both RFC 9110 forms and rejects absent/negative/unparseable
+    values (a bare ``float()`` raises on the HTTP-date form). The honored
+    delay is capped so a hostile header cannot park the channel.
+    """
+    parsed = parse_retry_after(response.headers.get("Retry-After"))
+    return min(fallback if parsed is None else parsed, MAX_RETRY_AFTER_S)
+
+
 async def retry_request(
     func: Callable[..., Awaitable[httpx.Response]],
     *args: Any,
@@ -275,18 +331,24 @@ async def retry_request(
     base_delay: float = 1.0,
     **kwargs: Any,
 ) -> httpx.Response:
-    """Retry an httpx request with exponential backoff on transient errors."""
+    """Retry an httpx request with exponential backoff on transient errors.
+
+    On exhaustion the final response is returned rather than raised: a 429 or
+    5xx that survived every attempt is the provider's answer, and the caller
+    needs it to classify the failure.
+    """
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
             resp = await func(*args, **kwargs)
-            if resp.status_code == 429:
-                retry_after = float(resp.headers.get("Retry-After", base_delay * (2**attempt)))
+            backoff = base_delay * (2**attempt)
+            if resp.status_code == 429 and attempt < max_retries:
+                retry_after = _retry_after_delay(resp, backoff)
                 log.warning("rate_limited", retry_after=retry_after, attempt=attempt)
                 await asyncio.sleep(retry_after)
                 continue
             if resp.status_code in {500, 502, 503, 504} and attempt < max_retries:
-                delay = base_delay * (2**attempt) + random.random()
+                delay = backoff + random.random()
                 log.warning("transient_error", status=resp.status_code, delay=delay)
                 await asyncio.sleep(delay)
                 continue
@@ -301,36 +363,108 @@ async def retry_request(
     raise last_exc or RuntimeError("retry_request exhausted")
 
 
-def split_text_for_channel(text: str, limit: int) -> list[str]:
-    """Split ``text`` into chunks no longer than ``limit`` characters.
+def _measure_for(unit: ChannelLengthUnit) -> Callable[[str], int]:
+    if unit is ChannelLengthUnit.UTF8_BYTES:
+        return lambda s: len(s.encode("utf-8"))
+    if unit is ChannelLengthUnit.UTF16_UNITS:
+        return lambda s: len(s.encode("utf-16-le")) // 2
+    return len
+
+
+def measured_len(text: str, unit: ChannelLengthUnit = ChannelLengthUnit.CODE_POINTS) -> int:
+    """Length of ``text`` in the unit the platform counts in."""
+    return _measure_for(unit)(text)
+
+
+def _fit_cut(text: str, limit: int, measure: Callable[[str], int]) -> int:
+    """Largest code-point index whose measured prefix length is ``<= limit``.
+
+    Bisection over the code-point index — O(log n) measures. The index is a
+    Python string index, so an astral code point (emoji) is atomic: a prefix
+    either includes it whole or not at all, never a half surrogate.
+    """
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if measure(text[:mid]) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    # Always make progress even if a single leading code point exceeds limit.
+    return max(lo, 1)
+
+
+def _boundary_before(text: str, cut: int) -> int:
+    """Preferred split index in ``[0, cut)``: paragraph, then line, then word.
+
+    Returns the index just past the chosen separator so it stays with the
+    preceding chunk, or 0 when no boundary exists (caller hard-splits at cut).
+    """
+    paragraph_at = text.rfind("\n\n", 0, cut)
+    if paragraph_at >= 0:
+        return paragraph_at + 2
+    line_at = text.rfind("\n", 0, cut)
+    if line_at >= 0:
+        return line_at + 1
+    word_at = text.rfind(" ", 0, cut)
+    return word_at + 1 if word_at >= 0 else 0
+
+
+def split_text_for_channel(
+    text: str,
+    limit: int,
+    *,
+    unit: ChannelLengthUnit = ChannelLengthUnit.CODE_POINTS,
+) -> list[str]:
+    """Split ``text`` into chunks no longer than ``limit`` in ``unit``.
 
     Splitting prefers paragraph (blank-line) then line then word boundaries,
     hard-splitting only as a last resort for a single token longer than
     ``limit``. Used to keep outbound replies under a platform's per-message
-    length cap (Telegram 4096, Discord 2000, ...) instead of letting the API
-    reject the whole message. An empty ``text`` yields ``[""]`` so callers
-    always make at least one send; a non-positive ``limit`` disables splitting.
+    length cap (Telegram 4096 UTF-16 units, Discord 2000 code points, ...)
+    instead of letting the API reject the whole message. An empty ``text``
+    yields ``[""]`` so callers always make at least one send; a non-positive
+    ``limit`` disables splitting.
+
+    ``unit`` measures the fit test only; boundary search stays at code-point
+    granularity, so an astral character is never split mid-surrogate.
     """
-    if limit <= 0 or len(text) <= limit:
+    measure = _measure_for(unit)
+    if limit <= 0 or measure(text) <= limit:
         return [text]
 
     chunks: list[str] = []
     remaining = text
-    while len(remaining) > limit:
-        # Include the chosen separator in the preceding chunk. Splitting via
-        # ``str.split`` and reconstructing later loses blank lines/spaces when
-        # a boundary itself triggers a flush.
-        paragraph_at = remaining.rfind("\n\n", 0, limit)
-        if paragraph_at >= 0:
-            end = paragraph_at + 2
-        else:
-            line_at = remaining.rfind("\n", 0, limit)
-            if line_at >= 0:
-                end = line_at + 1
-            else:
-                word_at = remaining.rfind(" ", 0, limit)
-                end = word_at + 1 if word_at >= 0 else limit
+    while measure(remaining) > limit:
+        cut = _fit_cut(remaining, limit, measure)
+        end = _boundary_before(remaining, cut) or cut
         chunks.append(remaining[:end])
         remaining = remaining[end:]
     chunks.append(remaining)
     return chunks
+
+
+_TRUNCATE_FOOTER = "\n\n[message truncated to fit this channel's length limit]"
+
+
+def truncate_to_limit(
+    text: str,
+    limit: int,
+    *,
+    unit: ChannelLengthUnit = ChannelLengthUnit.CODE_POINTS,
+    footer: str = _TRUNCATE_FOOTER,
+) -> str:
+    """Cut ``text`` to ``limit`` in ``unit``, appending a footer when it fits.
+
+    The last resort for a single unsplittable unit that still overflows: a
+    delivered-but-truncated message beats a platform-rejected one.
+    """
+    measure = _measure_for(unit)
+    if measure(text) <= limit:
+        return text
+    budget = limit - measure(footer)
+    if budget <= 0:
+        return text[: _fit_cut(text, limit, measure)]
+    cut = _fit_cut(text, budget, measure)
+    end = _boundary_before(text, cut) or cut
+    return text[:end] + footer

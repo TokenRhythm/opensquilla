@@ -9,11 +9,20 @@ from typing import Any
 
 import pytest
 
+from opensquilla.channels.types import (
+    AuthenticatedPrincipal,
+    IncomingMessage,
+    IngressProvenance,
+    IngressVerification,
+)
+from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import AgentConfig, DoneEvent
 from opensquilla.gateway.boot import (
     _configured_agent_ids,
     _gateway_home,
     _register_dream_crons,
+    _sandbox_settings_for_runtime,
+    _task_runtime_envelope_owner,
     _task_runtime_turn_hard_deadline_s,
     _warn_workspace_state_mismatch,
     build_flush_service,
@@ -23,6 +32,7 @@ from opensquilla.gateway.boot import (
     emit_skill_filter_banner,
     validate_squilla_router_runtime,
 )
+from opensquilla.gateway.channel_dispatch import _stamp_channel_admin_principal
 from opensquilla.gateway.config import (
     AgentEntryConfig,
     GatewayConfig,
@@ -30,9 +40,25 @@ from opensquilla.gateway.config import (
     effective_webui_stream_idle_grace_seconds,
 )
 from opensquilla.gateway.diagnostics import DiagnosticsState
-from opensquilla.gateway.routing import build_cli_route_envelope, build_cron_route_envelope
+from opensquilla.gateway.model_routing import (
+    capture_model_routing_config,
+    model_routing_snapshot,
+)
+from opensquilla.gateway.routing import (
+    build_channel_route_envelope,
+    build_cli_route_envelope,
+    build_cron_route_envelope,
+    tool_context_from_envelope,
+)
 from opensquilla.onboarding.mutations import upsert_channel
-from opensquilla.provider import Message
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceStateError,
+    project_path_key,
+)
+from opensquilla.provider import Message, ProviderRequestCorrelation
+from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.scheduler.types import CronJob, JobStatus
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
@@ -48,6 +74,97 @@ def test_gateway_boot_bridges_compaction_notifications_to_session_stream() -> No
     assert "add_compaction_listener" in source
     assert '"session.event.compaction"' in source
     assert "_compaction_listener_remove" in source
+
+
+def test_gateway_startup_phase_log_uses_bounded_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeLog:
+        def info(self, event: str, **kwargs: Any) -> None:
+            events.append((event, kwargs))
+
+    monkeypatch.setattr(boot, "log", FakeLog())
+    ticks = iter((12.5, 12.75))
+    monkeypatch.setattr(boot.time, "monotonic", lambda: next(ticks))
+
+    completed_at = boot._log_gateway_startup_phase(
+        "services",
+        startup_started_at=10.0,
+        phase_started_at=11.5,
+    )
+
+    assert completed_at == 12.75
+    assert events == [
+        (
+            "gateway.startup_phase",
+            {
+                "phase": "services",
+                "status": "ready",
+                "duration_ms": 1000,
+                "startup_elapsed_ms": 2500,
+            },
+        )
+    ]
+
+
+def test_uvicorn_listener_callback_observes_a_real_bound_socket() -> None:
+    import httpx
+    import uvicorn
+
+    async def run_case() -> None:
+        callback_called = asyncio.Event()
+        callback_ports: list[int] = []
+        server: uvicorn.Server
+
+        async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+            assert scope["type"] == "http"
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [],
+                }
+            )
+            await send({"type": "http.response.body", "body": b""})
+
+        async def listener_ready() -> None:
+            assert server.started is True
+            assert server.servers
+            sockets = server.servers[0].sockets
+            assert sockets
+            callback_ports.append(int(sockets[0].getsockname()[1]))
+            callback_called.set()
+
+        config = uvicorn.Config(
+            app=app,
+            host="127.0.0.1",
+            port=0,
+            lifespan="off",
+            access_log=False,
+            log_level="warning",
+            callback_notify=listener_ready,
+        )
+        server = uvicorn.Server(config)
+        setattr(server, "install_signal_handlers", lambda: None)
+        task = asyncio.create_task(server.serve())
+        try:
+            await asyncio.wait_for(callback_called.wait(), timeout=5)
+            assert len(callback_ports) == 1
+            async with httpx.AsyncClient(trust_env=False) as client:
+                response = await client.get(
+                    f"http://127.0.0.1:{callback_ports[0]}/healthz",
+                    timeout=5,
+                )
+            assert response.status_code == 204
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(run_case())
 
 
 def test_task_runtime_default_hard_deadline_is_unbounded() -> None:
@@ -107,6 +224,11 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
         events.append("build_services")
         raise RuntimeError("service construction failed")
 
+    monkeypatch.setattr(
+        boot,
+        "_start_background_install_telemetry",
+        lambda config: events.append("install_telemetry"),
+    )
     monkeypatch.setattr(boot, "build_services", fail_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
@@ -134,20 +256,29 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
     asyncio.run(run_case())
 
 
-def test_start_gateway_server_logs_install_telemetry_without_structlog_event_collision(
+def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_ready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
 
     debug_logs: list[tuple[str, dict[str, Any]]] = []
+    call_order: list[str] = []
+    app_holder: dict[str, Any] = {}
 
     class FakeLog:
         def debug(self, event: str, **kwargs: Any) -> None:
             debug_logs.append((event, kwargs))
 
-        def info(self, _event: str, **_kwargs: Any) -> None:
-            return None
+        def info(self, event: str, **kwargs: Any) -> None:
+            if event != "gateway.startup_phase":
+                return
+            phase = kwargs.get("phase")
+            if phase == "runtime_state":
+                assert app_holder["app"].state.gateway_ready is True
+                call_order.append("runtime_state")
+            elif phase in {"listener", "gateway_ready"}:
+                call_order.append(str(phase))
 
         def warning(self, _event: str, **_kwargs: Any) -> None:
             return None
@@ -159,7 +290,17 @@ def test_start_gateway_server_logs_install_telemetry_without_structlog_event_col
         def set_session_lock_provider(self, _provider: Any) -> None:
             return None
 
+    class FakeUvicornServer:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+            self.should_exit = False
+
+        async def serve(self) -> None:
+            call_order.append("listener_callback")
+            await self.config.callback_notify()
+
     async def fake_build_services(**kwargs: Any) -> Any:
+        call_order.append("build_services")
         config = kwargs["config"]
 
         async def close() -> None:
@@ -186,23 +327,55 @@ def test_start_gateway_server_logs_install_telemetry_without_structlog_event_col
             close=close,
         )
 
-    def fake_collect_install_telemetry(*, config: GatewayConfig) -> Any:
-        return SimpleNamespace(
-            skipped_reason=None,
-            event="install",
-            sent=True,
-            uploaded=False,
-            endpoint_configured=True,
+    def fake_start_background_install_telemetry(
+        *,
+        config: GatewayConfig,
+        on_result: Any,
+    ) -> None:
+        assert app_holder["app"].state.gateway_ready is True
+        call_order.append("install_telemetry")
+        on_result(
+            SimpleNamespace(
+                skipped_reason=None,
+                event="install",
+                sent=True,
+                uploaded=False,
+                endpoint_configured=True,
+            )
         )
+
+    def fake_daily_usage_loop(storage: Any, *, config: GatewayConfig) -> Any:
+        assert app_holder["app"].state.gateway_ready is True
+        call_order.append("daily_usage")
+
+        async def complete() -> None:
+            return None
+
+        return complete()
+
+    real_create_gateway_app = boot.create_gateway_app
+
+    def capture_gateway_app(*args: Any, **kwargs: Any) -> Any:
+        app = real_create_gateway_app(*args, **kwargs)
+        app_holder["app"] = app
+        return app
 
     monkeypatch.setattr(boot, "log", FakeLog())
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
+    monkeypatch.setattr(boot, "create_gateway_app", capture_gateway_app)
+    monkeypatch.setattr(boot, "get_session_storage", lambda manager: object())
+    monkeypatch.setattr(boot.uvicorn, "Server", FakeUvicornServer)
+    monkeypatch.setattr(boot, "_desktop_router_preload_enabled", lambda: False)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
-        "opensquilla.observability.install_telemetry.collect_install_telemetry",
-        fake_collect_install_telemetry,
+        "opensquilla.observability.install_telemetry.start_background_install_telemetry",
+        fake_start_background_install_telemetry,
+    )
+    monkeypatch.setattr(
+        "opensquilla.observability.usage_telemetry.run_daily_usage_upload_loop",
+        fake_daily_usage_loop,
     )
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
@@ -220,9 +393,11 @@ def test_start_gateway_server_logs_install_telemetry_without_structlog_event_col
     )
 
     async def run_case() -> None:
-        server = await boot.start_gateway_server(config=config, run=False)
+        server = await boot.start_gateway_server(config=config, run=True)
 
         try:
+            assert call_order == ["build_services", "runtime_state"]
+            await asyncio.sleep(0)
             telemetry_logs = [
                 kwargs for event, kwargs in debug_logs if event == "gateway.install_telemetry"
             ]
@@ -232,6 +407,15 @@ def test_start_gateway_server_logs_install_telemetry_without_structlog_event_col
             assert "gateway.install_telemetry_skipped" not in {
                 event for event, _kwargs in debug_logs
             }
+            assert call_order == [
+                "build_services",
+                "runtime_state",
+                "listener_callback",
+                "listener",
+                "gateway_ready",
+                "install_telemetry",
+                "daily_usage",
+            ]
         finally:
             await server.close()
 
@@ -239,6 +423,7 @@ def test_start_gateway_server_logs_install_telemetry_without_structlog_event_col
 
 
 def test_build_task_runtime_run_kwargs_forwards_fresh_user_session() -> None:
+    pending_input_provider = object()
     run = SimpleNamespace(
         agent_id="main",
         attachments=[],
@@ -248,11 +433,171 @@ def test_build_task_runtime_run_kwargs_forwards_fresh_user_session() -> None:
         fresh_user_session=True,
         ingress_pipeline_steps=(),
         semantic_message=None,
+        pending_input_provider=pending_input_provider,
     )
 
     kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
 
     assert kwargs["fresh_user_session"] is True
+    assert kwargs["pending_input_provider"] is pending_input_provider
+
+
+def test_build_task_runtime_run_kwargs_forwards_task_id_as_root_turn() -> None:
+    run = SimpleNamespace(
+        task_id="task-turn-123",
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["root_turn_id"] == "task-turn-123"
+
+
+def test_build_task_runtime_run_kwargs_forwards_provider_correlation() -> None:
+    correlation = ProviderRequestCorrelation(
+        session_id="parent-session",
+        turn_id="parent-turn",
+        execution_id="subagent-run",
+        call_kind="subagent.chat",
+    )
+    run = SimpleNamespace(
+        task_id="subagent-run",
+        agent_id="worker",
+        attachments=[],
+        input_provenance={"kind": "subagent_task"},
+        run_kind="subagent",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        provider_request_correlation=correlation,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["provider_request_correlation"] is correlation
+    assert kwargs["root_turn_id"] == "subagent-run"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sender_id", "expected_owner"),
+    [("channel-admin", True), ("paired-user", False)],
+)
+async def test_task_runtime_turn_uses_authenticated_channel_admin_boundary(
+    sender_id: str,
+    expected_owner: bool,
+) -> None:
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    config = GatewayConfig(
+        channel_admin_senders={"feishu": ["channel-admin"]},
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+    msg = IncomingMessage(
+        sender_id=sender_id,
+        channel_id="oc-channel",
+        content="hello",
+        metadata={"principal_is_owner": True, "channel_admin_verified": True},
+        provenance=IngressProvenance(
+            provider="feishu",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id=sender_id),
+        ),
+    )
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key=f"agent:main:feishu:{sender_id}",
+        session_prefix="feishu",
+        agent_id="main",
+    )
+    assert "principal_is_owner" not in envelope.metadata
+    assert "channel_admin_verified" not in envelope.metadata
+    assert _stamp_channel_admin_principal(config, envelope, msg) is expected_owner
+    assert envelope.metadata["principal_is_owner"] is expected_owner
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id=f"task-{sender_id}",
+        session_key=envelope.session_key,
+        message="hello",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="channel_turn",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+    runner = RecordingTurnRunner()
+
+    await dispatch_task_runtime_turn(
+        run,
+        config=config,
+        session_manager=None,
+        turn_runner=runner,
+        event_emitter=emit,
+    )
+
+    tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.is_owner is expected_owner
+    assert tool_context.channel_admin_verified is expected_owner
+    assert tool_context.run_mode == "trusted"
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        IngressProvenance(),
+        IngressProvenance(
+            provider="feishu",
+            verification=IngressVerification.SDK_SESSION,
+            principal=AuthenticatedPrincipal(subject_id="another-user"),
+        ),
+    ],
+    ids=["unverified", "principal-mismatch"],
+)
+def test_channel_admin_stamp_rejects_unverified_or_mismatched_identity(
+    provenance: IngressProvenance,
+) -> None:
+    msg = IncomingMessage(
+        sender_id="channel-admin",
+        channel_id="oc-channel",
+        content="hello",
+        provenance=provenance,
+    )
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:feishu:channel-admin",
+        session_prefix="feishu",
+    )
+    config = GatewayConfig(channel_admin_senders={"feishu": ["channel-admin"]})
+
+    assert _stamp_channel_admin_principal(config, envelope, msg) is False
+    assert envelope.metadata["principal_is_owner"] is False
+    assert envelope.metadata["channel_admin_verified"] is False
+    assert _task_runtime_envelope_owner(envelope) is False
+
+    context = tool_context_from_envelope(envelope, is_owner=True)
+    assert context.is_owner is False
+    assert context.channel_admin_verified is False
 
 
 def test_build_task_runtime_run_kwargs_forwards_bound_user_message_id() -> None:
@@ -293,6 +638,28 @@ def test_build_task_runtime_run_kwargs_omits_bound_id_when_absent() -> None:
     kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
 
     assert "bound_user_message_id" not in kwargs
+
+
+def test_build_task_runtime_run_kwargs_forwards_exact_assistant_sink() -> None:
+    def sink(message_id: str | None, content: str) -> None:
+        return None
+
+    run = SimpleNamespace(
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="channel_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        persisted_user_message_id="msg-123",
+        assistant_message_sink=sink,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["assistant_message_sink"] is sink
 
 
 def test_gateway_stream_timeout_config_defaults_remain_serializable() -> None:
@@ -524,6 +891,7 @@ async def test_build_services_schedules_sandbox_setup_after_runtime(
 
     events: list[str] = []
     scheduled: list[Any] = []
+    background_task = SimpleNamespace()
 
     async def fake_setup(config: GatewayConfig) -> None:
         events.append("setup")
@@ -532,16 +900,20 @@ async def test_build_services_schedules_sandbox_setup_after_runtime(
         events.append("runtime")
         return SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {}))
 
+    def fake_reset_runtime() -> None:
+        events.append("runtime_reset")
+
     def fake_create_background_task(coro: Any) -> Any:
         scheduled.append(coro)
         close = getattr(coro, "close", None)
         if callable(close):
             close()
-        return SimpleNamespace()
+        return background_task
 
     monkeypatch.setattr(boot, "_ensure_sandbox_setup_on_boot", fake_setup)
     monkeypatch.setattr(boot, "create_background_task", fake_create_background_task)
     monkeypatch.setattr("opensquilla.sandbox.integration.configure_runtime", fake_configure_runtime)
+    monkeypatch.setattr("opensquilla.sandbox.integration.reset_runtime", fake_reset_runtime)
 
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -566,6 +938,100 @@ async def test_build_services_schedules_sandbox_setup_after_runtime(
     try:
         assert events == ["runtime"]
         assert len(scheduled) == 1
+        assert services.sandbox_setup_task is background_task
+    finally:
+        await services.close()
+    assert events == ["runtime", "runtime_reset"]
+
+
+@pytest.mark.asyncio
+async def test_service_container_close_cancels_owned_sandbox_setup_task() -> None:
+    from opensquilla.gateway import boot
+
+    entered = asyncio.Event()
+
+    async def blocked_setup() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(blocked_setup())
+    services = boot.ServiceContainer(
+        config=GatewayConfig(),
+        sandbox_setup_task=task,
+    )
+    await entered.wait()
+
+    await services.close()
+
+    assert services.sandbox_setup_task is None
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_service_container_close_cancels_profile_import_maintenance() -> None:
+    from opensquilla.gateway import boot
+
+    entered = asyncio.Event()
+
+    async def blocked_maintenance() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(blocked_maintenance())
+    services = boot.ServiceContainer(
+        config=GatewayConfig(),
+        profile_import_maintenance_task=task,
+    )
+    await entered.wait()
+
+    await services.close()
+
+    assert services.profile_import_maintenance_task is None
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_bare_full_default_boots_standard_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway import boot
+
+    captured: list[tuple[SandboxSettings, RunMode]] = []
+
+    def fake_configure_runtime(settings: SandboxSettings, **kwargs: Any) -> Any:
+        captured.append((settings, kwargs["default_run_mode"]))
+        return SimpleNamespace(
+            effective=SimpleNamespace(
+                sandbox_enabled=True,
+                as_dict=lambda: {"sandbox_enabled": True},
+            )
+        )
+
+    monkeypatch.setattr("opensquilla.sandbox.integration.configure_runtime", fake_configure_runtime)
+
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+        mcp={"enabled": False},
+        memory={"flush_enabled": False},
+        sandbox={"auto_setup": False},
+    )
+
+    services = await boot.build_services(
+        config=config,
+        session_db_path=str(tmp_path / "sessions.sqlite"),
+        seed_agent_workspaces=False,
+    )
+    try:
+        settings, default_mode = captured[0]
+        assert settings.run_mode == "standard"
+        assert settings.sandbox is True
+        assert settings.security_grading is True
+        assert settings.network_default == "proxy_allowlist"
+        assert default_mode is RunMode.FULL
     finally:
         await services.close()
 
@@ -1003,6 +1469,8 @@ def test_start_gateway_server_passes_tls_files_to_uvicorn(
         try:
             assert captured_config["ssl_keyfile"] == keyfile
             assert captured_config["ssl_certfile"] == certfile
+            assert captured_config["access_log"] is False
+            assert callable(captured_config["callback_notify"])
         finally:
             await server.close()
 
@@ -1077,12 +1545,8 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
     monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(scheduler_jobs, "set_failure_dispatcher", _record_dispatcher)
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None
-    )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None
-    )
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
 
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -1099,10 +1563,7 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         )
         # The wire must register DeliveryChain.dispatch_failure_alert
         # (a bound method), not some unrelated callable.
-        assert (
-            getattr(captured["dispatcher"], "__name__", "")
-            == "dispatch_failure_alert"
-        )
+        assert getattr(captured["dispatcher"], "__name__", "") == "dispatch_failure_alert"
         # Handler factories ran, confirming the wire ran inside the cron-init
         # branch (not just by coincidence).
         assert set(cron_sched.registered) >= {
@@ -1250,27 +1711,15 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
         "make_memory_dream_handler",
         fake_make_memory_dream_handler,
     )
-    monkeypatch.setattr(
-        runtime_e2e_mod, "make_runtime_e2e_context", fake_make_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "set_runtime_e2e_context", fake_set_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "reset_runtime_e2e_context", fake_reset_runtime_e2e_context
-    )
-    monkeypatch.setattr(
-        proposer_mod, "set_smoke_fixture_context", fake_set_smoke_fixture_context
-    )
+    monkeypatch.setattr(runtime_e2e_mod, "make_runtime_e2e_context", fake_make_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "set_runtime_e2e_context", fake_set_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "reset_runtime_e2e_context", fake_reset_runtime_e2e_context)
+    monkeypatch.setattr(proposer_mod, "set_smoke_fixture_context", fake_set_smoke_fixture_context)
     monkeypatch.setattr(
         proposer_mod, "reset_smoke_fixture_context", fake_reset_smoke_fixture_context
     )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None
-    )
-    monkeypatch.setattr(
-        "opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None
-    )
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
+    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
 
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -1383,6 +1832,7 @@ async def test_build_flush_service_archive_workspace_falls_back_to_main_workspac
     assert (main_workspace / receipt.flushed_paths[0]).exists()
     assert not (matching_memory_dir / receipt.flushed_paths[0]).exists()
 
+
 @pytest.mark.asyncio
 async def test_build_flush_service_wires_durable_receipt_writer(tmp_path: Path) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
@@ -1445,7 +1895,7 @@ async def test_build_flush_service_wires_durable_receipt_writer(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_build_flush_service_receipt_uses_session_id_captured_before_rotation(
+async def test_build_flush_service_skips_receipt_after_session_rotation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1499,11 +1949,62 @@ async def test_build_flush_service_receipt_uses_session_id_captured_before_rotat
         assert did_rotate
         assert rotated.session_id != original.session_id
         assert receipt.session_id == original.session_id
-        assert len(rows) == 2
-        assert {row.scope for row in rows} == {"preimage", "repair"}
-        for row in rows:
-            assert row.session_id == original.session_id
-            assert row.session_id != rotated.session_id
+        assert rows == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_build_flush_service_skips_receipt_after_session_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.sqlite"))
+    session_manager = SessionManager(storage)
+    registry = ToolRegistry()
+    archive_started = Event()
+    allow_archive = Event()
+
+    from opensquilla.memory import session_flush as session_flush_module
+
+    real_archive_writer = session_flush_module.write_raw_fallback_archive
+
+    def archive_writer(*args: Any, **kwargs: Any) -> Any:
+        archive_started.set()
+        assert allow_archive.wait(timeout=2.0)
+        return real_archive_writer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_flush_module,
+        "write_raw_fallback_archive",
+        archive_writer,
+    )
+    try:
+        session_key = "agent:main:webchat:deleted-during-flush"
+        original = await session_manager.create(session_key)
+        service = build_flush_service(
+            tool_registry=registry,
+            provider_selector=SimpleNamespace(resolve=lambda: None),
+            config=GatewayConfig(memory={"flush_enabled": True}),
+            session_manager=session_manager,
+            memory_managers={"main": SimpleNamespace(workspace_dir=tmp_path)},
+        )
+
+        task = asyncio.create_task(
+            service.execute(
+                [Message(role="user", content="temporary transcript")],
+                session_key,
+                agent_id="main",
+            )
+        )
+        await asyncio.wait_for(asyncio.to_thread(archive_started.wait), timeout=2.0)
+        await storage.delete_session(session_key)
+        allow_archive.set()
+        receipt = await task
+
+        assert receipt.session_id == original.session_id
+        assert await storage.get_session(session_key) is None
+        assert await storage.list_memory_durable_receipts(session_key=session_key) == []
     finally:
         await storage.close()
 
@@ -1633,9 +2134,7 @@ async def test_build_services_registers_session_search_tool(
     )
     monkeypatch.setattr(
         "opensquilla.sandbox.integration.configure_runtime",
-        lambda *args, **kwargs: SimpleNamespace(
-            effective=SimpleNamespace(as_dict=lambda: {})
-        ),
+        lambda *args, **kwargs: SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {})),
     )
 
     captured_memory_kwargs: dict[str, Any] = {}
@@ -1670,9 +2169,7 @@ async def test_build_services_registers_session_search_tool(
         assert "Full-text search across persisted session transcripts" in (
             session_search.spec.description
         )
-        assert "defaults to curated memory source files" in (
-            session_search.spec.description
-        )
+        assert "defaults to curated memory source files" in (session_search.spec.description)
         assert "use source=sessions or source=all" in session_search.spec.description
         owner_names = {
             tool["name"]
@@ -1774,9 +2271,7 @@ async def test_build_services_fails_fast_for_explicit_remote_memory_without_key(
 ) -> None:
     monkeypatch.setattr(
         "opensquilla.sandbox.integration.configure_runtime",
-        lambda *args, **kwargs: SimpleNamespace(
-            effective=SimpleNamespace(as_dict=lambda: {})
-        ),
+        lambda *args, **kwargs: SimpleNamespace(effective=SimpleNamespace(as_dict=lambda: {})),
     )
     config = GatewayConfig(
         state_dir=str(tmp_path / "state"),
@@ -1961,6 +2456,299 @@ async def test_task_runtime_turn_uses_agent_registry_model_when_session_has_no_m
 
 
 @pytest.mark.asyncio
+async def test_task_runtime_turn_uses_workspace_from_saved_run_context(
+    tmp_path: Path,
+) -> None:
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    default_workspace = tmp_path / "default-workspace"
+    project_workspace = tmp_path / "project-workspace"
+    default_workspace.mkdir()
+    project_workspace.mkdir()
+    envelope = build_cli_route_envelope(
+        session_key="agent:main:project-task",
+        agent_id="main",
+    )
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "trusted",
+        "workspace": str(project_workspace),
+        "mounts": [],
+        "domains": [],
+        "bundles": [],
+        "public_network": [],
+        "temporary_grants": [],
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="task-project-workspace",
+        session_key="agent:main:project-task",
+        message="pwd",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="interactive",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+    runner = RecordingTurnRunner()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    await dispatch_task_runtime_turn(
+        run,
+        config=GatewayConfig(
+            workspace_dir=str(default_workspace),
+            agent_stream_heartbeat_interval_seconds=0.0,
+            agent_stream_idle_timeout_seconds=1.0,
+        ),
+        session_manager=None,
+        turn_runner=runner,
+        event_emitter=emit,
+    )
+
+    assert runner.calls[0]["tool_context"].workspace_dir == str(project_workspace)
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_turn_restores_bound_project_and_owner_full_default(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "queued-project.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project_path.mkdir()
+    outside.mkdir()
+    project = await storage.create_or_restore_project_workspace(
+        path=str(project_path.resolve()),
+        path_key=project_path_key(project_path, strict=True),
+        display_name="project",
+        trusted_at=1,
+    )
+    key = "agent:main:webchat:queued-forged-envelope"
+    await manager.create(
+        key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "full",
+                "workspace": str(outside),
+            }
+        },
+    )
+    envelope = build_cli_route_envelope(session_key=key, agent_id="main")
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "full",
+        "workspace": str(outside),
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="queued-forged-envelope-task",
+        session_key=key,
+        message="pwd",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="interactive",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    runner = RecordingTurnRunner()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    try:
+        await dispatch_task_runtime_turn(
+            run,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "default"),
+                agent_stream_heartbeat_interval_seconds=0.0,
+                agent_stream_idle_timeout_seconds=1.0,
+            ),
+            session_manager=manager,
+            turn_runner=runner,
+            event_emitter=emit,
+        )
+    finally:
+        await storage.close()
+
+    tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.workspace_dir == project.path
+    assert tool_context.run_mode == "full"
+    assert envelope.metadata["sandbox_run_context"]["workspace"] == project.path
+
+
+@pytest.mark.parametrize("invalid_kind", ["missing", "file", "root"])
+@pytest.mark.asyncio
+async def test_task_runtime_turn_rejects_unavailable_bound_project_kinds(
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / f"queued-{invalid_kind}.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    project_path = tmp_path / f"{invalid_kind}-project"
+    if invalid_kind == "root":
+        canonical = str(Path("/").resolve())
+        path_key = project_path_key(canonical, strict=True)
+    else:
+        project_path.mkdir()
+        canonical = str(project_path.resolve())
+        path_key = project_path_key(project_path, strict=True)
+    project = await storage.create_or_restore_project_workspace(
+        path=canonical,
+        path_key=path_key,
+        display_name=invalid_kind,
+        trusted_at=1,
+    )
+    key = f"agent:main:webchat:queued-{invalid_kind}"
+    await manager.create(
+        key,
+        workspace_id=project.workspace_id,
+        origin={
+            RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "standard",
+                "workspace": project.path,
+            }
+        },
+    )
+    if invalid_kind == "missing":
+        project_path.rmdir()
+    elif invalid_kind == "file":
+        project_path.rmdir()
+        project_path.write_text("not a directory", encoding="utf-8")
+    envelope = build_cli_route_envelope(session_key=key, agent_id="main")
+    envelope.metadata["sandbox_run_context"] = {
+        "run_mode": "standard",
+        "workspace": project.path,
+    }
+    object.__setattr__(envelope, "sandbox_run_context_fresh", True)
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id=f"queued-{invalid_kind}-task",
+        session_key=key,
+        message="pwd",
+        envelope=envelope,
+        attachments=[],
+        input_provenance={},
+        run_kind="interactive",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    runner = RecordingTurnRunner()
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    try:
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await dispatch_task_runtime_turn(
+                run,
+                config=GatewayConfig(
+                    workspace_dir=str(tmp_path / "default"),
+                    agent_stream_heartbeat_interval_seconds=0.0,
+                    agent_stream_idle_timeout_seconds=1.0,
+                ),
+                session_manager=manager,
+                turn_runner=runner,
+                event_emitter=emit,
+            )
+    finally:
+        await storage.close()
+
+    assert raised.value.reason == "unavailable"
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_turn_uses_acceptance_time_model_routing_config() -> None:
+    live_config = GatewayConfig(
+        squilla_router={"enabled": False, "rollout_phase": "observe"},
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+    accepted_config = capture_model_routing_config(live_config)
+    live_config.llm_ensemble.enabled = True
+    live_config.squilla_router.enabled = True
+    live_config.squilla_router.rollout_phase = "full"
+
+    probe = TurnRunner.__new__(TurnRunner)
+    probe._config = live_config
+    observed: list[str] = []
+
+    class RecordingTurnRunner:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            observed.append(model_routing_snapshot(probe._turn_config())["mode"])
+            yield DoneEvent()
+
+    run = SimpleNamespace(
+        agent_id="main",
+        task_id="task-routing-snapshot",
+        session_key="agent:main:routing-snapshot",
+        message="hello",
+        envelope=build_cli_route_envelope(
+            session_key="agent:main:routing-snapshot",
+            agent_id="main",
+        ),
+        attachments=[],
+        input_provenance={},
+        run_kind="interactive",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+        accepted_config=accepted_config,
+    )
+
+    async def emit(_session_key: str, _event_name: str, _payload: dict[str, Any]) -> None:
+        return None
+
+    await dispatch_task_runtime_turn(
+        run,
+        config=live_config,
+        session_manager=None,
+        turn_runner=RecordingTurnRunner(),
+        event_emitter=emit,
+    )
+
+    assert observed == ["direct"]
+    assert model_routing_snapshot(live_config)["mode"] == "ensemble"
+
+
+@pytest.mark.asyncio
 async def test_task_runtime_turn_applies_cron_job_tool_policy() -> None:
     class RecordingTurnRunner:
         def __init__(self) -> None:
@@ -2037,6 +2825,9 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
         name="Owner",
         payload={"kind": "agent_turn", "agent_id": "ops"},
         creator_is_owner=True,
+        run_mode="full",
+        elevated="full",
+        execution_target="host",
         tool_policy={
             "profile": "minimal",
             "also_allow": ["memory_search", "exec_command"],
@@ -2072,7 +2863,18 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
     )
 
     tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.task_id == "task-1"
     assert tool_context.is_owner is True
+    assert tool_context.run_mode == "full"
+    assert tool_context.elevated == "full"
     assert tool_context.allowed_tools is None
     assert tool_context.tool_policy == job.tool_policy
     assert "exec_command" not in tool_context.denied_tools
+
+
+def test_default_bypass_keeps_sandbox_capability_for_explicit_restricted_calls() -> None:
+    settings = _sandbox_settings_for_runtime(GatewayConfig())
+
+    assert settings.run_mode == "standard"
+    assert settings.sandbox is True
+    assert settings.security_grading is True

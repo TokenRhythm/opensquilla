@@ -4,19 +4,21 @@ import { createPromptBlock } from "./blocks/promptBlock.mjs";
 import { createThinkingBlock } from "./blocks/thinkingBlock.mjs";
 import { createReasoningBlock } from "./blocks/reasoningBlock.mjs";
 import { createToolBlock } from "./blocks/toolBlock.mjs";
+import { createEnsembleBlock } from "./blocks/ensembleBlock.mjs";
 import { createAnswerBlock } from "./blocks/answerBlock.mjs";
 import { createUsageBlock } from "./blocks/usageBlock.mjs";
 import { createErrorBlock } from "./blocks/errorBlock.mjs";
 
 const FACTORIES = {
   prompt: createPromptBlock,
-  // intermediate narration the model speaks between tool calls (a result the
-  // user should see) — verbatim purple ✻ text
+  // Intermediate narration the model speaks between tool calls. It streams in
+  // full, then long completed narration keeps a retained expandable preview.
   thinking: createThinkingBlock,
-  // the model's extended-thinking PROCESS — a live dim peek of the latest
-  // lines while streaming, collapsed to "Thought for Ns" when it ends
+  // Extended-thinking process: a live tail while running and a bounded preview
+  // after completion; expansion always reconstructs the full retained payload.
   reasoning: createReasoningBlock,
   tool: createToolBlock,
+  ensemble: createEnsembleBlock,
   answer: createAnswerBlock,
   usage: createUsageBlock,
   error: createErrorBlock,
@@ -41,6 +43,9 @@ function createFallbackBlock(ctx) {
     renderer.requestRender?.();
   };
   return {
+    get rawText() { return text; },
+    get isExpanded() { return false; },
+    get hiddenLineCount() { return 0; },
     begin(meta) {
       const seed = String(meta?.text ?? "");
       if (seed) { text = seed; show(); }
@@ -48,6 +53,7 @@ function createFallbackBlock(ctx) {
     append(delta) { text += String(delta); show(); },
     update() {},
     end() {},
+    toggleExpanded() { return false; },
     recolor() { if (node) node.fg = THEME.detailText; },
   };
 }

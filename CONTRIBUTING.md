@@ -51,9 +51,17 @@ not attribution for the specific squashed or replayed work.
 
 ## Default Checks
 
-Install development dependencies:
+Full source development and the public quality gate require Node.js 22.12+ with
+npm for the Vue control console; backend-only editable work can still use
+`uv sync` without building it. Official wheels and Desktop installers are
+already built and do not require Node.js. Install the locked frontend and
+Python development dependencies:
 
 ```powershell
+cd opensquilla-webui
+npm ci
+npm run build
+cd ..
 uv sync --extra dev --extra recommended
 ```
 
@@ -62,8 +70,13 @@ Run the public quality gate before opening a pull request:
 ```powershell
 uv run ruff check src tests
 uv run pytest -q
+npm --prefix opensquilla-webui run build
 uv build --wheel
 ```
+
+The Web UI build writes an ignored package artifact that `uv build --wheel`
+validates and embeds. Rebuild it after frontend changes; do not commit the
+generated `src/opensquilla/gateway/static/dist/` tree.
 
 Default tests must be offline, deterministic, credential-free, and safe for forks. Do not add network, provider, browser, or channel requirements to the default pull request path.
 

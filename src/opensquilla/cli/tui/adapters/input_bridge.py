@@ -25,11 +25,9 @@ def image_prompt_and_attachments(
     prompt, attachments = _input_assets.image_prompt_and_attachments(command)
     if attachments:
         active_console = console if output_console is None else output_console
-        name = attachments[0].get("name") or "image"
-        data = attachments[0].get("data") or ""
-        active_console.print(
-            f"[dim]Sending image: {name} ({len(data) // 1024}KB base64)[/dim]"
-        )
+        name = str(attachments[0].get("name") or "image")
+        label = name.replace("\\", "/").rsplit("/", 1)[-1]
+        active_console.print(f"[dim]Preparing image: {label}[/dim]")
     return prompt, attachments
 
 

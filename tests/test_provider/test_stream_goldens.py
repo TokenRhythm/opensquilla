@@ -148,9 +148,15 @@ def _openai_collector(
         if deterministic_uuid:
             _patch_uuid4(monkeypatch, "opensquilla.provider.openai")
         _patch_transport(monkeypatch, "opensquilla.provider.openai", body, "text/event-stream")
+        provider_base_url = (
+            "https://tokenrhythm.studio/v1"
+            if provider_kind == "tokenrhythm"
+            else "https://api.openai.com"
+        )
         provider = OpenAIProvider(
             api_key="sk-test-000",
             model=model,
+            base_url=provider_base_url,
             provider_kind=provider_kind,
         )
         return await _collect_events(provider, tools)
@@ -238,10 +244,20 @@ CASES: list[GoldenCase] = [
     # TokenRhythm's live stream tail: a duplicate finish_reason chunk plus
     # TWO usage-bearing chunks (a details chunk with reasoning/cached token
     # counts, then a finish repeat with cost_cny/trace_id extras). Finish
-    # and usage handling are last-wins, so this must stay one clean turn.
+    # and usage handling use latest-present snapshot fields, so this must stay
+    # one clean turn without losing the earlier details or double-counting.
     GoldenCase(
         "openai_compat",
         "tokenrhythm_duplicate_finish_usage.sse",
+        _openai_collector(model="deepseek-v4-flash", provider_kind="tokenrhythm"),
+    ),
+    # TokenRhythm's corrected stream tail carries finish, the complete usage
+    # snapshot, and confirmed CNY billing metadata in one terminal frame. Keep
+    # this case alongside the legacy double-tail case above so both deployed
+    # response shapes remain covered without special-casing either one.
+    GoldenCase(
+        "openai_compat",
+        "tokenrhythm_single_finish_usage.sse",
         _openai_collector(model="deepseek-v4-flash", provider_kind="tokenrhythm"),
     ),
     # anthropic (AnthropicProvider, Messages SSE)
@@ -277,6 +293,8 @@ CASES: list[GoldenCase] = [
 def _event_to_dict(event: Any) -> dict[str, Any]:
     payload = dataclasses.asdict(event)
     payload.pop("kind", None)
+    if payload.get("billing_receipt") is None:
+        payload.pop("billing_receipt", None)
     return {"type": type(event).__name__, **payload}
 
 

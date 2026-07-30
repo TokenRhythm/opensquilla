@@ -8,8 +8,10 @@ from dataclasses import dataclass
 import pytest
 import structlog.testing
 
+from opensquilla.gateway.project_workspace_runtime import AcceptedRunModeOverride
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 
 
@@ -191,10 +193,8 @@ async def test_no_reservation_leaks_counters_after_handler_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_uses_default_run_kind_for_parent_wake() -> None:
-    """TaskRuntime.send (parent wake path) defaults run_kind=default so wakes
-    don't consume reserved subagent capacity.
-    """
+async def test_send_uses_runtime_send_kind_for_internal_followups() -> None:
+    """Every send path stays non-interactive and outside subagent capacity."""
     storage = _StubStorage.fresh()
     seen: list[str] = []
 
@@ -208,15 +208,85 @@ async def test_send_uses_default_run_kind_for_parent_wake() -> None:
         subagent_reserved_slots=1,
     )
 
-    # Seed envelope cache by enqueueing once, then send.
+    uncached = await rt.send("agent:s:uncached", "wake")
+    await rt.wait(uncached.task_id, timeout=1.0)
+
+    # Seed another session's envelope cache, then exercise both cached paths.
     h0 = await rt.enqueue(_envelope("agent:s:main"), "init", run_kind="default")
     await rt.wait(h0.task_id, timeout=1.0)
 
     h1 = await rt.send("agent:s:main", "wake")
     await rt.wait(h1.task_id, timeout=1.0)
+    h2 = await rt.send(
+        "agent:s:main",
+        "wake with provenance",
+        provenance={"kind": "internal_system"},
+    )
+    await rt.wait(h2.task_id, timeout=1.0)
 
     assert "subagent" not in seen
-    assert seen == ["default", "default"]
+    assert seen == ["runtime_send", "default", "runtime_send", "runtime_send"]
+
+
+@pytest.mark.asyncio
+async def test_reusable_envelopes_never_retain_execution_freshness() -> None:
+    storage = _StubStorage.fresh()
+    seen: list[tuple[str, bool]] = []
+    initial_started = asyncio.Event()
+    release_initial = asyncio.Event()
+
+    async def handler(run):
+        seen.append(
+            (
+                run.run_kind,
+                bool(run.envelope.sandbox_run_context_fresh),
+            )
+        )
+        if run.message == "initial":
+            initial_started.set()
+            await release_initial.wait()
+
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        max_concurrency=2,
+        subagent_reserved_slots=1,
+    )
+    session_key = "agent:s:fresh-cache"
+    fresh = _envelope(session_key)
+    fresh.metadata["sandbox_run_context"] = {
+        "run_mode": "full",
+        "workspace": "/tmp/stale-runtime-authority",
+    }
+    object.__setattr__(fresh, "sandbox_run_context_fresh", True)
+
+    initial = await rt.enqueue(fresh, "initial")
+    await asyncio.wait_for(initial_started.wait(), timeout=1.0)
+    cached = rt._last_envelope_by_session[session_key]
+    no_provenance = await rt.send(session_key, "cached")
+    with_provenance = await rt.send(
+        session_key,
+        "cached provenance",
+        provenance={"kind": "internal_system"},
+    )
+    explicit = await rt.send_with_envelope(
+        fresh,
+        "explicit envelope",
+        provenance={"kind": "explicit_internal"},
+    )
+    release_initial.set()
+    for handle in (initial, no_provenance, with_provenance, explicit):
+        await rt.wait(handle.task_id, timeout=1.0)
+
+    assert seen == [
+        ("default", True),
+        ("runtime_send", False),
+        ("runtime_send", False),
+        ("default", False),
+    ]
+    assert cached.sandbox_run_context_fresh is False
+    assert cached.metadata is not fresh.metadata
+    assert session_key not in rt._last_envelope_by_session
 
 
 @pytest.mark.asyncio
@@ -244,3 +314,66 @@ async def test_send_passes_stream_event_sink_to_parent_wake_task() -> None:
     await rt.wait(h1.task_id, timeout=1.0)
 
     assert seen_sinks == [None, sink]
+
+
+@pytest.mark.asyncio
+async def test_send_with_envelope_preserves_accepted_run_mode_override() -> None:
+    storage = _StubStorage.fresh()
+    seen_overrides = []
+
+    async def handler(run):
+        seen_overrides.append(run.accepted_run_mode_override)
+
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        max_concurrency=2,
+        subagent_reserved_slots=1,
+    )
+    accepted_override = AcceptedRunModeOverride(
+        run_mode=RunMode.STANDARD,
+        run_mode_source="user",
+        source="request",
+    )
+
+    handle = await rt.send_with_envelope(
+        _envelope("agent:s:mode-snapshot"),
+        "wake",
+        accepted_run_mode_override=accepted_override,
+    )
+    await rt.wait(handle.task_id, timeout=1.0)
+
+    assert seen_overrides == [accepted_override]
+
+
+@pytest.mark.asyncio
+async def test_reserve_serializes_accepted_run_mode_into_task_details() -> None:
+    storage = _StubStorage.fresh()
+
+    async def handler(_run):
+        return None
+
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        max_concurrency=1,
+    )
+    accepted_override = AcceptedRunModeOverride(
+        run_mode=RunMode.TRUSTED,
+        run_mode_source="user",
+        source="request",
+    )
+
+    reservation = await rt.reserve(
+        _envelope("agent:s:durable-mode-snapshot"),
+        "queued",
+        accepted_run_mode_override=accepted_override,
+    )
+    try:
+        assert reservation.task_record.details["accepted_run_mode"] == {
+            "run_mode": "trusted",
+            "run_mode_source": "user",
+        }
+        assert reservation.runtime_task.accepted_run_mode_override is accepted_override
+    finally:
+        await rt.abort_reservation(reservation)

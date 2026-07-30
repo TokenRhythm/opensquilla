@@ -24,3 +24,15 @@ def test_unknown_error_remains_failed() -> None:
 
     assert outcome.kind == "failed"
     assert outcome.retryable is False
+
+
+def test_ensemble_multimodal_rejection_is_failed_and_not_retryable() -> None:
+    outcome = outcome_from_error(
+        code="ensemble_multimodal_unsupported",
+        message="Switch to a single-model routing mode and try again.",
+    )
+
+    assert outcome.kind == "failed"
+    assert outcome.reason == "ensemble_multimodal_unsupported"
+    assert outcome.error_class == "ensemble_multimodal_unsupported"
+    assert outcome.retryable is False

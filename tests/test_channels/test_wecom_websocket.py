@@ -16,7 +16,7 @@ from opensquilla.channels.contract import (
 )
 from opensquilla.channels.registry import parse_channel_entry
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
-from opensquilla.channels.wecom import WeComChannel, WeComChannelConfig
+from opensquilla.channels.wecom import WeComApiError, WeComChannel, WeComChannelConfig
 from opensquilla.gateway.config import WeComChannelEntry
 
 
@@ -458,6 +458,37 @@ def test_wecom_webhook_streaming_reply_kwargs_pin_inbound_sender() -> None:
         "reply_to": "user-1",
         "metadata": {"toparty": "party-1"},
     }
+
+
+def test_wecom_webhook_build_reply_message_targets_inbound_sender() -> None:
+    channel = WeComChannel(WeComChannelConfig(name="wecom", agent_id_int=1))
+    inbound = IncomingMessage(
+        sender_id="user-1",
+        channel_id="user-1",
+        content="hello",
+        metadata={"toparty": "party-1", "totag": "tag-1"},
+    )
+
+    reply = channel.build_reply_message("answer", inbound)
+
+    assert reply.reply_to == "user-1"
+    assert reply.metadata == {"toparty": "party-1", "totag": "tag-1"}
+    assert channel._build_send_payload(reply) == {  # noqa: SLF001
+        "touser": "user-1",
+        "toparty": "party-1",
+        "totag": "tag-1",
+        "msgtype": "text",
+        "agentid": 1,
+        "text": {"content": "answer"},
+        "safe": 0,
+    }
+
+
+def test_wecom_webhook_send_payload_rejects_missing_target() -> None:
+    channel = WeComChannel(WeComChannelConfig(name="wecom", agent_id_int=1))
+
+    with pytest.raises(WeComApiError, match="explicit .* target is required"):
+        channel._build_send_payload(OutgoingMessage(content="never broadcast"))  # noqa: SLF001
 
 
 def test_wecom_webhook_config_remains_supported() -> None:

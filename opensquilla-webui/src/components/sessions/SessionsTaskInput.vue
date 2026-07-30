@@ -4,7 +4,7 @@
       ref="textareaRef"
       v-model="text"
       class="hub-task__input"
-      rows="2"
+      rows="1"
       :placeholder="t('sessions.taskInput.placeholder')"
       :aria-label="t('sessions.taskInput.ariaLabel')"
       @keydown.enter.exact.prevent="submit"
@@ -47,13 +47,14 @@ function submit() {
 
 <style scoped>
 .hub-task {
+  align-items: center;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  padding: var(--sp-4);
+  display: grid;
+  gap: var(--sp-3);
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 8px 10px 8px 18px;
   transition: border-color var(--transition), box-shadow var(--transition);
 }
 
@@ -67,9 +68,12 @@ function submit() {
   border: none;
   color: var(--text);
   font-family: var(--font-sans);
-  font-size: var(--fs-md);
+  font-size: 1rem;
   line-height: 1.5;
+  min-height: 40px;
   outline: none;
+  overflow-y: auto;
+  padding: 8px 0;
   resize: none;
   width: 100%;
 }
@@ -81,19 +85,18 @@ function submit() {
 .hub-task__bar {
   align-items: center;
   display: flex;
-  gap: var(--sp-3);
-  justify-content: space-between;
+  justify-content: flex-end;
 }
 
 .hub-task__hint {
-  color: var(--text-dim);
-  font-size: var(--fs-xs);
+  display: none;
 }
 
 .hub-task__send {
   align-items: center;
   display: inline-flex;
   gap: 6px;
+  min-height: 38px;
 }
 
 .hub-task__send:disabled {

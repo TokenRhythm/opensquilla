@@ -27,6 +27,28 @@ const NON_LOCALE_README = new Set(['product', 'release'])
 const failures = []
 const fail = (msg) => failures.push(msg)
 
+// The source-build Node contract is pinned once and rendered in several
+// translated/user-facing documents. Keep those copies in lockstep without
+// forcing historical changelog entries to change when the minimum moves.
+const pinnedNodeVersion = readFileSync(resolve(repoRoot, 'opensquilla-webui', '.node-version'), 'utf8')
+  .trim()
+  .replace(/^v/, '')
+const pinnedNodeMatch = pinnedNodeVersion.match(/^(\d+)\.(\d+)\.(\d+)$/)
+if (!pinnedNodeMatch) {
+  throw new Error(`invalid opensquilla-webui/.node-version: ${JSON.stringify(pinnedNodeVersion)}`)
+}
+const pinnedNodeMajor = pinnedNodeMatch[1]
+const pinnedNodeMajorMinor = `${pinnedNodeMatch[1]}.${pinnedNodeMatch[2]}`
+const packageJson = JSON.parse(
+  readFileSync(resolve(repoRoot, 'opensquilla-webui', 'package.json'), 'utf8'),
+)
+if (packageJson.engines?.node !== `>=${pinnedNodeVersion}`) {
+  fail(
+    `opensquilla-webui/package.json engines.node "${packageJson.engines?.node}" ` +
+      `must equal ">=${pinnedNodeVersion}" from .node-version`,
+  )
+}
+
 // --- read canonical list + labels from the webui source (single source of truth) ---
 function readSupportedLocales() {
   const src = readFileSync(resolve(webuiSrc, 'i18n', 'index.ts'), 'utf8')
@@ -58,6 +80,59 @@ for (const code of codes) {
 }
 
 const readmeFor = (code) => (code === defaultLocale ? 'README.md' : `README.${code}.md`)
+
+// --- current source-build docs use the pinned Node minimum ---
+const nodeContractDocs = [
+  ...codes.map(readmeFor),
+  'CONTRIBUTING.md',
+  'RELEASES.md',
+  'desktop/electron/README.md',
+  'docs/quickstart.md',
+  'docs/web-ui.md',
+]
+for (const file of nodeContractDocs) {
+  const path = resolve(repoRoot, file)
+  if (!existsSync(path)) {
+    fail(`Node version contract document is missing: ${file}`)
+    continue
+  }
+  const text = readFileSync(path, 'utf8')
+  const documented = [...text.matchAll(/\bNode(?:\.js)?\s+v?(\d+)\.(\d+)(?:\.\d+)?/gi)].map(
+    (match) => `${match[1]}.${match[2]}`,
+  )
+  if (documented.length === 0) {
+    fail(`${file}: no Node.js minimum version found`)
+  }
+  for (const version of new Set(documented)) {
+    if (version !== pinnedNodeMajorMinor) {
+      fail(
+        `${file}: Node.js minimum ${version} must match ` +
+          `${pinnedNodeMajorMinor} from opensquilla-webui/.node-version`,
+      )
+    }
+  }
+}
+
+for (const code of codes) {
+  const file = readmeFor(code)
+  const path = resolve(repoRoot, file)
+  if (!existsSync(path)) continue
+  const text = readFileSync(path, 'utf8')
+  const nodeSourceMajors = [
+    ...text.matchAll(/nodesource\.com\/setup_(\d+)\.x/g),
+  ].map((match) => match[1])
+  if (nodeSourceMajors.length === 0) {
+    fail(`${file}: NodeSource setup_X.x command is missing`)
+  }
+  for (const major of new Set(nodeSourceMajors)) {
+    if (major !== pinnedNodeMajor) {
+      fail(
+        `${file}: NodeSource setup_${major}.x must match Node ${pinnedNodeMajor}.x ` +
+          'from opensquilla-webui/.node-version',
+      )
+    }
+  }
+}
 
 // --- 1. every supported locale has a README file ---
 for (const code of codes) {
@@ -145,5 +220,5 @@ if (failures.length) {
 }
 console.log(
   `[check-readme-locales] OK — ${codes.length} locales (${codes.join(', ')}); ` +
-    'README files, switchers, and docs footer in sync with webui SUPPORTED_LOCALES',
+    `README files, Node ${pinnedNodeVersion} contract, switchers, and docs footer in sync`,
 )

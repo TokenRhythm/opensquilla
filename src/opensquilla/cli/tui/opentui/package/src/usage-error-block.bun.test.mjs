@@ -30,7 +30,14 @@ async function createTurnHarness() {
   });
   renderer.root.add(conversationBox);
   const turn = createTurnView(
-    { renderer, BoxRenderable, TextRenderable, MarkdownRenderable, syntaxStyle: undefined, conversationBox },
+    {
+      renderer,
+      BoxRenderable,
+      TextRenderable,
+      MarkdownRenderable,
+      syntaxStyle: undefined,
+      conversationBox,
+    },
     "probe",
   );
   return { ...setup, turn };
@@ -38,6 +45,16 @@ async function createTurnHarness() {
 
 function rows(frame) {
   return frame.lines.map((line) => line.spans.map((s) => s.text).join(""));
+}
+
+async function waitForText(renderOnce, captureSpans, needle, tries = 80) {
+  for (let i = 0; i < tries; i += 1) {
+    await renderOnce();
+    const frame = captureSpans();
+    if (rows(frame).join("\n").includes(needle)) return frame;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return captureSpans();
 }
 
 function spanFgIs(span, hex) {
@@ -99,6 +116,58 @@ test("an error block renders ✗ text inside the card in the error color", async
     const errorSpan = frame.lines[errorRow].spans.find((s) => s.text.includes("boom"));
     expect(errorSpan).toBeDefined();
     expect(spanFgIs(errorSpan, THEME.error)).toBe(true);
+  } finally {
+    renderer.destroy?.();
+  }
+});
+
+test("a corrected snapshot clears stale prose and keeps a visible notice plus tool rows", async () => {
+  applyTheme("opensquilla-dark");
+  const { renderer, renderOnce, captureSpans, turn } = await createTurnHarness();
+  try {
+    turn.begin("n", "thinking", {});
+    turn.append("n", "stale narration");
+    turn.end("n");
+    turn.begin("tool", "tool", { name: "lookup", args: "x" });
+    turn.update("tool", { status: "ok" });
+    turn.end("tool");
+
+    turn.update("n", { text: "" });
+    turn.begin("notice", "status", {
+      text: "Final answer corrected; an earlier streamed preview was superseded.",
+    });
+    turn.end("notice");
+    turn.finish();
+    const frame = await waitForText(renderOnce, captureSpans, "superseded");
+
+    const text = rows(frame).join("\n");
+    expect(text).not.toContain("stale narration");
+    expect(text).toContain("lookup");
+    expect(text).toContain("superseded");
+  } finally {
+    renderer.destroy?.();
+  }
+});
+
+test("an explicit empty terminal snapshot withdraws stale prose visibly", async () => {
+  applyTheme("opensquilla-dark");
+  const { renderer, renderOnce, captureSpans, turn } = await createTurnHarness();
+  try {
+    turn.begin("a", "thinking", {});
+    turn.append("a", "preview to withdraw");
+    turn.end("a");
+    turn.update("a", { text: "" });
+    turn.begin("notice", "status", {
+      text: "Streamed preview withdrawn; the final answer is empty.",
+    });
+    turn.end("notice");
+    turn.finish();
+    await renderOnce();
+
+    const text = rows(captureSpans()).join("\n");
+    expect(text).not.toContain("preview to withdraw");
+    expect(text).toContain("Streamed preview withdrawn");
+    expect(text).toContain("final answer is empty");
   } finally {
     renderer.destroy?.();
   }

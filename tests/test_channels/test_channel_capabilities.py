@@ -21,6 +21,7 @@ from opensquilla.channels.contract import (
     ChannelPlatformManifest,
     ChannelSendResult,
     ChannelSendStatus,
+    channel_capability_evidence,
     channel_capability_profile,
     channel_platform_manifest,
     normalize_channel_send_result,
@@ -199,7 +200,11 @@ def test_public_vendor_channels_expose_platform_manifests(
     }
 
 
-def test_feishu_platform_manifest_exposes_platform_tool_boundary() -> None:
+def test_feishu_platform_manifest_derives_from_the_profile() -> None:
+    # The channel no longer bundles vendor API tools (docs/drive/wiki are
+    # Feishu's own MCP server and CLI, mounted through the MCP client), so the
+    # manifest is the honest derivation from the capability profile: what the
+    # conversation surface itself can do.
     channel = FeishuChannel(
         FeishuChannelConfig(app_id="app", app_secret="secret", connection_mode="websocket")
     )
@@ -207,26 +212,14 @@ def test_feishu_platform_manifest_exposes_platform_tool_boundary() -> None:
     manifest = channel_platform_manifest(channel)
     assert isinstance(manifest, ChannelPlatformManifest)
 
+    chat = manifest.get(ChannelPlatformCategories.CHAT)
+    files = manifest.get(ChannelPlatformCategories.FILES)
     docs = manifest.get(ChannelPlatformCategories.DOCS)
-    drive = manifest.get(ChannelPlatformCategories.DRIVE)
-    wiki = manifest.get(ChannelPlatformCategories.WIKI)
-    scopes = manifest.get(ChannelPlatformCategories.SCOPES)
-    permissions = manifest.get(ChannelPlatformCategories.PERMISSIONS)
 
-    assert docs.status == ChannelPlatformCapabilityStatus.SUPPORTED
-    assert "feishu_doc_create" in docs.tools
-    assert "docx:document" in docs.required_scopes
-    assert drive.status == ChannelPlatformCapabilityStatus.SUPPORTED
-    assert "feishu_drive_upload_artifact" in drive.tools
-    assert "drive:drive" in drive.required_scopes
-    assert wiki.status == ChannelPlatformCapabilityStatus.SUPPORTED
-    assert "feishu_wiki_list_spaces" in wiki.tools
-    assert "wiki:space:retrieve" in wiki.required_scopes
-    assert scopes.status == ChannelPlatformCapabilityStatus.SUPPORTED
-    assert "feishu_scopes_status" in scopes.tools
-    assert permissions.status == ChannelPlatformCapabilityStatus.CONFIG_REQUIRED
-    assert "feishu_perm_grant_member" in permissions.tools
-    assert permissions.mutates is True
+    assert chat.status == ChannelPlatformCapabilityStatus.SUPPORTED
+    assert files.status == ChannelPlatformCapabilityStatus.SUPPORTED
+    assert docs.status == ChannelPlatformCapabilityStatus.UNSUPPORTED
+    assert not docs.tools
 
 
 @pytest.mark.parametrize(
@@ -436,8 +429,16 @@ def test_telegram_profile_matches_current_bot_api_adapter_surface() -> None:
     assert profile.supports(ChannelCapabilities.THREAD_REPLY)
     assert profile.supports(ChannelCapabilities.EDIT)
     assert profile.supports(ChannelCapabilities.DELETE)
-    assert not profile.supports(ChannelCapabilities.TYPING_INDICATOR)
+    assert profile.supports(ChannelCapabilities.TYPING_INDICATOR)
+    assert profile.supports(ChannelCapabilities.REACTIONS)
     assert profile.supports(ChannelCapabilities.NATIVE_FILE_UPLOAD)
+
+    evidence = channel_capability_evidence(channel)
+    assert evidence[ChannelCapabilities.TYPING_INDICATOR]["methods"] == [
+        "send_typing"
+    ]
+    assert evidence[ChannelCapabilities.REACTIONS]["methods"] == ["set_reaction"]
+    assert evidence[ChannelCapabilities.GROUP_CHAT]["evidence_kind"] == "declaration"
 
 
 def test_matrix_profile_matches_current_sync_adapter_surface() -> None:
@@ -445,7 +446,8 @@ def test_matrix_profile_matches_current_sync_adapter_surface() -> None:
 
     profile = channel.capability_profile
 
-    assert profile.supports(ChannelCapabilities.WEBSOCKET)
+    assert not profile.supports(ChannelCapabilities.WEBSOCKET)
+    assert profile.transports == ("http_sync",)
     assert profile.supports(ChannelCapabilities.GROUP_CHAT)
     assert profile.supports(ChannelCapabilities.MENTIONS)
     assert profile.supports(ChannelCapabilities.MEDIA)
@@ -531,7 +533,7 @@ def test_group_thread_metadata_builds_thread_session_key() -> None:
 
     key = ChannelManager._build_session_key("discord", msg)
 
-    assert key == "agent:main:discord:group:chat-1:thread:thread-9"
+    assert key == "agent:main:discord:group:chat-1:sender:user-1:thread:thread-9"
 
 
 def test_dm_message_uses_sender_session_even_with_native_message_metadata() -> None:
@@ -678,8 +680,17 @@ def test_feishu_profile_and_inbound_group_metadata() -> None:
     assert not channel.capability_profile.supports(ChannelCapabilities.THREAD_MESSAGES)
     assert channel.capability_profile.supports(ChannelCapabilities.THREAD_REPLY)
     assert channel.capability_profile.supports(ChannelCapabilities.SCOPE_DIAGNOSTICS)
-    assert channel.capability_profile.supports(ChannelCapabilities.INTERACTIVE_CARDS)
+    assert not channel.capability_profile.supports(ChannelCapabilities.INTERACTIVE_CARDS)
     assert not channel.capability_profile.supports(ChannelCapabilities.CARD_ACTIONS)
+
+    webhook_channel = FeishuChannel(
+        FeishuChannelConfig(
+            app_id="app",
+            app_secret="secret",
+            connection_mode="webhook",
+        )
+    )
+    assert webhook_channel.capability_profile.supports(ChannelCapabilities.INTERACTIVE_CARDS)
 
     group_msg = channel.parse_event(
         {
@@ -817,7 +828,7 @@ def test_feishu_topic_group_thread_remains_group_thread_session() -> None:
     assert msg.metadata["native_thread_id"] == "omt_topic"
     assert "thread_id" not in msg.metadata
     assert ChannelManager._build_session_key("feishu", msg) == (
-        "agent:main:feishu:group:oc_topic:thread:omt_topic"
+        "agent:main:feishu:group:oc_topic:sender:ou_user:thread:omt_topic"
     )
 
 

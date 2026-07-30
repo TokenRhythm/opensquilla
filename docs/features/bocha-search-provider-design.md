@@ -105,16 +105,21 @@ Rationale:
 
 Keep fallback semantics narrow:
 
-- `off`: surface the original provider error.
-- `network`: fallback only after network, timeout, rate-limit, retryable, or HTTP
-  provider errors.
+- `off`: send at most one provider network request and surface its error;
+  automatic routing may skip a missing-key candidate before any request.
+- `network`: after a provider-classified transient failure, try at most one
+  additional compatible provider. Automatic routing prefers the next ranked
+  provider with configured credentials and uses DuckDuckGo when no keyed
+  fallback is available.
 
 Do not fallback on:
 
 - empty results
 - low-quality results
-- parse errors, unless those are explicitly classified as retryable provider
-  failures later
+- authentication or missing-key errors
+- ordinary 4xx responses
+- blocked/challenge responses
+- parse errors
 
 This preserves cost, latency, and predictability for users who configured
 multiple paid providers.

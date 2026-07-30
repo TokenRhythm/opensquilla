@@ -12,6 +12,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from opensquilla.cli.gateway_rpc import (
+    default_gateway_token,
     default_gateway_url,
     rpc_error_exit_code,
     run_gateway_sync,
@@ -92,6 +93,58 @@ def _emit_skill_mutation_result(
 
     console.print(f"[red]Failed:[/] {message or name}")
     raise typer.Exit(1)
+
+
+async def _reload_running_skill_catalog(*, json_output: bool) -> dict[str, Any]:
+    """Call the running Gateway without an offline fallback."""
+    from opensquilla.cli import gateway_client as gateway_client_module
+
+    client = gateway_client_module.GatewayClient()
+    try:
+        await client.connect(default_gateway_url(), token=default_gateway_token())
+        payload = await client.call("skills.reload", {})
+    except SystemExit as exc:
+        emit_error(
+            f"Gateway unavailable: {exc}. The running Skill catalog was not refreshed.",
+            json_output=json_output,
+            code="GATEWAY_UNAVAILABLE",
+        )
+        raise typer.Exit(1) from exc
+    except gateway_client_module.GatewayRPCError as exc:
+        emit_error(
+            f"{exc.message} The running Skill catalog was not refreshed.",
+            json_output=json_output,
+            code=exc.code,
+            details=exc.data,
+        )
+        raise typer.Exit(rpc_error_exit_code(exc.code)) from exc
+    except (ConnectionError, OSError) as exc:
+        emit_error(
+            f"Gateway unavailable: {exc}. The running Skill catalog was not refreshed.",
+            json_output=json_output,
+            code="GATEWAY_UNAVAILABLE",
+        )
+        raise typer.Exit(1) from exc
+    finally:
+        await client.close()
+
+    return payload if isinstance(payload, dict) else {
+        "success": False,
+        "changed": False,
+        "partial": False,
+        "generation": 0,
+        "added": [],
+        "removed": [],
+        "modified": [],
+        "errors": [
+            {
+                "name": "",
+                "path": "",
+                "message": "Gateway returned an invalid skills.reload response",
+                "kept_previous": False,
+            }
+        ],
+    }
 
 
 def _load_skill_rows() -> list[dict[str, Any]]:
@@ -346,6 +399,53 @@ def skills_update(
             console.print(str(message))
     if failures or top_level_failure:
         raise typer.Exit(1)
+
+
+@skills_app.command("reload")
+def skills_reload(
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+) -> None:
+    """Force the running Gateway to reload its Skill catalog."""
+    payload = asyncio.run(_reload_running_skill_catalog(json_output=json_output))
+
+    if json_output:
+        print_json(payload)
+        if payload.get("success") is not True:
+            raise typer.Exit(1)
+        return
+
+    generation = int(payload.get("generation") or 0)
+    if payload.get("success") is not True:
+        typer.echo(
+            f"Skill catalog reload failed; generation {generation} remains active.",
+            err=True,
+        )
+        for error in payload.get("errors") or []:
+            if isinstance(error, dict) and error.get("message"):
+                typer.echo(f"- {error['message']}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Skill catalog generation {generation} is active.")
+    changes = [
+        ("Added", payload.get("added") or []),
+        ("Removed", payload.get("removed") or []),
+        ("Modified", payload.get("modified") or []),
+    ]
+    if payload.get("changed"):
+        for label, names in changes:
+            if names:
+                typer.echo(f"{label}: {', '.join(str(name) for name in names)}")
+    else:
+        typer.echo("No Skill catalog changes detected.")
+
+    errors = payload.get("errors") or []
+    if payload.get("partial"):
+        typer.echo(f"Warning: reload completed with {len(errors)} Skill error(s).", err=True)
+        for error in errors:
+            if not isinstance(error, dict):
+                continue
+            name = str(error.get("name") or error.get("path") or "Skill")
+            typer.echo(f"- {name}: {error.get('message', 'load failed')}", err=True)
 
 
 @skills_app.command("install")

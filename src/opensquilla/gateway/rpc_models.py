@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from opensquilla.gateway.model_routing import (
+    model_routing_patches,
+    model_routing_snapshot,
+)
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.provider.model_catalog import ModelCatalog
 
@@ -73,3 +77,40 @@ async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str,
         models = [m for m in models if required.issubset(set(m["capabilities"]))]
 
     return {"models": models, "errors": errors}
+
+
+@_d.method("models.routing.get", scope="operator.read")
+async def _handle_models_routing_get(
+    _params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    if ctx.config is None:
+        raise ValueError("No config available")
+    return model_routing_snapshot(ctx.config)
+
+
+@_d.method("models.routing.set", scope="operator.write")
+async def _handle_models_routing_set(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    if not isinstance(params, dict) or not isinstance(params.get("mode"), str):
+        raise ValueError("params.mode is required")
+    if ctx.config is None:
+        raise ValueError("No config available")
+
+    # Reuse the safe write transaction so persistence, validation, runtime
+    # synchronization, and old config.patch.safe clients keep one contract.
+    from opensquilla.gateway.rpc_config import _handle_config_patch_safe
+
+    patch_result = await _handle_config_patch_safe(
+        {"patches": model_routing_patches(ctx.config, params["mode"])},
+        ctx,
+    )
+    return {
+        **model_routing_snapshot(ctx.config),
+        "patched": list(patch_result.get("patched") or []),
+        "restart_required": bool(
+            patch_result.get("restartRequired", patch_result.get("restart_required", False))
+        ),
+    }

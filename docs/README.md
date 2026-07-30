@@ -12,7 +12,7 @@ root release README with task-oriented guides.
    memory, and permission configuration.
 5. [`cli.md`](cli.md) - command groups and common CLI workflows.
 6. [`tui.md`](tui.md) - terminal chat usage, slash commands, files, sessions,
-   and the OpenTUI preview.
+   and the development-only OpenTUI client.
 7. [`web-ui.md`](web-ui.md) - local control console and chat UI.
 8. [`sessions.md`](sessions.md) - session continuity, export, resume, abort,
    and cleanup.
@@ -23,7 +23,9 @@ root release README with task-oriented guides.
 - [`features.md`](features.md) - capability catalog.
 - [`features/squilla-router.md`](features/squilla-router.md) - model routing.
 - [`features/tui-frontend.md`](features/tui-frontend.md) - terminal backend
-  architecture, plugin slots, Router HUD, and OpenTUI evaluation.
+  architecture, plugin slots, Router HUD, and OpenTUI validation.
+- [`features/tui-product-contract.md`](features/tui-product-contract.md) - TUI,
+  Web UI, Gateway, standalone, fallback, and legacy ownership rules.
 - [`features/tool-compression.md`](features/tool-compression.md) - compact tool
   results and handles.
 - [`features/meta-skills.md`](features/meta-skills.md) - reusable workflow skills.
@@ -39,7 +41,9 @@ root release README with task-oriented guides.
 
 ## Surfaces and Operations
 
-- [`releases/0.5.0rc4.md`](releases/0.5.0rc4.md) - OpenSquilla 0.5.0 Preview 4 release notes.
+- [`releases/0.5.2.md`](releases/0.5.2.md) - OpenSquilla 0.5.2 release notes.
+- [`releases/0.5.1.md`](releases/0.5.1.md) - OpenSquilla 0.5.1 release notes.
+- [`releases/0.5.0.md`](releases/0.5.0.md) - OpenSquilla 0.5.0 release notes.
 - [`releases/0.5.0rc3.md`](releases/0.5.0rc3.md) - OpenSquilla 0.5.0 Preview 3 release notes.
 - [`releases/0.5.0rc2.md`](releases/0.5.0rc2.md) - OpenSquilla 0.5.0 Preview 2 release notes.
 - [`releases/0.5.0rc1.md`](releases/0.5.0rc1.md) - OpenSquilla 0.5.0 Preview 1 release notes.

@@ -3,6 +3,8 @@
 # Installer contract:
 #   - installs into a user-owned prefix (never Program Files or system32)
 #   - prefers uv tool install; falls back to pip --user; errors clearly if neither exists
+#   - requires the Node.js version pinned by opensquilla-webui/.node-version,
+#     runs npm ci + npm run build, and packages that exact Web UI
 #   - defaults to the "recommended" runtime profile (memory + bundled v4 router)
 #     and allows `$env:OPENSQUILLA_INSTALL_PROFILE="core"` to opt back down
 #   - on Windows, best-effort installs Microsoft Visual C++ Redistributable
@@ -23,6 +25,13 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# PowerShell 7 can promote a non-zero native exit to a terminating error
+# before $LASTEXITCODE is inspected. This installer checks native commands
+# explicitly so npm and the selected Python installer keep their original
+# exit codes on every supported PowerShell host.
+if ($null -ne (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue)) {
+    Set-Variable -Name PSNativeCommandUseErrorActionPreference -Value $false
+}
 
 # --- prefix resolution ------------------------------------------------------
 
@@ -35,6 +44,18 @@ if ($env:OPENSQUILLA_PREFIX) {
 }
 
 $dryRun = $env:OPENSQUILLA_INSTALL_DRY_RUN -eq '1'
+$webuiDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'opensquilla-webui'
+$nodeVersionFile = Join-Path $webuiDir '.node-version'
+if (-not (Test-Path $nodeVersionFile -PathType Leaf)) {
+    Write-Error "install_source.ps1: required Node.js version file is missing: $nodeVersionFile"
+    exit 1
+}
+try {
+    $minimumNodeVersion = [version]((Get-Content $nodeVersionFile -Raw).Trim().TrimStart('v'))
+} catch {
+    Write-Error "install_source.ps1: could not parse the required Node.js version in $nodeVersionFile."
+    exit 1
+}
 $script:isWindowsHost = if (Get-Variable IsWindows -ErrorAction SilentlyContinue) {
     $IsWindows
 } else {
@@ -159,6 +180,62 @@ function Test-SquillaRouterAssets {
         Write-Error $lfsMessage
         Write-Error $coreMessage
         exit 1
+    }
+}
+
+function Build-WebUI {
+    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $nodeCommand) {
+        Write-Error "install_source.ps1: Node.js >= $minimumNodeVersion is required to build the Web UI from source. Install Node.js, or use an official wheel/Desktop installer (no Node.js required)."
+        exit 1
+    }
+
+    $rawNodeVersion = (& $nodeCommand.Source --version 2>$null | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0 -or -not $rawNodeVersion) {
+        Write-Error 'install_source.ps1: could not determine the installed Node.js version.'
+        exit 1
+    }
+    try {
+        $nodeVersion = [version]($rawNodeVersion.Trim().TrimStart('v'))
+    } catch {
+        Write-Error "install_source.ps1: could not parse Node.js version '$rawNodeVersion'."
+        exit 1
+    }
+    if ($nodeVersion -lt $minimumNodeVersion) {
+        Write-Error "install_source.ps1: Node.js >= $minimumNodeVersion is required; found $nodeVersion. Upgrade Node.js, or use an official wheel/Desktop installer (no Node.js required)."
+        exit 1
+    }
+
+    $npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npmCommand) {
+        $npmCommand = Get-Command npm -ErrorAction SilentlyContinue
+    }
+    if (-not $npmCommand) {
+        Write-Error 'install_source.ps1: npm is required to build the Web UI from source. Install npm, or use an official wheel/Desktop installer (no npm required).'
+        exit 1
+    }
+    if (-not (Test-Path (Join-Path $webuiDir 'package-lock.json') -PathType Leaf)) {
+        Write-Error "install_source.ps1: Web UI package lock is missing: $webuiDir\package-lock.json"
+        exit 1
+    }
+
+    Write-Host 'install_source.ps1: installing locked Web UI dependencies (npm ci)'
+    Push-Location $webuiDir
+    try {
+        & $npmCommand.Source ci
+        $npmExitCode = $LASTEXITCODE
+        if ($npmExitCode -ne 0) {
+            [Console]::Error.WriteLine("install_source.ps1: npm ci failed with exit code $npmExitCode.")
+            exit $npmExitCode
+        }
+        & $npmCommand.Source run build
+        $npmExitCode = $LASTEXITCODE
+        if ($npmExitCode -ne 0) {
+            [Console]::Error.WriteLine("install_source.ps1: npm run build failed with exit code $npmExitCode.")
+            exit $npmExitCode
+        }
+    } finally {
+        Pop-Location
     }
 }
 
@@ -362,6 +439,9 @@ function Write-PathHint {
 }
 
 if ($dryRun) {
+    Write-Host "install_source.ps1: dry-run — would require Node.js >= $minimumNodeVersion and npm"
+    Write-Host "install_source.ps1: dry-run — would run in ${webuiDir}: npm ci"
+    Write-Host "install_source.ps1: dry-run — would run in ${webuiDir}: npm run build"
     Write-Host "install_source.ps1: dry-run — would run: $installCmd"
     Write-Host "install_source.ps1: dry-run — prefix: $prefix"
     Test-SquillaRouterAssets -WarnOnly
@@ -374,8 +454,9 @@ if ($dryRun) {
 
 # --- execute ---------------------------------------------------------------
 
-Install-WindowsVCRedistIfNeeded
 Test-SquillaRouterAssets
+Build-WebUI
+Install-WindowsVCRedistIfNeeded
 
 Write-Host "install_source.ps1: installing via $installer into prefix $prefix"
 Write-Host "install_source.ps1: running: $installCmd"
@@ -384,10 +465,11 @@ if ($installer -eq 'uv') {
 } else {
     & python @installArgs
 }
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "install_source.ps1: install command failed with exit code $LASTEXITCODE."
-    Write-Error 'install_source.ps1: Close any running OpenSquilla gateway or shell using the existing tool environment, then retry.'
-    exit $LASTEXITCODE
+$installExitCode = $LASTEXITCODE
+if ($installExitCode -ne 0) {
+    [Console]::Error.WriteLine("install_source.ps1: install command failed with exit code $installExitCode.")
+    [Console]::Error.WriteLine('install_source.ps1: Close any running OpenSquilla gateway or shell using the existing tool environment, then retry.')
+    exit $installExitCode
 }
 
 # Write an install receipt to aid `opensquilla uninstall`. Best-effort.

@@ -51,7 +51,61 @@ beforeEach(() => {
 })
 
 describe('AssistantMessage ensemble footer metadata', () => {
-  it('does not present ensemble aggregate metadata as single-model footer metadata', async () => {
+  it('marks only cron-provenance assistant rows as scheduled', async () => {
+    const { app, el } = await mountMessage(assistantMessage({
+      provenanceKind: 'cron',
+      provenanceSourceTool: 'cron.run',
+    }))
+
+    const badge = el.querySelector<HTMLElement>('.msg-provenance-chip')
+    expect(badge?.textContent).toContain('Scheduled')
+    expect(badge?.title).toContain('cron.run')
+    app.unmount()
+
+    const regular = await mountMessage(assistantMessage({ provenanceKind: 'internal_system' }))
+    expect(regular.el.querySelector('.msg-provenance-chip')).toBeNull()
+    regular.app.unmount()
+
+    const unsafe = await mountMessage(assistantMessage({
+      provenanceKind: 'cron',
+      provenanceSourceTool: 'cron.run\nBearer secret',
+    }))
+    expect(unsafe.el.querySelector<HTMLElement>('.msg-provenance-chip')?.title).not.toContain('Bearer')
+    unsafe.app.unmount()
+  })
+
+  it('keeps model, cost, and token details behind one info control', async () => {
+    const { app, el } = await mountMessage(
+      assistantMessage({
+        meta: {
+          model: 'z-ai/glm-5.2-20260616',
+          modelShort: 'glm-5.2-20260616',
+          input: 120,
+          output: 40,
+          hasTokens: true,
+          cachedTokens: 0,
+          reasoningTokens: 0,
+          costUsd: 0.050328,
+          hasSaved: false,
+          savedLabel: '',
+        },
+      }),
+    )
+
+    el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')?.click()
+    await nextTick()
+
+    expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
+    expect(el.querySelector('.msg-meta__model')).toBeNull()
+    expect(el.querySelector('.msg-meta__cost')).toBeNull()
+    const rows = Array.from(el.querySelectorAll('.msg-meta-popover__row')).map(row => row.textContent)
+    expect(rows).toContain('modelglm-5.2-20260616')
+    expect(rows).toContain('cost$0.050328')
+    expect(rows).toContain('tokens↑120 ↓40')
+    app.unmount()
+  })
+
+  it('keeps ensemble metadata behind the same single info control', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({
         meta: {
@@ -84,7 +138,8 @@ describe('AssistantMessage ensemble footer metadata', () => {
     expect(el.querySelector('.msg-meta__model')).toBeNull()
     expect(el.querySelector('.msg-meta__cost')).toBeNull()
     expect(el.querySelector('.savings-indicator')).toBeNull()
-    expect(el.querySelector('.msg-meta__ensemble')?.textContent).toBe('Ensemble · 5 models')
+    expect(el.querySelector('.msg-meta__ensemble')).toBeNull()
+    expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
     app.unmount()
   })
 
@@ -131,7 +186,7 @@ describe('AssistantMessage ensemble footer metadata', () => {
     app.unmount()
   })
 
-  it('keeps the savings badge for non-ensemble optimized messages', async () => {
+  it('does not show a savings badge beside the info control', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({
         meta: {
@@ -149,13 +204,23 @@ describe('AssistantMessage ensemble footer metadata', () => {
       }),
     )
 
-    expect(el.querySelector('.savings-indicator')?.textContent).toBe('Saved ~92%')
+    expect(el.querySelector('.savings-indicator')).toBeNull()
+    expect(el.querySelectorAll('.msg-meta__more-btn')).toHaveLength(1)
     app.unmount()
   })
 
-  it('keeps the ensemble summary broad enough on compact layouts', () => {
-    expect(source).not.toContain('max-width: 7rem;')
-    expect(source).toContain('max-width: min(14rem, 100%);')
+  it('does not render inline model, cost, ensemble, or savings metadata', () => {
+    expect(source).not.toContain('class="msg-meta__model"')
+    expect(source).not.toContain('class="msg-meta__cost"')
+    expect(source).not.toContain('class="msg-meta__ensemble"')
+    expect(source).not.toContain('class="savings-indicator"')
+  })
+
+  it('opens the info popover inward from the left edge of the message pane', () => {
+    const popoverRule = source.match(/\.msg-meta-popover\s*\{([^}]*)\}/)?.[1] || ''
+
+    expect(popoverRule).toMatch(/\bleft:\s*0;/)
+    expect(popoverRule).not.toContain('translateX(-50%)')
   })
 
   it('does not toggle share selection for stopped-output notices', async () => {

@@ -8,6 +8,7 @@ selector-fallback turns carry the realigned model plus the hop count.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
 import time
@@ -18,7 +19,7 @@ import pytest
 
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.routing import RoutingDecision
-from opensquilla.engine.steps import squilla_router
+from opensquilla.engine.steps import router_decision_record, squilla_router
 from opensquilla.engine.steps.router_decision_record import (
     DECISION_ID_METADATA_KEY,
     PENDING_RECORD_KEY,
@@ -52,6 +53,18 @@ class _FakeWriter:
     def record_decision(self, record: dict[str, Any]) -> bool:
         self.records.append(dict(record))
         return True
+
+
+class _GatedWriter(_FakeWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def record_decision(self, record: dict[str, Any]) -> bool:
+        self.entered.set()
+        self.release.wait(timeout=5)
+        return super().record_decision(record)
 
 
 @pytest.fixture(autouse=True)
@@ -137,6 +150,11 @@ def test_stage_then_flush_hands_record_to_writer_single() -> None:
     assert record["proposed_tier"] == "c1"
     assert record["final_tier"] == "c2"
     assert record["provider"] == "openrouter"
+    assert record["requested_provider"] == "openrouter"
+    assert record["requested_model"] == "deepseek/deepseek-chat"
+    assert record["executed_provider"] == "openrouter"
+    assert record["executed_model"] == "deepseek/deepseek-chat"
+    assert record["fallback_reason"] is None
     assert record["thinking_level"] == "medium"
     assert record["baseline_model"] == "anthropic/claude-sonnet"
     assert record["savings_pct"] == 42.5  # C2: today's value, verbatim
@@ -158,11 +176,23 @@ def test_flush_records_ensemble_execution_facts() -> None:
     ctx.metadata["routed_model_before_ensemble"] = "deepseek/deepseek-chat"
     flush_router_decision(
         ctx.metadata,
-        ensemble_trace={"mode": "b5_fusion", "profile": "static_openrouter_b5"},
+        ensemble_trace={
+            "mode": "b5_fusion",
+            "profile": "static_openrouter_b5",
+            "fallback_used": True,
+            "fallback_code": "ensemble_insufficient_proposers",
+            "fallback_reason": "ensemble quorum not reached",
+            "final_request": {
+                "execution": {"provider": "openai", "model": "gpt-5-mini"}
+            },
+        },
     )
     record = writer.records[0]
     assert record["executed_kind"] == "ensemble"
     assert record["ensemble_profile"] == "static_openrouter_b5"
+    assert record["executed_provider"] == "openai"
+    assert record["executed_model"] == "gpt-5-mini"
+    assert record["fallback_reason"] == "ensemble_insufficient_proposers"
 
 
 def test_flush_realigns_model_and_counts_fallback_hops() -> None:
@@ -173,11 +203,17 @@ def test_flush_realigns_model_and_counts_fallback_hops() -> None:
 
     # Selector fallback executed a different model and counted two hops.
     ctx.metadata["routed_model"] = "qwen/qwen-plus"
+    ctx.metadata["executed_provider"] = "dashscope"
+    ctx.metadata["executed_model"] = "qwen/qwen-plus"
     ctx.metadata["router_fallback_hops"] = 2
     flush_router_decision(ctx.metadata)
     record = writer.records[0]
     assert record["model"] == "qwen/qwen-plus"
     assert record["fallback_hops"] == 2
+    assert record["requested_model"] == "deepseek/deepseek-chat"
+    assert record["executed_provider"] == "dashscope"
+    assert record["executed_model"] == "qwen/qwen-plus"
+    assert record["fallback_reason"] == "selector_fallback"
     assert record["executed_kind"] == "single"
 
 
@@ -332,6 +368,31 @@ async def test_schedule_flush_noop_without_staged_record() -> None:
     assert writer.records == []
 
 
+async def test_schedule_flush_cancellation_waits_for_worker_thread_to_finish() -> None:
+    writer = _GatedWriter()
+    set_decision_writer(writer)
+    ctx = _ctx(session_key="agent:target")
+    stage_router_decision(ctx, decision=_decision(), routing_extra=ROUTING_EXTRA)
+    task = schedule_router_decision_flush(ctx.metadata)
+    assert task is not None
+    assert await asyncio.to_thread(writer.entered.wait, 1)
+
+    try:
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        writer.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert writer.records[0]["session_key"] == "agent:target"
+    finally:
+        writer.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 # ---------------------------------------------------------------------------
 # Rehydration
 # ---------------------------------------------------------------------------
@@ -347,7 +408,9 @@ def _synthetic_writer(tmp_path: Path) -> RouterDecisionWriter:
         " decision_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,"
         " turn_index INTEGER, ts_ms INTEGER NOT NULL, classifier TEXT,"
         " proposed_tier TEXT, confidence REAL, probs TEXT, flags TEXT,"
-        " final_tier TEXT, provider TEXT, model TEXT, thinking_level TEXT,"
+        " final_tier TEXT, requested_provider TEXT, requested_model TEXT,"
+        " provider TEXT, model TEXT, executed_provider TEXT, executed_model TEXT,"
+        " fallback_reason TEXT, thinking_level TEXT,"
         " source TEXT, trail TEXT, baseline_model TEXT, savings_pct REAL,"
         " executed_kind TEXT, ensemble_profile TEXT,"
         " fallback_hops INTEGER NOT NULL DEFAULT 0)"
@@ -443,13 +506,6 @@ async def test_drain_pending_flushes_lands_inflight_records_before_close() -> No
     """Shutdown drains scheduled flush tasks before the writer connection
     closes — a turn finishing near shutdown must not lose its record to a
     cancelled task or write on a closed connection."""
-    gate = threading.Event()
-
-    class _GatedWriter(_FakeWriter):
-        def record_decision(self, record: dict[str, Any]) -> bool:
-            gate.wait(timeout=5)
-            return super().record_decision(record)
-
     writer = _GatedWriter()
     set_decision_writer(writer)
     ctx = _ctx()
@@ -459,12 +515,176 @@ async def test_drain_pending_flushes_lands_inflight_records_before_close() -> No
     assert task is not None
     assert not task.done()
 
-    gate.set()
+    writer.release.set()
     await drain_pending_flushes()
 
     assert task.done()
     assert len(writer.records) == 1
 
 
+async def test_drain_pending_flushes_waits_for_cancelled_worker_before_returning() -> None:
+    writer = _GatedWriter()
+    set_decision_writer(writer)
+    ctx = _ctx()
+    stage_router_decision(ctx, decision=_decision(), routing_extra=ROUTING_EXTRA)
+    flush_task = schedule_router_decision_flush(ctx.metadata)
+    assert flush_task is not None
+    assert await asyncio.to_thread(writer.entered.wait, 1)
+
+    drain_task = asyncio.create_task(drain_pending_flushes(timeout=0))
+    try:
+        for _ in range(100):
+            if flush_task.cancelling():
+                break
+            await asyncio.sleep(0)
+        assert flush_task.cancelling()
+        assert not flush_task.done()
+        assert not drain_task.done()
+
+        writer.release.set()
+        await asyncio.wait_for(drain_task, timeout=1)
+        assert flush_task.done()
+        assert writer.records[0]["session_key"] == "agent:main:main"
+    finally:
+        writer.release.set()
+        await asyncio.gather(flush_task, drain_task, return_exceptions=True)
+
+
 async def test_drain_pending_flushes_noop_when_nothing_inflight() -> None:
     await drain_pending_flushes()  # must not raise or hang
+
+
+async def test_drain_pending_flushes_for_sessions_ignores_unrelated_blocked_flush() -> None:
+    entered = {
+        "agent:target": threading.Event(),
+        "agent:unrelated": threading.Event(),
+    }
+    release = {
+        "agent:target": threading.Event(),
+        "agent:unrelated": threading.Event(),
+    }
+
+    class _PerSessionGatedWriter(_FakeWriter):
+        def record_decision(self, record: dict[str, Any]) -> bool:
+            session_key = record["session_key"]
+            entered[session_key].set()
+            release[session_key].wait(timeout=5)
+            return super().record_decision(record)
+
+    writer = _PerSessionGatedWriter()
+    set_decision_writer(writer)
+    target_ctx = _ctx(session_key="agent:target")
+    unrelated_ctx = _ctx(session_key="agent:unrelated")
+    stage_router_decision(
+        target_ctx,
+        decision=_decision(),
+        routing_extra=ROUTING_EXTRA,
+    )
+    stage_router_decision(
+        unrelated_ctx,
+        decision=_decision(),
+        routing_extra=ROUTING_EXTRA,
+    )
+
+    target_task = schedule_router_decision_flush(target_ctx.metadata)
+    unrelated_task = schedule_router_decision_flush(unrelated_ctx.metadata)
+    assert target_task is not None
+    assert unrelated_task is not None
+    assert await asyncio.to_thread(entered["agent:target"].wait, 1)
+    assert await asyncio.to_thread(entered["agent:unrelated"].wait, 1)
+
+    try:
+        release["agent:target"].set()
+        await asyncio.wait_for(
+            router_decision_record.drain_pending_flushes_for_sessions({"agent:target"}),
+            timeout=1,
+        )
+
+        assert target_task.done()
+        assert not unrelated_task.done()
+        assert [record["session_key"] for record in writer.records] == ["agent:target"]
+    finally:
+        release["agent:unrelated"].set()
+        await drain_pending_flushes()
+
+
+async def test_drain_pending_flushes_for_sessions_loops_until_session_is_stable() -> None:
+    entered = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+
+    class _SequencedWriter(_FakeWriter):
+        def record_decision(self, record: dict[str, Any]) -> bool:
+            index = len(self.records)
+            entered[index].set()
+            release[index].wait(timeout=5)
+            return super().record_decision(record)
+
+    writer = _SequencedWriter()
+    set_decision_writer(writer)
+    first_ctx = _ctx(session_key="agent:target")
+    second_ctx = _ctx(session_key="agent:target")
+    stage_router_decision(first_ctx, decision=_decision(), routing_extra=ROUTING_EXTRA)
+    stage_router_decision(second_ctx, decision=_decision(), routing_extra=ROUTING_EXTRA)
+
+    first_task = schedule_router_decision_flush(first_ctx.metadata)
+    assert first_task is not None
+    assert await asyncio.to_thread(entered[0].wait, 1)
+
+    second_scheduled = asyncio.Event()
+    scheduled_tasks = [first_task]
+
+    def schedule_second(_task: asyncio.Task[None]) -> None:
+        second_task = schedule_router_decision_flush(second_ctx.metadata)
+        assert second_task is not None
+        scheduled_tasks.append(second_task)
+        second_scheduled.set()
+
+    first_task.add_done_callback(schedule_second)
+    drain_task = asyncio.create_task(
+        router_decision_record.drain_pending_flushes_for_sessions({"agent:target"})
+    )
+    await asyncio.sleep(0)
+
+    try:
+        release[0].set()
+        await asyncio.wait_for(second_scheduled.wait(), timeout=1)
+        assert await asyncio.to_thread(entered[1].wait, 1)
+        await asyncio.sleep(0)
+        assert not drain_task.done()
+
+        release[1].set()
+        await asyncio.wait_for(drain_task, timeout=1)
+        assert all(task.done() for task in scheduled_tasks)
+        assert len(writer.records) == 2
+    finally:
+        release[0].set()
+        release[1].set()
+        await drain_pending_flushes()
+
+
+async def test_cancelling_session_drain_does_not_cancel_matching_flush() -> None:
+    writer = _GatedWriter()
+    set_decision_writer(writer)
+    ctx = _ctx(session_key="agent:target")
+    stage_router_decision(ctx, decision=_decision(), routing_extra=ROUTING_EXTRA)
+    flush_task = schedule_router_decision_flush(ctx.metadata)
+    assert flush_task is not None
+    assert await asyncio.to_thread(writer.entered.wait, 1)
+
+    drain_task = asyncio.create_task(
+        router_decision_record.drain_pending_flushes_for_sessions({"agent:target"})
+    )
+    await asyncio.sleep(0)
+    try:
+        drain_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain_task
+        assert flush_task.cancelling() == 0
+        assert not flush_task.done()
+
+        writer.release.set()
+        await flush_task
+        assert writer.records[0]["session_key"] == "agent:target"
+    finally:
+        writer.release.set()
+        await asyncio.gather(flush_task, return_exceptions=True)

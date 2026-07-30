@@ -35,6 +35,14 @@ jobs:
       OSS_ENDPOINT: ${{ vars.ALIYUN_OSS_ENDPOINT }}
       OSS_ADDRESSING_STYLE: ${{ vars.ALIYUN_OSS_ADDRESSING_STYLE }}
     steps:
+      - name: Check out release tooling
+        uses: actions/checkout@v4
+        with:
+          # Release events normally resolve to the release tag. Use the exact
+          # commit that supplied this workflow so an older tag cannot select
+          # an older or missing manifest helper.
+          ref: ${{ github.workflow_sha }}
+
       - name: Resolve release tag
         id: release
         env:
@@ -117,6 +125,24 @@ jobs:
           fi
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
 
+      - name: Read published release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p channel-assets
+          gh release view "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,isDraft,isPrerelease,publishedAt,url \
+            > channel-assets/release.json
+          gh release list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --limit 1000 \
+            --json tagName,isDraft,isPrerelease,publishedAt \
+            > channel-assets/releases.json
+
       - name: Verify release checksums
         shell: bash
         run: |
@@ -150,6 +176,10 @@ jobs:
                   raise SystemExit(f"Unsafe checksum filename on line {line_number}: {name}")
               if name == "SHA256SUMS":
                   raise SystemExit("SHA256SUMS must not list itself")
+              if name in expected:
+                  raise SystemExit(
+                      f"Duplicate SHA256SUMS filename on line {line_number}: {name}"
+                  )
               expected.append(name)
 
           if not expected:
@@ -167,7 +197,19 @@ jobs:
           (root / "CHECKSUMMED_ASSETS").write_text("\n".join(expected) + "\n", encoding="utf-8")
           PY
 
-      - name: Build stable installer aliases
+      - name: Build release channel manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release_channel_manifest.py build \
+            --release-json channel-assets/release.json \
+            --assets-dir release-assets \
+            --output channel-assets/manifest.json \
+            --targets-output channel-assets/TARGETS
+          python3 -m json.tool channel-assets/manifest.json
+          sed -n '1,20p' channel-assets/TARGETS
+
+      - name: Build moving installer aliases
         shell: bash
         run: |
           set -euo pipefail
@@ -210,6 +252,7 @@ jobs:
             local name="$2"
             local destination="${3:-${dest_prefix}}"
             local cache_control="${4:-}"
+            local content_type="${5:-}"
             local -a options=(
               cp
               --force
@@ -218,7 +261,19 @@ jobs:
             if [[ -n "${cache_control}" ]]; then
               options+=(--cache-control "${cache_control}")
             fi
+            if [[ -n "${content_type}" ]]; then
+              options+=(--content-type "${content_type}")
+            fi
             ossutil "${options[@]}" "${source}" "${destination}/${name}"
+          }
+          download_object() {
+            local object="$1"
+            local destination="$2"
+            mkdir -p "$(dirname "${destination}")"
+            ossutil cp \
+              --force \
+              --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+              "${object}" "${destination}"
           }
           object_exists() {
             local object="$1"
@@ -232,85 +287,400 @@ jobs:
             grep -Fxq "${object}" <<<"${listing}"
           }
           latest_prefix="${mirror_root}/latest"
-          backup_prefix="${mirror_root}/.latest-backups/${GITHUB_RUN_ID}"
+          channels_prefix="${mirror_root}/channels"
+          # A GitHub Actions re-run keeps GITHUB_RUN_ID and increments
+          # GITHUB_RUN_ATTEMPT. Keep every attempt's recovery snapshot isolated
+          # so a retry cannot overwrite a backup preserved after a failed
+          # rollback.
+          backup_prefix="${mirror_root}/.promotion-backups/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          moving_cache_control="no-cache,max-age=0,must-revalidate"
+          versioned_cache_control="public,max-age=31536000,immutable"
+          json_content_type="application/json; charset=utf-8"
+          html_content_type="text/html; charset=utf-8"
           latest_aliases=(
             OpenSquilla-mac-arm64.dmg
             OpenSquilla-win-x64.exe
           )
           backed_up_aliases=()
           promoted_aliases=()
-          has_backup() {
+          backed_up_manifests=()
+          promoted_manifests=()
+          backed_up_latest_html=0
+          removed_latest_html=0
+          promote_targets=()
+          has_item() {
             local candidate="$1"
+            shift
             local name
-            for name in "${backed_up_aliases[@]}"; do
+            for name in "$@"; do
               [[ "${name}" == "${candidate}" ]] && return 0
             done
             return 1
           }
-          rollback_latest_aliases() {
+          verify_immutable_asset() {
+            local source="$1"
+            local name="$2"
+            local object="$3"
+            local remote_copy="channel-assets/remote-versioned/${name}"
+            local local_digest remote_digest
+            if ! download_object "${object}" "${remote_copy}"; then
+              echo "Unable to download immutable OSS release object: ${object}" >&2
+              return 1
+            fi
+            if ! local_digest="$(sha256sum -- "${source}" | awk '{print $1}')"; then
+              echo "Unable to hash local release asset: ${source}" >&2
+              return 1
+            fi
+            if ! remote_digest="$(sha256sum -- "${remote_copy}" | awk '{print $1}')"; then
+              echo "Unable to hash downloaded OSS release object: ${object}" >&2
+              return 1
+            fi
+            if [[ "${remote_digest}" != "${local_digest}" ]]; then
+              echo "Refusing to replace immutable OSS release object: ${object}" >&2
+              echo "  local SHA256:  ${local_digest}" >&2
+              echo "  remote SHA256: ${remote_digest}" >&2
+              echo "Publish corrected release assets under a new release tag." >&2
+              return 1
+            fi
+          }
+          put_immutable_asset() {
+            local source="$1"
+            local name="$2"
+            local cache_control="${3:-}"
+            local content_type="${4:-}"
+            local source_path
+            local -a options=(
+              api
+              put-object
+              --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
+              --bucket "${ALIYUN_OSS_BUCKET}"
+              --key "${ALIYUN_OSS_PREFIX_NORMALIZED}/${TAG}/${name}"
+              --forbid-overwrite true
+            )
+            if ! source_path="$(realpath -- "${source}")"; then
+              echo "Unable to resolve local release asset: ${source}" >&2
+              return 1
+            fi
+            options+=(--body "file://${source_path}")
+            if [[ -n "${cache_control}" ]]; then
+              options+=(--cache-control "${cache_control}")
+            fi
+            if [[ -n "${content_type}" ]]; then
+              options+=(--content-type "${content_type}")
+            fi
+            # The server-side forbid-overwrite condition closes the gap between
+            # the preceding existence check and this write. If the request lost
+            # a race, or its response was lost after committing, the caller
+            # verifies the now-existing object before deciding whether to fail.
+            ossutil "${options[@]}"
+          }
+          upload_immutable_asset() {
+            local source="$1"
+            local name="$2"
+            local cache_control="${3:-}"
+            local content_type="${4:-}"
+            local object="${dest_prefix}/${name}"
+            if object_exists "${object}"; then
+              verify_immutable_asset "${source}" "${name}" "${object}"
+              echo "Immutable OSS release object already matches: ${object}"
+              return 0
+            else
+              local exists_status="$?"
+              if (( exists_status != 1 )); then
+                echo "Refusing to upload after an OSS release-object existence-check error." >&2
+                return "${exists_status}"
+              fi
+            fi
+            if ! put_immutable_asset \
+              "${source}" "${name}" \
+              "${cache_control}" "${content_type}"; then
+              if object_exists "${object}" \
+                && verify_immutable_asset "${source}" "${name}" "${object}"; then
+                echo "Concurrent immutable OSS release object already matches: ${object}"
+                return 0
+              fi
+              echo "Immutable OSS release-object upload failed: ${object}" >&2
+              return 1
+            fi
+            # Verify the committed object before any moving channel state can
+            # reference it. A failed verification leaves manifests untouched;
+            # the next attempt can safely verify and continue.
+            verify_immutable_asset "${source}" "${name}" "${object}"
+          }
+          rollback_promotions() {
             local status="$?"
             local rollback_failed=0
-            local name
+            local name target
             trap - EXIT
             if (( status != 0 )); then
-              echo "Latest alias promotion failed; restoring the previous state." >&2
+              echo "Release channel promotion failed; restoring the previous state." >&2
               for name in "${promoted_aliases[@]}"; do
-                if has_backup "${name}"; then
-                  upload_asset "${backup_prefix}/${name}" "${name}" "${latest_prefix}" "no-cache" \
+                if has_item "${name}" "${backed_up_aliases[@]}"; then
+                  upload_asset \
+                    "${backup_prefix}/latest/${name}" "${name}" \
+                    "${latest_prefix}" "${moving_cache_control}" \
                     || rollback_failed=1
                 else
                   ossutil rm --force --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
                     "${latest_prefix}/${name}" || rollback_failed=1
                 fi
               done
+              for target in "${promoted_manifests[@]}"; do
+                if has_item "${target}" "${backed_up_manifests[@]}"; then
+                  upload_asset \
+                    "${backup_prefix}/channels/${target}" \
+                    "${target}" "${channels_prefix}" \
+                    "${moving_cache_control}" "${json_content_type}" \
+                    || rollback_failed=1
+                else
+                  ossutil rm --force --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+                    "${channels_prefix}/${target}" || rollback_failed=1
+                  fi
+              done
+              if (( removed_latest_html && backed_up_latest_html )); then
+                upload_asset \
+                  "${backup_prefix}/legacy/latest.html" "latest.html" \
+                  "${mirror_root}" "${moving_cache_control}" "${html_content_type}" \
+                  || rollback_failed=1
+              fi
             fi
-            if (( ${#backed_up_aliases[@]} )); then
-              ossutil rm --force --recursive \
+            if (( ${#backed_up_aliases[@]} || ${#backed_up_manifests[@]} || backed_up_latest_html )); then
+              if (( rollback_failed )); then
+                echo "Rollback backup preserved for manual recovery: ${backup_prefix}/" >&2
+              elif ! ossutil rm --force --recursive \
                 --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
-                "${backup_prefix}/" || rollback_failed=1
+                "${backup_prefix}/"; then
+                rollback_failed=1
+              fi
             fi
             if (( rollback_failed )); then
-              echo "Latest alias rollback did not complete." >&2
+              echo "Release channel rollback did not complete." >&2
             fi
             exit "${status}"
           }
-          trap rollback_latest_aliases EXIT
-          for name in "${latest_aliases[@]}"; do
-            if object_exists "${latest_prefix}/${name}"; then
-              upload_asset "${latest_prefix}/${name}" "${name}" "${backup_prefix}"
-              backed_up_aliases+=("${name}")
+
+          # Version-scoped immutability is enforced by the existence check plus
+          # SHA256 verification in upload_immutable_asset; x-oss-forbid-overwrite
+          # only narrows the check-to-write race and is ignored by OSS while
+          # bucket versioning is enabled or suspended. Query and log the
+          # versioning state so every mirror run records which regime it ran
+          # under.
+          versioning_endpoint="oss-${OSS_REGION}.aliyuncs.com"
+          ossutil api get-bucket-versioning \
+            --addressing-style virtual \
+            --endpoint "${versioning_endpoint}" \
+            --bucket "${ALIYUN_OSS_BUCKET}" \
+            --output-format json \
+            > channel-assets/bucket-versioning.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("channel-assets/bucket-versioning.json")
+          try:
+              raw = path.read_text(encoding="utf-8")
+          except (OSError, UnicodeError) as exc:
+              raise SystemExit(f"Unable to verify OSS bucket versioning state: {exc}") from exc
+
+          # ossutil emits the JSON body followed by extra output (for example an
+          # elapsed-time trailer or additional metadata documents). Parse every
+          # leading JSON document and fail closed only when none can be parsed.
+          decoder = json.JSONDecoder()
+          documents = []
+          index = 0
+          while index < len(raw):
+              while index < len(raw) and raw[index].isspace():
+                  index += 1
+              if index >= len(raw):
+                  break
+              try:
+                  document, index = decoder.raw_decode(raw, index)
+              except json.JSONDecodeError:
+                  break
+              documents.append(document)
+
+          if not documents:
+              snippet = " ".join(raw.split())[:300]
+              raise SystemExit(
+                  "Unable to verify OSS bucket versioning state: no JSON document "
+                  f"in ossutil output: {snippet!r}"
+              )
+
+          def statuses(value):
+              if isinstance(value, dict):
+                  for key, nested in value.items():
+                      if isinstance(key, str) and key.casefold() == "status":
+                          yield nested
+                      yield from statuses(nested)
+              elif isinstance(value, list):
+                  for nested in value:
+                      yield from statuses(nested)
+
+          # Only real versioning states matter here. Response envelopes may
+          # carry unrelated "status" fields (HTTP codes), so match the two
+          # states the OSS API can report for a versioned bucket.
+          reported = [
+              value
+              for document in documents
+              for value in statuses(document)
+              if isinstance(value, str) and value.casefold() in ("enabled", "suspended")
+          ]
+          if reported:
+              print(
+                  "OSS bucket versioning is "
+                  + ", ".join(repr(value) for value in reported)
+                  + "; x-oss-forbid-overwrite is advisory there. Version-scoped "
+                  "immutability remains enforced by the existence check plus "
+                  "SHA256 verification before every upload."
+              )
+          else:
+              print("OSS bucket versioning is not configured.")
+          PY
+          trap rollback_promotions EXIT
+
+          # A version-scoped OSS path is write-once. GitHub Releases remain the
+          # source of truth, but replacing a published asset under the same tag
+          # must fail closed and use a new tag rather than mixing old and new
+          # updater metadata, archives, installers, or checksums.
+          while IFS= read -r name; do
+            [[ -n "${name}" ]] || continue
+            upload_immutable_asset \
+              "release-assets/${name}" "${name}" \
+              "${versioned_cache_control}"
+          done < release-assets/CHECKSUMMED_ASSETS
+          upload_immutable_asset \
+            "release-assets/SHA256SUMS" "SHA256SUMS" \
+            "${versioned_cache_control}" "text/plain; charset=utf-8"
+
+          # First compare against the authenticated GitHub release inventory.
+          # This closes the bootstrap gap where legacy /latest aliases exist
+          # but latest.json has not been created yet. Then compare an existing
+          # OSS manifest as a second, fail-closed monotonic guard.
+          while IFS= read -r target; do
+            [[ -n "${target}" ]] || continue
+            if python3 scripts/release_channel_manifest.py is-release-head \
+              --channel "${target}" \
+              --releases channel-assets/releases.json \
+              --candidate channel-assets/manifest.json; then
+              :
+            else
+              head_status="$?"
+              if (( head_status == 3 )); then
+                echo "Skipping non-head release ${TAG} for ${target}."
+                continue
+              fi
+              exit "${head_status}"
+            fi
+            remote_manifest="${channels_prefix}/${target}"
+            if object_exists "${remote_manifest}"; then
+              current_manifest="channel-assets/current/${target}"
+              download_object "${remote_manifest}" "${current_manifest}"
+              if python3 scripts/release_channel_manifest.py should-promote \
+                --channel "${target}" \
+                --current "${current_manifest}" \
+                --candidate channel-assets/manifest.json; then
+                promote_targets+=("${target}")
+              else
+                promote_status="$?"
+                if (( promote_status == 3 )); then
+                  echo "Skipping older channel candidate ${TAG} for ${target}."
+                else
+                  exit "${promote_status}"
+                fi
+              fi
+            else
+              exists_status="$?"
+              if (( exists_status == 1 )); then
+                promote_targets+=("${target}")
+              else
+                echo "Refusing to promote after an OSS channel existence-check error." >&2
+                exit "${exists_status}"
+              fi
+            fi
+          done < channel-assets/TARGETS
+
+          promote_latest_aliases=0
+          for target in "${promote_targets[@]}"; do
+            [[ "${target}" == "latest.json" ]] && promote_latest_aliases=1
+            if object_exists "${channels_prefix}/${target}"; then
+              upload_asset \
+                "${channels_prefix}/${target}" "${target}" \
+                "${backup_prefix}/channels"
+              backed_up_manifests+=("${target}")
             else
               exists_status="$?"
               if (( exists_status != 1 )); then
-                echo "Refusing to promote aliases after an OSS existence-check error." >&2
+                echo "Refusing to back up channels after an OSS existence-check error." >&2
                 exit "${exists_status}"
               fi
             fi
           done
-          while IFS= read -r name; do
-            [[ -n "${name}" ]] || continue
-            upload_asset "release-assets/${name}" "${name}"
-          done < release-assets/CHECKSUMMED_ASSETS
-          upload_asset "release-assets/SHA256SUMS" "SHA256SUMS"
-          for name in "${latest_aliases[@]}"; do
-            upload_asset "release-assets/${name}" "${name}" "${latest_prefix}" "no-cache"
-            promoted_aliases+=("${name}")
+
+          if (( promote_latest_aliases )); then
+            if object_exists "${mirror_root}/latest.html"; then
+              upload_asset \
+                "${mirror_root}/latest.html" "latest.html" \
+                "${backup_prefix}/legacy"
+              backed_up_latest_html=1
+            else
+              latest_html_status="$?"
+              if (( latest_html_status != 1 )); then
+                echo "Refusing to promote aliases after a legacy-page existence-check error." >&2
+                exit "${latest_html_status}"
+              fi
+            fi
+            for name in "${latest_aliases[@]}"; do
+              if object_exists "${latest_prefix}/${name}"; then
+                upload_asset \
+                  "${latest_prefix}/${name}" "${name}" "${backup_prefix}/latest"
+                backed_up_aliases+=("${name}")
+              else
+                exists_status="$?"
+                if (( exists_status != 1 )); then
+                  echo "Refusing to promote aliases after an OSS existence-check error." >&2
+                  exit "${exists_status}"
+                fi
+              fi
+            done
+            for name in "${latest_aliases[@]}"; do
+              upload_asset \
+                "release-assets/${name}" "${name}" \
+                "${latest_prefix}" "${moving_cache_control}"
+              promoted_aliases+=("${name}")
+            done
+          fi
+
+          # Publish manifests last: every referenced versioned asset is already
+          # present, and latest aliases (when applicable) have already moved.
+          for target in "${promote_targets[@]}"; do
+            upload_asset \
+              channel-assets/manifest.json "${target}" "${channels_prefix}" \
+              "${moving_cache_control}" "${json_content_type}"
+            promoted_manifests+=("${target}")
           done
-          if object_exists "${mirror_root}/latest.html"; then
+
+          # The retired landing page is part of the global latest surface. An
+          # older version-only backfill must not mutate it.
+          if (( promote_latest_aliases && backed_up_latest_html )); then
             ossutil rm --force --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
               "${mirror_root}/latest.html"
-          else
-            latest_html_status="$?"
-            if (( latest_html_status != 1 )); then
-              echo "Refusing to finish promotion after a legacy-page existence-check error." >&2
-              exit "${latest_html_status}"
+            removed_latest_html=1
+          fi
+
+          # Verify the committed view while rollback backups still exist.
+          ossutil ls --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" "${dest_prefix}/"
+          if (( promote_latest_aliases )); then
+            ossutil ls --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" "${latest_prefix}/"
+          fi
+          if (( ${#promote_targets[@]} )); then
+            ossutil ls --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" "${channels_prefix}/"
+          fi
+
+          trap - EXIT
+          if (( ${#backed_up_aliases[@]} || ${#backed_up_manifests[@]} || backed_up_latest_html )); then
+            if ! ossutil rm --force --recursive \
+              --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+              "${backup_prefix}/"; then
+              echo "::warning::Promotion succeeded, but temporary OSS backups could not be removed."
             fi
           fi
-          trap - EXIT
-          if (( ${#backed_up_aliases[@]} )); then
-            ossutil rm --force --recursive \
-              --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
-              "${backup_prefix}/"
-          fi
-          ossutil ls --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" "${dest_prefix}/"
-          ossutil ls --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" "${latest_prefix}/"

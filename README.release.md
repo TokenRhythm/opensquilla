@@ -6,6 +6,9 @@ local memory, multi-channel messaging, and a local web control UI.
 The package is published as part of an OpenSquilla release zip. Install from the
 release bundle rather than from a source checkout so the wheel, dependency
 wheelhouse, install scripts, and third-party notices stay together.
+The wheel already contains the built Web UI, so installing this release bundle
+does not require Node.js or npm. Those tools are needed only when building from
+a Git checkout.
 
 ## Requirements
 

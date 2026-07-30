@@ -1,6 +1,7 @@
 ---
 name: weather
 description: "Get current weather and forecasts via wttr.in or Open-Meteo. Use when: user asks about weather, temperature, or forecasts for any location. NOT for: historical weather data, severe weather alerts, or detailed meteorological analysis. No API key needed."
+description_zh: "通过wttr.in或Open-Meteo获取当前天气和预报。当用户询问任意地点的天气、气温或预报时使用。不适用于历史天气数据、恶劣天气预警或详细气象分析。无需API密钥。"
 homepage: https://wttr.in/:help
 provenance:
   origin: openclaw-derived

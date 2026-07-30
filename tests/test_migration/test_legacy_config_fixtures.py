@@ -182,6 +182,23 @@ def test_matching_tier_profile_is_untouched() -> None:
     assert not result.changed
 
 
+def test_mismatched_tier_profile_is_preserved_when_profile_deployment_exists() -> None:
+    result = migrate_config_payload(
+        {
+            "llm": {"provider": "deepseek", "model": "deepseek-chat"},
+            "llm_profiles": {
+                "OpenAI": {"api_key_env": "SYNTHETIC_OPENAI_PROFILE_KEY"}
+            },
+            "squilla_router": {"tier_profile": "openai"},
+        }
+    )
+
+    assert not result.changed
+    cfg = GatewayConfig.model_validate(result.payload)
+    assert cfg.squilla_router.tier_profile == "openai"
+    assert cfg.squilla_router.tiers["c0"]["provider"] == "openai"
+
+
 def test_out_of_range_search_max_results_is_clamped() -> None:
     data = tomllib.loads(
         (FIXTURES_ROOT / "adversarial" / "search-max-results-over.toml").read_text(
@@ -212,3 +229,70 @@ def test_readonly_config_location_degrades_to_warning(
     # The original file is untouched (no partial rewrite).
     original = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert original["memory"]["dream"]["model_override"] == "dummy"
+
+
+def _feishu_webhook_payload(**entry_overrides) -> dict:
+    entry = {
+        "type": "feishu",
+        "name": "feishu-main",
+        "app_id": "cli_dummy",
+        "app_secret": "dummy-secret",
+        "connection_mode": "webhook",
+    }
+    entry.update(entry_overrides)
+    return {"channels": {"channels": [entry]}}
+
+
+def test_feishu_webhook_encrypt_key_only_still_loads_enabled() -> None:
+    # The pre-hardening shape: webhook mode authenticated by the encrypt_key
+    # HMAC signature alone was valid and fully functional — it must keep
+    # loading enabled after the verification requirement tightened.
+    result = migrate_config_payload(
+        _feishu_webhook_payload(encrypt_key="ek-1"), emit_diagnostics=False
+    )
+    assert not result.changed
+    cfg = GatewayConfig(**result.payload)
+    entry = cfg.channels.channels[0]
+    assert entry.enabled is True
+    assert entry.encrypt_key == "ek-1"
+
+
+def test_feishu_webhook_without_credentials_is_disabled_not_fatal() -> None:
+    # Neither verification_token nor encrypt_key: the entry was legal but
+    # dead in earlier releases (every request rejected). The strict schema
+    # rejects it; migration parks it disabled instead of failing the load.
+    result = migrate_config_payload(
+        _feishu_webhook_payload(), emit_diagnostics=False
+    )
+    assert result.changed
+    assert any("feishu" in warning for warning in result.warnings)
+    cfg = GatewayConfig(**result.payload)
+    entry = cfg.channels.channels[0]
+    assert entry.enabled is False
+
+
+def test_feishu_webhook_without_credentials_boots_from_disk(tmp_path: Path) -> None:
+    # End-to-end old-shape boot: GatewayConfig.load on a main-era TOML must
+    # not raise (one bad channel entry used to abort the whole config load).
+    import tomli_w
+
+    target = tmp_path / "config.toml"
+    with open(target, "wb") as fh:
+        tomli_w.dump(_feishu_webhook_payload(), fh)
+
+    cfg = GatewayConfig.load(target, read_only=True)
+    assert cfg.channels.channels[0].enabled is False
+
+    with_key = tmp_path / "config-key.toml"
+    with open(with_key, "wb") as fh:
+        tomli_w.dump(_feishu_webhook_payload(encrypt_key="ek-1"), fh)
+
+    cfg2 = GatewayConfig.load(with_key, read_only=True)
+    assert cfg2.channels.channels[0].enabled is True
+
+
+def test_feishu_webhook_enabled_entry_still_requires_a_credential() -> None:
+    # The hardening itself stays: constructing an ENABLED webhook entry with
+    # no credential (e.g. via RPC/env, which bypasses disk migration) fails.
+    with pytest.raises(Exception, match="verification_token or encrypt_key"):
+        GatewayConfig(**_feishu_webhook_payload())

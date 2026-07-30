@@ -1,6 +1,7 @@
 ---
 name: code-task
 description: "PREFERRED way to change code in a REAL repository: fix a GitHub issue, fix a bug, add/implement a function or feature, or make any edit to a project the user names by a filesystem path (e.g. /tmp/foo, ~/code/bar) or a git URL. Clones the repo, runs an OpenSquilla agent on the host to make the change on a task branch, then independently VERIFIES it with a red→green→regression test loop and reports a structured result. STRONGLY prefer this over hand-editing the user's files yourself in this session: editing files directly skips the isolation and the runner-verified red→green proof, so it is not equivalent. Use it whenever the request names a real on-disk repo/path or a repo URL and asks to fix/add/implement/change code. Examples: 'fix issue 412 in github.com/acme/widgets', '给 /tmp/calc 加个 average 函数', '帮我改一下 ~/proj 里的 X', 'implement CSV export in my project'. Docker-free host execution; treat the target repo as TRUSTED. GitHub issue mode needs the `gh` CLI. For self-contained, TESTABLE code from scratch when NO repo is named (e.g. 'write a function that maps A-Z to pitches'), use `--verification-mode scratch` with no --repo: it scaffolds a throwaway project, writes the code plus a test, and verifies it green. Only truly trivial one-liners or conceptual/non-testable questions are answered inline."
+description_zh: "在真实代码仓库中修改代码的首选方式：修复GitHub issue、修复bug、添加/实现函数或功能，或对用户以文件路径或git URL指定的项目做任何改动。它克隆仓库、在任务分支上运行OpenSquilla代理进行修改，再通过红→绿→回归测试循环独立验证并返回结构化结果，优于在本会话中手动改文件。当请求指定了真实的本地仓库/路径或仓库URL并要求修复/添加/实现/更改代码时使用；若未指定仓库、需从零编写可测试代码，则用 --verification-mode scratch。仅极简单的一行改动或概念性/不可测试的问题才直接内联回答。"
 triggers:
   - "code-task"
   - "fix the issue"
@@ -24,6 +25,10 @@ provenance:
   maintained_by: OpenSquilla
 metadata:
   {
+    "opensquilla":
+      {
+        "requires_tools": ["background_process", "exec_command", "process"],
+      },
     "platform":
       {
         "emoji": "🛠️",

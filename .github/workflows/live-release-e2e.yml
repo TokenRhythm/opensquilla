@@ -46,19 +46,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
 
       - name: Install dependencies
         run: uv sync --extra dev --extra recommended --frozen
-
-      - name: Install Playwright browser
-        run: npx --yes playwright install chromium
 
       - name: Fail if OpenRouter secret is missing
         shell: bash
@@ -85,11 +77,6 @@ jobs:
         env:
           OPENSQUILLA_GATEWAY_LLM_E2E: "1"
         run: uv run pytest tests/functional/test_gateway_llm_e2e.py -q -s
-
-      - name: Run real-browser chat e2e
-        env:
-          OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E: "1"
-        run: uv run pytest tests/functional/test_webui_browser_chat_e2e.py -q -s
 
       - name: Run live Telegram channel smoke
         if: ${{ inputs.run_telegram_channel }}

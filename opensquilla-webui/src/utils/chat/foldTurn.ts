@@ -2,6 +2,7 @@ import type {
   ChatRenderedMessage,
   ChatStreamSegment,
   ChatStreamTimelineItem,
+  ChatTimelineSegment,
   ChatToolCall,
   ChatToolCallGroup,
 } from '@/types/chat'
@@ -40,6 +41,7 @@ export interface FoldedTurn {
   // Accepted activity-phase transitions, in arrival order, for the finished
   // turn's activity timeline. Empty when no status frames were appended.
   statusHistory: StatusPart[]
+  timelineSegments: ChatTimelineSegment[]
 }
 
 // Live ownerKey: the legacy `streamTimelineItems` computed groups with the
@@ -49,6 +51,51 @@ const LIVE_OWNER_KEY = 'stream'
 
 /** One ordered interrupt accumulated by the fold, keyed by approvalId. */
 type FoldedInterrupt = ToPartsInterrupt
+
+export interface ReconciledTextSnapshot {
+  rawText: string
+  segments: ChatStreamSegment[]
+  changed: boolean
+}
+
+/**
+ * Apply an authoritative terminal text snapshot without losing tool history.
+ *
+ * A strict extension is still an ordinary suffix and therefore stays after the
+ * last streamed segment. A conflicting snapshot supersedes every streamed text
+ * segment, but keeps tool groups in arrival order and places the one canonical
+ * text segment after them. An empty snapshot intentionally clears text while
+ * retaining those tool groups.
+ */
+export function reconcileTextSnapshot(
+  segments: ChatStreamSegment[],
+  accumulatedText: string,
+  snapshot: string,
+): ReconciledTextSnapshot {
+  if (snapshot === accumulatedText) {
+    return { rawText: accumulatedText, segments, changed: false }
+  }
+
+  if (accumulatedText && snapshot.startsWith(accumulatedText)) {
+    const suffix = snapshot.slice(accumulatedText.length)
+    const next = segments.slice()
+    const last = next[next.length - 1]
+    if (last?.type === 'text') {
+      next[next.length - 1] = {
+        ...last,
+        raw: `${last.raw || ''}${suffix}`,
+        dirty: true,
+      }
+    } else {
+      next.push({ type: 'text', raw: suffix, html: '', dirty: true })
+    }
+    return { rawText: snapshot, segments: next, changed: true }
+  }
+
+  const next = segments.filter(segment => segment.type !== 'text')
+  if (snapshot) next.push({ type: 'text', raw: snapshot, html: '', dirty: true })
+  return { rawText: snapshot, segments: next, changed: true }
+}
 
 // A later requested-frame for the same approvalId (a re-broadcast or the
 // hydration backfill that carries args/warning) merges richer fields onto the
@@ -217,8 +264,9 @@ export function foldTurn(
         break
       }
       case 'final-text': {
-        // reconcileFinalText overrides rawText but does NOT re-segment
-        if (frame.text && frame.text !== rawText) finalText = frame.text
+        // Empty is meaningful: it clears stale streamed text while retaining
+        // any tool groups. A missing snapshot emits no frame at all.
+        finalText = frame.text
         break
       }
       case 'interrupt': {
@@ -226,6 +274,7 @@ export function foldTurn(
         if (i === undefined) {
           interruptIndex.set(frame.approvalId, interrupts.length)
           interrupts.push({ kind: frame.interruptKind, approvalId: frame.approvalId, data: frame.data })
+          segments.push({ type: 'interrupt', approvalId: frame.approvalId })
         } else {
           // A later requested-frame for the same id (re-broadcast / hydration
           // backfill) merges richer data without reordering.
@@ -247,6 +296,12 @@ export function foldTurn(
     }
   }
 
+  if (finalText !== null) {
+    const reconciled = reconcileTextSnapshot(segments, rawText, finalText)
+    rawText = reconciled.rawText
+    if (reconciled.segments !== segments) segments.splice(0, segments.length, ...reconciled.segments)
+  }
+
   // Render text segment html with the same renderer the legacy flush uses, so
   // compared html matches after a flush (synchronous here; ).
   for (const seg of segments) {
@@ -256,9 +311,48 @@ export function foldTurn(
     }
   }
 
-  if (finalText !== null) rawText = finalText
-
-  const timelineItems = segmentsToTimelineItems(segments, toolCalls, ownerKey)
+  const interruptParts = new Map<
+    string,
+    Extract<ChatPart, { type: 'interrupt' }>
+  >()
+  for (const interrupt of interrupts) {
+    const state = interruptState.get(interrupt.approvalId)
+    interruptParts.set(interrupt.approvalId, {
+      type: 'interrupt',
+      interruptKind: interrupt.kind,
+      approval: interrupt.kind === 'approval'
+        ? interrupt.data as InterruptApprovalData
+        : undefined,
+      clarify: interrupt.kind === 'clarify'
+        ? interrupt.data as InterruptClarifyData
+        : undefined,
+      resolution: state?.resolution ?? null,
+      busy: state?.busy ?? false,
+      error: state?.error ?? '',
+      key: `${ownerKey}:interrupt:${interrupt.approvalId}`,
+    })
+  }
+  const timelineItems = segmentsToTimelineItems(
+    segments,
+    toolCalls,
+    ownerKey,
+    interruptParts,
+  )
+  const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
+    if (segment.type === 'text') {
+      const raw = String(segment.raw || '')
+      return raw ? [{ type: 'text', raw }] : []
+    }
+    if (segment.type === 'interrupt') {
+      const approvalId = String(segment.approvalId || '')
+      return approvalId ? [{ type: 'interrupt', approvalId }] : []
+    }
+    return [{
+      type: 'tool-group',
+      groupId: segment.groupId,
+      operationKey: segment.operationKey,
+    }]
+  })
   const base = { timelineItems, toolCalls, artifacts, rawText }
   const rendered = asRenderedMessage(base)
 
@@ -267,6 +361,7 @@ export function foldTurn(
     thinkingText,
     toolTimes,
     statusHistory,
+    timelineSegments,
     parts: toParts(rendered, renderMarkdown, toolCallGroups, ownerKey, interrupts, interruptState),
     sources: toSources(rendered),
   }

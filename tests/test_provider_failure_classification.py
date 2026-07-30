@@ -19,6 +19,7 @@ from opensquilla.provider.registry import list_provider_specs
         "gemini",
         "dashscope",
         "bailian_coding",
+        "bailian_coding_cn",
         "moonshot",
         "mistral",
         "groq",

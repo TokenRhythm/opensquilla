@@ -194,6 +194,7 @@ async def run_concurrent_repl(
     dispatch: Callable[[str], Awaitable[bool]],
     queue_max_size: int,
     abort_active_turn: Callable[[], Awaitable[None]] | None = None,
+    steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
 ) -> None:
     """Run stable terminal chat without requiring OpenTUI sidecar assets."""
     await run_native_chat_runtime(
@@ -202,6 +203,7 @@ async def run_concurrent_repl(
         dispatch=dispatch,
         queue_max_size=queue_max_size,
         abort_active_turn=abort_active_turn,
+        steer_active_turn=steer_active_turn,
         surface_factory=lambda: open_native_terminal_surface(surface=surface),
     )
 

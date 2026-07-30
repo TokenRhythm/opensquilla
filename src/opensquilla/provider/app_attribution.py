@@ -26,13 +26,21 @@ def _normalized_hostname(url: str | None) -> str:
         return ""
 
 
+def is_host_or_subdomain(url: str | None, root_host: str) -> bool:
+    """Return whether ``url`` uses ``root_host`` or one of its subdomains."""
+    root = str(root_host or "").strip().lower().lstrip(".")
+    if not root or ":" in root or "%" in root:
+        return False
+    host = _normalized_hostname(url)
+    return host == root or host.endswith(f".{root}")
+
+
 def is_provider_app_host(url: str | None, root_host: str) -> bool:
     """Return whether ``url`` is the allowlisted root host or its subdomain."""
     root = str(root_host or "").strip().lower().lstrip(".")
     if root not in _APP_ATTRIBUTION_ROOT_HOSTS:
         return False
-    host = _normalized_hostname(url)
-    return host == root or host.endswith(f".{root}")
+    return is_host_or_subdomain(url, root)
 
 
 def provider_app_headers(url: str | None) -> dict[str, str]:

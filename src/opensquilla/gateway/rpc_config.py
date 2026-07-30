@@ -25,6 +25,11 @@ from opensquilla.gateway.config_secrets import (
 from opensquilla.gateway.config_secrets import (
     restore_redacted_values as _restore_redacted_values,
 )
+from opensquilla.gateway.model_routing import (
+    broadcast_model_routing_changed_if_needed,
+    model_routing_snapshot,
+    reconcile_model_routing_write,
+)
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.paths import default_opensquilla_home
 
@@ -89,7 +94,32 @@ def _persist_config(config: Any) -> None:
     )
 
 
+_PUBLIC_DERIVED_CONFIG_PATHS = frozenset(
+    {
+        "llm_ensemble.selection_configured",
+        "llm_ensemble.activation_preview",
+        "privacy.network_observability_disabled_effective",
+    }
+)
+
+
+def _is_public_derived_config_path(path: str) -> bool:
+    return any(
+        path == derived or path.startswith(f"{derived}.")
+        for derived in _PUBLIC_DERIVED_CONFIG_PATHS
+    )
+
+
 def _strip_public_derived_config_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    ensemble = payload.get("llm_ensemble")
+    if isinstance(ensemble, dict) and (
+        "selection_configured" in ensemble or "activation_preview" in ensemble
+    ):
+        payload = dict(payload)
+        ensemble = dict(ensemble)
+        ensemble.pop("selection_configured", None)
+        ensemble.pop("activation_preview", None)
+        payload["llm_ensemble"] = ensemble
     privacy = payload.get("privacy")
     if isinstance(privacy, dict) and "network_observability_disabled_effective" in privacy:
         payload = dict(payload)
@@ -446,6 +476,7 @@ def _sync_image_generation(config: Any) -> None:
 
     configure_image_generation(
         getattr(config, "image_generation", None),
+        gateway_config=config,
         llm_config=getattr(config, "llm", None),
         squilla_router_config=getattr(config, "squilla_router", None),
     )
@@ -466,6 +497,26 @@ def _sync_model_catalog_overrides(config: Any) -> None:
     from opensquilla.provider.model_catalog import shared_catalog
 
     apply_model_catalog_overrides(shared_catalog(), config)
+
+
+def _live_catalog_fingerprint(config: Any) -> tuple[str, bool, str]:
+    """Connection identity for deciding whether a config write should refresh."""
+
+    from opensquilla.gateway.model_catalog_refresh import live_catalog_refresh_fingerprint
+
+    return live_catalog_refresh_fingerprint(config)
+
+
+async def _refresh_live_catalog_after_change(
+    previous: tuple[str, bool, str], config: Any
+) -> None:
+    """Refresh public model metadata when its runtime connection changed."""
+
+    from opensquilla.gateway.model_catalog_refresh import (
+        refresh_live_model_catalog_if_changed,
+    )
+
+    await refresh_live_model_catalog_if_changed(previous, config)
 
 
 # Read-only paths that cannot be modified via config.set/patch/apply.
@@ -526,8 +577,11 @@ _SAFE_WRITE_PATCH_PATHS = frozenset(
         "skills.disabled",
         "skills.coding_mode",
         "llm_ensemble.enabled",
+        "llm_ensemble.selection_mode",
+        "llm_ensemble.candidates",
         "naming.enabled",
         "privacy.disable_network_observability",
+        "control_ui.default_locale",
         "prompt_cache.mode",
         "squilla_router.enabled",
         "squilla_router.rollout_phase",
@@ -629,6 +683,25 @@ def _clear_runtime_override_paths(config: Any, paths: set[tuple[str, ...]]) -> N
         config.clear_runtime_override(".".join(path))
 
 
+def _mark_explicit_provider_resolution(config: Any, explicit_paths: set[str]) -> None:
+    """Make an operator-authored provider identity replace inference metadata."""
+
+    if "llm.provider" not in explicit_paths:
+        return
+    marker = getattr(config, "mark_force_persist", None)
+    if callable(marker):
+        marker("llm.provider")
+    setter = getattr(config, "set_provider_resolution", None)
+    if callable(setter):
+        provider = str(getattr(getattr(config, "llm", None), "provider", "") or "")
+        setter(
+            status="explicit",
+            effective_provider=provider,
+            source="operator",
+            reason_code="provider_explicit",
+        )
+
+
 @_d.method("config.set", scope="operator.admin")
 async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "path" not in params or "value" not in params:
@@ -641,6 +714,8 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     if ctx.config is None:
         raise ValueError("No config available")
 
+    old_model_routing = model_routing_snapshot(ctx.config)
+    old_live_catalog_fingerprint = _live_catalog_fingerprint(ctx.config)
     old_memory_fingerprint = _memory_restart_fingerprint(ctx.config)
     old_channels_fingerprint = _channels_restart_fingerprint(ctx.config)
     old_sandbox_posture_fingerprint = _sandbox_posture_restart_fingerprint(ctx.config)
@@ -656,13 +731,22 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
         )
     restored_value, redacted_paths = _restore_redacted_values(value, source_value, path)
     _set_path(cfg_dict, path, restored_value)
+    cfg_dict = _strip_public_derived_config_fields(cfg_dict)
 
-    explicit_paths = {path} | _collect_paths(value, path)
-    force_persist_paths = _collect_explicit_leaf_paths(
-        value,
-        tuple(path.split(".")),
-        empty_mapping_is_leaf=True,
-    )
+    explicit_paths = {
+        item
+        for item in ({path} | _collect_paths(value, path))
+        if not _is_public_derived_config_path(item)
+    }
+    force_persist_paths = {
+        item
+        for item in _collect_explicit_leaf_paths(
+            value,
+            tuple(path.split(".")),
+            empty_mapping_is_leaf=True,
+        )
+        if not _is_public_derived_config_path(".".join(item))
+    }
     linked_paths = _link_dream_for_self_learning_patch(ctx.config, cfg_dict, explicit_paths)
     explicit_paths.update(linked_paths)
     force_persist_paths.update(tuple(path.split(".")) for path in linked_paths)
@@ -671,13 +755,22 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     from opensquilla.gateway.config import GatewayConfig
 
     new_config = GatewayConfig(**cfg_dict)
+    routing_changes = reconcile_model_routing_write(
+        new_config, explicit_paths, previous=ctx.config
+    )
+    if routing_changes:
+        routing_paths = set(routing_changes)
+        explicit_paths.update(routing_paths)
+        force_persist_paths.update(tuple(item.split(".")) for item in routing_paths)
     if _memory_restart_required_for_paths({path}):
         _validate_memory_embedding_semantics(new_config)
     inherit_then_clear_explicit(ctx.config, new_config, explicit_paths - redacted_paths)
+    new_config._mark_env_absorbed_secrets(cfg_dict)
     # Runtime-override provenance must ride the candidate BEFORE runtime
     # resolution applies env values, so persist can un-bake them.
     if hasattr(new_config, "inherit_persist_provenance"):
         new_config.inherit_persist_provenance(ctx.config)
+    _mark_explicit_provider_resolution(new_config, explicit_paths)
     explicit_force_paths = force_persist_paths - {
         tuple(path.split(".")) for path in redacted_paths
     }
@@ -692,6 +785,7 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
+    await _refresh_live_catalog_after_change(old_live_catalog_fingerprint, new_config)
     response = _change_meta(
         old_memory_fingerprint=old_memory_fingerprint,
         old_channels_fingerprint=old_channels_fingerprint,
@@ -702,11 +796,24 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     if linked_paths:
         response["linked"] = linked_paths
         await _reconcile_dream_crons_live(response)
+    model_routing = await broadcast_model_routing_changed_if_needed(
+        ctx,
+        previous=old_model_routing,
+        source="config.set",
+        config=new_config,
+    )
+    if model_routing is not None:
+        response["model_routing"] = model_routing
     return response
 
 
 @_d.method("config.patch", scope="operator.admin")
-async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+async def _handle_config_patch(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    _model_routing_source: str = "config.patch",
+) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params.patch or params.patches is required")
 
@@ -720,6 +827,8 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
     if ctx.config is None:
         raise ValueError("No config available")
 
+    old_model_routing = model_routing_snapshot(ctx.config)
+    old_live_catalog_fingerprint = _live_catalog_fingerprint(ctx.config)
     old_memory_fingerprint = _memory_restart_fingerprint(ctx.config)
     old_channels_fingerprint = _channels_restart_fingerprint(ctx.config)
     old_sandbox_posture_fingerprint = _sandbox_posture_restart_fingerprint(ctx.config)
@@ -764,10 +873,19 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
         cfg_dict = _deep_merge(cfg_dict, patch_data)
         force_persist_paths.update(_collect_explicit_leaf_paths(patch_data))
 
+    cfg_dict = _strip_public_derived_config_fields(cfg_dict)
     explicit_paths = set(dot_patches.keys()) | _collect_paths(patch_data)
     for path, value in dot_patches.items():
         explicit_paths.update(_collect_paths(value, path))
     explicit_paths -= _READONLY_PATHS
+    explicit_paths = {
+        path for path in explicit_paths if not _is_public_derived_config_path(path)
+    }
+    force_persist_paths = {
+        path
+        for path in force_persist_paths
+        if not _is_public_derived_config_path(".".join(path))
+    }
     _align_auto_router_profile_for_provider_patch(ctx.config, cfg_dict, explicit_paths)
     linked_paths = _link_dream_for_self_learning_patch(ctx.config, cfg_dict, explicit_paths)
     explicit_paths.update(linked_paths)
@@ -776,14 +894,23 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
     from opensquilla.gateway.config import GatewayConfig
 
     new_config = GatewayConfig(**cfg_dict)
+    routing_changes = reconcile_model_routing_write(
+        new_config, explicit_paths, previous=ctx.config
+    )
+    if routing_changes:
+        routing_paths = set(routing_changes)
+        explicit_paths.update(routing_paths)
+        force_persist_paths.update(tuple(item.split(".")) for item in routing_paths)
     if _memory_restart_required_for_paths(explicit_paths):
         _validate_memory_embedding_semantics(new_config)
     inherit_then_clear_explicit(ctx.config, new_config, explicit_paths - redacted_paths)
+    new_config._mark_env_absorbed_secrets(cfg_dict)
 
     # Runtime-override provenance must ride the candidate BEFORE runtime
     # resolution applies env values, so persist can un-bake them.
     if hasattr(new_config, "inherit_persist_provenance"):
         new_config.inherit_persist_provenance(ctx.config)
+    _mark_explicit_provider_resolution(new_config, explicit_paths)
     explicit_force_paths = force_persist_paths - {
         tuple(path.split(".")) for path in redacted_paths
     }
@@ -798,6 +925,7 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
+    await _refresh_live_catalog_after_change(old_live_catalog_fingerprint, new_config)
 
     change_meta = _change_meta(
         old_memory_fingerprint=old_memory_fingerprint,
@@ -813,6 +941,14 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
     if linked_paths:
         response["linked"] = linked_paths
         await _reconcile_dream_crons_live(response)
+    model_routing = await broadcast_model_routing_changed_if_needed(
+        ctx,
+        previous=old_model_routing,
+        source=_model_routing_source,
+        config=new_config,
+    )
+    if model_routing is not None:
+        response["model_routing"] = model_routing
     return response
 
 
@@ -832,7 +968,14 @@ async def _handle_config_patch_safe(params: dict | None, ctx: RpcContext) -> dic
     if unsafe_paths:
         raise ValueError(f"Path is not safe for operator.write: {unsafe_paths[0]}")
 
-    return cast(dict[str, Any], await _handle_config_patch(params, ctx))
+    return cast(
+        dict[str, Any],
+        await _handle_config_patch(
+            params,
+            ctx,
+            _model_routing_source="config.patch.safe",
+        ),
+    )
 
 
 @_d.method("config.apply", scope="operator.admin")
@@ -855,6 +998,7 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     if ctx.config is not None and not config_payload.get("config_path"):
         config_payload["config_path"] = getattr(ctx.config, "config_path", None)
 
+    old_live_catalog_fingerprint = _live_catalog_fingerprint(ctx.config)
     old_memory_fingerprint = _memory_restart_fingerprint(ctx.config)
     old_channels_fingerprint = _channels_restart_fingerprint(ctx.config)
     old_sandbox_posture_fingerprint = _sandbox_posture_restart_fingerprint(ctx.config)
@@ -863,6 +1007,7 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
         if ctx.config is not None and hasattr(ctx.config, "model_dump")
         else {}
     )
+    old_model_routing = model_routing_snapshot(ctx.config)
     config_payload, redacted_paths = _restore_redacted_values(config_payload, old_payload)
     config_payload = _strip_public_derived_config_fields(config_payload)
 
@@ -872,10 +1017,15 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     inherit_then_clear_explicit(
         ctx.config, new_config, _collect_paths(config_payload) - redacted_paths
     )
+    new_config._mark_env_absorbed_secrets(config_payload)
     # Runtime-override provenance must ride the candidate BEFORE runtime
     # resolution applies env values, so persist can un-bake them.
     if ctx.config is not None and hasattr(new_config, "inherit_persist_provenance"):
         new_config.inherit_persist_provenance(ctx.config)
+    _mark_explicit_provider_resolution(
+        new_config,
+        _collect_paths(config_payload),
+    )
     provider_config = _resolve_provider_selector_config(new_config)
     # Persist the candidate BEFORE mutating the live config: if the write
     # fails, memory and disk stay consistent (both keep the old state).
@@ -885,13 +1035,23 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
-    return _change_meta(
+    await _refresh_live_catalog_after_change(old_live_catalog_fingerprint, new_config)
+    response = _change_meta(
         old_memory_fingerprint=old_memory_fingerprint,
         old_channels_fingerprint=old_channels_fingerprint,
         old_sandbox_posture_fingerprint=old_sandbox_posture_fingerprint,
         old_dump=old_payload if isinstance(old_payload, dict) else {},
         new_config=new_config,
     )
+    model_routing = await broadcast_model_routing_changed_if_needed(
+        ctx,
+        previous=old_model_routing,
+        source="config.apply",
+        config=new_config,
+    )
+    if model_routing is not None:
+        response["model_routing"] = model_routing
+    return response
 
 
 def _get_config_attr(config: Any, path: str) -> Any:
@@ -963,6 +1123,7 @@ async def _handle_config_reload(params: dict | None, ctx: RpcContext) -> dict[st
     if ctx.config is None:
         raise ValueError("No config available")
 
+    old_model_routing = model_routing_snapshot(ctx.config)
     from opensquilla.onboarding.config_store import load_config, resolve_config_path
 
     target, _source = resolve_config_path(getattr(ctx.config, "config_path", None) or None)
@@ -1004,7 +1165,23 @@ async def _handle_config_reload(params: dict | None, ctx: RpcContext) -> dict[st
     _sync_image_generation(candidate)
     _sync_model_catalog_overrides(candidate)
 
-    return {"ok": True, "path": str(target), **change_meta}
+    # Reload is the operator's explicit retry path: if the active provider has
+    # a configured registry-backed live catalog, refresh even when its
+    # connection fingerprint is unchanged.
+    from opensquilla.gateway.model_catalog_refresh import refresh_live_model_catalog
+
+    await refresh_live_model_catalog(candidate)
+
+    response = {"ok": True, "path": str(target), **change_meta}
+    model_routing = await broadcast_model_routing_changed_if_needed(
+        ctx,
+        previous=old_model_routing,
+        source="config.reload",
+        config=candidate,
+    )
+    if model_routing is not None:
+        response["model_routing"] = model_routing
+    return response
 
 
 @_d.method("config.schema", scope="operator.admin")
