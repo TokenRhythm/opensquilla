@@ -16,6 +16,13 @@
 - full fork 的 SQLite lineage copy 与 child row 创建收敛为单事务。
 - constraint classification 增加有界并发与 chunk-hash cache；usage
   后台写入有上限；L3 advisory 考虑证据强度与重复度。
+- 前端 `Settings → Advanced` 暴露 L1/L2/L3、D11 与 D12 的实验性开关；
+  `config.patch.safe` 仅放行这些 boolean gate。
+- 四个 boot-bound `memory.experimental` 变更会诚实返回
+  `restartRequired=true`；D12 从下一次 compaction 起生效。
+- Agent 内部 overflow compaction 现已完整继承 anchor 与三项 summary
+  token budget，消除不同 compaction 入口之间的配置漂移。
+- 复审记录见 `AUDIT_2026-07-30.md`。
 
 ---
 

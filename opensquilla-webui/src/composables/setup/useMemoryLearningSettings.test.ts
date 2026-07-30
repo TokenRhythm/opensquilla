@@ -18,7 +18,16 @@ describe('useMemoryLearningSettings', () => {
     rpcCall.mockImplementation(async (method: string) => {
       if (method === 'config.get') {
         return {
-          memory: { dream: { enabled: true, auto_schedule: true } },
+          memory: {
+            dream: { enabled: true, auto_schedule: true },
+            experimental: {
+              constraint_annotation: true,
+              constraint_routing: false,
+              sufficiency_check: true,
+              usage_tracking: true,
+            },
+          },
+          compaction: { anchor_enabled: true },
           squilla_router: { self_learning: { enabled: false } },
         }
       }
@@ -30,6 +39,11 @@ describe('useMemoryLearningSettings', () => {
     expect(ml.dreamEnabled.value).toBe(true)
     expect(ml.selfLearningEnabled.value).toBe(false)
     expect(ml.trainingPaused.value).toBe(false)
+    expect(ml.constraintAnnotation.value).toBe(true)
+    expect(ml.constraintRouting.value).toBe(false)
+    expect(ml.sufficiencyCheck.value).toBe(true)
+    expect(ml.usageTracking.value).toBe(true)
+    expect(ml.compactionAnchors.value).toBe(true)
   })
 
   it('mirrors the backend dream linkage when enabling self-learning', async () => {
@@ -107,5 +121,31 @@ describe('useMemoryLearningSettings', () => {
 
     expect(ok).toBe(false)
     expect(ml.selfLearningEnabled.value).toBe(false)
+  })
+
+  it('persists experimental gates and reports boot-bound memory changes', async () => {
+    rpcCall.mockResolvedValue({ restartRequired: true })
+    const ml = useMemoryLearningSettings()
+
+    expect(await ml.setConstraintRouting(true)).toBe(true)
+
+    expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'memory.experimental.constraint_routing': true },
+    })
+    expect(ml.constraintRouting.value).toBe(true)
+    expect(ml.restartRequired.value).toBe(true)
+  })
+
+  it('persists compaction anchors without inventing a restart', async () => {
+    rpcCall.mockResolvedValue({ restartRequired: false })
+    const ml = useMemoryLearningSettings()
+
+    expect(await ml.setCompactionAnchors(true)).toBe(true)
+
+    expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'compaction.anchor_enabled': true },
+    })
+    expect(ml.compactionAnchors.value).toBe(true)
+    expect(ml.restartRequired.value).toBe(false)
   })
 })

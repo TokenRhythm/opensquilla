@@ -85,6 +85,36 @@ async def test_config_patch_same_memory_embedding_does_not_report_restart_requir
 
 
 @pytest.mark.asyncio
+async def test_config_patch_memory_experimental_reports_restart_required(tmp_path):
+    cfg = GatewayConfig(config_path=str(tmp_path / "c.toml"))
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patches": {"memory.experimental.sufficiency_check": True}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["restartRequired"] is True
+    assert res.payload["restartSections"] == ["memory"]
+
+
+@pytest.mark.asyncio
+async def test_config_patch_compaction_anchor_applies_live(tmp_path):
+    cfg = GatewayConfig(config_path=str(tmp_path / "c.toml"))
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patches": {"compaction.anchor_enabled": True}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["restartRequired"] is False
+    assert "compaction" in res.payload["liveApplied"]
+
+
+@pytest.mark.asyncio
 async def test_config_patch_permissions_default_reports_restart_required(tmp_path):
     cfg = GatewayConfig(config_path=str(tmp_path / "c.toml"))
     res = await get_dispatcher().dispatch(

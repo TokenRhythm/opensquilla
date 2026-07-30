@@ -546,6 +546,10 @@ class AgentConfig:
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"] = "protect"
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     compaction_protected_recent_messages: int = 0
+    compaction_anchor_enabled: bool = False
+    compaction_fallback_summary_max_tokens: int = 3000
+    compaction_previous_summary_max_tokens: int = 2000
+    compaction_total_summary_max_tokens: int = 5000
     repair_enabled: bool = True
     repair_interval_seconds: float = 60.0
     repair_max_items_per_tick: int = 5

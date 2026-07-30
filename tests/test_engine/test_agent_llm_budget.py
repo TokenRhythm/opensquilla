@@ -4140,8 +4140,18 @@ def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
             flush_backoff_max_seconds=30.0,
             flush_archive_max_bytes=999_999,
             flush_compaction_requires_safe_receipt=False,
+            compaction_anchor_enabled=True,
+            compaction_fallback_summary_max_tokens=701,
+            compaction_previous_summary_max_tokens=702,
+            compaction_total_summary_max_tokens=1403,
         ),
     )
+
+    compaction = agent._build_compaction_config()
+    assert compaction.anchor_enabled is True
+    assert compaction.fallback_summary_max_tokens == 701
+    assert compaction.previous_summary_max_tokens == 702
+    assert compaction.total_summary_max_tokens == 1403
 
     child = agent._make_child_agent(SubagentSpec(task="child task"), depth=1)
 
@@ -4168,6 +4178,10 @@ def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
     assert child.config.flush_backoff_max_seconds == 30.0
     assert child.config.flush_archive_max_bytes == 999_999
     assert child.config.flush_compaction_requires_safe_receipt is False
+    assert child.config.compaction_anchor_enabled is True
+    assert child.config.compaction_fallback_summary_max_tokens == 701
+    assert child.config.compaction_previous_summary_max_tokens == 702
+    assert child.config.compaction_total_summary_max_tokens == 1403
 
 
 def test_agent_config_max_turn_cost_usd_defaults_to_disabled() -> None:

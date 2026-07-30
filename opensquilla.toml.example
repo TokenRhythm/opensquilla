@@ -351,6 +351,16 @@ source = "workspace"
 # capture_excluded_run_kinds = ["recall", "session_recall"]
 # capture_excluded_provenance_kinds = ["recall", "tool_result", "memory_injected"]
 
+[memory.experimental]
+# Experimental memory reasoning remains opt-in. These four controls are bound
+# into the memory store/retriever at startup, so changing them requires a
+# gateway restart. Constraint annotation may add model calls while indexing
+# changed chunks; the other three paths are heuristic/local.
+constraint_annotation = false
+constraint_routing = false
+sufficiency_check = false
+usage_tracking = false
+
 [memory.dream]
 # Dream consolidation is safety-first by default. Background scheduling and
 # curated MEMORY.md writes require explicit opt-in.
@@ -502,6 +512,10 @@ tool_result_store_retention_seconds = 604800
 enabled = true
 # model = ""            # None = use session model
 # timeout_seconds = 30.0
+# Experimental: emit recoverable references to archived transcript entries in
+# future compaction summaries. This applies to the next compaction without a
+# gateway restart; existing summaries are not backfilled.
+anchor_enabled = false
 
 [sandbox]
 # Per-command ephemeral sandbox + security grading.

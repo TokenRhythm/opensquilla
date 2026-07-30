@@ -237,6 +237,6 @@ retriever = MemoryRetriever(
   - L1 关闭 → 所有 chunk "fact" → L2 boost 1.0 → no-op
   - L1 开启 + L2 关闭 → 分类结果存储但不影响检索
   - L1 开启 + L2 开启 → 完整约束感知检索
-- **L3**：依赖 L2 路由后的结果 + intent_confidence
-  - L3 仅在 L2 开启时可用
+- **L3**：与 L2 共享 `classify_query_intent()` 的 request-scoped 输出
+  - L3 可独立开启；只有 L2 开启时才应用 constraint boost
   - L3 触发条件：`results < 3 AND intent_confidence >= 0.7`

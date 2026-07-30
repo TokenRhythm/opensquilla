@@ -14,7 +14,9 @@ Design decisions (aligned 2026-07-29):
   - partial (0 < count < 3) → suggest re-query / broaden
 
 Feature flag: memory.experimental.sufficiency_check (default off).
-Requires L2 (constraint_routing) for intent classification data.
+Intent classification is shared with L2, but L3 can run independently: enabling
+either feature computes request-scoped intent data, while only L2 applies
+constraint boosts.
 """
 
 from __future__ import annotations

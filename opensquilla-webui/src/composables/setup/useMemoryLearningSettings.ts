@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, type Ref } from 'vue'
 import { useRpcStore } from '@/stores/rpc'
 
 /** Config slice + status consumed by the Settings › Advanced
@@ -9,7 +9,16 @@ import { useRpcStore } from '@/stores/rpc'
  *  mirrors that contract — it never re-implements the linkage client-side. */
 
 interface MemoryLearningConfig {
-  memory?: { dream?: { enabled?: boolean; auto_schedule?: boolean } }
+  memory?: {
+    dream?: { enabled?: boolean; auto_schedule?: boolean }
+    experimental?: {
+      constraint_annotation?: boolean
+      constraint_routing?: boolean
+      sufficiency_check?: boolean
+      usage_tracking?: boolean
+    }
+  }
+  compaction?: { anchor_enabled?: boolean }
   squilla_router?: { self_learning?: { enabled?: boolean } }
 }
 
@@ -51,6 +60,11 @@ export function useMemoryLearningSettings() {
   const dreamEnabled = ref(false)
   const dreamAutoSchedule = ref(false)
   const selfLearningEnabled = ref(false)
+  const constraintAnnotation = ref(false)
+  const constraintRouting = ref(false)
+  const sufficiencyCheck = ref(false)
+  const usageTracking = ref(false)
+  const compactionAnchors = ref(false)
   // True while the ON state of dream came from the linkage rather than the
   // user's own click — rendered as the "linked" (desaturated) switch state.
   const dreamLinkedOn = ref(false)
@@ -71,6 +85,11 @@ export function useMemoryLearningSettings() {
       dreamEnabled.value = cfg?.memory?.dream?.enabled === true
       dreamAutoSchedule.value = cfg?.memory?.dream?.auto_schedule === true
       selfLearningEnabled.value = cfg?.squilla_router?.self_learning?.enabled === true
+      constraintAnnotation.value = cfg?.memory?.experimental?.constraint_annotation === true
+      constraintRouting.value = cfg?.memory?.experimental?.constraint_routing === true
+      sufficiencyCheck.value = cfg?.memory?.experimental?.sufficiency_check === true
+      usageTracking.value = cfg?.memory?.experimental?.usage_tracking === true
+      compactionAnchors.value = cfg?.compaction?.anchor_enabled === true
       loaded.value = true
       if (selfLearningEnabled.value) void refreshStatus()
     } catch {
@@ -142,12 +161,76 @@ export function useMemoryLearningSettings() {
     }
   }
 
+  async function setExperimental(
+    path: string,
+    target: Ref<boolean>,
+    on: boolean,
+  ): Promise<boolean> {
+    if (busy.value) return false
+    busy.value = true
+    const prev = target.value
+    target.value = on
+    try {
+      const res = await rpc.call<PatchResponse>('config.patch.safe', {
+        patches: { [path]: on },
+      })
+      if (res?.restartRequired) restartRequired.value = true
+      return true
+    } catch {
+      target.value = prev
+      return false
+    } finally {
+      busy.value = false
+    }
+  }
+
+  function setConstraintAnnotation(on: boolean) {
+    return setExperimental(
+      'memory.experimental.constraint_annotation',
+      constraintAnnotation,
+      on,
+    )
+  }
+
+  function setConstraintRouting(on: boolean) {
+    return setExperimental(
+      'memory.experimental.constraint_routing',
+      constraintRouting,
+      on,
+    )
+  }
+
+  function setSufficiencyCheck(on: boolean) {
+    return setExperimental(
+      'memory.experimental.sufficiency_check',
+      sufficiencyCheck,
+      on,
+    )
+  }
+
+  function setUsageTracking(on: boolean) {
+    return setExperimental(
+      'memory.experimental.usage_tracking',
+      usageTracking,
+      on,
+    )
+  }
+
+  function setCompactionAnchors(on: boolean) {
+    return setExperimental('compaction.anchor_enabled', compactionAnchors, on)
+  }
+
   return {
     loaded,
     dreamEnabled,
     dreamAutoSchedule,
     dreamLinkedOn,
     selfLearningEnabled,
+    constraintAnnotation,
+    constraintRouting,
+    sufficiencyCheck,
+    usageTracking,
+    compactionAnchors,
     trainingPaused,
     busy,
     restartRequired,
@@ -157,5 +240,10 @@ export function useMemoryLearningSettings() {
     refreshStatus,
     setSelfLearning,
     setDream,
+    setConstraintAnnotation,
+    setConstraintRouting,
+    setSufficiencyCheck,
+    setUsageTracking,
+    setCompactionAnchors,
   }
 }

@@ -284,6 +284,12 @@ def _memory_restart_fingerprint(config: Any) -> dict[str, Any]:
     return {
         "retrieval_mode": memory.get("retrieval_mode"),
         "embedding": memory.get("embedding"),
+        # These flags are copied into LongTermMemoryStore/MemoryRetriever
+        # instances when the memory managers are constructed at boot.  A
+        # config patch updates ctx.config, but cannot mutate those already
+        # running instances, so claiming live application here would make the
+        # Settings switches dishonest.
+        "experimental": memory.get("experimental"),
     }
 
 
@@ -596,6 +602,13 @@ _SAFE_WRITE_PATCH_PATHS = frozenset(
         "squilla_router.self_learning.enabled",
         "memory.dream.enabled",
         "memory.dream.auto_schedule",
+        # Experimental memory/compaction controls exposed by Settings.  Keep
+        # this allow-list to boolean gates only; tuning remains admin-scoped.
+        "memory.experimental.constraint_annotation",
+        "memory.experimental.constraint_routing",
+        "memory.experimental.sufficiency_check",
+        "memory.experimental.usage_tracking",
+        "compaction.anchor_enabled",
     }
 )
 

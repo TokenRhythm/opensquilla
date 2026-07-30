@@ -214,6 +214,11 @@ async def test_patch_safe_allows_memory_learning_toggles(tmp_path) -> None:
     assert "squilla_router.self_learning.enabled" in _SAFE_WRITE_PATCH_PATHS
     assert "memory.dream.enabled" in _SAFE_WRITE_PATCH_PATHS
     assert "memory.dream.auto_schedule" in _SAFE_WRITE_PATCH_PATHS
+    assert "memory.experimental.constraint_annotation" in _SAFE_WRITE_PATCH_PATHS
+    assert "memory.experimental.constraint_routing" in _SAFE_WRITE_PATCH_PATHS
+    assert "memory.experimental.sufficiency_check" in _SAFE_WRITE_PATCH_PATHS
+    assert "memory.experimental.usage_tracking" in _SAFE_WRITE_PATCH_PATHS
+    assert "compaction.anchor_enabled" in _SAFE_WRITE_PATCH_PATHS
     # Thresholds/schedules stay admin-only.
     assert "squilla_router.self_learning.train_min_samples" not in _SAFE_WRITE_PATCH_PATHS
 

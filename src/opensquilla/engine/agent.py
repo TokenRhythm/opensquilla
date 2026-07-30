@@ -14181,6 +14181,14 @@ class Agent:
         )
         config.compaction_profile = self.config.compaction_profile
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
+        config.anchor_enabled = self.config.compaction_anchor_enabled
+        config.fallback_summary_max_tokens = (
+            self.config.compaction_fallback_summary_max_tokens
+        )
+        config.previous_summary_max_tokens = (
+            self.config.compaction_previous_summary_max_tokens
+        )
+        config.total_summary_max_tokens = self.config.compaction_total_summary_max_tokens
         return config
 
     @staticmethod
@@ -16643,6 +16651,16 @@ class Agent:
             flush_compaction_safety_mode=self.config.flush_compaction_safety_mode,
             compaction_profile=self.config.compaction_profile,
             compaction_protected_recent_messages=(self.config.compaction_protected_recent_messages),
+            compaction_anchor_enabled=self.config.compaction_anchor_enabled,
+            compaction_fallback_summary_max_tokens=(
+                self.config.compaction_fallback_summary_max_tokens
+            ),
+            compaction_previous_summary_max_tokens=(
+                self.config.compaction_previous_summary_max_tokens
+            ),
+            compaction_total_summary_max_tokens=(
+                self.config.compaction_total_summary_max_tokens
+            ),
             tool_result_projection_max_inline_chars=(
                 self.config.tool_result_projection_max_inline_chars
             ),

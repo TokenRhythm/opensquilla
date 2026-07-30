@@ -125,7 +125,7 @@ CandidateKind = Literal[
 L0 (infrastructure) ── 无依赖
 L1 (annotation)     ── 无依赖（可独立运行）
 L2 (routing)        ── 依赖 L1（需要 constraint_type 元数据）
-L3 (sufficiency)    ── 依赖 L2（需要路由后的结果）
+L3 (sufficiency)    ── 与 L2 共享 request-scoped intent 分类，但可独立启用
 ```
 
 ### 实现状态（2026-07-29）
@@ -481,7 +481,8 @@ if self._experimental.sufficiency_check and results:
 ### 7.3 成本控制
 
 - 每次搜索最多 1 次额外 LLM 调用
-- 仅在 `constraint_routing` 激活且结果 < 3 条时触发
+- `sufficiency_check` 可独立启用；L2 或 L3 任一开启都会计算
+  request-scoped intent，但只有 L2 会修改排序
 - `SearchIntent.ADMIN` 查询完全跳过
 
 ### 7.4 影响范围

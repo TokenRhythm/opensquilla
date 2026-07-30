@@ -90,11 +90,109 @@ function shortDate(iso: string): string {
 
 function onDreamChange(on: boolean) { void ml.setDream(on) }
 function onSelfLearningChange(on: boolean) { void ml.setSelfLearning(on) }
+function onConstraintAnnotationChange(on: boolean) { void ml.setConstraintAnnotation(on) }
+function onConstraintRoutingChange(on: boolean) { void ml.setConstraintRouting(on) }
+function onSufficiencyCheckChange(on: boolean) { void ml.setSufficiencyCheck(on) }
+function onUsageTrackingChange(on: boolean) { void ml.setUsageTracking(on) }
+function onCompactionAnchorsChange(on: boolean) { void ml.setCompactionAnchors(on) }
 </script>
 
 <template>
-  <div class="ml-pair">
+  <div class="ml-pair" data-testid="experimental-memory-controls">
     <div class="ml-pair__head">{{ t('setup.memoryLearning.groupTitle') }}</div>
+
+    <div class="ml-exp__intro">
+      <span>{{ t('setup.memoryLearning.experimentalIntro') }}</span>
+      <span class="labs-exp">{{ t('setup.advanced.experimental') }}</span>
+    </div>
+
+    <label class="control-row ml-pair__row">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('setup.memoryLearning.annotationLabel') }}</span>
+        <span class="control-row__desc">{{ t('setup.memoryLearning.annotationDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <span class="ml-restart">{{ t('setup.memoryLearning.restartBadge') }}</span>
+        <ControlSwitch
+          name="memory_constraint_annotation"
+          :checked="ml.constraintAnnotation.value"
+          :busy="ml.busy.value"
+          :aria-label="t('setup.memoryLearning.annotationLabel')"
+          @change="onConstraintAnnotationChange"
+        />
+      </div>
+    </label>
+
+    <label class="control-row ml-pair__row">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('setup.memoryLearning.routingLabel') }}</span>
+        <span class="control-row__desc">{{ t('setup.memoryLearning.routingDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <span class="ml-restart">{{ t('setup.memoryLearning.restartBadge') }}</span>
+        <ControlSwitch
+          name="memory_constraint_routing"
+          :checked="ml.constraintRouting.value"
+          :busy="ml.busy.value"
+          :aria-label="t('setup.memoryLearning.routingLabel')"
+          @change="onConstraintRoutingChange"
+        />
+      </div>
+    </label>
+
+    <label class="control-row ml-pair__row">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('setup.memoryLearning.sufficiencyLabel') }}</span>
+        <span class="control-row__desc">{{ t('setup.memoryLearning.sufficiencyDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <span class="ml-restart">{{ t('setup.memoryLearning.restartBadge') }}</span>
+        <ControlSwitch
+          name="memory_sufficiency_check"
+          :checked="ml.sufficiencyCheck.value"
+          :busy="ml.busy.value"
+          :aria-label="t('setup.memoryLearning.sufficiencyLabel')"
+          @change="onSufficiencyCheckChange"
+        />
+      </div>
+    </label>
+
+    <label class="control-row ml-pair__row">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('setup.memoryLearning.usageLabel') }}</span>
+        <span class="control-row__desc">{{ t('setup.memoryLearning.usageDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <span class="ml-restart">{{ t('setup.memoryLearning.restartBadge') }}</span>
+        <ControlSwitch
+          name="memory_usage_tracking"
+          :checked="ml.usageTracking.value"
+          :busy="ml.busy.value"
+          :aria-label="t('setup.memoryLearning.usageLabel')"
+          @change="onUsageTrackingChange"
+        />
+      </div>
+    </label>
+
+    <label class="control-row ml-pair__row">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('setup.memoryLearning.anchorsLabel') }}</span>
+        <span class="control-row__desc">{{ t('setup.memoryLearning.anchorsDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <span class="ml-live">{{ t('setup.memoryLearning.liveBadge') }}</span>
+        <ControlSwitch
+          name="compaction_anchors"
+          :checked="ml.compactionAnchors.value"
+          :busy="ml.busy.value"
+          :aria-label="t('setup.memoryLearning.anchorsLabel')"
+          @change="onCompactionAnchorsChange"
+        />
+      </div>
+    </label>
+
+    <div class="ml-exp__dependency">{{ t('setup.memoryLearning.experimentalDependency') }}</div>
+    <div class="ml-pair__divider" aria-hidden="true"></div>
 
     <label class="control-row ml-pair__row">
       <div class="control-row__label-block">
@@ -198,9 +296,48 @@ function onSelfLearningChange(on: boolean) { void ml.setSelfLearning(on) }
   text-transform: uppercase;
 }
 
+.ml-exp__intro {
+  align-items: center;
+  color: var(--text-dim);
+  display: flex;
+  font-size: var(--fs-xs);
+  gap: var(--sp-2);
+  justify-content: space-between;
+  line-height: 1.55;
+  padding: 10px 14px 4px;
+}
+
+.ml-exp__dependency {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.55;
+  padding: 4px 14px 12px;
+}
+
+.ml-pair__divider {
+  border-top: 1px solid var(--border);
+}
+
 .ml-pair__row {
   padding-left: 14px;
   padding-right: 14px;
+}
+
+.ml-restart,
+.ml-live {
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
+  border-radius: var(--radius-full);
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 1px 7px;
+  text-transform: uppercase;
+}
+
+.ml-live {
+  border-color: color-mix(in srgb, var(--ok) 35%, var(--border));
+  color: var(--ok);
 }
 
 .ml-pair__row--last {

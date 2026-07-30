@@ -59,7 +59,7 @@ L0 (infrastructure)     ── 无依赖
 D12 (compaction anchor) ── 依赖 L0（archived entries 存在）
 L1 (annotation)         ── 无依赖（可独立运行）
 L2 (routing)            ── 依赖 L1（需要 constraint_type 元数据）
-L3 (sufficiency)        ── 依赖 L2（需要路由后的结果）
+L3 (sufficiency)        ── 与 L2 共享 request-scoped intent 分类，但可独立启用
 ```
 
 ---
@@ -155,9 +155,15 @@ anchor_enabled = false
 constraint_annotation = false   # L1
 constraint_routing = false      # L2
 sufficiency_check = false       # L3
+usage_tracking = false          # D11
 ```
 
 L0 无开关，始终启用（基础设施修复）。
+
+上述实验性开关也可在前端 `Settings → Advanced → Memory & self-learning`
+中控制。四个 `memory.experimental` 开关在 gateway 启动时绑定到
+store/retriever，变更后需要重启；`compaction.anchor_enabled` 从下一次
+compaction 起实时生效，不回填既有 summary。
 
 ---
 

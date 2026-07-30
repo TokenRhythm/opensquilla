@@ -585,6 +585,26 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 "protected_recent_messages",
                 0,
             ),
+            compaction_anchor_enabled=getattr(
+                compaction_cfg,
+                "anchor_enabled",
+                False,
+            ),
+            compaction_fallback_summary_max_tokens=getattr(
+                compaction_cfg,
+                "fallback_summary_max_tokens",
+                3000,
+            ),
+            compaction_previous_summary_max_tokens=getattr(
+                compaction_cfg,
+                "previous_summary_max_tokens",
+                2000,
+            ),
+            compaction_total_summary_max_tokens=getattr(
+                compaction_cfg,
+                "total_summary_max_tokens",
+                5000,
+            ),
             tool_result_projection_max_inline_chars=getattr(
                 agent_token_cfg,
                 "tool_result_projection_max_inline_chars",
