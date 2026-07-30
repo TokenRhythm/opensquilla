@@ -913,6 +913,7 @@
     "tests/test_session/test_spawn_lock_eviction.py": 0.01,
     "tests/test_session/test_storage_count_batch.py": 1.093,
     "tests/test_session/test_storage_transactions.py": 0.01,
+    "tests/test_session/test_tokenizer.py": 0.01,
     "tests/test_session/test_turn_acceptance_storage.py": 0.01,
     "tests/test_session/test_turn_usage_storage.py": 0.015,
     "tests/test_session_streams_meta_events.py": 0.01,
