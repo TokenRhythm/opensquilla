@@ -461,6 +461,9 @@ class LlmEnsembleConfig(BaseSettings):
     aggregator_timeout_seconds: float = Field(default=3600.0, gt=0.0)
     shuffle_candidates: bool = True
     record_candidates: bool = False
+    # When "adaptive", skip the ensemble wrap for turns the squilla router
+    # confidently classifies as c0 (short conversational). Default "never".
+    simple_turn_bypass: Literal["never", "adaptive"] = "never"
 
     @model_validator(mode="after")
     def _validate_model_options(self) -> LlmEnsembleConfig:

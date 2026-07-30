@@ -5223,6 +5223,37 @@ class TurnRunner:
 
         ensemble_cfg = getattr(self._config, "llm_ensemble", None)
         if provider is not None and getattr(ensemble_cfg, "enabled", False):
+            # -- simple-turn bypass --
+            # When simple_turn_bypass="adaptive", skip the ensemble wrap for
+            # turns the squilla router confidently classified as c0 (short
+            # conversational) with no code blocks or attachments. The router's
+            # anti_downgrade stage already holds final_tier at the previous
+            # turn's level within the KV-cache window, so a brief "ok" after
+            # a c2 code task stays c2 and the ensemble fires normally.
+            bypass_mode = str(
+                getattr(ensemble_cfg, "simple_turn_bypass", "never") or "never"
+            )
+            if bypass_mode == "adaptive":
+                _extra = turn.metadata.get("routing_extra") or {}
+                _final_tier = normalize_text_tier(_extra.get("final_tier"))
+                # dict.get returns None (not the default) when the key
+                # exists with value None, so guard float() with "or 0.0".
+                _margin = float(_extra.get("margin") or 0.0)
+                if (
+                    _final_tier == "c0"
+                    and _margin >= 0.6
+                    and not turn.attachments
+                    and "```" not in (turn.semantic_message or "")
+                ):
+                    turn.metadata["ensemble_wrap_skipped_reason"] = (
+                        "simple_turn_bypass"
+                    )
+                    log.info(
+                        "llm_ensemble.simple_turn_bypass",
+                        tier=_final_tier,
+                        margin=round(_margin, 4),
+                    )
+                    return turn, provider
             from opensquilla.provider.ensemble import (
                 CUSTOM_B5_SELECTION_MODE,
                 build_ensemble_provider_from_config,
