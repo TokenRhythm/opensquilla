@@ -1772,10 +1772,10 @@
     "inspect": {
       "dialogLabel": "Detalles de la sesión: {title}",
       "subagentOf": "Subagente de {title}",
-      "copyKey": "Copiar clave de sesión",
-      "keyCopied": "Clave de sesión copiada",
+      "copyKey": "Copiar ID de sesión",
+      "keyCopied": "ID de sesión copiado",
       "copied": "Copiado",
-      "copyKeyFailed": "No se pudo copiar la clave de sesión.",
+      "copyKeyFailed": "No se pudo copiar el ID de sesión.",
       "updated": "actualizado {time}",
       "transcriptPreview": "Vista previa de la transcripción",
       "transcriptError": "No se pudo cargar la transcripción.",
@@ -2410,16 +2410,16 @@
         "reminder": "Los recordatorios estáticos se ejecutan de forma aislada y se entregan de vuelta al chat de origen cuando hay uno disponible.",
         "current": "La tarea de agente programada continúa en la sesión de chat activa.",
         "isolated": "La tarea de agente programada se ejecuta en su propia sesión cron, separada de la principal.",
-        "session": "La tarea de agente programada continúa en la clave de sesión con nombre.",
+        "session": "La tarea de agente programada continúa en el ID de sesión especificado.",
         "default": "Elige dónde mantiene esta tarea de agente en segundo plano su contexto de conversación."
       },
       "targetSessionLabel": {
-        "current": "Clave de sesión actual",
-        "named": "Clave de sesión con nombre"
+        "current": "ID de sesión actual",
+        "named": "ID de sesión específico"
       },
       "targetSessionHint": {
-        "current": "La actual se vincula a la clave de sesión de WebChat activa cuando se guarda la tarea.",
-        "named": "Usa una clave de sesión completa del encabezado del chat."
+        "current": "La actual se vincula al ID de sesión de WebChat activo cuando se guarda la tarea.",
+        "named": "Usa el ID de sesión completo del encabezado del chat."
       },
       "messageLabel": {
         "systemEvent": "Texto del evento",
@@ -2429,8 +2429,8 @@
       "toastNameRequired": "El nombre es obligatorio",
       "toastIntervalInvalid": "El intervalo debe ser un número entero de segundos",
       "toastIsoTimeRequired": "La hora ISO es obligatoria",
-      "toastCurrentSessionRequired": "La clave de sesión actual es obligatoria",
-      "toastNamedSessionRequired": "La clave de sesión con nombre es obligatoria",
+      "toastCurrentSessionRequired": "El ID de sesión actual es obligatorio",
+      "toastNamedSessionRequired": "El ID de sesión específico es obligatorio",
       "toastUpdated": "Programación actualizada",
       "toastCreated": "Programación creada",
       "toastSaveFailed": "Error al guardar: {error}"
@@ -2997,7 +2997,7 @@
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Copiado",
     "copy": "Copiar",
-    "copySessionKey": "Copiar clave de sesión",
+    "copySessionKey": "Copiar ID de sesión",
     "sessionActions": "Acciones de la sesión",
     "share": "Compartir",
     "shareSendFirst": "Envía un mensaje primero para compartir",
@@ -3304,11 +3304,18 @@
       "sendReply": "Enviar respuesta",
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
+    "slashCommands": {
+      "unknown": "Comando desconocido {command}. Sigue editándolo o usa // para enviarlo como texto."
+    },
     "codingMode": {
-      "enabled": "Coding mode activado.",
+      "enabled": "Coding mode activado para todos los chats.",
       "disabled": "Coding mode desactivado.",
-      "usage": "Usa /coding, /coding on, /coding off o /coding status.",
-      "updateFailed": "No se pudo actualizar Coding mode."
+      "usage": "Usa /coding para alternar, o /coding on, /coding off o /coding status.",
+      "updateFailed": "No se pudo actualizar Coding mode.",
+      "commandEnable": "Activar Coding mode.",
+      "commandDisable": "Desactivar Coding mode.",
+      "activeLabel": "Coding ACTIVO",
+      "disableLabel": "Desactivar Coding mode"
     },
     "composer": {
       "executionMode": "Modo de ejecución",

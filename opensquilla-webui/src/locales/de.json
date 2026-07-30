@@ -1772,10 +1772,10 @@
     "inspect": {
       "dialogLabel": "Sitzungsdetails: {title}",
       "subagentOf": "Subagent von {title}",
-      "copyKey": "Sitzungsschlüssel kopieren",
-      "keyCopied": "Sitzungsschlüssel kopiert",
+      "copyKey": "Sitzungs-ID kopieren",
+      "keyCopied": "Sitzungs-ID kopiert",
       "copied": "Kopiert",
-      "copyKeyFailed": "Der Sitzungsschlüssel konnte nicht kopiert werden.",
+      "copyKeyFailed": "Die Sitzungs-ID konnte nicht kopiert werden.",
       "updated": "aktualisiert {time}",
       "transcriptPreview": "Transkriptvorschau",
       "transcriptError": "Das Transkript konnte nicht geladen werden.",
@@ -2410,16 +2410,16 @@
         "reminder": "Statische Erinnerungen laufen isoliert und stellen die Antwort an den ursprünglichen Chat zu, sofern verfügbar.",
         "current": "Die geplante Agentenaufgabe wird in der aktiven Chat-Sitzung fortgesetzt.",
         "isolated": "Die geplante Agentenaufgabe läuft in ihrer eigenen Cron-Sitzung, getrennt von Main.",
-        "session": "Die geplante Agentenaufgabe wird im benannten Sitzungsschlüssel fortgesetzt.",
+        "session": "Die geplante Agentenaufgabe wird in der angegebenen Sitzungs-ID fortgesetzt.",
         "default": "Wählen Sie, wo diese Hintergrund-Agentenaufgabe ihren Unterhaltungskontext behält."
       },
       "targetSessionLabel": {
-        "current": "Aktueller Sitzungsschlüssel",
-        "named": "Benannter Sitzungsschlüssel"
+        "current": "Aktuelle Sitzungs-ID",
+        "named": "Bestimmte Sitzungs-ID"
       },
       "targetSessionHint": {
-        "current": "Aktuell wird beim Speichern des Jobs an den aktiven WebChat-Sitzungsschlüssel gebunden.",
-        "named": "Verwenden Sie einen vollständigen Sitzungsschlüssel aus der Chat-Kopfzeile."
+        "current": "Aktuell wird beim Speichern des Jobs an die aktive WebChat-Sitzungs-ID gebunden.",
+        "named": "Verwenden Sie die vollständige Sitzungs-ID aus der Chat-Kopfzeile."
       },
       "messageLabel": {
         "systemEvent": "Ereignistext",
@@ -2429,8 +2429,8 @@
       "toastNameRequired": "Name ist erforderlich",
       "toastIntervalInvalid": "Das Intervall muss eine ganze Zahl in Sekunden sein",
       "toastIsoTimeRequired": "ISO-Zeit ist erforderlich",
-      "toastCurrentSessionRequired": "Aktueller Sitzungsschlüssel ist erforderlich",
-      "toastNamedSessionRequired": "Benannter Sitzungsschlüssel ist erforderlich",
+      "toastCurrentSessionRequired": "Eine aktuelle Sitzungs-ID ist erforderlich",
+      "toastNamedSessionRequired": "Eine bestimmte Sitzungs-ID ist erforderlich",
       "toastUpdated": "Zeitplan aktualisiert",
       "toastCreated": "Zeitplan erstellt",
       "toastSaveFailed": "Speichern fehlgeschlagen: {error}"
@@ -2997,7 +2997,7 @@
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Kopiert",
     "copy": "Kopieren",
-    "copySessionKey": "Sitzungsschlüssel kopieren",
+    "copySessionKey": "Sitzungs-ID kopieren",
     "sessionActions": "Sitzungsaktionen",
     "share": "Teilen",
     "shareSendFirst": "Senden Sie zuerst eine Nachricht, um zu teilen",
@@ -3304,11 +3304,18 @@
       "sendReply": "Antwort senden",
       "sendingContinuing": "Antwort wird gesendet · Ausführung wird fortgesetzt…"
     },
+    "slashCommands": {
+      "unknown": "Unbekannter Befehl {command}. Bearbeite ihn weiter oder verwende //, um ihn als Text zu senden."
+    },
     "codingMode": {
-      "enabled": "Coding mode aktiviert.",
+      "enabled": "Coding mode für alle Chats aktiviert.",
       "disabled": "Coding mode deaktiviert.",
-      "usage": "Verwende /coding, /coding on, /coding off oder /coding status.",
-      "updateFailed": "Coding mode konnte nicht aktualisiert werden."
+      "usage": "Verwende /coding zum Umschalten oder /coding on, /coding off bzw. /coding status.",
+      "updateFailed": "Coding mode konnte nicht aktualisiert werden.",
+      "commandEnable": "Coding mode aktivieren.",
+      "commandDisable": "Coding mode deaktivieren.",
+      "activeLabel": "Coding AN",
+      "disableLabel": "Coding mode deaktivieren"
     },
     "composer": {
       "executionMode": "Ausführungsmodus",

@@ -1772,10 +1772,10 @@
     "inspect": {
       "dialogLabel": "セッションの詳細: {title}",
       "subagentOf": "{title} のサブエージェント",
-      "copyKey": "セッションキーをコピー",
-      "keyCopied": "セッションキーをコピーしました",
+      "copyKey": "セッション ID をコピー",
+      "keyCopied": "セッション ID をコピーしました",
       "copied": "コピーしました",
-      "copyKeyFailed": "セッションキーをコピーできませんでした。",
+      "copyKeyFailed": "セッション ID をコピーできませんでした。",
       "updated": "{time} に更新",
       "transcriptPreview": "トランスクリプトのプレビュー",
       "transcriptError": "トランスクリプトを読み込めませんでした。",
@@ -2410,16 +2410,16 @@
         "reminder": "静的リマインダーは分離して実行され、発信元のチャットが利用可能な場合はそこに配信されます。",
         "current": "スケジュールされたエージェントタスクはアクティブなチャットセッションで続行されます。",
         "isolated": "スケジュールされたエージェントタスクはメインとは別に、独自のスケジュールセッションで実行されます。",
-        "session": "スケジュールされたエージェントタスクは指定したセッションキーで続行されます。",
+        "session": "スケジュールされたエージェントタスクは指定したセッション ID で続行されます。",
         "default": "このバックグラウンドエージェントタスクが会話コンテキストを保持する場所を選択してください。"
       },
       "targetSessionLabel": {
-        "current": "現在のセッションキー",
-        "named": "名前付きセッションキー"
+        "current": "現在のセッション ID",
+        "named": "指定したセッション ID"
       },
       "targetSessionHint": {
-        "current": "現在は、ジョブを保存した時点でアクティブな WebChat セッションキーにバインドされます。",
-        "named": "チャットヘッダーの完全なセッションキーを使用してください。"
+        "current": "現在は、ジョブを保存した時点でアクティブな WebChat セッション ID にバインドされます。",
+        "named": "チャットヘッダーの完全なセッション ID を使用してください。"
       },
       "messageLabel": {
         "systemEvent": "イベントテキスト",
@@ -2429,8 +2429,8 @@
       "toastNameRequired": "名前は必須です",
       "toastIntervalInvalid": "間隔は整数の秒数である必要があります",
       "toastIsoTimeRequired": "ISO 時刻は必須です",
-      "toastCurrentSessionRequired": "現在のセッションキーは必須です",
-      "toastNamedSessionRequired": "名前付きセッションキーは必須です",
+      "toastCurrentSessionRequired": "現在のセッション ID は必須です",
+      "toastNamedSessionRequired": "指定したセッション ID は必須です",
       "toastUpdated": "スケジュールを更新しました",
       "toastCreated": "スケジュールを作成しました",
       "toastSaveFailed": "保存に失敗しました: {error}"
@@ -2997,7 +2997,7 @@
     "chatWithSuffix": "チャット {suffix}",
     "copied": "コピーしました",
     "copy": "コピー",
-    "copySessionKey": "セッションキーをコピー",
+    "copySessionKey": "セッション ID をコピー",
     "sessionActions": "セッション操作",
     "share": "共有",
     "shareSendFirst": "共有するには、まずメッセージを送信してください",
@@ -3304,11 +3304,18 @@
       "sendReply": "返信を送信",
       "sendingContinuing": "返信を送信中 · 実行を継続中…"
     },
+    "slashCommands": {
+      "unknown": "不明なコマンド {command} です。編集を続けるか、// を使用してテキストとして送信してください。"
+    },
     "codingMode": {
-      "enabled": "Coding mode を有効にしました。",
+      "enabled": "すべてのチャットで Coding mode を有効にしました。",
       "disabled": "Coding mode を無効にしました。",
-      "usage": "/coding、/coding on、/coding off、または /coding status を使用してください。",
-      "updateFailed": "Coding mode を更新できませんでした。"
+      "usage": "切り替えるには /coding、明示的に操作するには /coding on、/coding off、/coding status を使用してください。",
+      "updateFailed": "Coding mode を更新できませんでした。",
+      "commandEnable": "Coding mode を有効にする。",
+      "commandDisable": "Coding mode を無効にする。",
+      "activeLabel": "Coding 有効",
+      "disableLabel": "Coding mode を無効にする"
     },
     "composer": {
       "executionMode": "実行モード",

@@ -103,7 +103,7 @@ The chat UI supports:
 - pending message queue behavior while compaction or runtime work is in flight;
 - manual `/compact`;
 - per-turn usage and savings metadata when available;
-- copyable session keys;
+- copyable session IDs;
 - mobile tabs that keep chat, sessions, and operational views reachable on
   narrow screens.
 
@@ -111,10 +111,17 @@ Use the session selector to switch between existing sessions. Copy the session
 key when reporting a bug or asking another OpenSquilla surface to inspect the
 same session.
 
+Slash command suggestions complete before they run. `Tab` always completes the
+active candidate, while `Enter` completes a partial match and runs only an
+exact command. Unknown commands remain in the composer with a recovery hint.
+
 Coding mode can be enabled from chat when you want code modifications routed
 through `opensquilla code-task`. With Coding mode on, code changes use the
 guarded host workflow described in [`cli.md`](cli.md#coding-mode-and-code-task)
-instead of ordinary in-session editing.
+instead of ordinary in-session editing. Enter `/coding` to toggle the mode.
+While it is enabled, the composer shows a `Coding ON` status control that can
+also turn the mode off. The explicit `/coding on`, `/coding off`, and
+`/coding status` forms remain available for compatibility.
 
 ## Manual Compaction
 
