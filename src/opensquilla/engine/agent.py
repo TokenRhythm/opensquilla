@@ -14519,6 +14519,40 @@ class Agent:
                 )
             return None  # signal failure
 
+        kept_start_index = int(
+            getattr(result, "kept_start_index", result.removed_count)
+            or result.removed_count
+        )
+        if result.removed_count > 0 and (
+            kept_start_index != result.removed_count
+            or not 0 <= kept_start_index <= len(messages)
+            or len(result.kept_entries) != len(messages) - kept_start_index
+        ):
+            self._last_compaction_refusal_reason = "invalid_prefix_boundary"
+            logger.warning(
+                "compaction.invalid_prefix_boundary",
+                removed_count=result.removed_count,
+                kept_start_index=kept_start_index,
+                kept_count=len(result.kept_entries),
+                message_count=len(messages),
+            )
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="failed",
+                    reason=self._last_compaction_refusal_reason,
+                    tokens_before=estimated_context_tokens,
+                    context_window_tokens=window_tokens,
+                    **compaction_effect_payload(status="failed"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return None
+
         if self._session_key and result.removed_count > 0 and result.summary:
             for event in (
                 COMPACTION_CHUNK_SUMMARIZED_EVENT,
@@ -14610,15 +14644,18 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
-        # Rebuild message list from compacted entries
+        # Prefix compaction must preserve the kept provider messages verbatim.
+        # ``entries`` is only a flattened view for the compaction model; using
+        # it to rebuild the tail would discard images/thinking blocks and
+        # truncate structured tool results that were never selected for
+        # removal.
         compacted: list[Message] = []
         if result.summary:
             compacted.append(Message(role="user", content=f"[Context summary]\n{result.summary}"))
             compacted.append(
                 Message(role="assistant", content="Understood. Continuing from summary.")
             )
-        for entry in result.kept_entries:
-            compacted.append(Message(role=entry["role"], content=entry["content"]))
+        compacted.extend(messages[kept_start_index:])
 
         await _await_flush_task()
 
@@ -14636,10 +14673,6 @@ class Agent:
         # ``getattr`` keeps older/custom compactor result stubs compatible;
         # prefix-only compaction already guarantees that removed_count is the
         # same boundary when the additive field is absent.
-        kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
-        )
         adjusted_request_idx = self._adjust_index_after_prefix_compaction(
             request_context_insert_index,
             kept_start_index,

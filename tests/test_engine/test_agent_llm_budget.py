@@ -4956,6 +4956,89 @@ async def test_inline_overflow_compaction_reduces_tool_heavy_structured_context(
 
 
 @pytest.mark.asyncio
+async def test_inline_overflow_preserves_structured_kept_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_tool_result = "important structured output " * 100
+    kept_tail = Message(
+        role="user",
+        content=[
+            ContentBlockToolResult(
+                tool_use_id="tail-tool",
+                content=full_tool_result,
+            )
+        ],
+    )
+    messages = [
+        Message(role="user", content="old context " * 1000),
+        kept_tail,
+    ]
+
+    async def _compact(request: Any) -> CompactionResult:
+        return CompactionResult(
+            summary="short summary",
+            kept_entries=request.entries[1:],
+            removed_count=1,
+            chunks_processed=1,
+            kept_start_index=1,
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _compact)
+    agent = Agent(
+        provider=_ContextOverflowProvider(),
+        config=AgentConfig(context_window_tokens=1000, flush_enabled=False),
+    )
+
+    outcome = await agent._check_context_overflow(
+        messages,
+        estimated_context_tokens=1001,
+        compaction_window_tokens=1000,
+    )
+
+    assert outcome is not None
+    assert outcome.compacted
+    assert outcome.messages[-1] is kept_tail
+    assert isinstance(outcome.messages[-1].content, list)
+    block = outcome.messages[-1].content[0]
+    assert isinstance(block, ContentBlockToolResult)
+    assert block.content == full_tool_result
+
+
+@pytest.mark.asyncio
+async def test_inline_overflow_rejects_inconsistent_prefix_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages = [
+        Message(role="user", content="old context " * 1000),
+        Message(role="assistant", content="kept"),
+    ]
+
+    async def _compact(request: Any) -> CompactionResult:
+        return CompactionResult(
+            summary="short summary",
+            kept_entries=request.entries[1:],
+            removed_count=1,
+            chunks_processed=1,
+            kept_start_index=2,
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _compact)
+    agent = Agent(
+        provider=_ContextOverflowProvider(),
+        config=AgentConfig(context_window_tokens=1000, flush_enabled=False),
+    )
+
+    outcome = await agent._check_context_overflow(
+        messages,
+        estimated_context_tokens=1001,
+        compaction_window_tokens=1000,
+    )
+
+    assert outcome is None
+    assert agent._last_compaction_refusal_reason == "invalid_prefix_boundary"
+
+
+@pytest.mark.asyncio
 async def test_within_budget_skip_on_string_only_history_is_not_reported_as_compacted() -> None:
     agent = Agent(
         provider=_ContextOverflowProvider(),

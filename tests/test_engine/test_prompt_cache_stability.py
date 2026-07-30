@@ -10,7 +10,11 @@ import pytest
 
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine import runtime as runtime_module
-from opensquilla.engine.runtime import TurnRunner, _prepend_request_context_prompt
+from opensquilla.engine.runtime import (
+    TurnRunner,
+    _format_compaction_summary_context,
+    _prepend_request_context_prompt,
+)
 from opensquilla.provider import (
     ChatConfig,
     ContentBlockCompaction,
@@ -21,6 +25,35 @@ from opensquilla.provider import (
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionContextState, SessionSummary
 from opensquilla.session.storage import SessionStorage
+
+
+def test_compaction_summary_context_drops_whole_old_blocks() -> None:
+    summaries = [
+        f"old-{index}-start\n" + (str(index) * 5000) + f"\nold-{index}-end"
+        for index in range(4)
+    ]
+
+    rendered = _format_compaction_summary_context(summaries)
+
+    assert rendered is not None
+    assert len(rendered) <= runtime_module._COMPACTION_SUMMARY_CONTEXT_MAX_CHARS
+    assert "compaction summaries omitted" in rendered
+    assert "old-3-start" in rendered
+    assert "old-3-end" in rendered
+    for index in range(3):
+        assert (f"old-{index}-start" in rendered) == (f"old-{index}-end" in rendered)
+
+
+def test_single_oversized_compaction_summary_has_explicit_head_tail_truncation() -> None:
+    rendered = _format_compaction_summary_context(
+        ["newest-head\n" + ("x" * 20_000) + "\nnewest-tail"]
+    )
+
+    assert rendered is not None
+    assert len(rendered) <= runtime_module._COMPACTION_SUMMARY_CONTEXT_MAX_CHARS
+    assert "newest-head" in rendered
+    assert "newest-tail" in rendered
+    assert "[Newest compaction summary truncated here.]" in rendered
 
 
 class _CapturingProvider:

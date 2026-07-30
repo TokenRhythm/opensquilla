@@ -21,6 +21,7 @@ from opensquilla.memory.constraint_classifier import (
     heuristic_classify,
     llm_classify,
     parse_frontmatter_constraint,
+    parse_inline_constraint,
     should_classify,
 )
 from opensquilla.memory.types import (
@@ -706,6 +707,20 @@ class TestA1TieredEscalation:
         assert ct == ConstraintType.decision
         assert conf == 0.9
         assert not llm_called, "Inline marker should bypass both heuristic and LLM"
+
+    def test_repeated_unanimous_inline_markers_are_a_chunk_override(self):
+        text = (
+            "<!-- opensquilla-constraint: decision --> chose SQLite\n"
+            "<!-- opensquilla-constraint: decision --> kept WAL enabled"
+        )
+        assert parse_inline_constraint(text) == ConstraintType.decision
+
+    def test_mixed_inline_markers_do_not_mislabel_the_whole_chunk(self):
+        text = (
+            "<!-- opensquilla-constraint: decision --> chose SQLite\n"
+            "<!-- opensquilla-constraint: preference --> prefer local storage"
+        )
+        assert parse_inline_constraint(text) is None
 
     @pytest.mark.asyncio
     async def test_frontmatter_still_highest_priority(self):

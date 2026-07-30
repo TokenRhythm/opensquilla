@@ -414,7 +414,7 @@ class TestB6ChineseExpandedKeywords:
             assert intent == QueryIntent.transfer_knowledge, (
                 f"Expected transfer_knowledge for: {q}, got {intent}"
             )
-            assert conf == 0.6
+            assert conf == 0.7
 
     def test_avoid_failure_english_expanded(self):
         for q in [

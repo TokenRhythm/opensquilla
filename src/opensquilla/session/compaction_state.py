@@ -105,6 +105,21 @@ _ARTIFACT_NAME_RE = re.compile(
     r"\.(?:pdf|png|jpe?g|gif|csv|json|md|txt|xlsx?|pptx?|docx?|html?|zip)\b",
     re.IGNORECASE,
 )
+_OBLIGATION_KIND_PRIORITY = {
+    "user_goal": 0,
+    "user_constraint_or_preference": 1,
+    "current_plan_or_next_action": 2,
+    "do_not_repeat_action": 3,
+    "failed_command_or_error": 4,
+    "unresolved_question": 5,
+    "decision_or_rationale": 6,
+    "tool_result_fact": 7,
+    "tool_result_id": 8,
+    "file_path": 9,
+    "artifact_path_or_name": 10,
+    "command": 11,
+    "important_identifier": 12,
+}
 
 
 def _entry_value(entry: Any, key: str, default: Any = None) -> Any:
@@ -141,7 +156,10 @@ def _add_obligation(
     source_entry_id: int | None,
     max_obligations: int,
 ) -> None:
-    if len(obligations) >= max_obligations:
+    # The final cap is global and priority-aware. Keep at most one full cap per
+    # kind while collecting so adversarial path/id-heavy input cannot make the
+    # candidate set grow without bound.
+    if sum(item.kind == kind for item in obligations) >= max_obligations:
         return
     cleaned = _clean_obligation_text(value)
     if not cleaned:
@@ -167,9 +185,15 @@ def extract_compaction_obligations(
 ) -> list[CompactionObligation]:
     """Extract bounded high-signal continuity facts before entries are removed."""
 
+    if max_obligations <= 0:
+        return []
+
     obligations: list[CompactionObligation] = []
     seen: set[tuple[str, str]] = set()
-    for entry in entries:
+    # Inspect newest entries first so duplicate facts keep their most recent
+    # provenance.  Apply the hard cap only after extraction; otherwise early
+    # path/id noise can consume the quota before a later goal or constraint.
+    for entry in reversed(entries):
         role = _string_value(_entry_value(entry, "role")) or None
         entry_id = _entry_value(entry, "id")
         source_entry_id = entry_id if isinstance(entry_id, int) else None
@@ -326,7 +350,8 @@ def extract_compaction_obligations(
                 source_entry_id=source_entry_id,
                 max_obligations=max_obligations,
             )
-    return obligations
+    obligations.sort(key=lambda item: _OBLIGATION_KIND_PRIORITY.get(item.kind, 100))
+    return obligations[:max_obligations]
 
 
 def verify_summary_coverage(

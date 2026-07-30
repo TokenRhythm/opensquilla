@@ -80,7 +80,7 @@ _INTENT_PATTERNS: list[tuple[re.Pattern[str], QueryIntent, float]] = [
             re.IGNORECASE,
         ),
         QueryIntent.transfer_knowledge,
-        0.6,
+        0.7,
     ),
 ]
 

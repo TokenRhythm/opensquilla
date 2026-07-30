@@ -232,17 +232,28 @@ def parse_inline_constraint(text: str) -> ConstraintType | None:
     rendered markdown bullets so the L1 classifier can use the LLM-extracted
     candidate kind directly, bypassing heuristic classification.
     """
-    m = _INLINE_CONSTRAINT_RE.search(text)
-    if not m:
+    matches = _INLINE_CONSTRAINT_RE.findall(text)
+    if not matches:
         return None
-    raw = m.group(1).strip().lower()
-    # Direct ConstraintType match (fact, event, preference, decision, procedure, goal)
-    try:
-        return ConstraintType(raw)
-    except ValueError:
-        pass
-    # Fallback: CANDIDATE_KIND_TO_CONSTRAINT mapping (e.g. "todo" -> goal)
-    return CANDIDATE_KIND_TO_CONSTRAINT.get(raw)
+
+    resolved: set[ConstraintType] = set()
+    for match in matches:
+        raw = match.strip().lower()
+        try:
+            resolved.add(ConstraintType(raw))
+            continue
+        except ValueError:
+            pass
+        mapped = CANDIDATE_KIND_TO_CONSTRAINT.get(raw)
+        if mapped is not None:
+            resolved.add(mapped)
+
+    # A chunk may contain several flush bullets.  A unanimous set of markers
+    # is a valid chunk-level override; mixed markers are not, because choosing
+    # the first one would silently mislabel every later claim in the chunk.
+    if len(resolved) != 1:
+        return None
+    return next(iter(resolved))
 
 
 # ── Unified Classification Entry Point ────────────────────────────────────

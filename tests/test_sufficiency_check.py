@@ -103,6 +103,14 @@ class TestShouldEmit:
         assert confidence == 0.7
         assert should_emit_sufficiency_note(0, confidence) is True
 
+    def test_transfer_knowledge_classifier_output_can_trigger(self):
+        intent, confidence = classify_query_intent(
+            "have we done something similar before?"
+        )
+        assert intent is QueryIntent.transfer_knowledge
+        assert confidence == 0.7
+        assert should_emit_sufficiency_note(0, confidence) is True
+
     def test_disabled(self):
         assert should_emit_sufficiency_note(0, 0.9, enabled=False) is False
 

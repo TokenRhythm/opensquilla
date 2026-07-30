@@ -744,15 +744,46 @@ def _format_compaction_summary_context(summary_texts: list[str]) -> str | None:
     rendered = f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n" + "\n\n".join(blocks)
     if len(rendered) <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS:
         return rendered
-    tail_budget = (
-        _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS - len(_COMPACTION_SUMMARY_CONTEXT_HEADER) - 80
-    )
-    tail_budget = max(1000, tail_budget)
-    return (
-        f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n"
-        "[Earlier compaction summary context truncated to fit request budget.]\n"
-        f"{rendered[-tail_budget:]}"
-    )
+
+    marker_template = "[{count} earlier compaction summaries omitted to fit request budget.]"
+    # Reserve the largest marker this call can need so replacing the count
+    # after packing cannot push the final rendering over the hard limit.
+    reserved_marker = marker_template.format(count=len(blocks))
+    fixed_chars = len(_COMPACTION_SUMMARY_CONTEXT_HEADER) + 1 + len(reserved_marker) + 1
+    selected_newest_first: list[str] = []
+    selected_chars = 0
+    omitted = 0
+    for block in reversed(blocks):
+        separator_chars = 2 if selected_newest_first else 0
+        if (
+            fixed_chars + selected_chars + separator_chars + len(block)
+            <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS
+        ):
+            selected_newest_first.append(block)
+            selected_chars += separator_chars + len(block)
+        else:
+            omitted = len(blocks) - len(selected_newest_first)
+            break
+
+    if selected_newest_first:
+        marker = marker_template.format(count=omitted)
+        selected = list(reversed(selected_newest_first))
+        return (
+            f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n{marker}\n"
+            + "\n\n".join(selected)
+        )
+
+    # A single newest block may itself exceed the budget. Preserve its head
+    # and tail with an explicit marker rather than returning a structurally
+    # unexplained slice from the middle.
+    newest = blocks[-1]
+    marker = marker_template.format(count=max(0, len(blocks) - 1))
+    truncation = "\n[Newest compaction summary truncated here.]\n"
+    fixed = f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n{marker}\n"
+    available = _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS - len(fixed) - len(truncation)
+    head_chars = max(0, available // 2)
+    tail_chars = max(0, available - head_chars)
+    return f"{fixed}{newest[:head_chars]}{truncation}{newest[-tail_chars:]}"
 
 
 def _prepend_request_context_prompt(
