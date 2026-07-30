@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, type App } from 'vue'
 import i18n from '@/i18n'
 import ChatComposer from './ChatComposer.vue'
@@ -64,6 +64,38 @@ beforeEach(() => {
 })
 
 describe('ChatComposer popovers', () => {
+  it('shows an accessible Coding ON chip that requests disabling the global mode', async () => {
+    const setCodingModeEnabled = vi.fn()
+    const { app, el } = await mountComposer({
+      codingModeEnabled: true,
+      onSetCodingModeEnabled: setCodingModeEnabled,
+    })
+
+    const chip = el.querySelector<HTMLButtonElement>('.chat-coding-mode-chip')
+    expect(chip?.textContent).toContain('Coding ON')
+    expect(chip?.getAttribute('aria-label')).toBe('Disable Coding mode')
+    chip?.click()
+    await nextTick()
+    expect(setCodingModeEnabled).toHaveBeenCalledWith(false)
+
+    app.unmount()
+  })
+
+  it('hides the Coding mode chip while off and disables it during a pending update', async () => {
+    const { app, el } = await mountComposer()
+    expect(el.querySelector('.chat-coding-mode-chip')).toBeNull()
+    app.unmount()
+
+    const busy = await mountComposer({
+      codingModeEnabled: true,
+      codingModeSettingsBusy: true,
+    })
+    const chip = busy.el.querySelector<HTMLButtonElement>('.chat-coding-mode-chip')
+    expect(chip?.disabled).toBe(true)
+    expect(chip?.getAttribute('aria-busy')).toBe('true')
+    busy.app.unmount()
+  })
+
   it('preserves the original single stop control while streaming', async () => {
     const { app, el } = await mountComposer({
       isStreaming: true,
