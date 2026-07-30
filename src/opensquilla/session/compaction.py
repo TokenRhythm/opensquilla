@@ -694,6 +694,40 @@ def _bound_summary_text(text: str, max_tokens: int, *, keep_tail: bool) -> str:
     return marker + fragment if keep_tail else fragment + marker
 
 
+def _merge_previous_summary_with_budget(
+    previous: str,
+    current: str,
+    *,
+    max_tokens: int,
+) -> str:
+    """Keep the previous-context declaration while shrinking the new section."""
+    previous_section = f"[Previous context]\n{previous}"
+    new_header = "\n\n[New context]\n"
+    fixed = previous_section + new_header
+    if _estimate_tokens(fixed) >= max_tokens:
+        # In an exceptionally small budget, preserving the declaration and as
+        # much of its content as possible is more useful than retaining only
+        # the tail of the new summary.
+        return _bound_summary_text(
+            previous_section,
+            max_tokens,
+            keep_tail=False,
+        )
+
+    current_budget = max(1, max_tokens - _estimate_tokens(fixed))
+    while current_budget > 0:
+        bounded_current = _bound_summary_text(
+            current,
+            current_budget,
+            keep_tail=True,
+        )
+        merged = fixed + bounded_current
+        if _estimate_tokens(merged) <= max_tokens:
+            return merged
+        current_budget -= 1
+    return previous_section
+
+
 def _normalize_custom_instructions(custom_instructions: str | None) -> str:
     if custom_instructions is None:
         return ""
@@ -1112,14 +1146,10 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             effective_summary_budget - _estimate_tokens(bounded_previous),
         )
         bounded_new = _bound_summary_text(merged, new_budget, keep_tail=True)
-        merged = (
-            f"[Previous context]\n{bounded_previous}\n\n"
-            f"[New context]\n{bounded_new}"
-        )
-        merged = _bound_summary_text(
-            merged,
-            effective_summary_budget,
-            keep_tail=True,
+        merged = _merge_previous_summary_with_budget(
+            bounded_previous,
+            bounded_new,
+            max_tokens=effective_summary_budget,
         )
 
     tokens_after = _estimate_tokens(merged) + sum(_entry_tokens(e) for e in kept)
