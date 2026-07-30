@@ -1772,10 +1772,10 @@
     "inspect": {
       "dialogLabel": "Session details: {title}",
       "subagentOf": "Subagent of {title}",
-      "copyKey": "Copy session key",
-      "keyCopied": "Session key copied",
+      "copyKey": "Copy session ID",
+      "keyCopied": "Session ID copied",
       "copied": "Copied",
-      "copyKeyFailed": "Could not copy the session key.",
+      "copyKeyFailed": "Could not copy the session ID.",
       "updated": "updated {time}",
       "transcriptPreview": "Transcript preview",
       "transcriptError": "Could not load the transcript.",
@@ -2410,16 +2410,16 @@
         "reminder": "Static reminders run isolated and deliver back to the originating chat when one is available.",
         "current": "The scheduled agent task continues in the active chat session.",
         "isolated": "The scheduled agent task runs in its own cron session, separate from Main.",
-        "session": "The scheduled agent task continues in the named session key.",
+        "session": "The scheduled agent task continues in the specified session ID.",
         "default": "Choose where this background agent task keeps its conversation context."
       },
       "targetSessionLabel": {
-        "current": "Current session key",
-        "named": "Named session key"
+        "current": "Current session ID",
+        "named": "Specific session ID"
       },
       "targetSessionHint": {
-        "current": "Current is bound to the active WebChat session key when the job is saved.",
-        "named": "Use a full session key from the chat header."
+        "current": "Current is bound to the active WebChat session ID when the job is saved.",
+        "named": "Use the full session ID from the chat header."
       },
       "messageLabel": {
         "systemEvent": "Event text",
@@ -2429,8 +2429,8 @@
       "toastNameRequired": "Name is required",
       "toastIntervalInvalid": "Interval must be an integer number of seconds",
       "toastIsoTimeRequired": "ISO time is required",
-      "toastCurrentSessionRequired": "Current session key is required",
-      "toastNamedSessionRequired": "Named session key is required",
+      "toastCurrentSessionRequired": "Current session ID is required",
+      "toastNamedSessionRequired": "Specific session ID is required",
       "toastUpdated": "Schedule updated",
       "toastCreated": "Schedule created",
       "toastSaveFailed": "Save failed: {error}"
@@ -2997,7 +2997,7 @@
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Copied",
     "copy": "Copy",
-    "copySessionKey": "Copy session key",
+    "copySessionKey": "Copy session ID",
     "sessionActions": "Session actions",
     "share": "Share",
     "shareSendFirst": "Send a message first to share",
@@ -3304,11 +3304,18 @@
       "sendReply": "Send reply",
       "sendingContinuing": "Sending reply · continuing run…"
     },
+    "slashCommands": {
+      "unknown": "Unknown command {command}. Keep editing, or use // to send it as text."
+    },
     "codingMode": {
-      "enabled": "Coding mode enabled.",
+      "enabled": "Coding mode enabled for all chats.",
       "disabled": "Coding mode disabled.",
-      "usage": "Use /coding, /coding on, /coding off, or /coding status.",
-      "updateFailed": "Coding mode could not be updated."
+      "usage": "Use /coding to toggle, or /coding on, /coding off, or /coding status.",
+      "updateFailed": "Coding mode could not be updated.",
+      "commandEnable": "Enable Coding mode.",
+      "commandDisable": "Disable Coding mode.",
+      "activeLabel": "Coding ON",
+      "disableLabel": "Disable Coding mode"
     },
     "composer": {
       "executionMode": "Execution mode",

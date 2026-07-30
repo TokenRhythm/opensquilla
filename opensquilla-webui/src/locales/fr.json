@@ -1772,10 +1772,10 @@
     "inspect": {
       "dialogLabel": "Détails de la session : {title}",
       "subagentOf": "Sous-agent de {title}",
-      "copyKey": "Copier la clé de session",
-      "keyCopied": "Clé de session copiée",
+      "copyKey": "Copier l’ID de session",
+      "keyCopied": "ID de session copié",
       "copied": "Copié",
-      "copyKeyFailed": "Impossible de copier la clé de session.",
+      "copyKeyFailed": "Impossible de copier l’ID de session.",
       "updated": "mis à jour {time}",
       "transcriptPreview": "Aperçu de la transcription",
       "transcriptError": "Impossible de charger la transcription.",
@@ -2410,16 +2410,16 @@
         "reminder": "Les rappels statiques s'exécutent de manière isolée et reviennent vers le chat d'origine lorsqu'il est disponible.",
         "current": "La tâche d'agent planifiée se poursuit dans la session de chat active.",
         "isolated": "La tâche d'agent planifiée s'exécute dans sa propre session cron, distincte de Principal.",
-        "session": "La tâche d'agent planifiée se poursuit dans la clé de session nommée.",
+        "session": "La tâche d'agent planifiée se poursuit dans l’ID de session indiqué.",
         "default": "Choisissez où cette tâche d'agent en arrière-plan conserve son contexte de conversation."
       },
       "targetSessionLabel": {
-        "current": "Clé de session actuelle",
-        "named": "Clé de session nommée"
+        "current": "ID de session actuel",
+        "named": "ID de session spécifique"
       },
       "targetSessionHint": {
-        "current": "« Actuelle » est liée à la clé de session WebChat active lors de l'enregistrement de la tâche.",
-        "named": "Utilisez une clé de session complète depuis l'en-tête du chat."
+        "current": "« Actuelle » est liée à l’ID de session WebChat actif lors de l'enregistrement de la tâche.",
+        "named": "Utilisez l’ID de session complet depuis l'en-tête du chat."
       },
       "messageLabel": {
         "systemEvent": "Texte de l'événement",
@@ -2429,8 +2429,8 @@
       "toastNameRequired": "Le nom est requis",
       "toastIntervalInvalid": "L'intervalle doit être un nombre entier de secondes",
       "toastIsoTimeRequired": "L'heure ISO est requise",
-      "toastCurrentSessionRequired": "La clé de session actuelle est requise",
-      "toastNamedSessionRequired": "La clé de session nommée est requise",
+      "toastCurrentSessionRequired": "L’ID de session actuel est requis",
+      "toastNamedSessionRequired": "L’ID de session spécifique est requis",
       "toastUpdated": "Planification mise à jour",
       "toastCreated": "Planification créée",
       "toastSaveFailed": "Échec de l'enregistrement : {error}"
@@ -2997,7 +2997,7 @@
     "chatWithSuffix": "Chat {suffix}",
     "copied": "Copié",
     "copy": "Copier",
-    "copySessionKey": "Copier la clé de session",
+    "copySessionKey": "Copier l’ID de session",
     "sessionActions": "Actions de la session",
     "share": "Partager",
     "shareSendFirst": "Envoyez d'abord un message pour partager",
@@ -3304,11 +3304,18 @@
       "sendReply": "Envoyer la réponse",
       "sendingContinuing": "Envoi de la réponse · poursuite de l'exécution…"
     },
+    "slashCommands": {
+      "unknown": "Commande inconnue {command}. Continuez à la modifier ou utilisez // pour l’envoyer comme texte."
+    },
     "codingMode": {
-      "enabled": "Coding mode activé.",
+      "enabled": "Coding mode activé pour toutes les discussions.",
       "disabled": "Coding mode désactivé.",
-      "usage": "Utilisez /coding, /coding on, /coding off ou /coding status.",
-      "updateFailed": "Impossible de mettre à jour Coding mode."
+      "usage": "Utilisez /coding pour basculer, ou /coding on, /coding off ou /coding status.",
+      "updateFailed": "Impossible de mettre à jour Coding mode.",
+      "commandEnable": "Activer Coding mode.",
+      "commandDisable": "Désactiver Coding mode.",
+      "activeLabel": "Coding ACTIVÉ",
+      "disableLabel": "Désactiver Coding mode"
     },
     "composer": {
       "executionMode": "Mode d'exécution",

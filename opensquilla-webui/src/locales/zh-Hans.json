@@ -1772,10 +1772,10 @@
     "inspect": {
       "dialogLabel": "会话详情：{title}",
       "subagentOf": "{title} 的子智能体",
-      "copyKey": "复制会话标识",
-      "keyCopied": "会话标识已复制",
+      "copyKey": "复制会话 ID",
+      "keyCopied": "会话 ID 已复制",
       "copied": "已复制",
-      "copyKeyFailed": "无法复制会话标识。",
+      "copyKeyFailed": "无法复制会话 ID。",
       "updated": "更新于 {time}",
       "transcriptPreview": "记录预览",
       "transcriptError": "无法加载记录。",
@@ -2410,16 +2410,16 @@
         "reminder": "静态提醒独立运行，并在可用时投递回原始聊天。",
         "current": "定时智能体任务在当前活跃的聊天会话中继续。",
         "isolated": "定时智能体任务在其自己的定时任务会话中运行，与 Main 分离。",
-        "session": "定时智能体任务在指定的命名会话键中继续。",
+        "session": "定时智能体任务在指定的会话 ID 中继续。",
         "default": "选择此后台智能体任务保存其对话上下文的位置。"
       },
       "targetSessionLabel": {
-        "current": "当前会话键",
-        "named": "命名会话键"
+        "current": "当前会话 ID",
+        "named": "指定会话 ID"
       },
       "targetSessionHint": {
-        "current": "保存任务时，Current 会绑定到当前活跃的 WebChat 会话键。",
-        "named": "请使用聊天标题栏中的完整会话键。"
+        "current": "保存任务时，“当前”会绑定到当前活跃的 WebChat 会话 ID。",
+        "named": "请使用聊天标题栏中的完整会话 ID。"
       },
       "messageLabel": {
         "systemEvent": "事件文本",
@@ -2429,8 +2429,8 @@
       "toastNameRequired": "名称为必填项",
       "toastIntervalInvalid": "间隔必须为整数秒",
       "toastIsoTimeRequired": "ISO 时间为必填项",
-      "toastCurrentSessionRequired": "当前会话键为必填项",
-      "toastNamedSessionRequired": "命名会话键为必填项",
+      "toastCurrentSessionRequired": "当前会话 ID 为必填项",
+      "toastNamedSessionRequired": "指定会话 ID 为必填项",
       "toastUpdated": "定时任务已更新",
       "toastCreated": "定时任务已创建",
       "toastSaveFailed": "保存失败：{error}"
@@ -2997,7 +2997,7 @@
     "chatWithSuffix": "聊天 {suffix}",
     "copied": "已复制",
     "copy": "复制",
-    "copySessionKey": "复制会话密钥",
+    "copySessionKey": "复制会话 ID",
     "sessionActions": "会话操作",
     "share": "分享",
     "shareSendFirst": "先发送一条消息才能分享",
@@ -3304,11 +3304,18 @@
       "sendReply": "发送回复",
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
+    "slashCommands": {
+      "unknown": "未知命令 {command}。请继续编辑，或使用 // 将其作为普通文本发送。"
+    },
     "codingMode": {
-      "enabled": "Coding mode 已开启。",
+      "enabled": "Coding mode 已为所有聊天开启。",
       "disabled": "Coding mode 已关闭。",
-      "usage": "请使用 /coding、/coding on、/coding off 或 /coding status。",
-      "updateFailed": "无法更新 Coding mode。"
+      "usage": "使用 /coding 切换，或使用 /coding on、/coding off、/coding status。",
+      "updateFailed": "无法更新 Coding mode。",
+      "commandEnable": "开启 Coding mode。",
+      "commandDisable": "关闭 Coding mode。",
+      "activeLabel": "Coding 已开启",
+      "disableLabel": "关闭 Coding mode"
     },
     "composer": {
       "executionMode": "执行模式",

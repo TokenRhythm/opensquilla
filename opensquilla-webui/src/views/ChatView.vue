@@ -449,7 +449,7 @@
         :key="cmd.cmd"
         class="chat-slash-item"
         :class="{ 'chat-slash-item--active': i === slashIdx }"
-        @click="selectSlashCmd(cmd)"
+        @click="completeSlashCmd(cmd)"
       >
         <span class="chat-slash-cmd">{{ cmd.cmd }}</span>
         <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
@@ -486,6 +486,8 @@
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
       :model-routing-settings-busy="modelRoutingSettingsBusy"
+      :coding-mode-enabled="codingModeEnabled"
+      :coding-mode-settings-busy="codingModeSettingsBusy"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -510,6 +512,7 @@
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
       @set-model-routing-mode="setComposerModelRoutingMode"
+      @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
@@ -1175,6 +1178,7 @@ const {
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
+  codingModeSettingsBusy,
   routerTierConfigs,
   loadFeatureToggles,
   setModelRoutingMode,
@@ -1764,7 +1768,8 @@ const {
   loadSlashCommands,
   handleSlashInput,
   closeSlashMenu,
-  selectSlashCmd,
+  completeSlashCmd,
+  activateSlashCmd,
   executeSlashCommand,
 } = chatSlashCommands
 
@@ -1781,7 +1786,8 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   autoResizeTextarea,
   handleSlashInput,
   closeSlashMenu,
-  selectSlashCmd,
+  completeSlashCmd,
+  activateSlashCmd,
   popPendingTail,
   enqueuePendingInput,
   sendCurrentInput: () => sendCurrentInput(),
@@ -2621,6 +2627,15 @@ async function setComposerRunMode(mode: SandboxRunMode) {
 async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
   await setModelRoutingMode(mode)
   scheduleHistorySync()
+}
+
+async function setComposerCodingModeEnabled(enabled: boolean) {
+  const updated = await setCodingModeEnabled(enabled)
+  pushToast(t(
+    updated
+      ? (enabled ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
+      : 'chat.codingMode.updateFailed',
+  ))
 }
 
 // A suggestion chip is an explicit task choice. Route it through the same
