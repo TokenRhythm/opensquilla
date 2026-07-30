@@ -207,6 +207,19 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
   }
 
+  function withLiveDescription(command: ChatSlashCommand): ChatSlashCommand {
+    const action = command?.execution?.action || command.cmd || command.name
+    if (action !== 'coding.mode' && action !== '/coding') return command
+    return {
+      ...command,
+      desc: i18n.global.t(
+        options.codingModeEnabled.value
+          ? 'chat.codingMode.commandDisable'
+          : 'chat.codingMode.commandEnable',
+      ),
+    }
+  }
+
   function handleSlashInput() {
     const val = options.inputText.value
     if (val.startsWith('//') || !val.startsWith('/')) {
@@ -217,9 +230,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     if (firstSpace === -1) {
       // Command-name completion: "/me" -> matching commands.
       const query = val.slice(1).toLowerCase()
-      const matches = slashCmds.value.filter(command =>
-        slashCommandKeys(command).some(key => key.slice(1).startsWith(query)),
-      )
+      const matches = slashCmds.value
+        .filter(command =>
+          slashCommandKeys(command).some(key => key.slice(1).startsWith(query)),
+        )
+        .map(withLiveDescription)
       const exactKey = slashCommandKey(val)
       const exactMatches = matches.filter(command =>
         slashCommandKeys(command).includes(exactKey),
@@ -248,14 +263,34 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     filteredSlashCmds.value = []
   }
 
+  function completeSlashCmd(cmd: ChatSlashCommand) {
+    closeSlashMenu()
+    const needsArgument = !cmd.argValue && (cmd.argumentChoices?.length ?? 0) > 0
+    options.inputText.value = cmd.cmd + (needsArgument ? ' ' : '')
+    options.autoResizeTextarea()
+    if (needsArgument) handleSlashInput()
+  }
+
+  function activateSlashCmd(cmd: ChatSlashCommand) {
+    if (cmd.argValue) {
+      completeSlashCmd(cmd)
+      return
+    }
+    const typedKey = slashCommandKey(options.inputText.value)
+    const isExact = slashCommandKeys(cmd).includes(typedKey)
+    if (!isExact) {
+      completeSlashCmd(cmd)
+      return
+    }
+    selectSlashCmd(cmd)
+  }
+
   function selectSlashCmd(cmd: ChatSlashCommand, args = '') {
     const action = cmd?.execution?.action || cmd.cmd || cmd.name
     // Argument candidate ("/meta <skill>"): Tab-completes into the composer;
     // the user presses Enter to run it.
     if (cmd.argValue) {
-      closeSlashMenu()
-      options.inputText.value = cmd.cmd
-      options.autoResizeTextarea()
+      completeSlashCmd(cmd)
       return
     }
     // A command that takes arguments, selected with none yet: complete to
@@ -294,7 +329,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
     if (action === 'coding.mode' || action === '/coding') {
       closeSlashMenu()
-      const mode = String(args || 'on').trim().toLowerCase()
+      const mode = String(args || '').trim().toLowerCase()
       options.inputText.value = ''
       options.autoResizeTextarea()
       if (mode === 'status') {
@@ -306,6 +341,17 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         return
       }
       if (mode !== 'on' && mode !== 'off') {
+        if (mode === '') {
+          const enabled = !options.codingModeEnabled.value
+          void options.setCodingModeEnabled(enabled).then((updated) => {
+            options.notify(i18n.global.t(
+              updated
+                ? (enabled ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
+                : 'chat.codingMode.updateFailed',
+            ))
+          })
+          return
+        }
         options.notify(i18n.global.t('chat.codingMode.usage'))
         return
       }
@@ -406,7 +452,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     )
     if (!cmd) {
       closeSlashMenu()
-      console.warn('Unsupported command:', cmdText)
+      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmdText }))
       return true
     }
     selectSlashCmd(cmd, rest.join(' '))
@@ -421,6 +467,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     loadSlashCommands,
     handleSlashInput,
     closeSlashMenu,
+    completeSlashCmd,
+    activateSlashCmd,
     selectSlashCmd,
     executeSlashCommand,
     runMetaSkill,

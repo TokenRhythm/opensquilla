@@ -18,7 +18,8 @@ export interface UseChatComposerShortcutsOptions {
   autoResizeTextarea: () => void
   handleSlashInput: () => void
   closeSlashMenu: () => void
-  selectSlashCmd: (cmd: ChatSlashCommand) => void
+  completeSlashCmd: (cmd: ChatSlashCommand) => void
+  activateSlashCmd: (cmd: ChatSlashCommand) => void
   popPendingTail: () => boolean
   enqueuePendingInput: (text: string) => boolean
   sendCurrentInput: () => void
@@ -97,12 +98,16 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
         return
       }
       if (e.key === 'Enter' || e.key === 'Tab') {
-        if (options.filteredSlashCmds.value.length > 0) {
-          e.preventDefault()
-          clearTextareaUndoState()
-          options.selectSlashCmd(options.filteredSlashCmds.value[options.slashIdx.value])
-          return
+        const candidate = options.filteredSlashCmds.value[options.slashIdx.value]
+        if (!candidate) return
+        e.preventDefault()
+        clearTextareaUndoState()
+        if (e.key === 'Tab') {
+          options.completeSlashCmd(candidate)
+        } else {
+          options.activateSlashCmd(candidate)
         }
+        return
       }
       if (e.key === 'Escape') {
         e.preventDefault()

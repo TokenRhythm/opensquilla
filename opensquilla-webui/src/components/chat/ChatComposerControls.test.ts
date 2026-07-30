@@ -56,13 +56,23 @@ describe('ChatComposer control hierarchy', () => {
     expect(composerSource).not.toContain('setVisualEffectsEnabled')
   })
 
-  it('makes Coding mode available only through the slash path in Web chat', () => {
-    expect(composerSource).not.toContain('codingModeEnabled')
-    expect(composerSource).not.toContain('setCodingModeEnabled')
+  it('keeps Coding mode command-first while exposing its active global state', () => {
+    expect(composerSource).toContain('v-if="codingModeEnabled"')
+    expect(composerSource).toContain('chat-coding-mode-chip')
+    expect(composerSource).toContain("emit('setCodingModeEnabled', false)")
     expect(slashSource).toContain("action === 'coding.mode'")
-    expect(slashSource).toContain("options.setCodingModeEnabled(mode === 'on')")
+    expect(slashSource).toContain('const enabled = !options.codingModeEnabled.value')
     expect(viewSource).toContain('codingModeEnabled,')
+    expect(viewSource).toContain('codingModeSettingsBusy,')
     expect(viewSource).toContain('setCodingModeEnabled,')
+    expect(viewSource).toContain('@set-coding-mode-enabled="setComposerCodingModeEnabled"')
+  })
+
+  it('completes Slash candidates without executing them from the suggestion menu', () => {
+    expect(viewSource).toContain('@click="completeSlashCmd(cmd)"')
+    expect(viewSource).not.toContain('@click="selectSlashCmd(cmd)"')
+    expect(slashSource).toContain('function completeSlashCmd')
+    expect(slashSource).toContain('function activateSlashCmd')
   })
 })
 

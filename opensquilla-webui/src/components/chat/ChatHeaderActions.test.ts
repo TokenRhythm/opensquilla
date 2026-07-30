@@ -25,7 +25,7 @@ const BASE_PROPS = {
 const messages = {
   chat: {
     copied: 'Copied',
-    copySessionKey: 'Copy session key',
+    copySessionKey: 'Copy session ID',
     deliverablesCount: 'Deliverables ({count})',
     sessionActions: 'Session actions',
     share: 'Share',
