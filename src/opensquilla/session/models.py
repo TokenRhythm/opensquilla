@@ -309,6 +309,9 @@ class SessionSummary(SQLModel, table=True):
     kept_count: int = 0
     chunk_count: int = 0
     flush_receipt_status: str = "unknown"
+    extracted_anchors: list[dict[str, Any]] | None = Field(
+        default=None, sa_column=Column(JSON)
+    )
     # The transcript entry id up to which this summary covers (inclusive)
     covered_through_id: int = 0
     created_at: int = Field(default_factory=_now_ms)

@@ -92,6 +92,7 @@ class MemorySyncManager:
         self._timer_task: asyncio.Task[None] | None = None
         self._ttl_sweep_task: asyncio.Task[None] | None = None
         self._running = False
+        self._sync_lock = asyncio.Lock()
 
     # --- Public API ---
 
@@ -143,6 +144,11 @@ class MemorySyncManager:
         logger.info("sync_manager.stopped")
 
     async def sync(self, reason: str, *, force: bool = False) -> None:
+        """Serialize watcher, timer, search-time, and session-delta syncs."""
+        async with self._sync_lock:
+            await self._sync_once(reason, force=force)
+
+    async def _sync_once(self, reason: str, *, force: bool = False) -> None:
         """Unified sync entry point.
 
         Re-enqueues ``store.remove_file`` failures into
@@ -433,7 +439,8 @@ class MemorySyncManager:
             try:
                 await asyncio.sleep(interval)
                 if self._running and self._ttl_enabled():
-                    await self._do_ttl_sweep(initial=False)
+                    async with self._sync_lock:
+                        await self._do_ttl_sweep(initial=False)
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -595,6 +595,8 @@ def _candidate_markdown_bullet(candidate: FlushCandidate) -> str:
     event_comment = _candidate_event_comment(candidate)
     if event_comment:
         parts.append(event_comment)
+    # B4: embed constraint kind so L1 classifier can use it directly
+    parts.append(f"<!-- opensquilla-constraint: {candidate.kind} -->")
     return " ".join(parts)
 
 

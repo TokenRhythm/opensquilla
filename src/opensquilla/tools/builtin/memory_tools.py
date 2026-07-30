@@ -29,8 +29,13 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 import structlog
 
+from opensquilla.memory.constraint_routing import (
+    format_provenance_marker,
+    should_add_provenance_marker,
+)
 from opensquilla.memory.redaction import redact_memory_text
 from opensquilla.memory.source_paths import is_memory_source_path, is_searchable_source_path
+from opensquilla.memory.sufficiency_check import maybe_append_sufficiency_note
 from opensquilla.memory.types import (
     DEFAULT_MEMORY_SEARCH_MIN_SCORE,
     DEFAULT_MEMORY_SEARCH_RESULTS,
@@ -513,14 +518,26 @@ def create_memory_tools(
         return snapshots
 
     def _write_content(mem_path: Path, content: str, mode: str) -> None:
+        from opensquilla.memory.file_mutation import (
+            atomic_write_text,
+            memory_content_sha256,
+        )
+
         mem_path.parent.mkdir(parents=True, exist_ok=True)
+        current_content = (
+            mem_path.read_text(encoding="utf-8") if mem_path.exists() else ""
+        )
         if mode == "replace":
-            mem_path.write_text(content, encoding="utf-8")
-        elif mem_path.exists():
-            with open(mem_path, "a", encoding="utf-8") as handle:
-                handle.write("\n\n" + content)
+            next_content = content
+        elif current_content:
+            next_content = current_content + "\n\n" + content
         else:
-            mem_path.write_text(content, encoding="utf-8")
+            next_content = content
+        atomic_write_text(
+            mem_path,
+            next_content,
+            expected_sha256=memory_content_sha256(current_content),
+        )
 
     async def _rollback_snapshots(
         r: ResolvedAgent,
@@ -539,7 +556,9 @@ def create_memory_tools(
             try:
                 if snapshot.existed:
                     snapshot.abs_path.parent.mkdir(parents=True, exist_ok=True)
-                    snapshot.abs_path.write_text(snapshot.content or "", encoding="utf-8")
+                    from opensquilla.memory.file_mutation import atomic_write_text
+
+                    atomic_write_text(snapshot.abs_path, snapshot.content or "")
                 elif snapshot.abs_path.exists():
                     snapshot.abs_path.unlink()
             except Exception:
@@ -581,12 +600,22 @@ def create_memory_tools(
         raise RuntimeError(message) from exc
 
     async def _apply_memory_writes(r: ResolvedAgent, plans: list[PlannedWrite]) -> dict[str, int]:
-        from opensquilla.memory.types import MemorySource
+        from opensquilla.memory.file_mutation import get_memory_mutation_lock
 
         if not plans:
             return {}
 
         workspace_dir = _workspace_path(r)
+        async with get_memory_mutation_lock(workspace_dir):
+            return await _apply_memory_writes_locked(r, plans, workspace_dir)
+
+    async def _apply_memory_writes_locked(
+        r: ResolvedAgent,
+        plans: list[PlannedWrite],
+        workspace_dir: Path,
+    ) -> dict[str, int]:
+        from opensquilla.memory.types import MemorySource
+
         await _maybe_prune(r)
 
         snapshots = _snapshot_paths(workspace_dir, plans)
@@ -670,27 +699,82 @@ def create_memory_tools(
             min_score=normalize_memory_search_min_score(min_score),
             source=source_filter,
         )
+        search_with_context = getattr(r.retriever, "search_with_context", None)
+        if callable(search_with_context):
+            outcome = await search_with_context(
+                query, opts, intent=SearchIntent.TOOL
+            )
+        else:
+            # Compatibility for custom retrievers implementing the original
+            # list-only protocol. Request-scoped L2/L3 metadata is unavailable,
+            # so this path is intentionally metadata-neutral.
+            from opensquilla.memory.retrieval import MemoryRetrievalOutcome
+
+            outcome = MemoryRetrievalOutcome(
+                results=await r.retriever.search(
+                    query, opts, intent=SearchIntent.TOOL
+                )
+            )
         results = [
             result
-            for result in await r.retriever.search(query, opts, intent=SearchIntent.TOOL)
+            for result in outcome.results
             if (source_filter is None or result.source == source_filter)
             and is_searchable_source_path(result.source, str(result.path))
             and not _is_checkpoint_sidecar_path(str(result.path))
         ]
+        # L3 metadata belongs to this retrieval request, never the shared retriever.
+        _sufficiency_on = getattr(r.retriever, "sufficiency_check_enabled", False)
+        _l3_intent = outcome.query_intent
+        _l3_conf = outcome.query_confidence
+
         if not results:
-            return "No results found."
+            empty_msg = "No results found."
+            if _sufficiency_on and _l3_intent is not None and _l3_conf is not None:
+                empty_msg = maybe_append_sufficiency_note(
+                    query, 0, empty_msg, _l3_intent, _l3_conf,
+                    enabled=True,
+                )
+            return empty_msg
+
+        # D9: Provenance marker — only when L2 routing is active
+        _routing_on = getattr(r.retriever, "constraint_routing_enabled", False)
 
         lines = []
         for i, result in enumerate(results, 1):
             citation = result.citation or f"{result.path}#L{result.start_line}-L{result.end_line}"
             evidence = _bounded_memory_search_evidence(result.text or result.snippet, query=query)
+            if _routing_on and should_add_provenance_marker(result):
+                evidence = format_provenance_marker(result, evidence)
             lines.append(
                 f"[{i}] {result.path} "
                 f"(source: {result.source.value}; lines {result.start_line}-{result.end_line}; "
                 f"citation: {citation}; {', '.join(_score_parts(result))})\n"
                 f"{evidence}"
             )
-        return "\n\n".join(lines)
+        formatted = "\n\n".join(lines)
+
+        # L3: Append sufficiency note for partial results if needed
+        if _sufficiency_on and _l3_intent is not None and _l3_conf is not None:
+            formatted = maybe_append_sufficiency_note(
+                query, len(results), formatted, _l3_intent, _l3_conf,
+                enabled=True,
+                max_score=max(
+                    float(
+                        result.metadata.get(
+                            "constraint_base_score",
+                            result.score,
+                        )
+                    )
+                    for result in results
+                ),
+                distinct_evidence_count=len(
+                    {
+                        (result.path, result.start_line, result.end_line)
+                        for result in results
+                    }
+                ),
+            )
+        return formatted
 
     @tool(
         name="memory_save",

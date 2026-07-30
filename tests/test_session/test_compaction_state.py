@@ -134,6 +134,37 @@ def test_extract_compaction_obligations_prioritizes_goals_when_bounded() -> None
     ]
 
 
+def test_extract_compaction_obligations_cap_keeps_recent_high_signal_facts() -> None:
+    entries = [
+        {
+            "id": index,
+            "role": "assistant",
+            "content": f"Trace id: {index:032x}",
+        }
+        for index in range(70)
+    ]
+    entries.append(
+        {
+            "id": 100,
+            "role": "user",
+            "content": (
+                "Goal: finish the current bug fix.\n"
+                "Constraint: do not add the future purpose framework."
+            ),
+        }
+    )
+
+    obligations = extract_compaction_obligations(entries, max_obligations=8)
+    by_kind = {(item.kind, item.value) for item in obligations}
+
+    assert ("user_goal", "finish the current bug fix.") in by_kind
+    assert (
+        "user_constraint_or_preference",
+        "do not add the future purpose framework.",
+    ) in by_kind
+    assert len(obligations) == 8
+
+
 def test_structured_summary_backfills_missing_obligations_without_blocking() -> None:
     obligations = extract_compaction_obligations(
         [

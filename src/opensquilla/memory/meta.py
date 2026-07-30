@@ -16,6 +16,7 @@ class MemoryIndexMeta:
     fts_tokenizer: str
     sources: list[str]
     provider_fingerprint: str | None = None
+    constraint_annotation_version: str = "off"
 
     def to_json(self) -> str:
         d = dataclasses.asdict(self)
@@ -46,5 +47,7 @@ class MemoryIndexMeta:
         if self.fts_tokenizer != other.fts_tokenizer:
             return True
         if sorted(self.sources) != sorted(other.sources):
+            return True
+        if self.constraint_annotation_version != other.constraint_annotation_version:
             return True
         return False

@@ -88,6 +88,8 @@ def test_system_prompt_routes_exact_transcript_search_to_session_search() -> Non
     assert "transcript context" in prompt
     assert "code snippets from persisted sessions" in prompt
     assert "Ordinary recall should start with default curated `memory_search`" in prompt
+    assert '`session_search(anchor="N:entry_NNN")`' in prompt
+    assert "current session is selected automatically" in prompt
     assert "debug" not in prompt.lower()
 
 

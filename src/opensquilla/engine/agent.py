@@ -8279,6 +8279,10 @@ class Agent:
                                 kept_entries=overflow_outcome.kept_entries,
                                 kept_count=len(overflow_outcome.messages),
                                 removed_count=overflow_outcome.removed_count,
+                                removed_entries=overflow_outcome.removed_entries,
+                                compaction_index=overflow_outcome.compaction_index,
+                                extracted_anchors=overflow_outcome.extracted_anchors,
+                                anchor_enabled=overflow_outcome.anchor_enabled,
                             )
                             _call_attempt += 1
                             continue
@@ -8476,6 +8480,10 @@ class Agent:
                         kept_entries=overflow_outcome.kept_entries,
                         kept_count=len(overflow_outcome.messages),
                         removed_count=overflow_outcome.removed_count,
+                        removed_entries=overflow_outcome.removed_entries,
+                        compaction_index=overflow_outcome.compaction_index,
+                        extracted_anchors=overflow_outcome.extracted_anchors,
+                        anchor_enabled=overflow_outcome.anchor_enabled,
                     )
                     overflow_retries = 0  # reset on success
                     # Rebuild chat_cfg so next LLM call uses refreshed system
@@ -13857,6 +13865,10 @@ class Agent:
             return None, "no_safe_cut"
 
         compaction_config = self._build_compaction_config()
+        # This path produces a temporary provider request view and deliberately
+        # emits no CompactionEvent. A recoverable anchor would therefore be a
+        # lie: there is no durable archive row to expand.
+        compaction_config.anchor_enabled = False
         protected_tail_count = len(messages) - protected_start
         compaction_config.protected_recent_messages = max(
             int(compaction_config.protected_recent_messages or 0),
@@ -14181,6 +14193,14 @@ class Agent:
         )
         config.compaction_profile = self.config.compaction_profile
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
+        config.anchor_enabled = self.config.compaction_anchor_enabled
+        config.fallback_summary_max_tokens = (
+            self.config.compaction_fallback_summary_max_tokens
+        )
+        config.previous_summary_max_tokens = (
+            self.config.compaction_previous_summary_max_tokens
+        )
+        config.total_summary_max_tokens = self.config.compaction_total_summary_max_tokens
         return config
 
     @staticmethod
@@ -14430,11 +14450,31 @@ class Agent:
                 }
             )
 
+        compaction_config = self._build_compaction_config()
+        compaction_index: int | None = None
+        if compaction_config.anchor_enabled:
+            identity_provider = self.config.compaction_identity_provider
+            if identity_provider is not None:
+                try:
+                    compaction_index = await identity_provider()
+                except Exception as exc:  # noqa: BLE001 - anchors degrade, compaction lives
+                    logger.warning(
+                        "compaction.anchor_identity_unavailable",
+                        error=str(exc),
+                    )
+            if compaction_index is None:
+                logger.warning(
+                    "compaction.anchor_identity_unavailable",
+                    reason="missing_identity_provider",
+                )
+                compaction_config.anchor_enabled = False
+
         request = CompactionRequest(
             session_id="agent-turn",
             entries=entries,
             context_window_tokens=window_tokens,
-            config=self._build_compaction_config(),
+            config=compaction_config,
+            compaction_index=compaction_index,
             provider_request_correlation=derive_provider_request_correlation(
                 self._provider_request_correlation,
                 execution_id=uuid.uuid4().hex,
@@ -14478,6 +14518,40 @@ class Agent:
                     ),
                 )
             return None  # signal failure
+
+        kept_start_index = int(
+            getattr(result, "kept_start_index", result.removed_count)
+            or result.removed_count
+        )
+        if result.removed_count > 0 and (
+            kept_start_index != result.removed_count
+            or not 0 <= kept_start_index <= len(messages)
+            or len(result.kept_entries) != len(messages) - kept_start_index
+        ):
+            self._last_compaction_refusal_reason = "invalid_prefix_boundary"
+            logger.warning(
+                "compaction.invalid_prefix_boundary",
+                removed_count=result.removed_count,
+                kept_start_index=kept_start_index,
+                kept_count=len(result.kept_entries),
+                message_count=len(messages),
+            )
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="failed",
+                    reason=self._last_compaction_refusal_reason,
+                    tokens_before=estimated_context_tokens,
+                    context_window_tokens=window_tokens,
+                    **compaction_effect_payload(status="failed"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return None
 
         if self._session_key and result.removed_count > 0 and result.summary:
             for event in (
@@ -14570,15 +14644,18 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
-        # Rebuild message list from compacted entries
+        # Prefix compaction must preserve the kept provider messages verbatim.
+        # ``entries`` is only a flattened view for the compaction model; using
+        # it to rebuild the tail would discard images/thinking blocks and
+        # truncate structured tool results that were never selected for
+        # removal.
         compacted: list[Message] = []
         if result.summary:
             compacted.append(Message(role="user", content=f"[Context summary]\n{result.summary}"))
             compacted.append(
                 Message(role="assistant", content="Understood. Continuing from summary.")
             )
-        for entry in result.kept_entries:
-            compacted.append(Message(role=entry["role"], content=entry["content"]))
+        compacted.extend(messages[kept_start_index:])
 
         await _await_flush_task()
 
@@ -14596,10 +14673,6 @@ class Agent:
         # ``getattr`` keeps older/custom compactor result stubs compatible;
         # prefix-only compaction already guarantees that removed_count is the
         # same boundary when the additive field is absent.
-        kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
-        )
         adjusted_request_idx = self._adjust_index_after_prefix_compaction(
             request_context_insert_index,
             kept_start_index,
@@ -14621,7 +14694,14 @@ class Agent:
             summary=result.summary,
             kept_entries=kept_entries,
             removed_count=result.removed_count,
+            removed_entries=[
+                {"role": entry["role"], "content": entry["content"]}
+                for entry in entries[: result.removed_count]
+            ],
             compaction_id=compaction_id,
+            compaction_index=compaction_index,
+            extracted_anchors=getattr(result, "extracted_anchors", None),
+            anchor_enabled=compaction_config.anchor_enabled,
             request_context_insert_index=adjusted_request_idx,
             runtime_context_insert_index=adjusted_runtime_idx,
             protected_turn_start_index=adjusted_protected_idx,
@@ -16643,6 +16723,16 @@ class Agent:
             flush_compaction_safety_mode=self.config.flush_compaction_safety_mode,
             compaction_profile=self.config.compaction_profile,
             compaction_protected_recent_messages=(self.config.compaction_protected_recent_messages),
+            compaction_anchor_enabled=self.config.compaction_anchor_enabled,
+            compaction_fallback_summary_max_tokens=(
+                self.config.compaction_fallback_summary_max_tokens
+            ),
+            compaction_previous_summary_max_tokens=(
+                self.config.compaction_previous_summary_max_tokens
+            ),
+            compaction_total_summary_max_tokens=(
+                self.config.compaction_total_summary_max_tokens
+            ),
             tool_result_projection_max_inline_chars=(
                 self.config.tool_result_projection_max_inline_chars
             ),

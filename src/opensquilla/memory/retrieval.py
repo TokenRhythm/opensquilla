@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import math
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import structlog
+
+from .constraint_routing import QueryIntent, apply_constraint_boost, classify_query_intent
 from .source_paths import is_searchable_source_path
 from .store import LongTermMemoryStore
 from .types import (
@@ -22,6 +28,17 @@ from .types import (
 # Matches YYYY-MM-DD.md or YYYY-MM-DD-<slug>.md at the basename.
 # The date must prefix the basename; embedded dates elsewhere do not match.
 _DATED_FILENAME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:-[a-z0-9][a-z0-9_-]*)?\.md")
+_MAX_PENDING_USAGE_WRITES = 32
+logger = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class MemoryRetrievalOutcome:
+    """Request-scoped retrieval results and the metadata used to rank them."""
+
+    results: list[MemorySearchResult]
+    query_intent: QueryIntent | None = None
+    query_confidence: float | None = None
 
 
 def _match_dated_basename(path: str) -> re.Match[str] | None:
@@ -169,6 +186,9 @@ class MemoryRetriever:
         source_weights: dict[MemorySource, float] | None = None,
         sync_manager: Any | None = None,
         effective_metadata: dict[str, str] | None = None,
+        constraint_routing_enabled: bool = False,
+        sufficiency_check_enabled: bool = False,
+        usage_tracking_enabled: bool = False,
     ) -> None:
         self._store = store
         self._temporal_decay_enabled = temporal_decay_enabled
@@ -180,6 +200,11 @@ class MemoryRetriever:
         self._source_weights = source_weights or {MemorySource.sessions: 0.92}
         self._sync_manager = sync_manager
         self._effective_metadata = dict(effective_metadata or {})
+        self._constraint_routing_enabled = constraint_routing_enabled
+        self._sufficiency_check_enabled = sufficiency_check_enabled
+        self._usage_tracking_enabled = usage_tracking_enabled
+        self._usage_tasks: set[asyncio.Task[None]] = set()
+        self._usage_writes_dropped = 0
 
     async def search(
         self,
@@ -188,6 +213,18 @@ class MemoryRetriever:
         *,
         intent: SearchIntent = SearchIntent.TOOL,
     ) -> list[MemorySearchResult]:
+        """Backward-compatible result-only retrieval API."""
+        outcome = await self.search_with_context(query, opts, intent=intent)
+        return outcome.results
+
+    async def search_with_context(
+        self,
+        query: str,
+        opts: MemorySearchOpts | None = None,
+        *,
+        intent: SearchIntent = SearchIntent.TOOL,
+    ) -> MemoryRetrievalOutcome:
+        """Retrieve results with request-local intent metadata."""
         if self._sync_manager is not None:
             await self._sync_manager.sync(reason=f"search:{intent.value}")
         opts = opts or MemorySearchOpts()
@@ -245,6 +282,22 @@ class MemoryRetriever:
         ]
         filtered.sort(key=lambda r: _rank_score(r, self._source_weights), reverse=True)
 
+        # L2/L3: Constraint-aware routing (experimental, default off)
+        query_intent: QueryIntent | None = None
+        query_confidence: float | None = None
+        if (
+            self._constraint_routing_enabled
+            or self._sufficiency_check_enabled
+            or self._usage_tracking_enabled
+        ):
+            query_intent, query_confidence = classify_query_intent(query)
+            if self._constraint_routing_enabled:
+                filtered = apply_constraint_boost(filtered, query_intent)
+                filtered.sort(
+                    key=lambda r: _rank_score(r, self._source_weights),
+                    reverse=True,
+                )
+
         if self._mmr_enabled:
             weighted = [
                 _copy_result_with_score(r, _rank_score(r, self._source_weights))
@@ -261,10 +314,67 @@ class MemoryRetriever:
             k_selected = filtered[: opts.max_results]
         for result in k_selected:
             result.metadata["search_intent"] = intent.value
-        return k_selected
+
+        # D11: Non-blocking usage tracking (fire-and-forget, never blocks search)
+        if self._usage_tracking_enabled and k_selected:
+            intent_str = (
+                query_intent.value
+                if query_intent is not None
+                else "general"
+            )
+            chunk_ids = [r.chunk_id for r in k_selected]
+            try:
+                loop = asyncio.get_running_loop()
+                if len(self._usage_tasks) < _MAX_PENDING_USAGE_WRITES:
+                    task = loop.create_task(
+                        self._store.record_chunk_usage(chunk_ids, intent=intent_str)
+                    )
+                    self._usage_tasks.add(task)
+                    task.add_done_callback(self._finish_usage_write)
+                else:
+                    self._usage_writes_dropped += 1
+                    # Power-of-two sampling keeps saturation visible without
+                    # turning a degraded statistics path into a log storm.
+                    if self._usage_writes_dropped & (
+                        self._usage_writes_dropped - 1
+                    ) == 0:
+                        logger.warning(
+                            "memory.usage_write_dropped",
+                            dropped=self._usage_writes_dropped,
+                            pending=len(self._usage_tasks),
+                        )
+            except RuntimeError:
+                pass  # No running event loop (e.g. sync test) — skip
+
+        return MemoryRetrievalOutcome(
+            results=k_selected,
+            query_intent=query_intent,
+            query_confidence=query_confidence,
+        )
+
+    @property
+    def constraint_routing_enabled(self) -> bool:
+        """Whether L2 constraint-aware routing is active."""
+        return self._constraint_routing_enabled
+
+    @property
+    def sufficiency_check_enabled(self) -> bool:
+        """Whether L3 retrieval sufficiency check is active."""
+        return self._sufficiency_check_enabled
+
+    @property
+    def usage_tracking_enabled(self) -> bool:
+        """Whether D11 chunk usage tracking is active."""
+        return self._usage_tracking_enabled
 
     async def close(self) -> None:
-        return None
+        if self._usage_tasks:
+            await asyncio.gather(*tuple(self._usage_tasks), return_exceptions=True)
+
+    def _finish_usage_write(self, task: asyncio.Task[None]) -> None:
+        self._usage_tasks.discard(task)
+        with contextlib.suppress(asyncio.CancelledError):
+            task.exception()
 
     def effective_retrieval_metadata(self) -> dict[str, str]:
         effective_mode = "fts_only" if self._vector_weight == 0.0 else "hybrid"
@@ -274,4 +384,8 @@ class MemoryRetriever:
             "text_weight": str(self._text_weight),
         }
         metadata.update(self._effective_metadata)
+        if self._constraint_routing_enabled:
+            metadata["constraint_routing"] = "on"
+        if self._sufficiency_check_enabled:
+            metadata["sufficiency_check"] = "on"
         return metadata

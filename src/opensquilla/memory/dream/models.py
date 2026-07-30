@@ -17,6 +17,7 @@ class RawDreamCandidate:
     claim_sha256: str
     source_day: str | None = None
     signal_kind: str = "neutral"
+    content_sha256: str = ""
 
 
 @dataclass
@@ -32,6 +33,7 @@ class PromotionEvidenceEntry:
     claim_sha256: str
     first_seen_at: str
     last_seen_at: str
+    content_sha256: str = ""
     seen_count: int = 0
     positive_signal_count: int = 0
     correction_signal_count: int = 0
@@ -61,6 +63,7 @@ class PromotionCandidate:
     score: float
     reasons: list[str]
     signal_counts: dict[str, int]
+    content_sha256: str = ""
 
 
 @dataclass

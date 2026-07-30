@@ -20,6 +20,7 @@ future AgentConfig-validation early-yield branch.
 from __future__ import annotations
 
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
@@ -410,6 +411,10 @@ class _AgentConfigAuxiliaries:
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"]
     compaction_profile: Literal["conversation", "coding", "research", "support"]
     compaction_protected_recent_messages: int
+    compaction_anchor_enabled: bool
+    compaction_fallback_summary_max_tokens: int
+    compaction_previous_summary_max_tokens: int
+    compaction_total_summary_max_tokens: int
     # Agent-token-cfg-derived
     tool_result_projection_max_inline_chars: int
     tool_result_fresh_diagnostic_policy_enabled: bool
@@ -638,6 +643,10 @@ class AgentBootstrapStageInput:
         default=None,
         repr=False,
     )
+    compaction_identity_provider: Callable[[], Awaitable[int | None]] | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -862,6 +871,17 @@ class AgentBootstrapStage:
             flush_compaction_safety_mode=aux.flush_compaction_safety_mode,
             compaction_profile=aux.compaction_profile,
             compaction_protected_recent_messages=(aux.compaction_protected_recent_messages),
+            compaction_anchor_enabled=aux.compaction_anchor_enabled,
+            compaction_fallback_summary_max_tokens=(
+                aux.compaction_fallback_summary_max_tokens
+            ),
+            compaction_previous_summary_max_tokens=(
+                aux.compaction_previous_summary_max_tokens
+            ),
+            compaction_total_summary_max_tokens=(
+                aux.compaction_total_summary_max_tokens
+            ),
+            compaction_identity_provider=inp.compaction_identity_provider,
             flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
             thinking=aux.thinking,

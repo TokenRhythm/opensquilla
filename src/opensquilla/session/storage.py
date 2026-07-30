@@ -567,6 +567,7 @@ CREATE TABLE IF NOT EXISTS compacted_transcript_entries (
     session_key TEXT NOT NULL,
     compaction_id TEXT,
     compaction_index INTEGER,
+    compaction_anchor_id TEXT,
     original_entry_id INTEGER,
     message_id TEXT NOT NULL,
     role TEXT NOT NULL,
@@ -602,6 +603,11 @@ CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_cursor
 ON compacted_transcript_entries(session_id, created_at, original_entry_id, id)
 """
 
+_CREATE_IDX_COMPACTED_ANCHOR_LOOKUP = """
+CREATE INDEX IF NOT EXISTS idx_compacted_anchor_lookup
+ON compacted_transcript_entries(session_id, compaction_index, compaction_anchor_id)
+"""
+
 _CREATE_IDX_COMPACTED_TRANSCRIPT_COMPACTION = """
 CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_compaction
 ON compacted_transcript_entries(session_id, compaction_id)
@@ -634,6 +640,51 @@ CREATE TRIGGER IF NOT EXISTS transcript_fts_au AFTER UPDATE ON transcript_entrie
 END
 """
 
+# ── FTS5 for archived (compacted) transcript entries ──────────────────────
+# Mirrors the transcript_fts pattern so that entries moved to
+# compacted_transcript_entries during compaction remain full-text searchable.
+
+_CREATE_COMPACTED_TRANSCRIPT_FTS = """
+CREATE VIRTUAL TABLE IF NOT EXISTS compacted_transcript_fts
+USING fts5(content, content=compacted_transcript_entries, content_rowid=id)
+"""
+
+_CREATE_COMPACTED_FTS_TRIGGER_INSERT = """
+CREATE TRIGGER IF NOT EXISTS compacted_transcript_fts_ai
+AFTER INSERT ON compacted_transcript_entries BEGIN
+    INSERT INTO compacted_transcript_fts(rowid, content)
+    VALUES (new.id, new.content);
+END
+"""
+
+_CREATE_COMPACTED_FTS_TRIGGER_DELETE = """
+CREATE TRIGGER IF NOT EXISTS compacted_transcript_fts_ad
+AFTER DELETE ON compacted_transcript_entries BEGIN
+    INSERT INTO compacted_transcript_fts(compacted_transcript_fts, rowid, content)
+    VALUES ('delete', old.id, old.content);
+END
+"""
+
+_CREATE_COMPACTED_FTS_TRIGGER_UPDATE = """
+CREATE TRIGGER IF NOT EXISTS compacted_transcript_fts_au
+AFTER UPDATE ON compacted_transcript_entries BEGIN
+    INSERT INTO compacted_transcript_fts(compacted_transcript_fts, rowid, content)
+    VALUES ('delete', old.id, old.content);
+    INSERT INTO compacted_transcript_fts(rowid, content)
+    VALUES (new.id, new.content);
+END
+"""
+
+_CREATE_SESSION_STORAGE_META = """
+CREATE TABLE IF NOT EXISTS session_storage_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+"""
+
+_COMPACTED_FTS_BACKFILL_KEY = "compacted_transcript_fts_backfill"
+_COMPACTED_FTS_BACKFILL_VERSION = "1"
+
 _CREATE_SUMMARIES = """
 CREATE TABLE IF NOT EXISTS session_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -655,6 +706,7 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     kept_count INTEGER NOT NULL DEFAULT 0,
     chunk_count INTEGER NOT NULL DEFAULT 0,
     flush_receipt_status TEXT NOT NULL DEFAULT 'unknown',
+    extracted_anchors TEXT,
     covered_through_id INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1
@@ -1054,6 +1106,7 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         "summary_payload",
         "missing_obligations",
         "critical_carry_forward",
+        "extracted_anchors",
         "payload",
         "steps",
         "step_states",
@@ -1565,6 +1618,8 @@ class SessionStorage:
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
         await self._migrate_memory_durable_receipt_coverage_columns()
+        await self._migrate_compacted_transcript_fts()
+        await self._migrate_compaction_anchor_columns()
         await self._conn.execute(_CREATE_IDX_MEMORY_DURABLE_RECEIPTS_COVERAGE)
         # Recency index for list_sessions / title search. Guarded on the column
         # because a very old (pre-updated_at) sessions table can survive here
@@ -1905,6 +1960,96 @@ class SessionStorage:
                 changed = True
         if changed:
             await self._conn.commit()
+
+    async def _migrate_compacted_transcript_fts(self) -> None:
+        """Idempotently create FTS5 index for archived transcript entries.
+
+        Creates the ``compacted_transcript_fts`` virtual table and its
+        auto-sync triggers, then backfills any rows already present in
+        ``compacted_transcript_entries``.  Safe to call on every startup.
+        """
+        assert self._conn is not None
+        await self._conn.execute(_CREATE_SESSION_STORAGE_META)
+        async with self._conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'compacted_transcript_fts'"
+        ) as cur:
+            fts_existed = await cur.fetchone() is not None
+        await self._conn.execute(_CREATE_COMPACTED_TRANSCRIPT_FTS)
+        await self._conn.execute(_CREATE_COMPACTED_FTS_TRIGGER_INSERT)
+        await self._conn.execute(_CREATE_COMPACTED_FTS_TRIGGER_DELETE)
+        await self._conn.execute(_CREATE_COMPACTED_FTS_TRIGGER_UPDATE)
+        async with self._conn.execute(
+            "SELECT value FROM session_storage_meta WHERE key = ?",
+            (_COMPACTED_FTS_BACKFILL_KEY,),
+        ) as cur:
+            marker = await cur.fetchone()
+        if (
+            not fts_existed
+            or marker is None
+            or marker[0] != _COMPACTED_FTS_BACKFILL_VERSION
+        ):
+            # External-content FTS cannot use COUNT(*) as a backfill guard.
+            # Persist a migration marker so the O(history) rebuild runs once.
+            await self._conn.execute(
+                "INSERT INTO compacted_transcript_fts(compacted_transcript_fts) "
+                "VALUES ('rebuild')"
+            )
+            await self._conn.execute(
+                "INSERT OR REPLACE INTO session_storage_meta(key, value) "
+                "VALUES (?, ?)",
+                (
+                    _COMPACTED_FTS_BACKFILL_KEY,
+                    _COMPACTED_FTS_BACKFILL_VERSION,
+                ),
+            )
+        await self._conn.commit()
+
+    async def _migrate_compaction_anchor_columns(self) -> None:
+        """Idempotently add compaction anchor columns (D12).
+
+        Legacy databases can predate both ``compaction_index`` columns even
+        though current fresh schemas include them. Add those columns before
+        creating the anchor lookup index, then add the D12 anchor metadata.
+        Safe to call on every startup.
+        """
+        assert self._conn is not None
+        async with self._conn.execute(
+            "PRAGMA table_info(compacted_transcript_entries)"
+        ) as cur:
+            cte_columns = {row[1] for row in await cur.fetchall()}
+        cte_additions = {
+            "compaction_index": (
+                "ALTER TABLE compacted_transcript_entries "
+                "ADD COLUMN compaction_index INTEGER"
+            ),
+            "compaction_anchor_id": (
+                "ALTER TABLE compacted_transcript_entries "
+                "ADD COLUMN compaction_anchor_id TEXT"
+            ),
+        }
+        for column, sql in cte_additions.items():
+            if column not in cte_columns:
+                await self._conn.execute(sql)
+
+        async with self._conn.execute("PRAGMA table_info(session_summaries)") as cur:
+            ss_columns = {row[1] for row in await cur.fetchall()}
+        summary_additions = {
+            "compaction_index": (
+                "ALTER TABLE session_summaries "
+                "ADD COLUMN compaction_index INTEGER NOT NULL DEFAULT 0"
+            ),
+            "extracted_anchors": (
+                "ALTER TABLE session_summaries ADD COLUMN extracted_anchors TEXT"
+            ),
+        }
+        for column, sql in summary_additions.items():
+            if column not in ss_columns:
+                await self._conn.execute(sql)
+
+        # Composite lookup index
+        await self._conn.execute(_CREATE_IDX_COMPACTED_ANCHOR_LOOKUP)
+        await self._conn.commit()
 
     @property
     def conn(self) -> Any:
@@ -7289,6 +7434,7 @@ class SessionStorage:
                 session_key,
                 compaction_id,
                 compaction_index,
+                compaction_anchor_id,
                 original_entry_id,
                 message_id,
                 role,
@@ -7313,6 +7459,7 @@ class SessionStorage:
                 ?,
                 compaction_id,
                 compaction_index,
+                compaction_anchor_id,
                 original_entry_id,
                 message_id,
                 role,
@@ -7336,6 +7483,82 @@ class SessionStorage:
             ORDER BY created_at ASC, original_entry_id ASC, id ASC
                 """,
                 (target_session_id, target_session_key, source_session_id),
+            )
+
+    async def create_full_fork(
+        self,
+        *,
+        source_session_id: str,
+        child: SessionNode,
+    ) -> None:
+        """Atomically copy all SQLite-backed lineage and create the child row."""
+        child.session_key = canonicalize_session_key(child.session_key)
+        child.agent_id = normalize_agent_id(child.agent_id)
+        async with self._write_transaction("create_full_fork") as conn:
+            for table in (
+                "compacted_transcript_entries",
+                "transcript_entries",
+                "session_summaries",
+                "session_context_states",
+            ):
+                async with conn.execute(f'PRAGMA table_info("{table}")') as cur:
+                    table_info = await cur.fetchall()
+                columns = [str(row["name"]) for row in table_info if row["name"] != "id"]
+                quoted_columns = ", ".join(f'"{column}"' for column in columns)
+                select_expressions: list[str] = []
+                parameters: list[Any] = []
+                for column in columns:
+                    if column == "session_id":
+                        select_expressions.append("?")
+                        parameters.append(child.session_id)
+                    elif column == "session_key":
+                        select_expressions.append("?")
+                        parameters.append(child.session_key)
+                    else:
+                        select_expressions.append(f'"{column}"')
+                parameters.append(source_session_id)
+                await conn.execute(
+                    f'INSERT INTO "{table}" ({quoted_columns}) '
+                    f"SELECT {', '.join(select_expressions)} "
+                    f'FROM "{table}" WHERE session_id = ?',
+                    parameters,
+                )
+
+            data = child.model_dump()
+            columns = list(data)
+            placeholders = ", ".join("?" for _ in columns)
+            values = [_serialize(data[column]) for column in columns]
+            await conn.execute(
+                f"INSERT INTO sessions ({', '.join(columns)}) VALUES ({placeholders})",
+                values,
+            )
+
+    async def create_prefix_fork(
+        self,
+        *,
+        child: SessionNode,
+        entries: list[TranscriptEntry],
+    ) -> None:
+        """Atomically create a child and its active canonical prefix."""
+        child.session_key = canonicalize_session_key(child.session_key)
+        child.agent_id = normalize_agent_id(child.agent_id)
+        async with self._write_transaction("create_prefix_fork") as conn:
+            for entry in entries:
+                entry.session_id = child.session_id
+                entry.session_key = child.session_key
+                await self._insert_transcript_entry(
+                    conn,
+                    entry,
+                    expected_epoch=None,
+                )
+
+            data = child.model_dump()
+            columns = list(data)
+            placeholders = ", ".join("?" for _ in columns)
+            values = [_serialize(data[column]) for column in columns]
+            await conn.execute(
+                f"INSERT INTO sessions ({', '.join(columns)}) VALUES ({placeholders})",
+                values,
             )
 
     @_serialized_read
@@ -7493,16 +7716,26 @@ class SessionStorage:
 
     # ── SessionSummary CRUD ──────────────────────────────────────────────────
 
-    async def save_summary(self, summary: SessionSummary) -> SessionSummary:
-        """Persist a compaction summary. Sets compaction_index automatically."""
+    async def save_summary(
+        self,
+        summary: SessionSummary,
+        *,
+        preserve_compaction_index: bool = False,
+    ) -> SessionSummary:
+        """Persist a compaction summary.
+
+        Normal writes allocate the next index. Full-session forks preserve the
+        parent's index so summary anchors keep referring to the copied archive.
+        """
         _next_idx_sql = (
             "SELECT COALESCE(MAX(compaction_index), -1) + 1 "
             "FROM session_summaries WHERE session_id = ?"
         )
         async with self._write_transaction("save_summary") as conn:
-            async with conn.execute(_next_idx_sql, (summary.session_id,)) as cur:
-                row = await cur.fetchone()
-            summary.compaction_index = row[0] if row else 0
+            if not preserve_compaction_index:
+                async with conn.execute(_next_idx_sql, (summary.session_id,)) as cur:
+                    row = await cur.fetchone()
+                summary.compaction_index = row[0] if row else 0
 
             data = summary.model_dump(exclude={"id"})
             cols = list(data.keys())
@@ -7515,6 +7748,17 @@ class SessionStorage:
                 summary.id = cur.lastrowid
         return summary
 
+    @_serialized_read
+    async def get_next_compaction_index(self, session_id: str) -> int:
+        """Return the database-owned ordinal for the next compaction."""
+        async with self.conn.execute(
+            "SELECT COALESCE(MAX(compaction_index), -1) + 1 "
+            "FROM session_summaries WHERE session_id = ?",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
     async def _archive_transcript_entries(
         self,
         *,
@@ -7522,11 +7766,22 @@ class SessionStorage:
         entries: list[TranscriptEntry],
         compaction_id: str | None,
         compaction_index: int | None,
+        anchor_enabled: bool = False,
     ) -> None:
         if not entries:
             return
         archived_at = _now_ms()
-        for entry in entries:
+        # When anchor_enabled, sort by (created_at, id) for stable anchor IDs.
+        # NOTE (A4): The compaction LLM sees entries in original list order with
+        # anchor_base offsets.  If the input list is not already sorted by
+        # (created_at, id), the DB anchor IDs will differ from what the LLM
+        # referenced.  Callers MUST pass entries in chronological order.
+        sorted_entries = (
+            sorted(entries, key=lambda e: (e.created_at or 0, e.id or 0))
+            if anchor_enabled
+            else entries
+        )
+        for idx, entry in enumerate(sorted_entries):
             entry_data = entry.model_dump(exclude={"id"})
             entry_data["session_id"] = node.session_id
             entry_data["session_key"] = node.session_key
@@ -7535,6 +7790,7 @@ class SessionStorage:
                 "session_key": entry_data.pop("session_key"),
                 "compaction_id": compaction_id,
                 "compaction_index": compaction_index,
+                "compaction_anchor_id": f"entry_{idx:03d}" if anchor_enabled else None,
                 "original_entry_id": entry.id,
                 **entry_data,
                 "archived_at": archived_at,
@@ -7556,6 +7812,9 @@ class SessionStorage:
         entries: list[TranscriptEntry],
         context_states: list[SessionContextState] | None = None,
         archived_entries: list[TranscriptEntry] | None = None,
+        anchor_enabled: bool = False,
+        extracted_anchors: list[dict[str, Any]] | None = None,
+        expected_compaction_index: int | None = None,
     ) -> None:
         """Atomically persist a compaction rewrite for one session."""
         node.session_key = canonicalize_session_key(node.session_key)
@@ -7571,7 +7830,19 @@ class SessionStorage:
                     (summary.session_id,),
                 ) as cur:
                     row = await cur.fetchone()
-                summary.compaction_index = row[0] if row else 0
+                allocated_compaction_index = int(row[0]) if row else 0
+                if (
+                    expected_compaction_index is not None
+                    and allocated_compaction_index != expected_compaction_index
+                ):
+                    raise RuntimeError(
+                        "Compaction identity changed before persistence: "
+                        f"expected {expected_compaction_index}, "
+                        f"allocated {allocated_compaction_index}"
+                    )
+                summary.compaction_index = allocated_compaction_index
+                if extracted_anchors is not None:
+                    summary.extracted_anchors = extracted_anchors
 
             await self._archive_transcript_entries(
                 node=node,
@@ -7580,6 +7851,7 @@ class SessionStorage:
                 compaction_index=summary.compaction_index
                 if summary is not None
                 else None,
+                anchor_enabled=anchor_enabled,
             )
 
             await conn.execute(
@@ -7848,18 +8120,69 @@ class SessionStorage:
     @_serialized_read
     async def search_transcript(
         self,
-        query: str,
+        query: str | None = None,
         session_id: str | None = None,
         limit: int = 20,
+        *,
+        include_archived: bool = True,
+        anchor: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Full-text search across transcript entries.
+        """Full-text search across transcript entries, or exact anchor lookup.
 
-        Returns dicts with: id, session_key, role, snippet, created_at.
+        When *anchor* is provided (format ``"<compaction_index>:<entry_anchor_id>"``),
+        performs an exact lookup in ``compacted_transcript_entries`` by
+        ``(session_id, compaction_index, compaction_anchor_id)`` and returns the
+        full original entry.  *session_id* is required in anchor mode.
+
+        Otherwise searches the active transcript first, then (when
+        *include_archived* is True and fewer than *limit* results were found)
+        fills remaining slots from the archived table.
+
+        Returns dicts with: id, session_key, role, snippet, created_at, source.
+        ``source`` is ``"active"`` or ``"archived"``.
         """
+        # ── Anchor exact-lookup mode (D12) ──
+        if anchor:
+            if not session_id:
+                raise ValueError("anchor lookup requires session_id")
+            parts = anchor.split(":", 1)
+            if len(parts) != 2:
+                raise ValueError(f"invalid anchor format: {anchor!r}")
+            compaction_index_str, entry_anchor_id = parts
+            try:
+                compaction_index = int(compaction_index_str)
+            except ValueError:
+                raise ValueError(
+                    f"invalid compaction_index in anchor: {anchor!r}"
+                ) from None
+            sql = (
+                "SELECT id, session_key, role, created_at, content AS snippet, "
+                "tool_calls, tool_call_id, reasoning_content "
+                "FROM compacted_transcript_entries "
+                "WHERE session_id = ? "
+                "AND compaction_index = ? "
+                "AND compaction_anchor_id = ? "
+                "ORDER BY created_at "
+                "LIMIT ?"
+            )
+            async with self.conn.execute(
+                sql, [session_id, compaction_index, entry_anchor_id, limit]
+            ) as cur:
+                rows = await cur.fetchall()
+            results: list[dict[str, Any]] = [dict(r) for r in rows]
+            for r in results:
+                r["source"] = "archived"
+                r["anchor"] = anchor
+            return results
+
+        # ── FTS mode (original) ──
+        if not query:
+            return []
         safe_q = self.sanitize_fts_query(query)
         if safe_q == '""':
             return []
 
+        # ── Active transcript search ──
         if session_id:
             sql = (
                 "SELECT t.id, t.session_key, t.role, t.created_at, "
@@ -7883,7 +8206,42 @@ class SessionStorage:
 
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+        results = [dict(r) for r in rows]
+        for r in results:
+            r["source"] = "active"
+
+        # ── Archived (compacted) transcript search ──
+        if include_archived and len(results) < limit:
+            remaining = limit - len(results)
+            if session_id:
+                arch_sql = (
+                    "SELECT c.id, c.session_key, c.role, c.created_at, "
+                    "snippet(compacted_transcript_fts, 0, '>>>', '<<<', '...', 48) AS snippet "
+                    "FROM compacted_transcript_fts f "
+                    "JOIN compacted_transcript_entries c ON f.rowid = c.id "
+                    "WHERE f.content MATCH ? AND c.session_id = ? "
+                    "ORDER BY f.rank LIMIT ?"
+                )
+                arch_params: list[Any] = [safe_q, session_id, remaining]
+            else:
+                arch_sql = (
+                    "SELECT c.id, c.session_key, c.role, c.created_at, "
+                    "snippet(compacted_transcript_fts, 0, '>>>', '<<<', '...', 48) AS snippet "
+                    "FROM compacted_transcript_fts f "
+                    "JOIN compacted_transcript_entries c ON f.rowid = c.id "
+                    "WHERE f.content MATCH ? "
+                    "ORDER BY f.rank LIMIT ?"
+                )
+                arch_params = [safe_q, remaining]
+
+            async with self.conn.execute(arch_sql, arch_params) as cur:
+                arch_rows = await cur.fetchall()
+            for r in arch_rows:
+                d = dict(r)
+                d["source"] = "archived"
+                results.append(d)
+
+        return results[:limit]
 
     @staticmethod
     def _like_escape(raw: str) -> str:
@@ -7968,6 +8326,8 @@ class SessionStorage:
         query: str,
         session_id: str | None = None,
         limit: int = 20,
+        *,
+        include_archived: bool = True,
     ) -> list[dict[str, Any]]:
         """Substring content search for queries the FTS tokenizer can't handle.
 
@@ -7977,15 +8337,19 @@ class SessionStorage:
         must appear in the content, so mixed/multi-word queries match all terms;
         cased non-ASCII scripts fold via ``py_lower`` (caseless CJK skips it for
         speed). The handler only reaches this for non-ASCII queries (ASCII stays
-        on the indexed FTS path). Returns the same shape as ``search_transcript``.
+        on the indexed FTS path). Returns the same shape as ``search_transcript``
+        including the ``source`` provenance key.
         """
         tokens = self._like_tokens(query)
         if not tokens:
             return []
         col = "py_lower(content)" if self._needs_unicode_fold(query) else "content"
         clauses = [f"{col} LIKE ? ESCAPE '\\'" for _ in tokens]
-        params: list[Any] = list(tokens)
+        first_term = query.split()[0]
+
+        # ── Active transcript ──
         where = " AND ".join(clauses)
+        params: list[Any] = list(tokens)
         if session_id:
             where += " AND session_id = ?"
             params.append(session_id)
@@ -7997,8 +8361,6 @@ class SessionStorage:
         )
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
-        # Snippet highlights the first term; the others are guaranteed present too.
-        first_term = query.split()[0]
         out: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
@@ -8009,9 +8371,40 @@ class SessionStorage:
                     "role": d.get("role"),
                     "created_at": d.get("created_at"),
                     "snippet": self._make_snippet(str(d.get("content") or ""), first_term),
+                    "source": "active",
                 }
             )
-        return out
+
+        # ── Archived (compacted) transcript ──
+        if include_archived and len(out) < limit:
+            remaining = limit - len(out)
+            arch_where = " AND ".join(clauses)
+            arch_params: list[Any] = list(tokens)
+            if session_id:
+                arch_where += " AND session_id = ?"
+                arch_params.append(session_id)
+            arch_params.append(remaining)
+            arch_sql = (
+                "SELECT id, session_key, role, content, created_at "
+                f"FROM compacted_transcript_entries WHERE {arch_where} "
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+            async with self.conn.execute(arch_sql, arch_params) as cur:
+                arch_rows = await cur.fetchall()
+            for r in arch_rows:
+                d = dict(r)
+                out.append(
+                    {
+                        "id": d.get("id"),
+                        "session_key": d.get("session_key"),
+                        "role": d.get("role"),
+                        "created_at": d.get("created_at"),
+                        "snippet": self._make_snippet(str(d.get("content") or ""), first_term),
+                        "source": "archived",
+                    }
+                )
+
+        return out[:limit]
 
     async def __aenter__(self) -> SessionStorage:
         await self.connect()

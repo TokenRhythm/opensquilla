@@ -52,6 +52,7 @@ def _entry_from_dict(raw: dict[str, Any]) -> PromotionEvidenceEntry | None:
             claim_sha256=str(raw.get("claim_sha256") or ""),
             first_seen_at=str(raw.get("first_seen_at") or ""),
             last_seen_at=str(raw.get("last_seen_at") or ""),
+            content_sha256=str(raw.get("content_sha256") or ""),
             seen_count=max(0, int(raw.get("seen_count") or 0)),
             positive_signal_count=max(0, int(raw.get("positive_signal_count") or 0)),
             correction_signal_count=max(0, int(raw.get("correction_signal_count") or 0)),
@@ -161,6 +162,7 @@ def update_promotion_evidence(
                 claim_sha256=claim_sha,
                 first_seen_at=now_iso,
                 last_seen_at=now_iso,
+                content_sha256=candidate.content_sha256 or snippet_sha,
                 seen_count=0,
                 source_days=[],
             )
@@ -172,6 +174,7 @@ def update_promotion_evidence(
         entry.source_size = candidate.source_size
         entry.snippet = snippet
         entry.snippet_sha256 = snippet_sha
+        entry.content_sha256 = candidate.content_sha256 or snippet_sha
         entry.claim_sha256 = claim_sha
         entry.seen_count += 1
         if candidate.source_day and candidate.source_day not in entry.source_days:
@@ -199,6 +202,7 @@ def mark_evidence_skipped(
 ) -> None:
     entry = store.entries.get(candidate_id)
     if entry is not None:
+        entry.status = "skipped"
         entry.last_skip_reason = reason
 
 

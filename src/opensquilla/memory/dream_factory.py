@@ -115,6 +115,7 @@ def build_dream_factory(
     turn_runner: Any | None = None,
     workspace_for_agent: Callable[[str], Path] | None = None,
     need_provider: bool = True,
+    memory_stores: dict[str, Any] | None = None,
 ) -> Callable[[str], Dream]:
     """Return ``build_dream(agent_id)`` wired to gateway/CLI dependencies."""
     dream_cfg = getattr(getattr(config, "memory", None), "dream", None)
@@ -139,6 +140,7 @@ def build_dream_factory(
             session_lock=_session_lock_for(turn_runner, agent_id),
             config=dream_cfg,
             agent_id=agent_id,
+            memory_store=(memory_stores or {}).get(agent_id),
         )
 
     return build_dream

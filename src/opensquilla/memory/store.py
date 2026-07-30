@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import json
@@ -16,6 +17,12 @@ import structlog
 
 from opensquilla.compat import aiosqlite
 
+from .constraint_classifier import (
+    LlmCallFn,
+    classify_constraint,
+    classify_constraint_sync,
+    parse_frontmatter_constraint,
+)
 from .embedding import (
     EmbeddingProvider,
     NullEmbeddingProvider,
@@ -31,12 +38,15 @@ from .types import (
     LEXICAL_GUARANTEE_METADATA_VALUE,
     RELAXED_KEYWORD_MATCH_METADATA_KEY,
     RELAXED_KEYWORD_MATCH_METADATA_VALUE,
+    ConstraintType,
     MemorySearchResult,
     MemorySource,
     SearchMode,
 )
 
 logger = structlog.get_logger(__name__)
+_CONSTRAINT_CLASSIFICATION_TIMEOUT_SECONDS = 30.0
+_CONSTRAINT_CLASSIFICATION_BATCH_SIZE = 64
 
 _JIEBA_WARNED = False
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
@@ -119,6 +129,17 @@ CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
 CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);
 """
 
+DDL_CHUNK_USAGE = """
+CREATE TABLE IF NOT EXISTS chunk_usage (
+    chunk_id TEXT NOT NULL,
+    intent TEXT NOT NULL DEFAULT 'general',
+    recall_count INTEGER NOT NULL DEFAULT 0,
+    last_recalled_at REAL,
+    PRIMARY KEY (chunk_id, intent)
+);
+CREATE INDEX IF NOT EXISTS idx_chunk_usage_chunk ON chunk_usage(chunk_id);
+"""
+
 
 def _float_list_to_blob(floats: list[float]) -> bytes:
     return struct.pack(f"{len(floats)}f", *floats)
@@ -189,6 +210,8 @@ class LongTermMemoryStore:
         db_path: str | Path,
         embedding_provider: EmbeddingProvider | None = None,
         query_embedding_cache_mode: str = "on",
+        constraint_annotation_enabled: bool = False,
+        constraint_llm_call: LlmCallFn | None = None,
     ) -> None:
         self._db_path = str(db_path)
         self._provider: EmbeddingProvider = embedding_provider or NullEmbeddingProvider()
@@ -196,7 +219,15 @@ class LongTermMemoryStore:
         self._vec_available = False
         self._fts_available = False
         self._db: aiosqlite.Connection | None = None
+        self._write_lock = asyncio.Lock()
         self._dirty = False
+        self._constraint_annotation_enabled = constraint_annotation_enabled
+        # A1-3: LLM call for tiered escalation classification in index_file.
+        # None → falls back to heuristic-only (classify_constraint_sync).
+        self._constraint_llm_call = constraint_llm_call
+        self._constraint_classification_cache: dict[
+            str, tuple[ConstraintType, float | None]
+        ] = {}
         self._embedding_usage: dict[str, Any] = _zero_embedding_usage(self._provider)
 
     async def initialize(self) -> None:
@@ -266,6 +297,14 @@ class LongTermMemoryStore:
             fts_tokenizer="unicode61",
             sources=["memory", "sessions"],
             provider_fingerprint=self._provider_fingerprint(),
+            constraint_annotation_version=(
+                "v1-llm"
+                if self._constraint_annotation_enabled
+                and self._constraint_llm_call is not None
+                else "v1-heuristic"
+                if self._constraint_annotation_enabled
+                else "off"
+            ),
         )
 
         async with self._db.execute(
@@ -283,6 +322,7 @@ class LongTermMemoryStore:
             )
             # Clear all indexed data so next file sync rebuilds from disk.
             await self._db.execute("DELETE FROM chunks_fts")
+            await self._db.execute("DELETE FROM chunk_usage")
             await self._db.execute("DELETE FROM chunks")
             await self._db.execute("DELETE FROM files")
             if self._vec_available:
@@ -396,6 +436,7 @@ class LongTermMemoryStore:
         await self._db.execute(DDL_EMBEDDING_CACHE)
         await self._db.execute(DDL_META)
         await self._migrate_schema_version_columns()
+        await self._ensure_constraint_columns()
 
         # Migrate old external-content FTS to contentless mode
         async with self._db.execute(
@@ -407,6 +448,13 @@ class LongTermMemoryStore:
             await self._db.execute("DROP TABLE chunks_fts")
 
         await self._db.execute(DDL_FTS)
+
+        # D11: Usage tracking table (always created, gated by feature flag at write time)
+        await self._db.executescript(DDL_CHUNK_USAGE)
+        await self._db.execute(
+            "DELETE FROM chunk_usage "
+            "WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+        )
 
         # --- Schema version check ---
         async with self._db.execute("SELECT value FROM meta WHERE key = ?", (META_KEY,)) as cur:
@@ -422,6 +470,7 @@ class LongTermMemoryStore:
             await self._db.execute("DROP TABLE IF EXISTS chunks")
             await self._db.execute("DROP TABLE IF EXISTS files")
             await self._db.execute("DROP TABLE IF EXISTS embedding_cache")
+            await self._db.execute("DELETE FROM chunk_usage")
             try:
                 await self._db.execute("DROP TABLE IF EXISTS chunks_vec")
             except Exception:
@@ -487,6 +536,130 @@ class LongTermMemoryStore:
             )
         await self._db.commit()
 
+    async def _ensure_constraint_columns(self) -> None:
+        """Idempotently add constraint_type and constraint_confidence columns (L1).
+
+        Columns are always present (nullable with defaults) so that enabling
+        constraint_annotation later does not require a separate migration.
+        """
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(chunks)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        if not columns:
+            return
+        if "constraint_type" not in columns:
+            await self._db.execute(
+                "ALTER TABLE chunks ADD COLUMN constraint_type TEXT DEFAULT 'fact'"
+            )
+        if "constraint_confidence" not in columns:
+            await self._db.execute(
+                "ALTER TABLE chunks ADD COLUMN constraint_confidence REAL"
+            )
+        await self._db.commit()
+
+    # ── D11: Usage Tracking ──────────────────────────────────────────────
+
+    async def record_chunk_usage(
+        self, chunk_ids: list[str], intent: str = "general"
+    ) -> None:
+        """Increment recall count for chunks. Best-effort, never raises.
+
+        Called by MemoryRetriever.search() after returning results.
+        Uses a single transaction for all chunk_ids (batch upsert).
+        """
+        if not chunk_ids or self._db is None:
+            return
+        now = time.time()
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                for cid in chunk_ids:
+                    await self._db.execute(
+                        "INSERT INTO chunk_usage (chunk_id, intent, recall_count, last_recalled_at)"
+                        " SELECT ?, ?, 1, ?"
+                        " WHERE EXISTS (SELECT 1 FROM chunks WHERE id = ?)"
+                        " ON CONFLICT(chunk_id, intent) DO UPDATE SET"
+                        " recall_count = recall_count + 1, last_recalled_at = ?",
+                        (cid, intent, now, cid, now),
+                    )
+                await self._db.commit()
+            except BaseException as exc:
+                try:
+                    await self._db.rollback()
+                except BaseException:
+                    pass
+                if not isinstance(exc, Exception):
+                    raise
+                logger.debug("chunk_usage_record_failed", exc_info=True)
+
+    async def get_usage_stats(self, paths: list[str]) -> dict[str, dict]:
+        """Aggregate chunk_usage by file path for Dream consumption.
+
+        Returns {path: {total_recalls, intent_diversity, last_recalled_at}}.
+        """
+        if not paths or self._db is None:
+            return {}
+        try:
+            placeholders = ",".join("?" for _ in paths)
+            query = (
+                f"SELECT c.path, SUM(cu.recall_count), COUNT(DISTINCT cu.intent),"
+                f" MAX(cu.last_recalled_at)"
+                f" FROM chunk_usage cu"
+                f" JOIN chunks c ON c.id = cu.chunk_id"
+                f" WHERE c.path IN ({placeholders})"
+                f" GROUP BY c.path"
+            )
+            async with self._write_lock:
+                async with self._db.execute(query, paths) as cur:
+                    rows = await cur.fetchall()
+            return {
+                row[0]: {
+                    "total_recalls": int(row[1] or 0),
+                    "intent_diversity": int(row[2] or 0),
+                    "last_recalled_at": float(row[3]) if row[3] else None,
+                }
+                for row in rows
+            }
+        except Exception:
+            logger.debug("chunk_usage_stats_failed", exc_info=True)
+            return {}
+
+    async def get_dominant_constraint_types(
+        self, paths: list[str]
+    ) -> dict[str, str]:
+        """Return the dominant constraint_type per file path.
+
+        Dominant = the type with the highest total constraint_confidence
+        across all chunks in that file. Ties broken alphabetically.
+        Returns {} on error (best-effort).
+        """
+        if not paths or self._db is None:
+            return {}
+        try:
+            placeholders = ",".join("?" for _ in paths)
+            query = (
+                f"SELECT path, constraint_type,"
+                f" SUM(COALESCE(constraint_confidence, 0)) as total_conf"
+                f" FROM chunks"
+                f" WHERE path IN ({placeholders})"
+                f" AND constraint_confidence IS NOT NULL"
+                f" GROUP BY path, constraint_type"
+                f" ORDER BY path, total_conf DESC, constraint_type ASC"
+            )
+            async with self._write_lock:
+                async with self._db.execute(query, paths) as cur:
+                    rows = await cur.fetchall()
+            # First row per path has highest total_conf (ORDER BY)
+            result: dict[str, str] = {}
+            for row in rows:
+                path, ctype = row[0], row[1]
+                if path not in result:
+                    result[path] = ctype
+            return result
+        except Exception:
+            logger.debug("dominant_constraint_types_failed", exc_info=True)
+            return {}
+
     async def _probe_vec_extension(self) -> None:
         """Attempt to load sqlite-vec extension."""
         assert self._db is not None
@@ -510,15 +683,16 @@ class LongTermMemoryStore:
     async def _ensure_vec_table(self, dims: int) -> None:
         """Create or verify the vec virtual table with correct dimensions."""
         assert self._db is not None
-        await self._db.execute(
-            f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-                id TEXT PRIMARY KEY,
-                embedding FLOAT[{dims}]
+        async with self._write_lock:
+            await self._db.execute(
+                f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding FLOAT[{dims}]
+                )
+                """
             )
-            """
-        )
-        await self._db.commit()
+            await self._db.commit()
 
     # ------------------------------------------------------------------
     # Embedding cache helpers
@@ -569,14 +743,15 @@ class LongTermMemoryStore:
         provider_id, model, provider_key = self._cache_key_prefix()
         placeholders = ",".join("?" * len(hashes))
         try:
-            async with self._db.execute(
-                f"""SELECT hash, embedding FROM embedding_cache
-                    WHERE provider = ? AND model = ? AND provider_key = ?
-                      AND hash IN ({placeholders})""",
-                (provider_id, model, provider_key, *hashes),
-            ) as cur:
-                rows = await cur.fetchall()
-        except Exception as exc:
+            async with self._write_lock:
+                async with self._db.execute(
+                    f"""SELECT hash, embedding FROM embedding_cache
+                        WHERE provider = ? AND model = ? AND provider_key = ?
+                          AND hash IN ({placeholders})""",
+                    (provider_id, model, provider_key, *hashes),
+                ) as cur:
+                    rows = await cur.fetchall()
+        except BaseException as exc:
             if "no such table" not in str(exc).lower():
                 logger.warning("embedding_cache_lookup_failed", error=str(exc))
             return {}
@@ -612,6 +787,7 @@ class LongTermMemoryStore:
 
         provider_id, model, provider_key = self._cache_key_prefix()
         now = time.time()
+        await self._write_lock.acquire()
         try:
             for h, vec in items:
                 await self._db.execute(
@@ -638,12 +814,16 @@ class LongTermMemoryStore:
             # `cannot start a transaction within a transaction`.
             try:
                 await self._db.rollback()
-            except Exception:
+            except BaseException:
                 pass
+            if not isinstance(exc, Exception):
+                raise
             if "no such table" in str(exc).lower():
                 logger.warning("embedding_cache_table_missing", error=str(exc))
                 return
             logger.warning("embedding_cache_write_failed", error=str(exc))
+        finally:
+            self._write_lock.release()
 
     async def _embed_query_cached(self, query: str) -> list[float]:
         """Embed a search query with the same rebuildable cache used for chunks."""
@@ -681,9 +861,13 @@ class LongTermMemoryStore:
         mtime = mtime or time.time()
         size = len(raw)
 
-        # Check if file changed
-        async with self._db.execute("SELECT hash FROM files WHERE path = ?", (path,)) as cur:
-            row = await cur.fetchone()
+        # Check if file changed without observing another operation's partial
+        # transaction on the shared SQLite connection.
+        async with self._write_lock:
+            async with self._db.execute(
+                "SELECT hash FROM files WHERE path = ?", (path,)
+            ) as cur:
+                row = await cur.fetchone()
             if row and row[0] == file_hash:
                 # Unchanged content — but if a real embedding provider is now
                 # configured and this file has chunks left un-embedded by a
@@ -758,10 +942,96 @@ class LongTermMemoryStore:
             except Exception as e:
                 logger.warning("embedding_failed_fallback_fts", path=path, error=str(e))
 
+        # A1-3: Pre-compute constraint types OUTSIDE the transaction (LLM I/O
+        # must not hold the DB lock). Mirrors the embeddings pattern above.
+        constraint_results: list[tuple[ConstraintType, float | None]] | None = None
+        if self._constraint_annotation_enabled:
+            file_override = parse_frontmatter_constraint(content)
+            if file_override is not None:
+                constraint_results = [
+                    (file_override, 1.0) for _record in chunk_records
+                ]
+            else:
+                classification_slots = asyncio.Semaphore(4)
+                classification_provider_failed = False
+
+                async def _bounded_constraint_llm(prompt: str) -> str:
+                    nonlocal classification_provider_failed
+                    if classification_provider_failed or self._constraint_llm_call is None:
+                        raise RuntimeError("constraint classifier circuit open")
+                    try:
+                        return await asyncio.wait_for(
+                            self._constraint_llm_call(prompt),
+                            timeout=_CONSTRAINT_CLASSIFICATION_TIMEOUT_SECONDS,
+                        )
+                    except Exception:
+                        classification_provider_failed = True
+                        raise
+
+                async def _classify_record(
+                    record: tuple[Any, ...],
+                ) -> tuple[ConstraintType, float | None]:
+                    text_hash = str(record[5])
+                    text = str(record[7])
+                    cached = self._constraint_classification_cache.get(text_hash)
+                    if cached is not None:
+                        return cached
+                    async with classification_slots:
+                        if classification_provider_failed:
+                            result = classify_constraint_sync(text)
+                        else:
+                            result = await classify_constraint(
+                                text,
+                                llm_call=(
+                                    _bounded_constraint_llm
+                                    if self._constraint_llm_call is not None
+                                    else None
+                                ),
+                            )
+                    if len(self._constraint_classification_cache) >= 4096:
+                        oldest = next(iter(self._constraint_classification_cache))
+                        self._constraint_classification_cache.pop(oldest, None)
+                    self._constraint_classification_cache[text_hash] = result
+                    return result
+
+                unique_records: dict[str, tuple[Any, ...]] = {}
+                for record in chunk_records:
+                    unique_records.setdefault(str(record[5]), record)
+                unique_items = list(unique_records.items())
+                classified_by_hash: dict[
+                    str, tuple[ConstraintType, float | None]
+                ] = {}
+                for offset in range(
+                    0,
+                    len(unique_items),
+                    _CONSTRAINT_CLASSIFICATION_BATCH_SIZE,
+                ):
+                    batch = unique_items[
+                        offset : offset + _CONSTRAINT_CLASSIFICATION_BATCH_SIZE
+                    ]
+                    batch_results = await asyncio.gather(
+                        *(_classify_record(record) for _text_hash, record in batch)
+                    )
+                    classified_by_hash.update(
+                        zip(
+                            (text_hash for text_hash, _record in batch),
+                            batch_results,
+                            strict=True,
+                        )
+                    )
+                constraint_results = [
+                    classified_by_hash[str(record[5])] for record in chunk_records
+                ]
+
         # Wrap all SQLite mutations in an explicit transaction so a crash mid-operation
         # leaves the DB in a consistent state (either fully updated or fully rolled back).
-        await self._db.execute("BEGIN IMMEDIATE")
+        await self._write_lock.acquire()
         try:
+            await self._db.execute("BEGIN IMMEDIATE")
+            async with self._db.execute(
+                "SELECT id FROM chunks WHERE path = ?", (path,)
+            ) as cur:
+                old_chunk_ids = {row[0] for row in await cur.fetchall()}
             # Delete old chunks — vec first (needs chunk IDs before they're deleted)
             if self._vec_available:
                 try:
@@ -804,6 +1074,36 @@ class LongTermMemoryStore:
                     except Exception as e:
                         logger.warning("vec_insert_failed", chunk_id=cid, error=str(e))
 
+            # Stable chunk IDs retain their recall history across an edit.
+            # Clean only IDs removed from this path, avoiding a full usage-table
+            # scan for every file in a multi-file sync.
+            removed_ids = list(
+                old_chunk_ids.difference(record[0] for record in chunk_records)
+            )
+            for offset in range(0, len(removed_ids), 500):
+                batch = removed_ids[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                await self._db.execute(
+                    f"DELETE FROM chunk_usage WHERE chunk_id IN ({placeholders})",
+                    batch,
+                )
+
+            # L1: Constraint type annotation (experimental, default off)
+            # A1-3: constraint_results pre-computed BEFORE transaction (see above)
+            if self._constraint_annotation_enabled and constraint_results:
+                for i, (cid, _p, _src, _sl, _el, _h, _mdl, txt, _ts) in enumerate(
+                    chunk_records
+                ):
+                    ct, conf = constraint_results[i]
+                    try:
+                        await self._db.execute(
+                            "UPDATE chunks SET constraint_type=?, constraint_confidence=?"
+                            " WHERE id=?",
+                            (ct.value, conf, cid),
+                        )
+                    except Exception:
+                        logger.debug("constraint_annotation_failed", chunk_id=cid, exc_info=True)
+
             # Upsert file record
             await self._db.execute(
                 """INSERT OR REPLACE INTO files (path, source, hash, mtime, size)
@@ -814,14 +1114,17 @@ class LongTermMemoryStore:
         except BaseException:
             await self._db.rollback()
             raise
+        finally:
+            self._write_lock.release()
 
         self._dirty = False
         return len(chunk_records)
 
     async def remove_file(self, path: str) -> None:
         assert self._db is not None
-        await self._db.execute("BEGIN IMMEDIATE")
+        await self._write_lock.acquire()
         try:
+            await self._db.execute("BEGIN IMMEDIATE")
             # Vec first — needs chunk IDs before they're deleted (same pattern as index_file)
             if self._vec_available:
                 try:
@@ -833,12 +1136,19 @@ class LongTermMemoryStore:
                 except Exception:
                     pass
             await self._db.execute("DELETE FROM chunks_fts WHERE path = ?", (path,))
+            await self._db.execute(
+                "DELETE FROM chunk_usage "
+                "WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?)",
+                (path,),
+            )
             await self._db.execute("DELETE FROM chunks WHERE path = ?", (path,))
             await self._db.execute("DELETE FROM files WHERE path = ?", (path,))
             await self._db.commit()
         except BaseException:
             await self._db.rollback()
             raise
+        finally:
+            self._write_lock.release()
 
     async def rebuild(self) -> None:
         """Clear rebuildable index rows.
@@ -847,15 +1157,17 @@ class LongTermMemoryStore:
         memory sources and derived session sources after this call.
         """
         assert self._db is not None
-        if self._vec_available:
-            try:
-                await self._db.execute("DELETE FROM chunks_vec")
-            except Exception:
-                pass
-        await self._db.execute("DELETE FROM chunks_fts")
-        await self._db.execute("DELETE FROM chunks")
-        await self._db.execute("DELETE FROM files")
-        await self._db.commit()
+        async with self._write_lock:
+            if self._vec_available:
+                try:
+                    await self._db.execute("DELETE FROM chunks_vec")
+                except Exception:
+                    pass
+            await self._db.execute("DELETE FROM chunks_fts")
+            await self._db.execute("DELETE FROM chunk_usage")
+            await self._db.execute("DELETE FROM chunks")
+            await self._db.execute("DELETE FROM files")
+            await self._db.commit()
         self._dirty = True
 
     async def health(self) -> dict[str, Any]:
@@ -872,8 +1184,9 @@ class LongTermMemoryStore:
         healthy = True
         error: str | None = None
         try:
-            await self._db.execute("SELECT 1")
-            source_counts = await self.source_counts()
+            async with self._write_lock:
+                await self._db.execute("SELECT 1")
+                source_counts = await self._source_counts_unlocked()
         except Exception as exc:  # noqa: BLE001
             healthy = False
             error = str(exc)
@@ -893,10 +1206,11 @@ class LongTermMemoryStore:
     async def get_chunk_hashes_for_path(self, path: str) -> list[str]:
         """Return the chunk hashes currently indexed under ``path``."""
         assert self._db is not None
-        async with self._db.execute(
-            "SELECT hash FROM chunks WHERE path = ?", (path,)
-        ) as cur:
-            return [row[0] for row in await cur.fetchall()]
+        async with self._write_lock:
+            async with self._db.execute(
+                "SELECT hash FROM chunks WHERE path = ?", (path,)
+            ) as cur:
+                return [row[0] for row in await cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Search
@@ -922,20 +1236,22 @@ class LongTermMemoryStore:
         if use_vector:
             try:
                 query_vec = await self._embed_query_cached(query)
-                results = await self._hybrid_search(
-                    query,
-                    query_vec,
-                    max_results,
-                    min_score,
-                    vector_weight,
-                    text_weight,
-                    source=source,
-                )
+                async with self._write_lock:
+                    results = await self._hybrid_search(
+                        query,
+                        query_vec,
+                        max_results,
+                        min_score,
+                        vector_weight,
+                        text_weight,
+                        source=source,
+                    )
                 return results, SearchMode.hybrid
             except Exception as e:
                 logger.warning("vector_search_failed_fallback", error=str(e))
 
-        results = await self._fts_search(query, max_results, min_score, source=source)
+        async with self._write_lock:
+            results = await self._fts_search(query, max_results, min_score, source=source)
         return results, SearchMode.fts_only
 
     async def _vector_search(
@@ -988,6 +1304,7 @@ class LongTermMemoryStore:
         try:
             sql = """
             SELECT chunks_fts.id, c.path, c.source, c.start_line, c.end_line, c.text,
+                   c.constraint_type, c.constraint_confidence,
                    bm25(chunks_fts) as rank
             FROM chunks_fts
             JOIN chunks c ON c.id = chunks_fts.id
@@ -1005,8 +1322,13 @@ class LongTermMemoryStore:
             results = []
             relaxed_results = []
             for row in rows:
-                cid, path, source, sl, el, text, rank = row
+                cid, path, source, sl, el, text, ct, cc, rank = row
                 score = _bm25_to_score(rank)
+                _fts_meta: dict[str, str] = {}
+                if ct:
+                    _fts_meta["constraint_type"] = ct
+                if cc is not None:
+                    _fts_meta["constraint_confidence"] = str(cc)
                 result = MemorySearchResult(
                     chunk_id=cid,
                     path=path,
@@ -1017,6 +1339,7 @@ class LongTermMemoryStore:
                     score=score,
                     text_score=score,
                     text=text,
+                    metadata=_fts_meta,
                     citation=f"{path}#L{sl}-L{el}",
                 )
                 relaxed_results.append(result)
@@ -1084,7 +1407,8 @@ class LongTermMemoryStore:
         placeholders = ",".join("?" * len(all_ids))
         assert self._db is not None
         async with self._db.execute(
-            "SELECT id, path, source, start_line, end_line, text, hash"
+            "SELECT id, path, source, start_line, end_line, text, hash,"
+            " constraint_type, constraint_confidence"
             f" FROM chunks WHERE id IN ({placeholders})",
             all_ids,
         ) as cur:
@@ -1099,6 +1423,11 @@ class LongTermMemoryStore:
             tscore = s.get("text", 0.0)
             combined = vector_weight * vscore + text_weight * tscore
             if combined >= min_score:
+                _hs_meta: dict[str, str] = {}
+                if row[7]:
+                    _hs_meta["constraint_type"] = row[7]
+                if row[8] is not None:
+                    _hs_meta["constraint_confidence"] = str(row[8])
                 results.append(
                     MemorySearchResult(
                         chunk_id=cid,
@@ -1112,6 +1441,7 @@ class LongTermMemoryStore:
                         text_score=tscore,
                         text=row[5],
                         chunk_hash=row[6],
+                        metadata=_hs_meta,
                         citation=f"{row[1]}#L{row[3]}-L{row[4]}",
                     )
                 )
@@ -1128,6 +1458,15 @@ class LongTermMemoryStore:
                 row = chunk_rows[cid]
                 vscore = s.get("vector", 0.0)
                 combined = vector_weight * vscore + text_weight * tscore
+                _lg_meta: dict[str, str] = {
+                    LEXICAL_GUARANTEE_METADATA_KEY: (
+                        LEXICAL_GUARANTEE_METADATA_VALUE
+                    )
+                }
+                if row[7]:
+                    _lg_meta["constraint_type"] = row[7]
+                if row[8] is not None:
+                    _lg_meta["constraint_confidence"] = str(row[8])
                 lexical_guarantees.append(
                     MemorySearchResult(
                         chunk_id=cid,
@@ -1141,11 +1480,7 @@ class LongTermMemoryStore:
                         text_score=tscore,
                         text=row[5],
                         chunk_hash=row[6],
-                        metadata={
-                            LEXICAL_GUARANTEE_METADATA_KEY: (
-                                LEXICAL_GUARANTEE_METADATA_VALUE
-                            )
-                        },
+                        metadata=_lg_meta,
                         citation=f"{row[1]}#L{row[3]}-L{row[4]}",
                     )
                 )
@@ -1160,6 +1495,15 @@ class LongTermMemoryStore:
                 tscore = s.get("text", 0.0)
                 combined = vector_weight * vscore + text_weight * tscore
                 if combined >= relaxed_min_score or tscore >= min_score:
+                    _rx_meta: dict[str, str] = {
+                        RELAXED_KEYWORD_MATCH_METADATA_KEY: (
+                            RELAXED_KEYWORD_MATCH_METADATA_VALUE
+                        )
+                    }
+                    if row[7]:
+                        _rx_meta["constraint_type"] = row[7]
+                    if row[8] is not None:
+                        _rx_meta["constraint_confidence"] = str(row[8])
                     results.append(
                         MemorySearchResult(
                             chunk_id=cid,
@@ -1173,11 +1517,7 @@ class LongTermMemoryStore:
                             text_score=tscore,
                             text=row[5],
                             chunk_hash=row[6],
-                            metadata={
-                                RELAXED_KEYWORD_MATCH_METADATA_KEY: (
-                                    RELAXED_KEYWORD_MATCH_METADATA_VALUE
-                                )
-                            },
+                            metadata=_rx_meta,
                             citation=f"{row[1]}#L{row[3]}-L{row[4]}",
                         )
                     )
@@ -1203,32 +1543,36 @@ class LongTermMemoryStore:
         if not paths:
             return {}
         placeholders = ",".join("?" * len(paths))
-        async with self._db.execute(
-            f"SELECT path, mtime FROM files WHERE path IN ({placeholders})",
-            paths,
-        ) as cur:
-            return {row[0]: row[1] for row in await cur.fetchall()}
+        async with self._write_lock:
+            async with self._db.execute(
+                f"SELECT path, mtime FROM files WHERE path IN ({placeholders})",
+                paths,
+            ) as cur:
+                return {row[0]: row[1] for row in await cur.fetchall()}
 
     async def file_count(self) -> int:
         assert self._db is not None
-        async with self._db.execute("SELECT COUNT(*) FROM files") as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+        async with self._write_lock:
+            async with self._db.execute("SELECT COUNT(*) FROM files") as cur:
+                row = await cur.fetchone()
+                return row[0] if row else 0
 
     async def chunk_count(self) -> int:
         assert self._db is not None
-        async with self._db.execute("SELECT COUNT(*) FROM chunks") as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+        async with self._write_lock:
+            async with self._db.execute("SELECT COUNT(*) FROM chunks") as cur:
+                row = await cur.fetchone()
+                return row[0] if row else 0
 
     async def total_size(self) -> int:
         """Return total size in bytes across all indexed files."""
         assert self._db is not None
-        async with self._db.execute("SELECT COALESCE(SUM(size), 0) FROM files") as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+        async with self._write_lock:
+            async with self._db.execute("SELECT COALESCE(SUM(size), 0) FROM files") as cur:
+                row = await cur.fetchone()
+                return row[0] if row else 0
 
-    async def source_counts(self) -> dict[str, dict[str, int]]:
+    async def _source_counts_unlocked(self) -> dict[str, dict[str, int]]:
         assert self._db is not None
         result: dict[str, dict[str, int]] = {}
         async with self._db.execute("SELECT source, COUNT(*) FROM files GROUP BY source") as cur:
@@ -1239,17 +1583,22 @@ class LongTermMemoryStore:
                 result.setdefault(row[0], {})["chunks"] = row[1]
         return result
 
+    async def source_counts(self) -> dict[str, dict[str, int]]:
+        async with self._write_lock:
+            return await self._source_counts_unlocked()
+
     async def list_paths(self, source: MemorySource | None = None) -> list[str]:
         """Return indexed source paths, optionally restricted to one source."""
         assert self._db is not None
-        if source is None:
-            async with self._db.execute("SELECT path FROM files ORDER BY path") as cur:
+        async with self._write_lock:
+            if source is None:
+                async with self._db.execute("SELECT path FROM files ORDER BY path") as cur:
+                    return [row[0] for row in await cur.fetchall()]
+            async with self._db.execute(
+                "SELECT path FROM files WHERE source = ? ORDER BY path",
+                (source.value,),
+            ) as cur:
                 return [row[0] for row in await cur.fetchall()]
-        async with self._db.execute(
-            "SELECT path FROM files WHERE source = ? ORDER BY path",
-            (source.value,),
-        ) as cur:
-            return [row[0] for row in await cur.fetchall()]
 
     async def close(self) -> None:
         if self._db:

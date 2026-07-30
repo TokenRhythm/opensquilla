@@ -907,6 +907,15 @@ class MemoryCostConfig(BaseModel):
     query_embedding_cache: Literal["off", "shadow", "on"] = "on"
 
 
+class MemoryExperimentalConfig(BaseModel):
+    """Experimental memory features (L1/L2/L3). All default off."""
+
+    constraint_annotation: bool = False  # L1: annotate chunks with constraint_type
+    constraint_routing: bool = False  # L2: constraint-aware retrieval routing
+    sufficiency_check: bool = False  # L3: retrieval sufficiency meta-cognition
+    usage_tracking: bool = False  # D11: chunk recall usage statistics for Dream
+
+
 class MemoryConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_MEMORY_",
@@ -987,6 +996,9 @@ class MemoryConfig(BaseSettings):
 
     # Dream consolidation
     dream: DreamConfig = Field(default_factory=DreamConfig)
+
+    # Experimental features (L1/L2/L3)
+    experimental: MemoryExperimentalConfig = Field(default_factory=MemoryExperimentalConfig)
 
 
 def _default_tiers() -> dict:
@@ -1299,6 +1311,10 @@ class CompactionLlmConfig(BaseSettings):
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     protected_recent_messages: int = Field(default=0, ge=0)
+    anchor_enabled: bool = False  # D12: compaction anchor references
+    fallback_summary_max_tokens: int = Field(default=3000, ge=256)
+    previous_summary_max_tokens: int = Field(default=2000, ge=256)
+    total_summary_max_tokens: int = Field(default=5000, ge=512)
 
 
 class SessionNamingConfig(BaseSettings):

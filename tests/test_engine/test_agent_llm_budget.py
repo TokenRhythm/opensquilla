@@ -4140,8 +4140,18 @@ def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
             flush_backoff_max_seconds=30.0,
             flush_archive_max_bytes=999_999,
             flush_compaction_requires_safe_receipt=False,
+            compaction_anchor_enabled=True,
+            compaction_fallback_summary_max_tokens=701,
+            compaction_previous_summary_max_tokens=702,
+            compaction_total_summary_max_tokens=1403,
         ),
     )
+
+    compaction = agent._build_compaction_config()
+    assert compaction.anchor_enabled is True
+    assert compaction.fallback_summary_max_tokens == 701
+    assert compaction.previous_summary_max_tokens == 702
+    assert compaction.total_summary_max_tokens == 1403
 
     child = agent._make_child_agent(SubagentSpec(task="child task"), depth=1)
 
@@ -4168,6 +4178,10 @@ def test_agent_child_config_inherits_context_and_flush_budget_policy() -> None:
     assert child.config.flush_backoff_max_seconds == 30.0
     assert child.config.flush_archive_max_bytes == 999_999
     assert child.config.flush_compaction_requires_safe_receipt is False
+    assert child.config.compaction_anchor_enabled is True
+    assert child.config.compaction_fallback_summary_max_tokens == 701
+    assert child.config.compaction_previous_summary_max_tokens == 702
+    assert child.config.compaction_total_summary_max_tokens == 1403
 
 
 def test_agent_config_max_turn_cost_usd_defaults_to_disabled() -> None:
@@ -4939,6 +4953,89 @@ async def test_inline_overflow_compaction_reduces_tool_heavy_structured_context(
     assert outcome is not None
     assert outcome.compacted
     assert session_payload_chars(outcome.messages) < original_chars
+
+
+@pytest.mark.asyncio
+async def test_inline_overflow_preserves_structured_kept_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_tool_result = "important structured output " * 100
+    kept_tail = Message(
+        role="user",
+        content=[
+            ContentBlockToolResult(
+                tool_use_id="tail-tool",
+                content=full_tool_result,
+            )
+        ],
+    )
+    messages = [
+        Message(role="user", content="old context " * 1000),
+        kept_tail,
+    ]
+
+    async def _compact(request: Any) -> CompactionResult:
+        return CompactionResult(
+            summary="short summary",
+            kept_entries=request.entries[1:],
+            removed_count=1,
+            chunks_processed=1,
+            kept_start_index=1,
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _compact)
+    agent = Agent(
+        provider=_ContextOverflowProvider(),
+        config=AgentConfig(context_window_tokens=1000, flush_enabled=False),
+    )
+
+    outcome = await agent._check_context_overflow(
+        messages,
+        estimated_context_tokens=1001,
+        compaction_window_tokens=1000,
+    )
+
+    assert outcome is not None
+    assert outcome.compacted
+    assert outcome.messages[-1] is kept_tail
+    assert isinstance(outcome.messages[-1].content, list)
+    block = outcome.messages[-1].content[0]
+    assert isinstance(block, ContentBlockToolResult)
+    assert block.content == full_tool_result
+
+
+@pytest.mark.asyncio
+async def test_inline_overflow_rejects_inconsistent_prefix_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages = [
+        Message(role="user", content="old context " * 1000),
+        Message(role="assistant", content="kept"),
+    ]
+
+    async def _compact(request: Any) -> CompactionResult:
+        return CompactionResult(
+            summary="short summary",
+            kept_entries=request.entries[1:],
+            removed_count=1,
+            chunks_processed=1,
+            kept_start_index=2,
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _compact)
+    agent = Agent(
+        provider=_ContextOverflowProvider(),
+        config=AgentConfig(context_window_tokens=1000, flush_enabled=False),
+    )
+
+    outcome = await agent._check_context_overflow(
+        messages,
+        estimated_context_tokens=1001,
+        compaction_window_tokens=1000,
+    )
+
+    assert outcome is None
+    assert agent._last_compaction_refusal_reason == "invalid_prefix_boundary"
 
 
 @pytest.mark.asyncio

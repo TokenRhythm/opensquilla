@@ -27,6 +27,7 @@ No ``TurnHook`` is fired from inside the stream loop today.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
@@ -110,6 +111,11 @@ class CompactionPersistPort(Protocol):
         summary: str,
         kept_entries: list[Any],
         compaction_id: str | None = None,
+        removed_count: int | None = None,
+        removed_entries: list[Any] | None = None,
+        compaction_index: int | None = None,
+        extracted_anchors: list[dict[str, Any]] | None = None,
+        anchor_enabled: bool = False,
     ) -> None: ...
 
 @runtime_checkable
@@ -1017,12 +1023,28 @@ class _CompactionHandler:
         await self._fire_before_compact(state)
         if inp.session_manager_present:
             try:
-                await self._persist.persist_and_notify(
-                    session_key=inp.session_key,
-                    summary=event.summary,
-                    kept_entries=event.kept_entries,
-                    compaction_id=event.compaction_id,
+                persist = self._persist.persist_and_notify
+                parameters = inspect.signature(persist).parameters
+                accepts_kwargs = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
                 )
+                persist_kwargs: dict[str, Any] = {
+                    "session_key": inp.session_key,
+                    "summary": event.summary,
+                    "kept_entries": event.kept_entries,
+                    "compaction_id": event.compaction_id,
+                }
+                for name, value in {
+                    "removed_count": event.removed_count,
+                    "removed_entries": event.removed_entries,
+                    "compaction_index": event.compaction_index,
+                    "extracted_anchors": event.extracted_anchors,
+                    "anchor_enabled": event.anchor_enabled,
+                }.items():
+                    if value is not None and (name in parameters or accepts_kwargs):
+                        persist_kwargs[name] = value
+                await persist(**persist_kwargs)
             except Exception as exc:  # noqa: BLE001 - preserve turn recoverability
                 log.warning("compaction_persist_failed", error=str(exc))
                 from opensquilla.engine.cache_break_monitor import notify_compaction

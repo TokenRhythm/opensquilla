@@ -2713,6 +2713,8 @@ async def build_services(
     _turn_runner_ref: list = []
     memory_started_at = time.monotonic()
     memory_degraded = False
+    if usage_tracker is None:
+        usage_tracker = _UsageTracker()
     try:
         from opensquilla.memory.manager import build_memory_managers
         from opensquilla.tools.builtin.memory_tools import create_memory_tools
@@ -2723,6 +2725,8 @@ async def build_services(
             config,
             agent_ids,
             session_storage=session_storage,
+            provider_selector=provider_selector,
+            usage_tracker=usage_tracker,
         )
 
         # Derive legacy per-tier views from the managers. These remain in
@@ -4090,6 +4094,7 @@ async def start_gateway_server(
             build_dream=build_dream_factory(
                 config=config,
                 turn_runner=turn_runner,
+                memory_stores=svc.memory_stores,
             ),
             should_skip=lambda: (
                 "disabled" if not getattr(config.memory.dream, "enabled", False) else None

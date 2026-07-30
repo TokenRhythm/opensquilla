@@ -744,15 +744,46 @@ def _format_compaction_summary_context(summary_texts: list[str]) -> str | None:
     rendered = f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n" + "\n\n".join(blocks)
     if len(rendered) <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS:
         return rendered
-    tail_budget = (
-        _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS - len(_COMPACTION_SUMMARY_CONTEXT_HEADER) - 80
-    )
-    tail_budget = max(1000, tail_budget)
-    return (
-        f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n"
-        "[Earlier compaction summary context truncated to fit request budget.]\n"
-        f"{rendered[-tail_budget:]}"
-    )
+
+    marker_template = "[{count} earlier compaction summaries omitted to fit request budget.]"
+    # Reserve the largest marker this call can need so replacing the count
+    # after packing cannot push the final rendering over the hard limit.
+    reserved_marker = marker_template.format(count=len(blocks))
+    fixed_chars = len(_COMPACTION_SUMMARY_CONTEXT_HEADER) + 1 + len(reserved_marker) + 1
+    selected_newest_first: list[str] = []
+    selected_chars = 0
+    omitted = 0
+    for block in reversed(blocks):
+        separator_chars = 2 if selected_newest_first else 0
+        if (
+            fixed_chars + selected_chars + separator_chars + len(block)
+            <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS
+        ):
+            selected_newest_first.append(block)
+            selected_chars += separator_chars + len(block)
+        else:
+            omitted = len(blocks) - len(selected_newest_first)
+            break
+
+    if selected_newest_first:
+        marker = marker_template.format(count=omitted)
+        selected = list(reversed(selected_newest_first))
+        return (
+            f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n{marker}\n"
+            + "\n\n".join(selected)
+        )
+
+    # A single newest block may itself exceed the budget. Preserve its head
+    # and tail with an explicit marker rather than returning a structurally
+    # unexplained slice from the middle.
+    newest = blocks[-1]
+    marker = marker_template.format(count=max(0, len(blocks) - 1))
+    truncation = "\n[Newest compaction summary truncated here.]\n"
+    fixed = f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n{marker}\n"
+    available = _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS - len(fixed) - len(truncation)
+    head_chars = max(0, available // 2)
+    tail_chars = max(0, available - head_chars)
+    return f"{fixed}{newest[:head_chars]}{truncation}{newest[-tail_chars:]}"
 
 
 def _prepend_request_context_prompt(
@@ -3539,6 +3570,20 @@ class TurnRunner:
                 input_mode=input_mode,
                 turn_metadata=turn.metadata,
             )
+
+            async def _next_inline_compaction_index() -> int | None:
+                if self._session_manager is None:
+                    return None
+                get_index = getattr(
+                    self._session_manager,
+                    "get_next_compaction_index",
+                    None,
+                )
+                if not callable(get_index):
+                    return None
+                allocated = await get_index(session_key)
+                return None if allocated is None else int(allocated)
+
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,
@@ -3566,6 +3611,7 @@ class TurnRunner:
                     run_kind=run_kind,
                     session_epoch=self._usage_session_epoch_by_key.get(session_key, 0),
                     provider_request_correlation=provider_request_correlation,
+                    compaction_identity_provider=_next_inline_compaction_index,
                 )
             )
             ab_out = ab_outcome.require_output()
