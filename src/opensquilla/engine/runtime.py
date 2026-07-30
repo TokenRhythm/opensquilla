@@ -3550,7 +3550,8 @@ class TurnRunner:
                 )
                 if not callable(get_index):
                     return None
-                return await get_index(session_key)
+                allocated = await get_index(session_key)
+                return None if allocated is None else int(allocated)
 
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
