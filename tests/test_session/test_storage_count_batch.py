@@ -97,3 +97,35 @@ async def test_batch_count_chunks_above_500(storage: SessionStorage) -> None:
     for sid in all_ids:
         if sid not in counts:
             assert result[sid] == 0
+
+
+async def test_list_session_ids_updated_since_defaults_to_unlimited(
+    storage: SessionStorage,
+) -> None:
+    """Profile selection must not silently truncate its history window."""
+
+    from opensquilla.session.models import SessionNode
+
+    for i in range(2005):
+        await storage.upsert_session(
+            SessionNode(
+                session_key=f"agent:test:sid-{i}",
+                session_id=f"sid-{i}",
+                agent_id="test",
+                status="idle",
+                created_at=i + 1,
+                updated_at=i + 1,
+            )
+        )
+
+    rows = await storage.list_session_ids_updated_since(0, agent_id="test")
+    limited = await storage.list_session_ids_updated_since(
+        0,
+        agent_id="test",
+        limit=2000,
+    )
+
+    assert len(rows) == 2005
+    assert rows[0] == ("sid-0", 1)
+    assert rows[-1] == ("sid-2004", 2005)
+    assert len(limited) == 2000

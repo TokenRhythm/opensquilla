@@ -594,6 +594,7 @@ _SAFE_WRITE_PATCH_PATHS = frozenset(
         # self_learning.enabled through the safe path still runs the dream
         # linkage (safe delegates to the full patch handler).
         "squilla_router.self_learning.enabled",
+        "squilla_router.user_profile.enabled",
         "memory.dream.enabled",
         "memory.dream.auto_schedule",
     }

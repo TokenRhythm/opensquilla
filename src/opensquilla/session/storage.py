@@ -3711,6 +3711,37 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
 
+    async def list_session_ids_updated_since(
+        self,
+        since_ms: int,
+        *,
+        agent_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[tuple[str, int]]:
+        """Return ``(session_id, updated_at)`` for sessions touched since a timestamp.
+
+        This focused query lets the offline profile producer scan a stable
+        oldest-first window without loading full session objects or joining
+        task activity.
+        """
+
+        clauses = ["updated_at >= ?"]
+        params: list[Any] = [int(since_ms)]
+        if agent_id is not None:
+            clauses.append("agent_id = ?")
+            params.append(normalize_agent_id(agent_id))
+        where = " AND ".join(clauses)
+        sql = (
+            f"SELECT session_id, updated_at FROM sessions WHERE {where} "  # noqa: S608
+            "ORDER BY updated_at ASC"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [(str(row[0]), int(row[1])) for row in rows]
+
     async def _delete_session_rows(
         self,
         conn: aiosqlite.Connection,

@@ -175,6 +175,51 @@ def gateway_shutdown_deadline() -> float:
     return gateway_graceful_timeout() * 2 + 15.0
 
 
+def _user_profile_generation_enabled(config: Any) -> bool:
+    """Return whether post-Dream user-profile production is explicitly enabled."""
+
+    router_cfg = getattr(config, "squilla_router", None)
+    profile_cfg = getattr(router_cfg, "user_profile", None)
+    return bool(getattr(profile_cfg, "enabled", False))
+
+
+def _user_profile_permission_snapshot(
+    config: GatewayConfig,
+    tool_registry: Any,
+    agent_id: str,
+) -> dict[str, list[str]]:
+    """Record the effective tool policy alongside the produced profile."""
+
+    from opensquilla.squilla_router.user_profile.defaults import (
+        default_user_profile,
+    )
+    from opensquilla.squilla_router.user_profile.permission import (
+        build_permission_snapshot,
+    )
+    from opensquilla.tools.policy import apply_tool_policy_from_config
+    from opensquilla.tools.types import ToolContext
+
+    available_tools = (
+        list(tool_registry.list_names()) if tool_registry is not None else []
+    )
+    context = apply_tool_policy_from_config(
+        ToolContext(is_owner=True, agent_id=agent_id),
+        available_tools=available_tools,
+        config=config,
+    )
+    allowed_tools = (
+        set(context.allowed_tools)
+        if context.allowed_tools is not None
+        else set(available_tools) - set(context.denied_tools)
+    )
+    baseline = default_user_profile()["permission"]
+    return build_permission_snapshot(
+        baseline=baseline,
+        live_override=None,
+        allowed_tools=allowed_tools,
+    )
+
+
 class _FlushReceiptSessionStorage(Protocol):
     async def get_session(self, session_key: str) -> Any | None: ...
 
@@ -4021,11 +4066,91 @@ async def start_gateway_server(
                     error=str(exc),
                 )
 
+        async def _maybe_produce_user_profile(agent_id: str) -> None:
+            """Produce a versioned profile from recent sessions after Dream.
+
+            The default-off check happens before session access, provider
+            resolution, LLM calls, and filesystem writes. Failures never escape
+            into the Dream hook.
+            """
+
+            if not _user_profile_generation_enabled(config):
+                return
+            try:
+                from opensquilla.memory.dream_factory import (
+                    build_dream_provider_selector,
+                )
+                from opensquilla.provider.types import ChatConfig, Message
+                from opensquilla.squilla_router.user_profile.defaults import (
+                    default_user_profile,
+                )
+                from opensquilla.squilla_router.user_profile.orchestrator import (
+                    maybe_produce_user_profile,
+                )
+
+                storage = get_session_storage(svc.session_manager)
+                if storage is None:
+                    return
+
+                def build_provider() -> Any | None:
+                    selector = build_dream_provider_selector(config)
+                    resolve = getattr(selector, "resolve", None)
+                    return resolve() if callable(resolve) else None
+
+                def stream_factory(
+                    *,
+                    provider: Any,
+                    user_prompt: str,
+                    system_prompt: str,
+                    max_output_tokens: int,
+                    temperature: float,
+                    timeout: float,
+                ) -> Any:
+                    return provider.chat(
+                        [Message(role="user", content=user_prompt)],
+                        tools=None,
+                        config=ChatConfig(
+                            max_tokens=max_output_tokens,
+                            temperature=temperature,
+                            system=system_prompt,
+                            thinking=False,
+                            timeout=timeout,
+                        ),
+                    )
+
+                result = await maybe_produce_user_profile(
+                    agent_id,
+                    base_profile=default_user_profile(),
+                    permission_snapshot=_user_profile_permission_snapshot(
+                        config,
+                        svc.tool_registry,
+                        agent_id,
+                    ),
+                    storage=storage,
+                    build_provider=build_provider,
+                    stream_factory=stream_factory,
+                )
+                log.info(
+                    "user_profile.post_dream",
+                    agent_id=agent_id,
+                    ran=result.ran,
+                    reason=result.reason,
+                    version=result.version,
+                    sessions_read=result.sessions_read,
+                )
+            except Exception as exc:  # never poison the dream hook
+                log.warning(
+                    "user_profile.post_dream_error",
+                    agent_id=agent_id,
+                    error=str(exc),
+                )
+
         async def _post_dream_auto_propose(
             agent_id: str,
             dream_summary: str = "",
         ) -> None:
             await _maybe_run_router_self_learning(agent_id)
+            await _maybe_produce_user_profile(agent_id)
             if not bool(getattr(auto_cfg, "on_dream_complete", False)):
                 return
             result = await auto_propose(

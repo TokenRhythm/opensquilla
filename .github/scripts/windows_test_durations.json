@@ -1184,6 +1184,14 @@
     "tests/test_gateway/test_websocket_request_concurrency.py": 0.01,
     "tests/test_cli/test_gateway_client_steer.py": 0.01,
     "tests/test_engine/test_route_plan.py": 0.01,
-    "tests/test_gateway/test_steer_restart_recovery.py": 0.01
+    "tests/test_gateway/test_steer_restart_recovery.py": 0.01,
+    "tests/test_gateway/test_user_profile_generation_config.py": 0.01,
+    "tests/test_user_profile_builder.py": 0.01,
+    "tests/test_user_profile_extractor.py": 0.01,
+    "tests/test_user_profile_gates.py": 0.01,
+    "tests/test_user_profile_orchestrator.py": 0.01,
+    "tests/test_user_profile_permission.py": 0.01,
+    "tests/test_user_profile_prompts.py": 0.01,
+    "tests/test_user_profile_store.py": 0.01
   }
 }

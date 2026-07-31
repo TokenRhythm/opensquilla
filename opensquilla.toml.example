@@ -417,6 +417,11 @@ upgrade_to_c3_compaction_enabled = true
 # that executes on the active provider (or the default tier).
 # tier_provider_mismatch = "route"  # route | veto
 
+# Offline user-profile production is opt-in. When false (the default), the
+# post-Dream hook does not scan transcripts, call an LLM, or write profile JSON.
+[squilla_router.user_profile]
+enabled = false
+
 # TokenRhythm serves every model in reasoning-streaming mode and rejects
 # thinking-toggle request fields, so these tiers set no thinking_level.
 [squilla_router.tiers.c0]

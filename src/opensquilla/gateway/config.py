@@ -1131,6 +1131,21 @@ class RouterSelfLearningConfig(BaseModel):
 RouterSelfLearningConfig.model_rebuild()
 
 
+class RouterUserProfileConfig(BaseModel):
+    """Offline user-profile production.
+
+    Generation is opt-in because it scans recent transcripts and invokes an
+    LLM after Dream completes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+
+
+RouterUserProfileConfig.model_rebuild()
+
+
 class SquillaRouterConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_SQUILLA_ROUTER_",
@@ -1206,6 +1221,7 @@ class SquillaRouterConfig(BaseSettings):
     estimated_output_savings_pct: float = 0.03
     upgrade_to_c3_compaction_enabled: bool = True
     self_learning: RouterSelfLearningConfig = Field(default_factory=RouterSelfLearningConfig)
+    user_profile: RouterUserProfileConfig = Field(default_factory=RouterUserProfileConfig)
     vision_history_lookback_turns: int = Field(default=8, ge=0)
     vision_history_candidate_turns: int = Field(default=8, ge=0)
     vision_sticky_followup_turns: int = Field(default=3, ge=0)
@@ -1267,11 +1283,11 @@ class SquillaRouterConfig(BaseSettings):
         return next_values
 
 
-# Eagerly resolve the ``self_learning: RouterSelfLearningConfig`` forward ref
-# (``from __future__ import annotations`` makes it a string). Without this the
-# model stays "not fully defined" when this file is exec'd as an unregistered
-# module (e.g. tests load it via spec_from_file_location), since pydantic falls
-# back to ``sys.modules[__module__]`` which is absent in that scenario.
+# Eagerly resolve nested router config forward refs (``from __future__ import
+# annotations`` makes them strings). Without this the model stays "not fully
+# defined" when this file is exec'd as an unregistered module (e.g. tests load
+# it via spec_from_file_location), since pydantic falls back to
+# ``sys.modules[__module__]`` which is absent in that scenario.
 SquillaRouterConfig.model_rebuild()
 
 
