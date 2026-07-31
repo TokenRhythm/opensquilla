@@ -3542,6 +3542,8 @@
       "contractGap": "Des champs du contrat backend session-list-v1 sont manquants",
       "contractGapBadge": "Lacune",
       "rowActions": "Actions pour {title}",
+      "pinTask": "Épingler la tâche",
+      "unpinTask": "Désépingler la tâche",
       "rename": "Renommer",
       "delete": "Supprimer",
       "filterByAgent": "Filtrer par {name}",

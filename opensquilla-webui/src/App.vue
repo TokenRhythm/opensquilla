@@ -92,6 +92,8 @@
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
+      @reorder="onReorderSidebarSession"
+      @session-pin="onPinSidebarSession"
       @new-chat="startNewChatInstant"
       @new-project="openProjectCreator"
       @new-project-task="startProjectTask"
@@ -853,6 +855,31 @@ watch(allSessions, sessions => {
   }
 })
 
+const SIDEBAR_SESSION_ORDER_KEY = 'opensquilla-sidebar-session-order-v1'
+const SIDEBAR_PINNED_SESSIONS_KEY = 'opensquilla-sidebar-pinned-sessions-v1'
+
+function readStoredSessionKeys(storageKey: string): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(storageKey) || '[]')
+    if (!Array.isArray(parsed)) return []
+    return [...new Set(parsed.filter((key): key is string => typeof key === 'string' && key.length > 0))]
+      .slice(0, 1000)
+  } catch {
+    return []
+  }
+}
+
+function writeStoredSessionKeys(storageKey: string, keys: readonly string[]) {
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(keys))
+  } catch {
+    // Storage can be unavailable in restricted browser contexts.
+  }
+}
+
+const sidebarSessionOrder = ref<string[]>(readStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY))
+const sidebarPinnedSessionKeys = ref<string[]>(readStoredSessionKeys(SIDEBAR_PINNED_SESSIONS_KEY))
+
 // Collapsible family sections (Chats / Channels / Automations). Row titles and
 // agent names are resolved here so the raw-session-id scrub and the display-name
 // lookup stay in App.vue; subagents indent under their parent via the helper.
@@ -863,6 +890,8 @@ const sidebarSections = computed((): SidebarSection[] => {
     rpcStore.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
       ? projectWorkspaces.workspaces.value
       : undefined,
+    sidebarSessionOrder.value,
+    sidebarPinnedSessionKeys.value,
   ).map(section => ({
     ...section,
     rows: section.rows.map((row): SidebarSectionRow => {
@@ -878,6 +907,43 @@ const sidebarSections = computed((): SidebarSection[] => {
     }),
   }))
 })
+
+function onReorderSidebarSession(payload: {
+  draggedKey: string
+  targetKey: string
+  position: 'before' | 'after'
+}) {
+  const orderedKeys = sidebarSections.value
+    .flatMap(section => section.rows)
+    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
+    .map(row => row.key)
+  const from = orderedKeys.indexOf(payload.draggedKey)
+  if (from < 0 || !orderedKeys.includes(payload.targetKey) || payload.draggedKey === payload.targetKey) return
+
+  orderedKeys.splice(from, 1)
+  const target = orderedKeys.indexOf(payload.targetKey)
+  orderedKeys.splice(payload.position === 'after' ? target + 1 : target, 0, payload.draggedKey)
+  sidebarSessionOrder.value = orderedKeys
+  writeStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY, orderedKeys)
+}
+
+function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
+  const pinned = new Set(sidebarPinnedSessionKeys.value)
+  if (payload.pinned) pinned.add(payload.key)
+  else pinned.delete(payload.key)
+  sidebarPinnedSessionKeys.value = [...pinned]
+  writeStoredSessionKeys(SIDEBAR_PINNED_SESSIONS_KEY, sidebarPinnedSessionKeys.value)
+
+  if (!payload.pinned) return
+  const currentOrder = sidebarSections.value
+    .flatMap(section => section.rows)
+    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
+    .map(row => row.key)
+    .filter(key => key !== payload.key)
+  currentOrder.unshift(payload.key)
+  sidebarSessionOrder.value = currentOrder
+  writeStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY, currentOrder)
+}
 
 let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null
 let sidebarRefreshPending = false

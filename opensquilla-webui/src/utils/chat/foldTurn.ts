@@ -87,13 +87,15 @@ export function reconcileTextSnapshot(
         dirty: true,
       }
     } else {
-      next.push({ type: 'text', raw: suffix, html: '', dirty: true })
+      next.push({ type: 'text', raw: suffix, html: '', dirty: true, presentation: 'answer' })
     }
     return { rawText: snapshot, segments: next, changed: true }
   }
 
   const next = segments.filter(segment => segment.type !== 'text')
-  if (snapshot) next.push({ type: 'text', raw: snapshot, html: '', dirty: true })
+  if (snapshot) {
+    next.push({ type: 'text', raw: snapshot, html: '', dirty: true, presentation: 'answer' })
+  }
   return { rawText: snapshot, segments: next, changed: true }
 }
 
@@ -217,8 +219,18 @@ export function foldTurn(
       case 'text': {
         rawText += frame.text
         const lastSegment = segments[segments.length - 1]
-        if (!lastSegment || lastSegment.type !== 'text') {
-          segments.push({ type: 'text', raw: frame.text, html: '', dirty: true })
+        if (
+          !lastSegment
+          || lastSegment.type !== 'text'
+          || lastSegment.presentation !== frame.presentation
+        ) {
+          segments.push({
+            type: 'text',
+            raw: frame.text,
+            html: '',
+            dirty: true,
+            presentation: frame.presentation,
+          })
         } else {
           lastSegment.raw = (lastSegment.raw || '') + frame.text
           lastSegment.dirty = true

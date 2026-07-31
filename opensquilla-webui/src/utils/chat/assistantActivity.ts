@@ -141,6 +141,15 @@ export interface LiveAssistantTimelineSplit {
   answerItem: Extract<ChatStreamTimelineItem, { type: 'text' }> | null
 }
 
+export interface LiveAssistantTimelineSplitOptions {
+  /**
+   * Keep unclassified/intermediate text inside the activity transcript once
+   * the turn has used a tool. A gateway-confirmed `answer` span may still
+   * stream outside without relying on a timing heuristic.
+   */
+  keepToolTurnTextInActivity?: boolean
+}
+
 export interface AssistantActivityProjection extends AssistantActivityTimelineProjection {
   /**
    * Whether the message can be rendered as a compact activity disclosure plus
@@ -157,6 +166,7 @@ export interface AssistantActivityProjection extends AssistantActivityTimelinePr
 
 export type AssistantAnswerSource =
   | 'canonical'
+  | 'terminal-timeline-boundary'
   | 'terminal-control-boundary'
   | 'none'
 
@@ -267,14 +277,26 @@ const STATUS_PURPOSE_CODES: Readonly<Record<string, AssistantActivityPurposeCode
 }
 
 /**
- * Treat only the current trailing text segment as an answer candidate. A later
- * tool append makes that text chronological activity again without mutating
- * the append-only timeline.
+ * Treat only the current trailing text segment as an answer candidate. After
+ * a tool has run, the gateway's presentation marker must confirm that segment
+ * as an answer; unclassified/intermediate text remains chronological activity.
  */
 export function splitLiveAssistantTimeline(
   timeline: ChatStreamTimelineItem[],
+  options: LiveAssistantTimelineSplitOptions = {},
 ): LiveAssistantTimelineSplit {
   const last = timeline[timeline.length - 1]
+  if (
+    options.keepToolTurnTextInActivity
+    && timeline.some(item => item.type === 'tool-group')
+    && (
+      last?.type !== 'text'
+      || last.presentation !== 'answer'
+    )
+  ) {
+    return { activityItems: timeline.slice(), answerItem: null }
+  }
+
   if (
     !last
     || last.type !== 'text'
@@ -358,9 +380,9 @@ function normalizedComparableText(value: string): string {
   return String(value || '').replace(/\r\n?/g, '\n').trim()
 }
 
-function timelineTextAggregate(
+function timelineTextAggregates(
   timeline: ChatStreamTimelineItem[],
-): string | null {
+): string[] | null {
   const textItems = timeline.filter(
     (item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> =>
       item.type === 'text',
@@ -374,17 +396,109 @@ function timelineTextAggregate(
     if (typeof item.rawText !== 'string') return null
     chunks.push(item.rawText)
   }
-  return chunks.join('')
+  const compact = chunks.join('')
+  if (chunks.length < 2) return [compact]
+
+  // Mirrors the gateway's persisted `_readable_tool_boundary_text`: separate
+  // narration segments receive a paragraph break only when neither adjacent
+  // segment already supplies whitespace.
+  let readable = chunks[0] || ''
+  for (const chunk of chunks.slice(1)) {
+    readable += readable.slice(-1).trim() && chunk.slice(0, 1).trim()
+      ? `\n\n${chunk}`
+      : chunk
+  }
+  return readable === compact ? [compact] : [compact, readable]
 }
 
-interface TerminalControlAnswerCandidate {
+interface TerminalAnswerCandidate {
   text: string
   indexes: Set<number>
+  activityPrefix?: Extract<ChatStreamTimelineItem, { type: 'text' }>
+}
+
+function splitTerminalMarkdownAnswer(
+  text: string,
+): { activityText: string, answerText: string } | null {
+  const normalized = text.replace(/\r\n?/g, '\n')
+  const thematicBreak = /^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})[ \t]*$/gm
+
+  for (const match of normalized.matchAll(thematicBreak)) {
+    const index = match.index
+    if (index === undefined) continue
+    const activityText = normalized.slice(0, index).trim()
+    const answerText = normalized.slice(index + match[0].length).trim()
+    if (activityText && answerText) return { activityText, answerText }
+  }
+  return null
+}
+
+/**
+ * Recover the terminal answer from an ordinary tool transcript whose
+ * persisted message.text is the concatenation of every narration fragment.
+ *
+ * A non-empty trailing text run after an ordinary tool group is the same
+ * structural answer boundary the live renderer already uses. Requiring the
+ * canonical text to exactly equal either the compact timeline aggregate or
+ * the gateway's readable persisted form keeps this fail-open: when the
+ * persisted payload is incomplete or disagrees, no text is hidden.
+ */
+function terminalTimelineAnswerCandidate(
+  timeline: ChatStreamTimelineItem[],
+): TerminalAnswerCandidate | null {
+  let ordinaryToolGroups = 0
+  let lastOrdinaryToolIndex = -1
+  for (let index = 0; index < timeline.length; index += 1) {
+    const item = timeline[index]
+    if (item?.type !== 'tool-group' || isSuccessfulAnswerTransparentControlGroup(item)) {
+      continue
+    }
+    ordinaryToolGroups += 1
+    lastOrdinaryToolIndex = index
+  }
+  if (ordinaryToolGroups < 1 || lastOrdinaryToolIndex < 0) return null
+
+  const indexes = new Set<number>()
+  const chunks: string[] = []
+  for (let index = lastOrdinaryToolIndex + 1; index < timeline.length; index += 1) {
+    const item = timeline[index]
+    if (!item) continue
+    if (item.type === 'tool-group') {
+      if (isSuccessfulAnswerTransparentControlGroup(item)) continue
+      return null
+    }
+    if (item.type !== 'text' || typeof item.rawText !== 'string') return null
+    indexes.add(index)
+    chunks.push(item.rawText)
+  }
+  const text = chunks.join('')
+  if (!text.trim()) return null
+
+  // Some providers finish the last tool call with a short transition and the
+  // final answer in the same text item, separated by a Markdown thematic
+  // break. Preserve that transition in the activity chronology and expose
+  // only the content after the explicit boundary as the answer.
+  const markdownSplit = splitTerminalMarkdownAnswer(text)
+  if (markdownSplit) {
+    const firstIndex = Math.min(...indexes)
+    const firstItem = timeline[firstIndex]
+    return {
+      text: markdownSplit.answerText,
+      indexes,
+      activityPrefix: {
+        type: 'text',
+        key: `${firstItem?.key || 'terminal'}:activity-prefix`,
+        rawText: markdownSplit.activityText,
+        html: '',
+      },
+    }
+  }
+  return { text, indexes }
 }
 
 function terminalControlAnswerCandidate(
   timeline: ChatStreamTimelineItem[],
-): TerminalControlAnswerCandidate | null {
+): TerminalAnswerCandidate | null {
   let index = timeline.length - 1
   let crossedControlBoundary = false
 
@@ -442,10 +556,10 @@ function completedAnswerLifecycle(
  * Newer runtimes should eventually persist an explicit answer phase. For old
  * PlanRun rows, `message.text` is the concatenation of every narration segment.
  * We may recover the terminal answer only when all of these structural facts
- * agree: the turn settled successfully, the canonical text exactly matches the
- * raw timeline aggregate, and the last text run is followed only by successful
- * answer-transparent control calls. Every uncertain case fails open to the
- * canonical text.
+ * agree: the turn settled successfully, the canonical text exactly matches a
+ * supported persisted timeline aggregate, and the last text run is followed
+ * only by successful answer-transparent control calls. Every uncertain case
+ * fails open to the canonical text.
  */
 export function resolveAssistantAnswer(
   message: ChatRenderedMessage,
@@ -456,22 +570,45 @@ export function resolveAssistantAnswer(
     item => !isSuccessfulAnswerTransparentControlGroup(item),
   )
   const canonical = String(message.text || '')
-  const aggregate = timelineTextAggregate(timeline)
-  const candidate = terminalControlAnswerCandidate(timeline)
-  const canUseControlBoundary = completedAnswerLifecycle(message, lifecycle)
-    && aggregate !== null
-    && normalizedComparableText(canonical) === normalizedComparableText(aggregate)
-    && candidate !== null
-
-  if (canUseControlBoundary && candidate) {
+  const aggregates = timelineTextAggregates(timeline)
+  const completed = completedAnswerLifecycle(message, lifecycle)
+  const aggregateMatchesCanonical = aggregates !== null
+    && aggregates.some(aggregate =>
+      normalizedComparableText(canonical) === normalizedComparableText(aggregate),
+    )
+  const controlCandidate = terminalControlAnswerCandidate(timeline)
+  const canUseControlBoundary = completed
+    && aggregateMatchesCanonical
+    && controlCandidate !== null
+  if (canUseControlBoundary && controlCandidate) {
     return {
-      text: candidate.text,
+      text: controlCandidate.text,
       source: 'terminal-control-boundary',
       activityItems: timeline.filter(
         (item, index) =>
-          !candidate.indexes.has(index)
+          !controlCandidate.indexes.has(index)
           && !isSuccessfulAnswerTransparentControlGroup(item),
       ),
+    }
+  }
+
+  const timelineCandidate = terminalTimelineAnswerCandidate(timeline)
+  const canUseTimelineBoundary = completed
+    && aggregateMatchesCanonical
+    && timelineCandidate !== null
+  if (canUseTimelineBoundary && timelineCandidate) {
+    const activityItems = timeline.filter(
+      (item, index) =>
+        !timelineCandidate.indexes.has(index)
+        && !isSuccessfulAnswerTransparentControlGroup(item),
+    )
+    if (timelineCandidate.activityPrefix) {
+      activityItems.push(timelineCandidate.activityPrefix)
+    }
+    return {
+      text: timelineCandidate.text,
+      source: 'terminal-timeline-boundary',
+      activityItems,
     }
   }
 
@@ -805,9 +942,12 @@ export function projectAssistantActivity(
   const hasTimelineText = timeline.some(item => item.type === 'text')
   const hasCanonicalAnswer = Boolean(answerResolution.text.trim())
   const canSeparateActivity = hasCanonicalAnswer || !hasTimelineText
-  const activityItems = canSeparateActivity
+  const hasStructuralAnswerBoundary =
+    answerResolution.source === 'terminal-control-boundary'
+    || answerResolution.source === 'terminal-timeline-boundary'
+  const rawActivityItems = canSeparateActivity
     ? hasCanonicalAnswer
-      ? answerResolution.source === 'terminal-control-boundary'
+      ? hasStructuralAnswerBoundary
         ? answerResolution.activityItems
         : separatedActivityItems(
             answerResolution.activityItems,
@@ -815,6 +955,11 @@ export function projectAssistantActivity(
           )
       : answerResolution.activityItems
     : []
+  const activityItems = rawActivityItems.map(item =>
+    item.type === 'text' && !item.html && item.rawText
+      ? { ...item, html: renderMarkdown(item.rawText) }
+      : item,
+  )
   const timelineProjection = projectAssistantActivityTimeline(
     activityItems,
     options,

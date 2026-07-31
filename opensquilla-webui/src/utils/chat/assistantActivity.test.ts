@@ -75,7 +75,7 @@ function toolGroup(
 }
 
 describe('projectAssistantActivity', () => {
-  it('uses canonical message text and never guesses from the last timeline fragment', () => {
+  it('separates an aggregated answer at a single ordinary tool boundary', () => {
     const failed = call('failed', {
       status: 'error',
       isError: true,
@@ -95,11 +95,15 @@ describe('projectAssistantActivity', () => {
     )
 
     expect(projection.canSeparateActivity).toBe(true)
-    expect(projection.activityItems).toHaveLength(1)
-    expect(projection.activityItems[0]?.type).toBe('tool-group')
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.activityItems.map(item => item.type)).toEqual(['text', 'tool-group'])
+    expect(projection.activityItems[0]).toMatchObject({
+      key: 'prefix',
+      rawText: 'Canonical prefix',
+    })
     expect(projection.answerPart).toMatchObject({
-      rawText: 'Canonical prefix and suffix',
-      html: '<p>Canonical prefix and suffix</p>',
+      rawText: ' and suffix',
+      html: '<p> and suffix</p>',
     })
     expect(projection.toolCount).toBe(2)
     expect(projection.failureCount).toBe(1)
@@ -180,6 +184,80 @@ describe('projectAssistantActivity', () => {
     })
     expect(JSON.stringify(projection.activityItems))
       .not.toContain('Final answer after verification.')
+  })
+
+  it('folds multiple aggregated narration fragments around one tool call', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting first.\nChecking the result.\nFinal answer.',
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'opening',
+            html: '<p>Inspecting first.</p>',
+            rawText: 'Inspecting first.\n',
+          },
+          {
+            type: 'text',
+            key: 'middle',
+            html: '<p>Checking the result.</p>',
+            rawText: 'Checking the result.\n',
+          },
+          toolGroup([call('verify', { name: 'http_request' })], 'verify'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: '<p>Final answer.</p>',
+            rawText: 'Final answer.',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'opening',
+      'middle',
+      'verify',
+    ])
+  })
+
+  it('folds the transition before a terminal Markdown answer boundary', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting.\n\nPreparing the report.\n\n---\n\n## Final report\nResult.',
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'opening',
+            html: '<p>Inspecting.</p>',
+            rawText: 'Inspecting.',
+          },
+          toolGroup([call('weather', { name: 'http_request' })], 'weather'),
+          {
+            type: 'text',
+            key: 'terminal',
+            html: '<p>Preparing the report.</p><hr><h2>Final report</h2><p>Result.</p>',
+            rawText: 'Preparing the report.\n\n---\n\n## Final report\nResult.',
+          },
+        ],
+      }),
+      text => `<rendered>${text}</rendered>`,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('## Final report\nResult.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'opening',
+      'weather',
+      'terminal:activity-prefix',
+    ])
+    expect(projection.activityItems[2]).toMatchObject({
+      rawText: 'Preparing the report.',
+      html: '<rendered>Preparing the report.</rendered>',
+    })
   })
 
   it('separates an aggregated PlanRun answer at a successful terminal control boundary', () => {
@@ -860,6 +938,69 @@ describe('splitLiveAssistantTimeline', () => {
       key: 'rendered-candidate',
       html: '<p>Rendered candidate</p>',
     })
+  })
+
+  it('keeps provisional text inside activity for a tool-bearing turn', () => {
+    const timeline: ChatStreamTimelineItem[] = [
+      toolGroup([call('inspect', { name: 'read_file' })]),
+      {
+        type: 'text',
+        key: 'process-narration',
+        html: '<p>I will check one more thing.</p>',
+        rawText: 'I will check one more thing.',
+      },
+    ]
+    const snapshot = structuredClone(timeline)
+
+    const split = splitLiveAssistantTimeline(timeline, {
+      keepToolTurnTextInActivity: true,
+    })
+
+    expect(split.activityItems).toEqual(timeline)
+    expect(split.activityItems).not.toBe(timeline)
+    expect(split.answerItem).toBeNull()
+    expect(timeline).toEqual(snapshot)
+  })
+
+  it('still streams a direct answer outside activity when no tool has run', () => {
+    const answer: ChatStreamTimelineItem = {
+      type: 'text',
+      key: 'direct-answer',
+      html: '<p>Hello</p>',
+      rawText: 'Hello',
+    }
+
+    const split = splitLiveAssistantTimeline([answer], {
+      keepToolTurnTextInActivity: true,
+    })
+
+    expect(split.activityItems).toEqual([])
+    expect(split.answerItem).toEqual(answer)
+  })
+
+  it('streams a gateway-confirmed answer after a tool turn', () => {
+    const narration: ChatStreamTimelineItem = {
+      type: 'text',
+      key: 'narration',
+      html: '<p>Checking the source.</p>',
+      rawText: 'Checking the source.',
+      presentation: 'intermediate',
+    }
+    const answer: ChatStreamTimelineItem = {
+      type: 'text',
+      key: 'answer',
+      html: '<p>Verified answer.</p>',
+      rawText: 'Verified answer.',
+      presentation: 'answer',
+    }
+    const tool = toolGroup([call('inspect', { name: 'read_file' })])
+
+    const split = splitLiveAssistantTimeline([tool, narration, answer], {
+      keepToolTurnTextInActivity: true,
+    })
+
+    expect(split.activityItems).toEqual([tool, narration])
+    expect(split.answerItem).toEqual(answer)
   })
 })
 

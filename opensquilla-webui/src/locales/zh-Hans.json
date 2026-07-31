@@ -3542,6 +3542,8 @@
       "contractGap": "缺少后端 session-list-v1 契约字段",
       "contractGapBadge": "缺失",
       "rowActions": "{title} 的操作",
+      "pinTask": "置顶任务",
+      "unpinTask": "取消置顶",
       "rename": "重命名",
       "delete": "删除",
       "filterByAgent": "按 {name} 筛选",

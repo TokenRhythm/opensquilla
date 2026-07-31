@@ -3542,6 +3542,8 @@
       "contractGap": "バックエンドの session-list-v1 契約フィールドが不足しています",
       "contractGapBadge": "不足",
       "rowActions": "{title} のアクション",
+      "pinTask": "タスクをピン留め",
+      "unpinTask": "タスクのピン留めを解除",
       "rename": "名前を変更",
       "delete": "削除",
       "filterByAgent": "{name} で絞り込む",

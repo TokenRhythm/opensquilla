@@ -3542,6 +3542,8 @@
       "contractGap": "Faltan campos del contrato session-list-v1 del backend",
       "contractGapBadge": "Laguna",
       "rowActions": "Acciones para {title}",
+      "pinTask": "Fijar tarea",
+      "unpinTask": "Desfijar tarea",
       "rename": "Renombrar",
       "delete": "Eliminar",
       "filterByAgent": "Filtrar por {name}",

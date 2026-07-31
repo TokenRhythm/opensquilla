@@ -479,7 +479,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     return raw
   }
 
-  function appendDelta(text: string) {
+  function appendDelta(
+    text: string,
+    presentation: 'intermediate' | 'answer' = 'answer',
+  ) {
     if (options.aborted.value) return
     const deltaText = normalizeIncomingTextDelta(text)
     if (!deltaText) return
@@ -488,14 +491,24 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamRaw.value += deltaText
 
     const lastSegment = streamSegments.value[streamSegments.value.length - 1]
-    if (!lastSegment || lastSegment.type !== 'text') {
-      streamSegments.value.push({ type: 'text', raw: deltaText, html: '', dirty: true })
+    if (
+      !lastSegment
+      || lastSegment.type !== 'text'
+      || lastSegment.presentation !== presentation
+    ) {
+      streamSegments.value.push({
+        type: 'text',
+        raw: deltaText,
+        html: '',
+        dirty: true,
+        presentation,
+      })
     } else {
       lastSegment.raw = (lastSegment.raw || '') + deltaText
       lastSegment.dirty = true
     }
 
-    if (useReducer.value) appendFrame({ kind: 'text', text: deltaText })
+    if (useReducer.value) appendFrame({ kind: 'text', text: deltaText, presentation })
     scheduleRender()
   }
 

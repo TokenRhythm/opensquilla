@@ -233,6 +233,31 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('keeps intermediate and answer text in separate live segments', () => {
+    const { api } = makeStream()
+
+    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
+    api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
+    api.appendDelta('Checking.', 'intermediate')
+    api.appendDelta('Verified answer.', 'answer')
+
+    expect(api.streamTimelineItems.value).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+      expect.objectContaining({ type: 'text', rawText: 'Checking.', presentation: 'intermediate' }),
+      expect.objectContaining({ type: 'text', rawText: 'Verified answer.', presentation: 'answer' }),
+    ])
+    expect(api.foldedTurn.value.timelineItems.map(item => ({
+      type: item.type,
+      presentation: item.type === 'text' ? item.presentation : undefined,
+      rawText: item.type === 'text' ? item.rawText : undefined,
+    }))).toEqual(api.streamTimelineItems.value.map(item => ({
+      type: item.type,
+      presentation: item.type === 'text' ? item.presentation : undefined,
+      rawText: item.type === 'text' ? item.rawText : undefined,
+    })))
+    api.cleanup()
+  })
+
   it('checkpoints visible output before a same-turn steer without duplicating final text', () => {
     const { api, messages } = makeStream()
 

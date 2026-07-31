@@ -183,6 +183,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
               session_key: 'agent:main:test',
               task_id: 'task-live',
               text: 'Recovered answer',
+              presentation: 'answer',
               stream_seq: 12,
             },
           },
@@ -194,7 +195,7 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.appendToolCall).toHaveBeenCalledWith(expect.objectContaining({
         id: 'tool-1',
       }))
-      expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer')
+      expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer', 'answer')
       expect(activeStreamTaskId.value).toBe('task-live')
       expect(lastStreamSeq.value).toBe(2400)
     } finally {

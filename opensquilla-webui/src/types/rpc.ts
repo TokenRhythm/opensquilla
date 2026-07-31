@@ -283,6 +283,8 @@ export interface ApprovalStatusPayload {
 
 export interface TextDeltaPayload extends SessionEventPayload {
   text?: string
+  /** Gateway-owned semantic role for this text span. */
+  presentation?: 'intermediate' | 'answer'
 }
 
 export interface ToolUsePayload extends SessionEventPayload {

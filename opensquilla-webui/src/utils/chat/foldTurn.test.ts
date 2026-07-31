@@ -111,6 +111,21 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
     ]).rawText).toBe('Final answer')
   })
 
+  it('preserves semantic text boundaries for live answer streaming', () => {
+    const f = fold([
+      { kind: 'tool-start', seq: 0, toolId: 't', name: 'bash', input: '{}', at: 1 },
+      { kind: 'tool-result', seq: 1, toolId: 't', name: 'bash', result: 'ok', isError: false, input: '{}', at: 2 },
+      { kind: 'text', seq: 2, text: 'Checking.', presentation: 'intermediate' },
+      { kind: 'text', seq: 3, text: 'Answer', presentation: 'answer' },
+    ])
+
+    expect(f.timelineItems).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+      expect.objectContaining({ type: 'text', rawText: 'Checking.', presentation: 'intermediate' }),
+      expect.objectContaining({ type: 'text', rawText: 'Answer', presentation: 'answer' }),
+    ])
+  })
+
   it('replaces stale text around tools with one canonical terminal segment', () => {
     const f = fold([
       { kind: 'text', seq: 0, text: 'stale preface' },

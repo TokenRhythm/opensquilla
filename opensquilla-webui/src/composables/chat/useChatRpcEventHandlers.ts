@@ -63,7 +63,7 @@ export interface ChatRpcStreamApi {
   startStreaming: () => void
   endStreaming: (opts?: { reason?: string }) => void
   checkpointForUserMessage?: (turnId: string) => void
-  appendDelta: (text: string) => void
+  appendDelta: (text: string, presentation?: 'intermediate' | 'answer') => void
   scheduleRender: () => void
   appendToolCall: (payload: ToolUsePayload) => void
   appendToolDelta: (payload: ToolDeltaPayload) => void
@@ -616,7 +616,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
     options.markEnsembleHandoff()
-    stream.appendDelta(payload.text || '')
+    const presentation = payload.presentation
+    if (presentation === 'intermediate' || presentation === 'answer') {
+      stream.appendDelta(payload.text || '', presentation)
+    } else {
+      // Compatibility with older gateways that predate semantic text roles.
+      stream.appendDelta(payload.text || '')
+    }
   }
 
   function handleRpcToolUseStart(payload: ToolUsePayload) {

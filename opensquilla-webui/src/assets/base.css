@@ -926,6 +926,12 @@ pre {
   line-height: 1.35;
 }
 
+.sidebar-history-pin {
+  flex: 0 0 auto;
+  color: var(--accent);
+  opacity: 0.82;
+}
+
 .sidebar-history-gap {
   flex-shrink: 0;
   padding: 1px 5px;
@@ -952,6 +958,39 @@ pre {
   align-items: center;
   gap: 2px;
   margin: 1px var(--sp-1);
+}
+
+.sidebar-history-row.is-reorderable .sidebar-history-item {
+  cursor: grab;
+}
+
+.sidebar-history-row.is-reorderable:active .sidebar-history-item {
+  cursor: grabbing;
+}
+
+.sidebar-history-row.is-dragging {
+  opacity: 0.42;
+}
+
+.sidebar-history-row.is-drop-before::after,
+.sidebar-history-row.is-drop-after::after {
+  content: '';
+  position: absolute;
+  z-index: 2;
+  left: calc(var(--row-depth, 0) * 14px + var(--sp-2));
+  right: var(--sp-2);
+  height: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.sidebar-history-row.is-drop-before::after {
+  top: -2px;
+}
+
+.sidebar-history-row.is-drop-after::after {
+  bottom: -2px;
 }
 
 .sidebar-history-row--workspace {

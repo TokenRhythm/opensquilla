@@ -3542,6 +3542,8 @@
       "contractGap": "Backend session-list-v1 contract fields are missing",
       "contractGapBadge": "Gap",
       "rowActions": "Actions for {title}",
+      "pinTask": "Pin task",
+      "unpinTask": "Unpin task",
       "rename": "Rename",
       "delete": "Delete",
       "filterByAgent": "Filter by {name}",

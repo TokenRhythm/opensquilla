@@ -3542,6 +3542,8 @@
       "contractGap": "Backend-Vertragsfelder von session-list-v1 fehlen",
       "contractGapBadge": "Lücke",
       "rowActions": "Aktionen für {title}",
+      "pinTask": "Aufgabe anheften",
+      "unpinTask": "Aufgabe lösen",
       "rename": "Umbenennen",
       "delete": "Löschen",
       "filterByAgent": "Nach {name} filtern",

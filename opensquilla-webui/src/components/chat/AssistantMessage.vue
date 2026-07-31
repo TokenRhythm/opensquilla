@@ -93,12 +93,17 @@
             </template>
           </AssistantActivityTimeline>
         </ActivityDisclosure>
-        <TextPart
+        <div
           v-if="activityProjection.answerPart"
-          :part="activityProjection.answerPart"
-          :sources="message.sources ?? []"
-          @citation="onCitation"
-        />
+          class="assistant-answer"
+          :class="{ 'assistant-answer--separated': hasActivity }"
+        >
+          <TextPart
+            :part="activityProjection.answerPart"
+            :sources="message.sources ?? []"
+            @citation="onCitation"
+          />
+        </div>
       </template>
 
       <!-- Compatibility path for older history rows that have timeline text
@@ -721,7 +726,12 @@ const activityStepCount = computed(() => Math.max(
     + activityProjection.value.statusSteps.length
     + (reasoningPart.value ? 1 : 0),
 ))
-const activityDefaultOpen = computed(() => false)
+// Keep live work visible without making its expansion sticky. The disclosure
+// follows this lifecycle default in both directions, so terminal states fold
+// automatically while a later user click can still inspect the finished work.
+const activityDefaultOpen = computed(() =>
+  activityLifecycle.value === 'working' || activityLifecycle.value === 'answering',
+)
 const activityCompletionConfirmed = computed(() =>
   activityLifecycle.value === 'settled'
   && !props.message.isStreaming
@@ -953,6 +963,12 @@ function ensembleRole(role: string, label: string): string {
   min-width: 0;
   max-width: none;
   padding-top: 0.0625rem;
+}
+
+.assistant-answer--separated {
+  margin-top: 0;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--hairline);
 }
 
 .plan-message-card {

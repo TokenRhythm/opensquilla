@@ -207,16 +207,16 @@
           />
         </template>
 
-        <!-- Streaming AI message: activity stays open and flat while the turn
-             is live. The trailing text segment is rendered below it as the
-             current answer candidate; if a later tool starts, that text moves
-             back into the chronological activity transcript. -->
+        <!-- Streaming AI message: activity stays open while the turn is live.
+             Gateway-marked intermediate text remains in the transcript, while
+             gateway-marked answer text streams below the activity boundary. -->
         <!-- No blanket aria-live here: the phase label inside ActivityDisclosure
              is the single live announcement point, so streaming DOM churn (tool
              rows, answer tokens) is not read out mutation-by-mutation. -->
         <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
           <div class="msg-ai-main">
             <ActivityDisclosure
+              default-open
               :lifecycle="liveAnswerPart ? 'answering' : 'working'"
               :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
               :failure-count="liveActivityFailureCount"
@@ -263,19 +263,15 @@
               </AssistantActivityTimeline>
             </ActivityDisclosure>
 
-            <!-- Provisional answer candidate: the left rule + draft tag mark
-                 it as not-final, because a later tool start moves this text
-                 back into the activity transcript. The tag sits outside the
-                 candidate box so the candidate's own text stays the answer. -->
-            <template v-if="liveAnswerPart">
-              <span class="live-answer-candidate-tag">{{ t('chat.metaRuns.draft') }}</span>
-              <div class="live-answer-candidate">
-                <TextPart
-                  :part="liveAnswerPart"
-                  :sources="[]"
-                />
-              </div>
-            </template>
+            <!-- The gateway marks text as intermediate or answer. Only the
+                 semantic answer span streams below the activity boundary; no
+                 timeout or draft heuristic is involved. -->
+            <div v-if="liveAnswerPart" class="live-answer">
+              <TextPart
+                :part="liveAnswerPart"
+                :sources="[]"
+              />
+            </div>
             <span
               v-if="liveAnswerPart && !streamActivityStale"
               class="stream-caret"
@@ -2068,7 +2064,9 @@ watchEffect(() => assertLiveParity(streamThinkingText))
 const liveTimelineItems = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.timelineItems : streamTimelineItems.value,
 )
-const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value))
+const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value, {
+  keepToolTurnTextInActivity: true,
+}))
 const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() => {
   const candidate = liveTimelineSplit.value.answerItem
   if (!candidate) return null

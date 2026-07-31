@@ -49,7 +49,10 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     // The same structurally proven PlanRun answer shown outside the collapsed
     // activity must also be what Copy returns. Otherwise the compact completed
     // state would silently copy the entire execution narration.
-    if (answer.source === 'terminal-control-boundary') {
+    if (
+      answer.source === 'terminal-control-boundary'
+      || answer.source === 'terminal-timeline-boundary'
+    ) {
       return options.sanitizeCopyText(answer.text)
     }
     // Tool-bearing turns render text as separate timeline segments; the raw
