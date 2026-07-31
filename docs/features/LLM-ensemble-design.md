@@ -195,6 +195,13 @@ not a public configuration field:
 | `shuffle_candidates` | `True` | `False` |
 | `quorum_grace_seconds` | 0 (wait for every proposer) | 10 |
 
+The two timeout fields have intentionally different streaming semantics.
+`proposer_timeout_seconds` bounds each proposer's total execution time.
+`aggregator_timeout_seconds` is an idle/stall budget between upstream stream
+events, so an active aggregation may run longer than that value while a silent
+provider is still bounded. Host-generated keep-alive heartbeats do not reset
+the aggregator budget.
+
 `min_successful_proposers` is additionally clamped down to the actual proposer
 count. Both the configured and effective values (min-success, timeouts, shuffle)
 are recorded in the selection plan for debugging.
@@ -225,6 +232,9 @@ It also retries a timeout or a stream that ends before `DoneEvent` when that
 attempt has emitted no text, reasoning, or tool delta, reusing the completed
 proposer drafts. Once any user-visible delta has been emitted, the attempt is
 terminal so a retry cannot duplicate text or tool activity downstream.
+After the retry budget is exhausted without user-visible output,
+`fallback_single` makes exactly one request with the original conversation;
+the `error` policy remains terminal.
 
 Proposers never own an executable tool boundary. By default they receive no
 current tool schemas. Setting `proposer_tools = true` exposes those schemas only

@@ -259,7 +259,7 @@ all_failed_policy = "fallback_single"
 # proposer_tools = false              # expose tool schemas as non-executable advice
 # candidate_max_chars = 24000         # per-candidate transcript budget (0 = unlimited)
 # proposer_timeout_seconds = 3600.0
-# aggregator_timeout_seconds = 3600.0
+# aggregator_timeout_seconds = 3600.0 # idle/stall budget between stream events
 # shuffle_candidates = true           # shuffle candidate order before aggregation
 # record_candidates = false           # persist per-proposer candidates for replay/debug
 
