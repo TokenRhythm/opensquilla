@@ -84,6 +84,39 @@ describe('arrangeSidebarSections cancel stop labels', () => {
   })
 })
 
+describe('arrangeSidebarSections task attention', () => {
+  it('folds queued and running rows into one running indicator state', () => {
+    const sections = arrangeSidebarSections([
+      session({
+        key: 'agent:main:webchat:queued',
+        title: 'Queued',
+        updatedAt: 300,
+        runStatus: 'queued',
+        active_task: { status: 'queued' },
+      }),
+      session({
+        key: 'agent:main:webchat:running',
+        title: 'Running',
+        updatedAt: 200,
+        runStatus: 'running',
+        active_task: { status: 'running' },
+      }),
+      session({
+        key: 'agent:main:webchat:idle',
+        title: 'Idle',
+        updatedAt: 100,
+        runStatus: 'idle',
+      }),
+    ])
+
+    expect(sectionFor(sections, 'chats').rows.map(row => row.taskAttention)).toEqual([
+      'running',
+      'running',
+      'none',
+    ])
+  })
+})
+
 describe('arrangeSidebarSections — subagent nesting', () => {
   it('nests a subagent under its parent chat at depth 1', () => {
     const parentKey = 'agent:main:webchat:parent'

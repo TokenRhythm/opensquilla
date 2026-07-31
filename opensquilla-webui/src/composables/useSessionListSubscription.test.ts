@@ -49,11 +49,13 @@ describe('useSessionListSubscription', () => {
       harness.calls.push('refresh')
     })
     const scheduleRefresh = vi.fn()
+    const onChanged = vi.fn()
     const subscription = useSessionListSubscription({
       rpc: harness.rpc,
       isConnected: harness.isConnected,
       refresh,
       scheduleRefresh,
+      onChanged,
     })
 
     subscription.subscribe()
@@ -62,6 +64,7 @@ describe('useSessionListSubscription', () => {
 
     expect(harness.calls).toEqual(['sessions.subscribe', 'refresh'])
     expect(scheduleRefresh).toHaveBeenCalledOnce()
+    expect(onChanged).toHaveBeenCalledWith({ key: 'agent:main:webchat:test' })
   })
 
   it('subscribes once per connection and resubscribes after reconnect', async () => {

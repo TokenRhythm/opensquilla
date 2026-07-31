@@ -32,6 +32,7 @@ async function mountSidebar(options: {
       depth: 0,
       runStatus: 'idle',
       runLabel: 'Idle',
+      taskAttention: 'none',
       updatedAt: Date.now(),
       hasContractGaps: false,
     }],

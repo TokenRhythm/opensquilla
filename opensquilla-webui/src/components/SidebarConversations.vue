@@ -41,6 +41,7 @@ export type { SidebarSection as SidebarSectionType }
 <script setup lang="ts">
 import { computed, nextTick, ref, watch, type ComponentPublicInstance } from 'vue'
 import { useI18n } from 'vue-i18n'
+import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 import Icon from './Icon.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
@@ -81,6 +82,16 @@ const emit = defineEmits<{
 
 const { confirm } = useConfirm()
 const { t } = useI18n()
+
+const TASK_ATTENTION_LABEL_KEYS: Record<Exclude<SessionTaskAttention, 'none'>, string> = {
+  running: 'shared.sidebar.taskRunning',
+  completed: 'shared.sidebar.taskCompletedUnread',
+  failed: 'shared.sidebar.taskUnfinishedUnread',
+}
+
+function taskAttentionLabel(attention: SessionTaskAttention): string {
+  return attention === 'none' ? '' : t(TASK_ATTENTION_LABEL_KEYS[attention])
+}
 
 /* ── Agent filter (lives within the Chats section) ─────────────────── */
 
@@ -978,7 +989,16 @@ function onSelectRow(row: SidebarConversationItem) {
                 :aria-label="t('shared.sidebar.contractGap')"
                 :title="t('shared.sidebar.contractGap')"
               >{{ t('shared.sidebar.contractGapBadge') }}</span>
-              <span v-if="row.runStatus !== 'idle'" class="sidebar-history-run">{{ row.runLabel }}</span>
+              <span
+                v-if="!selectionMode"
+                class="sidebar-task-attention"
+                :class="`sidebar-task-attention--${row.taskAttention}`"
+                :role="row.taskAttention === 'none' ? undefined : 'img'"
+                :aria-hidden="row.taskAttention === 'none' ? 'true' : undefined"
+                :aria-label="taskAttentionLabel(row.taskAttention) || undefined"
+                :title="taskAttentionLabel(row.taskAttention) || undefined"
+                data-testid="sidebar-task-attention"
+              />
             </button>
 
             <!-- Chat-only ⋯ menu: rename + delete -->
