@@ -153,6 +153,7 @@ METHOD_SCOPES: dict[str, str] = {
     "usage.status": READ_SCOPE,
     "usage.cost": READ_SCOPE,
     "usage.query": READ_SCOPE,
+    "balance.query": READ_SCOPE,
     "meta.list": READ_SCOPE,  # OpenSquilla-only; invokable meta-skill catalog.
     "meta.runs.list": READ_SCOPE,
     "meta.runs.failures": READ_SCOPE,
