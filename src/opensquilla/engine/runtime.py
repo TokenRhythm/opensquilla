@@ -3422,6 +3422,7 @@ class TurnRunner:
                     session_epoch=self._usage_session_epoch_by_key.get(session_key, 0),
                     agent_id=agent_id,
                     run_kind=run_kind or "turn",
+                    router_control_replay_depth=tool_context.router_control_replay_depth if tool_context is not None else 0,
                 )
                 turn_usage_scope = UsageAccountingScope(
                     sink=self._usage_event_sink,
