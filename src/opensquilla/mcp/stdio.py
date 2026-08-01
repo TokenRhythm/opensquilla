@@ -32,6 +32,7 @@ class MCPStdioClient(MCPClient):
         self._process: asyncio.subprocess.Process | None = None
         self._request_id = 0
         self._request_lock = asyncio.Lock()
+        self._readahead: bytes = b""
 
     @staticmethod
     def _encode_request(request: dict[str, Any]) -> bytes:
@@ -128,6 +129,42 @@ class MCPStdioClient(MCPClient):
         self._process.stdin.write(encoded)
         await self._process.stdin.drain()
 
+    async def _readline_safe(self) -> bytes:
+        """Read a line from stdout without the 64 KB StreamReader limit.
+
+        ``asyncio.StreamReader.readline()`` raises ``LimitOverrunError`` when a
+        single line exceeds the reader's limit (default 64 KB). MCP tool
+        responses such as LSP diagnostics can be much larger, so we read in
+        chunks until we find a newline.
+        """
+        assert self._process is not None
+        assert self._process.stdout is not None
+
+        chunks: list[bytes] = []
+        while True:
+            if self._readahead:
+                nl_idx = self._readahead.find(b"\n")
+                if nl_idx >= 0:
+                    line = self._readahead[:nl_idx]
+                    self._readahead = self._readahead[nl_idx + 1 :]
+                    return line
+                # No newline in readahead; prepend it to the accumulated chunks.
+                chunks.append(self._readahead)
+                self._readahead = b""
+            data = await self._process.stdout.read(8192)
+            if not data:
+                if chunks:
+                    return b"".join(chunks)
+                return b""
+            nl_idx = data.find(b"\n")
+            if nl_idx >= 0:
+                chunks.append(data[:nl_idx])
+                remainder = data[nl_idx + 1 :]
+                if remainder:
+                    self._readahead = remainder
+                return b"".join(chunks)
+            chunks.append(data)
+
     async def _read_response(self, expected_id: int) -> dict[str, Any]:
         """Read newline-delimited JSON-RPC messages until the response arrives.
 
@@ -139,7 +176,7 @@ class MCPStdioClient(MCPClient):
         assert self._process.stdout is not None
 
         while True:
-            line = await self._process.stdout.readline()
+            line = await self._readline_safe()
             if not line:
                 raise ConnectionError("MCP stdio server closed the connection")
             try:
