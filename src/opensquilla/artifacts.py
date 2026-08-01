@@ -1186,6 +1186,10 @@ class ArtifactStore:
 
     def __init__(self, media_root: str | Path) -> None:
         self.media_root = Path(media_root)
+        self._disk_usage_cache: int = 0
+        # Initialize cache with a full scan on first use
+        # This is a one-time cost and ensures accuracy
+        self._disk_usage_cache = self._disk_usage_bytes()
 
     def publish_bytes(
         self,
@@ -1212,6 +1216,8 @@ class ArtifactStore:
                     "artifact material exceeds disk budget "
                     f"({current} + {len(payload)} > {disk_budget_bytes})"
                 )
+        # Update the disk usage cache after successful publish
+        self._disk_usage_cache += len(payload)
 
         session_id = _validate_non_empty("session_id", session_id)
         session_key = _validate_non_empty("session_key", session_key)
@@ -1299,6 +1305,41 @@ class ArtifactStore:
         bundle_max_files: int = DEFAULT_ARTIFACT_BUNDLE_MAX_FILES,
     ) -> ArtifactRef:
         """Atomically publish a static bundle while retaining the legacy entry file."""
+        # Calculate the total disk usage for the bundle
+        files = list(bundle.files)
+        _validate_bundle_file_set(
+            files,
+            entrypoint=bundle.entrypoint,
+            max_bytes=bundle_max_bytes,
+            max_files=bundle_max_files,
+        )
+        manifest = artifact_bundle_manifest(bundle)
+        source_by_path = {item.path: item for item in files}
+        entry_source = source_by_path[manifest.entrypoint]
+        payload = entry_source.data
+        manifest_bytes = json.dumps(
+            manifest.to_dict(),
+            ensure_ascii=False,
+            separators=(',', ':'),
+            sort_keys=True,
+        ).encode('utf-8')
+        unique_blob_bytes = {
+            hashlib.sha256(item.data).hexdigest(): item.data for item in files
+        }
+        added_disk_bytes = (
+            len(payload)
+            + len(manifest_bytes)
+            + sum(len(item) for item in unique_blob_bytes.values())
+        )
+        if disk_budget_bytes is not None:
+            current = self._disk_usage_bytes()
+            if current + added_disk_bytes > disk_budget_bytes:
+                raise ArtifactBudgetError(
+                    "artifact material exceeds disk budget "
+                    f"({current} + {added_disk_bytes} > {disk_budget_bytes})"
+                )
+        # Update the disk usage cache after successful publish
+        self._disk_usage_cache += added_disk_bytes
 
         files = list(bundle.files)
         _validate_bundle_file_set(
@@ -1681,6 +1722,34 @@ class ArtifactStore:
         sanitized legacy token), and links/reparse points are never followed.
         Returns the number of buckets removed.
         """
+        # Before deletion, calculate the total disk usage to subtract from the cache
+        total_deleted_bytes = 0
+        for meta_path in self._iter_session_meta_paths(session_id):
+            try:
+                ref = ArtifactRef.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if ref.session_id != session_id:
+                continue
+            try:
+                resolved_ref, material_path = self.resolve_for_download(
+                    ref.id,
+                    session_id=session_id,
+                )
+            except (ArtifactNotFoundError, ArtifactIntegrityError):
+                continue
+            total_deleted_bytes += resolved_ref.size
+            manifest = self.describe_preview_bundle(
+                ref.id,
+                session_id=session_id,
+            )
+            if manifest is not None:
+                for item in manifest.files:
+                    total_deleted_bytes += item.size
+        # Update the disk usage cache
+        self._disk_usage_cache -= total_deleted_bytes
+        if self._disk_usage_cache < 0:
+            self._disk_usage_cache = 0
 
         session_id = _validate_non_empty("session_id", session_id)
         legacy_token = _safe_token(session_id)
@@ -1901,9 +1970,19 @@ class ArtifactStore:
         return self._artifact_dir(session_id, artifact_id) / "meta.json"
 
     def _disk_usage_bytes(self) -> int:
+        # Return the cached value for O(1) performance
+        return self._disk_usage_cache
+
+    def _force_full_scan(self) -> int:
+        """Force a full scan of the artifact store and reset the cache.
+
+        This method is for debugging or when the cache is suspected to be drifted.
+        It should not be called in normal operation.
+        """
         root = self.media_root / ARTIFACT_STORE
         native_root = native_io_path(root)
         if not native_root.exists():
+            self._disk_usage_cache = 0
             return 0
         total = 0
         for path in native_root.rglob("*"):
@@ -1912,6 +1991,7 @@ class ArtifactStore:
                     total += path.stat().st_size
             except OSError:
                 continue
+        self._disk_usage_cache = total
         return total
 
 

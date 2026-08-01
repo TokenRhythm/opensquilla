@@ -1542,3 +1542,42 @@ def test_strip_artifact_markers_handles_bracket_in_name() -> None:
     cleaned = strip_artifact_markers_from_text(f"Done!\n{marker}\nAnything else?")
     assert "]" not in cleaned
     assert ".html" not in cleaned
+
+def test_artifact_store_incremental_disk_usage_cache(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    # Initial state: no artifacts, cache should be 0
+    assert store._disk_usage_bytes() == 0
+
+    # Publish a small artifact
+    ref1 = store.publish_bytes(
+        b"hello\n",
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        name="report.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    # Verify the artifact was published
+    assert ref1.size == 6
+    # Cache should be updated to 6 bytes
+    assert store._disk_usage_bytes() == 6
+
+    # Publish a larger artifact
+    ref2 = store.publish_bytes(
+        b"world\nworld\n",
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        name="report2.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    # Verify the artifact was published
+    assert ref2.size == 12
+    # Cache should be updated to 6 + 12 = 18 bytes
+    assert store._disk_usage_bytes() == 18
+
+    # Delete the session artifacts
+    deleted = store.delete_session_artifacts("session-1")
+    # Cache should be updated to 0
+    assert store._disk_usage_bytes() == 0
+    assert deleted == 1
