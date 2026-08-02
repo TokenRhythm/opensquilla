@@ -67,6 +67,7 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     # catalog entry marks it reasoning-capable -> "openrouter" format, so
     # thinking-off freezes reasoning={"enabled": false} too.
     "openrouter": ("z-ai/glm-5", "openrouter"),
+    "orcarouter": (_NEUTRAL_MODEL, "none"),
     "azure": (_NEUTRAL_MODEL, "none"),
     # _DEEPSEEK_V4_MODEL_IDS: thinking-toggle + require-reasoning_content
     # sets (compat_policy); deepseek reasoning_shape -> "deepseek".

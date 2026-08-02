@@ -48,6 +48,13 @@ def test_registry_attaches_kind_policy() -> None:
     assert specs["vllm"].compat.display_name == "OpenAI"  # kind-aliased to openai
 
 
+def test_orcarouter_kind_policy() -> None:
+    specs = {spec.provider_id: spec for spec in list_provider_specs()}
+    assert specs["orcarouter"].compat.display_name == "OrcaRouter"
+    assert specs["orcarouter"].compat.official_host == "api.orcarouter.ai"
+    assert specs["orcarouter"].compat.sends_usage_include is True
+
+
 def test_unknown_kind_gets_neutral_default() -> None:
     policy = compat_policy_for_kind("no-such-kind")
     assert policy == OpenAICompatPolicy()

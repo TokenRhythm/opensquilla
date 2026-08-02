@@ -67,6 +67,7 @@ _CATALOG_SOURCE_WAIVERS: frozenset[str] = frozenset(
 # moved the data verbatim.
 _EXPECTED_CATALOG_SOURCES: dict[str, tuple[str, ...]] = {
     "openrouter": ("openrouter",),
+    "orcarouter": ("orcarouter",),
     "openai": ("openai",),
     "openai_responses": ("openai",),
     "anthropic": ("anthropic",),

@@ -383,7 +383,7 @@ class ModelCatalog:
     def __len__(self) -> int:
         return len(self._models)
 
-    def _populate_from_data(self, models: list[dict]) -> None:
+    def _populate_from_data(self, models: list[dict], *, provider: str = "openrouter") -> None:
         """Parse a list of OpenRouter model dicts into ModelInfo entries."""
         for m in models:
             model_id = m.get("id", "")
@@ -398,7 +398,7 @@ class ModelCatalog:
             }
             pricing = m.get("pricing") or {}
             self._models[model_id] = ModelInfo(
-                provider="openrouter",
+                provider=provider,
                 model_id=model_id,
                 display_name=m.get("name", model_id),
                 context_window=m.get("context_length", 0),
@@ -520,6 +520,30 @@ class ModelCatalog:
             data = resp.json()
 
         self._populate_from_data(data.get("data", []))
+        log.debug("model_catalog.fetched", count=len(self._models))
+
+    async def fetch_orcarouter(self, api_key: str, base_url: str, proxy: str = "") -> None:
+        """Fetch model list from OrcaRouter /v1/models endpoint.
+
+        OrcaRouter's model listing is public (no auth required), but a Bearer
+        key is sent when available. ``base_url`` must NOT end with ``/v1`` —
+        boot.py strips it. URL constructed as: ``f"{base_url}/v1/models"``
+        """
+        url = f"{base_url}/v1/models"
+        headers = {}
+        if api_key:
+            headers["Authorization"] = (
+                f"Bearer {clean_header_secret(api_key, label='OrcaRouter API key')}"
+            )
+        headers.update(provider_app_headers(base_url))
+        async with httpx.AsyncClient(
+            timeout=10.0, trust_env=_trust_env(), proxy=proxy or None
+        ) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+        self._populate_from_data(data.get("data", []), provider="orcarouter")
         log.debug("model_catalog.fetched", count=len(self._models))
 
     def get(self, model_id: str) -> ModelInfo | None:

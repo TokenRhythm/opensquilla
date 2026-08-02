@@ -2634,13 +2634,22 @@ async def build_services(
 
         await refresh_live_model_catalog(config, catalog=model_catalog)
 
-        if not (api_key and config.llm.provider == "openrouter"):
+        provider = config.llm.provider
+        if provider not in ("openrouter", "orcarouter"):
+            return
+        if provider == "openrouter" and not api_key:
             return
         try:
-            await asyncio.wait_for(
-                model_catalog.fetch_openrouter(api_key, resolved_base, proxy),
-                timeout=5.0,
-            )
+            if provider == "openrouter":
+                await asyncio.wait_for(
+                    model_catalog.fetch_openrouter(api_key, resolved_base, proxy),
+                    timeout=5.0,
+                )
+            else:
+                await asyncio.wait_for(
+                    model_catalog.fetch_orcarouter(api_key, resolved_base, proxy),
+                    timeout=5.0,
+                )
             log.info("build_services.model_catalog_ready", count=len(model_catalog))
         except Exception as e:
             log.warning("build_services.model_catalog_failed", error=str(e))
