@@ -569,6 +569,19 @@ _COMMANDS: tuple[CommandDef, ...] = (
         order=180,
     ),
     CommandDef(
+        name="/goal",
+        usage="/goal [status|clear|pause|resume|<description>]",
+        description="Set a long-running goal; the agent keeps working toward it "
+                    "turn after turn until complete or blocked.",
+        execution={
+            _T: _local("goal.set"),
+        },
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.NOTICE,
+        order=185,
+    ),
+    CommandDef(
         name="/permissions",
         usage="/permissions [mode]",
         description="Show or set the session permission override.",

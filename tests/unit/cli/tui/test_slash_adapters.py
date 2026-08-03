@@ -11,6 +11,7 @@ import pytest
 
 from opensquilla.cli.chat.session_state import ChatSessionState
 from opensquilla.cli.chat.turn import TurnResult
+from opensquilla.cli.gateway_client import GatewayRPCError
 from opensquilla.cli.tui.adapters import slash_bridge as _slash_bridge
 from opensquilla.cli.tui.adapters import slash_gateway as _slash_gateway
 from opensquilla.cli.tui.adapters import slash_standalone as _slash_standalone
@@ -1341,6 +1342,363 @@ async def test_gateway_model_strategy_missing_control_rpc_is_explicit_read_only(
     assert handled is True
     assert "read-only" in recorder.text()
     assert ("set_model_routing", "router") not in client.calls
+
+
+# --------------------------------------------------------------------------- #
+# /goal: goals.* RPC surface + watch loop for continuation turns              #
+# --------------------------------------------------------------------------- #
+
+_GOAL_KEY = "agent:main:test:0"
+
+
+def _goal_plan_run_frame(
+    *,
+    driver_kind: str = "goal",
+    status: str,
+    reason: str | None = None,
+    run_id: str = "run-1",
+) -> dict[str, Any]:
+    run: dict[str, Any] = {"runId": run_id, "driverKind": driver_kind, "status": status}
+    if reason is not None:
+        run["terminalReason"] = reason
+    return {"event": "session.event.plan_run", "payload": {"plan_run": run}}
+
+
+class _GoalFakeSubscription:
+    """Async iterable of scripted frames; turn pulls share the same queue."""
+
+    def __init__(self, frames: list[dict[str, Any]]) -> None:
+        self._frames = list(frames)
+        self.closed = False
+
+    def __aiter__(self) -> _GoalFakeSubscription:
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        if not self._frames:
+            raise StopAsyncIteration
+        return self._frames.pop(0)
+
+    async def get(self) -> dict[str, Any]:
+        if not self._frames:
+            raise StopAsyncIteration
+        return self._frames.pop(0)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _GoalFakeClient:
+    """Minimal gateway double for the goals.* RPC + watch path."""
+
+    def __init__(self, subscription: _GoalFakeSubscription | None = None) -> None:
+        self.calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.responses: dict[str, list[Any]] = {}
+        self.errors: dict[str, Exception] = {}
+        self.subscribe_keys: list[str] = []
+        self.subscription = subscription or _GoalFakeSubscription([])
+
+    async def call(self, method: str, params: dict | None = None) -> Any:
+        self.calls.append((method, params))
+        if method in self.errors:
+            raise self.errors[method]
+        responses = self.responses.get(method)
+        if responses:
+            return responses.pop(0)
+        return {"ok": True}
+
+    async def subscribe_session_events(self, session_key: str) -> _GoalFakeSubscription:
+        self.subscribe_keys.append(session_key)
+        return self.subscription
+
+    def goal_calls(self) -> list[tuple[str, dict[str, Any] | None]]:
+        return [call for call in self.calls if call[0].startswith("goals.")]
+
+
+async def _goal_watch_stream(
+    turn_client: Any,
+    session_key: str,
+    message: str,
+    elevated_state: dict[str, str | None],
+    *,
+    tui_output: Any | None = None,
+) -> TurnResult:
+    """Drain one goal turn projection through the shared renderer path."""
+    del session_key, message, elevated_state, tui_output
+    frames = [frame async for frame in turn_client.send_message("", "")]
+    assert frames, "goal turn projection produced no frames"
+    return TurnResult(text="ok")
+
+
+async def test_goal_status_without_active_goal_renders_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+
+    handled = await handle_gateway_slash_command("/goal status", _gateway_context(client))
+
+    assert handled is True
+    assert client.calls == [("goals.status", {"sessionKey": _GOAL_KEY})]
+    assert "No active goal" in recorder.text()
+
+
+async def test_goal_status_with_active_goal_renders_goal_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [
+        {"goal": {"goalText": "ship it", "status": "running", "turns": 2, "idleTurns": 1}}
+    ]
+
+    handled = await handle_gateway_slash_command("/goal", _gateway_context(client))
+
+    assert handled is True
+    text = recorder.text()
+    assert "ship it" in text
+    assert "running" in text
+    assert "turns" in text
+    assert "2" in text
+
+
+async def test_goal_clear_renders_active_and_empty_states(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.responses["goals.clear"] = [{"goal": {"goalText": "ship it"}}]
+
+    handled = await handle_gateway_slash_command("/goal clear", _gateway_context(client))
+
+    assert handled is True
+    assert client.calls == [("goals.clear", {"sessionKey": _GOAL_KEY})]
+    text = recorder.text()
+    assert "cleared" in text
+    assert "ship it" in text
+
+    recorder.entries.clear()
+    assert (
+        await handle_gateway_slash_command("/goal clear", _gateway_context(_GoalFakeClient()))
+        is True
+    )
+    assert "No active goal to clear" in recorder.text()
+
+
+async def test_goal_pause_rpc_and_help(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+
+    assert await handle_gateway_slash_command("/goal pause", _gateway_context(client)) is True
+    assert client.calls == [("goals.pause", {"sessionKey": _GOAL_KEY})]
+    assert "paused" in recorder.text()
+
+    recorder.entries.clear()
+    assert (
+        await handle_gateway_slash_command("/goal help", _gateway_context(_GoalFakeClient()))
+        is True
+    )
+    assert "Usage: /goal" in recorder.text()
+
+
+async def test_goal_resume_restarts_watch_until_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    subscription = _GoalFakeSubscription(
+        [_goal_plan_run_frame(status="completed", reason="all done")]
+    )
+    client = _GoalFakeClient(subscription)
+
+    handled = await handle_gateway_slash_command(
+        "/goal resume",
+        _gateway_context(client, stream_response=_goal_watch_stream),
+    )
+
+    assert handled is True
+    assert client.goal_calls() == [
+        ("goals.resume", {"sessionKey": _GOAL_KEY}),
+        ("goals.unobserve", {"sessionKey": _GOAL_KEY, "watch": False}),
+        ("goals.status", {"sessionKey": _GOAL_KEY}),
+    ]
+    assert client.subscribe_keys == [_GOAL_KEY]
+    assert subscription.closed is True
+    text = recorder.text()
+    assert "resumed" in text
+    assert "watching" in text
+    assert "goal complete" in text
+    assert "all done" in text
+
+
+async def test_goal_set_watches_until_plan_terminal_then_unobserves_and_pauses_if_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    subscription = _GoalFakeSubscription(
+        [
+            _goal_plan_run_frame(status="running"),
+            {"event": "session.event.done", "payload": {"turn_id": "turn-1"}},
+            _goal_plan_run_frame(status="completed", reason="all goals met"),
+        ]
+    )
+    client = _GoalFakeClient(subscription)
+    client.responses["goals.set"] = [{"goal": {"goalText": "build the thing"}}]
+    client.responses["goals.status"] = [
+        {"goal": {"status": "running"}},
+        {"goal": {"status": "running"}},
+    ]
+
+    handled = await handle_gateway_slash_command(
+        "/goal build the thing",
+        _gateway_context(client, stream_response=_goal_watch_stream),
+    )
+
+    assert handled is True
+    assert client.calls[:2] == [
+        ("goals.observe", {"sessionKey": _GOAL_KEY, "watch": True}),
+        ("goals.set", {"sessionKey": _GOAL_KEY, "message": "build the thing"}),
+    ]
+    assert client.subscribe_keys == [_GOAL_KEY]
+    assert client.goal_calls() == [
+        ("goals.observe", {"sessionKey": _GOAL_KEY, "watch": True}),
+        ("goals.set", {"sessionKey": _GOAL_KEY, "message": "build the thing"}),
+        ("goals.status", {"sessionKey": _GOAL_KEY}),
+        ("goals.unobserve", {"sessionKey": _GOAL_KEY, "watch": False}),
+        ("goals.status", {"sessionKey": _GOAL_KEY}),
+        ("goals.pause", {"sessionKey": _GOAL_KEY}),
+    ]
+    assert subscription.closed is True
+    text = recorder.text()
+    assert "watching" in text
+    assert "build the thing" in text
+    assert "paused" in text
+    assert "(no watcher)" in text
+    assert "goal complete" in text
+    assert "all goals met" in text
+
+
+async def test_goal_watch_cleanup_skips_pause_when_goal_no_longer_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    subscription = _GoalFakeSubscription(
+        [_goal_plan_run_frame(status="cancelled", reason="changed mind")]
+    )
+    client = _GoalFakeClient(subscription)
+    client.responses["goals.set"] = [{"goal": {"goalText": "ship it"}}]
+    client.responses["goals.status"] = [
+        {"goal": {"status": "complete", "terminalReason": "done"}}
+    ]
+
+    handled = await handle_gateway_slash_command(
+        "/goal ship it",
+        _gateway_context(client, stream_response=_goal_watch_stream),
+    )
+
+    assert handled is True
+    assert client.goal_calls() == [
+        ("goals.observe", {"sessionKey": _GOAL_KEY, "watch": True}),
+        ("goals.set", {"sessionKey": _GOAL_KEY, "message": "ship it"}),
+        ("goals.unobserve", {"sessionKey": _GOAL_KEY, "watch": False}),
+        ("goals.status", {"sessionKey": _GOAL_KEY}),
+    ]
+    assert subscription.closed is True
+    assert "goal cancelled" in recorder.text()
+    assert "changed mind" in recorder.text()
+    assert "paused" not in recorder.text()
+
+
+async def test_goal_set_error_renders_panel_and_only_unobserves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.errors["goals.set"] = GatewayRPCError(
+        "goals.set",
+        code="GOAL_LOCKED",
+        message="another goal is active",
+    )
+
+    handled = await handle_gateway_slash_command(
+        "/goal ship it",
+        _gateway_context(client, stream_response=_goal_watch_stream),
+    )
+
+    assert handled is True
+    assert client.goal_calls() == [
+        ("goals.observe", {"sessionKey": _GOAL_KEY, "watch": True}),
+        ("goals.set", {"sessionKey": _GOAL_KEY, "message": "ship it"}),
+        ("goals.unobserve", {"sessionKey": _GOAL_KEY, "watch": False}),
+    ]
+    assert client.subscribe_keys == []
+    assert "Goal set failed" in recorder.text()
+    assert "another goal is active" in recorder.text()
+    assert "watching" not in recorder.text()
+
+
+@pytest.mark.parametrize(
+    ("command", "method", "title"),
+    [
+        ("/goal status", "goals.status", "Goal status failed"),
+        ("/goal clear", "goals.clear", "Goal clear failed"),
+        ("/goal pause", "goals.pause", "Goal pause failed"),
+        ("/goal resume", "goals.resume", "Goal resume failed"),
+    ],
+)
+async def test_goal_rpc_errors_render_panel_and_return_true(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    method: str,
+    title: str,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.errors[method] = GatewayRPCError(method, message="boom")
+
+    handled = await handle_gateway_slash_command(command, _gateway_context(client))
+
+    assert handled is True
+    assert title in recorder.text()
+    assert "boom" in recorder.text()
+
+
+def test_goal_plan_run_terminal_judges_goal_driver_terminal_states() -> None:
+    terminal = _slash_gateway._goal_plan_run_terminal
+
+    assert terminal(_goal_plan_run_frame(status="completed")) == ("completed", None)
+    assert terminal(_goal_plan_run_frame(status="completed", reason="all done")) == (
+        "completed",
+        "all done",
+    )
+    assert terminal(_goal_plan_run_frame(status="cancelled")) == ("cancelled", None)
+    # Non-goal drivers never settle the goal watch.
+    assert terminal(_goal_plan_run_frame(status="completed", driver_kind="task")) is None
+    # Non-terminal plan statuses keep the loop consuming frames.
+    assert terminal(_goal_plan_run_frame(status="running")) is None
+    assert terminal(_goal_plan_run_frame(status="blocked")) is None
+    # Non-plan events and missing snapshots are ignored.
+    assert terminal({"event": "session.event.done", "payload": {"turn_id": "t1"}}) is None
+    assert terminal({"event": "session.event.plan_run", "payload": {}}) is None
+
+
+def test_goal_turn_id_reads_event_identity_keys() -> None:
+    extract = _slash_gateway._goal_turn_id
+
+    assert extract({"payload": {"turn_id": "t1"}}) == "t1"
+    assert extract({"payload": {"turnId": "t2"}}) == "t2"
+    assert extract({"payload": {"task_id": "t3"}}) == "t3"
+    assert extract({"payload": {"taskId": "t4"}}) == "t4"
+    assert extract({"payload": {"turn_id": ""}}) is None
+    assert extract({"payload": {"turn_id": 7}}) is None
+    assert extract({"payload": {}}) is None
+    assert extract({}) is None
+
+
+def test_goal_reason_text_filters_non_string_values() -> None:
+    text = _slash_gateway._goal_reason_text
+
+    assert text("all done") == "all done"
+    assert text("") is None
+    assert text(None) is None
+    assert text(0) is None
+    assert text(3.5) is None
+
 
 
 async def test_gateway_model_strategy_failed_write_reprojects_canonical_state(

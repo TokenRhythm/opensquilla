@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -341,6 +341,441 @@ async def _requested_session_model(context: GatewaySlashContext) -> str | None:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# /goal (gateway mode): goals.* RPC surface + watch loop for continuation turns
+# --------------------------------------------------------------------------- #
+
+# Goal run statuses that mean "no more turns will be driven" (server FSM).
+_GOAL_TERMINAL_STATUSES = frozenset({"complete", "blocked"})
+# Plan run statuses that settle the owning goal run (driverKind == "goal").
+_GOAL_PLAN_RUN_TERMINAL_STATUSES = frozenset({"completed", "cancelled"})
+
+
+def _goal_payload(frame: Mapping[str, Any]) -> dict[str, Any]:
+    payload = frame.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _goal_turn_id(frame: Mapping[str, Any]) -> str | None:
+    """Return the turn identity stamped on a session event frame, if any."""
+    event = _goal_payload(frame)
+    for key in ("turn_id", "turnId", "task_id", "taskId"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _goal_plan_run(frame: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Extract the ``plan_run`` snapshot from a plan run event frame."""
+    if str(frame.get("event") or "") != "session.event.plan_run":
+        return None
+    run = _goal_payload(frame).get("plan_run")
+    return run if isinstance(run, dict) else None
+
+
+def _goal_plan_run_terminal(
+    frame: Mapping[str, Any],
+) -> tuple[str, str | None] | None:
+    """Return ``(status, terminal_reason)`` when the frame settles the goal run.
+
+    A plan run only settles its goal when it is a goal driver run reaching a
+    terminal state. Anything else returns ``None`` so the watch loop keeps
+    consuming frames.
+    """
+    run = _goal_plan_run(frame)
+    if run is None or str(run.get("driverKind") or "") != "goal":
+        return None
+    status = str(run.get("status") or "")
+    if status not in _GOAL_PLAN_RUN_TERMINAL_STATUSES:
+        return None
+    reason = run.get("terminalReason")
+    return status, reason if isinstance(reason, str) and reason else None
+
+
+def _goal_frame_error(frame: Mapping[str, Any]) -> str | None:
+    """Return a user-facing message when the frame is a session error."""
+    if str(frame.get("event") or "") != "session.event.error":
+        return None
+    event = _goal_payload(frame)
+    message = event.get("message")
+    if isinstance(message, str) and message:
+        return message
+    error_message = event.get("error_message")
+    return (
+        error_message
+        if isinstance(error_message, str) and error_message
+        else "Goal turn failed"
+    )
+
+
+def _goal_reason_text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _print_goal_status(payload: dict[str, Any]) -> None:
+    """Render a ``goals.status`` payload in the compact ``/status`` style."""
+    goal = payload.get("goal")
+    if goal is None:
+        console.print(f"[{ACCENT}]goal[/] [dim]No active goal[/dim]")
+        return
+    goal_text = str(goal.get("goalText") or "")
+    console.print(f"[{ACCENT}]goal[/] [dim]{goal_text}[/dim]")
+    console.print(f"[{ACCENT}]status[/] [dim]{str(goal.get('status') or '')}[/dim]")
+    turns = goal.get("turns")
+    if isinstance(turns, int):
+        console.print(f"[{ACCENT}]turns[/] [dim]{turns}[/dim]")
+    idle = goal.get("idleTurns")
+    if isinstance(idle, int):
+        console.print(f"[{ACCENT}]idle[/] [dim]{idle}[/dim]")
+    reason = _goal_reason_text(goal.get("blockedReason")) or _goal_reason_text(
+        goal.get("terminalReason")
+    )
+    if reason:
+        console.print(f"[{ACCENT}]reason[/] [dim]{reason}[/dim]")
+    run = payload.get("planRun")
+    if isinstance(run, dict) and str(run.get("driverKind") or "") == "goal":
+        console.print(
+            f"[{ACCENT}]run[/] [dim]{run.get('runId')}[/dim] "
+            f"[dim]({str(run.get('status') or '')})[/dim]"
+        )
+
+
+def _print_goal_terminal_summary(terminal: str, reason: str | None) -> None:
+    """Render the one-line outcome after the watch loop stops."""
+    if terminal in {"complete", "completed"}:
+        headline = "[green]goal complete[/green]"
+    elif terminal in {"blocked", "failed", "error"}:
+        headline = f"[yellow]goal {terminal}[/yellow]"
+    elif terminal in {"cancelled", "cleared", "paused"}:
+        headline = f"[{ACCENT}]goal {terminal}[/{ACCENT}]"
+    else:
+        headline = f"[{ACCENT}]goal {terminal}[/{ACCENT}]"
+    if reason:
+        console.print(f"{headline} [dim]({reason})[/dim]")
+    else:
+        console.print(headline)
+
+
+class _GoalTurnClient:
+    """Feed one goal-driven continuation turn through the shared renderer.
+
+    Mirrors the runtime's external-turn projection (``_ExternalTurnClient``):
+    the first frame that announced the turn is replayed, then frames are pulled
+    from the shared session subscription until the turn reaches its terminal
+    frame. A settling goal plan run is intercepted while pulling so the watch
+    loop can stop as soon as the server terminalizes the goal.
+    """
+
+    def __init__(
+        self,
+        client: GatewayClientLike,
+        subscription: Any,
+        first_frame: dict[str, Any],
+        *,
+        turn_id: str,
+    ) -> None:
+        self._client = client
+        self._subscription = subscription
+        self._first_frame = first_frame
+        self._turn_id = turn_id
+        self.terminal_plan_run: dict[str, Any] | None = None
+
+    async def send_message(
+        self,
+        session_key: str,
+        message: str,
+        attachments: list[dict] | None = None,
+        elevated: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        del session_key, message, attachments, elevated
+        from opensquilla.cli.gateway_client import _advance_gateway_turn_event
+
+        active_task_groups: set[str] = set()
+        first: dict[str, Any] | None = self._first_frame
+        while True:
+            frame = first if first is not None else await self._subscription.get()
+            first = None
+            plan_terminal = _goal_plan_run_terminal(frame)
+            if plan_terminal is not None:
+                run = _goal_plan_run(frame)
+                if run is not None:
+                    self.terminal_plan_run = run
+                return
+            event_name = str(frame.get("event") or "")
+            payload = _goal_payload(frame)
+            turn_id = _goal_turn_id(frame)
+            if turn_id is not None and turn_id != self._turn_id:
+                continue
+            normalized, terminal = _advance_gateway_turn_event(
+                event_name,
+                payload,
+                active_task_groups,
+            )
+            yield normalized
+            if terminal:
+                return
+
+    async def resolve_approval(
+        self,
+        approval_id: str,
+        approved: bool,
+        *,
+        choice: str | None = None,
+    ) -> Any:
+        return await self._client.resolve_approval(approval_id, approved, choice=choice)
+
+    async def abort_session(self, key: str) -> dict[str, Any]:
+        # Cancelling the local projection (Ctrl+C / surface exit) must not
+        # strand the goal driver: the watcher cleanup pauses the goal instead.
+        return await self._client.abort_session(key)
+
+
+async def _goal_status_after_turn(
+    client: GatewayClientLike,
+    session_key: str,
+) -> tuple[str, str | None] | None:
+    """Return ``(terminal_status, reason)`` after a goal turn, else ``None``.
+
+    The driver settles the goal run durably without broadcasting a terminal
+    ``plan_run`` frame, so the watcher re-reads canonical status after each
+    turn. ``None`` means the goal is still running and the loop keeps watching.
+    """
+    try:
+        payload = await client.call("goals.status", {"sessionKey": session_key})
+    except GatewayRPCError:
+        return ("error", None)
+    goal = payload.get("goal") if isinstance(payload, dict) else None
+    if goal is None:
+        return ("cleared", None)
+    status = str(goal.get("status") or "")
+    if status in _GOAL_TERMINAL_STATUSES:
+        return (status, _goal_reason_text(goal.get("terminalReason")))
+    if status == "paused":
+        return ("paused", None)
+    return None
+
+
+async def _goal_watch_cleanup(
+    client: GatewayClientLike,
+    session_key: str,
+) -> None:
+    """Release the watcher and pause a still-running goal ("close chat = pause")."""
+    try:
+        await client.call("goals.unobserve", {"sessionKey": session_key, "watch": False})
+    except Exception:  # noqa: BLE001 - cleanup is best-effort
+        pass
+    try:
+        payload = await client.call("goals.status", {"sessionKey": session_key})
+    except Exception:  # noqa: BLE001 - cleanup is best-effort
+        return
+    goal = payload.get("goal") if isinstance(payload, dict) else None
+    if goal is None or str(goal.get("status") or "") != "running":
+        return
+    try:
+        await client.call("goals.pause", {"sessionKey": session_key})
+    except Exception:  # noqa: BLE001 - cleanup is best-effort
+        return
+    console.print(f"[{ACCENT}]goal[/] [yellow]paused[/yellow] [dim](no watcher)[/dim]")
+
+
+async def _run_goal_watch(
+    client: GatewayClientLike,
+    session_key: str,
+    *,
+    stream: GatewayStreamResponse,
+    elevated_state: dict[str, str | None],
+    tui_output: TuiOutputHandle | None,
+) -> None:
+    """Render gateway-driven goal turns until the goal settles or watching stops.
+
+    Continuation turns arrive as ``session.event.*`` frames on the session
+    stream. Every new turn (keyed by its ``turn_id``) is projected through the
+    shared gateway stream path, so TUI and plain surfaces see the same live
+    output as a normal turn. The loop exits when the goal plan run reaches a
+    terminal state, the goal run itself terminalizes (checked after each turn),
+    an error surfaces, or the user interrupts (Ctrl+C), which pauses the goal.
+    """
+    try:
+        subscription = await client.subscribe_session_events(session_key)
+    except Exception:
+        # Never leave the watcher registered when the stream cannot be opened.
+        await _goal_watch_cleanup(client, session_key)
+        raise
+    console.print(f"[{ACCENT}]goal[/] [dim]watching; press Ctrl+C to pause[/dim]")
+    terminal: str | None = None
+    terminal_reason: str | None = None
+    current_turn_id: str | None = None
+    try:
+        async for frame in subscription:
+            plan_terminal = _goal_plan_run_terminal(frame)
+            if plan_terminal is not None:
+                terminal, terminal_reason = plan_terminal
+                break
+            error_message = _goal_frame_error(frame)
+            if error_message is not None:
+                console.print(error_panel(error_message, title="Goal turn failed"))
+                terminal = "failed"
+                break
+            turn_id = _goal_turn_id(frame)
+            if turn_id is None or turn_id == current_turn_id:
+                continue
+            current_turn_id = turn_id
+            turn_client = _GoalTurnClient(
+                client,
+                subscription,
+                frame,
+                turn_id=turn_id,
+            )
+            result = await stream(
+                turn_client,
+                session_key,
+                "",
+                elevated_state,
+                tui_output=tui_output,
+            )
+            if turn_client.terminal_plan_run is not None:
+                run = turn_client.terminal_plan_run
+                terminal = str(run.get("status") or "cancelled")
+                terminal_reason = _goal_reason_text(run.get("terminalReason"))
+                break
+            if result.error:
+                console.print(error_panel(str(result.error), title="Goal turn failed"))
+                terminal = "failed"
+                break
+            status = await _goal_status_after_turn(client, session_key)
+            if status is not None:
+                terminal, terminal_reason = status
+                break
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        console.print(f"\n[{ACCENT}]goal[/] [yellow]watch cancelled[/yellow]")
+    finally:
+        close = getattr(subscription, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                pass
+        await _goal_watch_cleanup(client, session_key)
+        if terminal is not None:
+            _print_goal_terminal_summary(terminal, terminal_reason)
+
+
+async def _handle_goal_command(argument: str, context: GatewaySlashContext) -> bool:
+    """Dispatch one gateway-mode ``/goal`` invocation (all subcommands)."""
+    client = context.client
+    key = context.state.session_key
+    word = argument.strip().lower()
+
+    if word in {"", "status"}:
+        try:
+            payload = await client.call("goals.status", {"sessionKey": key})
+        except GatewayRPCError as exc:
+            console.print(error_panel(str(exc), title="Goal status failed"))
+        else:
+            _print_goal_status(payload if isinstance(payload, dict) else {})
+        return True
+
+    if word == "clear":
+        try:
+            before = await client.call("goals.clear", {"sessionKey": key})
+        except GatewayRPCError as exc:
+            console.print(error_panel(str(exc), title="Goal clear failed"))
+            return True
+        goal = before.get("goal") if isinstance(before, dict) else None
+        if goal is None:
+            console.print(f"[{ACCENT}]goal[/] [dim]No active goal to clear[/dim]")
+        else:
+            console.print(
+                f"[{ACCENT}]goal[/] [yellow]cleared[/yellow] "
+                f"[dim]{goal.get('goalText')}[/dim]"
+            )
+        return True
+
+    if word == "pause":
+        try:
+            payload = await client.call("goals.pause", {"sessionKey": key})
+        except GatewayRPCError as exc:
+            console.print(error_panel(str(exc), title="Goal pause failed"))
+            return True
+        goal = payload.get("goal") if isinstance(payload, dict) else None
+        label = (
+            str(goal.get("goalText") or "")
+            if isinstance(goal, dict) and goal.get("goalText")
+            else ""
+        )
+        console.print(
+            f"[{ACCENT}]goal[/] [yellow]paused[/yellow]"
+            + (f" [dim]{label}[/dim]" if label else "")
+        )
+        return True
+
+    if word == "resume":
+        try:
+            await client.call("goals.resume", {"sessionKey": key})
+        except GatewayRPCError as exc:
+            console.print(error_panel(str(exc), title="Goal resume failed"))
+            return True
+        console.print(f"[{ACCENT}]goal[/] [green]resumed[/green]; watching…")
+        await _run_goal_watch(
+            client,
+            key,
+            stream=context.stream_response or stream_response_gateway,
+            elevated_state=context.elevated_state,
+            tui_output=context.tui_output,
+        )
+        return True
+
+    if word in {"help", "-h", "--help"}:
+        console.print(
+            "[red]Usage: /goal [status|clear|pause|resume|<description>][/red]"
+        )
+        return True
+
+    # /goal <description> → goals.observe + goals.set + watch loop.
+    try:
+        await client.call("goals.observe", {"sessionKey": key, "watch": True})
+    except GatewayRPCError as exc:
+        console.print(error_panel(str(exc), title="Goal watch failed"))
+        return True
+    watch_started = False
+    try:
+        try:
+            payload = await client.call("goals.set", {"sessionKey": key, "message": argument})
+        except GatewayRPCError as exc:
+            console.print(error_panel(str(exc), title="Goal set failed"))
+            return True
+        goal = payload.get("goal") if isinstance(payload, dict) else None
+        goal_text = (
+            str(goal.get("goalText") or argument)
+            if isinstance(goal, dict)
+            else argument
+        )
+        console.print(f"[{ACCENT}]goal[/] [green]set[/green]: [bold]{goal_text}[/bold]")
+        watch_started = True
+        await _run_goal_watch(
+            client,
+            key,
+            stream=context.stream_response or stream_response_gateway,
+            elevated_state=context.elevated_state,
+            tui_output=context.tui_output,
+        )
+    finally:
+        # The watch loop's own finally unobserves and pauses when it runs.
+        # This guard only covers the goals.set failure path before the loop
+        # starts: drop the watcher so the driver cannot keep enqueueing turns
+        # without a viewer.
+        if not watch_started:
+            try:
+                await client.call(
+                    "goals.unobserve",
+                    {"sessionKey": key, "watch": False},
+                )
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                pass
+    return True
+
+
 async def _dispatch_gateway_slash_command(
     cmd: str,
     context: GatewaySlashContext,
@@ -455,6 +890,10 @@ async def _dispatch_gateway_slash_command(
             f"[{ACCENT}]permissions[/] [dim]{state.elevated or 'normal'}[/dim]"
         )
         return True
+
+    if parts := _slash_parts(cmd, "/goal"):
+        argument = parts[1].strip() if len(parts) > 1 else ""
+        return await _handle_goal_command(argument, context)
 
     if parts := _slash_parts(cmd, "/sessions"):
         limit = 10
