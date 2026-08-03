@@ -353,3 +353,74 @@ describe('useChatSlashCommands recovery', () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining('//'))
   })
 })
+
+describe('useChatSlashCommands goal', () => {
+  const goalCommand = {
+    name: '/goal',
+    cmd: '/goal',
+    label: '/goal',
+    desc: 'Set a long-running goal.',
+    aliases: [],
+    execution: { action: 'goal.set' },
+  }
+  const goalKey = 'agent:main:webchat:test'
+
+  it('starts a goal and registers a watcher when /goal has a description', async () => {
+    const { api, inputText, notify, rpc } = harness(false, [goalCommand])
+    inputText.value = '/goal 完成迁移文档'
+
+    await api.executeSlashCommand(inputText.value)
+
+    expect(rpc.call).toHaveBeenCalledWith('goals.set', { key: goalKey, message: '完成迁移文档' })
+    expect(rpc.call).toHaveBeenCalledWith('goals.observe', { key: goalKey, watch: true })
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('完成迁移文档'))
+  })
+
+  it('reports the active goal for /goal status', async () => {
+    const { api, inputText, notify, rpc } = harness(false, [goalCommand])
+    rpc.call.mockImplementation(async (method: string) => {
+      if (method === 'goals.status') {
+        return { goal: { goalText: '完成迁移文档', status: 'running', turns: 3 } }
+      }
+      return { commands: [goalCommand] }
+    })
+    inputText.value = '/goal status'
+
+    await api.executeSlashCommand(inputText.value)
+
+    expect(rpc.call).toHaveBeenCalledWith('goals.status', { key: goalKey })
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('running'))
+  })
+
+  it('clears the active goal for /goal clear', async () => {
+    const { api, inputText, notify, rpc } = harness(false, [goalCommand])
+    inputText.value = '/goal clear'
+
+    await api.executeSlashCommand(inputText.value)
+
+    expect(rpc.call).toHaveBeenCalledWith('goals.clear', { key: goalKey })
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('cleared'))
+  })
+
+  it('pauses and resumes via /goal pause and /goal resume', async () => {
+    const { api, inputText, notify, rpc } = harness(false, [goalCommand])
+    inputText.value = '/goal pause'
+    await api.executeSlashCommand(inputText.value)
+    expect(rpc.call).toHaveBeenCalledWith('goals.pause', { key: goalKey })
+
+    inputText.value = '/goal resume'
+    await api.executeSlashCommand(inputText.value)
+    expect(rpc.call).toHaveBeenCalledWith('goals.resume', { key: goalKey })
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('resumed'))
+  })
+
+  it('shows usage without starting a goal when /goal has no arguments', async () => {
+    const { api, inputText, notify, rpc } = harness(false, [goalCommand])
+    inputText.value = '/goal'
+
+    await api.executeSlashCommand(inputText.value)
+
+    expect(rpc.call).not.toHaveBeenCalledWith('goals.set', expect.anything())
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/goal'))
+  })
+})

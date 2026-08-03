@@ -3514,7 +3514,17 @@
       "sendingContinuing": "Envoi de la réponse · poursuite de l'exécution…"
     },
     "slashCommands": {
-      "unknown": "Commande inconnue {command}. Continuez à la modifier ou utilisez // pour l’envoyer comme texte."
+      "unknown": "Commande inconnue {command}. Continuez à la modifier ou utilisez // pour l’envoyer comme texte.",
+      "goal": {
+        "usage": "Utilisez /goal avec une description pour démarrer un objectif, ou /goal status, clear, pause, ou resume.",
+        "setOk": "Objectif démarré : {goal}. L'agent continue jusqu'à sa réalisation ou un blocage.",
+        "statusNone": "Aucun objectif n'est défini pour cette session.",
+        "statusOk": "Objectif [{status}] après {turns} tours : {goal}",
+        "clearOk": "Objectif effacé.",
+        "pauseOk": "Objectif mis en pause.",
+        "resumeOk": "Objectif repris.",
+        "actionError": "Échec de l'action d'objectif : {error}"
+      }
     },
     "codingMode": {
       "enabled": "Coding mode activé pour toutes les discussions.",

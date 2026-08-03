@@ -3567,7 +3567,17 @@
       "sendingContinuing": "Sending reply · continuing run…"
     },
     "slashCommands": {
-      "unknown": "Unknown command {command}. Keep editing, or use // to send it as text."
+      "unknown": "Unknown command {command}. Keep editing, or use // to send it as text.",
+      "goal": {
+        "usage": "Use /goal with a description to start a goal, or /goal status, clear, pause, or resume.",
+        "setOk": "Goal started: {goal}. The agent keeps working toward it until complete or blocked.",
+        "statusNone": "No goal is set for this session.",
+        "statusOk": "Goal [{status}] after {turns} turns: {goal}",
+        "clearOk": "Goal cleared.",
+        "pauseOk": "Goal paused.",
+        "resumeOk": "Goal resumed.",
+        "actionError": "Goal action failed: {error}"
+      }
     },
     "codingMode": {
       "enabled": "Coding mode enabled for all chats.",

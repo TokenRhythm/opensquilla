@@ -3514,7 +3514,17 @@
       "sendingContinuing": "返信を送信中 · 実行を継続中…"
     },
     "slashCommands": {
-      "unknown": "不明なコマンド {command} です。編集を続けるか、// を使用してテキストとして送信してください。"
+      "unknown": "不明なコマンド {command} です。編集を続けるか、// を使用してテキストとして送信してください。",
+      "goal": {
+        "usage": "/goal に目標の説明を付けて設定するか、/goal status、clear、pause、resume を使用します。",
+        "setOk": "目標を開始しました：{goal}。エージェントは完了または停止まで継続します。",
+        "statusNone": "このセッションには目標が設定されていません。",
+        "statusOk": "目標[{status}] {turns}ターン後：{goal}",
+        "clearOk": "目標をクリアしました。",
+        "pauseOk": "目標を一時停止しました。",
+        "resumeOk": "目標を再開しました。",
+        "actionError": "目標操作に失敗しました：{error}"
+      }
     },
     "codingMode": {
       "enabled": "すべてのチャットで Coding mode を有効にしました。",

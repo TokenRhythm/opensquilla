@@ -3567,7 +3567,17 @@
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
     "slashCommands": {
-      "unknown": "未知命令 {command}。请继续编辑，或使用 // 将其作为普通文本发送。"
+      "unknown": "未知命令 {command}。请继续编辑，或使用 // 将其作为普通文本发送。",
+      "goal": {
+        "usage": "使用 /goal 加目标描述来设定目标，或使用 /goal status、clear、pause、resume。",
+        "setOk": "已设定目标：{goal}。代理将持续推进直到完成或受阻。",
+        "statusNone": "当前会话没有设定目标。",
+        "statusOk": "目标[{status}] 已执行{turns}轮：{goal}",
+        "clearOk": "目标已清除。",
+        "pauseOk": "目标已暂停。",
+        "resumeOk": "目标已恢复。",
+        "actionError": "目标操作失败：{error}"
+      }
     },
     "codingMode": {
       "enabled": "Coding mode 已为所有聊天开启。",

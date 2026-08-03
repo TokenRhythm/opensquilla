@@ -3514,7 +3514,17 @@
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
     "slashCommands": {
-      "unknown": "Comando desconocido {command}. Sigue editándolo o usa // para enviarlo como texto."
+      "unknown": "Comando desconocido {command}. Sigue editándolo o usa // para enviarlo como texto.",
+      "goal": {
+        "usage": "Usa /goal con una descripción para iniciar un objetivo, o /goal status, clear, pause, o resume.",
+        "setOk": "Objetivo iniciado: {goal}. El agente seguirá trabajando hasta completarlo o bloquearse.",
+        "statusNone": "No hay ningún objetivo definido para esta sesión.",
+        "statusOk": "Objetivo [{status}] tras {turns} turnos: {goal}",
+        "clearOk": "Objetivo borrado.",
+        "pauseOk": "Objetivo en pausa.",
+        "resumeOk": "Objetivo reanudado.",
+        "actionError": "Error en la acción de objetivo: {error}"
+      }
     },
     "codingMode": {
       "enabled": "Coding mode activado para todos los chats.",

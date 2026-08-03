@@ -203,9 +203,10 @@ def test_file_is_gateway_only() -> None:
     assert "/file" not in _handler_words(Surface.CLI_STANDALONE)
 
 
-def test_goal_is_gateway_only() -> None:
+def test_goal_surface_visibility() -> None:
     assert "/goal" in _handler_words(Surface.CLI_GATEWAY)
     assert "/goal" not in _handler_words(Surface.CLI_STANDALONE)
+    assert "/goal" in _handler_words(Surface.WEB_CHAT)
     assert "/goal" in EXPECTED_GATEWAY_COMMANDS
     assert "/goal" not in EXPECTED_STANDALONE_COMMANDS
 

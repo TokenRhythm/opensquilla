@@ -575,6 +575,7 @@ _COMMANDS: tuple[CommandDef, ...] = (
                     "turn after turn until complete or blocked.",
         execution={
             _T: _local("goal.set"),
+            _W: _local("goal.set"),
         },
         category=CommandCategory.CONTROL,
         busy_policy=CommandBusyPolicy.IMMEDIATE,

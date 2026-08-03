@@ -60,6 +60,18 @@ interface UsageStatusResult {
   total_tokens?: number
 }
 
+interface GoalStatusResult {
+  goal?: {
+    goalText?: string
+    status?: string
+    turns?: number
+    idleTurns?: number
+    blockedReason?: string
+    pauseReason?: string
+    terminalReason?: string
+  } | null
+}
+
 export interface UseChatSlashCommandsOptions {
   rpc: RpcClient
   catalogCallOptions?: RpcCallOptions
@@ -438,6 +450,65 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         const request = separator === -1 ? '' : metaArgs.slice(separator).trim()
         if (!skillName) break
         void runMetaSkill(skillName, request)
+        break
+      }
+      case 'goal.set': {
+        const goalText = String(args || '').trim()
+        const goalKey = options.sessionKey.value
+        const first = goalText.split(/\s+/, 1)[0]?.toLowerCase() || ''
+        const fail = (err: unknown) => {
+          options.notify(i18n.global.t('chat.slashCommands.goal.actionError', {
+            error: err instanceof Error ? err.message : String(err),
+          }))
+        }
+        const status = (res: GoalStatusResult) => {
+          const goal = res?.goal
+          if (!goal || !goal.goalText) {
+            options.notify(i18n.global.t('chat.slashCommands.goal.statusNone'))
+            return
+          }
+          options.notify(i18n.global.t('chat.slashCommands.goal.statusOk', {
+            status: goal.status || 'unknown',
+            turns: goal.turns ?? 0,
+            goal: goal.goalText,
+          }))
+        }
+        if (first === 'status') {
+          options.rpc.call<GoalStatusResult>('goals.status', { key: goalKey })
+            .then(status)
+            .catch(fail)
+          break
+        }
+        if (first === 'clear') {
+          options.rpc.call('goals.clear', { key: goalKey })
+            .then(() => options.notify(i18n.global.t('chat.slashCommands.goal.clearOk')))
+            .catch(fail)
+          break
+        }
+        if (first === 'pause') {
+          options.rpc.call('goals.pause', { key: goalKey })
+            .then(() => options.notify(i18n.global.t('chat.slashCommands.goal.pauseOk')))
+            .catch(fail)
+          break
+        }
+        if (first === 'resume') {
+          options.rpc.call('goals.resume', { key: goalKey })
+            .then(() => options.notify(i18n.global.t('chat.slashCommands.goal.resumeOk')))
+            .catch(fail)
+          break
+        }
+        if (!goalText) {
+          options.notify(i18n.global.t('chat.slashCommands.goal.usage'))
+          break
+        }
+        // Start a new goal run and register this client as its watcher so the
+        // continuation driver keeps the loop running for the Web surface.
+        options.rpc.call('goals.set', { key: goalKey, message: goalText })
+          .then(() => {
+            options.rpc.call('goals.observe', { key: goalKey, watch: true }).catch(() => undefined)
+            options.notify(i18n.global.t('chat.slashCommands.goal.setOk', { goal: goalText }))
+          })
+          .catch(fail)
         break
       }
     }
