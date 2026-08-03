@@ -91,6 +91,61 @@ def new_plan_revision(
     return prepare_plan_revision(PlanRevisionRecord(**values))
 
 
+def new_goal_plan_revision(
+    *,
+    source_session_key: str,
+    source_session_id: str,
+    source_epoch: int,
+    goal_text: str,
+    parent: PlanRevisionRecord | None = None,
+    created_at: int | None = None,
+) -> PlanRevisionRecord:
+    """Build the single-step plan revision backing a Goal controller run.
+
+    The revision body is the goal text itself so the provider always sees the
+    exact goal it is pursuing. ``parent`` defaults to ``None`` (a fresh lineage
+    for the first goal on a session); Goal controller replacement passes the
+    current active revision so the storage layer can atomically activate the
+    replacement over it.
+    """
+
+    return new_plan_revision(
+        source_session_key=source_session_key,
+        source_session_id=source_session_id,
+        source_epoch=source_epoch,
+        title=goal_text[:MAX_PLAN_TITLE_CHARS],
+        markdown=goal_text,
+        steps=[{"step_id": "goal", "title": "Pursue the goal"}],
+        parent=parent,
+        created_at=created_at,
+    )
+
+
+def new_goal_plan_run(
+    *,
+    revision: PlanRevisionRecord,
+    session_id: str,
+    session_key: str,
+    session_epoch: int,
+    goal_id: str,
+) -> PlanRunRecord:
+    """Build the queued Goal-driven run overlay for one goal revision."""
+
+    return prepare_plan_run(
+        PlanRunRecord(
+            session_key=session_key,
+            session_id=session_id,
+            session_epoch=session_epoch,
+            plan_revision_id=revision.revision_id,
+            driver_kind="goal",
+            driver_id=goal_id,
+            status=PlanRunStatus.QUEUED.value,
+            step_states=initial_plan_step_states(revision.steps),
+        ),
+        revision=revision,
+    )
+
+
 def _bounded_text(value: Any, *, field: str, maximum: int) -> str:
     if not isinstance(value, str):
         raise PlanValidationError(f"{field} must be a string")

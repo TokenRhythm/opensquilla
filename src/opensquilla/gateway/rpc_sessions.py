@@ -2174,6 +2174,8 @@ async def _handle_sessions_send(
     fingerprint_params: dict[str, Any] | None = None,
     plan_revision_id: str | None = None,
     plan_context_revision_id: str | None = None,
+    plan_run_driver_kind: str | None = None,
+    plan_run_driver_id: str | None = None,
     required_collaboration_mode: str | None = None,
     required_collaboration_revision: int | None = None,
     initial_collaboration_mode: str | None = None,
@@ -2252,6 +2254,16 @@ async def _handle_sessions_send(
         plan_context_revision_id = plan_context_revision_id.strip()
         if not plan_context_revision_id:
             raise ValueError("plan_context_revision_id must not be empty")
+    if plan_run_driver_kind is not None:
+        if plan_revision_id is None:
+            raise ValueError("plan_run_driver_kind requires plan_revision_id")
+        if plan_run_driver_kind not in {"manual", "goal"}:
+            raise ValueError("plan_run_driver_kind must be manual or goal")
+    if plan_run_driver_kind == "goal":
+        if not isinstance(plan_run_driver_id, str) or not plan_run_driver_id.strip():
+            raise ValueError("plan_run_driver_id is required for a goal plan run")
+    elif plan_run_driver_id is not None:
+        raise ValueError("plan_run_driver_id is valid only for a goal plan run")
     if required_collaboration_mode not in {None, "default", "plan"}:
         raise ValueError("required_collaboration_mode must be default or plan")
     if (
@@ -2601,6 +2613,15 @@ async def _handle_sessions_send(
                 parent=None,
             )
             selected_plan_revision_id = plan_revision_to_create.revision_id
+        if plan_run is not None and plan_run_driver_kind is not None:
+            if plan_run.driver_kind != plan_run_driver_kind:
+                raise RpcHandlerError(
+                    "PLAN_RUN_DRIVER_MISMATCH",
+                    "The resumed plan run is owned by a different execution driver.",
+                    details={"runId": plan_run.run_id, "driverKind": plan_run.driver_kind},
+                    retryable=False,
+                    accepted=False,
+                )
         if plan_run is None:
             assert selected_plan_revision_id is not None
             plan_run = PlanRunRecord(
@@ -2609,7 +2630,12 @@ async def _handle_sessions_send(
                 session_id=session_id,
                 session_epoch=int(getattr(session, "epoch", 0) or 0),
                 plan_revision_id=selected_plan_revision_id,
-                driver_kind="manual",
+                driver_kind=plan_run_driver_kind or "manual",
+                driver_id=(
+                    plan_run_driver_id
+                    if plan_run_driver_kind == "goal"
+                    else None
+                ),
                 status="queued",
                 step_states=[],
             )
@@ -8037,7 +8063,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             "planMode": True,
             "implementation": ctx.task_runtime is not None,
             "newTaskImplementation": ctx.task_runtime is not None,
-            "goalDriver": False,
+            "goalDriver": True,
         },
         "epoch": epoch,
         "stream_cursor": stream_cursor,
