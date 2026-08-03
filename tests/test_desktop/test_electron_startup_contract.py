@@ -2373,7 +2373,8 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     # Stable and same-base preview discovery uses a rate-limit-free static OSS
     # manifest. Versioned assets then use a strict OSS/GitHub generic feed with
     # runtime fallback; unsigned Windows verifies an exact versioned installer
-    # against the canonical GitHub checksum before revealing it.
+    # against the release SHA256SUMS (OSS mirror first, canonical GitHub
+    # Release as fail-over) before revealing it.
     main_ts = _read("desktop/electron/src/main.ts")
     resolver = _read("desktop/electron/src/update-channel.ts")
     verification = _read("desktop/electron/src/update-verification.ts")
@@ -2442,7 +2443,15 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     assert "'install_failed'" in manual_download
     assert "manualInstall" in check
     assert "updateAssetUrl(resolved.candidate, resolved.source)" in check
-    assert "updateAssetUrl(candidate, 'github', 'SHA256SUMS')" in main_ts
+    assert "updateAssetUrl(candidate, source, 'SHA256SUMS')" in main_ts
+    assert (
+        "DESKTOP_UPDATE_CHECKSUM_SOURCES: readonly DesktopUpdateSource[] = ['oss', 'github']"
+        in main_ts
+    )
+    assert "const UPDATE_CHECKSUM_FETCH_ATTEMPTS = 3" in main_ts
+    assert "err.code === 'integrity_failed') throw err" in main_ts
+    assert "desktopLog('update_checksum_fetch_retry', {" in main_ts
+    assert "desktopLog('update_checksum_fetch_failed', {" in main_ts
     assert "await fetchCanonicalWindowsInstallerDigest(candidate)" in manual_download
     assert "await downloadVerifiedWindowsInstallerWithFallback(" in manual_download
     assert "alternateDesktopUpdateSource(chosen.source)" in verified_windows_download

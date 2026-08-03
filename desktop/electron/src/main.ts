@@ -2966,7 +2966,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.errorTitle': 'Update check failed',
     'update.manifestInvalid': 'The update information is invalid. Please try again later.',
     'update.sourceUnavailable': 'The update service is temporarily unavailable. Please try again later.',
-    'update.checksumUnavailable': 'The installer cannot be verified because the canonical GitHub checksum is unavailable. No installer was opened.',
+    'update.checksumUnavailable': 'The installer cannot be verified because the official checksum is unavailable. No installer was opened.',
     'update.integrityFailed': 'The downloaded installer failed integrity verification and was deleted.',
     'update.downloadFailed': 'The update could not be downloaded. Please try again.',
     'update.installFailed': 'The update installer could not be opened. Please try again.',
@@ -3102,7 +3102,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.errorTitle': '检查更新失败',
     'update.manifestInvalid': '更新信息无效，请稍后重试。',
     'update.sourceUnavailable': '更新服务暂时不可用，请稍后重试。',
-    'update.checksumUnavailable': '无法获取 GitHub 官方校验和，因此不能验证安装包；未打开任何安装包。',
+    'update.checksumUnavailable': '无法获取官方校验和，因此不能验证安装包；未打开任何安装包。',
     'update.integrityFailed': '下载的安装包未通过完整性校验，已将其删除。',
     'update.downloadFailed': '更新下载安装失败，请重试。',
     'update.installFailed': '无法打开更新安装包，请重试。',
@@ -3238,7 +3238,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.errorTitle': 'アップデートの確認に失敗しました',
     'update.manifestInvalid': 'アップデート情報が無効です。しばらくしてから再試行してください。',
     'update.sourceUnavailable': 'アップデートサービスを一時的に利用できません。後でもう一度お試しください。',
-    'update.checksumUnavailable': 'GitHub の正規チェックサムを取得できないため、インストーラを検証できません。インストーラは開かれていません。',
+    'update.checksumUnavailable': '正規のチェックサムを取得できないため、インストーラを検証できません。インストーラは開かれていません。',
     'update.integrityFailed': 'ダウンロードしたインストーラは整合性検証に失敗したため削除されました。',
     'update.downloadFailed': 'アップデートをダウンロードできませんでした。もう一度お試しください。',
     'update.installFailed': 'アップデートインストーラを開けませんでした。もう一度お試しください。',
@@ -3372,7 +3372,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.errorTitle': 'Échec de la recherche de mises à jour',
     'update.manifestInvalid': 'Les informations de mise à jour sont invalides. Réessayez plus tard.',
     'update.sourceUnavailable': 'Le service de mise à jour est temporairement indisponible. Réessayez plus tard.',
-    'update.checksumUnavailable': 'Le programme d’installation ne peut pas être vérifié car la somme de contrôle GitHub officielle est indisponible. Aucun programme n’a été ouvert.',
+    'update.checksumUnavailable': 'Le programme d’installation ne peut pas être vérifié car la somme de contrôle officielle est indisponible. Aucun programme n’a été ouvert.',
     'update.integrityFailed': 'Le programme d’installation téléchargé a échoué au contrôle d’intégrité et a été supprimé.',
     'update.downloadFailed': 'Impossible de télécharger la mise à jour. Réessayez.',
     'update.installFailed': 'Impossible d’ouvrir le programme d’installation. Réessayez.',
@@ -3506,7 +3506,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.errorTitle': 'Update-Prüfung fehlgeschlagen',
     'update.manifestInvalid': 'Die Update-Informationen sind ungültig. Versuchen Sie es später erneut.',
     'update.sourceUnavailable': 'Der Update-Dienst ist vorübergehend nicht verfügbar. Versuchen Sie es später erneut.',
-    'update.checksumUnavailable': 'Das Installationsprogramm kann nicht geprüft werden, weil die offizielle GitHub-Prüfsumme nicht verfügbar ist. Es wurde nichts geöffnet.',
+    'update.checksumUnavailable': 'Das Installationsprogramm kann nicht geprüft werden, weil die offizielle Prüfsumme nicht verfügbar ist. Es wurde nichts geöffnet.',
     'update.integrityFailed': 'Das heruntergeladene Installationsprogramm hat die Integritätsprüfung nicht bestanden und wurde gelöscht.',
     'update.downloadFailed': 'Das Update konnte nicht heruntergeladen werden. Versuchen Sie es erneut.',
     'update.installFailed': 'Das Update-Installationsprogramm konnte nicht geöffnet werden. Versuchen Sie es erneut.',
@@ -3640,7 +3640,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.errorTitle': 'Error al buscar actualizaciones',
     'update.manifestInvalid': 'La información de actualización no es válida. Inténtalo más tarde.',
     'update.sourceUnavailable': 'El servicio de actualizaciones no está disponible temporalmente. Inténtalo más tarde.',
-    'update.checksumUnavailable': 'No se puede verificar el instalador porque la suma de comprobación oficial de GitHub no está disponible. No se abrió ningún instalador.',
+    'update.checksumUnavailable': 'No se puede verificar el instalador porque la suma de comprobación oficial no está disponible. No se abrió ningún instalador.',
     'update.integrityFailed': 'El instalador descargado no superó la verificación de integridad y se eliminó.',
     'update.downloadFailed': 'No se pudo descargar la actualización. Inténtalo de nuevo.',
     'update.installFailed': 'No se pudo abrir el instalador de la actualización. Inténtalo de nuevo.',
@@ -9449,10 +9449,19 @@ function rememberSuccessfulUpdateSource(source: DesktopUpdateSource): void {
   void persistDesktopUpdateState()
 }
 
-async function fetchCanonicalWindowsInstallerDigest(
+// The OSS mirror is the primary checksum source; the canonical GitHub Release
+// copy is the fail-over so a missing or unreadable mirror object cannot block
+// verified updates. Each source gets one initial fetch plus two retries before
+// the next source is tried.
+const DESKTOP_UPDATE_CHECKSUM_SOURCES: readonly DesktopUpdateSource[] = ['oss', 'github']
+const UPDATE_CHECKSUM_FETCH_ATTEMPTS = 3
+const UPDATE_CHECKSUM_RETRY_DELAY_MS = 500
+
+async function fetchWindowsInstallerDigestFromSource(
   candidate: DesktopUpdateCandidate,
+  source: DesktopUpdateSource,
 ): Promise<string> {
-  const checksumUrl = updateAssetUrl(candidate, 'github', 'SHA256SUMS')
+  const checksumUrl = updateAssetUrl(candidate, source, 'SHA256SUMS')
   let response: Response
   try {
     response = await fetch(checksumUrl, {
@@ -9463,14 +9472,14 @@ async function fetchCanonicalWindowsInstallerDigest(
   } catch (err) {
     throw new UpdateChannelError(
       'checksum_unavailable',
-      `The canonical GitHub checksum is unreachable: ${String(err instanceof Error ? err.message : err)}`,
+      `The ${source} checksum is unreachable: ${String(err instanceof Error ? err.message : err)}`,
     )
   }
   if (!response.ok) {
     await response.body?.cancel().catch(() => {})
     throw new UpdateChannelError(
       'checksum_unavailable',
-      `The canonical GitHub checksum returned HTTP ${response.status}.`,
+      `The ${source} checksum returned HTTP ${response.status}.`,
     )
   }
   try {
@@ -9480,9 +9489,56 @@ async function fetchCanonicalWindowsInstallerDigest(
     if (err instanceof UpdateChannelError) throw err
     throw new UpdateChannelError(
       'integrity_failed',
-      `The canonical GitHub checksum could not be parsed: ${String(err instanceof Error ? err.message : err)}`,
+      `The ${source} checksum could not be parsed: ${String(err instanceof Error ? err.message : err)}`,
     )
   }
+}
+
+async function fetchWindowsInstallerDigestWithRetries(
+  candidate: DesktopUpdateCandidate,
+  source: DesktopUpdateSource,
+): Promise<string> {
+  let lastError: unknown = null
+  for (let attempt = 1; attempt <= UPDATE_CHECKSUM_FETCH_ATTEMPTS; attempt += 1) {
+    try {
+      return await fetchWindowsInstallerDigestFromSource(candidate, source)
+    } catch (err) {
+      // A malformed SHA256SUMS is deterministic: refetching the same bytes
+      // cannot succeed, so skip the remaining attempts for this source.
+      if (err instanceof UpdateChannelError && err.code === 'integrity_failed') throw err
+      lastError = err
+      if (attempt < UPDATE_CHECKSUM_FETCH_ATTEMPTS) {
+        desktopLog('update_checksum_fetch_retry', {
+          source,
+          attempt,
+          error: String(err instanceof Error ? err.message : err),
+        })
+        await new Promise((resolveWait) =>
+          setTimeout(resolveWait, UPDATE_CHECKSUM_RETRY_DELAY_MS * attempt),
+        )
+      }
+    }
+  }
+  throw lastError
+}
+
+async function fetchCanonicalWindowsInstallerDigest(
+  candidate: DesktopUpdateCandidate,
+): Promise<string> {
+  let lastError: unknown = null
+  for (const source of DESKTOP_UPDATE_CHECKSUM_SOURCES) {
+    try {
+      return await fetchWindowsInstallerDigestWithRetries(candidate, source)
+    } catch (err) {
+      lastError = err
+      desktopLog('update_checksum_fetch_failed', {
+        source,
+        error: String(err instanceof Error ? err.message : err),
+      })
+    }
+  }
+  if (lastError instanceof UpdateChannelError) throw lastError
+  throw new UpdateChannelError('checksum_unavailable', 'No checksum source is reachable.')
 }
 
 async function downloadVerifiedWindowsInstaller(
