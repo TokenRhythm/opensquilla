@@ -36,6 +36,7 @@ def _write_run(
     assignment_sha256: str,
     seconds: dict[str, float],
     attempts: dict[str, int] | None = None,
+    image_versions: dict[str, str] | None = None,
     duplicate_core_node_in: str | None = None,
 ) -> Path:
     run_dir = root / f"run-{run_id}"
@@ -57,7 +58,9 @@ def _write_run(
                 "runner_os": "Windows",
                 "runner_arch": "X64",
                 "image_os": "win25",
-                "image_version": "20260728.188.1",
+                "image_version": (image_versions or {}).get(
+                    shard, "20260728.188.1"
+                ),
             },
             "test_files": [path],
         }
@@ -161,6 +164,58 @@ def test_duration_builder_rejects_incomplete_shard_artifacts(tmp_path: Path) -> 
     metadata.unlink()
 
     with pytest.raises(ValueError, match="expected 4 Windows shard metadata"):
+        load_run_directory(run_dir)
+
+
+def test_duration_builder_records_runner_image_patch_drift(tmp_path: Path) -> None:
+    run_dir = _write_run(
+        tmp_path,
+        run_id=250,
+        sha="c" * 40,
+        assignment_sha256="d" * 64,
+        image_versions={
+            "core": "20260714.173.1",
+            "gateway-sqlite": "20260728.188.1",
+            "recovery-migration": "20260728.188.1",
+            "desktop-installer-contracts": "20260714.173.1",
+        },
+        seconds={path: 1.0 for path in FILES_BY_SHARD.values()},
+    )
+
+    observation = load_run_directory(run_dir)
+
+    assert observation.runtime_compatibility == {
+        "python_version": "3.12.10",
+        "runner_os": "Windows",
+        "runner_arch": "X64",
+        "image_os": "win25",
+    }
+    assert observation.image_versions_by_shard == {
+        "core": "20260714.173.1",
+        "gateway-sqlite": "20260728.188.1",
+        "recovery-migration": "20260728.188.1",
+        "desktop-installer-contracts": "20260714.173.1",
+    }
+
+
+def test_duration_builder_rejects_incompatible_shard_runtime(tmp_path: Path) -> None:
+    run_dir = _write_run(
+        tmp_path,
+        run_id=275,
+        sha="d" * 40,
+        assignment_sha256="e" * 64,
+        seconds={path: 1.0 for path in FILES_BY_SHARD.values()},
+    )
+    metadata_path = (
+        run_dir
+        / "windows-high-risk-recovery-migration-attempt-1"
+        / "windows-shard-metadata.json"
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["runtime"]["runner_arch"] = "ARM64"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime compatibility metadata"):
         load_run_directory(run_dir)
 
 

@@ -32,7 +32,8 @@ class RunObservation:
     sha: str
     assignment_sha256: str
     attempts_by_shard: dict[str, int]
-    runtime: dict[str, str | None]
+    runtime_compatibility: dict[str, str | None]
+    image_versions_by_shard: dict[str, str | None]
     files_by_shard: dict[str, tuple[str, ...]]
     node_ids: frozenset[str]
     file_seconds: dict[str, float]
@@ -141,8 +142,9 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         )
 
     common: tuple[int, str, str] | None = None
-    common_runtime: dict[str, str | None] | None = None
+    common_runtime_compatibility: dict[str, str | None] | None = None
     attempts_by_shard: dict[str, int] = {}
+    image_versions_by_shard: dict[str, str | None] = {}
     files_by_shard: dict[str, tuple[str, ...]] = {}
     junit_by_shard: dict[str, Path] = {}
     all_files: set[str] = set()
@@ -194,14 +196,19 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         normalized_runtime = {
             key: str(value) if value is not None else None for key, value in runtime.items()
         }
+        runtime_compatibility = {
+            key: value
+            for key, value in normalized_runtime.items()
+            if key != "image_version"
+        }
         run_common = (run_id, sha, assignment_sha256)
         if common is None:
             common = run_common
-            common_runtime = normalized_runtime
+            common_runtime_compatibility = runtime_compatibility
         elif run_common != common:
             raise ValueError(f"inconsistent run metadata in {run_dir}")
-        elif normalized_runtime != common_runtime:
-            raise ValueError(f"inconsistent runtime metadata in {run_dir}")
+        elif runtime_compatibility != common_runtime_compatibility:
+            raise ValueError(f"inconsistent runtime compatibility metadata in {run_dir}")
         files = _validated_test_files(payload.get("test_files"), metadata_path=metadata_path)
         overlap = all_files.intersection(files)
         if overlap:
@@ -210,6 +217,7 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         all_files.update(files)
         files_by_shard[str(shard)] = files
         attempts_by_shard[str(shard)] = attempt
+        image_versions_by_shard[str(shard)] = normalized_runtime["image_version"]
         junit_path = metadata_path.with_name(JUNIT_NAME)
         if not junit_path.is_file():
             raise ValueError(f"missing JUnit report beside {metadata_path}")
@@ -234,7 +242,8 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         sha=common[1],
         assignment_sha256=common[2],
         attempts_by_shard=attempts_by_shard,
-        runtime=common_runtime or {},
+        runtime_compatibility=common_runtime_compatibility or {},
+        image_versions_by_shard=image_versions_by_shard,
         files_by_shard=files_by_shard,
         node_ids=frozenset(node_ids),
         file_seconds=dict(file_seconds),
@@ -273,7 +282,7 @@ def build_duration_payload(
     for run in observations:
         if run.assignment_sha256 != expected_assignment_sha256:
             raise ValueError("Windows run assignment hash does not match the current snapshot")
-        if run.runtime != reference.runtime:
+        if run.runtime_compatibility != reference.runtime_compatibility:
             raise ValueError("Windows runtime metadata differs across source runs")
         if run.files_by_shard != reference.files_by_shard:
             raise ValueError("Windows test file assignments differ across source runs")
@@ -304,7 +313,10 @@ def build_duration_payload(
                 shard: run.attempts_by_shard[shard] for shard in SHARD_NAMES
             },
             "assignment_sha256": run.assignment_sha256,
-            "runtime": run.runtime,
+            "runtime_compatibility": run.runtime_compatibility,
+            "image_versions": {
+                shard: run.image_versions_by_shard[shard] for shard in SHARD_NAMES
+            },
             "node_count": len(run.node_ids),
             "weighted_file_count": len(run.file_seconds),
         }
