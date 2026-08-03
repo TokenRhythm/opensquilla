@@ -72,23 +72,33 @@ class SchedulerTimer:
     async def startup_catchup(self) -> None:
         """Called once at start to recover from downtime.
 
-        1. Clear stale RUNNING jobs -> reset to PENDING
+        1. Clear reservations left by the previous process; reset RUNNING to PENDING
         2. Collect missed (overdue) jobs
         3. First max_catchup: run with stagger
         4. Remaining: fast-forward next_run_at (except AT one-shots)
         """
         now = datetime.now(UTC)
 
-        # Step 1: clear stale RUNNING jobs
-        stale = await self._store.list_by_status(JobStatus.RUNNING)
+        # Step 1: recover reservations left by a previous process. Active
+        # executions cannot survive a restart, but pause/resume may have kept
+        # their reservation while preserving the requested lifecycle state.
         recovered_ids: set[str] = set()
-        for job in stale:
-            recovered_ids.add(job.id)
-            job.status = JobStatus.PENDING
+        for job in await self._store.list_active():
+            was_running = job.status == JobStatus.RUNNING
+            if not was_running and not job.reservation_token:
+                continue
+            if was_running:
+                recovered_ids.add(job.id)
+                job.status = JobStatus.PENDING
             job.updated_at = now
             clear_reservation(job)
             await self._store.save(job)
-            logger.info("startup_reset_stale id=%s name=%s", job.id, job.name)
+            logger.info(
+                "startup_reset_stale id=%s name=%s previous_status=%s",
+                job.id,
+                job.name,
+                JobStatus.RUNNING.value if was_running else job.status.value,
+            )
 
         # Step 2: collect missed jobs
         missed: list[CronJob] = []

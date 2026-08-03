@@ -183,8 +183,7 @@ class SchedulerEngine:
         return result
 
     async def pause_job(self, job_id: str) -> CronJob | None:
-        """Pause a job."""
-        await self._timer.cancel_running(job_id)
+        """Pause future scheduling without interrupting an active run."""
         return await self._ops.pause(job_id)
 
     async def resume_job(self, job_id: str) -> CronJob | None:
@@ -195,8 +194,7 @@ class SchedulerEngine:
         return result
 
     async def delete_job(self, job_id: str) -> bool:
-        """Delete a job and cancel it if running."""
-        await self._timer.cancel_running(job_id)
+        """Delete future scheduling without interrupting an active run."""
         result = await self._ops.remove(job_id)
         if result:
             self._timer.nudge()
