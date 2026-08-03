@@ -5035,10 +5035,25 @@ async def _write_exec_stdin(proc: Any, stdin_bytes: bytes | None) -> None:
                 await wait_closed()
 
 
-async def _wait_exec_stdin_writer(writer_task: asyncio.Task[None], timeout: float) -> bool:
-    done, _ = await asyncio.wait({writer_task}, timeout=max(0.0, timeout))
-    if writer_task not in done:
-        return False
+async def _wait_exec_stdin_writer(
+    proc: Any, writer_task: asyncio.Task[None], timeout: float
+) -> bool:
+    """Wait for stdin closure without mistaking a completed process for a hang.
+
+    Windows' proactor pipe transport can leave ``StreamWriter.wait_closed()``
+    pending briefly after the child has consumed EOF and exited. The process exit
+    is authoritative in that case; the caller cancels the stale writer task after
+    observing the return code.
+    """
+
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+    while not writer_task.done() and proc.returncode is None:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return writer_task.done() or proc.returncode is not None
+        await asyncio.wait({writer_task}, timeout=min(0.01, remaining))
+    if not writer_task.done():
+        return proc.returncode is not None
     with contextlib.suppress(BrokenPipeError, ConnectionResetError):
         await writer_task
     return True
@@ -5129,7 +5144,7 @@ async def _run_host_shell_command(
             try:
                 if stdin_bytes is not None:
                     stdin_writer = asyncio.create_task(_write_exec_stdin(proc, stdin_bytes))
-                    if not await _wait_exec_stdin_writer(stdin_writer, remaining):
+                    if not await _wait_exec_stdin_writer(proc, stdin_writer, remaining):
                         await _cancel_exec_stdin_writer(proc, stdin_writer)
                         await _terminate_exec_process_tree(proc)
                         return timeout_result()
@@ -5143,6 +5158,7 @@ async def _run_host_shell_command(
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
                 await _terminate_exec_process_tree(proc)
                 return timeout_result()
+            await _cancel_exec_stdin_writer(proc, stdin_writer)
             if os.name == "posix":
                 _signal_exec_process_tree(proc, signal.SIGTERM)
 

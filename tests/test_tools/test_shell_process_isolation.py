@@ -288,6 +288,33 @@ async def test_write_exec_stdin_waits_until_eof_is_delivered() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_exec_stdin_writer_accepts_process_exit_before_pipe_close() -> None:
+    proc = _FakeProcess(returncode=None)
+    release_writer = asyncio.Event()
+
+    async def wait_for_pipe_close() -> None:
+        await release_writer.wait()
+
+    writer_task = asyncio.create_task(wait_for_pipe_close())
+
+    async def finish_process() -> None:
+        await asyncio.sleep(0.02)
+        proc.returncode = 0
+
+    process_task = asyncio.create_task(finish_process())
+    started = time.monotonic()
+    try:
+        assert await shell._wait_exec_stdin_writer(proc, writer_task, timeout=0.5)
+        assert time.monotonic() - started < 0.25
+        assert not writer_task.done()
+    finally:
+        await process_task
+        await shell._cancel_exec_stdin_writer(proc, writer_task)
+
+    assert writer_task.cancelled()
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(os.name != "posix", reason="large pipe backpressure is POSIX-specific")
 async def test_exec_command_stdin_write_obeys_timeout() -> None:
     command = _python_shell_command("import time; time.sleep(5)")
