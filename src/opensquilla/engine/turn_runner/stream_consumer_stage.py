@@ -27,6 +27,7 @@ No ``TurnHook`` is fired from inside the stream loop today.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
@@ -342,6 +343,37 @@ def _clear_artifact_delivery_failure(state: _StreamState, target_key: str) -> No
         pass
 
 
+def _user_input_payload(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict) or value.get("kind") != "user_input":
+        return None
+    return dict(value)
+
+
+def _pending_user_input_request(value: Any) -> dict[str, Any] | None:
+    payload = _user_input_payload(value)
+    if (
+        payload is None
+        or payload.get("status") != "input_required"
+        or payload.get("paused") is not True
+    ):
+        return None
+    return payload
+
+
+def _is_terminal_user_input_outcome(value: Any) -> bool:
+    payload = _user_input_payload(value)
+    return bool(
+        payload is not None
+        and payload.get("status") in {"answered", "cancelled", "expired"}
+        and payload.get("paused") is False
+    )
+
+
 class _ToolResultHandler:
     """Capture artifact-delivery failures and append the tool_result segment."""
 
@@ -396,6 +428,16 @@ class _ToolResultHandler:
                 segment.get("type") == "tool_result"
                 and segment.get("tool_use_id") == event.tool_use_id
             ):
+                initial_user_input_request = segment.get("user_input_request")
+                if initial_user_input_request is None:
+                    initial_user_input_request = _pending_user_input_request(
+                        segment.get("result")
+                    )
+                if (
+                    initial_user_input_request is not None
+                    and _is_terminal_user_input_outcome(result_segment.get("result"))
+                ):
+                    result_segment["user_input_request"] = initial_user_input_request
                 state.turn_segments[index] = result_segment
                 break
         else:

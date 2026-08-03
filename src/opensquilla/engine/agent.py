@@ -10019,7 +10019,15 @@ class Agent:
                         ):
                             yield event
                         mutex_result = results_by_id.get(tc.tool_use_id)
-                        if mutex_result is not None and mutex_result.terminates_turn:
+                        # A structured-input attempt owns the remainder of the
+                        # provider response even when its arguments are invalid.
+                        # Keep the error non-terminal so the next provider
+                        # iteration can correct it, but never let a tail call in
+                        # the same response (notably submit_plan) race past it.
+                        if mutex_result is not None and (
+                            mutex_result.terminates_turn
+                            or tc.tool_name == "request_user_input"
+                        ):
                             dispatch_boundary = mutex_result
                         if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
                             plan_run_delivery_only = True

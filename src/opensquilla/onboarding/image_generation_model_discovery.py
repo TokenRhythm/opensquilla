@@ -14,10 +14,12 @@ from typing import Any
 import httpx
 import structlog
 
+from opensquilla.env import trust_env as _trust_env
 from opensquilla.onboarding.image_generation_specs import (
     ImageGenerationProviderSetupSpec,
     get_image_generation_provider_setup_spec,
 )
+from opensquilla.provider.app_attribution import provider_app_headers
 from opensquilla.provider.image_generation_policy import (
     IMAGE_GENERATION_OFFICIAL_BASE_URLS,
 )
@@ -27,6 +29,7 @@ log = structlog.get_logger(__name__)
 _OPENROUTER_IMAGE_MODELS_URL = (
     f"{IMAGE_GENERATION_OFFICIAL_BASE_URLS['openrouter'].rstrip('/')}/images/models"
 )
+_TOKENRHYTHM_IMAGE_MODELS_URL = "https://tokenrhythm.studio/api/models"
 _DISCOVERY_TIMEOUT_SECONDS = 8.0
 
 
@@ -110,6 +113,46 @@ def parse_openrouter_image_models(payload: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_tokenrhythm_image_models(payload: Any) -> list[dict[str, Any]]:
+    """Normalize online image-capable rows from TokenRhythm's public catalog."""
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise ValueError("TokenRhythm image model response has no data list")
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        status = str(item.get("status") or "").strip().lower()
+        model_type = str(item.get("type") or "").strip().lower()
+        abilities = item.get("abilities")
+        normalized_abilities = {
+            str(ability or "").strip().lower()
+            for ability in abilities
+            if isinstance(ability, str)
+        } if isinstance(abilities, list) else set()
+        if (
+            not model_id
+            or model_id in seen
+            or status not in {"", "online"}
+            or (model_type != "image" and "image" not in normalized_abilities)
+        ):
+            continue
+
+        seen.add(model_id)
+        rows.append(
+            _model_row(
+                model_id,
+                name=str(item.get("name") or "").strip(),
+                capability_source="TokenRhythm",
+            )
+        )
+    return rows
+
+
 async def _fetch_openrouter_image_models() -> list[dict[str, Any]]:
     async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT_SECONDS) as client:
         response = await client.get(
@@ -120,11 +163,31 @@ async def _fetch_openrouter_image_models() -> list[dict[str, Any]]:
         return parse_openrouter_image_models(response.json())
 
 
+async def _fetch_tokenrhythm_image_models() -> list[dict[str, Any]]:
+    async with httpx.AsyncClient(
+        timeout=_DISCOVERY_TIMEOUT_SECONDS,
+        trust_env=_trust_env(),
+    ) as client:
+        response = await client.get(
+            _TOKENRHYTHM_IMAGE_MODELS_URL,
+            headers={
+                "Accept": "application/json",
+                **provider_app_headers(_TOKENRHYTHM_IMAGE_MODELS_URL),
+            },
+        )
+        response.raise_for_status()
+        return parse_tokenrhythm_image_models(response.json())
+
+
 async def discover_image_generation_models(provider_id: str) -> dict[str, Any]:
     """Return a live image catalog when available, otherwise curated rows."""
     spec = get_image_generation_provider_setup_spec(str(provider_id or "").strip())
     curated = curated_image_generation_models(spec)
-    if spec.provider_id != "openrouter":
+    fetch_live = {
+        "openrouter": _fetch_openrouter_image_models,
+        "tokenrhythm": _fetch_tokenrhythm_image_models,
+    }.get(spec.provider_id)
+    if fetch_live is None:
         return {
             "ok": True,
             "providerId": spec.provider_id,
@@ -133,7 +196,7 @@ async def discover_image_generation_models(provider_id: str) -> dict[str, Any]:
         }
 
     try:
-        live = await _fetch_openrouter_image_models()
+        live = await fetch_live()
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         log.info(
             "image_model_discovery_fallback",
@@ -154,4 +217,5 @@ __all__ = [
     "curated_image_generation_models",
     "discover_image_generation_models",
     "parse_openrouter_image_models",
+    "parse_tokenrhythm_image_models",
 ]

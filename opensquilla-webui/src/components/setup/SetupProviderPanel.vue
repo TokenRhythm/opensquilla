@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ControlSwitch from '@/components/ControlSwitch.vue'
 import SetupField from '@/components/SetupField.vue'
 import SetupNeedList from '@/components/SetupNeedList.vue'
 import SetupCommandBlock from '@/components/setup/SetupCommandBlock.vue'
@@ -76,6 +77,8 @@ interface ProviderPanelContract {
   editingNew: boolean
   profileSaveSupported: boolean
   primaryProviderRemovalSupported: boolean
+  imageGenerationOffer?: boolean
+  imageGenerationOptIn?: boolean
   routingEnabled: boolean
   routerEnabled: boolean
   routerBinding: 'follow_primary' | 'custom' | 'legacy'
@@ -131,6 +134,7 @@ const emit = defineEmits<{
   addProvider: [value: string]
   probeConfiguredProvider: [value: string]
   activateProvider: [providerId: string]
+  updateImageGenerationOptIn: [enabled: boolean]
 }>()
 
 const addOpen = ref(false)
@@ -347,8 +351,13 @@ watch(() => props.panel.providerSelected, (value, previous) => {
   })
 })
 
+const hasSavableProviderChange = computed(() => (
+  Boolean(props.dirty)
+  || Boolean(props.panel.imageGenerationOffer && props.panel.imageGenerationOptIn)
+))
+
 watch(() => props.saving, (saving, wasSaving) => {
-  if (!wasSaving || saving || props.dirty) return
+  if (!wasSaving || saving || hasSavableProviderChange.value) return
   closeAddPicker()
 })
 
@@ -1099,6 +1108,29 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                   <strong>{{ selectedProviderLabel }}</strong>
                 </label>
 
+                <label
+                  v-if="panel.imageGenerationOffer"
+                  class="control-row setup-provider-image-offer"
+                  data-testid="openrouter-image-generation-offer"
+                >
+                  <div class="control-row__label-block">
+                    <span class="control-row__label">
+                      {{ t('setup.provider.imageGenerationOptInLabel') }}
+                    </span>
+                    <span class="control-row__desc">
+                      {{ t('setup.provider.imageGenerationOptInDesc') }}
+                    </span>
+                  </div>
+                  <div class="control-row__control">
+                    <ControlSwitch
+                      :checked="panel.imageGenerationOptIn !== false"
+                      name="setup_provider_image_generation_opt_in"
+                      :aria-label="t('setup.provider.imageGenerationOptInLabel')"
+                      @change="emit('updateImageGenerationOptIn', $event)"
+                    />
+                  </div>
+                </label>
+
                 <SetupProviderRecommendation
                   v-if="tokenRhythmSelected"
                   compact
@@ -1183,7 +1215,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
               <button
                 type="button"
                 class="btn btn--primary"
-                :disabled="providerBusy || saving || !dirty || (replacesCurrentProvider && panel.connection.phase !== 'verified')"
+                :disabled="providerBusy || saving || !hasSavableProviderChange || (replacesCurrentProvider && panel.connection.phase !== 'verified')"
                 :title="replacesCurrentProvider && panel.connection.phase !== 'verified'
                   ? t('setup.provider.currentSettingsNotTested')
                   : undefined"
@@ -1816,6 +1848,14 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 .setup-provider-modal__provider-name strong {
   color: var(--text);
   font-size: var(--fs-md);
+}
+
+.setup-provider-image-offer {
+  margin: 0;
+  padding: var(--sp-3);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-elevated));
 }
 
 .setup-provider-modal__endpoint,

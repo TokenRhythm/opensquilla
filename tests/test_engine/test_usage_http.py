@@ -11,7 +11,10 @@ from opensquilla.engine.usage_accounting import (
     UsageExecutionContext,
     bind_usage_accounting_scope,
 )
-from opensquilla.engine.usage_http import openai_compatible_done_event
+from opensquilla.engine.usage_http import (
+    openai_compatible_done_event,
+    reserve_direct_usage_call,
+)
 from opensquilla.session.compaction import call_compaction_llm
 from opensquilla.session.naming import call_naming_llm
 
@@ -172,6 +175,61 @@ async def test_direct_tokenrhythm_receipt_uses_native_cny_policy(monkeypatch) ->
     assert item.billing_receipt.currency == "CNY"
     assert item.billing_receipt.amount_nanos == 21_000
     assert item.billing_receipt.usd_equivalent_nanos == 3_011
+
+
+@pytest.mark.asyncio
+async def test_direct_tokenrhythm_image_receipt_accepts_trusted_billing_without_tokens() -> None:
+    payload = {
+        "billing_pending": False,
+        "cost_cny": 0.000021,
+        "data": [{"url": "https://generated.example.test/image.png"}],
+    }
+    sink = _Sink()
+
+    with bind_usage_accounting_scope(_scope(sink)):
+        reservation = await reserve_direct_usage_call(
+            provider="tokenrhythm",
+            model="qwen-image-2.0",
+            base_url="https://tokenrhythm.studio/v1",
+        )
+        finalized = await reservation.finalize_openai_response(
+            payload,
+            raw_json=json.dumps(payload),
+            allow_billing_only=True,
+        )
+
+    assert finalized is True
+    assert sink.unknown == []
+    [(_call, result)] = sink.finalized
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
+    assert result.billed_cost_nanos == 3_011
+    [item] = result.items
+    assert item.billing_receipt is not None
+    assert item.billing_receipt.currency == "CNY"
+    assert item.billing_receipt.amount_nanos == 21_000
+
+
+@pytest.mark.asyncio
+async def test_direct_image_billing_only_shape_without_trusted_receipt_is_unknown() -> None:
+    sink = _Sink()
+
+    with bind_usage_accounting_scope(_scope(sink)):
+        reservation = await reserve_direct_usage_call(
+            provider="tokenrhythm",
+            model="qwen-image-2.0",
+            base_url="https://compatible.example.test/v1",
+        )
+        finalized = await reservation.finalize_openai_response(
+            {"billing_pending": False, "cost_cny": 0.000021, "data": [{}]},
+            allow_billing_only=True,
+        )
+
+    assert finalized is False
+    assert sink.finalized == []
+    assert [reason for _call, reason in sink.unknown] == [
+        "missing_or_invalid_usage_receipt"
+    ]
 
 
 @pytest.mark.asyncio

@@ -121,6 +121,7 @@
               @add-provider="requestAddProvider"
               @probe-configured-provider="probeConfiguredProvider"
               @activate-provider="activateProvider"
+              @update-image-generation-opt-in="setProviderImageGenerationOptIn"
             />
             <SetupBehaviorPanel
               v-else-if="section === 'behavior'"
@@ -160,6 +161,7 @@
               @update-field="updateCapabilityField"
               @search-provider-change="onSearchProviderChange"
               @image-provider-change="onImageProviderChange"
+              @use-image-recommendation="useImageRecommendation"
               @reset-capability="resetCapability"
             />
             <SettingsAppearancePanel v-else-if="section === 'appearance'" />
@@ -280,6 +282,7 @@ const {
   setAutoSessionTitles,
   setDisableNetworkObservability,
   setMemoryAutoCapture,
+  setProviderImageGenerationOptIn,
   setModelStrategy,
   setFixedProvider,
   setFixedModel,
@@ -308,6 +311,7 @@ const {
   onProviderChange,
   onSearchProviderChange,
   onImageProviderChange,
+  useImageRecommendation,
   saveProvider,
   resetCapability,
   copyCommand,

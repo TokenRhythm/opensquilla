@@ -64,9 +64,13 @@ export function clarifyRequestFromValue(value: unknown): InterruptClarifyData | 
   const requestId = typeof raw.request_id === 'string'
     ? raw.request_id
     : typeof raw.requestId === 'string' ? raw.requestId : ''
+  const presentation = typeof schema.presentation === 'string'
+    ? schema.presentation.trim()
+    : ''
   return {
     intro: String(schema.intro || ''),
     fields,
+    ...(presentation ? { presentation } : {}),
     ...(requestId ? { requestId } : {}),
     runId: typeof raw.run_id === 'string' ? raw.run_id : '',
     step: typeof raw.step === 'string' ? raw.step : '',

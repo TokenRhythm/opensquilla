@@ -5,6 +5,7 @@ from __future__ import annotations
 import types
 from io import StringIO
 
+import pytest
 from rich.console import Console
 
 
@@ -637,6 +638,28 @@ def test_interactive_onboard_imported_provider_prefers_inline_key_over_env(
     assert data["llm"]["model"] == "deepseek/deepseek-v4-pro"
 
 
+def test_imported_openrouter_router_defaults_respect_image_skip():
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.onboarding import flow
+
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.5",
+            "api_key": "synthetic-imported-key",
+        }
+    )
+
+    updated = flow._use_imported_provider_credentials_with_router_defaults(
+        None,
+        cfg,
+        requested_mode="",
+        skip_image_generation=True,
+    )
+
+    assert updated.image_generation.enabled is False
+
+
 def test_interactive_onboard_imported_provider_finalize_error_continues_setup(
     tmp_path, monkeypatch
 ):
@@ -1065,7 +1088,16 @@ def test_interactive_onboard_migration_prompts_for_missing_imported_provider_key
     assert data["llm"]["model"] == "deepseek/deepseek-v4-pro"
 
 
-def test_interactive_onboard_can_enable_image_generation(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("skip_image_generation", "expected_enabled"),
+    [(False, True), (True, False)],
+)
+def test_interactive_openrouter_onboard_applies_image_default_unless_skipped(
+    tmp_path,
+    monkeypatch,
+    skip_image_generation,
+    expected_enabled,
+):
     import sys
     import tomllib
     import types
@@ -1146,15 +1178,21 @@ def test_interactive_onboard_can_enable_image_generation(tmp_path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "questionary", _Questionary())
 
-    flow.run_interactive_onboard(flow.OnboardOptions())
-
-    assert calls.index("Enable image generation now?") > calls.index("Configure web search now?")
-    data = tomllib.loads(target.read_text())
-    assert data["image_generation"]["enabled"] is True
-    assert (
-        data["image_generation"]["primary"]
-        == "openrouter/google/gemini-3.1-flash-image-preview"
+    flow.run_interactive_onboard(
+        flow.OnboardOptions(skip_image_generation=skip_image_generation)
     )
+
+    assert "Configure web search now?" in calls
+    assert "Enable image generation now?" not in calls
+    saved = flow.load_config(target)
+    assert saved.image_generation.enabled is expected_enabled
+    if expected_enabled:
+        data = tomllib.loads(target.read_text())
+        assert data["image_generation"]["binding"] == "follow_llm"
+        assert (
+            data["image_generation"]["primary"]
+            == "openrouter/google/gemini-3.1-flash-image-preview"
+        )
 
 
 def test_onboard_if_needed_core_ready_repairs_memory_embedding_without_provider_setup(

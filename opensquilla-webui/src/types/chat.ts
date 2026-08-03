@@ -226,6 +226,7 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   tool_name?: string
   input?: unknown
   result?: unknown
+  user_input_request?: unknown
   content?: unknown
   output?: unknown
   sources?: unknown

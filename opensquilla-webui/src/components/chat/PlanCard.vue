@@ -81,8 +81,10 @@
               class="plan-card__step"
               :data-step-id="step.stepId"
             >
-              <span class="plan-card__step-title">{{ step.title }}</span>
-              <span v-if="step.details" class="plan-card__step-details">{{ step.details }}</span>
+              <span class="plan-card__step-copy">
+                <span class="plan-card__step-title">{{ step.title }}</span>
+                <span v-if="step.details" class="plan-card__step-details">{{ step.details }}</span>
+              </span>
             </li>
           </ol>
         </section>
@@ -96,7 +98,7 @@
 
     <footer v-if="plan.current" class="plan-card__actions">
       <button
-        class="btn btn--primary"
+        class="btn btn--primary plan-card__action--primary"
         type="button"
         :disabled="actionsDisabled"
         @click="emitAction('implement-current')"
@@ -340,20 +342,17 @@ onBeforeUnmount(() => {
   --plan-card-collapsed-height: 220px;
 
   width: var(--chat-col, min(calc(100% - 48px), 980px));
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   margin: var(--sp-3) auto;
   padding: var(--sp-4);
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--bg-surface) 96%, var(--accent) 4%),
-      var(--bg-surface)
-    );
-  box-shadow: var(--shadow-sm);
+  background: var(--bg-surface);
+  box-shadow: none;
   color: var(--text);
   flex-shrink: 0;
-  animation: plan-card-enter var(--dur-enter) var(--ease-out) both;
 }
 
 .plan-card--superseded {
@@ -366,6 +365,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: var(--sp-3);
+  min-width: 0;
 }
 
 .plan-card__identity {
@@ -384,15 +384,15 @@ onBeforeUnmount(() => {
 
 .plan-card__icon {
   display: inline-flex;
-  color: var(--accent);
+  color: var(--text-muted);
 }
 
 .plan-card__eyebrow {
-  color: var(--accent);
+  color: var(--text-muted);
   font-size: var(--fs-xs);
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .plan-card__revision {
@@ -414,15 +414,16 @@ onBeforeUnmount(() => {
 }
 
 .plan-card__state--current {
-  border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  color: var(--accent);
+  border-color: var(--border);
+  background: var(--bg-hover);
+  color: var(--text-muted);
 }
 
 .plan-card__title {
   margin: var(--sp-3) 0 var(--sp-2);
   font-size: var(--fs-lg);
   line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .plan-card__body {
@@ -498,28 +499,43 @@ onBeforeUnmount(() => {
   margin: 0 0 var(--sp-2);
   color: var(--text-muted);
   font-size: var(--fs-xs);
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .plan-card__step-list {
   display: grid;
   gap: var(--sp-2);
   margin: 0;
-  padding-inline-start: 1.5rem;
+  padding: 0;
+  list-style: none;
+  counter-reset: plan-step;
 }
 
 .plan-card__step {
+  display: grid;
+  grid-template-columns: minmax(2rem, auto) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--sp-2);
   min-inline-size: 0;
-  padding-inline-start: var(--sp-1);
   overflow-wrap: anywhere;
+  counter-increment: plan-step;
 }
 
-.plan-card__step::marker {
-  color: var(--accent);
+.plan-card__step::before {
+  content: counter(plan-step) ".";
+  min-width: 0;
+  color: var(--text-muted);
   font-family: var(--font-mono);
   font-weight: 600;
+  line-height: 1.45;
+  text-align: end;
+}
+
+.plan-card__step-copy {
+  display: block;
+  min-width: 0;
 }
 
 .plan-card__step-title,
@@ -589,15 +605,17 @@ onBeforeUnmount(() => {
   border-top: 1px solid var(--border);
 }
 
-@keyframes plan-card-enter {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+.plan-card__action--primary {
+  border-color: var(--text);
+  background: var(--text);
+  color: var(--bg-surface);
+}
+
+.plan-card__action--primary:hover:not(:disabled) {
+  border-color: var(--text);
+  background: var(--text);
+  color: var(--bg-surface);
+  opacity: 0.88;
 }
 
 @media (max-width: 640px) {
@@ -637,10 +655,6 @@ onBeforeUnmount(() => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .plan-card {
-    animation: none;
-  }
-
   .plan-card__body--expanding,
   .plan-card__body--collapsing,
   .plan-card__disclosure,

@@ -529,6 +529,27 @@
   z-index: 2;
 }
 
+.plan-questionnaire-dock {
+  position: absolute;
+  bottom: calc(100% + var(--sp-2));
+  left: 50%;
+  z-index: 35;
+  width: min(calc(100% - 48px), var(--composer-col, 820px));
+  min-width: 0;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.plan-questionnaire-dock > .clarify-card {
+  pointer-events: auto;
+}
+
+/* The transcript retains the unresolved interrupt for chronological folding,
+   while the active Plan questionnaire is owned by the composer dock. */
+.chat--plan-questionnaire-open .chat-thread :deep(.clarify-card--plan) {
+  display: none;
+}
+
 .plan-run-dock {
   position: absolute;
   bottom: calc(100% + 8px);
@@ -555,7 +576,13 @@
 .plan-run-dock-enter-from,
 .plan-run-dock-leave-to {
   opacity: 0;
-  transform: translate(-50%, 6px) scale(0.98);
+  transform: translate(-50%, 4px);
+}
+
+@media (max-width: 640px) {
+  .plan-questionnaire-dock {
+    width: calc(100% - 24px);
+  }
 }
 
 /* Slash menu */

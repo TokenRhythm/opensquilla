@@ -12,6 +12,7 @@ runtime wrapper.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -949,6 +950,68 @@ def test_tool_result_handler_replaces_intermediate_approval_result() -> None:
     assert tool_results[0]["is_error"] is True
     assert tool_results[0]["execution_status"]["reason"] == "approval_denied"
     assert state.turn_segments[0]["input"]["approval_id"] == "approval-1"
+
+
+def test_tool_result_handler_preserves_initial_user_input_request() -> None:
+    state = _make_state()
+    handler = _ToolResultHandler()
+    request = {
+        "status": "input_required",
+        "kind": "user_input",
+        "paused": True,
+        "request_id": "request-1",
+        "run_id": "run-1",
+        "step": "plan",
+        "clarify_schema": {
+            "mode": "form",
+            "presentation": "plan_questionnaire_v1",
+            "fields": [{"name": "scope", "required": True}],
+        },
+    }
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="call-input",
+            tool_name="request_user_input",
+            result=json.dumps(request),
+        ),
+        state,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="call-input",
+            tool_name="request_user_input",
+            result=json.dumps(
+                {
+                    "status": "answered",
+                    "kind": "user_input",
+                    "paused": False,
+                    "request_id": "request-1",
+                    "answers": {"scope": "focused"},
+                }
+            ),
+        ),
+        state,
+    )
+
+    assert state.turn_segments == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-input",
+            "name": "request_user_input",
+            "result": json.dumps(
+                {
+                    "status": "answered",
+                    "kind": "user_input",
+                    "paused": False,
+                    "request_id": "request-1",
+                    "answers": {"scope": "focused"},
+                }
+            ),
+            "is_error": False,
+            "user_input_request": request,
+        }
+    ]
 
 
 def test_artifact_handler_appends_payload() -> None:

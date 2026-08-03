@@ -604,16 +604,19 @@ def onboard_command(
             router_mode = "recommended"
         try:
             engine = SetupEngine(cfg_before, path=config_path)
+            provider_payload = {
+                "providerId": provider,
+                "model": model,
+                "apiKey": api_key,
+                "apiKeyEnv": api_key_env,
+                "baseUrl": base_url,
+                "proxy": proxy,
+            }
+            if skip_image_generation:
+                provider_payload["imageGenerationIntent"] = "preserve"
             engine.apply(
                 "provider",
-                {
-                    "providerId": provider,
-                    "model": model,
-                    "apiKey": api_key,
-                    "apiKeyEnv": api_key_env,
-                    "baseUrl": base_url,
-                    "proxy": proxy,
-                },
+                provider_payload,
             )
             if router_mode:
                 engine.apply("router", {"mode": router_mode})
@@ -776,6 +779,7 @@ def _status_payload(status: OnboardingStatus, *, config: GatewayConfig) -> dict:
         "imageGenerationProvider": status.image_generation_provider,
         "imageGenerationPrimary": status.image_generation_primary,
         "imageGenerationEnvKey": status.image_generation_env_key,
+        "imageGenerationState": dict(status.image_generation_state),
         "audioConfigured": status.audio_configured,
         "audioEnabled": status.audio_enabled,
         "audioSource": status.audio_source,
