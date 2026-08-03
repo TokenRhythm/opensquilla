@@ -222,6 +222,8 @@ METHOD_SCOPES: dict[str, str] = {
     "goals.clear": WRITE_SCOPE,
     "goals.pause": WRITE_SCOPE,
     "goals.resume": WRITE_SCOPE,
+    "goals.observe": WRITE_SCOPE,
+    "goals.unobserve": WRITE_SCOPE,
     "sessions.steer": WRITE_SCOPE,
     "sessions.steer.v2": WRITE_SCOPE,
     "sessions.abort": WRITE_SCOPE,

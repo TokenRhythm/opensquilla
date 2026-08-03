@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -13,9 +15,11 @@ import pytest
 
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.goal_driver import get_goal_watcher_registry
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
 from opensquilla.gateway.rpc_goals import (
     _handle_goals_clear,
+    _handle_goals_observe,
     _handle_goals_pause,
     _handle_goals_resume,
     _handle_goals_set,
@@ -583,3 +587,154 @@ async def test_send_passthrough_driver_kind_defaults_to_manual(
                 plan_revision_id=revision.revision_id,
                 plan_run_driver_kind="hack",
             )
+
+@pytest.mark.asyncio
+async def test_goals_observe_watch_flips_watcher_eligibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(run: TaskRun) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    registry = get_goal_watcher_registry()
+    registry.unobserve(SOURCE_KEY, "goal-rpc-test")  # defensive cleanup
+    try:
+        async with _open_goal_rpc_stack(
+            tmp_path / "goal-observe.sqlite",
+            handler=handler,
+        ) as stack:
+            on = await _handle_goals_observe(
+                {"sessionKey": SOURCE_KEY, "watch": True},
+                stack.context,
+            )
+            assert on["sessionKey"] == SOURCE_KEY
+            assert on["clientId"] == "goal-rpc-test"
+            assert on["watching"] is True
+            assert on["watchers"] >= 1
+            assert registry.has_watchers(SOURCE_KEY) is True
+
+            off = await _handle_goals_observe(
+                {"sessionKey": SOURCE_KEY, "watch": False},
+                stack.context,
+            )
+            assert off["watching"] is False
+            assert off["watchers"] == 0
+            assert registry.has_watchers(SOURCE_KEY) is False
+    finally:
+        registry.unobserve(SOURCE_KEY, "goal-rpc-test")
+
+
+@pytest.mark.asyncio
+async def test_goals_resume_enqueues_goal_turn_when_paused_at_finished_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[TaskRun] = []
+    manager_holder: dict[str, Any] = {}
+    markers: list[str | None] = [None, "[goal:complete]"]
+    resumed_started = asyncio.Event()
+    release_resumed = asyncio.Event()
+
+    async def handler(run: TaskRun) -> None:
+        captured.append(run)
+        if len(captured) == 2:  # the goal_turn enqueued by goals.resume
+            resumed_started.set()
+            await release_resumed.wait()
+        manager = manager_holder.get("manager")
+        marker = markers.pop(0) if markers else None
+        if marker is not None and manager is not None:
+            await manager.append_message(SOURCE_KEY, "assistant", marker)
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    registry = get_goal_watcher_registry()
+    registry.unobserve(SOURCE_KEY, "goal-rpc-test")  # defensive cleanup
+    try:
+        async with _open_goal_rpc_stack(
+            tmp_path / "goal-resume-enqueue.sqlite",
+            handler=handler,
+        ) as stack:
+            manager_holder["manager"] = stack.manager
+            set_response = await _handle_goals_set(
+                {
+                    "sessionKey": SOURCE_KEY,
+                    "message": "Resume this goal.",
+                    "clientRequestId": "goal-resume-enqueue-set",
+                },
+                stack.context,
+            )
+            await stack.runtime.wait(set_response["turnId"], timeout=2.0)
+            run_id = set_response["planRun"]["runId"]
+
+            paused = await _handle_goals_pause(
+                {"sessionKey": SOURCE_KEY},
+                stack.context,
+            )
+            assert paused["goal"]["status"] == "paused"
+
+            # Resume on a paused goal whose plan run sits at the
+            # goal_turn_finished anchor flips the goal back to running and
+            # enqueues the next goal_turn task immediately.
+            resumed = await _handle_goals_resume(
+                {"sessionKey": SOURCE_KEY},
+                stack.context,
+            )
+            assert resumed["goal"]["status"] == "running"
+            task_id = resumed["taskId"]
+            assert task_id
+
+            # Park the resumed turn in-flight so the plan-run claim and the
+            # running-state guard are observable without racing the hook.
+            await asyncio.wait_for(resumed_started.wait(), timeout=5.0)
+            assert len(captured) == 2
+            assert captured[1].run_kind == "goal_turn"
+            plan_run = await stack.storage.get_plan_run(run_id)
+            assert plan_run is not None
+            assert plan_run.status == "running"
+            assert plan_run.active_task_id == task_id
+
+            continued_record = await stack.storage.get_agent_task(task_id)
+            assert continued_record is not None
+            assert continued_record.run_kind == "goal_turn"
+            metadata = continued_record.details["metadata"]
+            assert metadata["plan_run_id"] == run_id
+            assert "task_id" not in metadata
+
+            # While the goal is running again, a second resume is rejected and
+            # must not double-trigger another continuation.
+            with pytest.raises(RpcHandlerError) as running_resume:
+                await _handle_goals_resume(
+                    {"sessionKey": SOURCE_KEY},
+                    stack.context,
+                )
+            assert running_resume.value.code == "GOAL_NOT_PAUSED"
+            assert len(captured) == 2
+
+            # With a watcher present, the resumed turn's [goal:complete]
+            # finishes the loop: goal and plan run both reach a terminal
+            # state, no further task enqueued.
+            registry.observe(SOURCE_KEY, "goal-rpc-test")
+            release_resumed.set()
+            terminal = await stack.runtime.wait(task_id, timeout=2.0)
+            assert terminal.status == AgentTaskStatus.SUCCEEDED
+
+            deadline = time.monotonic() + 5.0
+            goal = await stack.storage.get_goal_run(set_response["goalId"])
+            while goal is not None and goal.status != "complete" and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+                goal = await stack.storage.get_goal_run(set_response["goalId"])
+            assert goal is not None
+            assert goal.status == "complete"
+            final_run = await stack.storage.get_plan_run(run_id)
+            assert final_run is not None
+            assert final_run.status == "cancelled"
+            assert final_run.terminal_reason == "goal_complete"
+            assert len(captured) == 2
+    finally:
+        registry.unobserve(SOURCE_KEY, "goal-rpc-test")

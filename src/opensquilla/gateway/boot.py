@@ -3773,6 +3773,7 @@ async def start_gateway_server(
         pending_overflow_policy=getattr(
             config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),
+        goal_config=getattr(config, "goal", None),
     )
     # Wire task_runtime's short write-lock provider into turn_runner.
     turn_runner.set_session_lock_provider(task_runtime._get_session_lock_for_turn)

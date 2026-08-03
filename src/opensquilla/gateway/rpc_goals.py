@@ -5,11 +5,10 @@ any prior goal for the session (its cancelled ``goal_runs`` row and superseded
 plan run stay durable), activates a single-step goal plan revision, and starts
 the first implementation turn through the shared ``sessions.send`` pipeline with
 the run bound to ``driver_kind="goal"`` / ``driver_id=<goal_id>``. Later turns
-are driven by the runtime's goal continuation hook (WO-4); this module only
-starts the first turn and manages the goal state machine.
-
-``goals.observe`` / ``goals.unobserve`` are deliberately not implemented here —
-they need the watcher registry delivered by WO-4.
+are driven by the runtime's goal continuation hook (``gateway/goal_driver.py``);
+``goals.observe`` / ``goals.unobserve`` register/unregister the watcher
+eligibility that gates auto-continuation, and ``goals.resume`` restarts a
+paused loop by enqueueing the next goal turn immediately.
 """
 
 from __future__ import annotations
@@ -19,6 +18,12 @@ from typing import Any
 
 import structlog
 
+from opensquilla.gateway.goal_driver import (
+    GOAL_CONTINUATION_MESSAGE,
+    build_goal_route_envelope,
+    enqueue_goal_continuation,
+    get_goal_watcher_registry,
+)
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.session.goals import (
@@ -284,6 +289,55 @@ async def _handle_goals_status(params: dict | None, ctx: RpcContext) -> dict:
     }
 
 
+@_d.method("goals.observe", scope="operator.write")
+async def _handle_goals_observe(params: dict | None, ctx: RpcContext) -> dict:
+    """Register or unregister a watcher for a session's goal turns.
+
+    ``watch: true`` marks the caller as an active observer so the continuation
+    driver keeps auto-enqueueing turns even when ``continue_unwatched`` is
+    false; ``watch: false`` (or ``goals.unobserve``) releases it. The caller
+    identity defaults to the connection id when ``clientId`` is absent.
+    """
+
+    return await _apply_goal_observe(params, ctx)
+
+
+@_d.method("goals.unobserve", scope="operator.write")
+async def _handle_goals_unobserve(params: dict | None, ctx: RpcContext) -> dict:
+    """Release a goal watcher; thin symmetric wrapper over ``goals.observe``."""
+
+    return await _apply_goal_observe(params, ctx, watch=False)
+
+
+async def _apply_goal_observe(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    watch: bool | None = None,
+) -> dict:
+    from opensquilla.gateway.rpc_sessions import _optional_string_param, _require_plan_session_key
+
+    key = _require_plan_session_key(params)
+    registry = get_goal_watcher_registry()
+    requested = _optional_string_param(params, "clientId", "client_id")
+    if requested:
+        client_id = requested
+    else:
+        client_id = str(getattr(ctx, "conn_id", "") or "").strip() or uuid.uuid4().hex
+    if watch is None:
+        watch = bool(params.get("watch", True)) if isinstance(params, dict) else True
+    if watch:
+        count = registry.observe(key, client_id)
+    else:
+        count = registry.unobserve(key, client_id)
+    return {
+        "sessionKey": key,
+        "clientId": client_id,
+        "watching": bool(watch),
+        "watchers": count,
+    }
+
+
 @_d.method("goals.clear", scope="operator.write")
 async def _handle_goals_clear(params: dict | None, ctx: RpcContext) -> dict:
     from opensquilla.gateway.rpc_sessions import _require_plan_session_key
@@ -378,8 +432,10 @@ async def _handle_goals_resume(params: dict | None, ctx: RpcContext) -> dict:
             retryable=False,
             accepted=False,
         )
-    # Resuming only flips the goal state machine back to running; re-enqueueing
-    # the next goal turn is the WO-4 continuation hook's responsibility.
+    # Flip the goal state machine back to running, then immediately enqueue
+    # the next goal turn when the plan run is paused at the goal_turn_finished
+    # anchor. This makes "reopen chat + /goal resume" restore the loop without
+    # waiting for a live task to finish and trigger the runtime hook.
     try:
         updated = await storage.update_goal_run(
             goal.goal_id,
@@ -388,4 +444,48 @@ async def _handle_goals_resume(params: dict | None, ctx: RpcContext) -> dict:
         )
     except GoalConflictError as exc:
         raise _goal_changed_error(exc, goal) from exc
-    return {"sessionKey": key, "goal": goal_run_snapshot(updated)}
+
+    task_id: str | None = None
+    plan_run = (
+        await storage.get_plan_run(goal.plan_run_id)
+        if goal.plan_run_id
+        else None
+    )
+    if (
+        plan_run is None
+        or str(plan_run.status) != "paused"
+        or str(plan_run.pause_reason or "") != "goal_turn_finished"
+    ):
+        plan_run = None
+    if plan_run is not None and ctx.task_runtime is not None:
+        session = await storage.get_session(key)
+        envelope_seed = build_goal_route_envelope(
+            session_key=key,
+            agent_id=goal.agent_id,
+            session_id=(
+                str(getattr(session, "session_id", "") or "")
+                if session is not None
+                else None
+            ),
+            goal_id=goal.goal_id,
+            run_id=plan_run.run_id,
+            plan_revision_id=str(plan_run.plan_revision_id or "") or None,
+            source_name="goals.resume",
+            conn_id=str(getattr(ctx, "conn_id", "") or "") or None,
+            principal_is_owner=ctx.principal.is_owner,
+        )
+        handle = await enqueue_goal_continuation(
+            ctx.task_runtime,
+            session_key=key,
+            run_id=plan_run.run_id,
+            goal_id=goal.goal_id,
+            message=GOAL_CONTINUATION_MESSAGE,
+            envelope_seed=envelope_seed,
+        )
+        if handle is not None:
+            task_id = str(getattr(handle, "task_id", "") or "") or None
+    return {
+        "sessionKey": key,
+        "goal": goal_run_snapshot(updated),
+        "taskId": task_id,
+    }

@@ -34,6 +34,7 @@ import structlog
 
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.outcome import completed_outcome, outcome_from_error
+from opensquilla.gateway.goal_driver import maybe_continue_goal
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.session_lifecycle import TaskLifecycleEvent, TaskLifecycleListener
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
@@ -665,6 +666,7 @@ class TaskRuntime:
         pending_overflow_policy: PendingOverflowPolicy | str = (
             PendingOverflowPolicy.REJECT_NEWEST
         ),
+        goal_config: Any | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be >= 1")
@@ -705,6 +707,9 @@ class TaskRuntime:
         self._running_heartbeat_interval_s = running_heartbeat_interval_s
         self._accepted_config_provider = accepted_config_provider
         self._pending_overflow_policy = pending_overflow_policy
+        # Goal continuation guardrails (``[goal]`` config section). ``None``
+        # falls back to the module defaults in ``goal_driver.maybe_continue_goal``.
+        self._goal_config = goal_config
         from opensquilla.gateway.user_input_broker import StructuredUserInputBroker
 
         self._user_input_broker = StructuredUserInputBroker()
@@ -2812,6 +2817,13 @@ class TaskRuntime:
         finally:
             self._user_input_broker.cancel_task(task.task_id)
             await self._settle_attached_plan_run(task)
+            # Goal continuation hook (WO-4). Runs after the per-session
+            # execution lock is released (this outer ``finally`` executes after
+            # the ``async with execution_lock`` block exits), so enqueueing the
+            # next goal turn cannot deadlock against this task's own lane. The
+            # driver is best-effort: it swallows its own errors and never
+            # raises into the turn terminal flow.
+            await maybe_continue_goal(self, task, config=self._goal_config)
             _cleanup_guest_profile(task)
 
     async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
