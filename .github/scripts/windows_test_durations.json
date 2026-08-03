@@ -841,6 +841,7 @@
     "tests/test_scheduler/test_exact_and_retry_classification.py": 0.308,
     "tests/test_scheduler/test_failure_destination.py": 0.315,
     "tests/test_scheduler/test_heartbeat_service.py": 0.01,
+    "tests/test_scheduler/test_job_lifecycle.py": 0.05,
     "tests/test_scheduler/test_ops_strict_schedule.py": 0.74,
     "tests/test_scheduler/test_parser.py": 0.02,
     "tests/test_scheduler/test_parser_tz.py": 0.418,

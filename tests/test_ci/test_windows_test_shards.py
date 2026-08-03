@@ -130,6 +130,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_recovery/test_transaction.py",
     "tests/test_scripts/test_release_channel_manifest.py",
     "tests/test_scripts/test_verify_webui_artifact.py",
+    "tests/test_scheduler/test_job_lifecycle.py",
     "tests/test_session/test_storage_transactions.py",
     "tests/test_session/test_turn_acceptance_storage.py",
     "tests/test_skills/test_hub_deps_subprocess.py",
