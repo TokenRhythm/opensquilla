@@ -130,6 +130,15 @@ class TaskCollectionUnavailableError(RuntimeError):
     """Raised when a queued task stopped being collectable before acceptance."""
 
 
+class PlanImplementationSessionBusyError(RuntimeError):
+    """A current-session Plan implementation requires an idle task ledger."""
+
+    def __init__(self, *, task_id: str, task_status: str) -> None:
+        super().__init__("current-session plan implementation requires an idle session")
+        self.task_id = task_id
+        self.task_status = task_status
+
+
 class ProjectSessionSnapshotMismatchError(RuntimeError):
     """Raised when a locked project-session snapshot changed before deletion."""
 
@@ -152,6 +161,9 @@ class TurnAcceptanceResult:
     fresh_user_session: bool
     task_status: AgentTaskStatus | None = None
     reset_archive_snapshot: ResetArchiveSnapshot | None = None
+    collaboration_mode: str | None = None
+    collaboration_revision: int | None = None
+    active_plan_revision_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -5468,6 +5480,12 @@ class SessionStorage:
     async def mark_abandoned_agent_tasks(self, now_ms: int | None = None) -> int:
         """Mark non-terminal persisted tasks as abandoned after process restart."""
         ts = now_ms or _now_ms()
+        plan_run_reconciliation = {
+            "cancelled": 0,
+            "completed": 0,
+            "paused_terminal_owner": 0,
+            "paused_orphan_owner": 0,
+        }
         terminal_session_statuses = (
             SessionStatus.DONE,
             SessionStatus.FAILED,
@@ -5606,6 +5624,164 @@ class SessionStorage:
                     AgentTaskStatus.ABANDONED,
                 ),
             )
+            # A prior process can also crash after the AgentTask reaches a
+            # terminal state but before TaskRuntime settles its attached
+            # PlanRun. Reconcile that narrow window here, outside the task
+            # terminalization hot path. Runs paused above for process restart
+            # are deliberately excluded, preserving their resumable state.
+            async with conn.execute(
+                """
+                SELECT plan_runs.run_id,
+                       plan_runs.status,
+                       plan_runs.state_revision,
+                       plan_runs.driver_kind,
+                       plan_runs.current_step_id,
+                       plan_runs.step_states,
+                       plan_runs.active_task_id,
+                       agent_tasks.status AS owner_status
+                FROM plan_runs
+                LEFT JOIN agent_tasks
+                  ON agent_tasks.task_id = plan_runs.active_task_id
+                WHERE plan_runs.status IN ('queued', 'running')
+                ORDER BY plan_runs.created_at ASC, plan_runs.run_id ASC
+                """
+            ) as plan_run_cur:
+                unsettled_plan_runs = await plan_run_cur.fetchall()
+            for row in unsettled_plan_runs:
+                run_id = str(row["run_id"])
+                run_status = str(row["status"])
+                state_revision = int(row["state_revision"])
+                active_task_id_raw = row["active_task_id"]
+                active_task_id = (
+                    None
+                    if active_task_id_raw is None
+                    else str(active_task_id_raw)
+                )
+                owner_status_raw = row["owner_status"]
+                owner_status = (
+                    None if owner_status_raw is None else str(owner_status_raw)
+                )
+                if owner_status is None:
+                    await conn.execute(
+                        """
+                        UPDATE plan_runs
+                        SET status = 'paused',
+                            state_revision = state_revision + 1,
+                            active_task_id = NULL,
+                            pause_reason = 'orphaned_plan_run_owner',
+                            terminal_reason = 'orphaned_plan_run_owner',
+                            updated_at = ?,
+                            finished_at = NULL
+                        WHERE run_id = ?
+                          AND state_revision = ?
+                          AND status = ?
+                          AND active_task_id IS ?
+                        """,
+                        (
+                            ts,
+                            run_id,
+                            state_revision,
+                            run_status,
+                            active_task_id,
+                        ),
+                    )
+                    plan_run_reconciliation["paused_orphan_owner"] += 1
+                    continue
+                assert active_task_id is not None
+                if owner_status in {
+                    AgentTaskStatus.QUEUED.value,
+                    AgentTaskStatus.RUNNING.value,
+                }:
+                    continue
+                if run_status == PlanRunStatus.QUEUED.value:
+                    await conn.execute(
+                        """
+                        UPDATE plan_runs
+                        SET status = 'cancelled',
+                            state_revision = state_revision + 1,
+                            active_task_id = NULL,
+                            pause_reason = NULL,
+                            terminal_reason = 'implementation_turn_ended_before_start',
+                            updated_at = ?,
+                            finished_at = ?
+                        WHERE run_id = ?
+                          AND state_revision = ?
+                          AND status = 'queued'
+                          AND active_task_id = ?
+                        """,
+                        (ts, ts, run_id, state_revision, active_task_id),
+                    )
+                    plan_run_reconciliation["cancelled"] += 1
+                    continue
+
+                step_states_raw = _deserialize_row(
+                    {"step_states": row["step_states"]}
+                ).get("step_states")
+                step_states = (
+                    step_states_raw if isinstance(step_states_raw, list) else []
+                )
+                delivery_ready = (
+                    row["current_step_id"] is None
+                    and bool(step_states)
+                    and all(
+                        isinstance(state, dict)
+                        and str(state.get("status") or "")
+                        in {"completed", "skipped"}
+                        for state in step_states
+                    )
+                )
+                if (
+                    owner_status == AgentTaskStatus.SUCCEEDED.value
+                    and delivery_ready
+                ):
+                    await conn.execute(
+                        """
+                        UPDATE plan_runs
+                        SET status = 'completed',
+                            state_revision = state_revision + 1,
+                            active_task_id = NULL,
+                            pause_reason = NULL,
+                            terminal_reason = NULL,
+                            updated_at = ?,
+                            finished_at = ?
+                        WHERE run_id = ?
+                          AND state_revision = ?
+                          AND status = 'running'
+                          AND current_step_id IS NULL
+                          AND active_task_id = ?
+                        """,
+                        (ts, ts, run_id, state_revision, active_task_id),
+                    )
+                    plan_run_reconciliation["completed"] += 1
+                    continue
+
+                driver_kind = str(row["driver_kind"] or "manual")
+                reason = (
+                    (
+                        "manual_turn_finished"
+                        if driver_kind == "manual"
+                        else "goal_turn_finished"
+                    )
+                    if owner_status == AgentTaskStatus.SUCCEEDED.value
+                    else f"{driver_kind}_turn_{owner_status}"
+                )
+                await conn.execute(
+                    """
+                    UPDATE plan_runs
+                    SET status = 'paused',
+                        state_revision = state_revision + 1,
+                        active_task_id = NULL,
+                        pause_reason = ?,
+                        updated_at = ?,
+                        finished_at = NULL
+                    WHERE run_id = ?
+                      AND state_revision = ?
+                      AND status = 'running'
+                      AND active_task_id = ?
+                    """,
+                    (reason, ts, run_id, state_revision, active_task_id),
+                )
+                plan_run_reconciliation["paused_terminal_owner"] += 1
             for index in range(0, len(session_keys), _SQLITE_VARIABLE_CHUNK_SIZE):
                 chunk = session_keys[index : index + _SQLITE_VARIABLE_CHUNK_SIZE]
                 placeholders = ", ".join("?" for _ in chunk)
@@ -5633,6 +5809,11 @@ class SessionStorage:
                     *chunk,
                     *terminal_session_statuses,
                 ),
+            )
+        if any(plan_run_reconciliation.values()):
+            log.info(
+                "plan_run.startup_reconciliation",
+                extra=plan_run_reconciliation,
             )
         return count
 
@@ -6041,6 +6222,9 @@ class SessionStorage:
         plan_run: PlanRunRecord | None = None,
         merge_into_task: bool = False,
         workspace_guard: ProjectWorkspaceGuard | None = None,
+        expected_collaboration_revision: int | None = None,
+        expected_active_plan_revision_id: str | None = None,
+        require_idle_for_current_plan_implementation: bool = False,
     ) -> TurnAcceptanceResult:
         """Commit one user message, optional task, and request receipt atomically.
 
@@ -6059,6 +6243,24 @@ class SessionStorage:
             raise ValueError("client_request_id is required")
         if not request_fingerprint:
             raise ValueError("request_fingerprint is required")
+        if (
+            expected_collaboration_revision is not None
+            and (
+                isinstance(expected_collaboration_revision, bool)
+                or expected_collaboration_revision < 0
+            )
+        ):
+            raise ValueError(
+                "expected_collaboration_revision must be a non-negative integer"
+            )
+        if expected_active_plan_revision_id is not None:
+            expected_active_plan_revision_id = expected_active_plan_revision_id.strip()
+            if not expected_active_plan_revision_id:
+                raise ValueError("expected_active_plan_revision_id must not be blank")
+        if require_idle_for_current_plan_implementation and plan_run is None:
+            raise ValueError(
+                "idle Plan implementation admission requires an accepted plan run"
+            )
 
         request_session_key = canonicalize_session_key(request_session_key)
         entry.session_key = canonicalize_session_key(entry.session_key)
@@ -6184,6 +6386,76 @@ class SessionStorage:
                     fresh_user_session=fresh_user_session,
                     task_status=task_status,
                 )
+
+            # Existing-session Plan operations require compare-and-set guards
+            # before *any* transcript, session, task, receipt, or PlanRun write.
+            # BEGIN IMMEDIATE makes this the cross-connection final arbiter;
+            # the in-memory broker check is only a richer preflight response.
+            if session_node is None and (
+                expected_collaboration_revision is not None
+                or expected_active_plan_revision_id is not None
+                or require_idle_for_current_plan_implementation
+            ):
+                async with conn.execute(
+                    """
+                    SELECT session_id, epoch, collaboration_revision,
+                           active_plan_revision_id
+                    FROM sessions
+                    WHERE session_key = ?
+                    """,
+                    (entry.session_key,),
+                ) as cur:
+                    guarded_session_row = await cur.fetchone()
+                if guarded_session_row is None:
+                    raise KeyError(f"Session not found: {entry.session_key}")
+                if (
+                    str(guarded_session_row["session_id"]) != entry.session_id
+                    or int(guarded_session_row["epoch"]) != expected_epoch
+                ):
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=entry.session_key,
+                        expected_epoch=expected_epoch,
+                    )
+                if (
+                    expected_collaboration_revision is not None
+                    and int(guarded_session_row["collaboration_revision"])
+                    != expected_collaboration_revision
+                ):
+                    raise PlanConflictError(
+                        "collaboration state changed before turn acceptance"
+                    )
+                if (
+                    expected_active_plan_revision_id is not None
+                    and guarded_session_row["active_plan_revision_id"]
+                    != expected_active_plan_revision_id
+                ):
+                    raise PlanConflictError(
+                        "active plan revision changed before turn acceptance"
+                    )
+                if require_idle_for_current_plan_implementation:
+                    async with conn.execute(
+                        """
+                        SELECT task_id, status
+                        FROM agent_tasks
+                        WHERE session_key = ? AND status IN (?, ?)
+                        ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
+                                 created_at ASC, rowid ASC
+                        LIMIT 1
+                        """,
+                        (
+                            entry.session_key,
+                            AgentTaskStatus.QUEUED,
+                            AgentTaskStatus.RUNNING,
+                            AgentTaskStatus.RUNNING,
+                        ),
+                    ) as cur:
+                        busy_task = await cur.fetchone()
+                    if busy_task is not None:
+                        raise PlanImplementationSessionBusyError(
+                            task_id=str(busy_task["task_id"]),
+                            task_status=str(busy_task["status"]),
+                        )
 
             await _verify_project_workspace_guard(
                 conn,
@@ -6340,35 +6612,73 @@ class SessionStorage:
                 entry,
                 expected_epoch=expected_epoch,
             )
+            async with conn.execute(
+                """
+                SELECT collaboration_mode, collaboration_revision,
+                       active_plan_revision_id
+                FROM sessions
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
+                """,
+                (entry.session_key, entry.session_id, expected_epoch),
+            ) as cur:
+                collaboration_row = await cur.fetchone()
+            if collaboration_row is None:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=entry.session_key,
+                    expected_epoch=expected_epoch,
+                )
+            assert collaboration_row is not None
+            mode_changed = (
+                collaboration_mode_update is not None
+                and collaboration_mode_update != collaboration_row["collaboration_mode"]
+            )
+            active_revision_changed = (
+                active_plan_revision_update is not None
+                and active_plan_revision_update
+                != collaboration_row["active_plan_revision_id"]
+            )
+
             touch_fields = {"updated_at": updated_at, **session_updates}
             touch_assignments = [f"{name} = ?" for name in touch_fields]
             touch_values = [_serialize(value) for value in touch_fields.values()]
-            collaboration_changed = (
-                collaboration_mode_update is not None
-                or active_plan_revision_update is not None
-            )
-            if collaboration_mode_update is not None:
+            collaboration_changed = mode_changed or active_revision_changed
+            if mode_changed:
                 touch_assignments.append("collaboration_mode = ?")
                 touch_values.append(collaboration_mode_update)
-            if active_plan_revision_update is not None:
+            if active_revision_changed:
                 touch_assignments.append("active_plan_revision_id = ?")
                 touch_values.append(active_plan_revision_update)
             if collaboration_changed:
                 touch_assignments.append(
                     "collaboration_revision = collaboration_revision + 1"
                 )
+            session_where = "WHERE session_key = ? AND session_id = ? AND epoch = ?"
+            session_where_values: list[Any] = [
+                entry.session_key,
+                entry.session_id,
+                expected_epoch,
+            ]
+            if expected_collaboration_revision is not None:
+                session_where += " AND collaboration_revision = ?"
+                session_where_values.append(expected_collaboration_revision)
+            if expected_active_plan_revision_id is not None:
+                session_where += " AND active_plan_revision_id = ?"
+                session_where_values.append(expected_active_plan_revision_id)
             async with conn.execute(
                 f"UPDATE sessions SET {', '.join(touch_assignments)} "  # noqa: S608
-                "WHERE session_key = ? AND session_id = ? AND epoch = ?",
-                [
-                    *touch_values,
-                    entry.session_key,
-                    entry.session_id,
-                    expected_epoch,
-                ],
+                f"{session_where}",  # noqa: S608
+                [*touch_values, *session_where_values],
             ) as cur:
                 touched = cur.rowcount or 0
             if touched == 0:
+                if (
+                    expected_collaboration_revision is not None
+                    or expected_active_plan_revision_id is not None
+                ):
+                    raise PlanConflictError(
+                        "plan collaboration state changed before turn acceptance"
+                    )
                 await self._raise_stale_epoch(
                     conn,
                     session_key=entry.session_key,
@@ -6377,6 +6687,36 @@ class SessionStorage:
 
             if plan_run is not None:
                 await self._start_plan_run_on_conn(conn, plan_run)
+
+            async with conn.execute(
+                """
+                SELECT collaboration_mode, collaboration_revision,
+                       active_plan_revision_id
+                FROM sessions
+                WHERE session_key = ? AND session_id = ? AND epoch = ?
+                """,
+                (entry.session_key, entry.session_id, expected_epoch),
+            ) as cur:
+                accepted_collaboration_row = await cur.fetchone()
+            assert accepted_collaboration_row is not None
+
+            if task_record is not None and isinstance(task_record.details, dict):
+                task_details = dict(task_record.details)
+                task_metadata_raw = task_details.get("metadata")
+                task_metadata = (
+                    dict(task_metadata_raw)
+                    if isinstance(task_metadata_raw, dict)
+                    else {}
+                )
+                if task_metadata.get("required_collaboration_mode") in {
+                    "default",
+                    "plan",
+                }:
+                    task_metadata["required_collaboration_revision"] = int(
+                        accepted_collaboration_row["collaboration_revision"]
+                    )
+                    task_details["metadata"] = task_metadata
+                    task_record.details = task_details
 
             if task_record is not None:
                 incoming_details = dict(task_record.details or {})
@@ -6505,6 +6845,17 @@ class SessionStorage:
                 fresh_user_session=fresh_user_session,
                 task_status=task_record.status if task_record is not None else None,
                 reset_archive_snapshot=reset_archive_snapshot,
+                collaboration_mode=str(
+                    accepted_collaboration_row["collaboration_mode"]
+                ),
+                collaboration_revision=int(
+                    accepted_collaboration_row["collaboration_revision"]
+                ),
+                active_plan_revision_id=(
+                    str(accepted_collaboration_row["active_plan_revision_id"])
+                    if accepted_collaboration_row["active_plan_revision_id"] is not None
+                    else None
+                ),
             )
 
     @_serialized_read

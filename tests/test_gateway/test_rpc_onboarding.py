@@ -107,6 +107,77 @@ async def test_provider_configure_redacts_api_key(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_provider_configure_can_atomically_enable_openrouter_image_default(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(config_path))
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.provider.configure",
+        {
+            "providerId": "openrouter",
+            "model": "openai/gpt-test",
+            "apiKey": "synthetic-openrouter-key",
+            "imageGenerationIntent": "enable_provider_default",
+        },
+        _admin_ctx(),
+    )
+
+    assert res.error is None, res.error
+    change = res.payload["entry"]["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is True
+    persisted = tomllib.loads(config_path.read_text())
+    assert persisted["image_generation"] == {
+        "enabled": True,
+        "binding": "follow_llm",
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+    }
+
+    status = await get_dispatcher().dispatch(
+        "r2",
+        "onboarding.status",
+        {},
+        _read_ctx(),
+    )
+    assert status.error is None, status.error
+    image_state = status.payload["imageGenerationState"]
+    assert image_state["mode"] == "follow_llm"
+    assert image_state["effective"]["providerId"] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_provider_configure_image_default_intent_preserves_explicit_off(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "c.toml"
+    config_path.write_text("[image_generation]\nenabled = false\n")
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(config_path))
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.provider.configure",
+        {
+            "providerId": "openrouter",
+            "model": "openai/gpt-test",
+            "apiKey": "synthetic-openrouter-key",
+            "imageGenerationIntent": "enable_provider_default",
+        },
+        _admin_ctx(),
+    )
+
+    assert res.error is None, res.error
+    change = res.payload["entry"]["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is False
+    assert change["reason"] == "operator_configuration_preserved"
+    persisted = tomllib.loads(config_path.read_text())
+    assert persisted["image_generation"] == {"enabled": False}
+
+
+@pytest.mark.asyncio
 async def test_provider_configure_can_omit_model_for_router_profile(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
     res = await get_dispatcher().dispatch(

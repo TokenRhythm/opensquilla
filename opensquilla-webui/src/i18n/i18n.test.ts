@@ -430,4 +430,17 @@ describe('catalog parity', () => {
       expect(copy.stepReplaceAndPaste).toBeTruthy()
     }
   })
+
+  it('ships English and Simplified Chinese image-onboarding copy', () => {
+    expect(en.setup.provider.imageGenerationOptInLabel)
+      .toBe('Also enable image generation (recommended)')
+    expect(zhHans.setup.provider.imageGenerationOptInLabel)
+      .toBe('同时启用图像生成（推荐）')
+    expect(en.setup.capabilities.imageRecommendationUse).toBe('Use {provider}')
+    expect(zhHans.setup.capabilities.imageRecommendationUse).toBe('使用 {provider}')
+    expect(en.setup.capabilities.imageRecommendationRegisterExternal)
+      .toContain('opens in a new tab')
+    expect(zhHans.setup.capabilities.imageRecommendationRegisterExternal)
+      .toContain('在新标签页中打开')
+  })
 })

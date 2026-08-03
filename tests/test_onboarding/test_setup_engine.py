@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import tomllib
 
+import pytest
+
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.config_store import load_config
 from opensquilla.onboarding.section_status import SectionStatus
@@ -33,6 +35,40 @@ def test_setup_engine_applies_provider_and_router_without_persisting_secret(tmp_
     assert "api_key" not in data["llm"]
     assert data["squilla_router"]["tier_profile"] == "deepseek"
     assert "tiers" not in data["squilla_router"]
+
+
+def test_setup_engine_enables_openrouter_image_default_on_first_configuration():
+    engine = SetupEngine(config=GatewayConfig())
+
+    result = engine.apply(
+        "provider",
+        {
+            "providerId": "openrouter",
+            "model": "openai/gpt-test",
+            "apiKey": "synthetic-openrouter-key",
+        },
+    )
+
+    image = result.config.image_generation
+    assert image.enabled is True
+    assert image.binding == "follow_llm"
+    assert image.primary == "openrouter/google/gemini-3.1-flash-image-preview"
+
+
+@pytest.mark.parametrize("intent", ["", False])
+def test_setup_engine_rejects_invalid_image_generation_intent(intent):
+    engine = SetupEngine(config=GatewayConfig())
+
+    with pytest.raises(ValueError, match="image_generation_intent"):
+        engine.apply(
+            "provider",
+            {
+                "providerId": "openrouter",
+                "model": "openai/gpt-test",
+                "apiKey": "synthetic-openrouter-key",
+                "imageGenerationIntent": intent,
+            },
+        )
 
 
 def test_setup_engine_optional_key_preservation_is_explicit_and_legacy_safe():

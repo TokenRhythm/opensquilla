@@ -55,6 +55,12 @@ from opensquilla.provider.image_generation import (
     parse_image_generation_model_ref,
     reset_image_generation_providers,
 )
+from opensquilla.provider.image_generation_catalog import (
+    get_image_generation_provider_catalog_entry,
+)
+from opensquilla.provider.image_generation_credentials import (
+    resolve_image_generation_credential,
+)
 from opensquilla.provider.image_generation_policy import (
     conflicting_image_generation_endpoint_provider,
     is_valid_image_generation_base_url,
@@ -104,7 +110,11 @@ def configure_image_generation(
     _media_gateway_config = gateway_config
     _media_llm_config = llm_config
     _media_squilla_router_config = squilla_router_config
-    reset_image_generation_providers(config, llm_config=llm_config)
+    reset_image_generation_providers(
+        config,
+        llm_config=llm_config,
+        gateway_config=gateway_config,
+    )
 
 
 def configure_audio(config: Any | None) -> None:
@@ -527,6 +537,10 @@ async def _image_generate_impl(
 
     if not getattr(config, "enabled", False):
         raise ToolError("Image generation is disabled")
+    if not _image_generation_binding_is_active(config):
+        raise ToolError(
+            "Image generation is inactive because its bound LLM provider is not active"
+        )
 
     candidates = _resolve_image_generation_candidates(model, config)
     if not candidates:
@@ -534,6 +548,7 @@ async def _image_generate_impl(
 
     output_format = getattr(config, "output_format", "png")
     target = _resolve_generated_image_path(filename, output_format)
+    tool_context = current_tool_context.get()
     try:
         result = await generate_with_fallbacks(
             request=ImageGenerationRequest(
@@ -542,6 +557,9 @@ async def _image_generate_impl(
                 size=effective_size,
                 output_format=output_format,
                 timeout_seconds=float(getattr(config, "timeout_seconds", 180.0)),
+                credential_session_key=(
+                    str(tool_context.session_key or "") if tool_context is not None else ""
+                ),
             ),
             candidates=candidates,
         )
@@ -641,10 +659,49 @@ def _resolve_image_generation_candidates(model: str | None, config: Any) -> list
     return candidates
 
 
+def _image_generation_binding_is_active(config: Any) -> bool:
+    """Whether a system-owned route still has its bound provider credential."""
+
+    if str(getattr(config, "binding", "custom") or "custom") != "follow_llm":
+        return True
+    try:
+        provider_id, _model = parse_image_generation_model_ref(
+            str(getattr(config, "primary", "") or "")
+        )
+    except ValueError:
+        return False
+    provider = get_image_generation_provider(provider_id)
+    if provider is None:
+        return False
+    try:
+        spec = get_image_generation_provider_catalog_entry(provider_id)
+        provider_config = getattr(
+            getattr(config, "providers", None),
+            provider_id,
+            None,
+        )
+        resolution = resolve_image_generation_credential(
+            provider_id=provider_id,
+            provider_config=provider_config,
+            default_env_key=spec.env_key,
+            default_base_url=spec.default_base_url,
+            effective_base_url=spec.default_base_url,
+            gateway_config=_media_gateway_config,
+            llm_config=_media_llm_config,
+            model=spec.default_model,
+            include_image_credentials=False,
+        )
+    except (KeyError, ValueError):
+        return False
+    return resolution.available and resolution.owner in {"primary", "profile"}
+
+
 def image_generation_available(config: Any | None = None) -> bool:
     """Return whether image generation has at least one configured provider."""
     resolved_config = config if config is not None else _resolve_image_generation_config()
-    if not getattr(resolved_config, "enabled", False):
+    if not getattr(resolved_config, "enabled", False) or not _image_generation_binding_is_active(
+        resolved_config
+    ):
         return False
 
     for candidate in _resolve_image_generation_candidates(None, resolved_config):

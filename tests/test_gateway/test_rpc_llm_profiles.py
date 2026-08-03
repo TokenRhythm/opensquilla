@@ -752,6 +752,54 @@ async def test_profile_activate_persists_then_hot_syncs_without_secret_echo(
 
 
 @pytest.mark.asyncio
+async def test_profile_activate_rpc_accepts_openrouter_image_default_intent(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    cfg = GatewayConfig(
+        config_path=str(config_path),
+        llm={
+            "provider": "openai",
+            "model": "gpt-test",
+            "api_key": "synthetic-openai-key",
+        },
+        llm_profiles={
+            "openrouter": {
+                "model": "openai/gpt-test",
+                "api_key": "synthetic-openrouter-key",
+                "base_url": "https://openrouter.ai/api/v1",
+            }
+        },
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+
+    async def fake_refresh(config):
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.refresh_live_model_catalog",
+        fake_refresh,
+    )
+    response = await get_dispatcher().dispatch(
+        "profile-activate-openrouter-image",
+        "onboarding.llmProfile.activate",
+        {
+            "providerId": "openrouter",
+            "imageGenerationIntent": "enable_provider_default",
+        },
+        _admin_ctx(cfg),
+    )
+
+    assert response.error is None, response.error
+    change = response.payload["entry"]["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is True
+    persisted = tomllib.loads(config_path.read_text())
+    assert persisted["image_generation"]["enabled"] is True
+    assert persisted["image_generation"]["binding"] == "follow_llm"
+
+
+@pytest.mark.asyncio
 async def test_profile_activate_rpc_omits_model_and_uses_provider_default(
     tmp_path,
     monkeypatch,

@@ -7,6 +7,15 @@ from typing import Any
 
 import structlog
 
+from opensquilla.session.plans import (
+    MAX_PLAN_MARKDOWN_CHARS,
+    MAX_PLAN_STEP_DETAILS_CHARS,
+    MAX_PLAN_STEP_ID_CHARS,
+    MAX_PLAN_STEP_REASON_CHARS,
+    MAX_PLAN_STEP_TITLE_CHARS,
+    MAX_PLAN_STEPS,
+    MAX_PLAN_TITLE_CHARS,
+)
 from opensquilla.tools.registry import tool
 from opensquilla.tools.types import (
     InteractionMode,
@@ -17,6 +26,13 @@ from opensquilla.tools.types import (
 )
 
 _MAX_QUESTION_COUNT = 3
+_MAX_QUESTION_ID_CHARS = 80
+_MAX_QUESTION_HEADER_CHARS = 80
+_MAX_QUESTION_TEXT_CHARS = 1_000
+_MIN_OPTION_COUNT = 2
+_MAX_OPTION_COUNT = 3
+_MAX_OPTION_LABEL_CHARS = 120
+_MAX_OPTION_DESCRIPTION_CHARS = 500
 log = structlog.get_logger(__name__)
 
 
@@ -116,21 +132,26 @@ def _plan_mode_context() -> Any:
 def _clean_text(value: Any, *, field: str, max_chars: int) -> str:
     text = str(value or "").strip()
     if not text:
-        raise ValueError(f"{field} is required")
+        raise RetryableToolInputError(f"{field} is required")
     if len(text) > max_chars:
-        raise ValueError(f"{field} must be at most {max_chars} characters")
+        raise RetryableToolInputError(
+            f"{field} must be at most {max_chars} characters"
+        )
     return text
 
 
 def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
     if not isinstance(steps, list):
-        raise ValueError("steps must be an array")
-    from opensquilla.session.plans import normalize_plan_steps
+        raise RetryableToolInputError("steps must be an array")
+    from opensquilla.session.plans import PlanValidationError, normalize_plan_steps
 
     # Use the exact durable validator here. A successful terminating control
     # must not fail later because duplicate or non-portable step ids passed a
     # weaker tool-layer check.
-    return normalize_plan_steps(steps)
+    try:
+        return normalize_plan_steps(steps)
+    except PlanValidationError as exc:
+        raise RetryableToolInputError(str(exc)) from exc
 
 
 @tool(
@@ -143,6 +164,8 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
         "title": {
             "type": "string",
             "description": "Short plan title.",
+            "minLength": 1,
+            "maxLength": MAX_PLAN_TITLE_CHARS,
         },
         "markdown": {
             "type": "string",
@@ -150,19 +173,33 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
                 "Complete human-readable plan. Do not use Markdown task-list "
                 "checkboxes as execution state."
             ),
+            "minLength": 1,
+            "maxLength": MAX_PLAN_MARKDOWN_CHARS,
         },
         "steps": {
             "type": "array",
             "description": "Ordered implementation steps for the complete plan.",
+            "minItems": 1,
+            "maxItems": MAX_PLAN_STEPS,
             "items": {
                 "type": "object",
                 "properties": {
                     "step_id": {
                         "type": "string",
                         "description": "Optional stable id; the server creates one if omitted.",
+                        "minLength": 1,
+                        "maxLength": MAX_PLAN_STEP_ID_CHARS,
                     },
-                    "title": {"type": "string"},
-                    "details": {"type": "string"},
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_PLAN_STEP_TITLE_CHARS,
+                    },
+                    "details": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_PLAN_STEP_DETAILS_CHARS,
+                    },
                 },
                 "required": ["title"],
                 "additionalProperties": False,
@@ -182,8 +219,16 @@ async def submit_plan(
     """Validate a plan payload; finalization commits it with the transcript."""
 
     ctx = _plan_mode_context()
-    normalized_title = _clean_text(title, field="title", max_chars=500)
-    _clean_text(markdown, field="markdown", max_chars=100_000)
+    normalized_title = _clean_text(
+        title,
+        field="title",
+        max_chars=MAX_PLAN_TITLE_CHARS,
+    )
+    _clean_text(
+        markdown,
+        field="markdown",
+        max_chars=MAX_PLAN_MARKDOWN_CHARS,
+    )
     normalized_steps = _normalized_steps(steps)
     return json.dumps(
         {
@@ -209,19 +254,41 @@ async def submit_plan(
     params={
         "questions": {
             "type": "array",
+            "minItems": 1,
+            "maxItems": _MAX_QUESTION_COUNT,
             "items": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string"},
-                    "header": {"type": "string"},
-                    "question": {"type": "string"},
+                    "id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": _MAX_QUESTION_ID_CHARS,
+                    },
+                    "header": {
+                        "type": "string",
+                        "maxLength": _MAX_QUESTION_HEADER_CHARS,
+                    },
+                    "question": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": _MAX_QUESTION_TEXT_CHARS,
+                    },
                     "options": {
                         "type": "array",
+                        "minItems": _MIN_OPTION_COUNT,
+                        "maxItems": _MAX_OPTION_COUNT,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "label": {"type": "string"},
-                                "description": {"type": "string"},
+                                "label": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": _MAX_OPTION_LABEL_CHARS,
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "maxLength": _MAX_OPTION_DESCRIPTION_CHARS,
+                                },
                             },
                             "required": ["label"],
                             "additionalProperties": False,
@@ -244,52 +311,66 @@ async def request_user_input(questions: list[dict[str, Any]]) -> str:
     if getattr(ctx, "interaction_mode", None) is not InteractionMode.INTERACTIVE:
         raise ValueError("request_user_input requires an interactive surface")
     if not isinstance(questions, list) or not 1 <= len(questions) <= _MAX_QUESTION_COUNT:
-        raise ValueError("questions must contain between one and three items")
+        raise RetryableToolInputError(
+            "questions must contain between one and three items"
+        )
     normalized: list[dict[str, Any]] = []
     fields: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, raw in enumerate(questions):
         if not isinstance(raw, dict):
-            raise ValueError(f"questions[{index}] must be an object")
+            raise RetryableToolInputError(f"questions[{index}] must be an object")
         question_id = _clean_text(
             raw.get("id"),
             field=f"questions[{index}].id",
-            max_chars=80,
+            max_chars=_MAX_QUESTION_ID_CHARS,
         )
         if question_id in seen:
-            raise ValueError("question ids must be unique")
+            raise RetryableToolInputError("question ids must be unique")
         seen.add(question_id)
         question_text = _clean_text(
             raw.get("question"),
             field=f"questions[{index}].question",
-            max_chars=1000,
+            max_chars=_MAX_QUESTION_TEXT_CHARS,
         )
         header = str(raw.get("header") or "").strip()
-        if header and len(header) > 80:
-            raise ValueError(f"questions[{index}].header must be at most 80 characters")
+        if header and len(header) > _MAX_QUESTION_HEADER_CHARS:
+            raise RetryableToolInputError(
+                f"questions[{index}].header must be at most "
+                f"{_MAX_QUESTION_HEADER_CHARS} characters"
+            )
         raw_options = raw.get("options")
         choices: list[str] = []
         normalized_options: list[dict[str, str]] = []
         if raw_options is not None:
-            if not isinstance(raw_options, list) or not 2 <= len(raw_options) <= 3:
-                raise ValueError(
+            if (
+                not isinstance(raw_options, list)
+                or not _MIN_OPTION_COUNT <= len(raw_options) <= _MAX_OPTION_COUNT
+            ):
+                raise RetryableToolInputError(
                     f"questions[{index}].options must contain two or three items"
                 )
+            seen_labels: set[str] = set()
             for option_index, option in enumerate(raw_options):
                 if not isinstance(option, dict):
-                    raise ValueError(
+                    raise RetryableToolInputError(
                         f"questions[{index}].options[{option_index}] must be an object"
                     )
                 label = _clean_text(
                     option.get("label"),
                     field=f"questions[{index}].options[{option_index}].label",
-                    max_chars=120,
+                    max_chars=_MAX_OPTION_LABEL_CHARS,
                 )
+                if label in seen_labels:
+                    raise RetryableToolInputError(
+                        f"questions[{index}].option labels must be unique"
+                    )
+                seen_labels.add(label)
                 description = str(option.get("description") or "").strip()
-                if len(description) > 500:
-                    raise ValueError(
+                if len(description) > _MAX_OPTION_DESCRIPTION_CHARS:
+                    raise RetryableToolInputError(
                         f"questions[{index}].options[{option_index}].description "
-                        "must be at most 500 characters"
+                        f"must be at most {_MAX_OPTION_DESCRIPTION_CHARS} characters"
                     )
                 normalized_option = {"label": label}
                 if description:
@@ -329,6 +410,7 @@ async def request_user_input(questions: list[dict[str, Any]]) -> str:
             "step": "plan",
             "clarify_schema": {
                 "mode": "form",
+                "presentation": "plan_questionnaire_v1",
                 "intro": "The plan needs a decision before it can be completed.",
                 "fields": fields,
             },
@@ -353,21 +435,17 @@ async def request_user_input(questions: list[dict[str, Any]]) -> str:
         "step_id": {
             "type": "string",
             "description": "The plan step whose state changed.",
+            "minLength": 1,
+            "maxLength": MAX_PLAN_STEP_ID_CHARS,
         },
         "step_status": {
             "type": "string",
             "enum": ["completed", "blocked", "skipped"],
         },
-        "next_step_id": {
-            "type": "string",
-            "description": (
-                "Next step to mark in progress. Omit after the final completed "
-                "step; the run then completes."
-            ),
-        },
         "reason": {
             "type": "string",
             "description": "Required explanation when blocked or skipped.",
+            "maxLength": MAX_PLAN_STEP_REASON_CHARS,
         },
     },
     required=["step_id", "step_status"],
@@ -393,7 +471,11 @@ async def plan_run_checkpoint(
         raise ValueError(
             "plan_run_checkpoint is available only during plan implementation"
         )
-    normalized_step_id = _clean_text(step_id, field="step_id", max_chars=128)
+    normalized_step_id = _clean_text(
+        step_id,
+        field="step_id",
+        max_chars=MAX_PLAN_STEP_ID_CHARS,
+    )
     normalized_status = str(step_status or "").strip().lower()
     if normalized_status not in {"completed", "blocked", "skipped"}:
         raise ValueError("step_status must be completed, blocked, or skipped")
@@ -401,8 +483,13 @@ async def plan_run_checkpoint(
     normalized_reason = str(reason or "").strip() or None
     if normalized_status in {"blocked", "skipped"} and normalized_reason is None:
         raise ValueError(f"reason is required when step_status is {normalized_status}")
-    if normalized_reason is not None and len(normalized_reason) > 2_000:
-        raise ValueError("reason must be at most 2000 characters")
+    if (
+        normalized_reason is not None
+        and len(normalized_reason) > MAX_PLAN_STEP_REASON_CHARS
+    ):
+        raise RetryableToolInputError(
+            f"reason must be at most {MAX_PLAN_STEP_REASON_CHARS} characters"
+        )
 
     current = await storage.get_plan_run(run_id)
     if current is None:
@@ -428,6 +515,14 @@ async def plan_run_checkpoint(
         ) from exc
 
     snapshot = plan_run_snapshot(updated)
+    actual_next = str(snapshot.get("currentStepId") or "").strip() or None
+    if normalized_next is not None and normalized_next != actual_next:
+        log.warning(
+            "plan_run.checkpoint_next_step_ignored",
+            run_id=run_id,
+            task_id=task_id,
+            has_actual_next_step=actual_next is not None,
+        )
     emitter = getattr(ctx, "plan_event_emitter", None)
     if callable(emitter) and ctx.session_key:
         try:

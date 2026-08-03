@@ -310,6 +310,170 @@ async def test_apply_patch_context_mismatch_is_model_retriable(tmp_path: Path) -
     assert target.read_text(encoding="utf-8") == "actual = 1\n"
 
 
+@pytest.mark.parametrize("trailing_whitespace", ["  ", "\t"])
+@pytest.mark.asyncio
+async def test_apply_patch_tolerates_trailing_space_or_tab(
+    tmp_path: Path,
+    trailing_whitespace: str,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text(
+        f"value = 1{trailing_whitespace}\nname = 'a'\n",
+        encoding="utf-8",
+    )
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "value = 2\nname = 'a'\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_preserves_trailing_whitespace_on_context_lines(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text("value = 1\nname = 'a'  \n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "value = 2\nname = 'a'  \n"
+
+
+@pytest.mark.parametrize("significant_whitespace", ["\u00a0", "\u2003"])
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_non_ascii_trailing_whitespace(
+    tmp_path: Path,
+    significant_whitespace: str,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    original = f"value = 1{significant_whitespace}\n"
+    target.write_text(original, encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,1 +1,1 @@
+-value = 1
++value = 2
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "context mismatch" in exc_info.value.user_message
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_leading_indentation_drift(tmp_path: Path) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text("    value = 1\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,1 +1,1 @@
+-value = 1
++value = 2
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "context mismatch" in exc_info.value.user_message
+    assert target.read_text(encoding="utf-8") == "    value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_rejects_inserted_blank_line_in_hunk_context(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    original = "value = 1\n\nname = 'a'\n"
+    target.write_text(original, encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,2 +1,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "context mismatch" in exc_info.value.user_message
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_context_drift_still_rejects_real_mismatch(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    target.write_text("value = 1\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await apply_patch(
+                """*** Begin Patch
+*** Update File: src/feature.py
+@@ -1,1 +1,1 @@
+-unrelated = 9
++value = 2
+*** End Patch"""
+            )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "context mismatch" in exc_info.value.user_message
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
 @pytest.mark.asyncio
 async def test_apply_patch_allows_workspace_under_sensitive_parent(
     tmp_path: Path,

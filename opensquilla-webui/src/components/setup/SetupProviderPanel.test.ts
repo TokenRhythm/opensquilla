@@ -325,6 +325,67 @@ describe('SetupProviderPanel — configured provider management', () => {
     },
   ]
 
+  it('shows the default-on accessible image offer only inside the OpenRouter editor', async () => {
+    const onUpdateImageGenerationOptIn = vi.fn()
+    const { app, el, panelState } = await mountPanel({
+      providerSelected: 'openrouter',
+      providerSummary: 'OpenRouter',
+      runtimeProviders: [OPENROUTER_PROVIDER],
+      imageGenerationOffer: true,
+      imageGenerationOptIn: true,
+      configuredProviders: [{
+        providerId: 'openrouter',
+        label: 'OpenRouter',
+        active: true,
+        ready: true,
+        credentialSource: 'explicit',
+        credentialEnv: '',
+        endpointSource: 'registry',
+        reason: '',
+      }],
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: 'OpenRouter',
+      },
+    }, { onUpdateImageGenerationOptIn })
+
+    el.querySelector<HTMLButtonElement>(
+      '[data-provider-id="openrouter"] .setup-provider-card__select',
+    )?.click()
+    await nextTick()
+
+    const offer = document.body.querySelector<HTMLElement>(
+      '[data-testid="openrouter-image-generation-offer"]',
+    )
+    const toggle = offer?.querySelector<HTMLInputElement>(
+      '[name="setup_provider_image_generation_opt_in"]',
+    )
+    expect(offer?.textContent).toContain('Also enable image generation (recommended)')
+    expect(toggle?.getAttribute('role')).toBe('switch')
+    expect(toggle?.getAttribute('aria-checked')).toBe('true')
+    expect(toggle?.getAttribute('aria-label')).toBe('Also enable image generation (recommended)')
+
+    const save = document.body.querySelector<HTMLButtonElement>(
+      '.setup-provider-modal__footer .btn--primary',
+    )
+    expect(save?.disabled).toBe(false)
+
+    toggle!.click()
+    expect(onUpdateImageGenerationOptIn).toHaveBeenCalledWith(false)
+
+    Object.assign(panelState, { imageGenerationOptIn: false })
+    await nextTick()
+    expect(save?.disabled).toBe(true)
+
+    Object.assign(panelState, {
+      imageGenerationOptIn: true,
+      imageGenerationOffer: false,
+    })
+    await nextTick()
+    expect(save?.disabled).toBe(true)
+    app.unmount()
+  })
+
   it('keeps provider state accessible while the visible list stays quiet', async () => {
     const { app, el } = await mountPanel({
       configuredProviders: configured,

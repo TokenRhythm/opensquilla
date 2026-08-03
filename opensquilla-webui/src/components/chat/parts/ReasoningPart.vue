@@ -1,6 +1,6 @@
 <template>
   <section v-if="embedded" class="thinking-block">
-    <div class="thinking-block__header">
+    <div v-if="!hideSummary" class="thinking-block__header">
       <Icon name="moreHorizontal" :size="12" aria-hidden="true" />
       <span>{{ summary }}</span>
     </div>
@@ -39,6 +39,9 @@ const props = defineProps<{
   /** Streaming turn: label the fold "Thinking · Ns" (matching the live
    * elapsed ticker) instead of the settled "Thought for …" wording. */
   live?: boolean
+  /** The parent disclosure already names this content, so avoid a second
+   * "thought" label when reasoning is embedded in a Plan process. */
+  hideSummary?: boolean
 }>()
 
 const summary = computed(() => {

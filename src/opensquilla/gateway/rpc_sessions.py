@@ -117,7 +117,9 @@ from opensquilla.session.naming import (
     is_naming_eligible,
     title_slot_is_empty,
 )
+from opensquilla.session.plans import PlanConflictError, PlanRunConflictError
 from opensquilla.session.storage import (
+    PlanImplementationSessionBusyError,
     SessionStorage,
     StaleEpochError,
     StorageBusyError,
@@ -1914,6 +1916,10 @@ async def _handle_sessions_send(
     required_collaboration_mode: str | None = None,
     required_collaboration_revision: int | None = None,
     initial_collaboration_mode: str | None = None,
+    expected_collaboration_revision: int | None = None,
+    expected_active_plan_revision_id: str | None = None,
+    require_idle_for_current_plan_implementation: bool = False,
+    atomic_collaboration_mode_update: bool = False,
 ) -> dict:
     key = _require_key(params)
     if not isinstance(params, dict) or "message" not in params:
@@ -2077,6 +2083,37 @@ async def _handle_sessions_send(
                         _plan_collaboration_snapshot(current_session)
                     )
             return replay_response
+
+    if require_idle_for_current_plan_implementation:
+        pending_user_inputs = getattr(ctx.task_runtime, "pending_user_inputs", None)
+        if callable(pending_user_inputs):
+            pending = list(pending_user_inputs(key) or [])
+            if pending:
+                request = pending[0]
+                request_id = str(
+                    request.get("request_id") or request.get("requestId") or ""
+                )
+                task_id = str(
+                    request.get("run_id") or request.get("runId") or ""
+                )
+                log.info(
+                    "plan_implementation.admission_rejected",
+                    session_key=key,
+                    reason="input_pending",
+                    request_id=request_id,
+                    task_id=task_id,
+                )
+                raise RpcHandlerError(
+                    "PLAN_INPUT_PENDING",
+                    "The current Plan turn is waiting for user input.",
+                    details={
+                        "requestId": request_id,
+                        "turnId": task_id,
+                        "allowedActions": ["answer", "stop", "wait"],
+                    },
+                    retryable=True,
+                    accepted=False,
+                )
 
     def _project_workspace_error(exc: ProjectWorkspaceStateError) -> RpcHandlerError:
         return map_project_workspace_error(
@@ -2927,12 +2964,17 @@ async def _handle_sessions_send(
                 accepted_session_updates["origin"] = accepted_run_mode_origin
             if plan_run is not None:
                 accepted_session_updates["collaboration_mode"] = "default"
-                if plan_revision_to_create is None:
-                    accepted_session_updates["active_plan_revision_id"] = (
-                        selected_plan_revision_id
-                    )
+                # Current-session implementation validates the selected active
+                # revision through acceptance CAS; it must never write an old
+                # pointer back. A copied new-session revision selects itself
+                # atomically when it is created.
             elif initial_collaboration_mode == "plan":
                 accepted_session_updates["collaboration_mode"] = "plan"
+            elif atomic_collaboration_mode_update:
+                assert required_collaboration_mode is not None
+                accepted_session_updates["collaboration_mode"] = (
+                    required_collaboration_mode
+                )
             return await storage.accept_turn(
                 persisted_entry,
                 expected_epoch=expected_epoch,
@@ -2966,6 +3008,11 @@ async def _handle_sessions_send(
                 plan_run=accepted_plan_run,
                 merge_into_task=merge_into_task,
                 workspace_guard=workspace_guard,
+                expected_collaboration_revision=expected_collaboration_revision,
+                expected_active_plan_revision_id=expected_active_plan_revision_id,
+                require_idle_for_current_plan_implementation=(
+                    require_idle_for_current_plan_implementation
+                ),
             )
 
         async def _commit_and_activate() -> TurnAcceptanceResult:
@@ -3144,6 +3191,91 @@ async def _handle_sessions_send(
             raise RpcHandlerError(
                 "COLLECT_RACE",
                 "The queued task started before this message could be collected. Retry it.",
+                retryable=True,
+                accepted=False,
+            ) from exc
+        except PlanImplementationSessionBusyError as exc:
+            _consumed_file_uuids = []
+            log.info(
+                "plan_implementation.admission_rejected",
+                session_key=key,
+                reason="session_busy",
+                task_id=exc.task_id,
+                task_status=exc.task_status,
+            )
+            raise RpcHandlerError(
+                "PLAN_IMPLEMENTATION_SESSION_BUSY",
+                "Current-session plan implementation requires an idle session.",
+                details={
+                    "turnId": exc.task_id,
+                    "taskStatus": exc.task_status,
+                },
+                retryable=True,
+                accepted=False,
+            ) from exc
+        except (PlanConflictError, PlanRunConflictError) as exc:
+            _consumed_file_uuids = []
+            latest = await storage.get_session(key)
+            if (
+                expected_active_plan_revision_id is not None
+                and latest is not None
+                and latest.active_plan_revision_id
+                != expected_active_plan_revision_id
+            ):
+                log.info(
+                    "plan_implementation.admission_rejected",
+                    session_key=key,
+                    reason="plan_revision_changed",
+                )
+                raise RpcHandlerError(
+                    "PLAN_REVISION_CHANGED",
+                    "The selected plan is no longer the current revision.",
+                    details={"collaboration": _plan_collaboration_snapshot(latest)},
+                    retryable=False,
+                    accepted=False,
+                ) from exc
+            if (
+                expected_collaboration_revision is not None
+                and latest is not None
+                and int(latest.collaboration_revision or 0)
+                != expected_collaboration_revision
+            ):
+                log.info(
+                    "plan_implementation.admission_rejected",
+                    session_key=key,
+                    reason="collaboration_changed",
+                )
+                raise RpcHandlerError(
+                    "COLLABORATION_CHANGED",
+                    "The collaboration state changed before the turn was accepted.",
+                    details={"collaboration": _plan_collaboration_snapshot(latest)},
+                    retryable=True,
+                    accepted=False,
+                ) from exc
+            active_run = await storage.get_active_plan_run(key)
+            if active_run is not None and active_run.status in {"queued", "running"}:
+                log.info(
+                    "plan_implementation.admission_rejected",
+                    session_key=key,
+                    reason="plan_run_active",
+                    plan_run_id=active_run.run_id,
+                    plan_run_status=active_run.status,
+                )
+                raise RpcHandlerError(
+                    "PLAN_RUN_ACTIVE",
+                    "This plan already has an implementation task in progress.",
+                    details={"runId": active_run.run_id, "status": active_run.status},
+                    retryable=False,
+                    accepted=False,
+                ) from exc
+            log.info(
+                "plan_implementation.admission_rejected",
+                session_key=key,
+                reason="plan_run_changed",
+            )
+            raise RpcHandlerError(
+                "PLAN_RUN_CHANGED",
+                "The plan execution state changed before acceptance. Refresh and retry.",
                 retryable=True,
                 accepted=False,
             ) from exc
@@ -6413,11 +6545,7 @@ async def _handle_plans_implement(params: dict | None, ctx: RpcContext) -> dict:
         # display surfaces to omit it from the visible transcript.
         send_params["displayText"] = ""
     target_before_acceptance = await storage.get_session(key)
-    required_collaboration_revision = (
-        int(target_before_acceptance.collaboration_revision or 0) + 1
-        if target_before_acceptance is not None
-        else 1
-    )
+    current_session_implementation = send_params["intent"] == "continue"
     result = await _handle_sessions_send(
         send_params,
         ctx,
@@ -6430,7 +6558,18 @@ async def _handle_plans_implement(params: dict | None, ctx: RpcContext) -> dict:
         },
         plan_revision_id=revision_id,
         required_collaboration_mode="default",
-        required_collaboration_revision=required_collaboration_revision,
+        expected_collaboration_revision=(
+            int(target_before_acceptance.collaboration_revision or 0)
+            if current_session_implementation
+            and target_before_acceptance is not None
+            else None
+        ),
+        expected_active_plan_revision_id=(
+            revision_id if current_session_implementation else None
+        ),
+        require_idle_for_current_plan_implementation=(
+            current_session_implementation
+        ),
     )
     accepted_key = str(result.get("session_key") or key)
     task_id = str(result.get("turn_id") or result.get("task_id") or "").strip()
@@ -6530,78 +6669,32 @@ async def _handle_plans_revise(params: dict | None, ctx: RpcContext) -> dict:
         "prompt": prompt,
     }
 
-    # Idempotent retries must replay even after the first request has already
-    # committed a replacement and made ``revision_id`` non-current.
-    get_ingress_receipt = getattr(storage, "get_turn_ingress_receipt", None)
-    if callable(get_ingress_receipt):
-        source_hint = _normalize_session_send_source_hint(send_params)
-        identity = request_identity(
-            send_params,
-            request_session_key=key,
-            source_scope=_turn_source_scope(source_hint, ctx),
-            fingerprint_params=fingerprint_params,
-        )
-        previous = await get_ingress_receipt(
-            source_scope=identity.source_scope,
-            request_session_key=identity.request_session_key,
-            client_request_id=identity.client_request_id,
-        )
-        if previous is not None:
-            replay_session_before_send = await storage.get_session(key)
-            result = await _handle_sessions_send(
-                send_params,
-                ctx,
-                fingerprint_params=fingerprint_params,
-                plan_context_revision_id=revision_id,
-                required_collaboration_mode="plan",
-                required_collaboration_revision=(
-                    int(replay_session_before_send.collaboration_revision or 0)
-                    if replay_session_before_send is not None
-                    else None
-                ),
-            )
-            replay_session = await storage.get_session(key)
-            collaboration = (
-                _plan_collaboration_snapshot(replay_session)
-                if replay_session is not None
-                else {"mode": "plan", "revision": 0, "appliesTo": "next_turn"}
-            )
-            return {
-                **result,
-                "sessionKey": key,
-                "collaboration": collaboration,
-            }
     session = await storage.get_session(key)
     if session is None:
         raise KeyError(f"Session not found: {key}")
-    if session.active_plan_revision_id != revision_id:
-        raise RpcHandlerError(
-            "PLAN_REVISION_CHANGED",
-            "The selected plan is no longer the current revision.",
-            retryable=False,
-            accepted=False,
-        )
-    if session.collaboration_mode != "plan":
-        session = await storage.set_collaboration_mode(
-            key,
-            "plan",
-            expected_revision=int(session.collaboration_revision or 0),
-        )
-    collaboration = _plan_collaboration_snapshot(session)
-    await _emit_to_subscribers(
-        ctx,
-        key,
-        "session.event.collaboration_mode",
-        {"session_key": key, "collaboration": collaboration},
-    )
     result = await _handle_sessions_send(
         send_params,
         ctx,
         fingerprint_params=fingerprint_params,
         plan_context_revision_id=revision_id,
         required_collaboration_mode="plan",
-        required_collaboration_revision=int(session.collaboration_revision or 0),
+        expected_collaboration_revision=int(session.collaboration_revision or 0),
+        expected_active_plan_revision_id=revision_id,
+        atomic_collaboration_mode_update=True,
     )
+    accepted_session = await storage.get_session(key)
+    collaboration = (
+        _plan_collaboration_snapshot(accepted_session)
+        if accepted_session is not None
+        else {"mode": "plan", "revision": 0, "appliesTo": "next_turn"}
+    )
+    if not bool(result.get("replayed")):
+        await _emit_to_subscribers(
+            ctx,
+            key,
+            "session.event.collaboration_mode",
+            {"session_key": key, "collaboration": collaboration},
+        )
     return {**result, "sessionKey": key, "collaboration": collaboration}
 
 

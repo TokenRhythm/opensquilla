@@ -581,6 +581,18 @@ def _gate_patch_ops(
 # ---------------------------------------------------------------------------
 
 
+def _match_line(actual: str, expected: str) -> bool:
+    """Return whether hunk anchor lines differ only by trailing space or tab.
+
+    Prefer an exact match.  The fallback keeps leading, non-ASCII, and other
+    whitespace significant while tolerating ASCII horizontal whitespace at
+    the end of context and delete lines.
+    """
+    if actual == expected:
+        return True
+    return actual.rstrip("\r\n").rstrip(" \t") == expected.rstrip("\r\n").rstrip(" \t")
+
+
 def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
     """Apply a single hunk to file_lines (0-indexed list of lines with newlines).
 
@@ -604,12 +616,11 @@ def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
                     f"line {check_pos + 1}. Read the current file content and retry "
                     "with hunk line numbers and context that match the file."
                 )
-            actual = result[check_pos].rstrip("\n")
-            expected = content.rstrip("\n")
-            if actual != expected:
+            if not _match_line(result[check_pos], content):
                 raise RetryableToolInputError(
                     f"apply_patch context mismatch at line {check_pos + 1}: "
-                    f"expected {expected!r}, got {actual!r}. Read the current file "
+                    f"expected {content.rstrip('\n')!r}, "
+                    f"got {result[check_pos].rstrip('\n')!r}. Read the current file "
                     "content and retry with exact surrounding context."
                 )
             check_pos += 1

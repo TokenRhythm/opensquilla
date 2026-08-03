@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ControlSwitch from '@/components/ControlSwitch.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type { ImageCredentialSource } from '@/composables/setup/useSetupCapabilitiesForm'
 import type { DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
@@ -24,6 +25,7 @@ interface CapabilitiesPanelContract {
     imageProvider: string
     imagePrimary: string
     imageApiKey: string
+    imageEnabled: boolean
     imageKeyConfigured: boolean
     imageCredentialSource: ImageCredentialSource
     audioApiKey: string
@@ -31,6 +33,19 @@ interface CapabilitiesPanelContract {
   options: {
     searchProviders: ProviderOption[]
     imageProviders: ProviderOption[]
+    imageCredentialOptions: Array<{
+      providerId: string
+      available: boolean
+      source: string
+      owner: string
+    }>
+    imageRecommendation?: {
+      providerId: string
+      label: string
+      canReuseCredential: boolean
+      actionRequired: boolean
+      registrationUrl: string
+    } | null
     imageModels: DiscoveredModel[]
   }
   state: {
@@ -60,13 +75,17 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  updateField: [group: CapabilityGroup, key: string, value: string]
+  updateField: [group: CapabilityGroup, key: string, value: string | boolean]
   searchProviderChange: []
   imageProviderChange: [providerId: string]
+  useImageRecommendation: [providerId: string]
   resetCapability: [capabilityId: CapabilityId]
 }>()
 
-const expanded = ref<CapabilityId | ''>('search')
+// Enter the capability settings at a quiet overview. Operators can expand
+// exactly the capability they intend to edit instead of landing inside the
+// first form by default.
+const expanded = ref<CapabilityId | ''>('')
 const imageKeyEditorOpen = ref(false)
 const imageCredentialNeedsInput = computed(() => (
   props.panel.form.imageCredentialSource === 'none'
@@ -75,6 +94,30 @@ const imageCredentialNeedsInput = computed(() => (
 const imageCredentialInputVisible = computed(() => (
   imageCredentialNeedsInput.value || imageKeyEditorOpen.value
 ))
+const recommendedImageProvider = computed(() => props.panel.options.imageRecommendation || null)
+const configuredImageProviderIds = computed(() => new Set(
+  props.panel.options.imageCredentialOptions
+    .filter(option => (
+      option.available
+      && option.source === 'llm_fallback'
+      && (option.owner === 'primary' || option.owner === 'profile')
+    ))
+    .map(option => option.providerId),
+))
+const configuredImageProviders = computed(() => {
+  const recommendedId = recommendedImageProvider.value?.providerId
+  return props.panel.options.imageProviders.filter(provider => (
+    provider.providerId !== recommendedId
+    && configuredImageProviderIds.value.has(provider.providerId)
+  ))
+})
+const otherImageProviders = computed(() => {
+  const recommendedId = recommendedImageProvider.value?.providerId
+  return props.panel.options.imageProviders.filter(provider => (
+    provider.providerId !== recommendedId
+    && !configuredImageProviderIds.value.has(provider.providerId)
+  ))
+})
 
 watch(
   () => [props.panel.form.imageProvider, props.panel.form.imageCredentialSource],
@@ -294,7 +337,26 @@ function resetLabel(capabilityId: CapabilityId): string {
         </div>
 
         <template v-else-if="capability.id === 'image_generation'">
-          <label class="control-row">
+          <div class="control-row">
+            <div class="control-row__label-block">
+              <span class="control-row__label">
+                {{ t('setup.capabilities.imageEnabledTitle') }}
+              </span>
+              <span class="control-row__desc">
+                {{ t('setup.capabilities.imageEnabledHint') }}
+              </span>
+            </div>
+            <div class="control-row__control">
+              <ControlSwitch
+                name="setup_image_enabled"
+                :checked="panel.form.imageEnabled"
+                :aria-label="t('setup.capabilities.imageEnabledTitle')"
+                @change="emit('updateField', 'image', 'enabled', $event)"
+              />
+            </div>
+          </div>
+          <template v-if="panel.form.imageEnabled">
+            <label class="control-row">
             <div class="control-row__label-block">
               <span class="control-row__label">{{ t('setup.common.provider') }}</span>
             </div>
@@ -303,75 +365,148 @@ function resetLabel(capabilityId: CapabilityId): string {
                 class="control-input"
                 :value="panel.form.imageProvider"
                 name="setup_image_provider"
+                :aria-label="t('setup.capabilities.imageProviderSelectLabel')"
                 @change="onImageProviderSelect"
               >
-                <option
-                  v-for="provider in panel.options.imageProviders"
-                  :key="provider.providerId"
-                  :value="provider.providerId"
-                >{{ provider.label }}</option>
+                <option value="" disabled>{{ t('setup.capabilities.imageProviderPlaceholder') }}</option>
+                <optgroup
+                  v-if="recommendedImageProvider"
+                  :label="t('setup.capabilities.imageRecommendedGroup')"
+                >
+                  <option :value="recommendedImageProvider.providerId">
+                    {{ recommendedImageProvider.label }} · {{ t('setup.capabilities.imageRecommendedBadge') }}
+                  </option>
+                </optgroup>
+                <optgroup
+                  v-if="configuredImageProviders.length"
+                  :label="t('setup.capabilities.imageConfiguredProvidersGroup')"
+                >
+                  <option
+                    v-for="provider in configuredImageProviders"
+                    :key="provider.providerId"
+                    :value="provider.providerId"
+                  >{{ provider.label }}</option>
+                </optgroup>
+                <optgroup
+                  v-if="otherImageProviders.length"
+                  :label="t('setup.capabilities.imageOtherProvidersGroup')"
+                >
+                  <option
+                    v-for="provider in otherImageProviders"
+                    :key="provider.providerId"
+                    :value="provider.providerId"
+                  >{{ provider.label }}</option>
+                </optgroup>
               </select>
             </div>
           </label>
-          <SetupModelCombobox
-            :field="{
-              name: 'image_model_identifier',
-              label: t('setup.capabilities.imageModelSummary'),
-              description: t('setup.capabilities.imageModelHint'),
-            }"
-            :value="panel.form.imagePrimary"
-            :models="panel.options.imageModels"
-            :model-source="panel.state.imageModelSource"
-            input-class="capability-card__model-input"
-            @update="emit('updateField', 'image', 'primary', $event)"
-          />
-          <div class="control-row">
-            <div class="control-row__label-block">
-              <span class="control-row__label">
-                {{ t('setup.capabilities.imageCredentialLabel') }}
-              </span>
-              <span class="control-row__desc">{{ imageCredentialHint() }}</span>
-            </div>
-            <div class="control-row__control capability-card__credential-control">
-              <div
-                class="capability-card__credential-source"
-                :class="{ 'is-missing': imageCredentialNeedsInput }"
-                role="status"
-              >
-                <span class="capability-card__credential-icon" aria-hidden="true">
-                  <Icon :name="imageCredentialNeedsInput ? 'info' : 'check'" :size="14" />
+          <aside
+            v-if="recommendedImageProvider?.actionRequired"
+            class="capability-card__recommendation control-card control-card--compact control-card--accent"
+            data-testid="image-provider-recommendation"
+            role="note"
+            aria-labelledby="image-provider-recommendation-title"
+          >
+            <div class="capability-card__recommendation-copy">
+              <div class="capability-card__recommendation-title-row">
+                <strong id="image-provider-recommendation-title">
+                  {{ t('setup.capabilities.imageRecommendationTitle', {
+                    provider: recommendedImageProvider.label,
+                  }) }}
+                </strong>
+                <span class="control-pill control-pill--accent">
+                  {{ t('setup.capabilities.imageRecommendedBadge') }}
                 </span>
-                <span class="capability-card__credential-copy">
-                  <strong>{{ imageCredentialTitle() }}</strong>
-                  <span>{{ imageCredentialDetail() }}</span>
-                </span>
-                <button
-                  v-if="!imageCredentialNeedsInput && !imageKeyEditorOpen"
-                  type="button"
-                  class="capability-card__credential-action"
-                  @click="imageKeyEditorOpen = true"
-                >{{ imageCredentialActionLabel() }}</button>
               </div>
-              <input
-                v-if="imageCredentialInputVisible"
-                class="control-input"
-                :value="panel.form.imageApiKey"
-                name="setup_image_api_key"
-                type="password"
-                :aria-label="t('setup.capabilities.imageCredentialInputLabel')"
-                autocomplete="off"
-                data-1p-ignore
-                data-bwignore
-                data-form-type="other"
-                data-lpignore="true"
-                data-protonpass-ignore="true"
-                :placeholder="panel.form.imageKeyConfigured
-                  ? t('setup.capabilities.imageKeyPlaceholderKeep')
-                  : t('setup.capabilities.imageKeyPlaceholderNew')"
-                @input="emit('updateField', 'image', 'apiKey', ($event.target as HTMLInputElement).value)"
-              >
+              <span>{{ t('setup.capabilities.imageRecommendationDesc', {
+                provider: recommendedImageProvider.label,
+              }) }}</span>
             </div>
-          </div>
+            <div class="capability-card__recommendation-actions">
+              <a
+                v-if="recommendedImageProvider.registrationUrl && !recommendedImageProvider.canReuseCredential"
+                class="btn btn--ghost"
+                :href="recommendedImageProvider.registrationUrl"
+                target="_blank"
+                rel="noopener noreferrer"
+                :aria-label="t('setup.capabilities.imageRecommendationRegisterExternal', {
+                  provider: recommendedImageProvider.label,
+                })"
+              >{{ t('setup.capabilities.imageRecommendationRegister') }}</a>
+              <button
+                type="button"
+                class="btn btn--primary"
+                :disabled="panel.form.imageProvider === recommendedImageProvider.providerId"
+                @click="emit('useImageRecommendation', recommendedImageProvider.providerId)"
+              >{{ panel.form.imageProvider === recommendedImageProvider.providerId
+                ? t('setup.capabilities.imageRecommendationSelected')
+                : t('setup.capabilities.imageRecommendationUse', {
+                  provider: recommendedImageProvider.label,
+                }) }}</button>
+            </div>
+          </aside>
+          <template v-if="panel.form.imageProvider">
+            <SetupModelCombobox
+              :field="{
+                name: 'image_model_identifier',
+                label: t('setup.capabilities.imageModelSummary'),
+                description: t('setup.capabilities.imageModelHint'),
+              }"
+              :value="panel.form.imagePrimary"
+              :models="panel.options.imageModels"
+              :model-source="panel.state.imageModelSource"
+              input-class="capability-card__model-input"
+              @update="emit('updateField', 'image', 'primary', $event)"
+            />
+            <div class="control-row">
+              <div class="control-row__label-block">
+                <span class="control-row__label">
+                  {{ t('setup.capabilities.imageCredentialLabel') }}
+                </span>
+                <span class="control-row__desc">{{ imageCredentialHint() }}</span>
+              </div>
+              <div class="control-row__control capability-card__credential-control">
+                <div
+                  class="capability-card__credential-source"
+                  :class="{ 'is-missing': imageCredentialNeedsInput }"
+                  role="status"
+                >
+                  <span class="capability-card__credential-icon" aria-hidden="true">
+                    <Icon :name="imageCredentialNeedsInput ? 'info' : 'check'" :size="14" />
+                  </span>
+                  <span class="capability-card__credential-copy">
+                    <strong>{{ imageCredentialTitle() }}</strong>
+                    <span>{{ imageCredentialDetail() }}</span>
+                  </span>
+                  <button
+                    v-if="!imageCredentialNeedsInput && !imageKeyEditorOpen"
+                    type="button"
+                    class="capability-card__credential-action"
+                    @click="imageKeyEditorOpen = true"
+                  >{{ imageCredentialActionLabel() }}</button>
+                </div>
+                <input
+                  v-if="imageCredentialInputVisible"
+                  class="control-input"
+                  :value="panel.form.imageApiKey"
+                  name="setup_image_api_key"
+                  type="password"
+                  :aria-label="t('setup.capabilities.imageCredentialInputLabel')"
+                  autocomplete="off"
+                  data-1p-ignore
+                  data-bwignore
+                  data-form-type="other"
+                  data-lpignore="true"
+                  data-protonpass-ignore="true"
+                  :placeholder="panel.form.imageKeyConfigured
+                    ? t('setup.capabilities.imageKeyPlaceholderKeep')
+                    : t('setup.capabilities.imageKeyPlaceholderNew')"
+                  @input="emit('updateField', 'image', 'apiKey', ($event.target as HTMLInputElement).value)"
+                >
+              </div>
+            </div>
+          </template>
+          </template>
         </template>
 
         <template v-else>
@@ -540,6 +675,45 @@ function resetLabel(capabilityId: CapabilityId): string {
   text-align: right;
 }
 
+.capability-card__recommendation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-elevated));
+}
+
+.capability-card__recommendation-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.capability-card__recommendation-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.capability-card__recommendation-title-row strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.capability-card__recommendation-actions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
 .capability-card__model-input {
   width: min(100%, 360px);
   max-width: 360px;
@@ -685,6 +859,15 @@ function resetLabel(capabilityId: CapabilityId): string {
 
   .capability-card__field-error {
     text-align: left;
+  }
+
+  .capability-card__recommendation {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .capability-card__recommendation-actions {
+    flex-wrap: wrap;
   }
 
   .capability-card__credential-source {
