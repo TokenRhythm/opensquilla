@@ -61,6 +61,18 @@ beforeEach(() => {
 })
 
 describe('ChatComposer voice-input gate', () => {
+  it('disables drafting and sending while a Plan questionnaire owns the input area', async () => {
+    const { app, el } = await mount({ inputDisabled: true })
+    const textarea = el.querySelector<HTMLTextAreaElement>('textarea')
+    const send = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.send')}"]`,
+    )
+
+    expect(textarea?.disabled).toBe(true)
+    expect(send?.disabled).toBe(true)
+    app.unmount()
+  })
+
   it('keeps Stop available while a background subagent group is active', async () => {
     const onStop = vi.fn()
     const { app, el } = await mount({ canStop: true, isStreaming: false, onStop })

@@ -112,6 +112,7 @@ export interface ChatClarifyField {
 export interface ChatClarifyRequest {
   intro: string
   fields: ChatClarifyField[]
+  presentation?: string
   requestId?: string
   runId: string
   step: string
@@ -783,6 +784,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const clarifyData: InterruptClarifyData = {
       intro: request.intro,
       fields: request.fields,
+      ...(request.presentation ? { presentation: request.presentation } : {}),
       ...(request.requestId ? { requestId: request.requestId } : {}),
       runId: request.runId,
       step: request.step,

@@ -41,6 +41,9 @@ STATUS_TOP_LEVEL_KEYS = frozenset(
         "imageGenerationProvider",
         "imageGenerationPrimary",
         "imageGenerationEnvKey",
+        # Additive binding/effective-state contract. Legacy flat fields above
+        # remain frozen for older clients.
+        "imageGenerationState",
         "audioConfigured",
         "audioEnabled",
         "audioSource",
@@ -146,6 +149,34 @@ LLM_PROFILE_STATUS_KEYS = frozenset(
         "primaryBlockReason",
     }
 )
+IMAGE_GENERATION_STATE_KEYS = frozenset(
+    {
+        "mode",
+        "operatorManaged",
+        "storedEnabled",
+        "effective",
+        "recommendation",
+        "credentialOptions",
+    }
+)
+IMAGE_GENERATION_EFFECTIVE_KEYS = frozenset(
+    {
+        "enabled",
+        "available",
+        "dormant",
+        "providerId",
+        "primary",
+        "credentialSource",
+        "credentialOwner",
+        "reason",
+    }
+)
+IMAGE_GENERATION_RECOMMENDATION_KEYS = frozenset(
+    {"providerId", "reason", "canReuseCredential", "actionRequired"}
+)
+IMAGE_GENERATION_CREDENTIAL_OPTION_KEYS = frozenset(
+    {"providerId", "available", "source", "owner", "kind", "envKey", "reason"}
+)
 
 
 def _synthetic_config(tmp_path, **overrides) -> GatewayConfig:
@@ -163,6 +194,15 @@ async def test_onboarding_status_top_level_keys_are_frozen(tmp_path) -> None:
     assert payload["configPath"] == cfg.config_path
     assert payload["llmProfileStatus"]
     assert all(set(row) == LLM_PROFILE_STATUS_KEYS for row in payload["llmProfileStatus"])
+    image_state = payload["imageGenerationState"]
+    assert set(image_state) == IMAGE_GENERATION_STATE_KEYS
+    assert set(image_state["effective"]) == IMAGE_GENERATION_EFFECTIVE_KEYS
+    assert set(image_state["recommendation"]) == IMAGE_GENERATION_RECOMMENDATION_KEYS
+    assert image_state["credentialOptions"]
+    assert all(
+        set(option) == IMAGE_GENERATION_CREDENTIAL_OPTION_KEYS
+        for option in image_state["credentialOptions"]
+    )
 
 
 async def test_llm_profile_status_reflects_exhausted_global_credential_pool(

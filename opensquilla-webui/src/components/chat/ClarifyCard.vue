@@ -3,13 +3,16 @@
   <div
     v-if="submitted"
     class="clarify-outcome"
-    :class="{ 'is-busy': busy }"
+    :class="{
+      'is-busy': busy,
+      'clarify-outcome--plan': isPlanQuestionnaire,
+    }"
     data-testid="clarify-outcome"
     role="status"
     aria-live="polite"
     aria-atomic="true"
   >
-    <span class="clarify-outcome__icon" aria-hidden="true">
+    <span v-if="!isPlanQuestionnaire" class="clarify-outcome__icon" aria-hidden="true">
       <Icon :name="busy ? 'clock' : 'check'" :size="18" />
     </span>
     <span class="clarify-outcome__copy">
@@ -26,6 +29,10 @@
   <article
     v-else
     class="clarify-card"
+    :class="{
+      'clarify-card--plan': isPlanQuestionnaire,
+      'clarify-card--docked': docked,
+    }"
     data-testid="clarify-card"
     role="group"
     :aria-label="t('chat.clarify.needsInput')"
@@ -38,57 +45,124 @@
     >{{ t('chat.clarify.inputNeededFromAgent') }}</div>
     <header class="clarify-card__head">
       <span class="clarify-card__eyebrow">{{ t('chat.clarify.inputNeeded') }}</span>
-      <p v-if="request.intro" class="clarify-card__intro">{{ request.intro }}</p>
+      <p v-if="request.intro && !isPlanQuestionnaire" class="clarify-card__intro">
+        {{ request.intro }}
+      </p>
+      <p v-if="isPlanQuestionnaire" class="clarify-card__intro">
+        {{ t('chat.clarify.planQuestionnaireHint') }}
+      </p>
     </header>
 
     <div class="clarify-card__body">
-      <div v-for="field in request.fields" :key="field.name" class="clarify-field">
-        <label class="clarify-field__label" :for="fieldId(field.name)">
+      <div v-for="field in displayedFields" :key="field.name" class="clarify-field">
+        <div :id="fieldLabelId(field.name)" class="clarify-field__label">
           <span class="clarify-field__name">{{ field.header || field.name }}</span>
           <span v-if="field.prompt && field.prompt !== field.name" class="clarify-field__prompt">
             {{ field.prompt }}
           </span>
           <span class="clarify-field__req">{{ field.required ? t('chat.clarify.required') : t('chat.clarify.optional') }}</span>
-        </label>
+        </div>
 
         <!-- Enum: numbered choices -->
         <div
           v-if="field.type === 'enum' && field.choices.length"
           class="clarify-field__choices"
           role="radiogroup"
-          :aria-label="field.name"
+          :aria-labelledby="fieldLabelId(field.name)"
         >
-          <button
-            v-for="(choice, idx) in field.choices"
-            :key="choice"
-            type="button"
-            class="clarify-choice"
-            :class="{ 'is-selected': values[field.name] === choice }"
-            role="radio"
-            :aria-checked="values[field.name] === choice"
-            :disabled="busy"
-            @click="values[field.name] = choice"
-          >
-            <span class="clarify-choice__num">{{ idx + 1 }}</span>
-            <span class="clarify-choice__copy">
-              <span class="clarify-choice__text">{{ choice }}</span>
-              <span
-                v-if="optionDescription(field, choice)"
-                class="clarify-choice__description"
-              >{{ optionDescription(field, choice) }}</span>
-            </span>
-          </button>
-          <label v-if="field.allowOther" class="clarify-field__other">
-            <span>{{ t('chat.clarify.other') }}</span>
-            <input
-              :id="fieldId(field.name)"
-              v-model="values[field.name]"
-              class="clarify-field__input"
-              type="text"
-              :placeholder="t('chat.clarify.otherPlaceholder')"
+          <template v-if="isPlanQuestionnaire">
+            <label
+              v-for="(choice, idx) in field.choices"
+              :key="choice"
+              class="clarify-choice clarify-choice--radio"
+              :class="{ 'is-selected': values[field.name] === choice && !otherSelected[field.name] }"
+            >
+              <input
+                class="clarify-choice__radio"
+                type="radio"
+                :name="choiceName(field.name)"
+                :value="choice"
+                :checked="values[field.name] === choice && !otherSelected[field.name]"
+                :disabled="busy"
+                @change="selectChoice(field.name, choice)"
+              />
+              <span class="clarify-choice__num">{{ idx + 1 }}</span>
+              <span class="clarify-choice__copy">
+                <span class="clarify-choice__text">{{ choice }}</span>
+                <span
+                  v-if="optionDescription(field, choice)"
+                  class="clarify-choice__description"
+                >{{ optionDescription(field, choice) }}</span>
+              </span>
+            </label>
+            <div
+              v-if="field.allowOther"
+              class="clarify-choice clarify-choice--other"
+              :class="{ 'is-selected': otherSelected[field.name] }"
+            >
+              <input
+                :id="otherRadioId(field.name)"
+                class="clarify-choice__radio"
+                type="radio"
+                :name="choiceName(field.name)"
+                :checked="otherSelected[field.name]"
+                :aria-label="t('chat.clarify.other')"
+                :disabled="busy"
+                @change="selectOther(field.name)"
+              />
+              <span class="clarify-choice__num">{{ field.choices.length + 1 }}</span>
+              <span class="clarify-choice__copy clarify-choice__copy--other">
+                <label class="clarify-choice__text" :for="otherInputId(field.name)">
+                  {{ t('chat.clarify.other') }}
+                </label>
+                <input
+                  :id="otherInputId(field.name)"
+                  class="clarify-choice__other-input"
+                  type="text"
+                  :value="otherValues[field.name]"
+                  :placeholder="t('chat.clarify.otherPlaceholder')"
+                  :disabled="busy"
+                  @focus="selectOther(field.name)"
+                  @input="updateOther(field.name, $event)"
+                />
+              </span>
+            </div>
+          </template>
+          <template v-else>
+            <button
+              v-for="(choice, idx) in field.choices"
+              :key="choice"
+              type="button"
+              class="clarify-choice"
+              :class="{ 'is-selected': values[field.name] === choice && !otherSelected[field.name] }"
+              role="radio"
+              :aria-checked="values[field.name] === choice && !otherSelected[field.name]"
               :disabled="busy"
-            />
-          </label>
+              @click="selectChoice(field.name, choice)"
+            >
+              <span class="clarify-choice__num">{{ idx + 1 }}</span>
+              <span class="clarify-choice__copy">
+                <span class="clarify-choice__text">{{ choice }}</span>
+                <span
+                  v-if="optionDescription(field, choice)"
+                  class="clarify-choice__description"
+                >{{ optionDescription(field, choice) }}</span>
+              </span>
+            </button>
+            <label v-if="field.allowOther" class="clarify-field__other">
+              <span>{{ t('chat.clarify.other') }}</span>
+              <input
+                :id="fieldId(field.name)"
+                class="clarify-field__input"
+                type="text"
+                :value="otherValues[field.name]"
+                :placeholder="t('chat.clarify.otherPlaceholder')"
+                :disabled="busy"
+                @focus="selectOther(field.name)"
+                @input="updateOther(field.name, $event)"
+              />
+            </label>
+          </template>
         </div>
 
         <!-- Bool: explicit true/false select -->
@@ -98,6 +172,7 @@
           v-model="values[field.name]"
           class="clarify-field__input"
           :disabled="busy"
+          :aria-labelledby="fieldLabelId(field.name)"
         >
           <option value="">—</option>
           <option value="true">true</option>
@@ -113,21 +188,68 @@
           type="text"
           :placeholder="field.defaultValue ? `default: ${field.defaultValue}` : ''"
           :disabled="busy"
+          :aria-labelledby="fieldLabelId(field.name)"
         />
       </div>
     </div>
 
     <footer class="clarify-card__footer">
-      <div class="clarify-card__actions">
+      <div v-if="isPlanQuestionnaire" class="clarify-card__plan-actions">
         <button
-          class="btn btn--primary"
           type="button"
-          :disabled="busy"
+          class="clarify-card__nav-button"
+          data-testid="clarify-previous"
+          :disabled="busy || activeFieldIndex === 0"
+          :aria-label="t('chat.clarify.previousQuestion')"
+          @click="goPrevious"
+        >
+          <Icon name="chevronLeft" :size="16" aria-hidden="true" />
+          <span>{{ t('chat.clarify.previousQuestion') }}</span>
+        </button>
+        <span
+          class="clarify-card__progress"
+          data-testid="clarify-question-progress"
+          role="status"
+          aria-live="polite"
+        >{{ activeFieldIndex + 1 }} / {{ request.fields.length }}</span>
+        <button
+          v-if="!isLastPlanField"
+          type="button"
+          class="clarify-card__nav-button clarify-card__nav-button--next"
+          data-testid="clarify-next"
+          :disabled="busy || !canAdvanceActiveField"
+          :aria-label="t('chat.clarify.nextQuestion')"
+          @click="goNext"
+        >
+          <span>{{ t('chat.clarify.nextQuestion') }}</span>
+          <Icon name="chevronRight" :size="16" aria-hidden="true" />
+        </button>
+        <button
+          v-else
+          class="clarify-card__nav-button clarify-card__nav-button--submit"
+          data-testid="clarify-submit"
+          type="button"
+          :disabled="busy || !canSubmit"
           @click="onSubmit"
         >
           {{ busy ? t('chat.clarify.sendingReply') : t('chat.clarify.sendReply') }}
         </button>
-        <button class="btn btn--ghost" type="button" :disabled="busy" @click="$emit('dismiss')">
+      </div>
+      <div v-else class="clarify-card__actions">
+        <button
+          class="btn btn--primary"
+          type="button"
+          :disabled="busy || !canSubmit"
+          @click="onSubmit"
+        >
+          {{ busy ? t('chat.clarify.sendingReply') : t('chat.clarify.sendReply') }}
+        </button>
+        <button
+          class="btn btn--ghost"
+          type="button"
+          :disabled="busy"
+          @click="$emit('dismiss')"
+        >
           {{ t('chat.clarify.dismiss') }}
         </button>
       </div>
@@ -146,19 +268,25 @@
 </template>
 
 <script setup lang="ts">
-import { reactive, watch } from 'vue'
+import { computed, reactive, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ChatClarifyRequest } from '@/composables/chat/useChatApprovals'
 
 const { t } = useI18n()
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   request: ChatClarifyRequest
   submitted?: boolean
   busy?: boolean
   error?: string
-}>()
+  docked?: boolean
+}>(), {
+  submitted: false,
+  busy: false,
+  error: '',
+  docked: false,
+})
 
 const emit = defineEmits<{
   submit: [fields: Record<string, string>]
@@ -166,25 +294,78 @@ const emit = defineEmits<{
 }>()
 
 const values = reactive<Record<string, string>>({})
+const otherValues = reactive<Record<string, string>>({})
+const otherSelected = reactive<Record<string, boolean>>({})
+const activeFieldIndex = ref(0)
+const componentId = useId()
+const isPlanQuestionnaire = computed(
+  () => props.request.presentation === 'plan_questionnaire_v1',
+)
+const displayedFields = computed(() => (
+  isPlanQuestionnaire.value
+    ? props.request.fields.slice(activeFieldIndex.value, activeFieldIndex.value + 1)
+    : props.request.fields
+))
+const activeField = computed(() => props.request.fields[activeFieldIndex.value])
+const isLastPlanField = computed(
+  () => activeFieldIndex.value >= props.request.fields.length - 1,
+)
+const canAdvanceActiveField = computed(() => {
+  const field = activeField.value
+  return !field || !field.required || Boolean((values[field.name] || '').trim())
+})
+const canSubmit = computed(() => (
+  !isPlanQuestionnaire.value
+  || props.request.fields.every(
+    field => !field.required || Boolean((values[field.name] || '').trim()),
+  )
+))
 
 // The parent rebuilds the request object while messages stream and when the
 // conversation is re-rendered. Watching that object directly used to reset
 // every field to its default even though the user was still answering the same
 // clarify request. Reset only when the logical request itself changes.
 watch(
-  () => `${props.request.runId}\u0000${props.request.step}`,
+  () => props.request.requestId || `${props.request.runId}\u0000${props.request.step}`,
   () => {
     const request = props.request
     for (const key of Object.keys(values)) delete values[key]
+    for (const key of Object.keys(otherValues)) delete otherValues[key]
+    for (const key of Object.keys(otherSelected)) delete otherSelected[key]
+    activeFieldIndex.value = 0
     for (const field of request.fields) {
-      values[field.name] = field.defaultValue || ''
+      const defaultValue = field.defaultValue || ''
+      const isCustomDefault = Boolean(
+        field.allowOther
+        && defaultValue
+        && !field.choices.includes(defaultValue),
+      )
+      values[field.name] = defaultValue
+      otherValues[field.name] = isCustomDefault ? defaultValue : ''
+      otherSelected[field.name] = isCustomDefault
     }
   },
   { immediate: true },
 )
 
 function fieldId(name: string): string {
-  return `clarify-field-${name}`
+  return `clarify-${componentId}-${name}`
+}
+
+function fieldLabelId(name: string): string {
+  return `${fieldId(name)}-label`
+}
+
+function choiceName(name: string): string {
+  return `${fieldId(name)}-choices`
+}
+
+function otherRadioId(name: string): string {
+  return `${fieldId(name)}-other-radio`
+}
+
+function otherInputId(name: string): string {
+  return `${fieldId(name)}-other-input`
 }
 
 function optionDescription(
@@ -194,8 +375,35 @@ function optionDescription(
   return field.options?.find(option => option.label === choice)?.description || ''
 }
 
+function selectChoice(name: string, choice: string) {
+  otherSelected[name] = false
+  values[name] = choice
+}
+
+function selectOther(name: string) {
+  otherSelected[name] = true
+  values[name] = otherValues[name] || ''
+}
+
+function updateOther(name: string, event: Event) {
+  const input = event.target as HTMLInputElement
+  otherValues[name] = input.value
+  otherSelected[name] = true
+  values[name] = input.value
+}
+
+function goPrevious() {
+  if (props.busy || activeFieldIndex.value === 0) return
+  activeFieldIndex.value -= 1
+}
+
+function goNext() {
+  if (props.busy || !canAdvanceActiveField.value || isLastPlanField.value) return
+  activeFieldIndex.value += 1
+}
+
 function onSubmit() {
-  if (props.busy) return
+  if (props.busy || !canSubmit.value) return
   const fields: Record<string, string> = {}
   for (const field of props.request.fields) {
     const value = (values[field.name] || '').trim()
@@ -234,6 +442,29 @@ function onSubmit() {
      scrolls. */
   flex-shrink: 0;
   animation: card-enter var(--dur-enter) var(--ease-out) both;
+}
+
+.clarify-card--plan {
+  border-color: var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: none;
+  animation: none;
+}
+
+.clarify-card--docked {
+  width: min(100%, var(--composer-col, 820px));
+  max-height: min(64dvh, 520px);
+  margin: 0 auto;
+  box-shadow: var(--shadow-md);
+}
+
+.clarify-card--docked .clarify-card__head,
+.clarify-card--docked .clarify-card__footer {
+  flex-shrink: 0;
+}
+
+.clarify-card--docked .clarify-card__body {
+  min-height: 0;
 }
 
 .clarify-card__head {
@@ -386,6 +617,132 @@ function onSubmit() {
   text-overflow: ellipsis;
 }
 
+.clarify-choice__radio {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  flex: none;
+  accent-color: var(--text);
+}
+
+.clarify-choice__other-input {
+  width: 100%;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+}
+
+.clarify-choice__other-input:focus-visible {
+  border-bottom-color: var(--border-focus);
+}
+
+.clarify-card--plan .clarify-card__head {
+  gap: 3px;
+  padding: var(--sp-3) var(--sp-3) var(--sp-1);
+}
+
+.clarify-card--plan .clarify-card__eyebrow {
+  color: var(--text-muted);
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.clarify-card--plan .clarify-card__intro {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.clarify-card--plan .clarify-card__body {
+  max-height: min(36vh, 300px);
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
+}
+
+.clarify-card--plan .clarify-field {
+  min-width: 0;
+  gap: var(--sp-2);
+}
+
+.clarify-card--plan .clarify-field__label {
+  display: grid;
+  gap: 2px;
+}
+
+.clarify-card--plan .clarify-field__name {
+  font-family: inherit;
+  font-size: var(--fs-base);
+}
+
+.clarify-card--plan .clarify-field__prompt {
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.clarify-card--plan .clarify-field__req {
+  display: none;
+}
+
+.clarify-card--plan .clarify-field__choices {
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+}
+
+.clarify-card--plan .clarify-choice {
+  min-width: 0;
+  min-height: 44px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 0;
+  border-bottom: 1px solid var(--hairline);
+  border-radius: 0;
+  background: var(--bg-surface);
+  transition: background var(--transition);
+}
+
+.clarify-card--plan .clarify-choice:last-child {
+  border-bottom: 0;
+}
+
+.clarify-card--plan .clarify-choice:hover:not(:has(input:disabled)) {
+  background: var(--bg-hover);
+}
+
+.clarify-card--plan .clarify-choice.is-selected {
+  border-color: var(--hairline);
+  background: var(--bg-hover);
+}
+
+.clarify-card--plan .clarify-choice:has(.clarify-choice__radio:focus-visible) {
+  box-shadow: var(--focus-ring-inset);
+}
+
+.clarify-card--plan .clarify-choice__num {
+  display: none;
+}
+
+.clarify-card--plan .clarify-choice__text {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.clarify-card--plan .clarify-choice__copy--other {
+  display: grid;
+  width: 100%;
+  grid-template-columns: max-content minmax(7rem, 1fr);
+  align-items: center;
+  gap: var(--sp-2);
+}
+
 /* Sticky action bar below the scrollable body. */
 .clarify-card__footer {
   position: sticky;
@@ -402,6 +759,67 @@ function onSubmit() {
   display: flex;
   flex-wrap: wrap;
   gap: var(--sp-2);
+}
+
+.clarify-card__plan-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.clarify-card__nav-button {
+  display: inline-flex;
+  min-width: 0;
+  min-height: 36px;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 4px;
+  padding: var(--sp-1) var(--sp-2);
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--fs-sm);
+}
+
+.clarify-card__nav-button--next,
+.clarify-card__nav-button--submit {
+  justify-self: end;
+  justify-content: flex-end;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.clarify-card__nav-button:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.clarify-card__nav-button:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.clarify-card__nav-button:disabled {
+  opacity: var(--state-disabled-opacity);
+  cursor: not-allowed;
+}
+
+.clarify-card__progress {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.clarify-card--plan .clarify-card__footer {
+  position: static;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
 }
 
 .clarify-card__error {
@@ -436,6 +854,20 @@ function onSubmit() {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
   box-shadow: 0 8px 22px color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent);
+}
+
+.clarify-outcome--plan,
+.clarify-outcome--plan.is-busy {
+  gap: var(--sp-2);
+  background: var(--bg-surface);
+  border-color: var(--border);
+  box-shadow: none;
+  color: var(--text-muted);
+  animation: none;
+}
+
+.clarify-outcome--plan .clarify-outcome__title {
+  font-weight: 600;
 }
 
 .clarify-outcome__icon {
@@ -501,6 +933,28 @@ function onSubmit() {
 
   .clarify-card__actions .btn {
     justify-content: center;
+  }
+}
+
+@media (max-width: 420px) {
+  .clarify-card--plan .clarify-card__head,
+  .clarify-card--plan .clarify-card__body,
+  .clarify-card--plan .clarify-card__footer {
+    padding-right: var(--sp-2);
+    padding-left: var(--sp-2);
+  }
+
+  .clarify-card--plan .clarify-choice {
+    padding-right: var(--sp-2);
+    padding-left: var(--sp-2);
+  }
+
+  .clarify-card__nav-button:not(.clarify-card__nav-button--submit) span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
   }
 }
 

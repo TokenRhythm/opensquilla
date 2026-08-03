@@ -309,6 +309,74 @@ async def test_request_user_input_emits_canonical_interactive_protocol() -> None
     )
 
 
+def test_plan_control_schema_exposes_runtime_limits_and_server_owned_next_step() -> None:
+    from opensquilla.tools.builtin import plan_control as _plan_control  # noqa: F401
+
+    request = get_default_registry().get("request_user_input")
+    submit = get_default_registry().get("submit_plan")
+    checkpoint = get_default_registry().get("plan_run_checkpoint")
+    assert request is not None
+    assert submit is not None
+    assert checkpoint is not None
+
+    questions = request.spec.parameters["questions"]
+    assert questions["minItems"] == 1
+    assert questions["maxItems"] == 3
+    assert questions["items"]["properties"]["options"]["minItems"] == 2
+    assert questions["items"]["properties"]["options"]["maxItems"] == 3
+
+    steps = submit.spec.parameters["steps"]
+    assert steps["minItems"] == 1
+    assert steps["maxItems"] == 64
+    assert steps["items"]["properties"]["step_id"]["maxLength"] == 128
+    assert "next_step_id" not in checkpoint.spec.parameters
+    assert checkpoint.spec.parameters["step_id"]["maxLength"] == 128
+    assert checkpoint.spec.parameters["reason"]["maxLength"] == 2_000
+
+
+@pytest.mark.asyncio
+async def test_duplicate_user_input_option_labels_return_retryable_correction() -> None:
+    from opensquilla.tools.builtin import plan_control as _plan_control  # noqa: F401
+
+    registered = get_default_registry().get("request_user_input")
+    assert registered is not None
+    registry = ToolRegistry()
+    registry.register(registered.spec, registered.handler)
+    ctx = ToolContext(
+        collaboration_mode="plan",
+        interaction_mode=InteractionMode.INTERACTIVE,
+        task_id="plan-turn-duplicate-options",
+        session_key="agent:main:webchat:plan-input-duplicates",
+        allowed_tools={"request_user_input"},
+        surfaced_tools={"request_user_input"},
+    )
+
+    result = await build_tool_handler(registry, ctx)(
+        ToolCall(
+            tool_use_id="duplicate-options",
+            tool_name="request_user_input",
+            arguments={
+                "questions": [
+                    {
+                        "id": "scope",
+                        "question": "Which scope should be used?",
+                        "options": [
+                            {"label": "Core"},
+                            {"label": "Core"},
+                        ],
+                    }
+                ]
+            },
+        )
+    )
+
+    assert result.is_error is True
+    assert result.terminates_turn is False
+    envelope = json.loads(result.content)
+    assert envelope["error_class"] == "RetryableToolInputError"
+    assert envelope["retry_allowed"] is True
+
+
 @pytest.mark.asyncio
 async def test_request_user_input_failure_does_not_end_plan_turn() -> None:
     from opensquilla.tools.builtin import plan_control as _plan_control  # noqa: F401
@@ -460,6 +528,7 @@ async def test_plan_checkpoint_event_failure_does_not_undo_committed_state() -> 
         ) -> SimpleNamespace:
             assert run_id == updated.run_id
             assert kwargs["expected_state_revision"] == 7
+            assert kwargs["next_step_id"] == "legacy-sensitive-step"
             self.checkpoint_calls += 1
             return updated
 
@@ -491,6 +560,7 @@ async def test_plan_checkpoint_event_failure_does_not_undo_committed_state() -> 
             arguments={
                 "step_id": "step-1",
                 "step_status": "completed",
+                "next_step_id": "legacy-sensitive-step",
             },
         )
     )
@@ -503,6 +573,8 @@ async def test_plan_checkpoint_event_failure_does_not_undo_committed_state() -> 
     assert payload["plan_run"]["status"] == "running"
     assert payload["plan_run"]["currentStepId"] is None
     assert payload["plan_run"]["stateRevision"] == 8
+    assert "legacy-sensitive-step" not in result.content
+    assert "legacy-sensitive-step" not in json.dumps(emitted)
 
 
 @pytest.mark.asyncio

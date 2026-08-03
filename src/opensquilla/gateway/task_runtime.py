@@ -1292,6 +1292,18 @@ class TaskRuntime:
                 raise RuntimeError("Unknown task reservation")
 
             runtime_task = reservation.runtime_task
+            persisted_details = reservation.task_record.details
+            if isinstance(persisted_details, dict):
+                persisted_metadata = persisted_details.get("metadata")
+                if isinstance(persisted_metadata, dict):
+                    # Durable acceptance may resolve authoritative metadata
+                    # (notably the actual collaboration revision) inside the
+                    # same transaction that admits the task. Activate that
+                    # exact snapshot instead of a caller-predicted value.
+                    runtime_task.envelope = replace(
+                        runtime_task.envelope,
+                        metadata=dict(persisted_metadata),
+                    )
             if not runtime_task.accepted_config_captured:
                 accepted_config = (
                     self._accepted_config_provider()

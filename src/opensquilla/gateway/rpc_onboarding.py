@@ -267,6 +267,7 @@ def _status_payload(ctx: RpcContext) -> dict[str, Any]:
         "imageGenerationProvider": s.image_generation_provider,
         "imageGenerationPrimary": s.image_generation_primary,
         "imageGenerationEnvKey": s.image_generation_env_key,
+        "imageGenerationState": s.image_generation_state,
         "audioConfigured": s.audio_configured,
         "audioEnabled": s.audio_enabled,
         "audioSource": s.audio_source,
@@ -508,6 +509,11 @@ async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
             # the client sends presetId; a plain save never auto-applies one.
             preset_id=_param(params, "presetId", ""),
             router_action=_param(params, "routerAction", "preserve"),
+            image_generation_intent=_param(
+                params,
+                "imageGenerationIntent",
+                "preserve",
+            ),
         )
     # Persist first: if the write fails, the live config is untouched and
     # memory/disk stay consistent. Tool syncs run only on applied state.
@@ -646,6 +652,9 @@ async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, 
     replacement_provider_id = str(_require(params, "replacementProviderId"))
     replacement_model = str(_param(params, "replacementModel", "") or "")
     router_action = str(_param(params, "routerAction", "preserve"))
+    image_generation_intent = str(
+        _param(params, "imageGenerationIntent", "preserve")
+    )
     cfg = _active_config(ctx)
     try:
         res = remove_active_llm_profile(
@@ -654,6 +663,7 @@ async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, 
             replacement_provider_id=replacement_provider_id,
             replacement_model=replacement_model,
             router_action=router_action,
+            image_generation_intent=image_generation_intent,
         )
     except LlmProfileActivationError as exc:
         code_by_reason = {
@@ -721,6 +731,11 @@ async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
     provider_id = str(_require(params, "providerId"))
     model = str(_param(params, "model", "") or "")
     router_action = _param(params, "routerAction", "preserve")
+    image_generation_intent = _param(
+        params,
+        "imageGenerationIntent",
+        "preserve",
+    )
     cfg = _active_config(ctx)
     try:
         res = activate_llm_profile(
@@ -728,6 +743,7 @@ async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
             provider_id=provider_id,
             model=model,
             router_action=str(router_action),
+            image_generation_intent=str(image_generation_intent),
         )
     except LlmProfileActivationError as exc:
         code_by_reason = {

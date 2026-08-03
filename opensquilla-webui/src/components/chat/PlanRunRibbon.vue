@@ -523,8 +523,8 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
   padding: 6px 11px;
   border: 1px solid var(--border);
   border-radius: var(--radius-pill);
-  background: var(--bg-elevated);
-  box-shadow: var(--shadow-sm);
+  background: var(--bg-surface);
+  box-shadow: none;
   color: inherit;
   font: inherit;
   text-align: left;
@@ -537,8 +537,7 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
   cursor: pointer;
   transition:
     border-color var(--dur-fast) var(--ease-standard),
-    background var(--dur-fast) var(--ease-standard),
-    box-shadow var(--dur-fast) var(--ease-standard);
+    background var(--dur-fast) var(--ease-standard);
 }
 
 .plan-run__static {
@@ -556,18 +555,18 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
 }
 
 .plan-run__summary:hover {
-  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
-  background: color-mix(in srgb, var(--bg-elevated) 96%, var(--accent) 4%);
+  border-color: var(--border);
+  background: var(--bg-hover);
 }
 
 .plan-run__summary[aria-expanded="true"] {
-  border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
-  background: var(--bg-elevated);
+  border-color: var(--border);
+  background: var(--bg-hover);
 }
 
 .plan-run__summary--static:hover {
   border-color: var(--border);
-  background: var(--bg-elevated);
+  background: var(--bg-surface);
 }
 
 .plan-run__summary:focus-visible {
@@ -684,7 +683,7 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-elevated);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--shadow-sm);
   scrollbar-gutter: stable;
 }
 
@@ -758,7 +757,7 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
 }
 
 .plan-run__step--in_progress .plan-run__step-state {
-  color: color-mix(in srgb, var(--accent) 72%, var(--text-muted));
+  color: var(--text-muted);
 }
 
 .plan-run__step--blocked .plan-run__step-state {

@@ -37,6 +37,7 @@ RPC_STATUS_KEYS = frozenset(
         "imageGenerationProvider",
         "imageGenerationPrimary",
         "imageGenerationEnvKey",
+        "imageGenerationState",
         "audioConfigured",
         "audioEnabled",
         "audioSource",
@@ -128,6 +129,10 @@ def test_status_json_new_keys_carry_the_expected_values(tmp_path, monkeypatch):
     assert profiles[0]["ready"] is False
     assert profiles[0]["credentialSource"] == "none"
     assert "apiKey" not in profiles[0]
+    assert payload["imageGenerationState"]["mode"] == "unconfigured"
+    assert payload["imageGenerationState"]["recommendation"]["providerId"] == (
+        "openrouter"
+    )
     assert payload["audioConfigured"] is False
     assert payload["audioEnabled"] is False
     # Default search provider (duckduckgo) needs no key, so the section is

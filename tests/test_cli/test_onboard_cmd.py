@@ -330,7 +330,7 @@ def test_onboard_if_needed_skips_when_configured(tmp_path, monkeypatch):
     assert "core setup is ready" in result.stdout.lower()
     assert "Optional next moves:" in result.stdout
     assert "Channel recipes:" in result.stdout
-    assert "Image recipes:" in result.stdout
+    assert "Image recipes:" not in result.stdout
     assert target.stat().st_mtime == mtime_before
 
 

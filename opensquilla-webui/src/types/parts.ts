@@ -52,6 +52,7 @@ export interface InterruptClarifyField {
 export interface InterruptClarifyData {
   intro: string
   fields: InterruptClarifyField[]
+  presentation?: string
   requestId?: string
   runId: string
   step: string

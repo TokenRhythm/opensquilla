@@ -144,6 +144,21 @@ function approvalTimelineItem(
   }
 }
 
+function planPart(): Extract<ChatPart, { type: 'plan' }> {
+  return {
+    type: 'plan',
+    key: 'assistant-1:plan:revision-1',
+    plan: {
+      revisionId: 'revision-1',
+      planId: 'plan-1',
+      title: 'A restrained plan',
+      markdown: 'Keep the final plan easy to scan.',
+      steps: [{ stepId: 'step-1', title: 'Verify the layout' }],
+      current: true,
+    },
+  }
+}
+
 function baseMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
   return {
     id: 'assistant-1',
@@ -292,6 +307,59 @@ describe('AssistantMessage activity disclosure', () => {
 
     expect(el.querySelector('.assistant-answer')).not.toBeNull()
     expect(el.querySelector('.assistant-answer--separated')).toBeNull()
+  })
+
+  it('places a single planning-process disclosure before the Plan card', async () => {
+    const reasoning: Extract<ChatPart, { type: 'reasoning' }> = {
+      type: 'reasoning',
+      key: 'assistant-1:reasoning',
+      text: 'Checked constraints and compatibility.',
+      seconds: 7,
+    }
+    const el = mountMessage(baseMessage({
+      text: 'The plan is ready.',
+      timelineItems: successfulTimeline(),
+      parts: [reasoning, planPart()],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    const main = el.querySelector<HTMLElement>('.msg-ai-main')
+    const intro = main?.querySelector<HTMLElement>('.plan-message-intro')
+    const activity = main?.querySelector<HTMLElement>('.assistant-activity')
+    const card = main?.querySelector<HTMLElement>('.plan-card')
+    const children = Array.from(main?.children ?? [])
+
+    expect(intro?.textContent).toContain('The plan is ready.')
+    expect(children.indexOf(intro as HTMLElement))
+      .toBeLessThan(children.indexOf(activity as HTMLElement))
+    expect(children.indexOf(activity as HTMLElement))
+      .toBeLessThan(children.indexOf(card as HTMLElement))
+    expect(activity?.querySelector('.assistant-activity__label')?.textContent)
+      .toBe('Planning process · 7s')
+    expect(activity?.querySelector('.assistant-activity__detail')).toBeNull()
+    expect(activity?.querySelector('.thinking-fold')).toBeNull()
+    expect(activity?.querySelector('.thinking-block__header')).toBeNull()
+    expect(activity?.querySelector('.thinking-block__body')?.textContent)
+      .toBe('Checked constraints and compatibility.')
+  })
+
+  it('does not add a generic completed receipt below a Plan card', async () => {
+    const el = mountMessage(baseMessage({
+      text: '',
+      timelineItems: [],
+      parts: [planPart()],
+      statusHistory: [],
+      turnOutcome: {
+        turnId: 'turn-plan',
+        status: 'succeeded',
+        kind: 'completed',
+      },
+    }), true)
+    await nextTick()
+
+    expect(el.querySelector('.plan-card')).not.toBeNull()
+    expect(el.querySelector('[data-testid="turn-outcome-completed"]')).toBeNull()
   })
 
   it('keeps intermediate candidate narration inside activity and the final answer outside once', async () => {
