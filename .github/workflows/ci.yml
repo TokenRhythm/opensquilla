@@ -754,6 +754,7 @@ jobs:
             "${{ matrix.shard }}" \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
+            --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
             -- \
             -q \
             -m "${markers}" \

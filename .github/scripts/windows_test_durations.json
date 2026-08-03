@@ -97,6 +97,7 @@
     "tests/test_ci/test_pr_body_lint.py": 0.197,
     "tests/test_ci/test_router_artifact_manifest.py": 0.092,
     "tests/test_ci/test_session_storage_connection_contract.py": 0.01,
+    "tests/test_ci/test_windows_duration_governance.py": 0.01,
     "tests/test_ci/test_windows_test_shards.py": 1.015,
     "tests/test_ci/test_workflows.py": 1.956,
     "tests/test_cli/test_agent_cmd.py": 1.117,
