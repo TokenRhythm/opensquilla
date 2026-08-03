@@ -130,7 +130,8 @@ class SchedulerTimer:
 
             for reservation in reservations:
                 delay = delays.get(reservation.job.id, 0.0)
-                asyncio.create_task(self._staggered_run(reservation, delay))
+                task = asyncio.create_task(self._staggered_run(reservation, delay))
+                self._running[reservation.job.id] = task
 
         # Step 4: fast-forward remaining (except AT one-shots). Delegates to
         # the shared next-run helper so EVERY+anchor jobs use the interval-grid
@@ -151,9 +152,15 @@ class SchedulerTimer:
         """Run a catchup job after a stagger delay."""
         if not isinstance(reservation, JobReservation):
             raise TypeError("_staggered_run requires a JobReservation")
-        if delay > 0:
-            await asyncio.sleep(delay)
-        await self._run_single(reservation)
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await self._run_single(reservation)
+        except asyncio.CancelledError:
+            # Cancellation can happen during the stagger sleep, before
+            # _run_single has a chance to own cleanup.
+            await self._store.release_reservation(reservation.job.id, reservation.token)
+            raise
 
     # ------------------------------------------------------------------
     # Tick loop
@@ -231,31 +238,37 @@ class SchedulerTimer:
         if not isinstance(reservation, JobReservation):
             raise TypeError("_run_single requires a JobReservation")
         job = reservation.job
-        handler = self._handlers.get(job.handler_key)
+        try:
+            handler = self._handlers.get(job.handler_key)
 
-        if handler is None:
-            error = f"No handler registered for key '{job.handler_key}'"
-            await self._store.finalize_reserved_missing_handler(
-                job.id,
-                reservation.token,
-                error=error,
-            )
-            finished_at = datetime.now(UTC)
-            exe = JobExecution(
-                job_id=job.id,
-                started_at=finished_at,
-                finished_at=finished_at,
-                success=False,
-                error=error,
-            )
+            if handler is None:
+                error = f"No handler registered for key '{job.handler_key}'"
+                await self._store.finalize_reserved_missing_handler(
+                    job.id,
+                    reservation.token,
+                    error=error,
+                )
+                finished_at = datetime.now(UTC)
+                exe = JobExecution(
+                    job_id=job.id,
+                    started_at=finished_at,
+                    finished_at=finished_at,
+                    success=False,
+                    error=error,
+                )
+                await self._store.save_execution(exe)
+                await notify_terminal_result(job, exe)
+                return
+
+            exe = await execute_with_timeout(job, handler)
             await self._store.save_execution(exe)
+            await apply_reserved_result(job.id, reservation.token, exe, self._store)
             await notify_terminal_result(job, exe)
-            return
-
-        exe = await execute_with_timeout(job, handler)
-        await self._store.save_execution(exe)
-        await apply_reserved_result(job.id, reservation.token, exe, self._store)
-        await notify_terminal_result(job, exe)
+        except asyncio.CancelledError:
+            # A paused/deleted job must not retain ownership of a persisted
+            # reservation after its execution task has been cancelled.
+            await self._store.release_reservation(job.id, reservation.token)
+            raise
 
     # ------------------------------------------------------------------
     # Main loop
@@ -303,11 +316,25 @@ class SchedulerTimer:
     # Cancel
     # ------------------------------------------------------------------
 
-    def cancel_running(self, job_id: str) -> None:
-        """Cancel a specific running task."""
-        task = self._running.pop(job_id, None)
-        if task is not None and not task.done():
+    async def cancel_running(self, job_id: str) -> bool:
+        """Cancel and await a running task so reservation cleanup completes."""
+        task = self._running.get(job_id)
+        if task is None:
+            return False
+        if not task.done():
             task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # Pausing/deleting must still progress if the task had already
+            # terminated abnormally; SchedulerOps will clear the reservation.
+            logger.exception("cancel_running_task_failed id=%s", job_id)
+        finally:
+            if self._running.get(job_id) is task:
+                self._running.pop(job_id, None)
+        return True
 
     # ------------------------------------------------------------------
     # Start / stop
@@ -331,8 +358,11 @@ class SchedulerTimer:
             except asyncio.CancelledError:
                 pass
         # Cancel all running job tasks
-        for task in self._running.values():
+        running = list(self._running.values())
+        for task in running:
             if not task.done():
                 task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
         self._running.clear()
         logger.info("scheduler_timer_stopped")

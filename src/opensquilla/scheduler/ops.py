@@ -23,6 +23,7 @@ from .types import (
     JobStatus,
     ScheduleKind,
     SessionTarget,
+    clear_reservation,
 )
 
 _RUN_MODE_ALIASES = {
@@ -374,6 +375,7 @@ class SchedulerOps:
         if job is None:
             return None
         job.status = JobStatus.PAUSED
+        clear_reservation(job)
         job.updated_at = datetime.now(UTC)
         await self._store.save(job)
         return job
@@ -385,6 +387,8 @@ class SchedulerOps:
             return None
 
         now = datetime.now(UTC)
+        # Defensively heal reservations left by older scheduler versions.
+        clear_reservation(job)
         job.status = JobStatus.PENDING
         # Reviving a DISABLED/FAILED job must clear the flags the due-job query
         # filters on, or the job would stay excluded despite the status change.

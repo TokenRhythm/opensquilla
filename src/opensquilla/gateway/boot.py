@@ -2838,12 +2838,11 @@ async def build_services(
                 ),
             },
         )
-        await cron_scheduler.start()
         # Inject into admin tool so `cron` tool can dispatch to the scheduler
         from opensquilla.tools.builtin.admin import set_scheduler
 
         set_scheduler(cron_scheduler)
-        log.info("build_services.cron_scheduler_started")
+        log.info("build_services.cron_scheduler_initialized")
     except Exception as e:
         log.warning("build_services.cron_scheduler_failed", error=str(e))
 
@@ -4139,6 +4138,11 @@ async def start_gateway_server(
             await _register_auto_propose_runtime_crons()
         else:
             await _pause_auto_propose_runtime_crons()
+
+        # Startup catch-up can execute overdue jobs immediately. Start only
+        # after delivery, terminal notifications, and every handler are ready.
+        await svc.cron_scheduler.start()
+        log.info("build_services.cron_scheduler_started")
 
     # Build channel adapters (don't start yet -- app doesn't exist)
     webhook_routes: list = []

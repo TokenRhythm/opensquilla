@@ -1500,12 +1500,23 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
     class FakeCronScheduler:
         def __init__(self) -> None:
             self.registered: dict[str, Any] = {}
+            self.started = False
 
         def register_handler(self, key: str, fn: Any) -> None:
             self.registered[key] = fn
 
         async def list_jobs(self) -> list:
             return []
+
+        async def start(self) -> None:
+            assert set(self.registered) >= {
+                "agent_run",
+                "static_message",
+                "system_event",
+                "memory_dream",
+                "auto_propose",
+            }
+            self.started = True
 
     cron_sched = FakeCronScheduler()
 
@@ -1571,6 +1582,7 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
             "static_message",
             "system_event",
         }
+        assert cron_sched.started is True
     finally:
         await server.close()
 
@@ -1626,6 +1638,7 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
             self.registered: dict[str, Any] = {}
             self.added: list[dict[str, Any]] = []
             self.paused: list[str] = []
+            self.started = False
 
         def register_handler(self, key: str, fn: Any) -> None:
             self.registered[key] = fn
@@ -1639,6 +1652,11 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
 
         async def pause_job(self, job_id: str) -> None:
             self.paused.append(job_id)
+
+        async def start(self) -> None:
+            assert "agent_run" in self.registered
+            assert "auto_propose" in self.registered
+            self.started = True
 
     cron_sched = FakeCronScheduler()
 
