@@ -2237,6 +2237,12 @@ class GoalConfig(BaseSettings):
     runtime_budget_seconds: int | None = Field(default=None, ge=1)
     # False: only auto-continue while the session has an active goal watcher.
     continue_unwatched: bool = False
+    # Seconds a registered watcher stays eligible for auto-continuation without
+    # a fresh goals.observe heartbeat. A hard-killed CLI / dropped connection
+    # leaves a stale watcher behind; the driver lazily evicts entries older
+    # than this TTL so continuation stops instead of burning tokens to
+    # max_turns.
+    watcher_ttl_seconds: int = Field(default=900, ge=1)
 
 
 class GatewayConfig(BaseSettings):

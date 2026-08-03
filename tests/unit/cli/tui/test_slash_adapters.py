@@ -1514,6 +1514,7 @@ async def test_goal_resume_restarts_watch_until_terminal(monkeypatch: pytest.Mon
     assert handled is True
     assert client.goal_calls() == [
         ("goals.resume", {"sessionKey": _GOAL_KEY}),
+        ("goals.observe", {"sessionKey": _GOAL_KEY, "watch": True}),
         ("goals.unobserve", {"sessionKey": _GOAL_KEY, "watch": False}),
         ("goals.status", {"sessionKey": _GOAL_KEY}),
     ]
@@ -1699,6 +1700,55 @@ def test_goal_reason_text_filters_non_string_values() -> None:
     assert text(0) is None
     assert text(3.5) is None
 
+
+@pytest.mark.asyncio
+async def test_goal_status_after_turn_reports_terminal_complete_goal() -> None:
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [
+        {
+            "goal": {
+                "status": "complete",
+                "terminalReason": "all goals met",
+            }
+        }
+    ]
+
+    status = await _slash_gateway._goal_status_after_turn(client, _GOAL_KEY)
+
+    assert status == ("complete", "all goals met")
+    assert client.calls == [("goals.status", {"sessionKey": _GOAL_KEY})]
+
+
+@pytest.mark.asyncio
+async def test_goal_status_after_turn_reports_blocked_goal() -> None:
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [
+        {"goal": {"status": "blocked", "terminalReason": "no api key"}}
+    ]
+
+    status = await _slash_gateway._goal_status_after_turn(client, _GOAL_KEY)
+
+    assert status == ("blocked", "no api key")
+
+
+@pytest.mark.asyncio
+async def test_goal_status_after_turn_missing_goal_stays_cleared() -> None:
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [{"goal": None}]
+
+    status = await _slash_gateway._goal_status_after_turn(client, _GOAL_KEY)
+
+    assert status == ("cleared", None)
+
+
+@pytest.mark.asyncio
+async def test_goal_status_after_turn_running_keeps_watching() -> None:
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [{"goal": {"status": "running"}}]
+
+    status = await _slash_gateway._goal_status_after_turn(client, _GOAL_KEY)
+
+    assert status is None
 
 
 async def test_gateway_model_strategy_failed_write_reprojects_canonical_state(

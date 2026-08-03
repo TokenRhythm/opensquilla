@@ -716,6 +716,14 @@ async def _handle_goal_command(argument: str, context: GatewaySlashContext) -> b
         except GatewayRPCError as exc:
             console.print(error_panel(str(exc), title="Goal resume failed"))
             return True
+        # Re-register the watcher before entering the watch loop (mirrors the
+        # /goal <description> path) so a stale/expired watcher entry does not
+        # stop the continuation driver after the first resumed turn.
+        try:
+            await client.call("goals.observe", {"sessionKey": key, "watch": True})
+        except GatewayRPCError as exc:
+            console.print(error_panel(str(exc), title="Goal watch failed"))
+            return True
         console.print(f"[{ACCENT}]goal[/] [green]resumed[/green]; watching…")
         await _run_goal_watch(
             client,

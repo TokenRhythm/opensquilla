@@ -13,6 +13,7 @@ paused loop by enqueueing the next goal turn immediately.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -73,6 +74,32 @@ def _goal_changed_error(exc: Exception, goal: Any | None = None) -> RpcHandlerEr
         retryable=True,
         accepted=False,
     )
+
+
+async def _cancel_orphan_goal_run(storage: Any, goal_id: str) -> None:
+    """Best-effort cancel of a goal ledger row left without an accepted turn.
+
+    ``goals.set`` persists the goal row before the send pipeline runs; if the
+    send or the accepted-run readback fails, cancel it with
+    ``terminal_reason="goal_set_failed"`` so it never lingers as "running but
+    unturned". Reads the current ``updated_at`` first for the CAS, and swallows
+    races (another controller already moved the row) and missing rows.
+    """
+    try:
+        current = await storage.get_goal_run(goal_id)
+    except Exception:  # noqa: BLE001 - cleanup must never mask the original error
+        return
+    if current is None:
+        return
+    try:
+        await storage.cancel_goal_run(
+            goal_id,
+            expected_updated_at=int(current.updated_at),
+            terminal_reason="goal_set_failed",
+        )
+    except (GoalConflictError, KeyError):
+        # Someone else already terminalized or removed the goal; nothing to do.
+        pass
 
 
 @_d.method("goals.set", scope="operator.write")
@@ -200,74 +227,86 @@ async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
         if target_before_acceptance is not None
         else 1
     )
-    result = await _handle_sessions_send(
-        send_params,
-        ctx,
-        fingerprint_params={
-            "action": "goals.set",
-            "sessionKey": key,
-            "goalId": goal_id,
-            "message": provider_message,
-            "intent": "continue",
-        },
-        plan_revision_id=goal_revision.revision_id,
-        plan_run_driver_kind="goal",
-        plan_run_driver_id=goal_id,
-        required_collaboration_mode="default",
-        required_collaboration_revision=required_collaboration_revision,
-    )
-    accepted_key = str(result.get("session_key") or key)
-    task_id = str(result.get("turn_id") or result.get("task_id") or "").strip()
-    task_record = await storage.get_agent_task(task_id) if task_id else None
-    task_details = (
-        task_record.details
-        if task_record is not None and isinstance(task_record.details, dict)
-        else {}
-    )
-    task_metadata = task_details.get("metadata")
-    task_metadata = task_metadata if isinstance(task_metadata, dict) else {}
-    accepted_run_id = str(task_metadata.get("plan_run_id") or "").strip()
-    if not accepted_run_id:
-        raise RuntimeError("Accepted goal turn lost its durable plan run binding")
-    accepted_run = await storage.get_plan_run(accepted_run_id)
-    if accepted_run is None:
-        raise RuntimeError("Accepted goal plan run no longer exists")
-    if (
-        str(accepted_run.driver_kind) != "goal"
-        or str(accepted_run.driver_id or "") != goal_id
-    ):
-        raise RuntimeError("Accepted goal turn bound to a different execution driver")
-
-    # Backfill the run id onto the goal ledger row created before the run.
-    current_goal = await storage.get_goal_run(goal_id)
-    if current_goal is not None and not current_goal.plan_run_id:
-        try:
-            current_goal = await storage.update_goal_run(
-                goal_id,
-                expected_updated_at=int(current_goal.updated_at),
-                plan_run_id=accepted_run.run_id,
+    try:
+        result = await _handle_sessions_send(
+            send_params,
+            ctx,
+            fingerprint_params={
+                "action": "goals.set",
+                "sessionKey": key,
+                "goalId": goal_id,
+                "message": provider_message,
+                "intent": "continue",
+            },
+            plan_revision_id=goal_revision.revision_id,
+            plan_run_driver_kind="goal",
+            plan_run_driver_id=goal_id,
+            required_collaboration_mode="default",
+            required_collaboration_revision=required_collaboration_revision,
+        )
+        accepted_key = str(result.get("session_key") or key)
+        task_id = str(result.get("turn_id") or result.get("task_id") or "").strip()
+        task_record = await storage.get_agent_task(task_id) if task_id else None
+        task_details = (
+            task_record.details
+            if task_record is not None and isinstance(task_record.details, dict)
+            else {}
+        )
+        task_metadata = task_details.get("metadata")
+        task_metadata = task_metadata if isinstance(task_metadata, dict) else {}
+        accepted_run_id = str(task_metadata.get("plan_run_id") or "").strip()
+        if not accepted_run_id:
+            raise RuntimeError("Accepted goal turn lost its durable plan run binding")
+        accepted_run = await storage.get_plan_run(accepted_run_id)
+        if accepted_run is None:
+            raise RuntimeError("Accepted goal plan run no longer exists")
+        if (
+            str(accepted_run.driver_kind) != "goal"
+            or str(accepted_run.driver_id or "") != goal_id
+        ):
+            raise RuntimeError(
+                "Accepted goal turn bound to a different execution driver"
             )
-        except GoalConflictError:
-            current_goal = await storage.get_goal_run(goal_id)
-    goal_snapshot = (
-        goal_run_snapshot(current_goal)
-        if current_goal is not None
-        else goal_run_snapshot(goal_run)
-    )
-    run_snapshot = plan_run_snapshot(accepted_run)
-    await _emit_to_subscribers(
-        ctx,
-        accepted_key,
-        "session.event.plan_run",
-        {"session_key": accepted_key, "plan_run": run_snapshot},
-    )
-    return {
-        "goalId": goal_id,
-        "sessionKey": accepted_key,
-        "goal": goal_snapshot,
-        "planRun": run_snapshot,
-        "turnId": str(result.get("turn_id") or ""),
-    }
+
+        # Backfill the run id onto the goal ledger row created before the run.
+        current_goal = await storage.get_goal_run(goal_id)
+        if current_goal is not None and not current_goal.plan_run_id:
+            try:
+                current_goal = await storage.update_goal_run(
+                    goal_id,
+                    expected_updated_at=int(current_goal.updated_at),
+                    plan_run_id=accepted_run.run_id,
+                )
+            except GoalConflictError:
+                current_goal = await storage.get_goal_run(goal_id)
+        goal_snapshot = (
+            goal_run_snapshot(current_goal)
+            if current_goal is not None
+            else goal_run_snapshot(goal_run)
+        )
+        run_snapshot = plan_run_snapshot(accepted_run)
+        await _emit_to_subscribers(
+            ctx,
+            accepted_key,
+            "session.event.plan_run",
+            {"session_key": accepted_key, "plan_run": run_snapshot},
+        )
+        return {
+            "goalId": goal_id,
+            "sessionKey": accepted_key,
+            "goal": goal_snapshot,
+            "planRun": run_snapshot,
+            "turnId": str(result.get("turn_id") or ""),
+        }
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # The goal ledger row is already durable (created before the send). If
+        # the send or the accepted-run readback fails, cancel the orphan so it
+        # never lingers as "running but unturned"; then re-raise the original
+        # error to the caller.
+        await _cancel_orphan_goal_run(storage, goal_id)
+        raise
 
 
 @_d.method("goals.status", scope="operator.read")
@@ -277,6 +316,11 @@ async def _handle_goals_status(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_plan_session_key(params)
     storage = _require_goal_storage(ctx)
     goal = await storage.get_active_goal_run(key)
+    if goal is None:
+        # No active run: fall back to the most recent goal (any status) so a
+        # completed/blocked goal still reports its terminal outcome instead of
+        # an empty active slot.
+        goal = await storage.get_latest_goal_run(key)
     plan_run = (
         await storage.get_plan_run(goal.plan_run_id)
         if goal is not None and goal.plan_run_id

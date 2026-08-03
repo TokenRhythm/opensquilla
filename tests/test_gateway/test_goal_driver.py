@@ -240,6 +240,43 @@ def test_goal_watcher_registry_observe_unobserve_has_watchers() -> None:
         registry.unobserve(key, "client-b")
 
 
+def test_goal_watcher_registry_ttl_evicts_stale_watchers() -> None:
+    registry = GoalWatcherRegistry()
+    key = "agent:main:webchat:goal-watcher-ttl"
+    ttl_ms = 900_000  # 900s default
+    clock = [1_000.0]
+
+    registry._now = lambda: clock[0]
+    try:
+        assert registry.observe(key, "client-a") == 1
+        assert registry.observe(key, "client-b") == 2
+
+        # Within the TTL the watchers stay eligible.
+        assert registry.has_watchers(key, ttl_ms=ttl_ms) is True
+        assert registry.watcher_count(key, ttl_ms=ttl_ms) == 2
+
+        # Advance past the TTL: both entries are lazily evicted.
+        clock[0] += ttl_ms / 1000.0 + 1.0
+        assert registry.has_watchers(key, ttl_ms=ttl_ms) is False
+        assert registry.watcher_count(key, ttl_ms=ttl_ms) == 0
+
+        # A fresh observe heartbeat resets eligibility.
+        assert registry.observe(key, "client-a") == 1
+        clock[0] += ttl_ms / 1000.0 / 2.0
+        assert registry.has_watchers(key, ttl_ms=ttl_ms) is True
+        assert registry.watcher_count(key, ttl_ms=ttl_ms) == 1
+
+        # The no-ttl accessors never evict (backward-compatible behavior).
+        registry.observe(key, "client-stale")
+        clock[0] += ttl_ms / 1000.0 * 10.0
+        assert registry.has_watchers(key) is True
+        assert registry.watcher_count(key) == 2
+    finally:
+        registry.unobserve(key, "client-a")
+        registry.unobserve(key, "client-b")
+        registry.unobserve(key, "client-stale")
+
+
 # ── Driver scenarios ──────────────────────────────────────────────────────
 
 

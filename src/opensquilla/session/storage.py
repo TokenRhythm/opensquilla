@@ -5152,6 +5152,32 @@ class SessionStorage:
             row = await cur.fetchone()
         return None if row is None else GoalRunRecord(**_deserialize_row(dict(row)))
 
+    @_serialized_read
+    async def get_latest_goal_run(
+        self,
+        session_key: str,
+    ) -> GoalRunRecord | None:
+        """Return the most recently created goal run for a session, any status.
+
+        Used as a ``goals.status`` fallback after the active run terminalizes
+        so the caller can still see the completed/blocked outcome instead of
+        an empty active slot. Ties on ``created_at`` break by insertion order
+        (rowid) so the newest row wins deterministically.
+        """
+        session_key = canonicalize_session_key(session_key)
+        async with self.conn.execute(
+            """
+            SELECT *
+            FROM goal_runs
+            WHERE session_key = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (session_key,),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else GoalRunRecord(**_deserialize_row(dict(row)))
+
     async def update_goal_run(
         self,
         goal_id: str,

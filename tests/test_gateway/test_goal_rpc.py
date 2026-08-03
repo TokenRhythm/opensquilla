@@ -269,6 +269,114 @@ async def test_goals_status_snapshots_active_goal_and_plan_run(
 
 
 @pytest.mark.asyncio
+async def test_goals_set_send_failure_cancels_orphan_goal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(run: TaskRun) -> None:
+        return None
+
+    async def exploding_send(*_args: Any, **_kwargs: Any) -> dict:
+        raise RuntimeError("send exploded")
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._handle_sessions_send",
+        exploding_send,
+    )
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-set-failure.sqlite",
+        handler=handler,
+    ) as stack:
+        with pytest.raises(RuntimeError, match="send exploded"):
+            await _handle_goals_set(
+                {
+                    "sessionKey": SOURCE_KEY,
+                    "message": "Doomed goal.",
+                },
+                stack.context,
+            )
+
+        # The ledger row created before the send must not linger as an
+        # unturned running orphan: it is cancelled best-effort with the
+        # durable goal_set_failed terminal reason.
+        goal = await stack.storage.get_latest_goal_run(SOURCE_KEY)
+        assert goal is not None
+        assert goal.status == "cancelled"
+        assert goal.terminal_reason == "goal_set_failed"
+
+
+@pytest.mark.asyncio
+async def test_goals_status_falls_back_to_latest_completed_goal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[TaskRun] = []
+    manager_holder: dict[str, Any] = {}
+    markers: list[str | None] = [None, "[goal:complete]"]
+
+    async def handler(run: TaskRun) -> None:
+        captured.append(run)
+        manager = manager_holder.get("manager")
+        marker = markers.pop(0) if markers else None
+        if marker is not None and manager is not None:
+            await manager.append_message(SOURCE_KEY, "assistant", marker)
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    registry = get_goal_watcher_registry()
+    registry.unobserve(SOURCE_KEY, "goal-rpc-test")  # defensive cleanup
+    try:
+        async with _open_goal_rpc_stack(
+            tmp_path / "goal-status-complete.sqlite",
+            handler=handler,
+        ) as stack:
+            manager_holder["manager"] = stack.manager
+            registry.observe(SOURCE_KEY, "goal-rpc-test")
+            set_response = await _handle_goals_set(
+                {
+                    "sessionKey": SOURCE_KEY,
+                    "message": "Finish this goal.",
+                },
+                stack.context,
+            )
+
+            # Turn 2 ends with [goal:complete]: the driver terminalizes the
+            # goal so no active run remains on the session.
+            deadline = time.monotonic() + 5.0
+            goal = await stack.storage.get_goal_run(set_response["goalId"])
+            while (
+                goal is not None
+                and goal.status != "complete"
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.01)
+                goal = await stack.storage.get_goal_run(set_response["goalId"])
+            assert goal is not None
+            assert goal.status == "complete"
+
+            # R3: goals.status falls back to the most recent goal (any status)
+            # instead of an empty active slot, so the completed outcome stays
+            # visible with its plan run attached.
+            status = await _handle_goals_status({"sessionKey": SOURCE_KEY}, stack.context)
+            assert status["goal"] is not None
+            assert status["goal"]["goalId"] == set_response["goalId"]
+            assert status["goal"]["status"] == "complete"
+            assert "terminalReason" in status["goal"]
+            assert status["planRun"] is not None
+            assert status["planRun"]["runId"] == set_response["planRun"]["runId"]
+            assert status["planRun"]["status"] == "cancelled"
+            assert status["planRun"]["terminalReason"] == "goal_complete"
+    finally:
+        registry.unobserve(SOURCE_KEY, "goal-rpc-test")
+
+
+@pytest.mark.asyncio
 async def test_goals_set_replaces_old_goal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -384,8 +492,15 @@ async def test_goals_clear_returns_before_snapshot_and_cancels_run(
         assert cleared["planRun"]["runId"] == set_response["planRun"]["runId"]
 
         status = await _handle_goals_status({"sessionKey": SOURCE_KEY}, stack.context)
-        assert status["goal"] is None
-        assert status["planRun"] is None
+        # R3: with no active run, status falls back to the most recent goal so
+        # the cleared outcome stays visible instead of an empty slot.
+        assert status["goal"] is not None
+        assert status["goal"]["goalId"] == set_response["goalId"]
+        assert status["goal"]["status"] == "cancelled"
+        assert status["goal"]["terminalReason"] == "superseded_by_new_goal"
+        assert status["planRun"] is not None
+        assert status["planRun"]["runId"] == set_response["planRun"]["runId"]
+        assert status["planRun"]["status"] == "cancelled"
 
         goal = await stack.storage.get_goal_run(set_response["goalId"])
         assert goal is not None

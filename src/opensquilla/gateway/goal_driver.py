@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -60,20 +61,42 @@ class GoalWatcherRegistry:
     A session with at least one watcher is eligible for automatic
     continuation when ``config.continue_unwatched`` is false. Client ids are
     per-connection identities (``RpcContext.conn_id`` or an explicit
-    ``clientId``); the registry never expires entries — observers must
-    unregister (CLI watch flow, websocket disconnect).
+    ``clientId``). Entries carry a ``last_seen`` timestamp refreshed on every
+    ``observe``; ``has_watchers``/``watcher_count`` with a ``ttl_ms`` lazily
+    evict stale entries so a hard-killed CLI or dropped connection stops
+    gating auto-continuation instead of burning tokens to ``max_turns``.
     """
 
     def __init__(self) -> None:
-        self._watchers: dict[str, set[str]] = {}
+        self._watchers: dict[str, dict[str, float]] = {}
+        # Injectable clock (seconds since epoch) so tests can advance time.
+        self._now = time.time
+
+    def _now_ms(self) -> float:
+        return self._now() * 1000.0
+
+    def _evict_expired(self, session_key: str, ttl_ms: int) -> None:
+        watchers = self._watchers.get(session_key)
+        if not watchers:
+            return
+        now_ms = self._now_ms()
+        expired = [
+            client_id
+            for client_id, last_seen_ms in watchers.items()
+            if now_ms - last_seen_ms > ttl_ms
+        ]
+        for client_id in expired:
+            watchers.pop(client_id, None)
+        if not watchers:
+            self._watchers.pop(session_key, None)
 
     def observe(self, session_key: str, client_id: str) -> int:
         """Register a watcher for a session; returns the watcher count."""
         key = canonicalize_session_key(session_key)
         if not client_id:
             raise ValueError("client_id must be non-empty")
-        watchers = self._watchers.setdefault(key, set())
-        watchers.add(client_id)
+        watchers = self._watchers.setdefault(key, {})
+        watchers[client_id] = self._now_ms()
         return len(watchers)
 
     def unobserve(self, session_key: str, client_id: str) -> int:
@@ -82,19 +105,33 @@ class GoalWatcherRegistry:
         watchers = self._watchers.get(key)
         if watchers is None:
             return 0
-        watchers.discard(client_id)
+        watchers.pop(client_id, None)
         if not watchers:
             self._watchers.pop(key, None)
         return len(watchers)
 
-    def has_watchers(self, session_key: str) -> bool:
-        """Return whether any client currently observes the session."""
-        watchers = self._watchers.get(canonicalize_session_key(session_key))
+    def has_watchers(self, session_key: str, ttl_ms: int | None = None) -> bool:
+        """Return whether any client currently observes the session.
+
+        With ``ttl_ms``, stale entries (no observe heartbeat within the
+        window) are lazily evicted before answering.
+        """
+        key = canonicalize_session_key(session_key)
+        if ttl_ms is not None:
+            self._evict_expired(key, ttl_ms)
+        watchers = self._watchers.get(key)
         return bool(watchers)
 
-    def watcher_count(self, session_key: str) -> int:
-        """Return the number of active watchers for a session."""
-        watchers = self._watchers.get(canonicalize_session_key(session_key))
+    def watcher_count(self, session_key: str, ttl_ms: int | None = None) -> int:
+        """Return the number of active watchers for a session.
+
+        With ``ttl_ms``, stale entries (no observe heartbeat within the
+        window) are lazily evicted before answering.
+        """
+        key = canonicalize_session_key(session_key)
+        if ttl_ms is not None:
+            self._evict_expired(key, ttl_ms)
+        watchers = self._watchers.get(key)
         return len(watchers) if watchers else 0
 
 
@@ -454,7 +491,7 @@ async def _maybe_continue_goal_impl(
         )
 
     if not config.continue_unwatched and not get_goal_watcher_registry().has_watchers(
-        session_key
+        session_key, ttl_ms=int(config.watcher_ttl_seconds) * 1000
     ):
         # No observer: stop the loop without touching the goal ledger. The plan
         # run stays paused at ``goal_turn_finished`` so a later
