@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,66 @@ def _undo_leaked_cli_structlog_default():
             structlog.configure(**old_config)
         else:
             structlog.reset_defaults()
+
+
+@pytest.fixture(scope="session")
+def _migrated_db_template(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Path]:
+    """Build one pristine latest-schema SQLite database per pytest session.
+
+    This fixture is only for ordinary tests that require the current schema.
+    Migration, rollback, schema-ahead, audit, and lock tests must continue to
+    create their databases from scratch and call the migrator explicitly.
+    """
+    import hashlib
+    import sqlite3
+
+    from opensquilla.persistence.migrator import apply_pending
+
+    template = tmp_path_factory.mktemp("migrated-db-template") / "template.db"
+    applied = apply_pending(str(template), _REPO_ROOT / "migrations")
+    assert applied, "fresh migrated test template did not apply any migrations"
+
+    connection = sqlite3.connect(template)
+    try:
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    finally:
+        connection.close()
+
+    sidecars = tuple(Path(f"{template}{suffix}") for suffix in ("-wal", "-shm"))
+    assert not any(path.exists() for path in sidecars)
+    pristine_digest = hashlib.sha256(template.read_bytes()).digest()
+
+    yield template
+
+    assert hashlib.sha256(template.read_bytes()).digest() == pristine_digest
+    assert not any(path.exists() for path in sidecars)
+
+
+@pytest.fixture
+def migrated_db_factory(
+    tmp_path: Path,
+    _migrated_db_template: Path,
+) -> Callable[[str | None], Path]:
+    """Return a factory that copies the pristine schema into isolated test DBs."""
+    import itertools
+    import shutil
+
+    sequence = itertools.count()
+
+    def copy_template(filename: str | None = None) -> Path:
+        destination = tmp_path / (filename or f"test-{next(sequence)}.db")
+        shutil.copyfile(_migrated_db_template, destination)
+        return destination
+
+    return copy_template
+
+
+@pytest.fixture
+def migrated_db(migrated_db_factory: Callable[[str | None], Path]) -> Path:
+    """Return an isolated latest-schema database for one test."""
+    return migrated_db_factory(None)
 
 
 @pytest.fixture(scope="session")

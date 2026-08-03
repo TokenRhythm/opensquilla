@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -28,12 +30,29 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[1].parent / "migrations"
 
 
 @pytest.fixture
-def writer(tmp_path: Path):
-    db = str(tmp_path / "test.db")
-    apply_pending(db, MIGRATIONS_DIR)
-    w = open_meta_run_writer(db)
+def writer(migrated_db: Path) -> Iterator[MetaRunWriter]:
+    w = open_meta_run_writer(str(migrated_db))
     yield w
     w.close()
+
+
+def test_migrated_db_factory_produces_current_isolated_copies(
+    migrated_db_factory: Callable[[str | None], Path],
+) -> None:
+    first = migrated_db_factory("first.db")
+    second = migrated_db_factory("second.db")
+
+    assert apply_pending(str(first), MIGRATIONS_DIR) == []
+    with sqlite3.connect(first) as connection:
+        connection.execute("CREATE TABLE template_isolation_probe (value TEXT)")
+
+    with sqlite3.connect(second) as connection:
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        probe = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'template_isolation_probe'"
+        ).fetchone()
+    assert probe is None
 
 
 def _make_plan(name: str = "demo") -> MetaPlan:
@@ -522,11 +541,9 @@ def test_cancelled_status_distinct(writer: MetaRunWriter) -> None:
     assert record.final_text is None
 
 
-def test_writer_failures_dont_raise(tmp_path: Path) -> None:
+def test_writer_failures_dont_raise(migrated_db: Path) -> None:
     """Fail-open contract: writer methods log + swallow."""
-    db = str(tmp_path / "test.db")
-    apply_pending(db, MIGRATIONS_DIR)
-    w = open_meta_run_writer(db)
+    w = open_meta_run_writer(str(migrated_db))
     w.close()  # connection now closed
     # Subsequent calls must not raise
     assert w.begin_run_sync(
@@ -594,19 +611,15 @@ _DAY_MS = 24 * 60 * 60 * 1000
 
 
 def _open_clocked_writer(
-    tmp_path: Path,
+    migrated_db: Path,
     *,
     retention_days: int = 90,
     prune_every: int = 1,
     prune_batch: int = 1_000,
 ) -> tuple[MetaRunWriter, dict[str, int]]:
     """Migrated writer with a mutable fake clock for retention tests."""
-    import sqlite3
-
-    db = str(tmp_path / "retention.db")
-    apply_pending(db, MIGRATIONS_DIR)
     clock = {"now_ms": 0}
-    conn = sqlite3.connect(db, check_same_thread=False, isolation_level=None)
+    conn = sqlite3.connect(migrated_db, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     writer = MetaRunWriter(
@@ -630,8 +643,8 @@ def _begin(writer: MetaRunWriter, *, session_key: str | None) -> str:
     return run_id
 
 
-def test_retention_prunes_old_terminal_runs_and_cascades_steps(tmp_path: Path) -> None:
-    writer, clock = _open_clocked_writer(tmp_path, retention_days=90, prune_every=1)
+def test_retention_prunes_old_terminal_runs_and_cascades_steps(migrated_db: Path) -> None:
+    writer, clock = _open_clocked_writer(migrated_db, retention_days=90, prune_every=1)
     try:
         plan = _make_plan()
         old_ok = _begin(writer, session_key="s-old-ok")
@@ -671,8 +684,8 @@ def test_retention_prunes_old_terminal_runs_and_cascades_steps(tmp_path: Path) -
         writer.close()
 
 
-def test_retention_keeps_terminal_runs_inside_window(tmp_path: Path) -> None:
-    writer, clock = _open_clocked_writer(tmp_path, retention_days=90, prune_every=1)
+def test_retention_keeps_terminal_runs_inside_window(migrated_db: Path) -> None:
+    writer, clock = _open_clocked_writer(migrated_db, retention_days=90, prune_every=1)
     try:
         recent_ok = _begin(writer, session_key="s-recent")
         writer.finish_run_sync(run_id=recent_ok, status="ok", result=None)
@@ -685,8 +698,8 @@ def test_retention_keeps_terminal_runs_inside_window(tmp_path: Path) -> None:
         writer.close()
 
 
-def test_retention_prune_cadence_honours_prune_every(tmp_path: Path) -> None:
-    writer, clock = _open_clocked_writer(tmp_path, retention_days=90, prune_every=3)
+def test_retention_prune_cadence_honours_prune_every(migrated_db: Path) -> None:
+    writer, clock = _open_clocked_writer(migrated_db, retention_days=90, prune_every=3)
     try:
         old = _begin(writer, session_key="s-old")  # begin #1 — no prune
         writer.finish_run_sync(run_id=old, status="ok", result=None)
@@ -701,9 +714,9 @@ def test_retention_prune_cadence_honours_prune_every(tmp_path: Path) -> None:
         writer.close()
 
 
-def test_retention_pruning_is_bounded_and_keeps_live_runs(tmp_path: Path) -> None:
+def test_retention_pruning_is_bounded_and_keeps_live_runs(migrated_db: Path) -> None:
     writer, clock = _open_clocked_writer(
-        tmp_path,
+        migrated_db,
         retention_days=90,
         prune_every=8,
         prune_batch=2,
@@ -743,17 +756,15 @@ def test_retention_pruning_is_bounded_and_keeps_live_runs(tmp_path: Path) -> Non
         writer.close()
 
 
-def test_retention_defaults_via_open_meta_run_writer_kwargs(tmp_path: Path) -> None:
-    db = str(tmp_path / "kwargs.db")
-    apply_pending(db, MIGRATIONS_DIR)
-    w = open_meta_run_writer(db, retention_days=7, prune_every=16)
+def test_retention_defaults_via_open_meta_run_writer_kwargs(migrated_db: Path) -> None:
+    w = open_meta_run_writer(str(migrated_db), retention_days=7, prune_every=16)
     try:
         assert w._retention_days == 7
         assert w._prune_every == 16
     finally:
         w.close()
     # Backward-compatible positional-only call keeps working with defaults.
-    w2 = open_meta_run_writer(db)
+    w2 = open_meta_run_writer(str(migrated_db))
     try:
         assert w2._retention_days == 90
         assert w2._prune_every == 64
