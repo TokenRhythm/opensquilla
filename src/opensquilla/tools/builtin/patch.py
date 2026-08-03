@@ -582,15 +582,15 @@ def _gate_patch_ops(
 
 
 def _match_line(actual: str, expected: str) -> bool:
-    """Return whether two lines match, tolerating minor whitespace drift.
+    """Return whether hunk anchor lines differ only by trailing space or tab.
 
-    Only the line endings and trailing whitespace are normalized for the
-    comparison.  The applied result keeps the original file bytes, so this
-    tolerance never rewrites content; it only decides whether a hunk's
-    context/delete lines anchor on the current file state.  This avoids
-    spurious retry-until-timeout loops on CRLF files or trailing-space drift.
+    Prefer an exact match.  The fallback keeps leading, non-ASCII, and other
+    whitespace significant while tolerating ASCII horizontal whitespace at
+    the end of context and delete lines.
     """
-    return actual.rstrip("\r\n").rstrip() == expected.rstrip("\r\n").rstrip()
+    if actual == expected:
+        return True
+    return actual.rstrip("\r\n").rstrip(" \t") == expected.rstrip("\r\n").rstrip(" \t")
 
 
 def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
