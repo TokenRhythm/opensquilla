@@ -179,6 +179,51 @@ async def test_goals_set_creates_goal_plan_run_and_first_send(
 
 
 @pytest.mark.asyncio
+async def test_goal_driver_turn_injects_goal_run_into_runtime_services(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[TaskRun] = []
+
+    async def handler(run: TaskRun) -> None:
+        captured.append(run)
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-inject.sqlite",
+        handler=handler,
+    ) as stack:
+        response = await _handle_goals_set(
+            {
+                "sessionKey": SOURCE_KEY,
+                "message": "Ship the goal mode.",
+                "clientRequestId": "goal-inject-1",
+            },
+            stack.context,
+        )
+        terminal = await stack.runtime.wait(response["turnId"], timeout=2.0)
+        assert terminal.status == AgentTaskStatus.SUCCEEDED
+
+        assert len(captured) == 1
+        envelope = captured[0].envelope
+        plan_run = envelope.runtime_services.get("plan_run")
+        assert plan_run is not None
+        assert plan_run.driver_kind == "goal"
+        goal_run = envelope.runtime_services.get("goal_run")
+        assert goal_run is not None
+        assert goal_run.goal_id == response["goalId"]
+        assert goal_run.goal_text == "Ship the goal mode."
+        assert goal_run.plan_run_id == plan_run.run_id
+
+        tool_context = envelope.tool_context(is_owner=True)
+        assert tool_context.goal_run is goal_run
+        assert tool_context.plan_run is plan_run
+
+
+@pytest.mark.asyncio
 async def test_goals_status_snapshots_active_goal_and_plan_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

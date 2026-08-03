@@ -647,6 +647,7 @@ def tool_context_from_envelope(
         user_input_provider=envelope.runtime_services.get("user_input_provider"),
         plan_revision=envelope.runtime_services.get("plan_revision"),
         plan_run=envelope.runtime_services.get("plan_run"),
+        goal_run=envelope.runtime_services.get("goal_run"),
     )
     if sandbox_run_context_fresh:
         # Runtime-only authority marker copied from the RouteEnvelope field,

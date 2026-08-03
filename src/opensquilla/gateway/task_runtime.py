@@ -2999,6 +2999,29 @@ class TaskRuntime:
         await self._emit_plan_run(task.envelope.session_key, updated)
         if str(getattr(updated, "status", "")) != "running":
             raise RuntimeError("The selected plan revision is no longer executable")
+        # Goal driver runs additionally carry their authoritative GoalRunRecord
+        # so the prompt layer can render the live "Active Goal" contract. The
+        # goal entity is optional: its absence only degrades the prompt, and
+        # the caller spreads ``task.envelope.runtime_services`` into the
+        # replaced envelope alongside ``plan_run``.
+        if (
+            str(getattr(updated, "driver_kind", "")) == "goal"
+            and str(getattr(updated, "driver_id", "") or "").strip()
+        ):
+            goal_id = str(getattr(updated, "driver_id", "") or "").strip()
+            get_goal_run = getattr(self._storage, "get_goal_run", None)
+            goal_run = (
+                await get_goal_run(goal_id) if callable(get_goal_run) else None
+            )
+            if goal_run is None:
+                log.warning(
+                    "attached_goal_run_missing",
+                    goal_id=goal_id,
+                    run_id=run_id,
+                    session_key=task.envelope.session_key,
+                )
+            else:
+                task.envelope.runtime_services["goal_run"] = goal_run
         return updated
 
     async def _settle_attached_plan_run(self, task: _RuntimeTask) -> None:

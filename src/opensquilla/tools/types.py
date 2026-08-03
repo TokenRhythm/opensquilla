@@ -178,6 +178,9 @@ class ToolContext:
     # run. Runtime-only prompt input; checkpoint tools continue to read live
     # storage for compare-and-set transitions.
     plan_run: Any | None = field(default=None, repr=False)
+    # Authoritative GoalRunRecord captured for a Goal driver run, alongside its
+    # attached PlanRun. Runtime-only prompt input; mirrors ``plan_run``.
+    goal_run: Any | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

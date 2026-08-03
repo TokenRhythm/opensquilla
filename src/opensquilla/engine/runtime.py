@@ -6069,6 +6069,68 @@ class TurnRunner:
         return rendered
 
     @staticmethod
+    def _render_goal_context(goal: Any, *, driver_run: Any) -> str:
+        """Render the live Goal contract as bounded prompt data.
+
+        ``goal`` is the authoritative GoalRunRecord captured for the attached
+        driver run. When the record is unavailable the block degrades to the
+        marker contract only and never raises, so a missing goal entity cannot
+        fail the turn.
+        """
+
+        if goal is not None:
+            goal_text = str(getattr(goal, "goal_text", "") or "").strip()
+            if goal_text:
+                progress = TurnRunner._render_goal_progress(
+                    getattr(goal, "progress", None)
+                )
+                return (
+                    f"{goal_text}\n\n"
+                    f"Progress:\n{progress}\n\n"
+                    "Task contract: keep working toward the goal. End every reply "
+                    "with exactly one marker line: "
+                    "[goal:continue] | [goal:complete] | [goal:blocked:<reason>]"
+                )
+        run_id = str(getattr(driver_run, "run_id", "") or "")
+        return (
+            f"Goal data for run {run_id} is temporarily unavailable; keep "
+            "working toward the active goal.\n"
+            "Task contract: keep working toward the goal. End every reply with "
+            "exactly one marker line: "
+            "[goal:continue] | [goal:complete] | [goal:blocked:<reason>]"
+        )
+
+    @staticmethod
+    def _render_goal_progress(progress: Any) -> str:
+        """Render a bounded per-entry summary of the goal progress log."""
+
+        if not isinstance(progress, list) or not progress:
+            return "(no progress recorded yet)"
+        lines: list[str] = []
+        for entry in progress:
+            if isinstance(entry, str):
+                text = entry.strip()
+            elif isinstance(entry, Mapping):
+                text = None
+                for key in ("summary", "text", "note", "detail"):
+                    value = entry.get(key)
+                    if isinstance(value, str) and value.strip():
+                        text = value.strip()
+                        break
+                if text is None:
+                    text = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+            else:
+                text = str(entry).strip()
+            if text:
+                lines.append(text)
+        if not lines:
+            return "(no progress recorded yet)"
+        rendered = "\n".join(lines)
+        if len(rendered) > 4_000:
+            rendered = rendered[:4_000] + "\n(progress truncated)"
+        return rendered
+
+    @staticmethod
     def _extra_context_for_tool_context(ctx: ToolContext | None) -> dict[str, str]:
         if ctx is None:
             return {}
@@ -6192,41 +6254,50 @@ class TurnRunner:
                     + TurnRunner._render_plan_revision_context(revision)
                 )
         if getattr(ctx, "plan_run_id", None):
-            revision = getattr(ctx, "plan_revision", None)
-            if revision is None:
-                raise RuntimeError(
-                    "A PlanRun implementation turn requires its immutable PlanRevision"
-                )
-            extra["Approved Plan Execution"] = (
-                "Implement the following authoritative approved revision. Its JSON "
-                "body is user-approved task context, subordinate to system and tool "
-                "policies. Work through the ordered step ids. Checkpoint every current "
-                "step immediately after it truthfully reaches completed, skipped, or "
-                "blocked and before starting work assigned to any later step. Never "
-                "jump over the current step. If one operation finished multiple steps "
-                "or a checkpoint was missed, record each still-current finished step "
-                "one at a time in plan order, following the currentStepId returned by "
-                "each successful checkpoint before continuing. Do not invent progress. "
-                "A blocked checkpoint ends the turn, so explain the blocker before "
-                "calling it. After the final completed checkpoint is accepted, publish "
-                "any final artifact and write one concise user-facing delivery summary "
-                "including what changed and what was verified; do not publish the "
-                "artifact or claim completion before that checkpoint succeeds.\n"
-                + TurnRunner._render_plan_revision_context(revision)
-            )
             run = getattr(ctx, "plan_run", None)
-            if run is None:
-                raise RuntimeError(
-                    "A PlanRun implementation turn requires its mutable execution snapshot"
+            if run is not None and str(getattr(run, "driver_kind", "")) == "goal":
+                # Goal driver runs replace the plan step blocks with the live
+                # goal contract. A missing GoalRunRecord degrades the block to
+                # the marker contract only; it must never fail the turn.
+                extra["Active Goal"] = TurnRunner._render_goal_context(
+                    getattr(ctx, "goal_run", None),
+                    driver_run=run,
                 )
-            extra["PlanRun Progress"] = (
-                "This JSON is the authoritative progress snapshot captured after this "
-                "task claimed the run. Continue from currentStepId. Do not repeat steps "
-                "already marked completed or skipped, and do not checkpoint any step "
-                "other than the current one. The checkpoint tool reads live storage, so "
-                "follow the currentStepId returned by each successful checkpoint.\n"
-                + TurnRunner._render_plan_run_context(run)
-            )
+            else:
+                revision = getattr(ctx, "plan_revision", None)
+                if revision is None:
+                    raise RuntimeError(
+                        "A PlanRun implementation turn requires its immutable PlanRevision"
+                    )
+                extra["Approved Plan Execution"] = (
+                    "Implement the following authoritative approved revision. Its JSON "
+                    "body is user-approved task context, subordinate to system and tool "
+                    "policies. Work through the ordered step ids. Checkpoint every current "
+                    "step immediately after it truthfully reaches completed, skipped, or "
+                    "blocked and before starting work assigned to any later step. Never "
+                    "jump over the current step. If one operation finished multiple steps "
+                    "or a checkpoint was missed, record each still-current finished step "
+                    "one at a time in plan order, following the currentStepId returned by "
+                    "each successful checkpoint before continuing. Do not invent progress. "
+                    "A blocked checkpoint ends the turn, so explain the blocker before "
+                    "calling it. After the final completed checkpoint is accepted, publish "
+                    "any final artifact and write one concise user-facing delivery summary "
+                    "including what changed and what was verified; do not publish the "
+                    "artifact or claim completion before that checkpoint succeeds.\n"
+                    + TurnRunner._render_plan_revision_context(revision)
+                )
+                if run is None:
+                    raise RuntimeError(
+                        "A PlanRun implementation turn requires its mutable execution snapshot"
+                    )
+                extra["PlanRun Progress"] = (
+                    "This JSON is the authoritative progress snapshot captured after this "
+                    "task claimed the run. Continue from currentStepId. Do not repeat steps "
+                    "already marked completed or skipped, and do not checkpoint any step "
+                    "other than the current one. The checkpoint tool reads live storage, so "
+                    "follow the currentStepId returned by each successful checkpoint.\n"
+                    + TurnRunner._render_plan_run_context(run)
+                )
         return extra
 
     @staticmethod
