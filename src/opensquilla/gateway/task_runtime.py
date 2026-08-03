@@ -34,7 +34,11 @@ import structlog
 
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.outcome import completed_outcome, outcome_from_error
-from opensquilla.gateway.goal_driver import maybe_continue_goal
+from opensquilla.gateway.goal_driver import (
+    drive_due_goal_retries,
+    maybe_continue_goal,
+    recover_goal_runs_after_restart,
+)
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.session_lifecycle import TaskLifecycleEvent, TaskLifecycleListener
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
@@ -710,6 +714,7 @@ class TaskRuntime:
         # Goal continuation guardrails (``[goal]`` config section). ``None``
         # falls back to the module defaults in ``goal_driver.maybe_continue_goal``.
         self._goal_config = goal_config
+        self._goal_retry_loop_task: asyncio.Task[None] | None = None
         from opensquilla.gateway.user_input_broker import StructuredUserInputBroker
 
         self._user_input_broker = StructuredUserInputBroker()
@@ -2135,6 +2140,14 @@ class TaskRuntime:
             Deadline (seconds) for the graceful drain phase.  ``None`` means
             wait indefinitely (use with care in production; set a finite value).
         """
+        loop_task = self._goal_retry_loop_task
+        self._goal_retry_loop_task = None
+        if loop_task is not None and not loop_task.done():
+            loop_task.cancel()
+            try:
+                await loop_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown path
+                pass
         auxiliary_tasks = [
             task
             for task in self._auxiliary_tasks_by_session.values()
@@ -2824,7 +2837,60 @@ class TaskRuntime:
             # driver is best-effort: it swallows its own errors and never
             # raises into the turn terminal flow.
             await maybe_continue_goal(self, task, config=self._goal_config)
+            # Transient failures and enqueue rejections schedule a retry; make
+            # sure the retry loop exists to drive them.
+            self._ensure_goal_retry_loop()
             _cleanup_guest_profile(task)
+
+    def _ensure_goal_retry_loop(self) -> None:
+        """Start the goal retry loop once (idempotent; used by tests too)."""
+
+        if self._goal_retry_loop_task is not None and not self._goal_retry_loop_task.done():
+            return
+        if self._goal_config is None:
+            from opensquilla.gateway.config import GoalConfig
+
+            self._goal_config = GoalConfig()
+        self._goal_retry_loop_task = asyncio.create_task(self._goal_retry_loop())
+
+    async def _goal_retry_loop(self) -> None:
+        """Periodically enqueue due goal retries until shutdown."""
+
+        from opensquilla.gateway.config import GoalConfig
+
+        config: GoalConfig = cast("GoalConfig", self._goal_config)
+        interval = float(getattr(config, "retry_poll_interval_seconds", 10) or 10)
+        while True:
+            # Sleep first so the loop never races the finishing turn's own
+            # storage work: the hook that scheduled the retry already ran, and
+            # the due time is at least one backoff interval in the future.
+            await asyncio.sleep(interval)
+            try:
+                await drive_due_goal_retries(
+                    self,
+                    self._storage,
+                    config=config,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - loop must survive per-tick errors
+                log.warning("task_runtime.goal_retry_tick_failed", exc_info=True)
+
+    async def recover_goal_runs_after_restart(self) -> dict[str, int]:
+        """Reconcile durable goal runs after a gateway restart (boot hook)."""
+
+        config = self._goal_config
+        if config is None:
+            from opensquilla.gateway.config import GoalConfig
+
+            config = self._goal_config = GoalConfig()
+        result = await recover_goal_runs_after_restart(
+            self,
+            self._storage,
+            config=config,
+        )
+        self._ensure_goal_retry_loop()
+        return result
 
     async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
         """Snapshot session collaboration state at the actual turn boundary.

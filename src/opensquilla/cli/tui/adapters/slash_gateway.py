@@ -390,6 +390,11 @@ _GOAL_TERMINAL_STATUSES = frozenset({"complete", "blocked"})
 # Plan run statuses that settle the owning goal run (driverKind == "goal").
 _GOAL_PLAN_RUN_TERMINAL_STATUSES = frozenset({"completed", "cancelled"})
 
+# How often the watch loop refreshes the goal watcher registration. The server
+# evicts watchers that stay silent past ``goal.watcher_ttl_seconds`` (default
+# 900s); a 60s heartbeat keeps a long-running single turn from being evicted.
+_GOAL_HEARTBEAT_INTERVAL_S = 60.0
+
 
 def _goal_payload(frame: Mapping[str, Any]) -> dict[str, Any]:
     payload = frame.get("payload")
@@ -468,6 +473,15 @@ def _print_goal_status(payload: dict[str, Any]) -> None:
     idle = goal.get("idleTurns")
     if isinstance(idle, int):
         console.print(f"[{ACCENT}]idle[/] [dim]{idle}[/dim]")
+    failure_retries = goal.get("failureRetries")
+    if isinstance(failure_retries, int) and failure_retries:
+        console.print(f"[{ACCENT}]retries[/] [dim]{failure_retries}[/dim]")
+    last_error = _goal_reason_text(goal.get("lastError"))
+    if last_error:
+        console.print(f"[{ACCENT}]last error[/] [dim]{last_error}[/dim]")
+    pause_reason = _goal_reason_text(goal.get("pauseReason"))
+    if pause_reason:
+        console.print(f"[{ACCENT}]paused[/] [dim]{pause_reason}[/dim]")
     reason = _goal_reason_text(goal.get("blockedReason")) or _goal_reason_text(
         goal.get("terminalReason")
     )
@@ -592,7 +606,18 @@ async def _goal_status_after_turn(
     if status in _GOAL_TERMINAL_STATUSES:
         return (status, _goal_reason_text(goal.get("terminalReason")))
     if status == "paused":
-        return ("paused", None)
+        reason = _goal_reason_text(goal.get("pauseReason")) or _goal_reason_text(
+            goal.get("lastError")
+        )
+        return ("paused", reason)
+    if status == "running" and goal.get("nextRetryAtMs") is not None:
+        # A transient failure scheduled an automatic retry; keep watching.
+        retries = goal.get("failureRetries")
+        console.print(
+            f"[{ACCENT}]goal[/] [yellow]retry scheduled[/yellow] "
+            f"[dim](attempt {retries}, waiting…)[/dim]"
+        )
+        return None
     return None
 
 
@@ -646,6 +671,24 @@ async def _run_goal_watch(
     terminal: str | None = None
     terminal_reason: str | None = None
     current_turn_id: str | None = None
+
+    async def _heartbeat() -> None:
+        """Refresh the watcher registration so a long turn stays observed."""
+
+        try:
+            while True:
+                await asyncio.sleep(_GOAL_HEARTBEAT_INTERVAL_S)
+                try:
+                    await client.call(
+                        "goals.observe",
+                        {"sessionKey": session_key, "watch": True},
+                    )
+                except Exception:  # noqa: BLE001 - heartbeat is best-effort
+                    pass
+        except asyncio.CancelledError:
+            return
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         async for frame in subscription:
             plan_terminal = _goal_plan_run_terminal(frame)
@@ -690,6 +733,7 @@ async def _run_goal_watch(
     except (KeyboardInterrupt, asyncio.CancelledError):
         console.print(f"\n[{ACCENT}]goal[/] [yellow]watch cancelled[/yellow]")
     finally:
+        heartbeat_task.cancel()
         close = getattr(subscription, "close", None)
         if callable(close):
             try:

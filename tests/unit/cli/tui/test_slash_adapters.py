@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -1525,6 +1526,46 @@ async def test_goal_resume_restarts_watch_until_terminal(monkeypatch: pytest.Mon
     assert "watching" in text
     assert "goal complete" in text
     assert "all done" in text
+
+
+async def test_goal_watch_heartbeats_observe_during_long_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watch loop refreshes the watcher so a long turn is not evicted."""
+
+    recorder = _patch_gateway_io(monkeypatch)
+    monkeypatch.setattr(
+        "opensquilla.cli.tui.adapters.slash_gateway._GOAL_HEARTBEAT_INTERVAL_S",
+        0.01,
+    )
+
+    class _DelayedSubscription(_GoalFakeSubscription):
+        async def __anext__(self) -> dict[str, Any]:
+            # Block long enough for several heartbeat ticks before terminal.
+            await asyncio.sleep(0.06)
+            return await super().__anext__()
+
+    subscription = _DelayedSubscription(
+        [_goal_plan_run_frame(status="completed", reason="all done")]
+    )
+    client = _GoalFakeClient(subscription)
+
+    handled = await handle_gateway_slash_command(
+        "/goal resume",
+        _gateway_context(client, stream_response=_goal_watch_stream),
+    )
+    assert handled is True
+
+    observe_calls = [
+        call
+        for call in client.calls
+        if call[0] == "goals.observe"
+        and isinstance(call[1], dict)
+        and call[1].get("watch") is True
+    ]
+    # Initial registration + at least one heartbeat while the turn was pending.
+    assert len(observe_calls) >= 2
+    assert "goal complete" in recorder.text()
 
 
 async def test_goal_set_watches_until_plan_terminal_then_unobserves_and_pauses_if_running(

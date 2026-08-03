@@ -303,6 +303,18 @@ class GoalRunRecord(SQLModel, table=True):
     idle_turns: int = 0
     blocked_reason: str | None = None
     blocked_retries: int = 0
+    # Consecutive transient failures (provider errors / enqueue admission
+    # rejections) awaiting an automatic retry. Reset when a turn succeeds.
+    failure_retries: int = 0
+    # Next automatic retry timestamp (epoch ms) for a transient failure, or
+    # ``None`` when no retry is scheduled.
+    next_retry_at_ms: int | None = None
+    # Goal-level pause reason (``goal_unwatched`` / ``user_paused`` /
+    # ``goal_turn_cancelled`` …), complementing the bound plan run's
+    # ``pause_reason`` for restart recovery.
+    pause_reason: str | None = None
+    # Last transient failure summary surfaced to users via ``goals.status``.
+    last_error: str | None = None
     plan_run_id: str | None = Field(default=None, index=True)
     started_at: int
     last_turn_at: int | None = None

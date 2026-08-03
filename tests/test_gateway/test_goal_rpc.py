@@ -377,6 +377,84 @@ async def test_goals_status_falls_back_to_latest_completed_goal(
 
 
 @pytest.mark.asyncio
+async def test_goals_resume_restarts_after_transient_turn_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume must work from the goal_turn_failed anchor (failure recovery)."""
+
+    captured: list[TaskRun] = []
+
+    async def handler(run: TaskRun) -> None:
+        captured.append(run)
+        raise RuntimeError("simulated provider overload")
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-resume-failed-anchor.sqlite",
+        handler=handler,
+    ) as stack:
+        set_response = await _handle_goals_set(
+            {
+                "sessionKey": SOURCE_KEY,
+                "message": "Resume after a transient failure.",
+                "clientRequestId": "goal-resume-failed-set",
+            },
+            stack.context,
+        )
+        await stack.runtime.wait(set_response["turnId"], timeout=2.0)
+        goal_id = set_response["goalId"]
+        print(
+            f"DEBUG same={stack.runtime._storage is stack.storage} "
+            f"runtime_conn={stack.runtime._storage.conn is not None} "
+            f"stack_conn={stack.storage.conn is not None}"
+        )
+
+        # Turn 1 failed: the driver parks the plan run at goal_turn_failed and
+        # schedules a retry. The post-turn hook runs inside the turn's own
+        # finally, which outlives ``runtime.wait``, so poll until it lands.
+        deadline = time.monotonic() + 5.0
+        goal = await stack.storage.get_goal_run(goal_id)
+        while (
+            goal is None or goal.failure_retries < 1
+        ) and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+            goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "running"
+        assert goal.failure_retries == 1
+        assert goal.next_retry_at_ms is not None
+
+        plan_run = await stack.storage.get_plan_run(
+            set_response["planRun"]["runId"]
+        )
+        assert plan_run is not None
+        assert plan_run.pause_reason == "goal_turn_failed"
+
+        paused = await _handle_goals_pause({"sessionKey": SOURCE_KEY}, stack.context)
+        assert paused["goal"]["status"] == "paused"
+        assert paused["goal"]["pauseReason"] == "user_paused"
+        assert paused["goal"]["nextRetryAtMs"] is None
+
+        # Resume from the failed anchor enqueues a fresh goal_turn immediately.
+        resumed = await _handle_goals_resume(
+            {"sessionKey": SOURCE_KEY},
+            stack.context,
+        )
+        assert resumed["goal"]["status"] == "running"
+        assert resumed["goal"]["nextRetryAtMs"] is None
+        assert resumed["goal"]["lastError"] is None
+        assert resumed["taskId"]
+        deadline = time.monotonic() + 5.0
+        while len(captured) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert len(captured) == 2
+
+
+@pytest.mark.asyncio
 async def test_goals_set_replaces_old_goal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

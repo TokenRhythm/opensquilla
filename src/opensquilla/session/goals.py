@@ -24,6 +24,13 @@ IDLE_PROGRESS_PROMPT = (
     "[goal:complete]/[goal:blocked:<reason>]"
 )
 
+# Task outcomes that may recover on retry (provider overload / rate limit /
+# transport errors surface as ``failed`` or ``timeout`` turns).
+GOAL_RETRYABLE_TURN_STATUSES = frozenset({"failed", "timeout"})
+# Task outcomes that must never auto-retry: the user cancelled, or the process
+# abandoned the turn during shutdown.
+GOAL_NON_RETRYABLE_TURN_STATUSES = frozenset({"cancelled", "abandoned"})
+
 
 class GoalValidationError(ValueError):
     """Raised when a goal violates its durable wire contract."""
@@ -43,8 +50,89 @@ class GoalAdvance:
     terminal_reason: str | None
 
 
+@dataclass
+class GoalFailureAdvance:
+    """Decision outcome after a failed goal turn (transient vs terminal)."""
+
+    retry_at_ms: int | None
+    terminal: bool
+    terminal_reason: str | None
+
+
 def _now_ms() -> int:
     return int(datetime.now(UTC).timestamp() * 1000)
+
+
+def goal_retry_delay_ms(
+    retry_index: int,
+    *,
+    base_ms: int = 30_000,
+    max_ms: int = 600_000,
+) -> int:
+    """Exponential backoff delay (ms) for goal retry ``retry_index`` (0-based).
+
+    Mirrors the turn-level provider backoff shape (base * 2**index, capped at
+    ``max_ms``) so transient provider pressure backs off instead of hammering.
+    """
+
+    if retry_index < 0:
+        raise GoalValidationError("retry_index must be >= 0")
+    if base_ms < 1 or max_ms < 1:
+        raise GoalValidationError("backoff bounds must be positive")
+    delay = int(min(base_ms * (2**retry_index), max_ms))
+    return max(1, delay)
+
+
+def advance_goal_after_failure(
+    goal: GoalRunRecord,
+    *,
+    task_status: str,
+    failure_retries: int,
+    max_failure_retries: int,
+    base_backoff_ms: int,
+    max_backoff_ms: int,
+    now_ms: int,
+) -> GoalFailureAdvance:
+    """Decide whether a failed goal turn should retry automatically.
+
+    ``task_status`` is the terminal turn outcome (``failed`` / ``timeout`` are
+    retryable; ``cancelled`` / ``abandoned`` are not). A retryable failure
+    schedules the next attempt at ``now + backoff(failure_retries)`` until
+    ``max_failure_retries`` consecutive failures block the goal. Non-retryable
+    outcomes return ``retry_at_ms=None`` with no terminal transition so the
+    caller can park the goal in ``paused`` instead.
+    """
+
+    if max_failure_retries < 1:
+        raise GoalValidationError("max_failure_retries must be positive")
+    if failure_retries < 0:
+        raise GoalValidationError("failure_retries must be >= 0")
+
+    if task_status in GOAL_NON_RETRYABLE_TURN_STATUSES:
+        return GoalFailureAdvance(
+            retry_at_ms=None,
+            terminal=False,
+            terminal_reason=None,
+        )
+    if task_status not in GOAL_RETRYABLE_TURN_STATUSES:
+        raise GoalValidationError(f"unknown goal turn status: {task_status}")
+
+    if failure_retries >= max_failure_retries:
+        return GoalFailureAdvance(
+            retry_at_ms=None,
+            terminal=True,
+            terminal_reason=f"goal_turn_failed_after_retries:{task_status}",
+        )
+    retry_at_ms = now_ms + goal_retry_delay_ms(
+        failure_retries,
+        base_ms=base_backoff_ms,
+        max_ms=max_backoff_ms,
+    )
+    return GoalFailureAdvance(
+        retry_at_ms=retry_at_ms,
+        terminal=False,
+        terminal_reason=None,
+    )
 
 
 def _bounded_goal_text(value: Any) -> str:
@@ -110,6 +198,10 @@ def goal_run_snapshot(run: GoalRunRecord) -> dict[str, Any]:
         "idleTurns": run.idle_turns,
         "blockedReason": run.blocked_reason,
         "blockedRetries": run.blocked_retries,
+        "failureRetries": run.failure_retries,
+        "nextRetryAtMs": run.next_retry_at_ms,
+        "pauseReason": run.pause_reason,
+        "lastError": run.last_error,
         "planRunId": run.plan_run_id,
         "startedAt": run.started_at,
         "lastTurnAt": run.last_turn_at,

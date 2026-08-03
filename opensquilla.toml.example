@@ -386,6 +386,37 @@ max_concurrency = 4
 # Waiting tasks per session before new follow-up work is rejected.
 max_pending_per_session = 64
 
+[goal]
+# Session-level `/goal` mode: guardrails for the automatic continuation driver.
+# max_turns: turn count at which a goal run blocks
+# (terminal_reason="goal_continuation_limit_reached"). Default: 50.
+# max_turns = 50
+# Consecutive no-marker turns before a nudge prompt is injected. Default: 2.
+# idle_turns = 2
+# Consecutive same-cause [goal:blocked:<reason>] markers before the run blocks.
+# Default: 3.
+# blocked_retries = 3
+# Consecutive transient turn failures (provider overload / rate limit /
+# transport errors) before the run blocks with
+# terminal_reason="goal_turn_failed_after_retries:<status>". Default: 3.
+# failure_retries = 3
+# Exponential backoff bounds (ms) for automatic retries after a transient
+# failure or enqueue admission rejection. Defaults: 30s base, 10m cap.
+# retry_base_backoff_ms = 30000
+# retry_max_backoff_ms = 600000
+# How often (s) the gateway scans for due goal retries. Default: 10.
+# retry_poll_interval_seconds = 10
+# Non-null: wall-clock budget (seconds) after which a goal run blocks
+# (terminal_reason="goal_runtime_budget_exceeded"). Default: unlimited.
+# runtime_budget_seconds = 3600
+# False: only auto-continue while a chat client is observing the goal.
+# True: keep auto-continuing unattended (burns tokens until a guardrail stops).
+# continue_unwatched = false
+# Seconds a watcher stays eligible without a goals.observe heartbeat; the TUI
+# watch loop heartbeats every 60s, so this must stay comfortably above 60.
+# Default: 900.
+# watcher_ttl_seconds = 900
+
 [squilla_router]
 enabled = true           # V4 model router
 auto_thinking = true

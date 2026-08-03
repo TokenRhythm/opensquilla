@@ -20,6 +20,7 @@ from typing import Any
 import structlog
 
 from opensquilla.gateway.goal_driver import (
+    _GOAL_RESUMABLE_PAUSE_REASONS,
     GOAL_CONTINUATION_MESSAGE,
     build_goal_route_envelope,
     enqueue_goal_continuation,
@@ -448,6 +449,8 @@ async def _handle_goals_pause(params: dict | None, ctx: RpcContext) -> dict:
             goal.goal_id,
             expected_updated_at=int(goal.updated_at),
             status="paused",
+            pause_reason="user_paused",
+            next_retry_at_ms=None,
         )
     except GoalConflictError as exc:
         raise _goal_changed_error(exc, goal) from exc
@@ -485,6 +488,9 @@ async def _handle_goals_resume(params: dict | None, ctx: RpcContext) -> dict:
             goal.goal_id,
             expected_updated_at=int(goal.updated_at),
             status="running",
+            pause_reason=None,
+            next_retry_at_ms=None,
+            last_error=None,
         )
     except GoalConflictError as exc:
         raise _goal_changed_error(exc, goal) from exc
@@ -498,7 +504,7 @@ async def _handle_goals_resume(params: dict | None, ctx: RpcContext) -> dict:
     if (
         plan_run is None
         or str(plan_run.status) != "paused"
-        or str(plan_run.pause_reason or "") != "goal_turn_finished"
+        or str(plan_run.pause_reason or "") not in _GOAL_RESUMABLE_PAUSE_REASONS
     ):
         plan_run = None
     if plan_run is not None and ctx.task_runtime is not None:

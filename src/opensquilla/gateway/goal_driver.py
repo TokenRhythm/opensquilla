@@ -28,7 +28,9 @@ from opensquilla.gateway.config import GoalConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.session.goals import (
     GoalConflictError,
+    advance_goal_after_failure,
     advance_goal_after_turn,
+    goal_retry_delay_ms,
     parse_goal_status_marker,
 )
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
@@ -51,8 +53,34 @@ _PLAN_RUN_TERMINAL_STATUSES = frozenset({"completed", "cancelled", "superseded"}
 
 # Goal plan runs are paused by ``_settle_attached_plan_run`` with exactly this
 # reason when their owning turn succeeded. Failed/cancelled turns use
-# ``goal_turn_<outcome>`` and must NOT auto-continue (no resurrection loop).
+# ``goal_turn_<outcome>``.
 _GOAL_TURN_FINISHED_PAUSE_REASON = "goal_turn_finished"
+
+# Transient turn outcomes the driver may retry automatically after a backoff
+# (provider overload / rate limit / transport errors surface as failed or
+# timeout turns). Non-retryable outcomes (cancelled / abandoned) park the goal
+# in ``paused`` instead of resurrecting user-interrupted or shutdown-dropped
+# work.
+_GOAL_RETRYABLE_PAUSE_REASONS = frozenset({"goal_turn_failed", "goal_turn_timeout"})
+
+# Every pause reason that still has a resumable execution pipeline (the bound
+# plan run is paused, not terminal), used by ``goals.resume`` and the restart
+# recovery scan.
+_GOAL_RESUMABLE_PAUSE_REASONS = frozenset(
+    {
+        _GOAL_TURN_FINISHED_PAUSE_REASON,
+        "goal_turn_failed",
+        "goal_turn_timeout",
+        "goal_unwatched",
+        "goal_turn_cancelled",
+        "goal_turn_abandoned",
+    }
+)
+
+# Goal-level pause reasons recorded on the ledger when the driver parks a run.
+_GOAL_PAUSE_REASON_UNWATCHED = "goal_unwatched"
+_GOAL_PAUSE_REASON_TURN_CANCELLED = "goal_turn_cancelled"
+_GOAL_PAUSE_REASON_TURN_ABANDONED = "goal_turn_abandoned"
 
 
 class GoalWatcherRegistry:
@@ -451,13 +479,15 @@ async def _maybe_continue_goal_impl(
         return None
     if str(getattr(plan_run, "driver_kind", "")) != "goal":
         return None
-    # Only a successfully settled turn may drive the next one. Failed/cancelled
-    # turns pause the run with ``goal_turn_<outcome>``; auto-continuing those
-    # would resurrect interrupted or failed work without a user intent.
+    # Only a paused plan run at a resumable anchor may drive the next turn.
+    # ``goal_turn_finished`` continues immediately; ``goal_turn_failed`` /
+    # ``goal_turn_timeout`` schedule an automatic retry with backoff;
+    # ``goal_turn_cancelled`` / ``goal_turn_abandoned`` park the goal paused so
+    # user-interrupted or shutdown-dropped work is never resurrected silently.
+    pause_reason = str(getattr(plan_run, "pause_reason", "") or "")
     if (
         str(getattr(plan_run, "status", "")) != "paused"
-        or str(getattr(plan_run, "pause_reason", "") or "")
-        != _GOAL_TURN_FINISHED_PAUSE_REASON
+        or pause_reason not in _GOAL_RESUMABLE_PAUSE_REASONS
     ):
         return None
     goal_id = str(getattr(plan_run, "driver_id", "") or "").strip()
@@ -496,6 +526,29 @@ async def _maybe_continue_goal_impl(
         )
         return None
 
+    if pause_reason in _GOAL_RETRYABLE_PAUSE_REASONS:
+        await _handle_goal_turn_failure(
+            storage,
+            task,
+            plan_run,
+            goal,
+            config=config,
+            now_ms=now_ms,
+        )
+        return None
+    if pause_reason in {
+        _GOAL_PAUSE_REASON_TURN_CANCELLED,
+        _GOAL_PAUSE_REASON_TURN_ABANDONED,
+    }:
+        await _park_goal_after_non_retryable_failure(
+            storage,
+            goal,
+            pause_reason=pause_reason,
+            now_ms=now_ms,
+        )
+        return None
+
+    # ``goal_turn_finished``: marker-driven continuation below.
     if not config.continue_unwatched and not get_goal_watcher_registry().has_watchers(
         session_key, ttl_ms=int(config.watcher_ttl_seconds) * 1000
     ):
@@ -592,7 +645,7 @@ async def _maybe_continue_goal_impl(
         return None
 
     try:
-        await storage.update_goal_run(
+        updated_goal = await storage.update_goal_run(
             goal.goal_id,
             expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
             **fields,
@@ -603,7 +656,7 @@ async def _maybe_continue_goal_impl(
     message = GOAL_CONTINUATION_MESSAGE
     if advance.inject_prompt:
         message = f"{message}\n\n{advance.inject_prompt}"
-    return await enqueue_goal_continuation(
+    handle = await enqueue_goal_continuation(
         runtime,
         session_key=session_key,
         run_id=run_id,
@@ -611,6 +664,189 @@ async def _maybe_continue_goal_impl(
         message=message,
         envelope_seed=envelope,
     )
+    if handle is None:
+        # Enqueue admission failed (session overflow / queue full): schedule an
+        # automatic retry with backoff instead of silently parking the loop.
+        await _record_enqueue_backoff(
+            storage,
+            updated_goal,
+            config=config,
+            now_ms=now_ms,
+        )
+    return handle
+
+
+async def _handle_goal_turn_failure(
+    storage: Any,
+    task: Any,
+    plan_run: Any,
+    goal: Any,
+    *,
+    config: GoalConfig,
+    now_ms: int,
+) -> None:
+    """Record one transient turn failure and schedule an automatic retry.
+
+    Retryable outcomes (``failed`` / ``timeout``) increment ``failure_retries``
+    and set ``next_retry_at_ms`` with exponential backoff; the retry loop
+    (``drive_due_goal_retries``) enqueues the next attempt once due. Exhausting
+    ``goal.failure_retries`` blocks the goal. Non-retryable outcomes park the
+    goal in ``paused`` so the user decides (``/goal resume``).
+    """
+
+    raw_status = getattr(task, "status", None)
+    task_status = str(
+        getattr(raw_status, "value", None) or raw_status or "failed"
+    )
+    retries = int(getattr(goal, "failure_retries", 0) or 0)
+    advance = advance_goal_after_failure(
+        goal,
+        task_status=task_status,
+        failure_retries=retries,
+        max_failure_retries=int(config.failure_retries),
+        base_backoff_ms=int(config.retry_base_backoff_ms),
+        max_backoff_ms=int(config.retry_max_backoff_ms),
+        now_ms=now_ms,
+    )
+    fields: dict[str, Any] = {
+        "turns": int(getattr(goal, "turns", 0) or 0) + 1,
+        "last_turn_at": now_ms,
+        "failure_retries": retries + 1,
+        "last_error": f"turn_{task_status}",
+    }
+    if advance.retry_at_ms is not None:
+        fields["status"] = "running"
+        fields["next_retry_at_ms"] = advance.retry_at_ms
+        log.info(
+            "goal_driver.turn_failure_retry_scheduled",
+            session_key=goal.session_key,
+            goal_id=goal.goal_id,
+            task_status=task_status,
+            failure_retries=retries + 1,
+            retry_at_ms=advance.retry_at_ms,
+        )
+    elif advance.terminal:
+        fields["status"] = "blocked"
+        fields["finished_at"] = now_ms
+        fields["terminal_reason"] = advance.terminal_reason
+        fields["next_retry_at_ms"] = None
+        log.warning(
+            "goal_driver.turn_failure_exhausted",
+            session_key=goal.session_key,
+            goal_id=goal.goal_id,
+            task_status=task_status,
+            terminal_reason=advance.terminal_reason,
+        )
+        await _terminalize_plan_run(
+            storage,
+            plan_run,
+            reason=_PLAN_RUN_TERMINAL_REASON_GOAL_BLOCKED,
+        )
+    else:
+        fields["status"] = "paused"
+        fields["pause_reason"] = (
+            _GOAL_PAUSE_REASON_TURN_CANCELLED
+            if task_status == "cancelled"
+            else _GOAL_PAUSE_REASON_TURN_ABANDONED
+        )
+        fields["next_retry_at_ms"] = None
+        log.info(
+            "goal_driver.turn_failure_parked",
+            session_key=goal.session_key,
+            goal_id=goal.goal_id,
+            task_status=task_status,
+        )
+    try:
+        await storage.update_goal_run(
+            goal.goal_id,
+            expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
+            **fields,
+        )
+    except GoalConflictError:
+        # A concurrent controller (pause/clear/replacement) won; stop.
+        return None
+    return None
+
+
+async def _park_goal_after_non_retryable_failure(
+    storage: Any,
+    goal: Any,
+    *,
+    pause_reason: str,
+    now_ms: int,
+) -> None:
+    """Park a goal whose turn was cancelled/abandoned; never auto-retry."""
+
+    try:
+        await storage.update_goal_run(
+            goal.goal_id,
+            expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
+            status="paused",
+            pause_reason=pause_reason,
+            next_retry_at_ms=None,
+            last_error=f"turn_{pause_reason.removeprefix('goal_turn_')}",
+        )
+    except GoalConflictError:
+        return None
+    log.info(
+        "goal_driver.goal_parked",
+        session_key=goal.session_key,
+        goal_id=goal.goal_id,
+        pause_reason=pause_reason,
+    )
+    return None
+
+
+async def _record_enqueue_backoff(
+    storage: Any,
+    goal: Any,
+    *,
+    config: GoalConfig,
+    now_ms: int,
+) -> None:
+    """Record an enqueue admission failure so the retry loop tries again."""
+
+    retries = int(getattr(goal, "failure_retries", 0) or 0)
+    if retries >= int(config.failure_retries):
+        fields: dict[str, Any] = {
+            "status": "paused",
+            "pause_reason": "goal_enqueue_blocked",
+            "next_retry_at_ms": None,
+            "failure_retries": retries,
+            "last_error": "enqueue_failed",
+        }
+        log.warning(
+            "goal_driver.enqueue_blocked",
+            session_key=goal.session_key,
+            goal_id=goal.goal_id,
+        )
+    else:
+        retry_at_ms = now_ms + goal_retry_delay_ms(
+            retries,
+            base_ms=int(config.retry_base_backoff_ms),
+            max_ms=int(config.retry_max_backoff_ms),
+        )
+        fields = {
+            "failure_retries": retries + 1,
+            "next_retry_at_ms": retry_at_ms,
+            "last_error": "enqueue_failed",
+        }
+        log.warning(
+            "goal_driver.enqueue_backoff_scheduled",
+            session_key=goal.session_key,
+            goal_id=goal.goal_id,
+            failure_retries=retries + 1,
+            retry_at_ms=retry_at_ms,
+        )
+    try:
+        await storage.update_goal_run(
+            goal.goal_id,
+            expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
+            **fields,
+        )
+    except GoalConflictError:
+        return None
+    return None
 
 
 async def _apply_guardrail_block(
@@ -645,6 +881,240 @@ async def _apply_guardrail_block(
         goal_id=goal.goal_id,
         terminal_reason=terminal_reason,
     )
+
+
+async def _enqueue_goal_resume(
+    runtime: Any,
+    storage: Any,
+    goal: Any,
+    plan_run: Any,
+    *,
+    config: GoalConfig,
+    now_ms: int,
+) -> bool:
+    """Enqueue one continuation turn for a resumable goal/plan-run pair.
+
+    Applies the watcher gate (parks the goal as ``paused`` when nobody is
+    watching and ``continue_unwatched`` is false), schedules a backoff when
+    enqueue admission fails, and clears the retry marker on success.
+    """
+
+    if not config.continue_unwatched and not get_goal_watcher_registry().has_watchers(
+        goal.session_key, ttl_ms=int(config.watcher_ttl_seconds) * 1000
+    ):
+        await _park_goal_unwatched(storage, goal, now_ms=now_ms)
+        return False
+    session = await storage.get_session(goal.session_key)
+    envelope_seed = build_goal_route_envelope(
+        session_key=goal.session_key,
+        agent_id=goal.agent_id,
+        session_id=(
+            str(getattr(session, "session_id", "") or "")
+            if session is not None
+            else None
+        ),
+        goal_id=goal.goal_id,
+        run_id=plan_run.run_id,
+        plan_revision_id=str(getattr(plan_run, "plan_revision_id", "") or "") or None,
+        source_name="goal_retry_loop",
+    )
+    handle = await enqueue_goal_continuation(
+        runtime,
+        session_key=goal.session_key,
+        run_id=plan_run.run_id,
+        goal_id=goal.goal_id,
+        message=GOAL_CONTINUATION_MESSAGE,
+        envelope_seed=envelope_seed,
+    )
+    if handle is None:
+        await _record_enqueue_backoff(
+            storage,
+            goal,
+            config=config,
+            now_ms=now_ms,
+        )
+        return False
+    try:
+        await storage.update_goal_run(
+            goal.goal_id,
+            expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
+            next_retry_at_ms=None,
+        )
+    except GoalConflictError:
+        pass
+    return True
+
+
+async def _park_goal_unwatched(
+    storage: Any,
+    goal: Any,
+    *,
+    now_ms: int,
+) -> None:
+    """Park a running goal as paused because nobody is observing it."""
+
+    try:
+        await storage.update_goal_run(
+            goal.goal_id,
+            expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
+            status="paused",
+            pause_reason=_GOAL_PAUSE_REASON_UNWATCHED,
+            next_retry_at_ms=None,
+            last_turn_at=now_ms,
+        )
+    except GoalConflictError:
+        return None
+    log.info(
+        "goal_driver.goal_parked_unwatched",
+        session_key=goal.session_key,
+        goal_id=goal.goal_id,
+    )
+    return None
+
+
+async def drive_due_goal_retries(
+    runtime: Any,
+    storage: Any,
+    *,
+    config: GoalConfig,
+    now_ms: int | None = None,
+) -> int:
+    """Enqueue continuation turns for every goal whose retry time has arrived.
+
+    The retry loop and restart recovery call this; it never raises. Returns the
+    number of turns actually enqueued.
+    """
+
+    now = now_ms if now_ms is not None else _now_ms()
+    list_due = getattr(storage, "list_goal_runs_due_for_retry", None)
+    get_plan_run = getattr(storage, "get_plan_run", None)
+    if not callable(list_due) or not callable(get_plan_run):
+        return 0
+    try:
+        goals = await list_due(now)
+    except Exception:  # noqa: BLE001 - driver must never raise into the loop
+        log.warning("goal_driver.retry_scan_failed", exc_info=True)
+        return 0
+    driven = 0
+    for goal in goals:
+        plan_run = (
+            await get_plan_run(goal.plan_run_id)
+            if goal.plan_run_id
+            else None
+        )
+        if plan_run is None:
+            continue
+        if (
+            str(getattr(plan_run, "status", "")) != "paused"
+            or str(getattr(plan_run, "pause_reason", "") or "")
+            not in _GOAL_RESUMABLE_PAUSE_REASONS
+        ):
+            continue
+        try:
+            resumed = await _enqueue_goal_resume(
+                runtime,
+                storage,
+                goal,
+                plan_run,
+                config=config,
+                now_ms=now,
+            )
+        except Exception:  # noqa: BLE001 - best-effort per goal
+            log.warning(
+                "goal_driver.retry_goal_failed",
+                goal_id=goal.goal_id,
+                session_key=goal.session_key,
+                exc_info=True,
+            )
+            continue
+        if resumed:
+            driven += 1
+            log.info(
+                "goal_driver.retry_driven",
+                session_key=goal.session_key,
+                goal_id=goal.goal_id,
+            )
+    return driven
+
+
+async def recover_goal_runs_after_restart(
+    runtime: Any,
+    storage: Any,
+    *,
+    config: GoalConfig,
+) -> dict[str, int]:
+    """Reconcile durable goal runs after a gateway restart.
+
+    Watchers are in-memory and gone after restart, so a goal whose plan run is
+    paused at a resumable anchor is:
+
+    - parked ``paused`` (``pause_reason="goal_unwatched"``) when
+      ``continue_unwatched`` is false — no silent token burn; the user resumes
+      with ``/goal resume`` after reopening a chat;
+    - enqueued immediately when ``continue_unwatched`` is true;
+    - left for the retry loop when a retry is already scheduled.
+
+    Returns ``{"recovered": n, "paused_unwatched": n}`` for boot logging.
+    """
+
+    list_active = getattr(storage, "list_active_goal_runs", None)
+    get_plan_run = getattr(storage, "get_plan_run", None)
+    if not callable(list_active) or not callable(get_plan_run):
+        return {"recovered": 0, "paused_unwatched": 0}
+    now = _now_ms()
+    recovered = 0
+    paused_unwatched = 0
+    try:
+        goals = await list_active()
+    except Exception:  # noqa: BLE001 - recovery must not fail boot
+        log.warning("goal_driver.restart_recovery_scan_failed", exc_info=True)
+        return {"recovered": 0, "paused_unwatched": 0}
+    for goal in goals:
+        plan_run = (
+            await get_plan_run(goal.plan_run_id)
+            if goal.plan_run_id
+            else None
+        )
+        if plan_run is None:
+            continue
+        if (
+            str(getattr(plan_run, "status", "")) != "paused"
+            or str(getattr(plan_run, "pause_reason", "") or "")
+            not in _GOAL_RESUMABLE_PAUSE_REASONS
+        ):
+            continue
+        if not config.continue_unwatched:
+            if str(getattr(goal, "status", "")) == "running":
+                await _park_goal_unwatched(storage, goal, now_ms=now)
+                paused_unwatched += 1
+            continue
+        if getattr(goal, "next_retry_at_ms", None) is not None:
+            continue  # the retry loop drives this once due
+        try:
+            resumed = await _enqueue_goal_resume(
+                runtime,
+                storage,
+                goal,
+                plan_run,
+                config=config,
+                now_ms=now,
+            )
+        except Exception:  # noqa: BLE001 - best-effort per goal
+            log.warning(
+                "goal_driver.restart_recovery_goal_failed",
+                goal_id=goal.goal_id,
+                session_key=goal.session_key,
+                exc_info=True,
+            )
+            continue
+        if resumed:
+            recovered += 1
+            log.info(
+                "goal_driver.restart_recovered",
+                session_key=goal.session_key,
+                goal_id=goal.goal_id,
+            )
+    return {"recovered": recovered, "paused_unwatched": paused_unwatched}
 
 
 def _now_ms() -> int:

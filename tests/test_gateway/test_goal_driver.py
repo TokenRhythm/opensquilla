@@ -26,8 +26,10 @@ from opensquilla.gateway.config import GatewayConfig, GoalConfig
 from opensquilla.gateway.goal_driver import (
     GOAL_CONTINUATION_MESSAGE,
     GoalWatcherRegistry,
+    drive_due_goal_retries,
     get_goal_watcher_registry,
     maybe_continue_goal,
+    recover_goal_runs_after_restart,
 )
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_goals import _handle_goals_set
@@ -589,3 +591,357 @@ async def test_goal_driver_idle_turns_inject_progress_prompt(
         assert goal.status == "complete"
         assert goal.turns == 3
         assert goal.idle_turns == 0  # counter reset at the nudge injection
+
+
+class _FlakyScript:
+    """Fake turn handler that fails scripted turn indices, else appends markers."""
+
+    def __init__(
+        self,
+        markers: list[str | None],
+        *,
+        fail_turns: set[int],
+    ) -> None:
+        self.markers = list(markers)
+        self.fail_turns = set(fail_turns)
+        self.captured: list[TaskRun] = []
+        self.manager: SessionManager | None = None
+
+    async def __call__(self, run: TaskRun) -> None:
+        self.captured.append(run)
+        if len(self.captured) in self.fail_turns:
+            raise RuntimeError("simulated provider overload")
+        marker = self.markers.pop(0) if self.markers else None
+        if marker is not None and self.manager is not None:
+            await self.manager.append_message(SOURCE_KEY, "assistant", marker)
+
+
+async def _start_goal_unchecked(stack: _GoalDriverStack) -> dict:
+    """Start a goal without asserting the first turn succeeded (failure tests)."""
+
+    response = await _handle_goals_set(
+        {
+            "sessionKey": SOURCE_KEY,
+            "message": "Ship the goal mode.",
+            "clientRequestId": "driver-goal-set-unchecked",
+        },
+        stack.context,
+    )
+    await stack.runtime.wait(response["turnId"], timeout=2.0)
+    return response
+
+
+@pytest.mark.asyncio
+async def test_goal_driver_retries_transient_turn_failure_then_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    script = _FlakyScript(
+        ["[goal:complete]"],
+        fail_turns={1},
+    )
+    async with _open_goal_driver_stack(
+        tmp_path / "driver-failure-retry.sqlite",
+        handler=script,
+        goal_config=GoalConfig(
+            continue_unwatched=True,
+            failure_retries=3,
+            retry_base_backoff_ms=1_000,
+        ),
+    ) as stack:
+        script.manager = stack.manager
+        response = await _start_goal_unchecked(stack)
+        goal_id = response["goalId"]
+
+        # Turn 1 fails: the driver records a retryable failure and schedules a
+        # backoff instead of blocking or silently stopping.
+        await _wait_until(
+            lambda: _goal_has_failure_retry(stack.storage, goal_id)
+        )
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "running"
+        assert goal.failure_retries == 1
+        assert goal.next_retry_at_ms is not None
+        assert goal.last_error == "turn_failed"
+
+        # The retry loop drives the due retry; turn 2 succeeds and completes.
+        driven = await drive_due_goal_retries(
+            stack.runtime,
+            stack.storage,
+            config=GoalConfig(
+                continue_unwatched=True,
+                failure_retries=3,
+                retry_base_backoff_ms=1_000,
+            ),
+            now_ms=int(goal.next_retry_at_ms or 0),
+        )
+        assert driven == 1
+        await _wait_for_goal_status(stack.storage, goal_id, "complete")
+        assert len(script.captured) == 2
+
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "complete"
+        assert goal.turns == 2
+
+
+async def _goal_has_failure_retry(storage: SessionStorage, goal_id: str) -> bool:
+    goal = await storage.get_goal_run(goal_id)
+    return goal is not None and goal.failure_retries >= 1
+
+
+async def _goal_has_failure_retry_count(
+    storage: SessionStorage,
+    goal_id: str,
+    count: int,
+) -> bool:
+    goal = await storage.get_goal_run(goal_id)
+    return goal is not None and goal.failure_retries >= count
+
+
+async def _goal_captured_count_async(script: _MarkerScript, count: int) -> bool:
+    return len(script.captured) >= count
+
+
+@pytest.mark.asyncio
+async def test_goal_driver_blocks_after_exhausting_failure_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    script = _FlakyScript([], fail_turns={1, 2, 3})
+    async with _open_goal_driver_stack(
+        tmp_path / "driver-failure-exhausted.sqlite",
+        handler=script,
+        goal_config=GoalConfig(
+            continue_unwatched=True,
+            failure_retries=2,
+            retry_base_backoff_ms=1_000,
+        ),
+    ) as stack:
+        script.manager = stack.manager
+        response = await _start_goal_unchecked(stack)
+        goal_id = response["goalId"]
+
+        await _wait_until(lambda: _goal_has_failure_retry(stack.storage, goal_id))
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.failure_retries == 1
+        await drive_due_goal_retries(
+            stack.runtime,
+            stack.storage,
+            config=GoalConfig(
+                continue_unwatched=True,
+                failure_retries=2,
+                retry_base_backoff_ms=1_000,
+            ),
+            now_ms=int(goal.next_retry_at_ms or 0),
+        )
+
+        # Turn 2 fails too; wait for the second scheduled retry then drive it.
+        await _wait_until(
+            lambda: _goal_has_failure_retry_count(stack.storage, goal_id, 2)
+        )
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        await drive_due_goal_retries(
+            stack.runtime,
+            stack.storage,
+            config=GoalConfig(
+                continue_unwatched=True,
+                failure_retries=2,
+                retry_base_backoff_ms=1_000,
+            ),
+            now_ms=int(goal.next_retry_at_ms or 0),
+        )
+
+        # Turn 3 fails with retries exhausted -> blocked with a clear reason.
+        await _wait_for_goal_status(stack.storage, goal_id, "blocked")
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.failure_retries == 3
+        assert goal.terminal_reason == "goal_turn_failed_after_retries:failed"
+
+        plan_run = await stack.storage.get_plan_run(response["planRun"]["runId"])
+        assert plan_run is not None
+        assert plan_run.terminal_reason == "goal_blocked"
+        assert len(script.captured) == 3
+
+
+@pytest.mark.asyncio
+async def test_goal_driver_parks_cancelled_turn_without_retrying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    script = _MarkerScript(["[goal:continue]"])
+    async with _open_goal_driver_stack(
+        tmp_path / "driver-cancelled-park.sqlite",
+        handler=script,
+        goal_config=GoalConfig(continue_unwatched=False),
+    ) as stack:
+        script.manager = stack.manager
+        response = await _start_goal(stack)
+        goal_id = response["goalId"]
+        run_id = response["planRun"]["runId"]
+
+        # Simulate a user-cancelled turn: the plan run parks at
+        # goal_turn_cancelled (goal still running, nothing enqueued because no
+        # watcher). Then the hook must park the goal, not retry.
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        # Simulate a user-cancelled turn by rewriting the settled plan run's
+        # pause reason (the runtime would have parked it as goal_turn_cancelled).
+        async with stack.storage.conn.execute(
+            "UPDATE plan_runs SET pause_reason = 'goal_turn_cancelled' "
+            "WHERE run_id = ?",
+            (run_id,),
+        ):
+            pass
+
+        handle = await maybe_continue_goal(
+            stack.runtime,
+            SimpleNamespace(
+                envelope=SimpleNamespace(
+                    metadata={"plan_run_id": run_id},
+                    session_key=SOURCE_KEY,
+                ),
+                task_id="fake-cancelled-turn",
+            ),
+            config=GoalConfig(continue_unwatched=False),
+        )
+        assert handle is None
+
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "paused"
+        assert goal.pause_reason == "goal_turn_cancelled"
+        assert goal.next_retry_at_ms is None
+        assert len(script.captured) == 1  # never auto-retried
+
+
+@pytest.mark.asyncio
+async def test_restart_recovery_parks_unwatched_goal_when_continue_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    script = _MarkerScript(["[goal:continue]"])
+    async with _open_goal_driver_stack(
+        tmp_path / "driver-restart-unwatched.sqlite",
+        handler=script,
+        goal_config=GoalConfig(continue_unwatched=False),
+    ) as stack:
+        script.manager = stack.manager
+        response = await _start_goal(stack)
+        goal_id = response["goalId"]
+
+        # First turn succeeded with continue; without a watcher the driver did
+        # not enqueue, leaving the goal running at the finished anchor.
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "running"
+
+        result = await recover_goal_runs_after_restart(
+            stack.runtime,
+            stack.storage,
+            config=GoalConfig(continue_unwatched=False),
+        )
+        assert result == {"recovered": 0, "paused_unwatched": 1}
+
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "paused"
+        assert goal.pause_reason == "goal_unwatched"
+        assert len(script.captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_recovery_auto_resumes_when_continue_unwatched_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    script = _MarkerScript(["[goal:complete]"])
+    async with _open_goal_driver_stack(
+        tmp_path / "driver-restart-auto.sqlite",
+        handler=script,
+        goal_config=GoalConfig(continue_unwatched=False),
+    ) as stack:
+        script.manager = stack.manager
+        response = await _start_goal(stack)
+        goal_id = response["goalId"]
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "running"
+
+        # Restart with continue_unwatched=true: recovery enqueues immediately.
+        result = await recover_goal_runs_after_restart(
+            stack.runtime,
+            stack.storage,
+            config=GoalConfig(continue_unwatched=True),
+        )
+        assert result == {"recovered": 1, "paused_unwatched": 0}
+        # Recovery enqueued the next turn. The stack's runtime still uses
+        # continue_unwatched=false for the post-turn hook, so the loop parks at
+        # the finished anchor after the turn instead of auto-enqueueing again
+        # (production keeps one consistent [goal] config across restarts).
+        await _wait_until(lambda: _goal_captured_count_async(script, 2))
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_goal_driver_backs_off_when_enqueue_admission_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+
+    async def _reject_enqueue(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.goal_driver.enqueue_goal_continuation",
+        _reject_enqueue,
+    )
+    script = _MarkerScript(["[goal:continue]"])
+    async with _open_goal_driver_stack(
+        tmp_path / "driver-enqueue-backoff.sqlite",
+        handler=script,
+        goal_config=GoalConfig(
+            continue_unwatched=True,
+            retry_base_backoff_ms=1_000,
+        ),
+    ) as stack:
+        script.manager = stack.manager
+        response = await _start_goal(stack)
+        goal_id = response["goalId"]
+
+        await _wait_until(lambda: _goal_has_failure_retry(stack.storage, goal_id))
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "running"
+        assert goal.next_retry_at_ms is not None
+        assert goal.last_error == "enqueue_failed"

@@ -5,12 +5,16 @@ from __future__ import annotations
 import pytest
 
 from opensquilla.session.goals import (
+    GOAL_RETRYABLE_TURN_STATUSES,
     GOAL_RUN_ACTIVE_STATUSES,
     GOAL_RUN_TERMINAL_STATUSES,
     IDLE_PROGRESS_PROMPT,
     GoalAdvance,
+    GoalFailureAdvance,
     GoalValidationError,
+    advance_goal_after_failure,
     advance_goal_after_turn,
+    goal_retry_delay_ms,
     goal_run_snapshot,
     new_goal_run,
     parse_goal_status_marker,
@@ -137,6 +141,10 @@ def test_goal_run_snapshot_is_camel_case() -> None:
         idle_turns=1,
         blocked_reason="no_api_key",
         blocked_retries=2,
+        failure_retries=1,
+        next_retry_at_ms=2000,
+        pause_reason="goal_unwatched",
+        last_error="turn_timeout",
         plan_run_id="run-9",
         last_turn_at=1500,
     )
@@ -152,6 +160,10 @@ def test_goal_run_snapshot_is_camel_case() -> None:
         "idleTurns": 1,
         "blockedReason": "no_api_key",
         "blockedRetries": 2,
+        "failureRetries": 1,
+        "nextRetryAtMs": 2000,
+        "pauseReason": "goal_unwatched",
+        "lastError": "turn_timeout",
         "planRunId": "run-9",
         "startedAt": 1000,
         "lastTurnAt": 1500,
@@ -264,6 +276,79 @@ def test_advance_blocked_without_reason_accumulates_retries() -> None:
     assert advance.continue_ is False
     assert advance.terminal is True
     assert advance.terminal_reason == "blocked_after_retries:"
+
+
+def test_goal_retry_delay_exponential_backoff() -> None:
+    assert goal_retry_delay_ms(0, base_ms=30_000, max_ms=600_000) == 30_000
+    assert goal_retry_delay_ms(1, base_ms=30_000, max_ms=600_000) == 60_000
+    assert goal_retry_delay_ms(2, base_ms=30_000, max_ms=600_000) == 120_000
+    # Capped at the configured maximum.
+    assert goal_retry_delay_ms(10, base_ms=30_000, max_ms=600_000) == 600_000
+    with pytest.raises(GoalValidationError):
+        goal_retry_delay_ms(-1)
+
+
+def test_advance_after_failure_retryable_schedules_backoff() -> None:
+    goal = _goal()
+    advance = advance_goal_after_failure(
+        goal,
+        task_status="timeout",
+        failure_retries=0,
+        max_failure_retries=3,
+        base_backoff_ms=30_000,
+        max_backoff_ms=600_000,
+        now_ms=2000,
+    )
+    assert isinstance(advance, GoalFailureAdvance)
+    assert advance.retry_at_ms == 32_000
+    assert advance.terminal is False
+    assert advance.terminal_reason is None
+
+
+def test_advance_after_failure_exhausts_retries_then_terminal() -> None:
+    goal = _goal()
+    advance = advance_goal_after_failure(
+        goal,
+        task_status="failed",
+        failure_retries=3,
+        max_failure_retries=3,
+        base_backoff_ms=30_000,
+        max_backoff_ms=600_000,
+        now_ms=2000,
+    )
+    assert advance.retry_at_ms is None
+    assert advance.terminal is True
+    assert advance.terminal_reason == "goal_turn_failed_after_retries:failed"
+
+
+def test_advance_after_failure_non_retryable_never_auto_retries() -> None:
+    goal = _goal()
+    for task_status in ("cancelled", "abandoned"):
+        advance = advance_goal_after_failure(
+            goal,
+            task_status=task_status,
+            failure_retries=0,
+            max_failure_retries=3,
+            base_backoff_ms=30_000,
+            max_backoff_ms=600_000,
+            now_ms=2000,
+        )
+        assert advance.retry_at_ms is None
+        assert advance.terminal is False
+    assert GOAL_RETRYABLE_TURN_STATUSES == {"failed", "timeout"}
+
+
+def test_advance_after_failure_rejects_unknown_status() -> None:
+    with pytest.raises(GoalValidationError):
+        advance_goal_after_failure(
+            _goal(),
+            task_status="succeeded",
+            failure_retries=0,
+            max_failure_retries=3,
+            base_backoff_ms=30_000,
+            max_backoff_ms=600_000,
+            now_ms=2000,
+        )
 
 
 def test_advance_idle_prompt_after_two_markerless_turns() -> None:

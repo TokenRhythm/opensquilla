@@ -432,6 +432,39 @@ rules. Network access is public by default through the managed boundary, with
 SSRF and local metadata protections; operators can deny domains, allow
 exceptions, or block all network access.
 
+## Goal Mode (`[goal]`)
+
+Session-level `/goal` mode drives the agent toward a fixed goal turn after turn
+until it completes, blocks, or hits a guardrail. All fields below are optional;
+absent keys keep the defaults.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `max_turns` | `50` | Turn count at which the run blocks (`goal_continuation_limit_reached`). |
+| `idle_turns` | `2` | Consecutive no-marker turns before a nudge prompt is injected. |
+| `blocked_retries` | `3` | Consecutive same-cause `[goal:blocked:<reason>]` markers before blocking. |
+| `failure_retries` | `3` | Consecutive transient turn failures (provider overload/rate limit/transport) before blocking (`goal_turn_failed_after_retries:<status>`). |
+| `retry_base_backoff_ms` | `30000` | Exponential backoff base for automatic failure retries (ms). |
+| `retry_max_backoff_ms` | `600000` | Backoff cap for automatic failure retries (ms). |
+| `retry_poll_interval_seconds` | `10` | How often the gateway scans for due goal retries. |
+| `runtime_budget_seconds` | `unset` | Wall-clock budget after which the run blocks (`goal_runtime_budget_exceeded`). |
+| `continue_unwatched` | `false` | When false, only auto-continue while a chat client observes the goal. |
+| `watcher_ttl_seconds` | `900` | Watcher eligibility window without a heartbeat (the TUI heartbeats every 60s). |
+
+```toml
+[goal]
+max_turns = 50
+failure_retries = 3
+retry_base_backoff_ms = 30000
+continue_unwatched = false
+```
+
+Transient failures are retried automatically with exponential backoff (the
+gateway keeps a retry loop); a cancelled or abandoned turn parks the goal as
+paused instead of resurrecting it. After a gateway restart, goals pause
+unwatched (or auto-resume with `continue_unwatched = true`); reopen the chat and
+run `/goal resume` to continue.
+
 ## Raw Config Editing
 
 For advanced settings, inspect `opensquilla.toml.example` and edit the active

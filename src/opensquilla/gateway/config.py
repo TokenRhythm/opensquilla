@@ -2232,6 +2232,16 @@ class GoalConfig(BaseSettings):
     # Consecutive same-cause [goal:blocked:<reason>] markers reaching this
     # value block the run with terminal_reason="blocked_after_retries:<reason>".
     blocked_retries: int = Field(default=3, ge=1)
+    # Consecutive transient turn failures (provider overload / rate limit /
+    # transport errors) before the run blocks with
+    # terminal_reason="goal_turn_failed_after_retries:<status>".
+    failure_retries: int = Field(default=3, ge=1)
+    # Exponential backoff bounds for automatic retries after a transient turn
+    # failure or an enqueue admission rejection (milliseconds).
+    retry_base_backoff_ms: int = Field(default=30_000, ge=1_000)
+    retry_max_backoff_ms: int = Field(default=600_000, ge=1_000)
+    # How often the gateway's goal retry loop scans for due retries.
+    retry_poll_interval_seconds: int = Field(default=10, ge=1)
     # Non-null: now - goal.started_at exceeding this budget (seconds) blocks
     # the run with terminal_reason="goal_runtime_budget_exceeded".
     runtime_budget_seconds: int | None = Field(default=None, ge=1)

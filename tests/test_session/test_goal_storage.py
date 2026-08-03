@@ -34,6 +34,7 @@ async def storage() -> SessionStorage:
 def _goal(
     goal_id: str = "goal-1",
     *,
+    session_key: str = SESSION_KEY,
     status: str = "running",
     turns: int = 0,
     created_at: int = 300,
@@ -41,7 +42,7 @@ def _goal(
 ) -> GoalRunRecord:
     return GoalRunRecord(
         goal_id=goal_id,
-        session_key=SESSION_KEY,
+        session_key=session_key,
         agent_id="main",
         goal_text="Ship the goal mode data layer.",
         status=status,
@@ -57,6 +58,10 @@ async def test_create_and_get_goal_run_roundtrip(storage: SessionStorage) -> Non
     created = await storage.create_goal_run(_goal())
     assert created.status == "running"
     assert created.turns == 0
+    assert created.failure_retries == 0
+    assert created.next_retry_at_ms is None
+    assert created.pause_reason is None
+    assert created.last_error is None
 
     loaded = await storage.get_goal_run("goal-1")
     assert loaded is not None
@@ -70,6 +75,92 @@ async def test_create_and_get_goal_run_roundtrip(storage: SessionStorage) -> Non
     assert loaded.terminal_reason is None
 
     assert await storage.get_goal_run("missing") is None
+
+
+async def test_goal_run_retry_fields_roundtrip(storage: SessionStorage) -> None:
+    created = await storage.create_goal_run(_goal())
+    updated = await storage.update_goal_run(
+        created.goal_id,
+        expected_updated_at=int(created.updated_at),
+        failure_retries=2,
+        next_retry_at_ms=123_000,
+        pause_reason="goal_unwatched",
+        last_error="turn_timeout",
+    )
+    assert updated.failure_retries == 2
+    assert updated.next_retry_at_ms == 123_000
+    assert updated.pause_reason == "goal_unwatched"
+    assert updated.last_error == "turn_timeout"
+
+    loaded = await storage.get_goal_run(created.goal_id)
+    assert loaded is not None
+    assert loaded.failure_retries == 2
+    assert loaded.next_retry_at_ms == 123_000
+    assert loaded.pause_reason == "goal_unwatched"
+    assert loaded.last_error == "turn_timeout"
+
+
+async def test_list_goal_runs_due_for_retry_filters_by_time_and_status(
+    storage: SessionStorage,
+) -> None:
+    due = await storage.create_goal_run(
+        _goal(goal_id="goal-due", session_key="agent:main:webchat:a", created_at=100)
+    )
+    await storage.update_goal_run(
+        due.goal_id,
+        expected_updated_at=int(due.updated_at),
+        next_retry_at_ms=500,
+    )
+    future = await storage.create_goal_run(
+        _goal(goal_id="goal-future", session_key="agent:main:webchat:b", created_at=200)
+    )
+    await storage.update_goal_run(
+        future.goal_id,
+        expected_updated_at=int(future.updated_at),
+        next_retry_at_ms=9_999,
+    )
+    parked = await storage.create_goal_run(
+        _goal(
+            goal_id="goal-paused",
+            session_key="agent:main:webchat:c",
+            status="paused",
+            created_at=300,
+        )
+    )
+    await storage.update_goal_run(
+        parked.goal_id,
+        expected_updated_at=int(parked.updated_at),
+        next_retry_at_ms=500,
+    )
+
+    results = await storage.list_goal_runs_due_for_retry(now_ms=500)
+    assert {run.goal_id for run in results} == {"goal-due"}
+
+
+async def test_list_active_goal_runs_includes_running_and_paused(
+    storage: SessionStorage,
+) -> None:
+    await storage.create_goal_run(
+        _goal(goal_id="goal-running", session_key="agent:main:webchat:a", created_at=100)
+    )
+    await storage.create_goal_run(
+        _goal(
+            goal_id="goal-paused",
+            session_key="agent:main:webchat:b",
+            status="paused",
+            created_at=200,
+        )
+    )
+    await storage.create_goal_run(
+        _goal(
+            goal_id="goal-blocked",
+            session_key="agent:main:webchat:c",
+            status="blocked",
+            created_at=300,
+        )
+    )
+    results = await storage.list_active_goal_runs()
+    assert {run.goal_id for run in results} == {"goal-running", "goal-paused"}
 
 
 async def test_create_goal_run_rejects_second_active_run(storage: SessionStorage) -> None:

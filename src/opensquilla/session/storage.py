@@ -557,6 +557,10 @@ CREATE TABLE IF NOT EXISTS goal_runs (
     idle_turns INTEGER NOT NULL DEFAULT 0,
     blocked_reason TEXT,
     blocked_retries INTEGER NOT NULL DEFAULT 0,
+    failure_retries INTEGER NOT NULL DEFAULT 0,
+    next_retry_at_ms INTEGER,
+    pause_reason TEXT,
+    last_error TEXT,
     plan_run_id TEXT,
     started_at INTEGER NOT NULL,
     last_turn_at INTEGER,
@@ -5087,6 +5091,10 @@ class SessionStorage:
             "idle_turns",
             "blocked_reason",
             "blocked_retries",
+            "failure_retries",
+            "next_retry_at_ms",
+            "pause_reason",
+            "last_error",
             "plan_run_id",
             "last_turn_at",
             "finished_at",
@@ -5151,6 +5159,38 @@ class SessionStorage:
         ) as cur:
             row = await cur.fetchone()
         return None if row is None else GoalRunRecord(**_deserialize_row(dict(row)))
+
+    @_serialized_read
+    async def list_goal_runs_due_for_retry(
+        self,
+        now_ms: int,
+    ) -> list[GoalRunRecord]:
+        """Return running goals whose automatic retry time has arrived."""
+
+        async with self.conn.execute(
+            """
+            SELECT * FROM goal_runs
+            WHERE status = 'running'
+              AND next_retry_at_ms IS NOT NULL
+              AND next_retry_at_ms <= ?
+            """,
+            (now_ms,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [GoalRunRecord(**_deserialize_row(dict(row))) for row in rows]
+
+    @_serialized_read
+    async def list_active_goal_runs(self) -> list[GoalRunRecord]:
+        """Return every non-terminal goal run (restart recovery scan)."""
+
+        async with self.conn.execute(
+            """
+            SELECT * FROM goal_runs
+            WHERE status IN ('running', 'paused')
+            """,
+        ) as cur:
+            rows = await cur.fetchall()
+        return [GoalRunRecord(**_deserialize_row(dict(row))) for row in rows]
 
     @_serialized_read
     async def get_latest_goal_run(
