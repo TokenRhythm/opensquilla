@@ -55,6 +55,7 @@
             class="chat-textarea"
             rows="1"
             :placeholder="placeholder"
+            :disabled="inputDisabled"
             maxlength="100000"
             :aria-label="t('chat.messageToSend')"
             :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
@@ -267,11 +268,11 @@
                 v-else
                 key="send"
                 class="btn btn--icon btn--primary chat-send-btn"
-                :class="{ 'is-ready': hasSendContent && !sendBlockedMessage }"
+                :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled }"
                 :title="sendBlockedMessage || sendButtonTitle"
                 :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
                 :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
-                :disabled="Boolean(sendBlockedMessage)"
+                :disabled="Boolean(sendBlockedMessage) || inputDisabled"
                 @click="emit('send')"
               >
                 <Icon name="arrowUp" :size="17" />
@@ -333,6 +334,7 @@ const props = withDefaults(defineProps<{
   placeholder: string
   sendButtonTitle: string
   sendBlockedMessage?: string
+  inputDisabled?: boolean
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
   runModeLocked: boolean
@@ -359,6 +361,7 @@ const props = withDefaults(defineProps<{
   canChooseProject: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
+  inputDisabled: false,
 })
 
 const emit = defineEmits<{

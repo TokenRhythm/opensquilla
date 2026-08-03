@@ -3284,6 +3284,7 @@
     },
     "plan": {
       "label": "实施方案",
+      "process": "规划过程",
       "revision": "版本 {id}",
       "current": "当前版本",
       "superseded": "已有更新版本",
@@ -3351,6 +3352,10 @@
       "other": "其他",
       "otherPlaceholder": "输入其他答案",
       "dismiss": "忽略",
+      "planQuestionnaireHint": "请回答必填问题；如不再继续规划，请停止当前轮次。",
+      "answerPlanQuestionnaire": "请先回答上方的规划问题",
+      "previousQuestion": "上一个",
+      "nextQuestion": "下一个",
       "outcomeDoneTitle": "回复已发送 · 已恢复运行",
       "outcomeBusyDetail": "正在处理你的回复。",
       "outcomeDoneDetail": "智能体已接受此回复并继续。",

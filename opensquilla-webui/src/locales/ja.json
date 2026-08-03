@@ -3284,6 +3284,7 @@
     },
     "plan": {
       "label": "プラン",
+      "process": "計画プロセス",
       "revision": "リビジョン {id}",
       "current": "現在",
       "superseded": "更新版があります",
@@ -3351,6 +3352,10 @@
       "other": "その他",
       "otherPlaceholder": "別の回答を入力",
       "dismiss": "閉じる",
+      "planQuestionnaireHint": "必須の質問に回答するか、計画を終了するには現在のターンを停止してください。",
+      "answerPlanQuestionnaire": "上の計画の質問に回答してください",
+      "previousQuestion": "前へ",
+      "nextQuestion": "次へ",
       "outcomeDoneTitle": "返信を送信しました · 実行を再開",
       "outcomeBusyDetail": "返信を現在処理しています。",
       "outcomeDoneDetail": "エージェントはこの返信を受け入れ、次へ進みました。",

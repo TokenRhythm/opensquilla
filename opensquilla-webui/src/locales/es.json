@@ -3284,6 +3284,7 @@
     },
     "plan": {
       "label": "Plan",
+      "process": "Proceso de planificación",
       "revision": "Revisión {id}",
       "current": "Actual",
       "superseded": "Hay una versión actualizada",
@@ -3351,6 +3352,10 @@
       "other": "Otra",
       "otherPlaceholder": "Escribe otra respuesta",
       "dismiss": "Descartar",
+      "planQuestionnaireHint": "Responde las preguntas obligatorias o detén el turno actual para salir de la planificación.",
+      "answerPlanQuestionnaire": "Responde la pregunta del plan de arriba",
+      "previousQuestion": "Anterior",
+      "nextQuestion": "Siguiente",
       "outcomeDoneTitle": "Respuesta enviada · ejecución reanudada",
       "outcomeBusyDetail": "Tu respuesta se está procesando ahora.",
       "outcomeDoneDetail": "El agente ha aceptado esta respuesta y ha continuado.",

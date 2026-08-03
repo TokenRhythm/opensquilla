@@ -24,24 +24,25 @@
       <Icon v-if="shareSelected" name="check" :size="13" />
     </button>
     <div class="msg-ai-main">
-      <PlanCard
-        v-for="part in planParts"
-        :key="part.key"
-        class="plan-message-card"
-        :plan="part.plan"
-        :disabled="planActionsDisabled"
-        :pending-action="planActionPending"
-        @implement-current="$emit('planImplementCurrent', $event)"
-        @implement-new="$emit('planImplementNew', $event)"
-        @replan="$emit('planReplan', $event)"
-      />
       <TurnOutcomeStatus
         v-if="
           showTurnOutcome
           && message.turnOutcome
           && !hasActivity
+          && !hasPlan
         "
         :outcome="message.turnOutcome"
+      />
+      <TextPart
+        v-if="
+          hasPlan
+          && activityProjection.canSeparateActivity
+          && activityProjection.answerPart
+        "
+        class="plan-message-intro"
+        :part="activityProjection.answerPart"
+        :sources="message.sources ?? []"
+        @citation="onCitation"
       />
       <template v-if="activityProjection.canSeparateActivity">
         <ActivityDisclosure
@@ -50,8 +51,9 @@
           :step-count="activityStepCount"
           :failure-count="0"
           :duration-seconds="activityDurationSeconds"
-          :summary-label="activitySummaryLabel"
-          :detail-label="activityDetailLabel"
+          :summary-label="displayActivitySummaryLabel"
+          :detail-label="displayActivityDetailLabel"
+          :phase-label="hasPlan ? t('chat.plan.process') : ''"
           :completion-confirmed="activityCompletionConfirmed"
           :default-open="activityDefaultOpen"
           :state-key="activityStateKey"
@@ -61,7 +63,9 @@
             v-if="reasoningPart"
             :part="reasoningPart"
             :live="activityLifecycle === 'working' || activityLifecycle === 'answering'"
-            nested
+            :embedded="hasPlan"
+            :hide-summary="hasPlan"
+            :nested="!hasPlan"
           />
           <AssistantActivityTimeline
             v-if="
@@ -94,7 +98,7 @@
           </AssistantActivityTimeline>
         </ActivityDisclosure>
         <div
-          v-if="activityProjection.answerPart"
+          v-if="activityProjection.answerPart && !hasPlan"
           class="assistant-answer"
           :class="{ 'assistant-answer--separated': hasActivity }"
         >
@@ -140,6 +144,18 @@
           :entries="statusHistory"
         />
       </template>
+
+      <PlanCard
+        v-for="part in planParts"
+        :key="part.key"
+        class="plan-message-card"
+        :plan="part.plan"
+        :disabled="planActionsDisabled"
+        :pending-action="planActionPending"
+        @implement-current="$emit('planImplementCurrent', $event)"
+        @implement-new="$emit('planImplementNew', $event)"
+        @replan="$emit('planReplan', $event)"
+      />
 
       <div
         class="msg-ai-ending"
@@ -476,6 +492,7 @@ const planParts = computed(
       (part): part is Extract<ChatPart, { type: 'plan' }> => part.type === 'plan',
     ) ?? [],
 )
+const hasPlan = computed(() => planParts.value.length > 0)
 // The persisted activity timeline for this finished turn. Empty (fold hidden)
 // for OFF-mode turns and reloaded threads, which carry no snapshot.
 const statusHistory = computed(() => props.message.statusHistory ?? [])
@@ -851,6 +868,16 @@ const activitySummaryLabel = computed(() => {
   }
   return activityDetailLabel.value
 })
+const planActivitySummaryLabel = computed(() => [
+  String(t('chat.plan.process')),
+  activityCompactElapsedLabel.value,
+].filter(Boolean).join(' · '))
+const displayActivitySummaryLabel = computed(() =>
+  hasPlan.value ? planActivitySummaryLabel.value : activitySummaryLabel.value,
+)
+const displayActivityDetailLabel = computed(() =>
+  hasPlan.value ? '' : activityDetailLabel.value,
+)
 
 function onMessageClick(event: MouseEvent) {
   if (!props.shareMode) return

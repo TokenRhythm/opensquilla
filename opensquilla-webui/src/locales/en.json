@@ -3284,6 +3284,7 @@
     },
     "plan": {
       "label": "Plan",
+      "process": "Planning process",
       "revision": "Revision {id}",
       "current": "Current",
       "superseded": "Updated version available",
@@ -3351,6 +3352,10 @@
       "other": "Other",
       "otherPlaceholder": "Enter another answer",
       "dismiss": "Dismiss",
+      "planQuestionnaireHint": "Answer the required questions, or stop the current turn to leave planning.",
+      "answerPlanQuestionnaire": "Answer the plan question above",
+      "previousQuestion": "Previous",
+      "nextQuestion": "Next",
       "outcomeDoneTitle": "Reply sent · run resumed",
       "outcomeBusyDetail": "Your reply is being processed now.",
       "outcomeDoneDetail": "The agent has accepted this reply and moved on.",

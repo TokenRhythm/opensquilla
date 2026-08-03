@@ -338,7 +338,7 @@ export function foldTurn(
       clarify: interrupt.kind === 'clarify'
         ? interrupt.data as InterruptClarifyData
         : undefined,
-      resolution: state?.resolution ?? null,
+      resolution: state?.resolution ?? interrupt.resolution ?? null,
       busy: state?.busy ?? false,
       error: state?.error ?? '',
       key: `${ownerKey}:interrupt:${interrupt.approvalId}`,

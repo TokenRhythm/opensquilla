@@ -3284,6 +3284,7 @@
     },
     "plan": {
       "label": "Plan",
+      "process": "Processus de planification",
       "revision": "Révision {id}",
       "current": "Actuel",
       "superseded": "Une version actualisée est disponible",
@@ -3351,6 +3352,10 @@
       "other": "Autre",
       "otherPlaceholder": "Saisissez une autre réponse",
       "dismiss": "Ignorer",
+      "planQuestionnaireHint": "Répondez aux questions obligatoires ou arrêtez le tour en cours pour quitter la planification.",
+      "answerPlanQuestionnaire": "Répondez à la question du plan ci-dessus",
+      "previousQuestion": "Précédent",
+      "nextQuestion": "Suivant",
       "outcomeDoneTitle": "Réponse envoyée · exécution reprise",
       "outcomeBusyDetail": "Votre réponse est en cours de traitement.",
       "outcomeDoneDetail": "L'agent a accepté cette réponse et est passé à la suite.",

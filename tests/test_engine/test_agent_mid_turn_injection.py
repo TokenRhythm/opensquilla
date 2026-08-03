@@ -973,3 +973,62 @@ async def test_deferred_user_input_defers_later_batch_calls_until_after_answer()
     }
     assert second_results["request-1"]["answers"] == {"scope": "Core"}
     assert second_results["write-1"]["status"] == "not_executed"
+
+
+@pytest.mark.asyncio
+async def test_failed_user_input_still_blocks_later_calls_in_same_provider_response() -> None:
+    provider = _ControlBoundaryProvider(
+        [
+            (
+                "request-invalid",
+                "request_user_input",
+                {"questions": [{"id": "scope", "options": ["too", "many"]}]},
+            ),
+            ("submit-1", "submit_plan", {"title": "must not dispatch"}),
+        ]
+    )
+    dispatched: list[str] = []
+
+    async def _handler(call: ToolCall) -> ToolResult:
+        dispatched.append(call.tool_name)
+        if call.tool_name != "request_user_input":
+            raise AssertionError("tail submit crossed the user-input dispatch boundary")
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content=json.dumps(
+                {
+                    "status": "error",
+                    "error_class": "RetryableToolInputError",
+                    "retry_allowed": True,
+                }
+            ),
+            is_error=True,
+            terminates_turn=False,
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[
+            _tool_def("request_user_input"),
+            _tool_def("submit_plan"),
+        ],
+        tool_handler=_handler,
+    )
+
+    events = [event async for event in agent.run_turn("make a plan")]
+
+    assert dispatched == ["request_user_input"]
+    assert len(provider.calls) == 2
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+    assert [event.tool_use_id for event in results] == [
+        "request-invalid",
+        "submit-1",
+    ]
+    assert json.loads(results[1].result) == {
+        "status": "not_executed",
+        "reason": "prior_tool_dispatch_boundary",
+        "boundary_tool": "request_user_input",
+        "boundary_tool_use_id": "request-invalid",
+    }

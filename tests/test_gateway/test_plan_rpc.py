@@ -26,7 +26,7 @@ from opensquilla.gateway.task_runtime import TaskRun, TaskRuntime
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import AgentTaskStatus, PlanRevisionRecord
 from opensquilla.session.plans import new_plan_revision
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StorageBusyError
 
 SOURCE_KEY = "agent:main:webchat:plan-rpc-source"
 
@@ -234,6 +234,412 @@ async def test_implement_binds_exact_run_injects_full_plan_and_rejects_duplicate
         assert paused.status == "paused"
         assert paused.pause_reason == "manual_turn_finished"
         assert paused.active_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_question_answer_submit_implement_and_first_checkpoint_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage_ref: SessionStorage | None = None
+    checkpointed: list[str] = []
+
+    async def handler(run: TaskRun) -> None:
+        assert storage_ref is not None
+        run_id = str(run.envelope.metadata.get("plan_run_id") or "")
+        current = await storage_ref.get_plan_run(run_id)
+        assert current is not None
+        assert current.status == "running"
+        assert current.current_step_id == "inspect"
+        advanced = await storage_ref.checkpoint_plan_run(
+            run_id,
+            expected_state_revision=current.state_revision,
+            expected_active_task_id=run.task_id,
+            step_id="inspect",
+            step_status="completed",
+        )
+        checkpointed.append(str(advanced.current_step_id))
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_plan_rpc_stack(
+        tmp_path / "plan-full-chain.sqlite",
+        handler=handler,
+    ) as stack:
+        storage_ref = stack.storage
+        session = await stack.storage.get_session(SOURCE_KEY)
+        assert session is not None
+        await stack.storage.set_collaboration_mode(
+            SOURCE_KEY,
+            "plan",
+            expected_revision=int(session.collaboration_revision or 0),
+        )
+        pending = stack.runtime._user_input_broker.open_request(
+            session_key=SOURCE_KEY,
+            task_id="planning-turn",
+            tool_use_id="request-scope",
+            payload={
+                "status": "input_required",
+                "kind": "user_input",
+                "paused": True,
+                "run_id": "planning-turn",
+                "step": "plan",
+                "clarify_schema": {
+                    "mode": "form",
+                    "presentation": "plan_questionnaire_v1",
+                    "fields": [
+                        {
+                            "name": "scope",
+                            "type": "enum",
+                            "required": True,
+                            "choices": ["focused", "complete"],
+                        }
+                    ],
+                },
+            },
+        )
+        resolved = stack.runtime._user_input_broker.resolve(
+            session_key=SOURCE_KEY,
+            request_id=str(pending["request_id"]),
+            fields={"scope": "focused"},
+        )
+        assert resolved == {
+            "resolved": True,
+            "replayed": False,
+            "request_id": pending["request_id"],
+        }
+        assert stack.runtime.pending_user_inputs(SOURCE_KEY) == []
+
+        submit_input = {
+            "title": "Focused Plan flow",
+            "markdown": "## Plan\n\nImplement the focused flow and verify it.",
+            "steps": [
+                {"step_id": "inspect", "title": "Inspect the accepted state"},
+                {"step_id": "verify", "title": "Verify the implementation"},
+            ],
+        }
+        await stack.manager.append_message(
+            SOURCE_KEY,
+            "assistant",
+            "Plan ready.",
+            tool_calls=[
+                {
+                    "type": "tool_use",
+                    "tool_use_id": "submit-focused-plan",
+                    "name": "submit_plan",
+                    "input": submit_input,
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "submit-focused-plan",
+                    "name": "submit_plan",
+                    "result": json.dumps(
+                        {
+                            "status": "plan_submitted",
+                            "title": submit_input["title"],
+                            "step_count": 2,
+                        }
+                    ),
+                    "is_error": False,
+                },
+            ],
+        )
+        revision = await stack.storage.get_current_plan_revision(SOURCE_KEY)
+        assert revision is not None
+        assert revision.revision_id != stack.source_revision.revision_id
+        assert revision.parent_revision_id == stack.source_revision.revision_id
+
+        response = await _handle_plans_implement(
+            {
+                "sessionKey": SOURCE_KEY,
+                "planRevisionId": revision.revision_id,
+                "clientRequestId": "implement-full-chain",
+                "intent": "continue",
+            },
+            stack.context,
+        )
+        await stack.runtime.wait(response["turn_id"], timeout=2.0)
+
+        assert checkpointed == ["verify"]
+        run = await stack.storage.get_plan_run(response["planRun"]["runId"])
+        assert run is not None
+        assert run.status == "paused"
+        assert run.current_step_id == "verify"
+        assert [step["status"] for step in run.step_states] == [
+            "completed",
+            "in_progress",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_current_session_implement_rejects_pending_input_with_exact_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(_run: TaskRun) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_plan_rpc_stack(
+        tmp_path / "plan-input-pending.sqlite",
+        handler=handler,
+    ) as stack:
+        request = stack.runtime._user_input_broker.open_request(
+            session_key=SOURCE_KEY,
+            task_id="planning-task",
+            tool_use_id="request-scope",
+            payload={
+                "status": "input_required",
+                "kind": "user_input",
+                "paused": True,
+                "clarify_schema": {
+                    "fields": [
+                        {
+                            "name": "scope",
+                            "type": "string",
+                            "required": True,
+                        }
+                    ]
+                },
+            },
+        )
+        try:
+            with pytest.raises(RpcHandlerError) as pending:
+                await _handle_plans_implement(
+                    {
+                        "sessionKey": SOURCE_KEY,
+                        "planRevisionId": stack.source_revision.revision_id,
+                        "clientRequestId": "implement-while-input-pending",
+                        "intent": "continue",
+                    },
+                    stack.context,
+                )
+            assert pending.value.code == "PLAN_INPUT_PENDING"
+            assert pending.value.retryable is True
+            assert pending.value.accepted is False
+            assert pending.value.details == {
+                "requestId": request["request_id"],
+                "turnId": "planning-task",
+                "allowedActions": ["answer", "stop", "wait"],
+            }
+            assert await stack.storage.get_active_plan_run(SOURCE_KEY) is None
+            assert await stack.storage.count_transcript_entries(
+                stack.source_revision.source_session_id
+            ) == 0
+        finally:
+            stack.runtime._user_input_broker.cancel_request(request["request_id"])
+
+
+@pytest.mark.asyncio
+async def test_current_session_implement_requires_idle_task_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(run: TaskRun) -> None:
+        if run.message == "keep source session busy":
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_plan_rpc_stack(
+        tmp_path / "plan-session-busy.sqlite",
+        handler=handler,
+    ) as stack:
+        blocker = await stack.runtime.enqueue(
+            _envelope(SOURCE_KEY, source_name="busy-turn"),
+            "keep source session busy",
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        before = await stack.storage.get_session(SOURCE_KEY)
+        try:
+            with pytest.raises(RpcHandlerError) as busy:
+                await _handle_plans_implement(
+                    {
+                        "sessionKey": SOURCE_KEY,
+                        "planRevisionId": stack.source_revision.revision_id,
+                        "clientRequestId": "implement-while-session-busy",
+                        "intent": "continue",
+                    },
+                    stack.context,
+                )
+            assert busy.value.code == "PLAN_IMPLEMENTATION_SESSION_BUSY"
+            assert busy.value.retryable is True
+            assert busy.value.accepted is False
+            assert busy.value.details["turnId"] == blocker.task_id
+            assert busy.value.details["taskStatus"] == "running"
+            assert await stack.storage.get_active_plan_run(SOURCE_KEY) is None
+            assert await stack.storage.get_session(SOURCE_KEY) == before
+            tasks = await stack.storage.list_agent_tasks(SOURCE_KEY)
+            assert [task.task_id for task in tasks] == [blocker.task_id]
+        finally:
+            release.set()
+            await stack.runtime.wait(blocker.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_plan_implement_returns_typed_conflict_and_one_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_run: TaskRun) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_plan_rpc_stack(
+        tmp_path / "plan-concurrent-implement.sqlite",
+        handler=handler,
+    ) as stack:
+        results = await asyncio.gather(
+            *(
+                _handle_plans_implement(
+                    {
+                        "sessionKey": SOURCE_KEY,
+                        "planRevisionId": stack.source_revision.revision_id,
+                        "clientRequestId": f"concurrent-implement-{index}",
+                        "intent": "continue",
+                    },
+                    stack.context,
+                )
+                for index in range(2)
+            ),
+            return_exceptions=True,
+        )
+        accepted = [result for result in results if isinstance(result, dict)]
+        rejected = [result for result in results if isinstance(result, RpcHandlerError)]
+        assert len(accepted) == 1
+        assert len(rejected) == 1
+        assert rejected[0].code in {
+            "PLAN_IMPLEMENTATION_SESSION_BUSY",
+            "PLAN_RUN_ACTIVE",
+        }
+        async with stack.storage.conn.execute(
+            "SELECT COUNT(*) FROM plan_runs WHERE session_key = ?",
+            (SOURCE_KEY,),
+        ) as cursor:
+            run_count = int((await cursor.fetchone())[0])
+        assert run_count == 1
+        tasks = await stack.storage.list_agent_tasks(SOURCE_KEY)
+        assert len(tasks) == 1
+
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        release.set()
+        await stack.runtime.wait(accepted[0]["turn_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_implement_collaboration_cas_prevents_concurrent_mode_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(_run: TaskRun) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_plan_rpc_stack(
+        tmp_path / "plan-implement-mode-cas.sqlite",
+        handler=handler,
+    ) as stack:
+        original_accept_turn = stack.storage.accept_turn
+        raced = False
+
+        async def race_mode_before_acceptance(*args: Any, **kwargs: Any) -> Any:
+            nonlocal raced
+            if not raced:
+                raced = True
+                current = await stack.storage.get_session(SOURCE_KEY)
+                assert current is not None
+                await stack.storage.set_collaboration_mode(
+                    SOURCE_KEY,
+                    "plan",
+                    expected_revision=int(current.collaboration_revision or 0),
+                )
+            return await original_accept_turn(*args, **kwargs)
+
+        monkeypatch.setattr(stack.storage, "accept_turn", race_mode_before_acceptance)
+        with pytest.raises(RpcHandlerError) as changed:
+            await _handle_plans_implement(
+                {
+                    "sessionKey": SOURCE_KEY,
+                    "planRevisionId": stack.source_revision.revision_id,
+                    "clientRequestId": "implement-mode-cas",
+                    "intent": "continue",
+                },
+                stack.context,
+            )
+        assert changed.value.code == "COLLABORATION_CHANGED"
+        current = await stack.storage.get_session(SOURCE_KEY)
+        assert current is not None
+        assert current.collaboration_mode == "plan"
+        assert current.active_plan_revision_id == stack.source_revision.revision_id
+        assert await stack.storage.get_active_plan_run(SOURCE_KEY) is None
+        assert await stack.storage.count_transcript_entries(
+            stack.source_revision.source_session_id
+        ) == 0
+        assert await stack.storage.list_agent_tasks(SOURCE_KEY) == []
+
+
+@pytest.mark.asyncio
+async def test_replan_acceptance_failure_does_not_leave_session_in_plan_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(_run: TaskRun) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_plan_rpc_stack(
+        tmp_path / "replan-atomic-mode.sqlite",
+        handler=handler,
+    ) as stack:
+        before = await stack.storage.get_session(SOURCE_KEY)
+        assert before is not None
+        assert before.collaboration_mode == "default"
+
+        async def fail_acceptance(*_args: Any, **_kwargs: Any) -> None:
+            raise StorageBusyError(
+                "accept_turn",
+                waited_ms=100,
+                retry_after_ms=25,
+            )
+
+        monkeypatch.setattr(stack.storage, "accept_turn", fail_acceptance)
+        with pytest.raises(RpcHandlerError) as failed:
+            await _handle_plans_revise(
+                {
+                    "sessionKey": SOURCE_KEY,
+                    "planRevisionId": stack.source_revision.revision_id,
+                    "prompt": "Tighten the verification step.",
+                    "clientRequestId": "replan-atomic-failure",
+                },
+                stack.context,
+            )
+        assert failed.value.code == "STORAGE_BUSY"
+        after = await stack.storage.get_session(SOURCE_KEY)
+        assert after == before
 
 
 @pytest.mark.asyncio

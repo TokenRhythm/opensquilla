@@ -3284,6 +3284,7 @@
     },
     "plan": {
       "label": "Plan",
+      "process": "Planungsprozess",
       "revision": "Revision {id}",
       "current": "Aktuell",
       "superseded": "Aktualisierte Version verfügbar",
@@ -3351,6 +3352,10 @@
       "other": "Andere",
       "otherPlaceholder": "Andere Antwort eingeben",
       "dismiss": "Schließen",
+      "planQuestionnaireHint": "Beantworten Sie die Pflichtfragen oder beenden Sie den aktuellen Durchlauf, um die Planung zu verlassen.",
+      "answerPlanQuestionnaire": "Beantworten Sie die Planfrage oben",
+      "previousQuestion": "Zurück",
+      "nextQuestion": "Weiter",
       "outcomeDoneTitle": "Antwort gesendet · Lauf fortgesetzt",
       "outcomeBusyDetail": "Ihre Antwort wird gerade verarbeitet.",
       "outcomeDoneDetail": "Der Agent hat diese Antwort angenommen und ist weitergegangen.",
