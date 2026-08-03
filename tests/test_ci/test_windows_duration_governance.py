@@ -35,18 +35,20 @@ def _write_run(
     sha: str,
     assignment_sha256: str,
     seconds: dict[str, float],
+    attempts: dict[str, int] | None = None,
     duplicate_core_node_in: str | None = None,
 ) -> Path:
     run_dir = root / f"run-{run_id}"
     for shard in SHARD_NAMES:
-        shard_dir = run_dir / f"windows-high-risk-{shard}-attempt-1"
+        attempt = (attempts or {}).get(shard, 1)
+        shard_dir = run_dir / f"windows-high-risk-{shard}-attempt-{attempt}"
         shard_dir.mkdir(parents=True)
         path = FILES_BY_SHARD[shard]
         metadata = {
             "schema_version": 1,
             "platform": "windows",
             "run_id": run_id,
-            "run_attempt": 1,
+            "run_attempt": attempt,
             "sha": sha,
             "shard": shard,
             "assignment_sha256": assignment_sha256,
@@ -94,6 +96,7 @@ def test_duration_builder_aggregates_three_comparable_runs(tmp_path: Path) -> No
             run_id=100 + index,
             sha=str(index) * 40,
             assignment_sha256=assignment,
+            attempts={"recovery-migration": 2} if index == 2 else None,
             seconds={
                 FILES_BY_SHARD["core"]: core,
                 FILES_BY_SHARD["gateway-sqlite"]: gateway,
@@ -134,6 +137,12 @@ def test_duration_builder_aggregates_three_comparable_runs(tmp_path: Path) -> No
     assert isinstance(source_runs, list)
     assert [run["id"] for run in source_runs] == [101, 102, 103]
     assert all(run["node_count"] == 4 for run in source_runs)
+    assert source_runs[1]["attempts"] == {
+        "core": 1,
+        "gateway-sqlite": 1,
+        "recovery-migration": 2,
+        "desktop-installer-contracts": 1,
+    }
 
 
 def test_duration_builder_rejects_incomplete_shard_artifacts(tmp_path: Path) -> None:

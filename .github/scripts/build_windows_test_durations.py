@@ -30,8 +30,8 @@ PROVISIONAL_FLOOR_SECONDS: Final[float] = 0.01
 class RunObservation:
     run_id: int
     sha: str
-    attempt: int
     assignment_sha256: str
+    attempts_by_shard: dict[str, int]
     runtime: dict[str, str | None]
     files_by_shard: dict[str, tuple[str, ...]]
     node_ids: frozenset[str]
@@ -140,8 +140,9 @@ def load_run_directory(run_dir: Path) -> RunObservation:
             f"found {len(metadata_paths)}"
         )
 
-    common: tuple[int, str, int, str] | None = None
+    common: tuple[int, str, str] | None = None
     common_runtime: dict[str, str | None] | None = None
+    attempts_by_shard: dict[str, int] = {}
     files_by_shard: dict[str, tuple[str, ...]] = {}
     junit_by_shard: dict[str, Path] = {}
     all_files: set[str] = set()
@@ -193,7 +194,7 @@ def load_run_directory(run_dir: Path) -> RunObservation:
         normalized_runtime = {
             key: str(value) if value is not None else None for key, value in runtime.items()
         }
-        run_common = (run_id, sha, attempt, assignment_sha256)
+        run_common = (run_id, sha, assignment_sha256)
         if common is None:
             common = run_common
             common_runtime = normalized_runtime
@@ -208,6 +209,7 @@ def load_run_directory(run_dir: Path) -> RunObservation:
             raise ValueError(f"test files assigned to multiple Windows shards: {sample}")
         all_files.update(files)
         files_by_shard[str(shard)] = files
+        attempts_by_shard[str(shard)] = attempt
         junit_path = metadata_path.with_name(JUNIT_NAME)
         if not junit_path.is_file():
             raise ValueError(f"missing JUnit report beside {metadata_path}")
@@ -230,8 +232,8 @@ def load_run_directory(run_dir: Path) -> RunObservation:
     return RunObservation(
         run_id=common[0],
         sha=common[1],
-        attempt=common[2],
-        assignment_sha256=common[3],
+        assignment_sha256=common[2],
+        attempts_by_shard=attempts_by_shard,
         runtime=common_runtime or {},
         files_by_shard=files_by_shard,
         node_ids=frozenset(node_ids),
@@ -263,9 +265,9 @@ def build_duration_payload(
         raise ValueError("minimum_runs cannot be lower than three")
     if len(observations) < minimum_runs:
         raise ValueError(f"at least {minimum_runs} comparable Windows runs are required")
-    identities = {(run.run_id, run.attempt) for run in observations}
+    identities = {run.run_id for run in observations}
     if len(identities) != len(observations):
-        raise ValueError("duplicate Windows run attempt supplied")
+        raise ValueError("duplicate Windows run supplied")
 
     reference = observations[0]
     for run in observations:
@@ -298,13 +300,15 @@ def build_duration_payload(
         {
             "id": run.run_id,
             "sha": run.sha,
-            "attempt": run.attempt,
+            "attempts": {
+                shard: run.attempts_by_shard[shard] for shard in SHARD_NAMES
+            },
             "assignment_sha256": run.assignment_sha256,
             "runtime": run.runtime,
             "node_count": len(run.node_ids),
             "weighted_file_count": len(run.file_seconds),
         }
-        for run in sorted(observations, key=lambda item: (item.run_id, item.attempt))
+        for run in sorted(observations, key=lambda item: item.run_id)
     ]
     return {
         "description": (
