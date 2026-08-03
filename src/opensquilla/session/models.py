@@ -285,6 +285,33 @@ class PlanRunRecord(SQLModel, table=True):
     schema_version: int = 1
 
 
+class GoalRunRecord(SQLModel, table=True):
+    """Server-authoritative long-running goal execution instance."""
+
+    __tablename__ = "goal_runs"
+
+    goal_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    session_key: str = Field(index=True, max_length=512)
+    agent_id: str = Field(index=True, max_length=256)
+    goal_text: str
+    status: str = Field(default="running", index=True)
+    progress: list[dict[str, Any]] | None = Field(
+        default=None,
+        sa_column=Column(JSON),
+    )
+    turns: int = 0
+    idle_turns: int = 0
+    blocked_reason: str | None = None
+    blocked_retries: int = 0
+    plan_run_id: str | None = Field(default=None, index=True)
+    started_at: int
+    last_turn_at: int | None = None
+    finished_at: int | None = None
+    terminal_reason: str | None = None
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+
+
 class SessionSummary(SQLModel, table=True):
     """Compaction summary record — stores merged summaries of older transcript segments."""
 

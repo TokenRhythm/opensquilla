@@ -28,11 +28,17 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
+from opensquilla.session.goals import (
+    GOAL_RUN_ACTIVE_STATUSES,
+    GoalConflictError,
+    GoalValidationError,
+)
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
     CollaborationMode,
+    GoalRunRecord,
     MemoryDurableReceipt,
     PlanRevisionRecord,
     PlanRunRecord,
@@ -536,6 +542,35 @@ _CREATE_IDX_PLAN_RUNS_DRIVER = """
 CREATE INDEX IF NOT EXISTS idx_plan_runs_driver
 ON plan_runs(driver_id)
 WHERE driver_id IS NOT NULL
+"""
+
+_CREATE_GOAL_RUNS = """
+CREATE TABLE IF NOT EXISTS goal_runs (
+    goal_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    goal_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'paused', 'complete', 'blocked', 'cancelled')),
+    progress TEXT,
+    turns INTEGER NOT NULL DEFAULT 0,
+    idle_turns INTEGER NOT NULL DEFAULT 0,
+    blocked_reason TEXT,
+    blocked_retries INTEGER NOT NULL DEFAULT 0,
+    plan_run_id TEXT,
+    started_at INTEGER NOT NULL,
+    last_turn_at INTEGER,
+    finished_at INTEGER,
+    terminal_reason TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)
+"""
+
+_CREATE_IDX_GOAL_RUNS_ACTIVE = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_runs_active
+ON goal_runs (session_key)
+WHERE status IN ('running', 'paused')
 """
 
 _CREATE_TRANSCRIPT = """
@@ -1109,6 +1144,7 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         "payload",
         "steps",
         "step_states",
+        "progress",
     }
     bool_fields = {
         "total_tokens_fresh",
@@ -1554,6 +1590,8 @@ class SessionStorage:
         await self._conn.execute(_CREATE_IDX_PLAN_RUNS_SESSION_HISTORY)
         await self._conn.execute(_CREATE_IDX_PLAN_RUNS_REVISION)
         await self._conn.execute(_CREATE_IDX_PLAN_RUNS_DRIVER)
+        await self._conn.execute(_CREATE_GOAL_RUNS)
+        await self._conn.execute(_CREATE_IDX_GOAL_RUNS_ACTIVE)
         await self._conn.execute(_CREATE_TRANSCRIPT)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_KEY)
@@ -5038,6 +5076,247 @@ class SessionStorage:
             updated = await self._select_plan_run_on_conn(conn, run_id)
             assert updated is not None
             return updated
+
+    # ── Goal run ledger CRUD ────────────────────────────────────────────────
+
+    _GOAL_RUN_UPDATABLE_FIELDS = frozenset(
+        {
+            "status",
+            "progress",
+            "turns",
+            "idle_turns",
+            "blocked_reason",
+            "blocked_retries",
+            "plan_run_id",
+            "last_turn_at",
+            "finished_at",
+            "terminal_reason",
+        }
+    )
+
+    @classmethod
+    async def _select_goal_run_on_conn(
+        cls,
+        conn: Any,
+        goal_id: str,
+    ) -> GoalRunRecord | None:
+        async with conn.execute(
+            "SELECT * FROM goal_runs WHERE goal_id = ?",
+            (goal_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else GoalRunRecord(**_deserialize_row(dict(row)))
+
+    async def create_goal_run(self, run: GoalRunRecord) -> GoalRunRecord:
+        """Persist a fresh goal run, honoring the one-active-run-per-session index."""
+
+        run.session_key = canonicalize_session_key(run.session_key)
+        run.agent_id = normalize_agent_id(run.agent_id)
+        async with self._write_transaction("create_goal_run") as conn:
+            data = run.model_dump()
+            columns = list(data)
+            placeholders = ", ".join("?" for _ in columns)
+            try:
+                await conn.execute(
+                    f"INSERT INTO goal_runs ({', '.join(columns)}) "
+                    f"VALUES ({placeholders})",
+                    [_serialize(data[column]) for column in columns],
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GoalConflictError(
+                    "an active goal run already exists for this session"
+                ) from exc
+        return run
+
+    @_serialized_read
+    async def get_goal_run(self, goal_id: str) -> GoalRunRecord | None:
+        return await self._select_goal_run_on_conn(self.conn, goal_id)
+
+    @_serialized_read
+    async def get_active_goal_run(
+        self,
+        session_key: str,
+    ) -> GoalRunRecord | None:
+        session_key = canonicalize_session_key(session_key)
+        placeholders = ", ".join("?" for _ in GOAL_RUN_ACTIVE_STATUSES)
+        async with self.conn.execute(
+            f"""
+            SELECT *
+            FROM goal_runs
+            WHERE session_key = ? AND status IN ({placeholders})
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,  # noqa: S608 - placeholder count is derived from a fixed constant
+            [session_key, *sorted(GOAL_RUN_ACTIVE_STATUSES)],
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else GoalRunRecord(**_deserialize_row(dict(row)))
+
+    async def update_goal_run(
+        self,
+        goal_id: str,
+        *,
+        expected_updated_at: int,
+        **fields: Any,
+    ) -> GoalRunRecord:
+        """Compare-and-set update guarded by ``updated_at`` for optimistic concurrency."""
+
+        unknown = set(fields) - self._GOAL_RUN_UPDATABLE_FIELDS
+        if unknown:
+            raise GoalValidationError(
+                f"cannot update goal run fields: {', '.join(sorted(unknown))}"
+            )
+        raw_status = fields.get("status")
+        if raw_status is not None and raw_status not in {
+            "running",
+            "paused",
+            "complete",
+            "blocked",
+            "cancelled",
+        }:
+            raise GoalValidationError(f"invalid goal run status: {raw_status}")
+        async with self._write_transaction("update_goal_run") as conn:
+            run = await self._select_goal_run_on_conn(conn, goal_id)
+            if run is None:
+                raise KeyError(f"Goal run not found: {goal_id}")
+            if run.updated_at != expected_updated_at:
+                raise GoalConflictError("goal run changed before the update")
+            updates = {**fields, "updated_at": _now_ms()}
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            async with conn.execute(
+                f"""
+                UPDATE goal_runs
+                SET {assignments}
+                WHERE goal_id = ? AND updated_at = ?
+                """,
+                [
+                    *(_serialize(updates[column]) for column in updates),
+                    goal_id,
+                    expected_updated_at,
+                ],
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed == 0:
+                raise GoalConflictError("goal run changed before the update")
+            updated = await self._select_goal_run_on_conn(conn, goal_id)
+            assert updated is not None
+            return updated
+
+    async def supersede_active_goal_runs(
+        self,
+        session_key: str,
+        *,
+        except_goal_id: str | None = None,
+    ) -> int:
+        """Cancel every active goal run for a session boundary (goals.set replacement)."""
+
+        session_key = canonicalize_session_key(session_key)
+        timestamp = _now_ms()
+        placeholders = ", ".join("?" for _ in GOAL_RUN_ACTIVE_STATUSES)
+        params: list[Any] = [
+            timestamp,
+            timestamp,
+            session_key,
+            *sorted(GOAL_RUN_ACTIVE_STATUSES),
+        ]
+        where = f"session_key = ? AND status IN ({placeholders})"  # noqa: S608
+        if except_goal_id is not None:
+            where += " AND goal_id != ?"
+            params.append(except_goal_id)
+        async with self._write_transaction("supersede_active_goal_runs") as conn:
+            async with conn.execute(
+                f"""
+                UPDATE goal_runs
+                SET status = 'cancelled',
+                    terminal_reason = 'superseded_by_new_goal',
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE {where}
+                """,
+                params,
+            ) as cur:
+                return int(cur.rowcount or 0)
+
+    async def complete_goal_run(
+        self,
+        goal_id: str,
+        *,
+        expected_updated_at: int,
+        terminal_reason: str | None = None,
+    ) -> GoalRunRecord:
+        """Mark a goal run complete with a durable terminal reason."""
+
+        return await self.update_goal_run(
+            goal_id,
+            expected_updated_at=expected_updated_at,
+            status="complete",
+            finished_at=_now_ms(),
+            terminal_reason=terminal_reason,
+        )
+
+    async def block_goal_run(
+        self,
+        goal_id: str,
+        *,
+        expected_updated_at: int,
+        blocked_reason: str | None = None,
+        terminal_reason: str,
+    ) -> GoalRunRecord:
+        """Block a goal run with its last failure cause and a terminal reason."""
+
+        return await self.update_goal_run(
+            goal_id,
+            expected_updated_at=expected_updated_at,
+            status="blocked",
+            blocked_reason=blocked_reason,
+            finished_at=_now_ms(),
+            terminal_reason=terminal_reason,
+        )
+
+    async def pause_goal_run(
+        self,
+        goal_id: str,
+        *,
+        expected_updated_at: int,
+    ) -> GoalRunRecord:
+        """Pause a goal run so it no longer auto-continues."""
+
+        return await self.update_goal_run(
+            goal_id,
+            expected_updated_at=expected_updated_at,
+            status="paused",
+        )
+
+    async def resume_goal_run(
+        self,
+        goal_id: str,
+        *,
+        expected_updated_at: int,
+    ) -> GoalRunRecord:
+        """Resume a paused goal run for automatic continuation."""
+
+        return await self.update_goal_run(
+            goal_id,
+            expected_updated_at=expected_updated_at,
+            status="running",
+        )
+
+    async def cancel_goal_run(
+        self,
+        goal_id: str,
+        *,
+        expected_updated_at: int,
+        terminal_reason: str,
+    ) -> GoalRunRecord:
+        """Cancel a goal run with a durable terminal reason."""
+
+        return await self.update_goal_run(
+            goal_id,
+            expected_updated_at=expected_updated_at,
+            status="cancelled",
+            finished_at=_now_ms(),
+            terminal_reason=terminal_reason,
+        )
 
     # ── AgentTask ledger CRUD ───────────────────────────────────────────────
 
