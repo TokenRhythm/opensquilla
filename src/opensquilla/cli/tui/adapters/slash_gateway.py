@@ -19,7 +19,11 @@ from rich.table import Table
 import opensquilla.cli.tui.adapters.input_bridge as _input_bridge
 from opensquilla.cli.chat.session_state import ChatSessionState, messages_to_markdown
 from opensquilla.cli.chat.turn import TurnResult
-from opensquilla.cli.gateway_client import GatewayRPCError, session_history_all
+from opensquilla.cli.gateway_client import (
+    GatewayEventSubscription,
+    GatewayRPCError,
+    session_history_all,
+)
 from opensquilla.cli.tui.adapters.commands import render_help_table, render_keys_table
 from opensquilla.cli.tui.adapters.slash_common import (
     compact_skipped_line,
@@ -142,11 +146,47 @@ class GatewayClientLike(Protocol):
 
     async def set_model_routing(self, mode: str) -> dict[str, Any]: ...
 
+    async def subscribe_session_events(
+        self,
+        session_key: str,
+        *,
+        since_stream_seq: int | None = None,
+        event_names: set[str] | frozenset[str] | None = None,
+    ) -> GatewayEventSubscription: ...
+
+
+class _GoalTurnStreamClient(Protocol):
+    """The client surface the shared gateway stream renderer needs per turn.
+
+    ``stream_response_gateway`` only pulls ``send_message`` frames and resolves
+    approvals/aborts through the client; ``_GoalTurnClient`` implements exactly
+    this surface for goal continuation turns replayed from a session
+    subscription.
+    """
+
+    def send_message(
+        self,
+        session_key: str,
+        message: str,
+        attachments: list[dict] | None = None,
+        elevated: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]: ...
+
+    async def resolve_approval(
+        self,
+        approval_id: str,
+        approved: bool,
+        *,
+        choice: str | None = None,
+    ) -> Any: ...
+
+    async def abort_session(self, key: str) -> dict[str, Any]: ...
+
 
 class GatewayStreamResponse(Protocol):
     async def __call__(
         self,
-        client: GatewayClientLike,
+        client: _GoalTurnStreamClient,
         session_key: str,
         message: str,
         elevated_state: dict[str, str | None] | None = None,
@@ -157,7 +197,7 @@ class GatewayStreamResponse(Protocol):
 
 
 async def stream_response_gateway(
-    client: GatewayClientLike,
+    client: _GoalTurnStreamClient,
     session_key: str,
     message: str,
     elevated_state: dict[str, str | None] | None = None,

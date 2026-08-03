@@ -212,7 +212,7 @@ def _extract_transcript_text(content: Any) -> str | None:
     try:
         payload = json.loads(content)
         if isinstance(payload, dict) and isinstance(payload.get("text"), str):
-            return payload["text"]
+            return str(payload["text"])
     except (ValueError, TypeError):
         pass
     return content
@@ -468,27 +468,33 @@ async def _maybe_continue_goal_impl(
     now_ms = _now_ms()
     # Guardrail pre-checks: short-circuit before reading the transcript so a
     # budget/turn-limit stop never pays for marker parsing.
-    if int(getattr(goal, "turns", 0) or 0) >= int(config.max_turns):
-        return await _apply_guardrail_block(
+    # Same threshold as ``advance_goal_after_turn`` (``turns + 1 >= max_turns``):
+    # the run blocks once it has executed ``max_turns`` turns. Checking here
+    # short-circuits before the transcript read so a limit stop never pays for
+    # marker parsing.
+    if int(getattr(goal, "turns", 0) or 0) + 1 >= int(config.max_turns):
+        await _apply_guardrail_block(
             storage,
             goal=goal,
             plan_run=plan_run,
             terminal_reason="goal_continuation_limit_reached",
             now_ms=now_ms,
         )
+        return None
     budget_seconds = config.runtime_budget_seconds
     if (
         budget_seconds is not None
         and now_ms - int(getattr(goal, "started_at", now_ms) or now_ms)
         > int(budget_seconds) * 1000
     ):
-        return await _apply_guardrail_block(
+        await _apply_guardrail_block(
             storage,
             goal=goal,
             plan_run=plan_run,
             terminal_reason="goal_runtime_budget_exceeded",
             now_ms=now_ms,
         )
+        return None
 
     if not config.continue_unwatched and not get_goal_watcher_registry().has_watchers(
         session_key, ttl_ms=int(config.watcher_ttl_seconds) * 1000
@@ -534,9 +540,8 @@ async def _maybe_continue_goal_impl(
     elif marker[0] == "blocked":
         reason_text = marker[1] or ""
         same_cause = (
-            str(getattr(goal, "blocked_reason", "") or "") == reason_text
-            if reason_text
-            else False
+            getattr(goal, "blocked_reason", None) is not None
+            and str(getattr(goal, "blocked_reason", "") or "") == reason_text
         )
         retries_after = (
             int(getattr(goal, "blocked_retries", 0) or 0) + 1

@@ -124,3 +124,7 @@ opensquilla-webui/public/music/playlist.local.json
 
 # Isolated local implementation worktrees.
 /.worktrees/
+
+# Local employee credential-unlock utility (DPAPI decrypt + .env write).
+# Personal tooling that must never be published with the public repo.
+scripts/employee_unlock_credential.py

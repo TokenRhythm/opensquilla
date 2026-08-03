@@ -418,6 +418,44 @@ async def test_goal_driver_blocks_after_three_same_cause_markers(
 
 
 @pytest.mark.asyncio
+async def test_goal_driver_blocks_after_three_reasonless_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    script = _MarkerScript(["[goal:blocked]"] * 3)
+    async with _open_goal_driver_stack(
+        tmp_path / "driver-blocked-reasonless.sqlite",
+        handler=script,
+        goal_config=GoalConfig(continue_unwatched=True),
+    ) as stack:
+        script.manager = stack.manager
+        response = await _start_goal(stack)
+        goal_id = response["goalId"]
+        run_id = response["planRun"]["runId"]
+
+        # Three consecutive reason-less blocked markers still hit the retry
+        # ceiling: the empty reason is a same-cause block, not a reset.
+        await _wait_for_goal_status(stack.storage, goal_id, "blocked")
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "blocked"
+        assert goal.turns == 3
+        assert goal.blocked_reason == ""
+        assert goal.blocked_retries == 3
+        assert goal.terminal_reason == "blocked_after_retries:"
+
+        plan_run = await stack.storage.get_plan_run(run_id)
+        assert plan_run is not None
+        assert plan_run.status == "cancelled"
+        assert plan_run.terminal_reason == "goal_blocked"
+        assert len(script.captured) == 3
+
+
+@pytest.mark.asyncio
 async def test_goal_driver_max_turns_blocks_after_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -250,6 +250,22 @@ def test_advance_blocked_reason_change_resets_retry_count() -> None:
     assert advance.terminal_reason == "blocked_after_retries:different_reason"
 
 
+def test_advance_blocked_without_reason_accumulates_retries() -> None:
+    goal = _goal()
+    for _ in range(2):
+        advance = _advance(goal, ("blocked", None))
+        assert advance.continue_ is True
+        assert advance.terminal is False
+        # The driver persists an empty reason string for reason-less markers.
+        goal = goal.model_copy(
+            update={"blocked_reason": "", "blocked_retries": goal.blocked_retries + 1}
+        )
+    advance = _advance(goal, ("blocked", None))
+    assert advance.continue_ is False
+    assert advance.terminal is True
+    assert advance.terminal_reason == "blocked_after_retries:"
+
+
 def test_advance_idle_prompt_after_two_markerless_turns() -> None:
     goal = _goal()
     first = _advance(goal, None)
