@@ -364,6 +364,7 @@ def _provider_display_name(provider_kind: str) -> str:
     return {
         "openai": "OpenAI",
         "openrouter": "OpenRouter",
+        "orcarouter": "OrcaRouter",
         "deepseek": "DeepSeek",
         "moonshot": "Moonshot",
         "dashscope": "DashScope",

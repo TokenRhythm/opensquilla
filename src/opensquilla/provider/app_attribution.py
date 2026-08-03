@@ -7,7 +7,9 @@ from urllib.parse import urlparse
 OPENSQUILLA_APP_REFERER = "https://opensquilla.ai"
 OPENSQUILLA_APP_TITLE = "OpenSquilla"
 
-_APP_ATTRIBUTION_ROOT_HOSTS = frozenset({"openrouter.ai", "tokenrhythm.studio"})
+_APP_ATTRIBUTION_ROOT_HOSTS = frozenset(
+    {"openrouter.ai", "tokenrhythm.studio", "api.orcarouter.ai"}
+)
 
 
 def _normalized_hostname(url: str | None) -> str:

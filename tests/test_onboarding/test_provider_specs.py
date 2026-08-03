@@ -76,6 +76,7 @@ EXPECTED_EXPERIMENTAL = {
     "byteplus_coding_plan", "byteplus_coding_plan_anthropic",
     "tencent_tokenhub", "tencent_tokenhub_anthropic", "tencent_tokenhub_intl",
     "tencent_token_plan", "tencent_token_plan_anthropic",
+    "orcarouter",
 }
 EXPECTED_SUPPORTED = EXPECTED_VERIFIED | EXPECTED_EXPERIMENTAL
 # No runtime support at all: never configurable.
@@ -126,6 +127,13 @@ def test_supported_providers_have_label_and_backend(provider_id: str):
 def test_openrouter_has_correct_default_base_url():
     spec = get_provider_setup_spec("openrouter")
     assert spec.default_base_url == "https://openrouter.ai/api/v1"
+
+
+def test_orcarouter_has_correct_default_base_url_and_model():
+    spec = get_provider_setup_spec("orcarouter")
+    assert spec.default_base_url == "https://api.orcarouter.ai/v1"
+    assert spec.default_direct_model == "orcarouter/auto"
+    assert spec.env_key == "ORCAROUTER_API_KEY"
 
 
 def test_bailian_coding_regions_are_explicit_provider_choices():

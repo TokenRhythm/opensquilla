@@ -193,6 +193,14 @@ for _provider_spec in [
         selectable_model_catalog="verified_live",
     ),
     _spec(
+        "orcarouter",
+        "openai_compat",
+        "orcarouter",
+        "ORCAROUTER_API_KEY",
+        "https://api.orcarouter.ai/v1",
+        catalog_source=("orcarouter",),
+    ),
+    _spec(
         "openai",
         "openai_compat",
         "openai",

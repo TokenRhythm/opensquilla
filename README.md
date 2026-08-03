@@ -39,9 +39,9 @@ on-device embeddings round out a single shared turn loop.
 Every entry point — Web UI, CLI, and chat channels — runs through that
 same loop, so tool dispatch, retries, and decision logging behave
 identically everywhere. A pluggable provider layer speaks to
-TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini,
-Qwen/DashScope, and 20+ other LLM providers with no change to your code or config
-schema.
+TokenRhythm, OpenRouter, OrcaRouter, OpenAI, Anthropic, Ollama, DeepSeek,
+Gemini, Qwen/DashScope, and 20+ other LLM providers with no change to your
+code or config schema.
 
 OpenSquilla 0.5.2 is the current stable release.
 

@@ -53,6 +53,7 @@ class ProviderSetupSpec:
 
 _PROVIDER_LABELS: dict[str, str] = {
     "openrouter": "OpenRouter",
+    "orcarouter": "OrcaRouter",
     "openai": "OpenAI",
     "azure": "Azure OpenAI",
     "anthropic": "Anthropic",
@@ -158,6 +159,7 @@ _DEDICATED_SK_SP_PROVIDER_IDS = _BAILIAN_CODING_PROVIDER_IDS | {
     "qwen_token_plan_anthropic",
 }
 _DIRECT_MODEL_DEFAULTS = {
+    "orcarouter": "orcarouter/auto",
     "bailian_coding": "qwen3.7-plus",
     "bailian_coding_cn": "qwen3.7-plus",
     "qwen_token_plan": "qwen3.8-max-preview",

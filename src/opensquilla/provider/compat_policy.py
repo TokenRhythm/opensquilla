@@ -296,6 +296,11 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         allow_post_terminal_noop_choice=True,
         post_terminal_metadata_keys=frozenset({"provider"}),
     ),
+    "orcarouter": OpenAICompatPolicy(
+        display_name="OrcaRouter",
+        official_host="api.orcarouter.ai",
+        sends_usage_include=True,
+    ),
     "azure": OpenAICompatPolicy(display_name="Azure OpenAI"),
     "deepseek": OpenAICompatPolicy(
         display_name="DeepSeek",
