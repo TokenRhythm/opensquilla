@@ -70,9 +70,18 @@ async def test_agent_task_ledger_marks_active_tasks_abandoned_after_restart(tmp_
     assert by_id["queued-task"].status == AgentTaskStatus.ABANDONED
     assert by_id["queued-task"].terminal_reason == "process_restart"
     assert by_id["queued-task"].finished_at is not None
+    assert by_id["queued-task"].details == {
+        "turn_outcome": {
+            "kind": "interrupted",
+            "reason": "process_restart",
+            "error_class": "process_restart",
+            "retryable": True,
+        }
+    }
     assert by_id["running-task"].status == AgentTaskStatus.ABANDONED
     assert by_id["running-task"].terminal_reason == "process_restart"
     assert by_id["running-task"].finished_at is not None
+    assert by_id["running-task"].details == by_id["queued-task"].details
     assert by_id["done-task"].status == AgentTaskStatus.SUCCEEDED
     assert by_id["done-task"].terminal_reason is None
 
@@ -270,6 +279,13 @@ async def test_list_agent_tasks_for_sessions_groups_visible_session_tasks(tmp_pa
             limit_per_session=1,
         )
         exact = await storage.get_agent_task("one-new")
+        exact_many = await storage.get_agent_tasks_by_ids(
+            ["two-task", "one-new", "missing-task"]
+        )
+        recent = await storage.list_recent_agent_tasks(
+            "agent:main:webchat:one",
+            limit=1,
+        )
     finally:
         await storage.close()
 
@@ -279,6 +295,9 @@ async def test_list_agent_tasks_for_sessions_groups_visible_session_tasks(tmp_pa
     assert grouped["agent:main:webchat:one"][0].details is None
     assert exact is not None
     assert exact.details == {"terminal_assistant_message_content": "x" * 100_000}
+    assert [row.task_id for row in exact_many] == ["two-task", "one-new"]
+    assert [row.task_id for row in recent] == ["one-new"]
+    assert recent[0].details == {"terminal_assistant_message_content": "x" * 100_000}
 
 
 @pytest.mark.asyncio

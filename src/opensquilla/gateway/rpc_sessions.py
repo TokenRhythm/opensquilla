@@ -137,6 +137,17 @@ log = structlog.get_logger(__name__)
 _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
 
+
+def _emit_steer_metric(disposition: str, **labels: Any) -> None:
+    log.info(
+        "steer_inputs_total",
+        metric="steer_inputs_total",
+        value=1,
+        disposition=disposition,
+        **labels,
+    )
+
+
 if TYPE_CHECKING:
     from opensquilla.gateway.task_runtime import TaskRuntime
 
@@ -923,8 +934,10 @@ def _session_turn_model(ctx: RpcContext, session: Any | None, agent_id: str) -> 
 
 
 def _task_summary(row: Any) -> dict[str, Any]:
+    task_id = getattr(row, "task_id", None)
     summary = {
-        "task_id": getattr(row, "task_id", None),
+        "task_id": task_id,
+        "turn_id": task_id,
         "status": _enum_value(getattr(row, "status", None)),
         "queue_mode": _enum_value(getattr(row, "queue_mode", None)),
         "run_kind": getattr(row, "run_kind", None),
@@ -944,6 +957,12 @@ def _task_summary(row: Any) -> dict[str, Any]:
             value = details.get(field)
             if isinstance(value, str) and value:
                 summary[field] = value
+        turn_outcome = details.get("turn_outcome")
+        if isinstance(turn_outcome, dict):
+            summary["turn_outcome"] = dict(turn_outcome)
+        steer_capability = details.get("steer_capability")
+        if isinstance(steer_capability, dict):
+            summary["steer_capability"] = dict(steer_capability)
     finished_at = getattr(row, "finished_at", None)
     if finished_at is not None:
         summary["finished_at"] = finished_at
@@ -1060,6 +1079,40 @@ def _task_state_summary(rows: list[Any]) -> dict[str, Any]:
     }
 
 
+async def _attach_active_steer_capability(
+    ctx: RpcContext,
+    session_key: str,
+    task_state: dict[str, Any],
+) -> None:
+    """Enrich active-task hydration from the live accepted routing snapshot."""
+
+    active_task = task_state.get("active_task")
+    if not isinstance(active_task, dict):
+        return
+    getter = getattr(getattr(ctx, "task_runtime", None), "steer_capability", None)
+    if not callable(getter):
+        return
+    try:
+        capability = getter(session_key)
+        if inspect.isawaitable(capability):
+            capability = await capability
+    except Exception:  # noqa: BLE001 - task hydration remains usable without it.
+        log.warning(
+            "sessions.steer_capability_hydration_failed",
+            session_key=session_key,
+            exc_info=True,
+        )
+        return
+    if not isinstance(capability, dict):
+        return
+    active_task["steer_capability"] = dict(capability)
+    active_task_id = active_task.get("task_id")
+    for task in task_state.get("tasks", []):
+        if isinstance(task, dict) and task.get("task_id") == active_task_id:
+            task["steer_capability"] = dict(capability)
+            break
+
+
 def _active_task_run_mode(rows: list[Any]) -> str | None:
     active = [
         row
@@ -1125,6 +1178,17 @@ def _run_mode_lock_payload(
 
 
 async def _list_task_rows(ctx: RpcContext, storage: Any | None, session_key: str) -> list[Any]:
+    if storage is not None:
+        recent_storage_list = getattr(storage, "list_recent_agent_tasks", None)
+        if callable(recent_storage_list):
+            try:
+                return list(await recent_storage_list(session_key))
+            except Exception:
+                log.warning(
+                    "sessions.recent_agent_task_storage_state_failed",
+                    session_key=session_key,
+                )
+
     task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
         runtime_list = getattr(task_runtime, "list", None)
@@ -2745,6 +2809,15 @@ async def _handle_sessions_send(
         or getattr(session, "queue_mode", None)
         or "followup"
     )
+    if requested_mode == "steer":
+        log.info(
+            "sessions.send.legacy_steer_queue_mode_used",
+            session_key=key,
+            deprecated=True,
+            runtime_mode="interrupt",
+            replacement="sessions.steer.v2",
+        )
+        _emit_steer_metric("legacy_interrupt_requested", session_key=key)
     runtime_mode = "interrupt" if requested_mode == "steer" else requested_mode
     if atomic_intent_plan is not None and atomic_intent_plan.action == "reset":
         # A reset rotates the session identity. Any old-key task must be stopped
@@ -3682,11 +3755,481 @@ async def _handle_sessions_send(
     raise AssertionError("unreachable: direct sends return before runtime dispatch")
 
 
+def _steer_v2_failure(
+    *,
+    key: str,
+    expected_turn_id: str,
+    failure_code: str,
+    capability: dict[str, Any] | None = None,
+    active_turn_id: str | None = None,
+) -> dict[str, Any]:
+    _emit_steer_metric(
+        "rejected",
+        session_key=key,
+        failure_code=failure_code,
+    )
+    payload: dict[str, Any] = {
+        "status": "not_accepted",
+        "accepted": False,
+        "key": key,
+        "session_key": key,
+        "expected_turn_id": expected_turn_id,
+        "failure_code": failure_code,
+        "retryable": False,
+        "fallback_safe": True,
+    }
+    if active_turn_id:
+        payload["active_turn_id"] = active_turn_id
+    if capability is not None:
+        payload["steer_capability"] = capability
+    return payload
+
+
+async def _steer_v2_response(
+    acceptance: TurnAcceptanceResult,
+    *,
+    client_request_id: str,
+    client_message_id: str,
+    surface_id: str,
+    storage: SessionStorage,
+) -> dict[str, Any]:
+    """Project one durable same-turn receipt, including its latest disposition."""
+
+    receipt = acceptance.receipt
+    context: dict[str, Any] = {}
+    try:
+        get_entry = getattr(storage, "get_canonical_transcript_entry", None)
+        if callable(get_entry):
+            entry = await get_entry(receipt.session_id, receipt.message_id)
+        else:
+            get_transcript = getattr(storage, "get_canonical_transcript", None)
+            if not callable(get_transcript):
+                get_transcript = storage.get_transcript
+            entries = await get_transcript(receipt.session_id)
+            entry = next(
+                (item for item in entries if item.message_id == receipt.message_id),
+                None,
+            )
+        if entry is not None and isinstance(entry.turn_context, dict):
+            context = dict(entry.turn_context)
+    except Exception:  # noqa: BLE001 - the durable receipt remains authoritative.
+        log.warning(
+            "sessions.steer_v2.disposition_read_failed",
+            session_key=receipt.accepted_session_key,
+            message_id=receipt.message_id,
+            exc_info=True,
+        )
+
+    target_turn_id = receipt.task_id
+    disposition = str(context.get("disposition") or "steering")
+    payload: dict[str, Any] = {
+        "status": "accepted",
+        "accepted": True,
+        "replayed": acceptance.replayed,
+        "key": receipt.accepted_session_key,
+        "session_key": receipt.accepted_session_key,
+        "session_id": receipt.session_id,
+        "task_id": target_turn_id,
+        "turn_id": target_turn_id,
+        "client_request_id": client_request_id,
+        "client_message_id": (
+            context.get("client_message_id") or client_message_id
+        ),
+        "user_message_id": receipt.message_id,
+        "surface_id": context.get("surface_id") or surface_id,
+        "disposition": disposition,
+        "revision": int(context.get("revision") or 1),
+        "fallback_safe": True,
+    }
+    if disposition == "promoted":
+        promoted_turn_id = context.get("promoted_turn_id") or context.get("turn_id")
+        if isinstance(promoted_turn_id, str) and promoted_turn_id:
+            payload["promoted_turn_id"] = promoted_turn_id
+    for field in (
+        "applied_iteration",
+        "model_call_id",
+        "promoted_from_turn_id",
+        "failure_code",
+        "retryable",
+        "recovery",
+    ):
+        value = context.get(field)
+        if value is not None:
+            payload[field] = value
+    return payload
+
+
+@_d.method("sessions.steer.v2", scope="operator.write")
+async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dict:
+    """Durably attach text to one explicitly named running turn."""
+
+    key = _require_key(params)
+    assert isinstance(params, dict)
+    raw_message = params.get("message")
+    if not isinstance(raw_message, str):
+        raise ValueError("params.message is required")
+    if not raw_message.strip():
+        raise ValueError("params.message must not be blank")
+    expected_turn_id = _optional_string_param(
+        params,
+        "expected_turn_id",
+        "expectedTurnId",
+    )
+    if expected_turn_id is None:
+        raise ValueError("params.expected_turn_id is required")
+    client_request_id = _optional_string_param(
+        params,
+        "client_request_id",
+        "clientRequestId",
+    )
+    if client_request_id is None:
+        raise ValueError("params.client_request_id is required")
+    client_message_id = _optional_string_param(
+        params,
+        "client_message_id",
+        "clientMessageId",
+    )
+    if client_message_id is None:
+        raise ValueError("params.client_message_id is required")
+    for field, value in (
+        ("expected_turn_id", expected_turn_id),
+        ("client_request_id", client_request_id),
+        ("client_message_id", client_message_id),
+    ):
+        if len(value) > 256:
+            raise ValueError(f"params.{field} must not exceed 256 characters")
+
+    unsupported = raw_message.lstrip().startswith(("/", "!"))
+    attachments = params.get("attachments")
+    if attachments not in (None, []):
+        unsupported = True
+    for field in (
+        "intent",
+        "model",
+        "model_id",
+        "workspaceId",
+        "workspace_id",
+        "collaborationMode",
+        "collaboration_mode",
+        "runMode",
+        "run_mode",
+    ):
+        if params.get(field) is not None:
+            unsupported = True
+            break
+    if unsupported:
+        return _steer_v2_failure(
+            key=key,
+            expected_turn_id=expected_turn_id,
+            failure_code="STEER_UNSUPPORTED_INPUT",
+            capability={
+                "mode": "queue_only",
+                "expected_turn_id": expected_turn_id,
+                "input_kinds": ["text"],
+                "reason": "text_only",
+            },
+        )
+
+    if ctx.session_manager is None:
+        raise KeyError("No session manager available")
+    storage_candidate = get_session_storage(ctx.session_manager)
+    if storage_candidate is None:
+        raise KeyError("No session storage available")
+    storage = cast(SessionStorage, storage_candidate)
+    session = await storage.get_session(key)
+    if session is None:
+        raise KeyError(f"Session not found: {key}")
+
+    task_runtime = getattr(ctx, "task_runtime", None)
+    admit_steer = getattr(task_runtime, "admit_steer", None)
+    if not callable(admit_steer):
+        return _steer_v2_failure(
+            key=key,
+            expected_turn_id=expected_turn_id,
+            failure_code="STEER_V2_UNAVAILABLE",
+            capability={
+                "mode": "disabled",
+                "expected_turn_id": expected_turn_id,
+                "input_kinds": [],
+                "reason": "gateway_upgrade_required",
+            },
+        )
+
+    source_hint = _normalize_session_send_source_hint(params)
+    normalized = normalize_incoming_text(
+        raw_message,
+        source_hint=source_hint,
+        attachments=[],
+    )
+    if normalized.generated_attachments:
+        return _steer_v2_failure(
+            key=key,
+            expected_turn_id=expected_turn_id,
+            failure_code="STEER_UNSUPPORTED_INPUT",
+            capability={
+                "mode": "queue_only",
+                "expected_turn_id": expected_turn_id,
+                "input_kinds": ["text"],
+                "reason": "generated_attachment",
+            },
+        )
+    message_text = normalized.message_text
+    semantic_message = normalized.semantic_message
+    default_surface_id = str(
+        source_hint.get("channel_id")
+        or (
+            f"{source_hint.get('caller_kind', 'rpc')}:"
+            f"{source_hint.get('channel_kind', 'rpc')}"
+        )
+    )
+    surface_id = (
+        _optional_string_param(params, "surface_id", "surfaceId")
+        or default_surface_id
+    )
+    source_scope = f"{_turn_source_scope(source_hint, ctx)}:steer.v2"[:256]
+    ingress_identity = request_identity(
+        params,
+        request_session_key=key,
+        source_scope=source_scope,
+        fingerprint_params={
+            "message": raw_message,
+            "intent": "steer.v2",
+            "queueMode": {
+                "expected_turn_id": expected_turn_id,
+                "client_message_id": client_message_id,
+                "surface_id": surface_id,
+            },
+        },
+    )
+    log.info(
+        "sessions.steer_v2.requested",
+        session_key=key,
+        expected_turn_id=expected_turn_id,
+    )
+    _emit_steer_metric("requested", session_key=key)
+
+    get_ingress_receipt = getattr(storage, "get_turn_ingress_receipt", None)
+    if callable(get_ingress_receipt):
+        previous = await get_ingress_receipt(
+            source_scope=ingress_identity.source_scope,
+            request_session_key=ingress_identity.request_session_key,
+            client_request_id=ingress_identity.client_request_id,
+        )
+        if previous is not None:
+            if (
+                previous.receipt.request_fingerprint
+                != ingress_identity.request_fingerprint
+            ):
+                raise RpcHandlerError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "client_request_id was already used for a different steer",
+                    retryable=False,
+                    accepted=False,
+                )
+            log.info(
+                "sessions.steer_v2.replayed",
+                session_key=key,
+                expected_turn_id=expected_turn_id,
+            )
+            _emit_steer_metric("replayed", session_key=key)
+            return await _steer_v2_response(
+                previous,
+                client_request_id=ingress_identity.client_request_id,
+                client_message_id=client_message_id,
+                surface_id=surface_id,
+                storage=storage,
+            )
+
+    prepare_message = getattr(ctx.session_manager, "prepare_message", None)
+    accept_turn = getattr(storage, "accept_turn", None)
+    if not callable(prepare_message) or not callable(accept_turn):
+        raise RpcUnavailableError(
+            "Same-turn steer requires durable atomic session storage"
+        )
+    turn_context = {
+        "turn_id": expected_turn_id,
+        "target_turn_id": expected_turn_id,
+        "client_request_id": ingress_identity.client_request_id,
+        "client_message_id": client_message_id,
+        "surface_id": surface_id,
+        "intent": "steer",
+        "disposition": "steering",
+        "revision": 1,
+    }
+    prepared_entry, expected_epoch = await prepare_message(
+        key,
+        role="user",
+        content=message_text,
+        turn_context=turn_context,
+        session_node=session,
+    )
+    if isinstance(prepared_entry.content, str):
+        message_text = prepared_entry.content
+
+    async def _persist(active_turn_id: str) -> TurnAcceptanceResult:
+        if active_turn_id != expected_turn_id:
+            raise RuntimeError("steer admission changed the expected turn")
+        return cast(
+            TurnAcceptanceResult,
+            await accept_turn(
+                prepared_entry,
+                expected_epoch=expected_epoch,
+                updated_at=int(time.time() * 1000),
+                task_record=None,
+                receipt_task_id=active_turn_id,
+                source_scope=ingress_identity.source_scope,
+                request_session_key=ingress_identity.request_session_key,
+                client_request_id=ingress_identity.client_request_id,
+                request_fingerprint=ingress_identity.request_fingerprint,
+            ),
+        )
+
+    try:
+        admission = await complete_durable_ingress(
+            admit_steer(
+                key,
+                expected_turn_id,
+                message_text,
+                persist=_persist,
+                semantic_message=semantic_message,
+                client_request_id=ingress_identity.client_request_id,
+                client_message_id=client_message_id,
+                surface_id=surface_id,
+            )
+        )
+    except StorageBusyError as exc:
+        raise RpcHandlerError(
+            "STORAGE_BUSY",
+            "Session storage is temporarily busy. Retry with the same client_request_id.",
+            details={
+                "operation": exc.operation,
+                "waited_ms": exc.waited_ms,
+                "fallback_safe": False,
+            },
+            retryable=True,
+            retry_after_ms=exc.retry_after_ms,
+            accepted=False,
+        ) from exc
+    except StaleEpochError as exc:
+        raise RpcHandlerError(
+            "SESSION_CHANGED",
+            "The session changed while the steer was being accepted.",
+            details={"fallback_safe": True},
+            retryable=True,
+            accepted=False,
+        ) from exc
+    except TurnIngressConflictError as exc:
+        raise RpcHandlerError(
+            "IDEMPOTENCY_CONFLICT",
+            str(exc),
+            details={"fallback_safe": False},
+            retryable=False,
+            accepted=False,
+        ) from exc
+
+    if not admission.accepted:
+        # A concurrent duplicate may have committed before this admission
+        # observed terminal closure. Re-read the receipt before reporting a
+        # fallback-safe rejection.
+        if callable(get_ingress_receipt):
+            previous = await get_ingress_receipt(
+                source_scope=ingress_identity.source_scope,
+                request_session_key=ingress_identity.request_session_key,
+                client_request_id=ingress_identity.client_request_id,
+            )
+            if previous is not None:
+                return await _steer_v2_response(
+                    previous,
+                    client_request_id=ingress_identity.client_request_id,
+                    client_message_id=client_message_id,
+                    surface_id=surface_id,
+                    storage=storage,
+                )
+        log.info(
+            "sessions.steer_v2.not_accepted",
+            session_key=key,
+            expected_turn_id=expected_turn_id,
+            failure_code=admission.failure_code,
+        )
+        return _steer_v2_failure(
+            key=key,
+            expected_turn_id=expected_turn_id,
+            failure_code=admission.failure_code or "ACTIVE_TURN_NOT_STEERABLE",
+            capability=admission.capability,
+            active_turn_id=admission.task_id,
+        )
+
+    acceptance = cast(TurnAcceptanceResult, admission.persisted)
+    if not acceptance.replayed:
+        notify_message_appended = getattr(
+            ctx.session_manager,
+            "notify_message_appended",
+            None,
+        )
+        if callable(notify_message_appended):
+            notify_message_appended(prepared_entry)
+        event_payload = {
+            "key": key,
+            "session_key": key,
+            "task_id": expected_turn_id,
+            "turn_id": expected_turn_id,
+            "target_turn_id": expected_turn_id,
+            "client_request_id": ingress_identity.client_request_id,
+            "client_message_id": client_message_id,
+            "user_message_id": acceptance.receipt.message_id,
+            "surface_id": surface_id,
+            "intent": "steer",
+            "disposition": "steering",
+            "revision": 1,
+        }
+        try:
+            await _emit_to_subscribers(
+                ctx,
+                key,
+                "session.event.steer",
+                event_payload,
+            )
+            await _emit_to_subscribers(
+                ctx,
+                key,
+                "session.event.input_disposition",
+                event_payload,
+            )
+        except Exception:  # noqa: BLE001 - durable acceptance is authoritative.
+            log.warning(
+                "sessions.steer_v2.accepted_event_emit_failed",
+                session_key=key,
+                message_id=acceptance.receipt.message_id,
+                exc_info=True,
+            )
+    log.info(
+        "sessions.steer_v2.accepted",
+        session_key=key,
+        expected_turn_id=expected_turn_id,
+        replayed=acceptance.replayed,
+    )
+    _emit_steer_metric("accepted", session_key=key)
+    return await _steer_v2_response(
+        acceptance,
+        client_request_id=ingress_identity.client_request_id,
+        client_message_id=client_message_id,
+        surface_id=surface_id,
+        storage=storage,
+    )
+
+
 @_d.method("sessions.steer", scope="operator.write")
 async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
     """Inject text into the active turn, with a durable follow-up fallback."""
 
     key = _require_key(params)
+    log.info(
+        "sessions.steer.legacy_used",
+        session_key=key,
+        deprecated=True,
+        replacement="sessions.steer.v2",
+    )
+    _emit_steer_metric("legacy_requested", session_key=key)
     if not isinstance(params, dict) or not isinstance(params.get("message"), str):
         raise ValueError("params.message is required")
     raw_message = params["message"]
@@ -3874,7 +4417,7 @@ async def _handle_sessions_steer(params: dict | None, ctx: RpcContext) -> dict:
         "surface_id": surface_id,
         "intent": "steer",
         # Acceptance reserves the input for the next safe boundary.  The task
-        # runtime advances this to ``applied`` only after the engine drains it,
+        # runtime advances this to ``applied`` only after a provider call starts,
         # or to ``promoted``/``rejected`` if the turn ends first.
         "disposition": "steering",
         "target_turn_id": accepted_turn_id,
@@ -5374,6 +5917,7 @@ async def _hydrate_sessions_messages_metadata(
     storage = get_session_storage(getattr(ctx, "session_manager", None))
     task_rows = await _list_task_rows(ctx, storage, key)
     task_state = _task_state_summary(task_rows)
+    await _attach_active_steer_capability(ctx, key, task_state)
     from opensquilla.gateway.subagent_announce import (
         active_background_completion_group_ids,
         active_background_completion_run_mode_override,
@@ -6247,6 +6791,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     history = await _handle_chat_history(history_params, ctx)
     task_rows = await _list_task_rows(ctx, storage, session_key)
     task_state = _task_state_summary(task_rows)
+    await _attach_active_steer_capability(ctx, session_key, task_state)
     epoch = await _bootstrap_epoch(ctx.session_manager, storage, session, session_key)
     queued_count = sum(
         1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "queued"

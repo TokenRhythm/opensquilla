@@ -43,14 +43,35 @@ interface StatusData {
   imageGenerationConfigured?: boolean
   imageGenerationProvider?: string
   imageGenerationPrimary?: string
+  imageGenerationSource?: string
 }
 
+type CapabilityId = 'search' | 'memory_embedding' | 'image_generation' | 'audio'
+
 interface CapabilitiesPanelContext {
-  searchProviders: ComputedRef<Array<{ providerId: string; label: string }>>
+  searchProviders: ComputedRef<Array<{
+    providerId: string
+    label: string
+    requiresApiKey?: boolean
+  }>>
   memoryProviders: ComputedRef<Array<{ providerId: string; label: string }>>
   imageProviders: ComputedRef<Array<{ providerId: string; label: string }>>
   imageSpec: ComputedRef<ProviderSpec | null>
+  imageModels: ComputedRef<Array<{
+    id: string
+    name: string
+    contextWindow: number | null
+    maxOutputTokens: number | null
+    capabilities: string[]
+    pricing: { inputPer1k: number; outputPer1k: number } | null
+    capabilitySource: string
+  }>>
+  imageModelSource: ComputedRef<string>
   searchRequiresKey: ComputedRef<boolean>
+  searchKeyPlaceholder: ComputedRef<string>
+  searchDraftDirty: ComputedRef<boolean>
+  searchDraftMissingKey: ComputedRef<boolean>
+  searchDraftStatusText: ComputedRef<string>
   searchEnvPlaceholder: ComputedRef<string>
   searchAdvancedOpen: ComputedRef<boolean>
   searchNeeds: ComputedRef<string[]>
@@ -67,13 +88,15 @@ interface CapabilitiesPanelContext {
   memoryEnvPlaceholder: ComputedRef<string>
   memoryNeeds: ComputedRef<string[]>
   memoryStatusText: ComputedRef<string>
+  memoryModeTitle: ComputedRef<string>
+  memoryModeDescription: ComputedRef<string>
+  memoryExpandable: ComputedRef<boolean>
   memoryEnvCommand: ComputedRef<string>
   imageNeeds: ComputedRef<string[]>
   imageStatusText: ComputedRef<string>
   imageEnvCommand: ComputedRef<string>
-  capabilityBadgeTone: (name: string) => string
-  capabilityBadgeLabel: (name: string) => string
-  capabilitySaveButtonClass: (name: string) => string
+  capabilityBadgeTone: (name: CapabilityId) => string
+  capabilityBadgeLabel: (name: CapabilityId) => string
   memoryAutoCapture: Ref<boolean>
   audioEnabled: Ref<boolean>
   audioApiKey: Ref<string>
@@ -86,6 +109,8 @@ interface CapabilitiesPanelContext {
   audioBadgeTone: ComputedRef<string>
   audioBadgeLabel: ComputedRef<string>
   audioKeyPlaceholder: ComputedRef<string>
+  resettable: (name: CapabilityId) => boolean
+  resetPending: Ref<CapabilityId | ''>
 }
 
 export interface SearchFormValues {
@@ -110,7 +135,6 @@ export interface MemoryFormValues {
 
 export interface ImageFormValues {
   providerId: string
-  enabled: boolean
   primary: string
   apiKey: string
   apiKeyEnv: string
@@ -121,6 +145,13 @@ export interface ImageFormValues {
 }
 
 export type ImageTouchedField = 'apiKey' | 'apiKeyEnv' | 'baseUrl' | 'fallbacks'
+export type ImageCredentialSource =
+  | 'explicit'
+  | 'env'
+  | 'llm_fallback'
+  | 'missing_env'
+  | 'configured'
+  | 'none'
 
 interface ImagePayloadOptions {
   clearFallbacks?: boolean
@@ -131,7 +162,21 @@ interface ImageProviderDraft {
   apiKeyEnv: string
   baseUrl: string
   credentialConfigured: boolean
+  credentialSource: ImageCredentialSource
   touched: Set<ImageTouchedField>
+}
+
+function normalizeImageCredentialSource(value: unknown): ImageCredentialSource {
+  const source = String(value || '').trim()
+  if (
+    source === 'explicit'
+    || source === 'env'
+    || source === 'llm_fallback'
+    || source === 'missing_env'
+  ) {
+    return source
+  }
+  return 'none'
 }
 
 // Fallbacks are entered as one comma/newline-separated string; split to the
@@ -177,7 +222,7 @@ export function imageModelRefForPayload(providerId: string, raw: string): string
 export function buildSearchPayload(values: SearchFormValues): Record<string, unknown> {
   const params: Record<string, unknown> = { providerId: values.providerId }
   if (values.apiKey) params.apiKey = values.apiKey
-  if (values.apiKeyEnv) params.apiKeyEnv = values.apiKeyEnv
+  else if (values.apiKeyEnv) params.apiKeyEnv = values.apiKeyEnv
   params.maxResults = values.maxResults
   if (values.proxy) params.proxy = values.proxy
   params.useEnvProxy = values.useEnvProxy
@@ -205,7 +250,6 @@ export function buildImagePayload(
   const apiKeyEnv = values.apiKeyEnv.trim()
   const params: Record<string, unknown> = {
     providerId: values.providerId.trim(),
-    enabled: values.enabled,
   }
   const primary = imageModelRefForPayload(values.providerId, values.primary)
   if (primary) params.primary = primary
@@ -256,6 +300,7 @@ export function useSetupCapabilitiesForm() {
   const imageOutputFormat = ref('png')
   const imageFallbacks = ref('')
   const imageKeyConfigured = ref(false)
+  const imageCredentialSource = ref<ImageCredentialSource>('none')
   const imageTouchedFields = ref<Set<ImageTouchedField>>(new Set())
   const imageGlobalTouchedFields = ref<Set<ImageTouchedField>>(new Set())
   const imageClearFallbacks = ref(false)
@@ -271,7 +316,7 @@ export function useSetupCapabilitiesForm() {
   ]))
   const imageSerialized = computed(() => JSON.stringify([
     imageProvider.value, imagePrimary.value, imageApiKey.value, imageApiKeyEnv.value,
-    imageBaseUrl.value, imageEnabled.value,
+    imageBaseUrl.value,
     imageSize.value, imageOutputFormat.value, imageFallbacks.value,
   ]))
   // Seed from the initial state so the pristine forms are never dirty while config loads.
@@ -289,6 +334,7 @@ export function useSetupCapabilitiesForm() {
   const selectedImageProvider = computed(() => imageProvider.value)
   const imageIsEnabled = computed(() => imageEnabled.value)
   const searchAdvancedOpen = computed(() => Boolean(searchProxy.value || searchUseEnvProxy.value || searchFallbackPolicy.value !== 'off' || searchDiagnostics.value))
+  const searchApiKeyValue = computed(() => searchApiKey.value)
   const searchApiKeyEnvValue = computed(() => searchApiKeyEnv.value)
   const memoryApiKeyEnvValue = computed(() => memoryApiKeyEnv.value)
   const imageApiKeyEnvValue = computed(() => imageApiKeyEnv.value)
@@ -296,6 +342,7 @@ export function useSetupCapabilitiesForm() {
   const imagePrimaryValue = computed(() => imagePrimary.value)
   const imageBaseUrlValue = computed(() => imageBaseUrl.value)
   const imageKeyConfiguredValue = computed(() => imageKeyConfigured.value)
+  const imageCredentialSourceValue = computed(() => imageCredentialSource.value)
   const memoryRemoteOptionsOpen = computed(() => memoryProvider.value !== 'auto' || Boolean(memoryModel.value || memoryApiKey.value || memoryApiKeyEnv.value || memoryBaseUrl.value))
   const memoryRemoteOptionsSummary = computed(() => i18n.global.t(memoryProvider.value === 'auto' ? 'setup.memory.remoteFallbackOptions' : 'setup.memory.connectionOptions'))
   const memoryModelPlaceholder = computed(() => memoryProvider.value === 'ollama' ? 'nomic-embed-text' : (memoryRemoteControlEnabled.value ? 'remote-embedding-model' : i18n.global.t('setup.memory.notUsedByProvider')))
@@ -344,15 +391,21 @@ export function useSetupCapabilitiesForm() {
       const providerConfig = (imageConfig.providers || {})[spec.providerId] || {}
       const configuredPrimary = spec.providerId === primaryProvider ? primaryRef : ''
       const keyConfigured = Boolean(providerConfig.api_key)
-      // A stored direct key is not the only working credential: a saved env
-      // reference, or the backend-computed status (ambient env, LLM-provider
-      // fallback), also mean image generation works. Never label those
-      // "not configured" — that wording invites clearing a credential that
-      // is actually in use.
-      const credentialConfigured = keyConfigured
-        || Boolean(providerConfig.api_key_env)
-        || (status.imageGenerationConfigured === true
-          && spec.providerId === status.imageGenerationProvider)
+      const isStatusProvider = spec.providerId === status.imageGenerationProvider
+      const statusSource = isStatusProvider
+        ? normalizeImageCredentialSource(status.imageGenerationSource)
+        : 'none'
+      const credentialSource: ImageCredentialSource = keyConfigured
+        ? 'explicit'
+        : statusSource !== 'none'
+          ? statusSource
+          : Boolean(providerConfig.api_key_env)
+            ? 'env'
+            : status.imageGenerationConfigured === true && isStatusProvider
+              ? 'configured'
+              : 'none'
+      const credentialConfigured = ['explicit', 'env', 'llm_fallback', 'configured']
+        .includes(credentialSource)
       imageProviderDrafts.set(spec.providerId, {
         primary: imageModelForDisplay(
           spec.providerId,
@@ -363,6 +416,7 @@ export function useSetupCapabilitiesForm() {
           : (providerConfig.api_key_env || (spec.requiresApiKey ? spec.envKey || '' : '')),
         baseUrl: providerConfig.base_url || spec.defaultBaseUrl || '',
         credentialConfigured,
+        credentialSource,
         touched: new Set(),
       })
     }
@@ -387,6 +441,7 @@ export function useSetupCapabilitiesForm() {
       apiKeyEnv: spec?.requiresApiKey ? spec.envKey || '' : '',
       baseUrl: spec?.defaultBaseUrl || '',
       credentialConfigured: false,
+      credentialSource: 'none',
       touched: new Set(),
     }
   }
@@ -397,6 +452,7 @@ export function useSetupCapabilitiesForm() {
     imageApiKeyEnv.value = draft.apiKeyEnv
     imageBaseUrl.value = draft.baseUrl
     imageKeyConfigured.value = draft.credentialConfigured
+    imageCredentialSource.value = draft.credentialSource
     imageTouchedFields.value = new Set(draft.touched)
   }
 
@@ -453,13 +509,13 @@ export function useSetupCapabilitiesForm() {
     fields.value = next
   }
 
-  function onSearchProviderChange(spec: ProviderSpec | null | undefined) {
-    if (spec?.requiresApiKey) {
-      searchApiKeyEnv.value = spec.envKey || ''
-    } else {
-      searchApiKeyEnv.value = ''
-      searchApiKey.value = ''
-    }
+  function onSearchProviderChange(_spec: ProviderSpec | null | undefined) {
+    // Existing env references are hydrated and preserved until the user
+    // actually changes provider. A newly selected provider must be configured
+    // visibly in this client: never author a hidden default env reference that
+    // turns into a confusing "needs attention" state only after Save.
+    searchApiKeyEnv.value = ''
+    searchApiKey.value = ''
   }
 
   function onMemoryProviderChange(spec: ProviderSpec | null | undefined, apiKeyEnabled: boolean) {
@@ -573,7 +629,6 @@ export function useSetupCapabilitiesForm() {
     ])
     return buildImagePayload({
       providerId: imageProvider.value,
-      enabled: imageEnabled.value,
       primary: imagePrimary.value,
       apiKey: imageApiKey.value,
       apiKeyEnv: imageApiKeyEnv.value,
@@ -609,6 +664,7 @@ export function useSetupCapabilitiesForm() {
         // the backend-computed configured status. Drives the key field's
         // placeholder/state hint; the key itself is never echoed back.
         imageKeyConfigured: imageKeyConfigured.value,
+        imageCredentialSource: imageCredentialSource.value,
         imageApiKeyEnv: imageApiKeyEnv.value,
         imageBaseUrl: imageBaseUrl.value,
         imageEnabled: imageEnabled.value,
@@ -629,9 +685,14 @@ export function useSetupCapabilitiesForm() {
         memoryProviders: context.memoryProviders.value,
         imageProviders: context.imageProviders.value,
         imageSpec: context.imageSpec.value,
+        imageModels: context.imageModels.value,
       },
       state: {
         searchRequiresKey: context.searchRequiresKey.value,
+        searchKeyPlaceholder: context.searchKeyPlaceholder.value,
+        searchDraftDirty: context.searchDraftDirty.value,
+        searchDraftMissingKey: context.searchDraftMissingKey.value,
+        searchDraftStatusText: context.searchDraftStatusText.value,
         searchEnvPlaceholder: context.searchEnvPlaceholder.value,
         searchAdvancedOpen: searchAdvancedOpen.value,
         searchNeeds: context.searchNeeds.value,
@@ -650,17 +711,22 @@ export function useSetupCapabilitiesForm() {
         memoryEnvPlaceholder: context.memoryEnvPlaceholder.value,
         memoryNeeds: context.memoryNeeds.value,
         memoryStatusText: context.memoryStatusText.value,
+        memoryModeTitle: context.memoryModeTitle.value,
+        memoryModeDescription: context.memoryModeDescription.value,
+        memoryExpandable: context.memoryExpandable.value,
         memoryEnvCommand: context.memoryEnvCommand.value,
         imageNeeds: context.imageNeeds.value,
         imageStatusText: context.imageStatusText.value,
+        imageModelSource: context.imageModelSource.value,
         imageEnvCommand: context.imageEnvCommand.value,
         capabilityBadgeTone: context.capabilityBadgeTone,
         capabilityBadgeLabel: context.capabilityBadgeLabel,
-        capabilitySaveButtonClass: context.capabilitySaveButtonClass,
         audioStatusText: context.audioStatusText.value,
         audioBadgeTone: context.audioBadgeTone.value,
         audioBadgeLabel: context.audioBadgeLabel.value,
         audioKeyPlaceholder: context.audioKeyPlaceholder.value,
+        resettable: context.resettable,
+        resetPending: context.resetPending.value,
       },
     }))
   }
@@ -674,6 +740,7 @@ export function useSetupCapabilitiesForm() {
     memoryDirty,
     imageDirty,
     searchAdvancedOpen,
+    searchApiKeyValue,
     searchApiKeyEnvValue,
     memoryApiKeyEnvValue,
     imageApiKeyEnvValue,
@@ -681,6 +748,7 @@ export function useSetupCapabilitiesForm() {
     imagePrimaryValue,
     imageBaseUrlValue,
     imageKeyConfiguredValue,
+    imageCredentialSourceValue,
     memoryRemoteOptionsOpen,
     memoryRemoteOptionsSummary,
     memoryModelPlaceholder,

@@ -216,8 +216,10 @@ const previewWidth = ref<number | null>(null)
 let coarseQuery: MediaQueryList | null = null
 let surfaceObserver: ResizeObserver | null = null
 let containerObserver: ResizeObserver | null = null
+let surfaceMutationObserver: MutationObserver | null = null
 let rectFrame = 0
 let lastNativeItemId: string | null = null
+const nativeSurfaceSlotSelector = '[data-workbench-native-surface-slot]'
 
 const measuredAvailableWidth = computed(() => {
   const supplied = props.availableWidth
@@ -345,16 +347,49 @@ function measureContainer() {
   }
 }
 
-function reconnectObservers() {
+function reconnectSurfaceObserver() {
   surfaceObserver?.disconnect()
-  containerObserver?.disconnect()
   if (surfaceObserver) {
     if (hostRef.value) surfaceObserver.observe(hostRef.value)
     if (surfaceRef.value) surfaceObserver.observe(surfaceRef.value)
+    surfaceRef.value
+      ?.querySelectorAll<HTMLElement>(nativeSurfaceSlotSelector)
+      .forEach(element => surfaceObserver?.observe(element))
   }
+}
+
+function reconnectObservers() {
+  reconnectSurfaceObserver()
+  containerObserver?.disconnect()
   const parent = hostRef.value?.parentElement
   if (containerObserver && parent) containerObserver.observe(parent)
+  surfaceMutationObserver?.disconnect()
+  if (surfaceMutationObserver && surfaceRef.value) {
+    surfaceMutationObserver.observe(surfaceRef.value, {
+      childList: true,
+      subtree: true,
+    })
+  }
   measureContainer()
+}
+
+function containsNativeSurfaceSlot(nodes: NodeList): boolean {
+  return Array.from(nodes).some((node) => {
+    if (!(node instanceof Element)) return false
+    return node.matches(nativeSurfaceSlotSelector)
+      || node.querySelector(nativeSurfaceSlotSelector) !== null
+  })
+}
+
+function onSurfaceMutation(records: MutationRecord[]) {
+  // Native panels can add or remove their surface slot after async resource loading
+  // without changing the Workbench border box, so ResizeObserver alone cannot detect it.
+  const nativeSlotChanged = records.some(record =>
+    containsNativeSurfaceSlot(record.addedNodes)
+    || containsNativeSurfaceSlot(record.removedNodes))
+  if (!nativeSlotChanged) return
+  reconnectSurfaceObserver()
+  scheduleSurfaceRect()
 }
 
 function updateCoarseOnly(event: MediaQueryListEvent | MediaQueryList) {
@@ -444,6 +479,9 @@ onMounted(() => {
       scheduleSurfaceRect()
     })
   }
+  if (typeof MutationObserver !== 'undefined') {
+    surfaceMutationObserver = new MutationObserver(onSurfaceMutation)
+  }
   reconnectObservers()
   scheduleSurfaceRect()
 })
@@ -454,6 +492,7 @@ onBeforeUnmount(() => {
   coarseQuery?.removeEventListener?.('change', updateCoarseOnly)
   surfaceObserver?.disconnect()
   containerObserver?.disconnect()
+  surfaceMutationObserver?.disconnect()
   if (rectFrame) cancelAnimationFrame(rectFrame)
   if (lastNativeItemId) emit('surface-rect', hiddenRect(lastNativeItemId))
   store.setHostAvailable(false)

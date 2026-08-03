@@ -195,6 +195,7 @@ def _persist(
     *,
     restart_required: bool,
     backup_credential_redaction: CredentialBackupRedaction | None = None,
+    remove_paths: tuple[str, ...] = (),
 ) -> str:
     from opensquilla.onboarding.config_store import persist_config
 
@@ -205,19 +206,13 @@ def _persist(
     # back would silently omit the replacement from disk and keep exposing the
     # startup environment credential through the live settings UI.
     path = _config_path_for(ctx, new_cfg) or _config_path_for(ctx, ctx.config)
-    if backup_credential_redaction is None:
-        persist = persist_config(
-            new_cfg,
-            path=path,
-            restart_required=restart_required,
-        )
-    else:
-        persist = persist_config(
-            new_cfg,
-            path=path,
-            restart_required=restart_required,
-            backup_credential_redaction=backup_credential_redaction,
-        )
+    persist = persist_config(
+        new_cfg,
+        path=path,
+        restart_required=restart_required,
+        backup_credential_redaction=backup_credential_redaction,
+        remove_paths=remove_paths,
+    )
     # Preserve the resolved path on the running config so subsequent saves
     # round-trip to the same file.
     if hasattr(new_cfg, "config_path") and not getattr(new_cfg, "config_path", None):
@@ -245,6 +240,7 @@ def _provider_backup_credential_redaction(
 
 def _status_payload(ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.onboarding.legacy_data import legacy_data_payload
+    from opensquilla.onboarding.mutations import capability_resettable
     from opensquilla.onboarding.next_steps import env_recovery_commands
     from opensquilla.onboarding.probe_history import load_probe_history
     from opensquilla.onboarding.status import get_onboarding_status
@@ -284,6 +280,17 @@ def _status_payload(ctx: RpcContext) -> dict[str, Any]:
         "memoryEmbeddingProvider": s.memory_embedding_provider,
         "memoryEmbeddingSource": s.memory_embedding_source,
         "memoryEmbeddingEnvKey": s.memory_embedding_env_key,
+        "capabilityConfiguration": {
+            capability_id: {
+                "resettable": capability_resettable(cfg, capability_id=capability_id)
+            }
+            for capability_id in (
+                "search",
+                "image_generation",
+                "audio",
+                "memory_embedding",
+            )
+        },
         "channelCount": s.channel_count,
         "channelsConfigured": s.channels_configured,
         "ensembleCredentialStatus": list(s.ensemble_credential_status),
@@ -1225,6 +1232,27 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return result.to_payload()
 
 
+@_d.method("onboarding.imageGeneration.models.discover", scope="operator.admin")
+async def _image_generation_models_discover(
+    params: Any,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """List image-output-capable models without persisting configuration.
+
+    Unlike the general LLM picker, this endpoint only uses provider image
+    catalogs.  The live request, when supported, is fixed to the provider's
+    official image-model endpoint and never accepts an operator-supplied URL or
+    credential.  Curated setup-catalog rows provide an offline-safe fallback.
+    """
+    from opensquilla.onboarding.image_generation_model_discovery import (
+        discover_image_generation_models,
+    )
+
+    provider_id = _require(params, "providerId")
+    with _validation_error("onboarding.imageGeneration.invalid"):
+        return await discover_image_generation_models(str(provider_id))
+
+
 @_d.method("onboarding.router.catalog", scope="operator.read")
 async def _router_catalog(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.onboarding.router_specs import router_catalog_payload
@@ -1551,6 +1579,52 @@ async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
         tts_model=p.get("ttsModel", ""),
         language_code=p.get("languageCode", ""),
     )
+
+
+@_d.method("onboarding.capability.reset", scope="operator.admin")
+async def _capability_reset(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    from opensquilla.onboarding.mutations import reset_capability
+
+    with _validation_error("onboarding.capability.invalid"):
+        res = reset_capability(
+            _active_config(ctx),
+            capability_id=str(_require(params, "capabilityId")),
+        )
+    # Scrub the current config and all managed backups before swapping the
+    # running config. Any persistence failure therefore leaves runtime intact.
+    config_path = _persist(
+        ctx,
+        res.config,
+        restart_required=res.restart_required,
+        remove_paths=res.remove_paths,
+    )
+    _apply_inplace(ctx, res.config)
+    canonical_capability_id = str(res.public_payload["capabilityId"])
+    restart_required = res.restart_required
+    warnings = list(res.warnings)
+    try:
+        if canonical_capability_id == "search":
+            _sync_search_provider(res.config)
+        elif canonical_capability_id in {"image_generation", "audio"}:
+            _sync_image_generation(res.config)
+    except Exception as exc:  # noqa: BLE001 - persisted reset degrades to restart
+        restart_required = True
+        warnings.append(
+            "Capability reset was saved, but the live runtime could not be "
+            "updated. Restart the gateway to apply it."
+        )
+        log.warning(
+            "onboarding.capability_reset_live_sync_failed",
+            capability_id=canonical_capability_id,
+            error_type=type(exc).__name__,
+        )
+    return {
+        "changed": res.changed,
+        "restartRequired": restart_required,
+        "configPath": config_path,
+        "entry": res.public_payload,
+        "warnings": warnings,
+    }
 
 
 async def _reconcile_channels_live() -> dict[str, str] | None:

@@ -2853,6 +2853,26 @@ def test_image_generation_explicit_enabled_decision_is_force_persisted(tmp_path)
     assert data["image_generation"]["enabled"] is False
 
 
+def test_audio_explicit_enabled_decision_is_force_persisted(tmp_path):
+    """An old client may still explicitly disable audio while saving a key."""
+    import tomllib as _tomllib
+
+    from opensquilla.onboarding.config_store import load_config, persist_config
+
+    target = tmp_path / "config.toml"
+    cfg = load_config(target)
+    res = upsert_audio_provider(
+        cfg,
+        provider_id="elevenlabs",
+        api_key="synthetic-audio-key",
+        enabled=False,
+    )
+    persist_config(res.config, path=target)
+
+    data = _tomllib.loads(target.read_text())
+    assert data["audio"]["enabled"] is False
+
+
 def test_upsert_channel_blank_secret_keeps_stored_value():
     cfg = GatewayConfig()
     res1 = upsert_channel(

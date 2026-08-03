@@ -57,7 +57,6 @@ interface ArtifactPreviewPanelHandle {
 export interface ArtifactWorkbenchProviderOptions {
   authToken(): string
   baseOrigin: string
-  confirmModeSwitch?(mode: WorkbenchPreviewMode): Promise<boolean>
   confirmPermission?(request: {
     permission: string
     requestingOrigin: string
@@ -374,10 +373,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         nextMode === 'full'
         && this.context.getRenderState().fullModeAvailable === false
       ) return
-      if (
-        this.options.confirmModeSwitch
-        && !await this.options.confirmModeSwitch(nextMode)
-      ) return
       this.mode = nextMode
       await this.replaceLeasePreview()
     } else if (actionId === 'set-default-preview-mode') {
@@ -394,10 +389,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       )
     } else if (actionId === 'restore-default-preview-mode') {
       if (this.mode === this.defaultMode) return
-      if (
-        this.options.confirmModeSwitch
-        && !await this.options.confirmModeSwitch(this.defaultMode)
-      ) return
       this.mode = this.defaultMode
       await this.replaceLeasePreview()
     } else if (actionId === 'toggle-remote-resources') {
@@ -667,7 +658,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       this.options.showFullPreviewNotice?.()
       try {
         await this.options.savePreviewPreferences?.({
-          mode: this.mode,
+          mode: this.defaultMode,
           noticeShown: true,
         })
       } catch {}

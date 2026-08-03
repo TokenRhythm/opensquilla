@@ -108,6 +108,23 @@ describe('SetupModelCombobox', () => {
     expect(listbox()).toBeNull()
   })
 
+  it('opens a curated fallback catalog without claiming it is live', async () => {
+    const { el } = await mountCombobox({ modelSource: 'catalog' })
+    await openList(el)
+
+    expect(optionRows()).toHaveLength(2)
+    expect(popup()?.textContent).not.toContain('Live')
+  })
+
+  it('opts out of password-manager field classification', async () => {
+    const { el } = await mountCombobox()
+    const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')
+
+    expect(input?.getAttribute('autocomplete')).toBe('one-time-code')
+    expect(input?.getAttribute('data-form-type')).toBe('other')
+    expect(input?.getAttribute('data-lpignore')).toBe('true')
+  })
+
   it('advertises model search and custom-id entry when no field placeholder is provided', async () => {
     const { el } = await mountCombobox()
     const input = el.querySelector<HTMLInputElement>('input[role="combobox"]')

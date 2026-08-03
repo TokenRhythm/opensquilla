@@ -163,6 +163,42 @@ describe('ArtifactPreviewPanel', () => {
     mounted.unmount()
   })
 
+  it('replaces native HTML loading state with the native surface slot', async () => {
+    let resolveFetch!: (response: Response) => void
+    const onNativeHtmlReady = vi.fn()
+    const onWorkbenchEvent = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => {
+      resolveFetch = resolve
+    })))
+
+    const mounted = mountPanel({
+      artifact: artifact(),
+      nativeHtml: true,
+      onNativeHtmlReady,
+      onWorkbenchEvent,
+    })
+    await nextTick()
+
+    expect(mounted.element.querySelector('[data-workbench-native-surface-slot]')).toBeNull()
+    expect(mounted.element.querySelector('[role="status"]')).not.toBeNull()
+
+    resolveFetch(new Response('<!doctype html><p>Native preview</p>', {
+      status: 200,
+      headers: { 'Content-Type': 'text/html' },
+    }))
+    await settlePreview()
+
+    expect(mounted.element.querySelector('[data-workbench-native-surface-slot]'))
+      .toBeInstanceOf(HTMLElement)
+    expect(mounted.element.querySelector('.artifact-preview__frame--html')).toBeNull()
+    expect(onNativeHtmlReady).toHaveBeenCalledOnce()
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({
+      type: 'native-html-ready',
+      payload: expect.any(Object),
+    })
+    mounted.unmount()
+  })
+
   it('emits external-open and download intents without performing them', async () => {
     const onExternalOpen = vi.fn()
     const onDownload = vi.fn()

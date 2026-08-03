@@ -225,6 +225,14 @@ class DoneEvent:
     message_output_tokens: int | None = None
     # Number of non-free usage components whose cost could not be determined.
     missing_cost_entries: int = 0
+    # Immutable logical router choice plus append-only physical provider calls.
+    # Appended for wire and positional-construction compatibility.
+    route_plan: dict[str, Any] | None = None
+    execution_legs: list[dict[str, Any]] = field(default_factory=list)
+    # Output ranges produced by model calls that applied a same-turn steer.
+    # Offsets are Unicode codepoint indexes into ``text_snapshot``/``text``.
+    # Appended for wire and positional-construction compatibility.
+    model_call_segments: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -260,10 +268,9 @@ class RouterDecisionEvent:
     pre-turn pipeline resolves the tier/model. Frontend uses this to drive
     the router HUD (tier pill, tier-shift highlight, scanner popover).
 
-    Routing fires once per user-message and the tier sticks across the
-    agent loop; consumers must treat the event as last-writer-wins state,
-    because a mid-turn selector failover re-emits it once before the
-    DoneEvent with ``source="fallback"`` and the model that actually ran.
+    Routing fires once per logical turn and the plan sticks across the
+    agent loop. Provider fallback is reported through the terminal
+    ``execution_legs`` payload and never creates a second routing decision.
     """
 
     kind: Literal["router_decision"] = field(default="router_decision", init=False)

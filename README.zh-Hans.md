@@ -43,7 +43,7 @@ OpenSquilla 是一个高效利用 Token 的微内核 AI Agent。本地模型路�
 Ollama、DeepSeek、Gemini、Qwen/DashScope 等 20 多个 LLM 提供商，无需改动你的代码或
 配置结构。
 
-OpenSquilla 0.5.1 是当前正式发布版本。
+OpenSquilla 0.5.2 是当前正式发布版本。
 
 如需面向任务的产品文档，请从
 [OpenSquilla 产品指南](README.product.md)或[文档索引](docs/README.md)开始。
@@ -59,8 +59,8 @@ OpenSquilla 可运行于 Windows、macOS 和 Linux。请选择与你的使用场
 发布版安装命令使用 GitHub 上已发布的 release 资源。Python wheel 安装使用带版本号的 wheel
 文件名，因为安装器会校验嵌入在 wheel 文件名中的版本号。
 
-对于 0.5.1 的桌面使用，建议从 GitHub Release 下载打包桌面安装包:macOS 上为
-`OpenSquilla-0.5.1-mac-arm64.dmg`，Windows 上为 `OpenSquilla-0.5.1-win-x64.exe`。
+对于 0.5.2 的桌面使用，建议从 GitHub Release 下载打包桌面安装包:macOS 上为
+`OpenSquilla-0.5.2-mac-arm64.dmg`，Windows 上为 `OpenSquilla-0.5.2-win-x64.exe`。
 
 | 安装方式 | 适合人群 | 何时使用 |
 | --- | --- | --- |
@@ -100,10 +100,10 @@ PowerShell 安装器会通过 `winget` 自动装好它；而**终端快速安装
 
 ### 桌面安装包
 
-0.5.1 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
+0.5.2 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
 
-- macOS Apple Silicon:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.1/OpenSquilla-0.5.1-mac-arm64.dmg>
-- Windows x64:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.1/OpenSquilla-0.5.1-win-x64.exe>
+- macOS Apple Silicon:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-mac-arm64.dmg>
+- Windows x64:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-win-x64.exe>
 
 中国大陆下载可直接使用 OSS 的固定安装包链接：
 
@@ -146,7 +146,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. 安装 OpenSquilla**——所有平台命令相同。
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.1/opensquilla-0.5.1-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl"
 ```
 
 这会从 release URL 安装 OpenSquilla wheel，再由 `uv` 下载所选 extra 所声明的依赖。
@@ -167,7 +167,7 @@ opensquilla gateway run
 > PATH 设置命令。
 
 如需完全锁定版本的安装，请使用带版本号的 wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.1/opensquilla-0.5.1-py3-none-any.whl`。
+`https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl`。
 
 <a id="install-from-source"></a>
 

@@ -462,7 +462,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     )
   })
 
-  it('keeps the stopped-output notice as a local turn result when the next user message is added', () => {
+  it('does not synthesize a stopped-output bubble before the next user message', () => {
     const { api, options, stream, messages } = makeHarness('__opensquilla_stopped_stream_task__')
     stream.isStreaming.value = true
     messages.value = [
@@ -484,10 +484,9 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', 'stop immediately'],
-      ['assistant', 'Stopped after 1s'],
       ['user', 'next question'],
     ])
-    expect(messages.value[1]?.stopNotice).toBe(true)
+    expect(messages.value.some(message => message.stopNotice)).toBe(false)
   })
 
   it('does not insert a stopped-output notice before a cancelled partial assistant output is finalized', () => {

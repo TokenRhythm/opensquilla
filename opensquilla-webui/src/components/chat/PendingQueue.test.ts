@@ -22,13 +22,14 @@ async function mountQueue(
   }> = [
     { text: 'Follow the latest instruction' },
   ],
-  props: { imageBlockedMessage?: string } = {},
+  props: { imageBlockedMessage?: string; steerAvailable?: boolean } = {},
 ) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(PendingQueue, {
     items,
     maxPending: 5,
+    steerAvailable: true,
     ...listeners,
     ...props,
   })
@@ -39,6 +40,17 @@ async function mountQueue(
 }
 
 describe('PendingQueue', () => {
+  it('keeps the original steer affordance visible but disabled when capability is unavailable', async () => {
+    const { app, el } = await mountQueue({}, undefined, { steerAvailable: false })
+
+    const steer = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+    expect(steer?.textContent).toContain('Steer')
+    expect(steer?.disabled).toBe(true)
+    expect(steer?.title).toContain('queues for after current response')
+    expect(el.querySelector('[aria-label="Remove pending message 1"]')).not.toBeNull()
+    app.unmount()
+  })
+
   it('offers steer, remove, and quiet overflow actions on each queued message', async () => {
     let steered = 0
     let removed = 0
@@ -105,7 +117,7 @@ describe('PendingQueue', () => {
     app.unmount()
   })
 
-  it('makes a failed hidden confirmation explicitly retryable or removable', async () => {
+  it('keeps hidden control input removable without exposing same-turn retry', async () => {
     let retried = 0
     let removed = 0
     const { app, el } = await mountQueue({
@@ -121,14 +133,30 @@ describe('PendingQueue', () => {
     expect(el.querySelector('.chat-pending-text')?.textContent).toContain('Confirmed')
     const retry = [...el.querySelectorAll<HTMLButtonElement>('button')]
       .find(button => button.textContent?.includes('Retry'))
-    retry?.click()
+    expect(retry).toBeUndefined()
     el.querySelector<HTMLButtonElement>('[aria-label="Remove pending message 1"]')?.click()
 
-    expect(retried).toBe(1)
+    expect(retried).toBe(0)
     expect(removed).toBe(1)
     expect(el.querySelector('[aria-label="More"]')).toBeNull()
     app.unmount()
   })
+
+  it.each(['/status', '!pwd'])(
+    'keeps the original affordance disabled for queued control input %s',
+    async (text) => {
+      let steered = 0
+      const { app, el } = await mountQueue({
+        onSteer: () => { steered += 1 },
+      }, [{ text }])
+
+      const steer = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+      expect(steer?.textContent).toContain('Steer')
+      expect(steer?.disabled).toBe(true)
+      expect(steered).toBe(0)
+      app.unmount()
+    },
+  )
 
   it('allows only one queued delivery lease at a time', async () => {
     const { app, el } = await mountQueue({}, [
@@ -144,7 +172,7 @@ describe('PendingQueue', () => {
     app.unmount()
   })
 
-  it('explains why a queued item with a failed attachment cannot steer', async () => {
+  it('keeps the original affordance disabled for a queued item with an attachment', async () => {
     const failed: Attachment = {
       kind: 'failed',
       local_id: 7,
@@ -162,12 +190,8 @@ describe('PendingQueue', () => {
     expect(steer?.title).toContain('failed attachment')
     const describedBy = steer?.getAttribute('aria-describedby')
     expect(describedBy).toBeTruthy()
-    expect(el.querySelector(`#${describedBy}`)?.textContent)
-      .toContain('retry or remove the failed attachment')
     expect(el.querySelector('.chat-pending-attachment-status')?.textContent)
       .toContain('retry or remove the failed attachment')
-    expect(el.querySelector('.chat-pending-card')?.getAttribute('aria-describedby'))
-      .toBe(describedBy)
     expect(el.querySelector('.chat-pending-attachments')?.textContent)
       .toContain('Needs attention')
     app.unmount()
@@ -191,7 +215,6 @@ describe('PendingQueue', () => {
     expect(steer?.disabled).toBe(true)
     expect(steer?.title).toBe(blockedMessage)
     const describedBy = steer?.getAttribute('aria-describedby')
-    expect(describedBy).toBeTruthy()
     expect(el.querySelector(`#${describedBy}`)?.textContent).toContain(blockedMessage)
     expect(el.querySelector('.chat-pending-attachment-status')?.textContent)
       .toContain(blockedMessage)

@@ -259,6 +259,26 @@ def _resolve_and_record_execution(
     turn_metadata["executed_model"] = str(
         getattr(current_config, "model", "") or ""
     )
+    remaining_chain = getattr(selector, "remaining_chain", None)
+    if callable(remaining_chain):
+        candidates: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in remaining_chain():
+            candidate_provider = str(
+                getattr(candidate, "provider", "") or ""
+            ).strip()
+            candidate_model = str(getattr(candidate, "model", "") or "").strip()
+            identity = (candidate_provider, candidate_model)
+            if not candidate_provider or not candidate_model or identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append(
+                {
+                    "provider": candidate_provider,
+                    "model": candidate_model,
+                }
+            )
+        turn_metadata["selector_execution_chain"] = candidates
     return provider
 
 

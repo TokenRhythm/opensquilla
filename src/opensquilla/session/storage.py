@@ -9,7 +9,15 @@ import logging
 import random
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -144,6 +152,15 @@ class TurnAcceptanceResult:
     fresh_user_session: bool
     task_status: AgentTaskStatus | None = None
     reset_archive_snapshot: ResetArchiveSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class StrandedSteerInput:
+    """One durable same-turn input whose target task is already terminal."""
+
+    entry: TranscriptEntry
+    receipt: TurnIngressReceipt
+    target_task: AgentTaskRecord
 
 
 async def _verify_project_workspace_guard(
@@ -4990,6 +5007,30 @@ class SessionStorage:
             return None
         return AgentTaskRecord(**_deserialize_row(dict(row)))
 
+    @_serialized_read
+    async def get_agent_tasks_by_ids(
+        self,
+        task_ids: Iterable[str],
+    ) -> list[AgentTaskRecord]:
+        """Fetch exact task identities without a page-order or age limit."""
+
+        ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
+        if not ids:
+            return []
+        rows_by_id: dict[str, AgentTaskRecord] = {}
+        for index in range(0, len(ids), _SQLITE_VARIABLE_CHUNK_SIZE):
+            chunk = ids[index : index + _SQLITE_VARIABLE_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            async with self.conn.execute(
+                f"SELECT * FROM agent_tasks WHERE task_id IN ({placeholders})",
+                chunk,
+            ) as cur:
+                rows = await cur.fetchall()
+            for row in rows:
+                task = AgentTaskRecord(**_deserialize_row(dict(row)))
+                rows_by_id[task.task_id] = task
+        return [rows_by_id[task_id] for task_id in ids if task_id in rows_by_id]
+
     async def update_agent_task(self, task_id: str, **fields: Any) -> AgentTaskRecord:
         if not fields:
             existing = await self.get_agent_task(task_id)
@@ -5042,6 +5083,30 @@ class SessionStorage:
             "ORDER BY created_at ASC, rowid ASC LIMIT ? OFFSET ?"
         )
         async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [AgentTaskRecord(**_deserialize_row(dict(row))) for row in rows]
+
+    @_serialized_read
+    async def list_recent_agent_tasks(
+        self,
+        session_key: str,
+        *,
+        limit: int = 100,
+    ) -> list[AgentTaskRecord]:
+        """Return the newest task state needed by interactive hydration."""
+
+        if limit <= 0:
+            return []
+        async with self.conn.execute(
+            """
+            SELECT *
+            FROM agent_tasks
+            WHERE session_key = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (canonicalize_session_key(session_key), limit),
+        ) as cur:
             rows = await cur.fetchall()
         return [AgentTaskRecord(**_deserialize_row(dict(row))) for row in rows]
 
@@ -5412,6 +5477,21 @@ class SessionStorage:
         async with self._write_transaction("mark_abandoned_agent_tasks") as conn:
             async with conn.execute(
                 """
+                SELECT task_id, details
+                FROM agent_tasks
+                WHERE status IN (?, ?)
+                   OR (status = ? AND terminal_reason = ?)
+                """,
+                (
+                    AgentTaskStatus.QUEUED,
+                    AgentTaskStatus.RUNNING,
+                    AgentTaskStatus.ABANDONED,
+                    "process_restart",
+                ),
+            ) as task_cur:
+                restart_task_rows = await task_cur.fetchall()
+            async with conn.execute(
+                """
                 SELECT DISTINCT session_key
                 FROM agent_tasks
                 WHERE status IN (?, ?)
@@ -5472,6 +5552,32 @@ class SessionStorage:
                 ),
             )
             count = int(cur.rowcount if cur.rowcount is not None else 0)
+            for task_row in restart_task_rows:
+                details_raw = _deserialize_row({"details": task_row["details"]}).get(
+                    "details"
+                )
+                details = dict(details_raw) if isinstance(details_raw, dict) else {}
+                details["turn_outcome"] = {
+                    "kind": "interrupted",
+                    "reason": "process_restart",
+                    "error_class": "process_restart",
+                    "retryable": True,
+                }
+                await conn.execute(
+                    """
+                    UPDATE agent_tasks
+                    SET details = ?
+                    WHERE task_id = ?
+                      AND status = ?
+                      AND terminal_reason = ?
+                    """,
+                    (
+                        _serialize(details),
+                        task_row["task_id"],
+                        AgentTaskStatus.ABANDONED,
+                        "process_restart",
+                    ),
+                )
             # A persisted PlanRun and its AgentTask form one ownership lease.
             # Process restart abandons the in-memory task, so release that lease
             # in the same recovery transaction. Preserve the run/driver and its
@@ -5921,6 +6027,7 @@ class SessionStorage:
         expected_epoch: int,
         updated_at: int,
         task_record: AgentTaskRecord | None,
+        receipt_task_id: str | None = None,
         source_scope: str,
         request_session_key: str,
         client_request_id: str,
@@ -5939,6 +6046,9 @@ class SessionStorage:
 
         Repeating the same scoped client request returns the original receipt.
         Reusing its id for a different payload is rejected before any write.
+        ``receipt_task_id`` associates an accepted input with an existing task
+        without inserting or mutating that task. This is used by same-turn
+        input, whose durable receipt must retain the target turn identity.
         """
 
         source_scope = source_scope.strip()
@@ -5957,6 +6067,12 @@ class SessionStorage:
             task_record.agent_id = normalize_agent_id(task_record.agent_id)
             if task_record.session_key != entry.session_key:
                 raise ValueError("task and transcript session keys must match")
+        if receipt_task_id is not None:
+            receipt_task_id = receipt_task_id.strip()
+            if not receipt_task_id:
+                raise ValueError("receipt_task_id must not be blank")
+            if task_record is not None and task_record.task_id != receipt_task_id:
+                raise ValueError("receipt_task_id must match task_record.task_id")
         if session_node is not None:
             session_node.session_key = canonicalize_session_key(session_node.session_key)
             session_node.agent_id = normalize_agent_id(session_node.agent_id)
@@ -6369,7 +6485,11 @@ class SessionStorage:
                 accepted_session_key=entry.session_key,
                 session_id=entry.session_id,
                 message_id=entry.message_id,
-                task_id=task_record.task_id if task_record is not None else None,
+                task_id=(
+                    task_record.task_id
+                    if task_record is not None
+                    else receipt_task_id
+                ),
             )
             data = receipt.model_dump()
             cols = list(data.keys())
@@ -6417,6 +6537,493 @@ class SessionStorage:
             limit=limit,
             offset=offset,
         )
+
+    @_serialized_read
+    async def get_canonical_transcript_entry(
+        self,
+        session_id: str,
+        message_id: str,
+    ) -> TranscriptEntry | None:
+        """Look up one message across compacted history and the active tail."""
+
+        sql = """
+            SELECT
+                original_entry_id AS id,
+                session_id,
+                session_key,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                turn_context,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                schema_version
+            FROM compacted_transcript_entries
+            WHERE session_id = ? AND message_id = ?
+            UNION ALL
+            SELECT
+                id,
+                session_id,
+                session_key,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                turn_context,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                schema_version
+            FROM transcript_entries
+            WHERE session_id = ? AND message_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        """
+        async with self.conn.execute(
+            sql,
+            (session_id, message_id, session_id, message_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return TranscriptEntry(**_deserialize_row(dict(row)))
+
+    @_serialized_read
+    async def list_stranded_steer_inputs(self) -> list[StrandedSteerInput]:
+        """Return pending steer rows whose exact target task can no longer run.
+
+        The receipt-to-task association is the authority here. Turn-context
+        text alone is not enough: old clients may have written similar
+        metadata without crossing the atomic ``sessions.steer.v2`` admission
+        boundary.
+        """
+
+        terminal_statuses = tuple(status.value for status in (
+            AgentTaskStatus.SUCCEEDED,
+            AgentTaskStatus.FAILED,
+            AgentTaskStatus.CANCELLED,
+            AgentTaskStatus.TIMEOUT,
+            AgentTaskStatus.ABANDONED,
+        ))
+        placeholders = ", ".join("?" for _ in terminal_statuses)
+        async with self.conn.execute(
+            f"""
+            SELECT receipt.*
+            FROM turn_ingress_receipts AS receipt
+            JOIN agent_tasks AS task ON task.task_id = receipt.task_id
+            WHERE task.status IN ({placeholders})
+            ORDER BY receipt.accepted_at ASC, receipt.receipt_id ASC
+            """,  # noqa: S608 - placeholders are derived from a fixed enum tuple
+            terminal_statuses,
+        ) as cur:
+            receipt_rows = await cur.fetchall()
+
+        task_cache: dict[str, AgentTaskRecord] = {}
+        stranded: list[StrandedSteerInput] = []
+        entry_sql = """
+            SELECT
+                original_entry_id AS id,
+                session_id,
+                session_key,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                turn_context,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                schema_version
+            FROM compacted_transcript_entries
+            WHERE session_id = ? AND message_id = ?
+            UNION ALL
+            SELECT
+                id,
+                session_id,
+                session_key,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                turn_context,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                schema_version
+            FROM transcript_entries
+            WHERE session_id = ? AND message_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        """
+        for raw_receipt in receipt_rows:
+            receipt = TurnIngressReceipt(**_deserialize_row(dict(raw_receipt)))
+            target_task_id = receipt.task_id
+            if target_task_id is None:
+                continue
+            target_task = task_cache.get(target_task_id)
+            if target_task is None:
+                async with self.conn.execute(
+                    "SELECT * FROM agent_tasks WHERE task_id = ?",
+                    (target_task_id,),
+                ) as cur:
+                    raw_task = await cur.fetchone()
+                if raw_task is None:
+                    continue
+                target_task = AgentTaskRecord(**_deserialize_row(dict(raw_task)))
+                task_cache[target_task_id] = target_task
+
+            async with self.conn.execute(
+                entry_sql,
+                (
+                    receipt.session_id,
+                    receipt.message_id,
+                    receipt.session_id,
+                    receipt.message_id,
+                ),
+            ) as cur:
+                raw_entry = await cur.fetchone()
+            if raw_entry is None:
+                continue
+            entry = TranscriptEntry(**_deserialize_row(dict(raw_entry)))
+            context = entry.turn_context
+            if (
+                entry.role != "user"
+                or not isinstance(context, dict)
+                or context.get("intent") != "steer"
+                or context.get("disposition") != "steering"
+                or context.get("target_turn_id") != target_task_id
+            ):
+                continue
+            stranded.append(
+                StrandedSteerInput(
+                    entry=entry,
+                    receipt=receipt,
+                    target_task=target_task,
+                )
+            )
+        return stranded
+
+    async def close_stranded_steer_inputs(
+        self,
+        *,
+        target_task_id: str,
+        message_ids: Sequence[str],
+        disposition: str,
+        failure_code: str | None = None,
+        retryable: bool | None = None,
+        recovery: str | None = None,
+        application_evidence: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> list[str]:
+        """Atomically terminalize still-pending steer rows without executing them."""
+
+        if disposition not in {"applied", "cancelled", "rejected"}:
+            raise ValueError("disposition must be applied, cancelled, or rejected")
+        ordered_ids = list(dict.fromkeys(message_id for message_id in message_ids if message_id))
+        if not ordered_ids:
+            return []
+        changed: list[str] = []
+        async with self._write_transaction("close_stranded_steer_inputs") as conn:
+            for message_id in ordered_ids:
+                async with conn.execute(
+                    """
+                    SELECT receipt_id, session_id
+                    FROM turn_ingress_receipts
+                    WHERE message_id = ? AND task_id = ?
+                    ORDER BY accepted_at ASC, receipt_id ASC
+                    LIMIT 1
+                    """,
+                    (message_id, target_task_id),
+                ) as cur:
+                    receipt_row = await cur.fetchone()
+                if receipt_row is None:
+                    continue
+                entry_row: Any | None = None
+                entry_table: str | None = None
+                for table in ("transcript_entries", "compacted_transcript_entries"):
+                    async with conn.execute(
+                        f"SELECT turn_context FROM {table} "  # noqa: S608
+                        "WHERE session_id = ? AND message_id = ?",
+                        (receipt_row["session_id"], message_id),
+                    ) as cur:
+                        candidate = await cur.fetchone()
+                    if candidate is not None:
+                        entry_row = candidate
+                        entry_table = table
+                        break
+                if entry_row is None or entry_table is None:
+                    continue
+                context_raw = _deserialize_row(
+                    {"turn_context": entry_row["turn_context"]}
+                ).get("turn_context")
+                if (
+                    not isinstance(context_raw, dict)
+                    or context_raw.get("intent") != "steer"
+                    or context_raw.get("disposition") != "steering"
+                    or context_raw.get("target_turn_id") != target_task_id
+                ):
+                    continue
+                try:
+                    revision = int(context_raw.get("revision", 1) or 1)
+                except (TypeError, ValueError):
+                    revision = 1
+                context = {
+                    **context_raw,
+                    "turn_id": target_task_id,
+                    "target_turn_id": target_task_id,
+                    "disposition": disposition,
+                    "revision": max(2, revision + 1),
+                }
+                if failure_code is not None:
+                    context["failure_code"] = failure_code
+                if retryable is not None:
+                    context["retryable"] = retryable
+                if recovery is not None:
+                    context["recovery"] = recovery
+                if disposition in {"cancelled", "rejected"}:
+                    context["fallback_safe"] = disposition == "cancelled"
+                if disposition == "applied" and application_evidence is not None:
+                    evidence = application_evidence.get(message_id)
+                    if isinstance(evidence, Mapping):
+                        applied_iteration = evidence.get("applied_iteration")
+                        model_call_id = evidence.get("model_call_id")
+                        if applied_iteration is not None:
+                            context["applied_iteration"] = applied_iteration
+                        if model_call_id:
+                            context["model_call_id"] = model_call_id
+                async with conn.execute(
+                    f"UPDATE {entry_table} SET turn_context = ? "  # noqa: S608
+                    "WHERE session_id = ? AND message_id = ? AND turn_context = ?",
+                    (
+                        _serialize(context),
+                        receipt_row["session_id"],
+                        message_id,
+                        entry_row["turn_context"],
+                    ),
+                ) as cur:
+                    if (cur.rowcount or 0) > 0:
+                        changed.append(message_id)
+        return changed
+
+    async def promote_stranded_steer_inputs(
+        self,
+        *,
+        target_task_id: str,
+        message_ids: Sequence[str],
+        task_record: AgentTaskRecord,
+        recovery: str = "process_restart_followup",
+    ) -> list[str]:
+        """Create one follow-up and claim its steer rows atomically."""
+
+        ordered_ids = list(dict.fromkeys(message_id for message_id in message_ids if message_id))
+        if not ordered_ids:
+            return []
+        task_record.session_key = canonicalize_session_key(task_record.session_key)
+        task_record.agent_id = normalize_agent_id(task_record.agent_id)
+        claimed: list[tuple[str, str, str, dict[str, Any]]] = []
+        async with self._write_transaction("promote_stranded_steer_inputs") as conn:
+            async with conn.execute(
+                "SELECT status FROM agent_tasks WHERE task_id = ?",
+                (target_task_id,),
+            ) as cur:
+                target_row = await cur.fetchone()
+            if (
+                target_row is None
+                or AgentTaskStatus(target_row["status"])
+                not in {
+                    AgentTaskStatus.SUCCEEDED,
+                    AgentTaskStatus.FAILED,
+                    AgentTaskStatus.CANCELLED,
+                    AgentTaskStatus.TIMEOUT,
+                    AgentTaskStatus.ABANDONED,
+                }
+            ):
+                return []
+
+            for message_id in ordered_ids:
+                async with conn.execute(
+                    """
+                    SELECT receipt_id, session_id
+                    FROM turn_ingress_receipts
+                    WHERE message_id = ? AND task_id = ?
+                    ORDER BY accepted_at ASC, receipt_id ASC
+                    LIMIT 1
+                    """,
+                    (message_id, target_task_id),
+                ) as cur:
+                    receipt_row = await cur.fetchone()
+                if receipt_row is None:
+                    continue
+                for table in ("transcript_entries", "compacted_transcript_entries"):
+                    async with conn.execute(
+                        f"SELECT session_key, turn_context FROM {table} "  # noqa: S608
+                        "WHERE session_id = ? AND message_id = ?",
+                        (receipt_row["session_id"], message_id),
+                    ) as cur:
+                        entry_row = await cur.fetchone()
+                    if entry_row is None:
+                        continue
+                    context_raw = _deserialize_row(
+                        {"turn_context": entry_row["turn_context"]}
+                    ).get("turn_context")
+                    if (
+                        isinstance(context_raw, dict)
+                        and context_raw.get("intent") == "steer"
+                        and context_raw.get("disposition") == "steering"
+                        and context_raw.get("target_turn_id") == target_task_id
+                        and entry_row["session_key"] == task_record.session_key
+                    ):
+                        claimed.append(
+                            (
+                                message_id,
+                                table,
+                                receipt_row["receipt_id"],
+                                context_raw,
+                            )
+                        )
+                    break
+
+            # A partial batch would make the runtime prompt disagree with the
+            # durable ownership transfer. Leave it untouched for the next
+            # recovery scan instead of executing a duplicate or incomplete
+            # follow-up.
+            if len(claimed) != len(ordered_ids):
+                return []
+
+            await self._insert_agent_task(conn, task_record)
+            for message_id, table, receipt_id, previous_context in claimed:
+                try:
+                    revision = int(previous_context.get("revision", 1) or 1)
+                except (TypeError, ValueError):
+                    revision = 1
+                context = {
+                    **previous_context,
+                    "turn_id": task_record.task_id,
+                    "target_turn_id": target_task_id,
+                    "disposition": "promoted",
+                    "promoted_from_turn_id": target_task_id,
+                    "promoted_turn_id": task_record.task_id,
+                    "revision": max(2, revision + 1),
+                    "recovery": recovery,
+                }
+                await conn.execute(
+                    f"UPDATE {table} SET turn_context = ? "  # noqa: S608
+                    "WHERE session_key = ? AND message_id = ?",
+                    (_serialize(context), task_record.session_key, message_id),
+                )
+                await conn.execute(
+                    """
+                    UPDATE turn_ingress_receipts
+                    SET task_id = ?
+                    WHERE receipt_id = ? AND task_id = ?
+                    """,
+                    (task_record.task_id, receipt_id, target_task_id),
+                )
+        return [message_id for message_id, *_rest in claimed]
+
+    @_serialized_read
+    async def list_retryable_steer_recovery_tasks(self) -> list[AgentTaskRecord]:
+        """Return crash-abandoned recovery tasks that never reached RUNNING."""
+
+        async with self.conn.execute(
+            """
+            SELECT *
+            FROM agent_tasks
+            WHERE status = ?
+              AND terminal_reason = ?
+              AND started_at IS NULL
+            ORDER BY created_at ASC, task_id ASC
+            """,
+            (AgentTaskStatus.ABANDONED, "process_restart"),
+        ) as cur:
+            rows = await cur.fetchall()
+        tasks: list[AgentTaskRecord] = []
+        for row in rows:
+            task = AgentTaskRecord(**_deserialize_row(dict(row)))
+            details = task.details if isinstance(task.details, dict) else {}
+            metadata = details.get("metadata")
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("steer_restart_recovery") is True
+            ):
+                tasks.append(task)
+        return tasks
+
+    async def requeue_steer_recovery_task(self, task_id: str) -> bool:
+        """CAS a never-started recovery task back to QUEUED after restart."""
+
+        async with self._write_transaction("requeue_steer_recovery_task") as conn:
+            async with conn.execute(
+                """
+                UPDATE agent_tasks
+                SET status = ?,
+                    updated_at = ?,
+                    finished_at = NULL,
+                    terminal_reason = NULL,
+                    error_class = NULL,
+                    error_message = NULL
+                WHERE task_id = ?
+                  AND status = ?
+                  AND terminal_reason = ?
+                  AND started_at IS NULL
+                """,
+                (
+                    AgentTaskStatus.QUEUED,
+                    _now_ms(),
+                    task_id,
+                    AgentTaskStatus.ABANDONED,
+                    "process_restart",
+                ),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed:
+                async with conn.execute(
+                    "SELECT details FROM agent_tasks WHERE task_id = ?",
+                    (task_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is not None:
+                    details_raw = _deserialize_row({"details": row["details"]}).get(
+                        "details"
+                    )
+                    details = (
+                        dict(details_raw) if isinstance(details_raw, dict) else {}
+                    )
+                    details.pop("turn_outcome", None)
+                    await conn.execute(
+                        "UPDATE agent_tasks SET details = ? WHERE task_id = ?",
+                        (_serialize(details), task_id),
+                    )
+        return changed > 0
 
     async def _canonical_transcript_cursor_exists(
         self,

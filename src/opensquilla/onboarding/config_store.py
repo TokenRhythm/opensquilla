@@ -14,7 +14,9 @@ support, so a save rewrites the file without them (pre-existing limitation).
 from __future__ import annotations
 
 import copy
+import io
 import os
+import stat
 import tempfile
 import types
 from collections.abc import Iterator
@@ -87,6 +89,16 @@ class CredentialBackupRedaction:
     """Provider-scoped credential fields a clear must remove from backups."""
 
     provider_id: str
+
+
+@dataclass(frozen=True)
+class _StagedFileMutation:
+    """One filesystem change with a staged replacement and in-memory rollback."""
+
+    target: Path
+    replacement_path: Path | None
+    original_bytes: bytes | None
+    original_mode: int | None
 
 
 def resolve_config_path(path: str | Path | None = None) -> tuple[Path, str]:
@@ -311,6 +323,20 @@ def _redact_backup_credentials(
     return changed
 
 
+def _remove_backup_paths(payload: Any, remove_paths: tuple[tuple[str, ...], ...]) -> bool:
+    """Remove exact config paths from a parsed managed backup."""
+
+    if not isinstance(payload, dict):
+        return False
+    changed = False
+    for path in remove_paths:
+        if _get_path(payload, path) is None:
+            continue
+        _remove_path(payload, path)
+        changed = True
+    return changed
+
+
 def _atomic_write_toml(target: Path, payload: dict[str, Any]) -> None:
     """Replace one TOML file atomically with owner-only permissions."""
 
@@ -327,18 +353,183 @@ def _atomic_write_toml(target: Path, payload: dict[str, Any]) -> None:
         os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, native_io_path(target))
     except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
+        _remove_staged_path(Path(tmp_name))
         raise
 
 
-def _sanitize_managed_config_backups(
+def _toml_bytes(payload: dict[str, Any]) -> bytes:
+    buffer = io.BytesIO()
+    tomli_w.dump(payload, buffer)
+    return buffer.getvalue()
+
+
+def _stage_bytes(target: Path, payload: bytes, *, mode: int, suffix: str) -> Path:
+    """Write and fsync one same-directory temporary file without committing it."""
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=suffix,
+        dir=os.fspath(native_io_path(target.parent)),
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_name, mode)
+    except Exception:
+        _remove_staged_path(Path(tmp_name))
+        raise
+    return Path(tmp_name)
+
+
+def _stage_file_mutation(
     target: Path,
-    redaction: CredentialBackupRedaction,
-) -> None:
-    """Remove a cleared credential from every regular managed config backup."""
+    *,
+    original_bytes: bytes | None,
+    original_mode: int | None,
+    replacement_bytes: bytes | None,
+) -> _StagedFileMutation:
+    """Stage desired contents while keeping the exact rollback bytes in memory."""
+
+    replacement_path: Path | None = None
+    try:
+        if replacement_bytes is not None:
+            replacement_path = _stage_bytes(
+                target,
+                replacement_bytes,
+                mode=0o600,
+                suffix=".replacement.tmp",
+            )
+    except Exception:
+        if replacement_path is not None:
+            _remove_staged_path(replacement_path)
+        raise
+    return _StagedFileMutation(
+        target=target,
+        replacement_path=replacement_path,
+        original_bytes=original_bytes,
+        original_mode=original_mode,
+    )
+
+
+def _remove_staged_path(path: Path) -> None:
+    """Remove one staged file, retrying once and never claiming false success."""
+
+    last_error: OSError | None = None
+    for _attempt in range(2):
+        try:
+            os.unlink(native_io_path(path))
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+def _cleanup_staged_mutations(mutations: list[_StagedFileMutation]) -> None:
+    errors: list[OSError] = []
+    for mutation in mutations:
+        staged = mutation.replacement_path
+        if staged is None:
+            continue
+        try:
+            _remove_staged_path(staged)
+        except OSError as exc:
+            errors.append(exc)
+            log.error(
+                "onboarding.config_transaction_temp_cleanup_failed",
+                path=str(staged),
+                error_type=type(exc).__name__,
+            )
+    if errors:
+        raise OSError("One or more staged config files could not be removed") from errors[0]
+
+
+def _restore_file_mutation(mutation: _StagedFileMutation) -> None:
+    target_io = native_io_path(mutation.target)
+    if mutation.original_bytes is None:
+        target_io.unlink(missing_ok=True)
+        return
+    restore_path: Path | None = None
+    for attempt in range(2):
+        try:
+            restore_path = _stage_bytes(
+                mutation.target,
+                mutation.original_bytes,
+                mode=(
+                    mutation.original_mode
+                    if mutation.original_mode is not None
+                    else 0o600
+                ),
+                suffix=".restore.tmp",
+            )
+            break
+        except OSError:
+            if attempt:
+                raise
+    assert restore_path is not None
+    last_error: OSError | None = None
+    for _attempt in range(2):
+        try:
+            os.replace(native_io_path(restore_path), target_io)
+            return
+        except OSError as exc:
+            last_error = exc
+    _remove_staged_path(restore_path)
+    assert last_error is not None
+    raise last_error
+
+
+def _rollback_file_mutations(mutations: list[_StagedFileMutation]) -> list[OSError]:
+    errors: list[OSError] = []
+    for mutation in reversed(mutations):
+        try:
+            _restore_file_mutation(mutation)
+        except OSError as exc:
+            errors.append(exc)
+            log.error(
+                "onboarding.config_transaction_rollback_failed",
+                path=str(mutation.target),
+                error_type=type(exc).__name__,
+            )
+    return errors
+
+
+def _commit_file_mutations(mutations: list[_StagedFileMutation]) -> None:
+    """Commit all staged files, rolling back every earlier target on failure."""
+
+    committed: list[_StagedFileMutation] = []
+    try:
+        for mutation in mutations:
+            target_io = native_io_path(mutation.target)
+            if mutation.replacement_path is None:
+                target_io.unlink()
+            else:
+                os.replace(native_io_path(mutation.replacement_path), target_io)
+            committed.append(mutation)
+    except Exception as exc:
+        rollback_errors = _rollback_file_mutations(committed)
+        try:
+            _cleanup_staged_mutations(mutations)
+        except OSError as cleanup_error:
+            rollback_errors.append(cleanup_error)
+        if rollback_errors:
+            raise OSError(
+                "Config transaction failed and rollback or staged-file cleanup was incomplete"
+            ) from exc
+        raise
+
+
+def _stage_managed_config_backup_mutations(
+    target: Path,
+    *,
+    credential_redaction: CredentialBackupRedaction | None = None,
+    remove_paths: tuple[tuple[str, ...], ...] = (),
+) -> list[_StagedFileMutation]:
+    """Prepare backup rewrites/deletions without changing any managed file."""
 
     prefix = f"{target.name}.backup."
     backup_paths = sorted(
@@ -346,29 +537,54 @@ def _sanitize_managed_config_backups(
         for candidate in native_io_path(target.parent).iterdir()
         if candidate.name.startswith(prefix)
     )
-    for backup_path in backup_paths:
-        backup_io = native_io_path(backup_path)
-        if backup_io.is_symlink() or not backup_io.is_file():
-            raise OSError(f"Refusing to rewrite non-regular config backup: {backup_path}")
-        try:
-            with backup_io.open("rb") as fh:
-                payload = tomllib.load(fh)
-        except (tomllib.TOMLDecodeError, ValueError) as exc:
-            # An unparseable backup is useless as a restore source, yet its
-            # raw bytes may still hold the credential being cleared in plain
-            # text. Deleting it completes the redaction for this file, while
-            # aborting would leave the LIVE config holding the secret the
-            # user explicitly asked to remove.
-            log.warning(
-                "onboarding.config_backup_unparseable_deleted",
-                path=str(backup_path),
-                error=str(exc),
-                action="deleting corrupt managed backup so the credential clear proceeds",
+    staged: list[_StagedFileMutation] = []
+    try:
+        for backup_path in backup_paths:
+            backup_io = native_io_path(backup_path)
+            if backup_io.is_symlink() or not backup_io.is_file():
+                raise OSError(
+                    f"Refusing to rewrite non-regular config backup: {backup_path}"
+                )
+            original_bytes = backup_io.read_bytes()
+            original_mode = stat.S_IMODE(backup_io.stat().st_mode)
+            try:
+                payload = tomllib.loads(original_bytes.decode("utf-8"))
+            except (tomllib.TOMLDecodeError, UnicodeDecodeError, ValueError) as exc:
+                # The raw bytes are staged as the rollback copy before the
+                # corrupt backup is deleted during commit.
+                log.warning(
+                    "onboarding.config_backup_unparseable_staged_for_deletion",
+                    path=str(backup_path),
+                    error=str(exc),
+                    action="deleting corrupt managed backup if the transaction commits",
+                )
+                staged.append(
+                    _stage_file_mutation(
+                        backup_path,
+                        original_bytes=original_bytes,
+                        original_mode=original_mode,
+                        replacement_bytes=None,
+                    )
+                )
+                continue
+            changed = bool(
+                credential_redaction is not None
+                and _redact_backup_credentials(payload, credential_redaction)
             )
-            backup_io.unlink(missing_ok=True)
-            continue
-        if _redact_backup_credentials(payload, redaction):
-            _atomic_write_toml(backup_path, payload)
+            changed = _remove_backup_paths(payload, remove_paths) or changed
+            if changed:
+                staged.append(
+                    _stage_file_mutation(
+                        backup_path,
+                        original_bytes=original_bytes,
+                        original_mode=original_mode,
+                        replacement_bytes=_toml_bytes(payload),
+                    )
+                )
+    except Exception:
+        _cleanup_staged_mutations(staged)
+        raise
+    return staged
 
 
 def _remember_load_baseline(
@@ -677,6 +893,7 @@ def persist_config(
     backup: bool = True,
     restart_required: bool = False,
     backup_credential_redaction: CredentialBackupRedaction | None = None,
+    remove_paths: tuple[str, ...] = (),
 ) -> PersistResult:
     resolved = _resolve_path(path)
     # The instance baseline only describes the file the config was loaded
@@ -704,6 +921,17 @@ def persist_config(
         for provenance_key in _NON_PERSISTED_TOP_LEVEL_FIELDS:
             diff.pop(provenance_key, None)
         _merge_diff(merged, diff)
+        exact_remove_paths = tuple(
+            tuple(part for part in dotted.split(".") if part)
+            for dotted in remove_paths
+            if dotted
+        )
+        # A capability reset removes the stale section first, then writes the
+        # small explicit intent fields below (for example ``enabled=false``).
+        # Hidden advanced values and credentials therefore cannot survive.
+        for remove_path in exact_remove_paths:
+            _remove_path(merged, remove_path)
+
         # Force-persisted paths are one-shot explicit mutations. They survive
         # failed writes, but a successful commit consumes them so a later
         # unrelated save cannot overwrite a newer on-disk edit.
@@ -720,44 +948,46 @@ def persist_config(
         next_baseline = copy.deepcopy(current_dump) if same_path else None
         next_raw_base = copy.deepcopy(merged) if same_path else None
 
-        # Credential removal is intentionally stronger than an ordinary config
-        # save: do not create a fresh backup containing the just-cleared secret,
-        # and scrub matching credential fields from every managed backup while
-        # holding the same cross-process config lock.  This runs before the
-        # current-file commit, so a sanitization failure leaves live/disk config
-        # aligned and the RPC can fail closed.
-        if backup_credential_redaction is not None:
-            _sanitize_managed_config_backups(target, backup_credential_redaction)
-            backup = False
-
         backup_path: Path | None = None
-        if backup and target_io.exists():
-            backup_path = make_config_backup(target)
-
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-            dir=os.fspath(native_io_path(target.parent)),
+        scrub_managed_backups = (
+            backup_credential_redaction is not None or bool(exact_remove_paths)
         )
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                tomli_w.dump(merged, fh)
-                # Flush user-space buffers and force the temp file to stable
-                # storage before the rename, so a power loss cannot leave a
-                # truncated config behind the atomic swap.
-                fh.flush()
-                os.fsync(fh.fileno())
-            # The temp file already carries the final restrictive mode. Rename
-            # is the commit point; no fallible chmod follows it and turns a
-            # successful disk commit into an apparent rollback.
-            os.chmod(tmp_name, 0o600)
-            os.replace(tmp_name, native_io_path(target))
-        except Exception:
+        if scrub_managed_backups:
+            # A reset/credential clear is one multi-file transaction: every
+            # backup rewrite/deletion and the final current config are fully
+            # serialized and fsynced before the first managed path changes.
+            # If any commit step fails, earlier paths are restored byte-for-byte
+            # from in-memory originals, so removed credentials never sit in a
+            # plaintext rollback temp during the successful path.
+            staged = _stage_managed_config_backup_mutations(
+                target,
+                credential_redaction=backup_credential_redaction,
+                remove_paths=exact_remove_paths,
+            )
             try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            raise
+                current_original = target_io.read_bytes() if target_io.exists() else None
+                current_mode = (
+                    stat.S_IMODE(target_io.stat().st_mode)
+                    if current_original is not None
+                    else None
+                )
+                staged.append(
+                    _stage_file_mutation(
+                        target,
+                        original_bytes=current_original,
+                        original_mode=current_mode,
+                        replacement_bytes=_toml_bytes(merged),
+                    )
+                )
+            except Exception:
+                _cleanup_staged_mutations(staged)
+                raise
+            _commit_file_mutations(staged)
+            backup = False
+        else:
+            if backup and target_io.exists():
+                backup_path = make_config_backup(target)
+            _atomic_write_toml(target, merged)
 
         config.consume_force_persist_path_segments(force_paths)
 

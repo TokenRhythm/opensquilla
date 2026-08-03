@@ -175,6 +175,59 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
 
 
 @pytest.mark.asyncio
+async def test_accept_turn_can_bind_receipt_to_existing_task_without_mutating_it(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "steer-receipt.db"))
+    try:
+        await storage.upsert_session(_session())
+        running = _task("turn-running")
+        running.status = AgentTaskStatus.RUNNING
+        await storage.create_agent_task(running)
+
+        accepted = await storage.accept_turn(
+            _entry("message-steer", content="change direction"),
+            expected_epoch=0,
+            updated_at=250,
+            task_record=None,
+            receipt_task_id=running.task_id,
+            source_scope="webui:steer.v2",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-steer",
+            request_fingerprint="sha256:request-steer",
+        )
+        replayed = await storage.accept_turn(
+            _entry("unused-replay-entry", content="change direction"),
+            expected_epoch=0,
+            updated_at=251,
+            task_record=None,
+            receipt_task_id=running.task_id,
+            source_scope="webui:steer.v2",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-steer",
+            request_fingerprint="sha256:request-steer",
+        )
+
+        task = await storage.get_agent_task(running.task_id)
+        transcript = await storage.get_transcript(SESSION_ID)
+        assert task is not None
+        assert task.status == AgentTaskStatus.RUNNING
+        assert accepted.receipt.task_id == running.task_id
+        assert accepted.replayed is False
+        assert replayed.receipt.message_id == "message-steer"
+        assert replayed.replayed is True
+        assert [entry.message_id for entry in transcript] == ["message-steer"]
+        looked_up = await storage.get_canonical_transcript_entry(
+            SESSION_ID,
+            "message-steer",
+        )
+        assert looked_up is not None
+        assert looked_up.content == "change direction"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_accept_turn_updates_session_origin_in_same_transaction(tmp_path) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
     try:

@@ -21,6 +21,7 @@ const inputRef = ref<HTMLInputElement | null>(null)
 const query = ref('')
 const activeIndex = ref(0)
 const FEATURED = ['tokenrhythm', 'openrouter', 'deepseek', 'gemini']
+const TOKENRHYTHM_REGISTRATION_URL = 'https://tokenrhythm.studio/'
 
 const configured = computed(() => new Set(
   props.configuredIds.map(id => id.trim().toLowerCase()),
@@ -197,29 +198,40 @@ watch(() => props.open, open => {
     >
       <section v-if="recommendedProviders.length" class="provider-picker__group" role="presentation">
         <p class="provider-picker__group-label">{{ t('setup.provider.recommendedProviders') }}</p>
-        <button
+        <div
           v-for="{ provider, index } in recommendedProviders"
-          :id="`setup-provider-catalog-option-${index}`"
           :key="provider.providerId"
-          type="button"
-          class="provider-picker__option"
-          :class="{ 'is-active': index === activeIndex }"
-          role="option"
-          tabindex="-1"
-          :disabled="isConfigured(provider.providerId)"
-          :aria-selected="index === activeIndex ? 'true' : 'false'"
-          :title="isConfigured(provider.providerId) ? t('setup.provider.alreadyConfigured') : undefined"
+          class="provider-picker__option-row"
           @mousemove="activeIndex = index"
-          @click="choose(provider.providerId)"
         >
-          <span class="provider-picker__option-copy">
-            <strong>{{ provider.label }}</strong>
-            <code>{{ provider.providerId }}</code>
-          </span>
-          <span class="control-pill provider-picker__offer">
+          <button
+            :id="`setup-provider-catalog-option-${index}`"
+            type="button"
+            class="provider-picker__option provider-picker__option--with-offer"
+            :class="{ 'is-active': index === activeIndex }"
+            role="option"
+            tabindex="-1"
+            :disabled="isConfigured(provider.providerId)"
+            :aria-selected="index === activeIndex ? 'true' : 'false'"
+            :title="isConfigured(provider.providerId) ? t('setup.provider.alreadyConfigured') : undefined"
+            @click="choose(provider.providerId)"
+          >
+            <span class="provider-picker__option-copy">
+              <strong>{{ provider.label }}</strong>
+              <code>{{ provider.providerId }}</code>
+            </span>
+          </button>
+          <a
+            class="control-pill provider-picker__offer"
+            :href="TOKENRHYTHM_REGISTRATION_URL"
+            target="_blank"
+            rel="noopener noreferrer"
+            :aria-label="t('setup.provider.recommendation.externalLabel')"
+          >
             {{ t('setup.provider.limitedFreeBadge') }}
-          </span>
-        </button>
+            <Icon name="externalLink" :size="12" aria-hidden="true" />
+          </a>
+        </div>
       </section>
       <section v-if="otherProviders.length" class="provider-picker__group" role="presentation">
         <p class="provider-picker__group-label">{{ t('setup.provider.otherProviders') }}</p>
@@ -371,6 +383,14 @@ watch(() => props.open, open => {
   padding: var(--sp-2) var(--sp-3);
   text-align: left;
 }
+.provider-picker__option-row {
+  min-width: 0;
+  position: relative;
+}
+.provider-picker__option--with-offer {
+  padding-right: clamp(148px, 38%, 190px);
+  width: 100%;
+}
 .provider-picker__option-copy {
   display: grid;
   gap: 1px;
@@ -382,10 +402,31 @@ watch(() => props.open, open => {
   overflow-wrap: anywhere;
 }
 .provider-picker__offer {
+  align-items: center;
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   border-color: color-mix(in srgb, var(--accent) 25%, transparent);
   color: var(--accent-deep);
+  display: inline-flex;
   flex: 0 0 auto;
+  gap: 4px;
+  position: absolute;
+  right: var(--sp-3);
+  text-decoration: none;
+  top: 50%;
+  transform: translateY(-50%);
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out);
+}
+.provider-picker__offer:hover {
+  background: color-mix(in srgb, var(--accent) 19%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+  text-decoration: none;
+}
+.provider-picker__offer:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .provider-picker__option:hover,
 .provider-picker__option.is-active,
@@ -412,6 +453,7 @@ watch(() => props.open, open => {
 }
 @container provider-panel (max-width: 560px) {
   .provider-picker__option { align-items: center; gap: var(--sp-2); }
+  .provider-picker__option--with-offer { padding-right: clamp(136px, 46%, 172px); }
   .provider-picker__results-head { align-items: flex-start; flex-direction: column; gap: var(--sp-1); }
 }
 </style>

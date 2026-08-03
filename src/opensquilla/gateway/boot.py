@@ -3637,6 +3637,17 @@ async def start_gateway_server(
     from opensquilla.tools.builtin.sessions import set_task_runtime
 
     set_task_runtime(task_runtime)
+    recover_stranded_steers = getattr(task_runtime, "recover_stranded_steers", None)
+    if callable(recover_stranded_steers):
+        steer_recovery = await recover_stranded_steers()
+        if any(
+            int(steer_recovery.get(field, 0) or 0)
+            for field in ("applied", "promoted", "cancelled", "rejected", "resumed")
+        ):
+            log.info(
+                "gateway.steer_restart_recovery_completed",
+                **steer_recovery,
+            )
 
     # Resolve HEARTBEAT.md path; instantiate Runner + Watcher;
     # start Watcher BEFORE the Loop so the first tick already sees any

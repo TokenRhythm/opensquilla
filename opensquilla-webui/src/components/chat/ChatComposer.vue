@@ -126,6 +126,19 @@
               <span>{{ t('workspaces.chooseProject') }}</span>
               <Icon class="chat-project-choose__chevron" name="chevronDown" :size="12" />
             </button>
+            <button
+              v-if="codingModeEnabled"
+              type="button"
+              class="chat-coding-mode-chip"
+              :title="t('chat.codingMode.disableLabel')"
+              :aria-label="t('chat.codingMode.disableLabel')"
+              :aria-busy="codingModeSettingsBusy ? 'true' : 'false'"
+              :disabled="codingModeSettingsBusy"
+              @click="emit('setCodingModeEnabled', false)"
+            >
+              <span>{{ t('chat.codingMode.activeLabel') }}</span>
+              <Icon name="x" :size="12" aria-hidden="true" />
+            </button>
             <div ref="modelRoutingAnchorEl" class="chat-settings-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-model-routing-btn"
@@ -326,6 +339,8 @@ const props = withDefaults(defineProps<{
   runModeLockMessage: string
   modelRoutingMode: ModelRoutingMode
   modelRoutingSettingsBusy: boolean
+  codingModeEnabled?: boolean
+  codingModeSettingsBusy?: boolean
   voiceBusy: boolean
   voiceRecording: boolean
   voiceReady: boolean
@@ -342,6 +357,8 @@ const props = withDefaults(defineProps<{
   replanActive?: boolean
 }>(), {
   canChooseProject: true,
+  codingModeEnabled: false,
+  codingModeSettingsBusy: false,
 })
 
 const emit = defineEmits<{
@@ -356,6 +373,7 @@ const emit = defineEmits<{
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: 'standard' | 'trusted' | 'full']
   setModelRoutingMode: [mode: ModelRoutingMode]
+  setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   cancelReplan: []
   voiceInput: []
@@ -643,6 +661,41 @@ defineExpose<ChatComposerExpose>({
 .chat-project-chip[data-status="removed"],
 .chat-project-chip[data-status="error"] {
   background: color-mix(in srgb, var(--warn) 7%, transparent);
+}
+.chat-coding-mode-chip {
+  flex: 0 0 auto;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px 3px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 650;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast),
+    background var(--dur-fast),
+    color var(--dur-fast);
+}
+.chat-coding-mode-chip:hover,
+.chat-coding-mode-chip:focus-visible {
+  outline: 0;
+  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent-hover);
+}
+.chat-coding-mode-chip:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+.chat-coding-mode-chip:disabled {
+  cursor: default;
+  opacity: var(--state-disabled-opacity);
 }
 .chat-project-choose {
   flex-shrink: 0;

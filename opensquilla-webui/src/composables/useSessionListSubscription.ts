@@ -15,6 +15,7 @@ export interface UseSessionListSubscriptionOptions {
   isAdmitted?: () => boolean
   refresh: () => void | Promise<void>
   scheduleRefresh: () => void
+  onChanged?: RpcEventHandler
   warn?: (message: string, error?: unknown) => void
   callOptions?: RpcCallOptions
 }
@@ -82,7 +83,10 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
     if (active) return cleanup
     active = true
     removeListeners = [
-      options.rpc.on('sessions.changed', options.scheduleRefresh),
+      options.rpc.on('sessions.changed', payload => {
+        options.scheduleRefresh()
+        options.onChanged?.(payload)
+      }),
       options.rpc.on('_state', (state: ConnectionState) => {
         if (state === 'connected') {
           void ensureSubscribed()

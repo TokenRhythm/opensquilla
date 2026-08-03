@@ -23,6 +23,7 @@ import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
+from opensquilla.engine.route_plan import pin_route_plan
 from opensquilla.engine.runtime_recovery import (
     normalize_reasoning_prefill_recovery_mode,
     normalize_runtime_recovery_mode,
@@ -756,6 +757,49 @@ class AgentBootstrapStage:
             turn=inp.turn,
         )
         agent_metadata = inp.turn.metadata
+        fallback_capabilities: dict[
+            tuple[str, str],
+            tuple[int, ModelCapabilities | None],
+        ] = {}
+        route_provider = str(
+            agent_metadata.get("routed_provider")
+            or inp.active_provider_id
+            or ""
+        )
+        fallback_sources = (
+            agent_metadata.get("router_fallback_chain"),
+            agent_metadata.get("selector_execution_chain"),
+        )
+        for raw_fallbacks in fallback_sources:
+            if not isinstance(raw_fallbacks, list):
+                continue
+            for raw_fallback in raw_fallbacks:
+                if not isinstance(raw_fallback, dict):
+                    continue
+                fallback_model = str(raw_fallback.get("model") or "").strip()
+                if not fallback_model:
+                    continue
+                fallback_provider = str(
+                    raw_fallback.get("provider") or route_provider
+                ).strip()
+                fallback_catalog = self._model_catalog.lookup(
+                    fallback_model,
+                    fallback_provider,
+                )
+                fallback_capabilities[(fallback_provider, fallback_model)] = (
+                    fallback_catalog.context_window,
+                    fallback_catalog.capabilities,
+                )
+        pin_route_plan(
+            inp.turn,
+            turn_id=inp.turn_id,
+            provider=inp.active_provider_id,
+            model=inp.resolved_model,
+            context_window=catalog.context_window,
+            capabilities=catalog.capabilities,
+            effective_thinking=aux.thinking,
+            fallback_capabilities=fallback_capabilities,
+        )
         agent_metadata["agent_max_iterations"] = budgets.max_iterations
         agent_metadata["agent_max_iterations_source"] = budgets.max_iterations_source
 

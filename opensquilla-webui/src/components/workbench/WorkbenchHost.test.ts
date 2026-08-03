@@ -81,6 +81,65 @@ async function mountHost(
   return { host, modalBlocked, onSurfaceRect, routeActive, store }
 }
 
+async function mountHostWithDeferredNativeSlot() {
+  const host = document.createElement('div')
+  document.body.appendChild(host)
+  const pinia = createPinia()
+  const ready = ref(false)
+  const onSurfaceRect = vi.fn()
+  const setNativeSlotRect = (value: unknown) => {
+    if (!(value instanceof HTMLElement)) return
+    value.getBoundingClientRect = () => ({
+      x: 500,
+      y: 50,
+      top: 50,
+      right: 1100,
+      bottom: 650,
+      left: 500,
+      width: 600,
+      height: 600,
+      toJSON: () => ({}),
+    })
+  }
+  const Root = defineComponent(() => () => h(
+    WorkbenchHost,
+    {
+      availableWidth: 1200,
+      onSurfaceRect,
+      routeActive: true,
+    },
+    {
+      'native-surface': () => h(
+        'section',
+        { 'data-testid': 'native-panel-shell' },
+        [
+          h('div', [
+            ready.value
+              ? h('div', {
+                  key: 'ready',
+                  ref: setNativeSlotRect,
+                  'data-workbench-native-surface-slot': '',
+                })
+              : h(
+                  'div',
+                  { key: 'loading', 'data-testid': 'native-loading' },
+                  'Loading preview',
+                ),
+          ]),
+        ],
+      ),
+    },
+  ))
+  const app = createApp(Root)
+  app.use(pinia)
+  apps.push(app)
+  const store = useWorkbenchStore(pinia)
+  store.openItem(item('native', 'native-webcontents'))
+  app.mount(host)
+  await nextTick()
+  return { host, onSurfaceRect, ready, store }
+}
+
 async function mountMobileHostFromInvoker() {
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -126,6 +185,7 @@ beforeEach(() => {
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
+  vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
 
@@ -324,6 +384,103 @@ describe('WorkbenchHost', () => {
     expect(mounted.host.querySelector('.workbench-host__surface--native')).not.toBeNull()
     expect(mounted.store.activeItem?.payload).toEqual({})
     expect(JSON.stringify(mounted.store.$state)).not.toMatch(/webContents|Blob|AbortController/)
+  })
+
+  it('remeasures when a native surface slot appears after loading', async () => {
+    const mounted = await mountHostWithDeferredNativeSlot()
+    const panelShell = mounted.host.querySelector('[data-testid="native-panel-shell"]')
+
+    expect(panelShell).toBeInstanceOf(HTMLElement)
+    expect(mounted.host.querySelector('[data-workbench-native-surface-slot]')).toBeNull()
+    expect(mounted.onSurfaceRect).toHaveBeenLastCalledWith({
+      itemId: 'native',
+      x: 0,
+      y: 0,
+      width: 0,
+      height: 0,
+      visible: false,
+    })
+
+    mounted.onSurfaceRect.mockClear()
+    mounted.ready.value = true
+    await nextTick()
+
+    expect(mounted.host.querySelector('[data-testid="native-panel-shell"]')).toBe(panelShell)
+    await vi.waitFor(() => {
+      expect(mounted.onSurfaceRect).toHaveBeenLastCalledWith({
+        itemId: 'native',
+        x: 500,
+        y: 50,
+        width: 600,
+        height: 600,
+        visible: true,
+      })
+    })
+
+    mounted.onSurfaceRect.mockClear()
+    mounted.ready.value = false
+    await nextTick()
+
+    expect(mounted.host.querySelector('[data-testid="native-panel-shell"]')).toBe(panelShell)
+    await vi.waitFor(() => {
+      expect(mounted.onSurfaceRect).toHaveBeenLastCalledWith({
+        itemId: 'native',
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        visible: false,
+      })
+    })
+  })
+
+  it('tracks size changes on a dynamically inserted native surface slot', async () => {
+    let observerIndex = 0
+    let surfaceResizeCallback: ResizeObserverCallback | null = null
+    const observeSurface = vi.fn()
+    class ResizeObserverStub {
+      readonly index = observerIndex++
+      constructor(callback: ResizeObserverCallback) {
+        if (this.index === 0) surfaceResizeCallback = callback
+      }
+      disconnect() {}
+      observe(element: Element) {
+        if (this.index === 0) observeSurface(element)
+      }
+      unobserve() {}
+    }
+    vi.stubGlobal('ResizeObserver', ResizeObserverStub)
+    const mounted = await mountHostWithDeferredNativeSlot()
+
+    mounted.ready.value = true
+    await nextTick()
+    const slot = mounted.host.querySelector<HTMLElement>(
+      '[data-workbench-native-surface-slot]',
+    )!
+    await vi.waitFor(() => expect(observeSurface).toHaveBeenCalledWith(slot))
+
+    slot.getBoundingClientRect = () => ({
+      x: 480,
+      y: 70,
+      top: 70,
+      right: 1080,
+      bottom: 550,
+      left: 480,
+      width: 600,
+      height: 480,
+      toJSON: () => ({}),
+    })
+    mounted.onSurfaceRect.mockClear()
+    surfaceResizeCallback!([], {} as ResizeObserver)
+
+    expect(mounted.onSurfaceRect).toHaveBeenLastCalledWith({
+      itemId: 'native',
+      x: 480,
+      y: 70,
+      width: 600,
+      height: 480,
+      visible: true,
+    })
   })
 
   it('keeps the active item mounted but hidden when the panel is collapsed', async () => {

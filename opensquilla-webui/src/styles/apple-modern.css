@@ -465,10 +465,6 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   transition: transform var(--dur-base) var(--ease-out);
 }
 
-.sidebar-history-dot.status--running {
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent);
-}
-
 .sidebar-foot {
   border-top: 0;
   padding: 10px 2px 0;

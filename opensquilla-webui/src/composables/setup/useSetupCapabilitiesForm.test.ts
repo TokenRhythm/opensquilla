@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { computed, ref } from 'vue'
 import {
   buildImagePayload,
+  buildSearchPayload,
   imageModelForDisplay,
   imageModelRefForPayload,
   parseImageFallbacks,
@@ -27,7 +28,6 @@ const imageProviders = [
 
 const baseValues = {
   providerId: 'openrouter',
-  enabled: true,
   primary: 'google/gemini-3.1-flash-image-preview',
   apiKey: '',
   apiKeyEnv: '',
@@ -154,6 +154,10 @@ describe('buildImagePayload', () => {
     expect(payload.credentialMode).toBe('direct')
   })
 
+  it('does not send the legacy enabled switch because configuration enables the capability', () => {
+    expect(buildImagePayload(baseValues)).not.toHaveProperty('enabled')
+  })
+
   it('adds a credential mode only when a credential field was edited', () => {
     const untouched = buildImagePayload({
       ...baseValues,
@@ -172,6 +176,66 @@ describe('buildImagePayload', () => {
       credentialMode: 'env',
       apiKeyEnv: 'OPENROUTER_API_KEY',
     })
+  })
+})
+
+describe('buildSearchPayload', () => {
+  it('preserves hidden advanced values but never sends inline and env keys together', () => {
+    const payload = buildSearchPayload({
+      providerId: 'brave',
+      apiKey: 'test-inline-key',
+      apiKeyEnv: 'BRAVE_SEARCH_API_KEY',
+      maxResults: 17,
+      proxy: 'http://127.0.0.1:7890',
+      useEnvProxy: true,
+      fallbackPolicy: 'network',
+      diagnostics: true,
+    })
+
+    expect(payload).toMatchObject({
+      providerId: 'brave',
+      apiKey: 'test-inline-key',
+      maxResults: 17,
+      proxy: 'http://127.0.0.1:7890',
+      useEnvProxy: true,
+      fallbackPolicy: 'network',
+      diagnostics: true,
+    })
+    expect(payload).not.toHaveProperty('apiKeyEnv')
+  })
+})
+
+describe('useSetupCapabilitiesForm search provider switching', () => {
+  const searchProviders = [
+    { providerId: 'duckduckgo', requiresApiKey: false },
+    { providerId: 'brave', requiresApiKey: true, envKey: 'BRAVE_SEARCH_API_KEY' },
+    { providerId: 'tavily', requiresApiKey: true, envKey: 'TAVILY_API_KEY' },
+  ]
+
+  it('preserves a saved env reference until the provider is changed', () => {
+    const form = useSetupCapabilitiesForm()
+    form.initSearchFromConfig({
+      search_provider: 'brave',
+      search_api_key_env: 'CUSTOM_BRAVE_KEY',
+    }, searchProviders)
+
+    expect(form.searchPayload().apiKeyEnv).toBe('CUSTOM_BRAVE_KEY')
+
+    form.updateField('search', 'provider', 'tavily')
+    form.onSearchProviderChange(searchProviders[2])
+
+    expect(form.searchPayload()).not.toHaveProperty('apiKeyEnv')
+    expect(form.searchPayload()).not.toHaveProperty('apiKey')
+  })
+
+  it('does not silently configure a hidden env reference for a new keyed provider', () => {
+    const form = useSetupCapabilitiesForm()
+    form.initSearchFromConfig({}, searchProviders)
+
+    form.updateField('search', 'provider', 'brave')
+    form.onSearchProviderChange(searchProviders[1])
+
+    expect(form.searchPayload()).not.toHaveProperty('apiKeyEnv')
   })
 })
 
@@ -208,6 +272,7 @@ describe('useSetupCapabilitiesForm image hydration', () => {
     }, imageProviders)
 
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('explicit')
     expect(form.imageApiKeyValue.value).toBe('')
     expect(form.imageApiKeyEnvValue.value).toBe('')
     expect(form.imagePayload()).not.toHaveProperty('apiKey')
@@ -224,12 +289,19 @@ function stubPanelContext() {
   const flag = computed(() => false)
   const list = computed(() => [] as string[])
   const providers = computed(() => [] as Array<{ providerId: string; label: string }>)
+  const imageModels = computed(() => [])
   return {
     searchProviders: providers,
     memoryProviders: providers,
     imageProviders: providers,
     imageSpec: computed(() => null),
+    imageModels,
+    imageModelSource: computed(() => 'none'),
     searchRequiresKey: flag,
+    searchKeyPlaceholder: text,
+    searchDraftDirty: flag,
+    searchDraftMissingKey: flag,
+    searchDraftStatusText: text,
     searchEnvPlaceholder: text,
     searchAdvancedOpen: flag,
     searchNeeds: list,
@@ -246,13 +318,15 @@ function stubPanelContext() {
     memoryEnvPlaceholder: text,
     memoryNeeds: list,
     memoryStatusText: text,
+    memoryModeTitle: text,
+    memoryModeDescription: text,
+    memoryExpandable: flag,
     memoryEnvCommand: text,
     imageNeeds: list,
     imageStatusText: text,
     imageEnvCommand: text,
     capabilityBadgeTone: () => '',
     capabilityBadgeLabel: () => '',
-    capabilitySaveButtonClass: () => '',
     memoryAutoCapture: ref(false),
     audioEnabled: ref(false),
     audioApiKey: ref(''),
@@ -265,6 +339,8 @@ function stubPanelContext() {
     audioBadgeTone: text,
     audioBadgeLabel: text,
     audioKeyPlaceholder: text,
+    resettable: () => false,
+    resetPending: ref<'search' | 'memory_embedding' | 'image_generation' | 'audio' | ''>(''),
   }
 }
 
@@ -281,12 +357,15 @@ describe('useSetupCapabilitiesForm image key state', () => {
       imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
     }, imageProviders)
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('explicit')
 
     form.onImageProviderChange(imageProviders[0])
     expect(form.imageKeyConfiguredValue.value).toBe(false)
+    expect(form.imageCredentialSourceValue.value).toBe('none')
 
     form.onImageProviderChange(imageProviders[1])
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('explicit')
   })
 
   it('exposes the stored-key state on the panel without ever exposing the key', () => {
@@ -303,10 +382,12 @@ describe('useSetupCapabilitiesForm image key state', () => {
     const panel = form.createPanel(stubPanelContext())
 
     expect(panel.value.form.imageKeyConfigured).toBe(true)
+    expect(panel.value.form.imageCredentialSource).toBe('explicit')
     expect(panel.value.form.imageApiKey).toBe('')
 
     form.onImageProviderChange(imageProviders[0])
     expect(panel.value.form.imageKeyConfigured).toBe(false)
+    expect(panel.value.form.imageCredentialSource).toBe('none')
     expect(panel.value.form.imageApiKey).toBe('')
   })
 
@@ -323,6 +404,7 @@ describe('useSetupCapabilitiesForm image key state', () => {
     }, imageProviders)
 
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('env')
     // The env reference stays editable; only the direct key is write-only.
     expect(form.imageApiKeyEnvValue.value).toBe('CUSTOM_OPENROUTER_ENV')
   })
@@ -338,11 +420,37 @@ describe('useSetupCapabilitiesForm image key state', () => {
       imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
     }, imageProviders)
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('configured')
 
     // The status describes the active provider; another provider without any
     // stored credential is honestly not configured.
     form.onImageProviderChange(imageProviders[0])
     expect(form.imageKeyConfiguredValue.value).toBe(false)
+    expect(form.imageCredentialSourceValue.value).toBe('none')
+  })
+
+  it('exposes backend credential-source detail for reusable and broken credentials', () => {
+    const reusable = useSetupCapabilitiesForm()
+    reusable.initImageFromConfig({}, {
+      imageGenerationConfigured: true,
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+      imageGenerationSource: 'llm_fallback',
+    }, imageProviders)
+
+    expect(reusable.imageKeyConfiguredValue.value).toBe(true)
+    expect(reusable.imageCredentialSourceValue.value).toBe('llm_fallback')
+
+    const broken = useSetupCapabilitiesForm()
+    broken.initImageFromConfig({}, {
+      imageGenerationConfigured: false,
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+      imageGenerationSource: 'missing_env',
+    }, imageProviders)
+
+    expect(broken.imageKeyConfiguredValue.value).toBe(false)
+    expect(broken.imageCredentialSourceValue.value).toBe('missing_env')
   })
 })
 

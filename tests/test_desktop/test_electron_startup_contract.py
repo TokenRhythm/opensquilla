@@ -676,61 +676,46 @@ def test_legacy_profiles_are_consolidated_before_primary_inspection_and_gateway_
     ) < startup_inspection.index("await inspectDesktopProfile(active)")
 
 
-def test_blocked_profile_consolidation_is_presented_as_retryable_primary_repair() -> None:
+def test_blocked_profile_consolidation_is_maintenance_until_primary_inspection() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     boot_html = _read("desktop/electron/src/boot.html")
-    failure_result = _section(
-        main_ts,
-        "function recoveryFailureResult",
-        "async function runRecoveryCli",
-    )
     consolidation = _section(
         main_ts,
         "async function consolidateLegacyRecoveryProfilesBeforeStartup",
-        "function recoveryStateSnapshot",
+        "function deferProfileConsolidationMaintenance",
     )
     startup_inspection = _section(
         main_ts,
         "async function inspectActiveProfileBeforeStartup",
         "async function openOrResumeDesktopApp",
     )
-    blocked_mapping = _section(
-        startup_inspection,
-        "const consolidationRepair = await consolidateLegacyRecoveryProfilesBeforeStartup()",
-        "const active = activeDesktopProfile()",
-    )
 
-    assert "Promise<RecoveryProtocolResult | null>" in consolidation
+    assert "Promise<DesktopProfileConsolidationResult | null>" in consolidation
     assert "result.outcome === 'blocked'" in consolidation
-    assert (
-        "return recoveryFailureResult(primary.home, result.stable_code)"
-        in consolidation
-    )
-    assert "Desktop profile consolidation is blocked" not in consolidation
+    assert "return result" in consolidation
+    assert "recoveryFailureResult" not in consolidation
+    assert "primary_home_intact" not in main_ts
+    assert "isPlainDesktopDirectory" not in main_ts
     assert consolidation.index("result.outcome === 'blocked'") < consolidation.index(
         "desktopProfilesConsolidatedThisProcess = true"
     )
 
-    assert "outcome: 'recovery_required'" in failure_result
-    assert "'show-backups'" in failure_result
-    assert "'copy-diagnostics'" in failure_result
-    assert "recoveryInspection = consolidationRepair" in blocked_mapping
-    assert "primaryRecoveryInspection = consolidationRepair" in blocked_mapping
-    assert "bootError = null" in blocked_mapping
-    assert "await restoreMainWindowToBootPage()" in blocked_mapping
-    assert blocked_mapping.count("publishRecoveryState()") == 2
-    assert "return false" in blocked_mapping
-    assert "sendBootError" not in blocked_mapping
-
-    # Retry is intentionally independent from the protocol action list: it
-    # starts the primary startup flow again, which reruns consolidation because
-    # a blocked attempt never sets desktopProfilesConsolidatedThisProcess.
-    assert 'id="recoveryRetry" class="primary"' in boot_html
     assert (
-        "document.getElementById('recoveryRetry').addEventListener"
-        "('click', () => retryStartup())"
-        in boot_html
+        "const consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()"
+        in startup_inspection
     )
+    assert "let inspection = await inspectDesktopProfile(active)" in startup_inspection
+    assert startup_inspection.index("let inspection = await inspectDesktopProfile(active)") < (
+        startup_inspection.index("if (consolidationFailure)")
+    )
+    assert "if (inspection.outcome === 'recovery_required')" in startup_inspection
+    assert "deferProfileConsolidationMaintenance(consolidationFailure)" in startup_inspection
+    assert "desktop_profile_consolidation_primary_blocked" in startup_inspection
+
+    # Consolidation diagnostics stay out of the blocking splash. That UI is now
+    # reserved for the primary inspector's genuine recovery-required verdict.
+    assert "unsafePathHelp" not in boot_html
+    assert "failure_detail" not in boot_html
 
 
 def test_consolidated_safe_storage_failure_cannot_publish_or_ack_as_adopted() -> None:
@@ -3112,70 +3097,51 @@ def test_consolidation_e2e_covers_receipt_replay_and_inactive_state_archival() -
     assert "archivedProfiles" in source
 
 
-def test_profile_consolidation_has_a_manual_operator_escape_hatch() -> None:
-    """A layout consolidation cannot process must not be a dead end.
-
-    Consolidation gates startup and its retry action re-runs the same work, so
-    without an opt-out the only remaining recovery is editing the profile
-    directory by hand. The opt-out must stay manual: an automatic fallback would
-    begin writing into a profile the audited inspector never verified.
-    """
+def test_obsolete_profile_consolidation_escape_hatch_is_removed() -> None:
+    """The product path replaces the old environment-variable workaround."""
 
     main_ts = _read("desktop/electron/src/main.ts")
+    preload = _read("desktop/electron/src/preload.cts")
 
-    assert "OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION" in main_ts
-    assert "function profileConsolidationOptOut()" in main_ts
-
-    consolidation = main_ts.split(
-        "async function consolidateLegacyRecoveryProfilesBeforeStartup(",
-    )[1]
-    guard = consolidation.split("desktopProfilesConsolidatedThisProcess")[0]
-    # The opt-out is checked before any writer lock or CLI spawn, so a wedged
-    # profile cannot block the check that exists to get past it.
-    assert "profileConsolidationOptOut()" in guard
-    assert "desktop_profile_consolidation_skipped" in guard
-
-    # Skipping silently would leave sessions split across profiles with no trace.
-    assert "reason: 'operator_opt_out'" in main_ts
-
-    # No automatic fallback: the opt-out is only ever read from the environment.
-    assert "profileConsolidationOptOut()" not in consolidation.split(
-        "desktop_profile_consolidation_skipped",
-    )[1]
+    assert "OPENSQUILLA_DESKTOP_SKIP_PROFILE_CONSOLIDATION" not in main_ts
+    assert "profileConsolidationOptOut" not in main_ts
+    assert "desktop_profile_consolidation_skipped" not in main_ts
+    assert "desktopProfileConsolidationMaintenance" in main_ts
+    assert "retryDeferredProfileConsolidation" in main_ts
+    assert "'desktop:recovery:retry-consolidation'" in main_ts
+    assert "'desktop:recovery:retry-consolidation'" in preload
 
 
-def test_blocked_consolidation_defers_startup_when_the_primary_survives() -> None:
-    """A failed legacy fan-in must not cost the user access to a healthy primary.
-
-    The repair page's only forward action re-runs the same work, so blocking on a
-    profile the fan-in cannot process is a dead end. Deferral is silent by design:
-    it writes nothing, records the reason only in the desktop log, and leaves every
-    recovery profile on disk for a later launch to retry.
-    """
+def test_blocked_consolidation_defers_only_after_primary_is_bootable() -> None:
+    """Maintenance never overrides the primary inspector's startup verdict."""
 
     main_ts = _read("desktop/electron/src/main.ts")
-    consolidation = _section(
+    deferral = _section(
         main_ts,
-        "async function consolidateLegacyRecoveryProfilesBeforeStartup",
+        "function deferProfileConsolidationMaintenance",
         "function recoveryStateSnapshot",
     )
-
-    # The protocol carries the verdict, and an older runtime that omits it must be
-    # treated as "not intact" so the stricter blocking path stays the default.
-    assert "primary_home_intact: boolean" in main_ts
-    assert "primary_home_intact: record.primary_home_intact === true" in main_ts
-
-    assert "if (result.primary_home_intact && isPlainDesktopDirectory(primary.home)) {" in (
-        consolidation
+    startup = _section(
+        main_ts,
+        "async function inspectActiveProfileBeforeStartup",
+        "async function openOrResumeDesktopApp",
     )
-    assert "desktop_profile_consolidation_deferred" in consolidation
-    # Still fails closed for every state the protocol does not vouch for.
-    assert "return recoveryFailureResult(primary.home, result.stable_code)" in consolidation
-    # A blocked attempt must never be recorded as a completed consolidation.
-    deferral = consolidation.split("desktop_profile_consolidation_deferred")[1]
-    assert "desktopProfilesConsolidatedThisProcess = true" not in deferral.split("return null")[0]
+
+    assert "desktop_profile_consolidation_deferred" in deferral
+    assert "desktopProfileConsolidationMaintenance = {" in deferral
+    assert "desktopProfileConsolidationFailureDetail" in deferral
     assert "let desktopProfileConsolidationDeferredThisProcess = false" in main_ts
 
-    # Silent: the deferral must not reach the renderer, the boot splash, or a dialog.
-    for surface in ("sendBootStatus", "sendBootError", "publishRecoveryState", "dialog."):
-        assert surface not in deferral.split("return null")[0], surface
+    decision = startup.split("if (consolidationFailure)")[1].split(
+        "recoveryInspection = inspection",
+    )[0]
+    assert "inspection.outcome === 'recovery_required'" in decision
+    assert "deferProfileConsolidationMaintenance(consolidationFailure)" in decision
+    assert decision.index("inspection.outcome === 'recovery_required'") < decision.index(
+        "deferProfileConsolidationMaintenance(consolidationFailure)"
+    )
+
+    # Interrupted profile transactions are attempted automatically before the
+    # severe blocking UI is considered.
+    assert "inspection.allowed_actions.includes('recover-transaction')" in startup
+    assert "'profile_transaction_auto_recovery_failed'" in startup

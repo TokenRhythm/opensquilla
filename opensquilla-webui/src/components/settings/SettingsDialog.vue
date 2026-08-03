@@ -131,6 +131,7 @@
               v-else-if="section === 'privacy'"
               :panel="privacyPanel"
               @update-disable-network-observability="setDisableNetworkObservability"
+              @update-memory-auto-capture="setMemoryAutoCapture"
             />
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
@@ -158,13 +159,8 @@
               :panel="capabilitiesPanel"
               @update-field="updateCapabilityField"
               @search-provider-change="onSearchProviderChange"
-              @memory-provider-change="onMemoryProviderChange"
               @image-provider-change="onImageProviderChange"
-              @save-search="saveSearch"
-              @save-memory="saveMemory"
-              @save-image="saveImage"
-              @save-audio="saveAudio"
-              @copy="copyCommand"
+              @reset-capability="resetCapability"
             />
             <SettingsAppearancePanel v-else-if="section === 'appearance'" />
             <SettingsKeyboardPanel v-else-if="section === 'keyboard'" />
@@ -283,6 +279,7 @@ const {
   cancelProviderEdit,
   setAutoSessionTitles,
   setDisableNetworkObservability,
+  setMemoryAutoCapture,
   setModelStrategy,
   setFixedProvider,
   setFixedModel,
@@ -310,13 +307,9 @@ const {
   updateCapabilityField,
   onProviderChange,
   onSearchProviderChange,
-  onMemoryProviderChange,
   onImageProviderChange,
   saveProvider,
-  saveSearch,
-  saveMemory,
-  saveImage,
-  saveAudio,
+  resetCapability,
   copyCommand,
   copyConfigPath,
 } = useSetupCatalog()

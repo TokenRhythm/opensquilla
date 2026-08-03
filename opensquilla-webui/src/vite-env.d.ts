@@ -121,6 +121,7 @@ declare global {
     cancelOnboarding: () => Promise<unknown>
     getBootState: () => Promise<unknown>
     getRecoveryState?: () => Promise<unknown>
+    retryProfileConsolidation?: () => Promise<{ ok: boolean; error?: string }>
     chooseLegacyAgentDataLocation?: (payload?: Record<string, never>) => Promise<unknown>
     retryStartup: () => Promise<DesktopRetryStartupResult>
     quitApp: () => Promise<unknown>

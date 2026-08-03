@@ -175,6 +175,153 @@ async function openWorkbenchSession(
   )
 }
 
+async function installDesktopWorkbenchV2Bridge(
+  page: Page,
+  mode?: 'full' | 'offline',
+) {
+  await page.addInitScript(({ previewMode }) => {
+    const initialMode = previewMode === 'offline' ? 'offline' : 'full'
+    const expiresAt = '2099-01-01T00:00:00Z'
+    const leaseResponse = (mode: 'full' | 'offline', sequence: number) => {
+      const token = mode === 'full'
+        ? '11111111111111111111111111111111'
+        : '22222222222222222222222222222222'
+      const previewOrigin = `http://p-${token}.localhost:48721`
+      return {
+        ok: true,
+        status: 201,
+        payload: {
+          version: 1,
+          lease_id: `apl-e2e-${mode}-${sequence}`,
+          effective_mode: mode,
+          launch_url: `${previewOrigin}/index.html`,
+          entrypoint: 'index.html',
+          expires_at: expiresAt,
+          preview_origin: previewOrigin,
+          idle_timeout_seconds: 28_800,
+          source: {
+            kind: 'single_file',
+            collection_status: 'not_applicable',
+            file_count: 1,
+            total_bytes: 80,
+            warning_codes: [],
+          },
+        },
+      }
+    }
+    let resolveLease!: (value: unknown) => void
+    const pendingLease = new Promise(resolve => {
+      resolveLease = resolve
+    })
+    const probe = {
+      activations: [] as string[],
+      createRequests: [] as Array<Record<string, unknown>>,
+      leaseRequests: [] as Array<Record<string, unknown>>,
+      rectRequests: [] as Array<Record<string, unknown>>,
+      releaseLease: () => resolveLease(leaseResponse(initialMode, 1)),
+      surfaceListener: null as ((payload: unknown) => void) | null,
+    }
+    const desktopPreferences = {
+      schemaVersion: 1,
+      mainWindowCloseBehavior: 'quit',
+      canRunInBackground: false,
+      platform: 'darwin',
+      workbenchPreviewNoticeShown: true,
+      workbenchPreviewForcedOffline: false,
+      ...(previewMode
+        ? {
+            workbenchPreviewMode: previewMode,
+            effectiveWorkbenchPreviewMode: previewMode,
+          }
+        : {}),
+    }
+    const bridge = {
+      getOsLocale: async () => 'en-US',
+      isAutoUpdateEnabled: async () => false,
+      isDesktopUpdateManaged: async () => false,
+      getGatewayStatus: async () => ({
+        url: '',
+        port: 0,
+        owned: true,
+        status: 'ready',
+        logPath: '',
+      }),
+      revealGatewayLog: async () => true,
+      getDesktopSettings: async () => ({}),
+      saveDesktopSettings: async () => ({}),
+      resetDesktopSettings: async () => ({ ok: true }),
+      getDesktopPreferences: async () => desktopPreferences,
+      saveDesktopPreferences: async () => desktopPreferences,
+      setNativeTheme: async () => undefined,
+      openArtifact: async () => ({ ok: true }),
+      chooseProjectDirectory: async () => null,
+      getWorkbenchCapabilities: async () => ({
+        protocolVersions: [1, 2],
+        modes: ['full', 'offline'],
+        maxSurfaces: 8,
+      }),
+      createArtifactPreviewLease: async (request: Record<string, unknown>) => {
+        probe.leaseRequests.push(request)
+        if (probe.leaseRequests.length === 1) return pendingLease
+        const requestedMode = request.mode === 'offline' ? 'offline' : 'full'
+        return leaseResponse(requestedMode, probe.leaseRequests.length)
+      },
+      renewArtifactPreviewLease: async (request: Record<string, unknown>) => ({
+        ok: true,
+        status: 200,
+        payload: {
+          version: 1,
+          lease_id: request.leaseId,
+          expires_at: expiresAt,
+        },
+      }),
+      revokeArtifactPreviewLease: async () => ({
+        ok: true,
+        status: 204,
+      }),
+      createWorkbenchSurface: async (request: Record<string, unknown>) => {
+        probe.createRequests.push(request)
+        const surfaceId = String(request.surfaceId || '')
+        queueMicrotask(() => probe.surfaceListener?.({
+          version: 2,
+          surfaceId,
+          type: 'ready',
+        }))
+        return { ok: true }
+      },
+      setWorkbenchSurfaceRect: async (request: Record<string, unknown>) => {
+        probe.rectRequests.push(request)
+        return { ok: true }
+      },
+      activateWorkbenchSurface: async (surfaceId: string) => {
+        probe.activations.push(surfaceId)
+        return { ok: true }
+      },
+      destroyWorkbenchSurface: async () => ({ ok: true }),
+      onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => {
+        probe.surfaceListener = callback
+        return () => {
+          if (probe.surfaceListener === callback) probe.surfaceListener = null
+        }
+      },
+      getOnboardingDefaults: async () => ({}),
+      saveOnboarding: async () => ({}),
+      cancelOnboarding: async () => ({}),
+      getBootState: async () => ({}),
+      retryStartup: async () => ({}),
+      quitApp: async () => ({}),
+      onBootStatus: () => () => {},
+      onBootError: () => () => {},
+    }
+    const testWindow = window as unknown as {
+      __opensquillaNativeWorkbenchProbe: typeof probe
+      opensquillaDesktop: typeof bridge
+    }
+    testWindow.__opensquillaNativeWorkbenchProbe = probe
+    testWindow.opensquillaDesktop = bridge
+  }, { previewMode: mode })
+}
+
 async function visibleHeaderAction(page: Page, testId: string): Promise<Locator> {
   const action = page.locator(`[data-testid="${testId}"]:visible`).first()
   await expect(action).toBeVisible()
@@ -195,6 +342,140 @@ async function deliverablesHeaderAction(page: Page): Promise<Locator> {
 }
 
 test.describe('Application Workbench', () => {
+  for (const mode of ['full', 'offline'] as const) {
+    test(`Desktop v2 ${mode} preview is positioned when its slot becomes ready`, async ({
+      page,
+    }) => {
+      // The full case omits a stored preference so it covers the fresh-profile
+      // default. Offline remains covered as a valid persisted user choice.
+      await installDesktopWorkbenchV2Bridge(page, mode === 'full' ? undefined : mode)
+      await openWorkbenchSession(page)
+
+      const htmlArtifact = page.locator('.msg-artifact-chip', { hasText: 'demo.html' })
+      await htmlArtifact.getByRole('button', { name: 'Open demo.html' }).click()
+
+      const workbench = page.getByTestId('workbench-host')
+      await expect(workbench).toBeVisible()
+      await expect.poll(() => page.evaluate(() => {
+        const probe = (window as unknown as {
+          __opensquillaNativeWorkbenchProbe: {
+            leaseRequests: unknown[]
+          }
+        }).__opensquillaNativeWorkbenchProbe
+        return probe.leaseRequests.length
+      })).toBe(1)
+
+      // Hold the lease response so the native slot is guaranteed to be absent
+      // during the first measurement, matching the real loading -> ready race.
+      await expect(workbench.locator('[data-workbench-native-surface-slot]')).toHaveCount(0)
+      expect(await page.evaluate(() => {
+        const probe = (window as unknown as {
+          __opensquillaNativeWorkbenchProbe: {
+            rectRequests: Array<{ visible?: boolean }>
+          }
+        }).__opensquillaNativeWorkbenchProbe
+        return probe.rectRequests.some(request => request.visible === true)
+      })).toBe(false)
+
+      await page.evaluate(() => {
+        const probe = (window as unknown as {
+          __opensquillaNativeWorkbenchProbe: {
+            releaseLease: () => void
+          }
+        }).__opensquillaNativeWorkbenchProbe
+        probe.releaseLease()
+      })
+
+      await expect(workbench.locator('[data-workbench-native-surface-slot]')).toBeVisible()
+      await expect.poll(() => page.evaluate((previewMode) => {
+        const probe = (window as unknown as {
+          __opensquillaNativeWorkbenchProbe: {
+            createRequests: Array<{
+              payload?: { mode?: string }
+              version?: number
+            }>
+          }
+        }).__opensquillaNativeWorkbenchProbe
+        return probe.createRequests.some(request =>
+          request.version === 2 && request.payload?.mode === previewMode)
+      }, mode)).toBe(true)
+      await expect.poll(() => page.evaluate(() => {
+        const probe = (window as unknown as {
+          __opensquillaNativeWorkbenchProbe: {
+            rectRequests: Array<{
+              height?: number
+              visible?: boolean
+              width?: number
+            }>
+          }
+        }).__opensquillaNativeWorkbenchProbe
+        return probe.rectRequests.some(request =>
+          request.visible === true
+          && Number(request.width) > 0
+          && Number(request.height) > 0)
+      })).toBe(true)
+
+      // No resize, panel drag, modal, or preview-mode switch occurs in this
+      // flow. The dynamic slot insertion itself must cause the visible rect.
+      expect(await page.evaluate(() => {
+        const probe = (window as unknown as {
+          __opensquillaNativeWorkbenchProbe: {
+            activations: string[]
+          }
+        }).__opensquillaNativeWorkbenchProbe
+        return probe.activations.length
+      })).toBeGreaterThan(0)
+    })
+  }
+
+  test('preview mode switches immediately without a confirmation dialog', async ({ page }) => {
+    await installDesktopWorkbenchV2Bridge(page)
+    await openWorkbenchSession(page)
+
+    const htmlArtifact = page.locator('.msg-artifact-chip', { hasText: 'demo.html' })
+    await htmlArtifact.getByRole('button', { name: 'Open demo.html' }).click()
+
+    await expect.poll(() => page.evaluate(() => {
+      const probe = (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: {
+          leaseRequests: unknown[]
+        }
+      }).__opensquillaNativeWorkbenchProbe
+      return probe.leaseRequests.length
+    })).toBe(1)
+    await page.evaluate(() => {
+      const probe = (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: {
+          releaseLease: () => void
+        }
+      }).__opensquillaNativeWorkbenchProbe
+      probe.releaseLease()
+    })
+
+    const modeSelect = page.locator('.app-workbench__mode-select:visible').first()
+    await expect(modeSelect).toHaveValue('full')
+    await modeSelect.selectOption('offline')
+
+    await expect(page.getByRole('dialog', { name: 'Change preview mode?' })).toHaveCount(0)
+    await expect.poll(() => page.evaluate(() => {
+      const probe = (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: {
+          leaseRequests: Array<{ mode?: string }>
+        }
+      }).__opensquillaNativeWorkbenchProbe
+      return probe.leaseRequests.map(request => request.mode)
+    })).toEqual(['full', 'offline'])
+    await expect.poll(() => page.evaluate(() => {
+      const probe = (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: {
+          createRequests: Array<{ payload?: { mode?: string } }>
+        }
+      }).__opensquillaNativeWorkbenchProbe
+      return probe.createRequests.map(request => request.payload?.mode)
+    })).toEqual(['full', 'offline'])
+    await expect(modeSelect).toHaveValue('offline')
+  })
+
   test('header opens the latest preview and uses a compact artifact switcher', async ({ page }) => {
     const requests = new Map<string, number>()
     await openWorkbenchSession(page, requests)

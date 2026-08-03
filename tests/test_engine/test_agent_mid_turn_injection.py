@@ -14,6 +14,7 @@ from opensquilla.provider import (
     ChatConfig,
     ContentBlockText,
     Message,
+    ModelCapabilities,
     ToolDefinition,
     ToolInputSchema,
 )
@@ -90,6 +91,121 @@ class _NoToolProvider:
         return []
 
 
+class _MultiToolBoundaryProvider(_ToolBoundaryProvider):
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            for index in (1, 2):
+                tool_use_id = f"tool-{index}"
+                yield ProviderToolUseStart(
+                    tool_use_id=tool_use_id,
+                    tool_name="echo",
+                )
+                yield ProviderToolUseEnd(
+                    tool_use_id=tool_use_id,
+                    tool_name="echo",
+                    arguments={"value": index},
+                )
+            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+
+        yield ProviderText(text="done")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+class _SecondCallStartFailureProvider(_NoToolProvider):
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(list(messages))
+        if len(self.calls) == 2:
+            raise RuntimeError("provider call did not start")
+        return self._stream()
+
+
+class _SecondCallFirstPullFailureProvider(_NoToolProvider):
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(list(messages))
+        return self._stream_call(len(self.calls))
+
+    async def _stream_call(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 2:
+            raise RuntimeError("provider stream did not start")
+        yield ProviderText(text="done")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+class _SequencedPlainProvider:
+    provider_name = "fake"
+
+    def __init__(
+        self,
+        pending: ListPendingInputProvider,
+        *,
+        outputs: list[str],
+        steer_batches: dict[int, list[str]],
+    ) -> None:
+        self.pending = pending
+        self.outputs = outputs
+        self.steer_batches = steer_batches
+        self.calls: list[list[Message]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(list(messages))
+        return self._stream(len(self.calls))
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        yield ProviderText(text=self.outputs[call_number - 1])
+        for text in self.steer_batches.get(call_number, []):
+            self.pending.append(text)
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+class _ExecutionLegPlainProvider:
+    provider_name = "fallback-provider"
+
+    def __init__(self, *, model: str = "fallback-model") -> None:
+        self.model = model
+        self.calls: list[list[Message]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(list(messages))
+        return self._stream(len(self.calls))
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        yield ProviderText(text="initial" if call_number == 1 else "continued")
+        yield ProviderDone(
+            stop_reason="stop",
+            input_tokens=3,
+            output_tokens=2,
+            model=self.model,
+            provider=self.provider_name,
+        )
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
 def _tool_def(name: str) -> ToolDefinition:
     return ToolDefinition(
         name=name,
@@ -106,10 +222,79 @@ async def _tool_handler(call: ToolCall) -> ToolResult:
     )
 
 
-def _agent(provider: Any, *, max_iterations: int = 3) -> Agent:
+async def _terminal_tool_handler(call: ToolCall) -> ToolResult:
+    return ToolResult(
+        tool_use_id=call.tool_use_id,
+        tool_name=call.tool_name,
+        content="terminal result",
+        terminates_turn=True,
+    )
+
+
+def _agent(
+    provider: Any,
+    *,
+    max_iterations: int = 3,
+    max_turn_llm_calls: int = 0,
+) -> Agent:
     return Agent(
         provider=provider,
-        config=AgentConfig(max_iterations=max_iterations),
+        config=AgentConfig(
+            max_iterations=max_iterations,
+            max_turn_llm_calls=max_turn_llm_calls,
+        ),
+        tool_definitions=[_tool_def("echo")],
+        tool_handler=_tool_handler,
+    )
+
+
+def _fallback_route_agent(
+    provider: _ExecutionLegPlainProvider,
+    *,
+    fallback_context_window: int = 200_000,
+    fallback_supports_tools: bool = True,
+    fallback_supports_vision: bool = True,
+    known_fallback: bool = True,
+) -> Agent:
+    fallback_model = provider.model if known_fallback else "different-fallback-model"
+    config = AgentConfig(
+        max_iterations=3,
+        model_id="primary-model",
+        provider_id="primary-provider",
+        context_window_tokens=200_000,
+        model_capabilities=ModelCapabilities(
+            supports_tools=True,
+            supports_vision=True,
+        ),
+        metadata={
+            "route_plan": {
+                "version": 1,
+                "plan_id": "turn-route",
+                "turn_id": "turn-route",
+                "provider": "primary-provider",
+                "model": "primary-model",
+                "capabilities": {
+                    "context_window": 200_000,
+                    "supports_tools": True,
+                    "supports_vision": True,
+                },
+                "fallback_chain": [
+                    {
+                        "provider": provider.provider_name,
+                        "model": fallback_model,
+                        "capabilities": {
+                            "context_window": fallback_context_window,
+                            "supports_tools": fallback_supports_tools,
+                            "supports_vision": fallback_supports_vision,
+                        },
+                    }
+                ],
+            }
+        },
+    )
+    return Agent(
+        provider=provider,
+        config=config,
         tool_definitions=[_tool_def("echo")],
         tool_handler=_tool_handler,
     )
@@ -171,6 +356,9 @@ async def test_pending_input_is_injected_after_tool_result_and_seen_by_next_mode
     assert _text_message_index(second_request, ["INJECTED"]) == (
         _tool_result_index(second_request) + 1
     )
+    assert pending.applications[0].iteration == 2
+    assert pending.applications[0].model_call_id == "2.0"
+    assert pending.applications[0].texts == ("INJECTED",)
     assert any(event.kind == "done" and event.text == "done" for event in events)
 
 
@@ -191,6 +379,32 @@ async def test_multiple_pending_inputs_are_merged_into_one_user_message() -> Non
     assert _text_block_texts(injected_messages[0]) == ["A", "B"]
     assert not _text_messages(second_request, ["A"])
     assert not _text_messages(second_request, ["B"])
+    assert pending.applications[0].texts == ("A", "B")
+
+
+@pytest.mark.asyncio
+async def test_pending_input_waits_for_the_complete_tool_batch() -> None:
+    provider = _MultiToolBoundaryProvider()
+    pending = ListPendingInputProvider()
+    pending.append("AFTER_BATCH")
+    agent = _agent(provider)
+
+    _events = [
+        event async for event in agent.run_turn("run both", pending_input_provider=pending)
+    ]
+
+    assert len(provider.calls) == 2
+    second_request = provider.calls[1]
+    tool_result_message = second_request[_tool_result_index(second_request)]
+    assert isinstance(tool_result_message.content, list)
+    assert sum(
+        getattr(block, "type", None) == "tool_result"
+        for block in tool_result_message.content
+    ) == 2
+    assert _text_message_index(second_request, ["AFTER_BATCH"]) == (
+        _tool_result_index(second_request) + 1
+    )
+    assert pending.applications[0].model_call_id == "2.0"
 
 
 @pytest.mark.asyncio
@@ -260,7 +474,7 @@ async def test_injected_pending_input_is_persisted_to_successful_turn_history() 
 
 
 @pytest.mark.asyncio
-async def test_pending_input_is_not_drained_without_a_tool_completion_boundary() -> None:
+async def test_pending_input_continues_after_a_plain_model_response() -> None:
     provider = _NoToolProvider()
     pending = ListPendingInputProvider()
     pending.append("NO_BOUNDARY")
@@ -270,9 +484,226 @@ async def test_pending_input_is_not_drained_without_a_tool_completion_boundary()
         event async for event in agent.run_turn("just answer", pending_input_provider=pending)
     ]
 
+    assert len(provider.calls) == 2
+    assert not _text_messages(provider.calls[0], ["NO_BOUNDARY"])
+    assert len(_text_messages(provider.calls[1], ["NO_BOUNDARY"])) == 1
+    assert len(pending) == 0
+    assert len(_text_messages(agent._history, ["NO_BOUNDARY"])) == 1
+    assert pending.applications[0].iteration == 2
+    assert pending.applications[0].model_call_id == "2.0"
+
+
+@pytest.mark.asyncio
+async def test_done_event_records_unicode_model_call_segment_for_applied_steer() -> None:
+    pending = ListPendingInputProvider()
+    provider = _SequencedPlainProvider(
+        pending,
+        outputs=["前😀", "后续"],
+        steer_batches={1: ["补充"]},
+    )
+    agent = _agent(provider)
+
+    events = [
+        event async for event in agent.run_turn("原始问题", pending_input_provider=pending)
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    assert done.text == "前😀后续"
+    assert done.model_call_segments == [
+        {
+            "model_call_id": "2.0",
+            "iteration": 2,
+            "start_codepoint": 2,
+            "end_codepoint": 4,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_done_event_records_multiple_fifo_steer_batches() -> None:
+    pending = ListPendingInputProvider()
+    provider = _SequencedPlainProvider(
+        pending,
+        outputs=["前😀", "中", "后"],
+        steer_batches={
+            1: ["A", "B"],
+            2: ["C"],
+        },
+    )
+    agent = _agent(provider)
+
+    events = [
+        event async for event in agent.run_turn("原始问题", pending_input_provider=pending)
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    assert [application.texts for application in pending.applications] == [
+        ("A", "B"),
+        ("C",),
+    ]
+    assert done.model_call_segments == [
+        {
+            "model_call_id": "2.0",
+            "iteration": 2,
+            "start_codepoint": 2,
+            "end_codepoint": 3,
+        },
+        {
+            "model_call_id": "3.0",
+            "iteration": 3,
+            "start_codepoint": 3,
+            "end_codepoint": 4,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_compatible_fallback_leg_accepts_same_turn_continuation() -> None:
+    provider = _ExecutionLegPlainProvider()
+    pending = ListPendingInputProvider()
+    pending.append("continue on this fallback")
+    agent = _fallback_route_agent(provider)
+
+    events = [
+        event async for event in agent.run_turn("original", pending_input_provider=pending)
+    ]
+
+    assert len(provider.calls) == 2
+    assert pending.applications[0].model_call_id == "2.0"
+    assert next(event for event in events if event.kind == "done").text == (
+        "initialcontinued"
+    )
+
+
+@pytest.mark.asyncio
+async def test_small_fallback_context_promotes_without_claiming_pending_input() -> None:
+    provider = _ExecutionLegPlainProvider()
+    pending = ListPendingInputProvider()
+    pending.append("too large for this fallback")
+    agent = _fallback_route_agent(provider, fallback_context_window=8)
+
+    _events = [
+        event async for event in agent.run_turn("original", pending_input_provider=pending)
+    ]
+
     assert len(provider.calls) == 1
-    assert len(pending) == 1
-    assert not _text_messages(agent._history, ["NO_BOUNDARY"])
+    assert pending.applications == ()
+    assert pending.peek_pending() == ["too large for this fallback"]
+    assert pending.reclaim_pending() == ["too large for this fallback"]
+
+
+@pytest.mark.asyncio
+async def test_tool_incompatible_fallback_promotes_without_second_model_call() -> None:
+    provider = _ExecutionLegPlainProvider()
+    pending = ListPendingInputProvider()
+    pending.append("requires the existing tool surface")
+    agent = _fallback_route_agent(provider, fallback_supports_tools=False)
+
+    _events = [
+        event async for event in agent.run_turn("original", pending_input_provider=pending)
+    ]
+
+    assert len(provider.calls) == 1
+    assert pending.applications == ()
+    assert pending.peek_pending() == ["requires the existing tool surface"]
+    assert pending.reclaim_pending() == ["requires the existing tool surface"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_fallback_leg_promotes_without_second_model_call() -> None:
+    provider = _ExecutionLegPlainProvider()
+    pending = ListPendingInputProvider()
+    pending.append("do not apply on an unknown fallback")
+    agent = _fallback_route_agent(provider, known_fallback=False)
+
+    _events = [
+        event async for event in agent.run_turn("original", pending_input_provider=pending)
+    ]
+
+    assert len(provider.calls) == 1
+    assert pending.applications == ()
+    assert pending.peek_pending() == ["do not apply on an unknown fallback"]
+    assert pending.reclaim_pending() == ["do not apply on an unknown fallback"]
+
+
+@pytest.mark.asyncio
+async def test_pending_input_remains_reclaimable_when_call_budget_has_no_headroom() -> None:
+    provider = _NoToolProvider()
+    pending = ListPendingInputProvider()
+    pending.append("FOLLOW_UP")
+    agent = _agent(provider, max_turn_llm_calls=1)
+
+    _events = [
+        event async for event in agent.run_turn("just answer", pending_input_provider=pending)
+    ]
+
+    assert len(provider.calls) == 1
+    assert pending.applications == ()
+    assert pending.reclaim_pending() == ["FOLLOW_UP"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_input_is_not_applied_when_the_next_provider_call_cannot_start() -> None:
+    provider = _SecondCallStartFailureProvider()
+    pending = ListPendingInputProvider()
+    pending.append("RETRY_LATER")
+    agent = _agent(provider)
+
+    with pytest.raises(RuntimeError, match="provider call did not start"):
+        _events = [
+            event
+            async for event in agent.run_turn(
+                "just answer",
+                pending_input_provider=pending,
+            )
+        ]
+
+    assert len(provider.calls) == 2
+    assert pending.applications == ()
+    assert pending.reclaim_pending() == ["RETRY_LATER"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_input_is_not_applied_when_first_stream_pull_fails() -> None:
+    provider = _SecondCallFirstPullFailureProvider()
+    pending = ListPendingInputProvider()
+    pending.append("RETRY_AFTER_FIRST_PULL")
+    agent = _agent(provider)
+
+    with pytest.raises(RuntimeError, match="provider stream did not start"):
+        _events = [
+            event
+            async for event in agent.run_turn(
+                "just answer",
+                pending_input_provider=pending,
+            )
+        ]
+
+    assert len(provider.calls) == 2
+    assert pending.applications == ()
+    assert pending.reclaim_pending() == ["RETRY_AFTER_FIRST_PULL"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_input_is_reclaimable_when_a_tool_terminates_the_turn() -> None:
+    provider = _ToolBoundaryProvider()
+    pending = ListPendingInputProvider()
+    pending.append("NEXT_TURN")
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[_tool_def("echo")],
+        tool_handler=_terminal_tool_handler,
+    )
+
+    _events = [
+        event async for event in agent.run_turn("run echo", pending_input_provider=pending)
+    ]
+
+    assert len(provider.calls) == 1
+    assert pending.applications == ()
+    assert pending.reclaim_pending() == ["NEXT_TURN"]
+    assert not _text_messages(agent._history, ["NEXT_TURN"])
 
 
 class _DeferredUserInputProvider(_ToolBoundaryProvider):

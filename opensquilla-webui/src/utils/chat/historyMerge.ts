@@ -1,5 +1,56 @@
 import type { ChatMessage } from '@/types/chat'
 
+const TERMINAL_STEER_DISPOSITIONS = new Set([
+  'applied',
+  'promoted',
+  'cancelled',
+  'rejected',
+])
+
+function isPromotedSteerRow(message: ChatMessage): boolean {
+  return message.role === 'user'
+    && message.inputDisposition === 'promoted'
+    && Boolean(message.turnId)
+    && Boolean(message.promotedFromTurnId)
+    && message.turnId !== message.promotedFromTurnId
+}
+
+/**
+ * Promotion changes a durable steer row's causal turn, but it cannot change
+ * the row's original transcript sequence. Rehome those rows deterministically
+ * so the completed turn keeps all of its output before the promoted follow-up,
+ * while multiple promoted rows retain FIFO order ahead of the new turn.
+ */
+export function rehomePromotedSteerRows(messages: ChatMessage[]): ChatMessage[] {
+  const promoted = messages.filter(isPromotedSteerRow)
+  if (promoted.length === 0) return messages
+
+  const ordered = messages.filter(message => !isPromotedSteerRow(message))
+  for (const message of promoted) {
+    const promotedTurnId = message.turnId!
+    let insertionIndex = ordered.findIndex(candidate => candidate.turnId === promotedTurnId)
+    if (insertionIndex >= 0) {
+      while (
+        insertionIndex < ordered.length
+        && ordered[insertionIndex]?.turnId === promotedTurnId
+        && isPromotedSteerRow(ordered[insertionIndex]!)
+      ) {
+        insertionIndex++
+      }
+    } else {
+      let completedTurnTail = -1
+      for (let index = 0; index < ordered.length; index++) {
+        if (ordered[index]?.turnId === message.promotedFromTurnId) {
+          completedTurnTail = index
+        }
+      }
+      insertionIndex = completedTurnTail >= 0 ? completedTurnTail + 1 : ordered.length
+    }
+    ordered.splice(insertionIndex, 0, message)
+  }
+  return ordered
+}
+
 // Live-only fields are written onto a row AFTER it is pushed (reasoning seconds
 // from the done backfill, routerSettled from the router runtime, interrupted
 // from a local Stop) and are absent from a fresh history map. Re-apply them
@@ -33,6 +84,35 @@ export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): Cha
   if (server.interrupted === undefined && prev.interrupted) {
     merged.interrupted = prev.interrupted
   }
+
+  const previousRevision = prev.inputDispositionRevision
+  const serverRevision = server.inputDispositionRevision
+  const staleServerDisposition = previousRevision !== undefined
+    && (
+      serverRevision === undefined
+      || serverRevision < previousRevision
+      || (
+        serverRevision === previousRevision
+        && TERMINAL_STEER_DISPOSITIONS.has(prev.inputDisposition || '')
+        && server.inputDisposition !== prev.inputDisposition
+      )
+    )
+  if ((!server.inputDisposition || staleServerDisposition) && prev.inputDisposition) {
+    merged.inputDisposition = prev.inputDisposition
+    merged.inputDispositionRevision = prev.inputDispositionRevision
+    if (prev.turnId) merged.turnId = prev.turnId
+  }
+  if (!server.turnOutcome && prev.turnOutcome) merged.turnOutcome = prev.turnOutcome
+  if (!server.steerClientRequestId && prev.steerClientRequestId) {
+    merged.steerClientRequestId = prev.steerClientRequestId
+  }
+  if (!server.steerClientMessageId && prev.steerClientMessageId) {
+    merged.steerClientMessageId = prev.steerClientMessageId
+  }
+  if (!server.promotedFromTurnId && prev.promotedFromTurnId) {
+    merged.promotedFromTurnId = prev.promotedFromTurnId
+  }
+  if (prev.steerRestored) merged.steerRestored = true
 
   // Approval/clarify interrupts are live event metadata. Canonical transcript
   // rows currently persist the surrounding text/tools but not these decisions,
@@ -85,8 +165,16 @@ export function reconcileHistoryMessages(prev: ChatMessage[], incoming: ChatMess
 }
 
 function turnEndIndex(messages: ChatMessage[], userIndex: number): number {
+  const turnId = messages[userIndex]?.turnId
   let index = userIndex + 1
-  while (index < messages.length && messages[index]?.role !== 'user') index++
+  while (index < messages.length) {
+    const message = messages[index]
+    if (
+      message?.role === 'user'
+      && (!turnId || !message.turnId || message.turnId !== turnId)
+    ) break
+    index++
+  }
   return index
 }
 
@@ -217,7 +305,11 @@ function userOccurrenceByText(messages: ChatMessage[], userIndex: number): numbe
   return occurrence
 }
 
-function findUserByTextOccurrence(messages: ChatMessage[], user: ChatMessage, occurrence: number): number {
+function findUserByTextOccurrence(
+  messages: ChatMessage[],
+  user: ChatMessage,
+  occurrence: number,
+): number {
   const key = userTextKey(user)
   if (!key || occurrence <= 0) return -1
   let seen = 0
@@ -265,62 +357,6 @@ function findIncomingUserForPreviousNotice(
   if (byTextOccurrence >= 0) return byTextOccurrence
 
   return findUserByOrdinal(incomingMessages, userOrdinal(previousMessages, previousUserIndex))
-}
-
-function assistantHasVisibleOutput(message: ChatMessage): boolean {
-  return Boolean(
-    String(message.text || '').trim() ||
-    message.reasoning?.text ||
-    message.attachments?.length ||
-    message.artifacts?.length ||
-    message.tool_calls?.length ||
-    message.timeline?.length ||
-    message.statusHistory?.length,
-  )
-}
-
-function turnHasServerOutputAfterUser(messages: ChatMessage[], userIndex: number): boolean {
-  for (let i = userIndex + 1; i < messages.length; i++) {
-    const msg = messages[i]
-    if (!msg) continue
-    if (msg.role === 'user') return false
-    if (msg.role === 'router') continue
-    if (msg.role === 'assistant' && !assistantHasVisibleOutput(msg)) continue
-    return true
-  }
-  return false
-}
-
-function stopNoticeInsertionIndex(messages: ChatMessage[], userIndex: number): number {
-  let index = userIndex + 1
-  while (index < messages.length && messages[index]?.role === 'router') index++
-  return index
-}
-
-export function reconcileClientStopNotices(prev: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
-  if (!prev.some(msg => msg.stopNotice)) return incoming
-  const merged = incoming.slice()
-
-  for (let i = 0; i < prev.length; i++) {
-    const notice = prev[i]
-    if (!notice?.stopNotice) continue
-    if (merged.some(msg => sameMessage(msg, notice))) continue
-
-    const priorUserIndex = (() => {
-      for (let j = i - 1; j >= 0; j--) {
-        if (prev[j]?.role === 'user') return j
-      }
-      return -1
-    })()
-    if (priorUserIndex < 0) continue
-    const userIndex = findIncomingUserForPreviousNotice(prev, merged, priorUserIndex)
-    if (userIndex < 0) continue
-    if (turnHasServerOutputAfterUser(merged, userIndex)) continue
-
-    merged.splice(stopNoticeInsertionIndex(merged, userIndex), 0, notice)
-  }
-
-  return merged
 }
 
 // A terminal replay has no future stream event to re-materialize its failure.
@@ -396,7 +432,21 @@ export function reconcileRunningHistoryMessages(
   const previousLastUserIndex = lastUserIndex(prev)
   if (previousLastUserIndex < 0) return reconcileHistoryMessages(prev, incoming)
 
-  const liveTail = prev.slice(previousLastUserIndex + 1)
+  // A same-turn steer is another user row with the same explicit turn id. It
+  // must not become the anchor that hides the live Router/tool/assistant tail
+  // preceding it. Walk back to the first user row in that causal turn.
+  let liveAnchorUserIndex = previousLastUserIndex
+  const liveTurnId = prev[previousLastUserIndex]?.turnId
+  if (liveTurnId) {
+    for (let index = previousLastUserIndex - 1; index >= 0; index--) {
+      const candidate = prev[index]
+      if (candidate?.role !== 'user') continue
+      if (candidate.turnId !== liveTurnId) break
+      liveAnchorUserIndex = index
+    }
+  }
+
+  const liveTail = prev.slice(liveAnchorUserIndex + 1)
   if (liveTail.length === 0) return reconcileHistoryMessages(prev, incoming)
 
   const merged = reconcileHistoryMessages(prev, incoming)
@@ -408,7 +458,7 @@ export function reconcileRunningHistoryMessages(
   })
   if (tailToPreserve.length === 0) return merged
 
-  const insertAfter = insertionIndexForLiveTail(merged, prev[previousLastUserIndex])
+  const insertAfter = insertionIndexForLiveTail(merged, prev[liveAnchorUserIndex])
   if (insertAfter < 0) return [...merged, ...tailToPreserve]
   return [
     ...merged.slice(0, insertAfter + 1),

@@ -54,6 +54,9 @@ STATUS_TOP_LEVEL_KEYS = frozenset(
         "memoryEmbeddingProvider",
         "memoryEmbeddingSource",
         "memoryEmbeddingEnvKey",
+        # Additive feature detection for clients that can offer capability
+        # restore/remove actions. Older gateways omit the whole object.
+        "capabilityConfiguration",
         "channelCount",
         "channelsConfigured",
         "ensembleCredentialStatus",

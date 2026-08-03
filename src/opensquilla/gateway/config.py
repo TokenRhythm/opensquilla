@@ -2802,6 +2802,12 @@ class GatewayConfig(BaseSettings):
         # dumps — an explicit key equal to the env value is still explicit.
         self._explicit_secret_paths.add(path)
 
+    def forget_secret_provenance(self, path: str) -> None:
+        """Forget both runtime and explicit authorship for a removed secret."""
+
+        self._runtime_secret_paths.discard(path)
+        self._explicit_secret_paths.discard(path)
+
     def inherit_runtime_secrets(self, other: GatewayConfig) -> None:
         self._runtime_secret_paths = set(other._runtime_secret_paths)
         self._explicit_secret_paths = set(other._explicit_secret_paths)

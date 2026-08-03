@@ -66,11 +66,40 @@ afterEach(() => {
   supportsMethod.mockReset()
   supportsMethod.mockReturnValue(true)
   pushToast.mockClear()
-  confirmAction.mockClear()
+  confirmAction.mockReset()
+  confirmAction.mockResolvedValue(true)
   document.body.innerHTML = ''
 })
 
 describe('useSetupCatalog privacy settings', () => {
+  it('moves automatic memory capture into the privacy dirty/save flow', async () => {
+    mockConfigSequence([
+      {
+        privacy: { disable_network_observability: false },
+        memory: { auto_capture_enabled: true },
+      },
+      {
+        privacy: { disable_network_observability: false },
+        memory: { auto_capture_enabled: false },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    api.setMemoryAutoCapture(false)
+
+    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('capabilities')).toBe(false)
+    await api.saveDirtySections()
+    expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
+      patches: {
+        'privacy.disable_network_observability': false,
+        'memory.auto_capture_enabled': false,
+      },
+    })
+    expect(api.sectionDirty('privacy')).toBe(false)
+    app.unmount()
+  })
+
   it('saves disable_network_observability through the safe gateway config patch', async () => {
     mockConfigSequence([
       { privacy: { disable_network_observability: false } },
@@ -163,6 +192,487 @@ describe('useSetupCatalog privacy settings', () => {
       'Network reporting is on.',
     )
     expect(api.sectionDirty('privacy')).toBe(true)
+    app.unmount()
+  })
+})
+
+describe('useSetupCatalog capability reset', () => {
+  it('confirms a draft, resets through the advertised RPC, and preserves unrelated drafts', async () => {
+    let load = 0
+    rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          imageGenerationProviders: [{
+            providerId: 'openrouter',
+            label: 'OpenRouter',
+            defaultModel: 'google/gemini-image',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return load === 0
+          ? {
+              imageGenerationEnabled: true,
+              imageGenerationConfigured: true,
+              imageGenerationProvider: 'openrouter',
+              imageGenerationPrimary: 'openrouter/saved-image',
+              capabilityConfiguration: {
+                image_generation: { resettable: true },
+              },
+            }
+          : {
+              imageGenerationEnabled: false,
+              imageGenerationConfigured: false,
+              capabilityConfiguration: {
+                image_generation: { resettable: false },
+              },
+            }
+      }
+      if (method === 'config.get') {
+        const value = load === 0
+          ? {
+              naming: { enabled: false },
+              image_generation: {
+                providers: { openrouter: { api_key_env: 'OPENROUTER_API_KEY' } },
+              },
+            }
+          : { naming: { enabled: false }, image_generation: {} }
+        load += 1
+        return value
+      }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.capability.reset') {
+        expect(params).toEqual({ capabilityId: 'image_generation' })
+        return { restartRequired: false }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.setAutoSessionTitles(true)
+    api.updateCapabilityField('image', 'apiKey', 'test-inline-key')
+
+    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('capabilities')).toBe(true)
+    await api.resetCapability('image_generation')
+
+    expect(confirmAction).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.stringContaining('discard its unsaved changes'),
+    }))
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.capability.reset', {
+      capabilityId: 'image_generation',
+    })
+    expect(api.sectionDirty('capabilities')).toBe(false)
+    expect(api.sectionDirty('behavior')).toBe(true)
+    app.unmount()
+  })
+
+  it('does not expose or call reset against an older gateway', async () => {
+    mockConfigSequence([{}])
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.resettable('search')).toBe(false)
+    await api.resetCapability('search')
+
+    expect(confirmAction).not.toHaveBeenCalled()
+    expect(rpcCall).not.toHaveBeenCalledWith('onboarding.capability.reset', expect.anything())
+    app.unmount()
+  })
+
+  it('does not reset when the confirmation is cancelled', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') {
+        return { capabilityConfiguration: { search: { resettable: true } } }
+      }
+      if (method === 'config.get') return { search_provider: 'brave' }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    confirmAction.mockResolvedValueOnce(false)
+    const { api, app } = await mountCatalog()
+
+    await api.resetCapability('search')
+
+    expect(rpcCall).not.toHaveBeenCalledWith('onboarding.capability.reset', expect.anything())
+    app.unmount()
+  })
+
+  it('keeps the current draft when reset fails', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          imageGenerationProviders: [{
+            providerId: 'openrouter',
+            label: 'OpenRouter',
+            defaultModel: 'google/gemini-image',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          imageGenerationEnabled: true,
+          imageGenerationConfigured: true,
+          imageGenerationProvider: 'openrouter',
+          imageGenerationPrimary: 'openrouter/saved-image',
+          capabilityConfiguration: { image_generation: { resettable: true } },
+        }
+      }
+      if (method === 'config.get') return { image_generation: {} }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.capability.reset') throw new Error('reset failed')
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.updateCapabilityField('image', 'apiKey', 'test-inline-key')
+
+    await api.resetCapability('image_generation')
+
+    expect(api.sectionDirty('capabilities')).toBe(true)
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.stringContaining('reset failed'),
+      { tone: 'danger' },
+    )
+    app.unmount()
+  })
+
+  it('keeps the current draft and suppresses success when the post-reset reload fails', async () => {
+    let resetApplied = false
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        if (resetApplied) throw new Error('reload failed')
+        return {
+          imageGenerationProviders: [{
+            providerId: 'openrouter',
+            label: 'OpenRouter',
+            defaultModel: 'google/gemini-image',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          imageGenerationEnabled: true,
+          imageGenerationConfigured: true,
+          imageGenerationProvider: 'openrouter',
+          imageGenerationPrimary: 'openrouter/saved-image',
+          capabilityConfiguration: { image_generation: { resettable: true } },
+        }
+      }
+      if (method === 'config.get') return { image_generation: {} }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.capability.reset') {
+        resetApplied = true
+        return { restartRequired: false }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.updateCapabilityField('image', 'apiKey', 'test-inline-key')
+
+    await api.resetCapability('image_generation')
+
+    expect(api.sectionDirty('capabilities')).toBe(true)
+    expect(pushToast).toHaveBeenCalledTimes(1)
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.stringContaining('reload failed'),
+      { tone: 'danger' },
+    )
+    expect(pushToast).not.toHaveBeenCalledWith(
+      expect.stringContaining('was reset'),
+    )
+    app.unmount()
+  })
+})
+
+describe('useSetupCatalog memory capability summary', () => {
+  it('describes built-in retrieval without exposing its implementation model', async () => {
+    mockConfigSequence([{ memory: { embedding: { provider: 'auto' } } }])
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.memoryModeTitle)
+      .toBe('Find related content in saved memory')
+    expect(api.capabilitiesPanel.value.state.memoryModeDescription)
+      .toBe('Runs on this device')
+    expect(api.capabilitiesPanel.value.state.memoryExpandable).toBe(false)
+    app.unmount()
+  })
+
+  it('distinguishes keyword-only mode from built-in embeddings', async () => {
+    mockConfigSequence([{ memory: { embedding: { provider: 'none' } } }])
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.memoryModeTitle)
+      .toBe('Keyword-only local retrieval')
+    expect(api.capabilitiesPanel.value.state.capabilityBadgeLabel('memory_embedding'))
+      .toBe('Available')
+    app.unmount()
+  })
+
+  it('identifies a configured custom embedding provider without exposing its selector', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          memoryEmbeddingProviders: [{
+            providerId: 'openai',
+            label: 'OpenAI',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          memoryEmbeddingConfigured: true,
+          memoryEmbeddingProvider: 'openai',
+        }
+      }
+      if (method === 'config.get') {
+        return { memory: { embedding: { provider: 'openai' } } }
+      }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.memoryModeTitle)
+      .toBe('Custom embedding · OpenAI')
+    expect(api.capabilitiesPanel.value.state.capabilityBadgeLabel('memory_embedding'))
+      .toBe('Available')
+    app.unmount()
+  })
+
+  it('makes a managed custom embedding expandable for its restore action', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          memoryEmbeddingProviders: [{
+            providerId: 'openai',
+            label: 'OpenAI',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          memoryEmbeddingConfigured: true,
+          memoryEmbeddingProvider: 'openai',
+          capabilityConfiguration: {
+            memory_embedding: { resettable: true },
+          },
+        }
+      }
+      if (method === 'config.get') {
+        return { memory: { embedding: { provider: 'openai' } } }
+      }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.memoryExpandable).toBe(true)
+    app.unmount()
+  })
+})
+
+describe('useSetupCatalog image model catalog', () => {
+  it('loads the provider image-model catalog when the capabilities section opens', async () => {
+    rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          imageGenerationProviders: [{
+            providerId: 'openrouter',
+            label: 'OpenRouter Images',
+            runtimeSupported: true,
+            defaultModel: 'openrouter/google/fallback-image',
+            suggestedModels: ['openrouter/google/fallback-image'],
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          imageGenerationProvider: 'openrouter',
+          imageGenerationPrimary: 'openrouter/google/fallback-image',
+        }
+      }
+      if (method === 'config.get') return { image_generation: {} }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.imageGeneration.models.discover') {
+        expect(params).toEqual({ providerId: 'openrouter' })
+        return {
+          ok: true,
+          providerId: 'openrouter',
+          source: 'live',
+          models: [{
+            id: 'vendor/live-image',
+            name: 'Live Image',
+            contextWindow: null,
+            maxOutputTokens: null,
+            capabilities: [],
+            pricing: null,
+            capabilitySource: 'OpenRouter',
+          }],
+        }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.setSection('capabilities')
+    await nextTick()
+    await Promise.resolve()
+    await nextTick()
+
+    expect(api.capabilitiesPanel.value.options.imageModels).toEqual([
+      expect.objectContaining({ id: 'vendor/live-image', name: 'Live Image' }),
+    ])
+    expect(api.capabilitiesPanel.value.state.imageModelSource).toBe('live')
+    app.unmount()
+  })
+
+  it('uses curated image models when the gateway lacks discovery support', async () => {
+    supportsMethod.mockImplementation(
+      method => method !== 'onboarding.imageGeneration.models.discover',
+    )
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          imageGenerationProviders: [{
+            providerId: 'qwen_token_plan',
+            label: 'Qwen Images',
+            runtimeSupported: true,
+            defaultModel: 'qwen_token_plan/wan2.7-image',
+            suggestedModels: [
+              'qwen_token_plan/wan2.7-image',
+              'qwen_token_plan/wan2.7-image-pro',
+            ],
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return { imageGenerationProvider: 'qwen_token_plan' }
+      }
+      if (method === 'config.get') return { image_generation: {} }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.setSection('capabilities')
+    await nextTick()
+
+    expect(api.capabilitiesPanel.value.options.imageModels.map(model => model.id)).toEqual([
+      'wan2.7-image',
+      'wan2.7-image-pro',
+    ])
+    expect(api.capabilitiesPanel.value.state.imageModelSource).toBe('catalog')
+    expect(rpcCall).not.toHaveBeenCalledWith(
+      'onboarding.imageGeneration.models.discover',
+      expect.anything(),
+    )
+    app.unmount()
+  })
+})
+
+describe('useSetupCatalog search draft validation', () => {
+  it('keeps current DuckDuckGo status explicit and blocks a keyed provider without a key', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          searchProviders: [
+            {
+              providerId: 'duckduckgo',
+              label: 'DuckDuckGo',
+              runtimeSupported: true,
+              requiresApiKey: false,
+            },
+            {
+              providerId: 'brave',
+              label: 'Brave Search',
+              runtimeSupported: true,
+              requiresApiKey: true,
+            },
+          ],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          searchConfigured: true,
+          searchProvider: 'duckduckgo',
+        }
+      }
+      if (method === 'config.get') return { search_provider: 'duckduckgo' }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.updateCapabilityField('search', 'provider', 'brave')
+    api.onSearchProviderChange()
+
+    expect(api.capabilitiesPanel.value.state.capabilityBadgeLabel('search'))
+      .toBe('Currently available')
+    expect(api.capabilitiesPanel.value.state.searchDraftStatusText)
+      .toBe('Currently using DuckDuckGo; add an API key before switching to Brave Search.')
+    expect(api.capabilitiesPanel.value.state.searchDraftMissingKey).toBe(true)
+
+    await api.saveDirtySections()
+
+    expect(rpcCall).not.toHaveBeenCalledWith(
+      'onboarding.search.configure',
+      expect.anything(),
+    )
+    expect(pushToast).toHaveBeenCalledWith(
+      'Enter an API key before saving this search provider.',
+      { tone: 'danger' },
+    )
+    app.unmount()
+  })
+
+  it('allows the provider switch after a key is entered', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          searchProviders: [
+            {
+              providerId: 'duckduckgo',
+              label: 'DuckDuckGo',
+              runtimeSupported: true,
+              requiresApiKey: false,
+            },
+            {
+              providerId: 'brave',
+              label: 'Brave Search',
+              runtimeSupported: true,
+              requiresApiKey: true,
+            },
+          ],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return { searchConfigured: true, searchProvider: 'duckduckgo' }
+      }
+      if (method === 'config.get') return { search_provider: 'duckduckgo' }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.search.configure') return {}
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.updateCapabilityField('search', 'provider', 'brave')
+    api.onSearchProviderChange()
+    api.updateCapabilityField('search', 'apiKey', 'test-search-key')
+
+    expect(api.capabilitiesPanel.value.state.searchDraftMissingKey).toBe(false)
+    await api.saveSearch({ reload: false })
+
+    expect(rpcCall).toHaveBeenCalledWith(
+      'onboarding.search.configure',
+      expect.objectContaining({
+        providerId: 'brave',
+        apiKey: 'test-search-key',
+      }),
+    )
     app.unmount()
   })
 })

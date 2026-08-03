@@ -102,6 +102,7 @@ from opensquilla.engine.hooks import (
 from opensquilla.engine.outcome import outcome_from_error, turn_outcome_details
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import PriceEntry, lookup_price
+from opensquilla.engine.route_plan import record_execution_leg
 from opensquilla.engine.router_decision import build_router_decision_event
 from opensquilla.engine.turn_policy import resolve_turn_policy
 from opensquilla.engine.turn_runner import (
@@ -1310,7 +1311,7 @@ def _cancelled_partial_response_text(
             else "The generated file was delivered."
         )
         return f"{partial_text}\n\n{delivered}" if partial_text else delivered
-    return f"{partial_text}\n\n[interrupted]" if partial_text else "[interrupted]"
+    return partial_text
 
 
 async def _finish_required_cancel_cleanup(awaitable: Awaitable[Any]) -> Any:
@@ -1700,6 +1701,13 @@ class _SelectorFallbackProvider:
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
         active_config = self._config_for_active_leg(config)
+        record_execution_leg(
+            self._turn_metadata,
+            provider=active_provider_id,
+            model=active_model,
+            kind="provider_fallback" if self._used_fallback else "primary",
+            config=active_config,
+        )
         primary_stream = account_provider_stream(
             lambda: active_provider.chat(messages, tools=tools, config=active_config),
             provider=active_provider_id,
@@ -1747,6 +1755,14 @@ class _SelectorFallbackProvider:
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
                     fallback_config = self._config_for_active_leg(config)
+                    record_execution_leg(
+                        self._turn_metadata,
+                        provider=fallback_provider_id,
+                        model=fallback_model,
+                        kind="provider_fallback",
+                        config=fallback_config,
+                        reason=str(event.code or "provider_error"),
+                    )
                     fallback_stream = account_provider_stream(
                         lambda: fallback_provider.chat(
                             messages,
@@ -3513,9 +3529,6 @@ class TurnRunner:
                 tool_context.router_control_turn_hold_applied = bool(
                     turn.metadata.get("router_control_hold_applied")
                 )
-            router_event = build_router_decision_event(turn)
-            if router_event is not None:
-                yield router_event
             active_provider_id = (
                 getattr(cloned_selector, "active_provider_id", "") or provider_name
             )
@@ -3570,6 +3583,9 @@ class TurnRunner:
             model_caps = ab_out.model_capabilities  # noqa: F841
             private_memory_allowed = ab_out.private_memory_allowed
             sync_manager = ab_out.sync_manager
+            router_event = build_router_decision_event(turn)
+            if router_event is not None:
+                yield router_event
             if turn_call_logger is not None:
                 turn_call_logger.write(
                     "agent_runtime_budget",
@@ -3875,11 +3891,10 @@ class TurnRunner:
                 yield pending_error_event
 
         except asyncio.CancelledError:
-            # Bug 2 partial-persistence: preserve whatever assistant text has
-            # already streamed back so a cancelled turn does not leave the
-            # transcript with an orphan user message. Marker `[interrupted]`
-            # lets future turns (and users reading history) recognise the
-            # response is incomplete.
+            # Preserve whatever assistant text has already streamed back. The
+            # typed turn outcome is the sole source of cancellation state; do
+            # not synthesize an assistant interruption marker into transcript
+            # content.
             # Flush trailing text streamed since the last tool boundary into
             # turn_segments, mirroring the normal-completion path — otherwise a
             # tool-using turn cancelled mid-answer persists segments with no
@@ -3922,10 +3937,9 @@ class TurnRunner:
                     )
             elif bound_user_message_id and self._session_manager is not None:
                 # Zero-output cancel: no assistant text/segments/artifacts ever
-                # streamed, so the only trace of this turn is the ingress-persisted
-                # user prompt. Drop it so a cancelled question does not silently
-                # influence later turns (#240). Cancels WITH partial output keep
-                # the `[interrupted]` marker above instead.
+                # streamed. Keep the ingress-persisted user prompt so reconnect
+                # can attach the typed outcome to the original turn. The helper
+                # is retained as a compatibility no-op for existing call sites.
                 await _finish_required_cancel_cleanup(
                     self._rollback_cancelled_prompt(session_key, bound_user_message_id)
                 )

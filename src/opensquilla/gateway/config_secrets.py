@@ -121,6 +121,15 @@ def clear_runtime_secret_paths(config: Any, paths: set[str]) -> None:
         config.clear_runtime_secret(path)
 
 
+def forget_secret_provenance_paths(config: Any, paths: set[str]) -> None:
+    """Forget all authorship markers for secrets removed from the config."""
+
+    if not hasattr(config, "forget_secret_provenance"):
+        return
+    for path in paths:
+        config.forget_secret_provenance(path)
+
+
 def inherit_then_clear_explicit(
     source: Any, target: Any, explicit_secret_paths: set[str]
 ) -> None:

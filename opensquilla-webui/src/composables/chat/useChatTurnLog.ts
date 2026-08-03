@@ -61,6 +61,12 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     appendIndex = 0
   }
 
+  function checkpointText() {
+    events.value = events.value.filter(
+      frame => frame.kind !== 'text' && frame.kind !== 'final-text',
+    )
+  }
+
   const foldedTurn: ComputedRef<FoldedTurn> = computed(() =>
     foldTurn(
       events.value,
@@ -108,6 +114,7 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     useReducer,
     appendFrame,
     resetLog,
+    checkpointText,
     foldedTurn,
     assertParity,
   }

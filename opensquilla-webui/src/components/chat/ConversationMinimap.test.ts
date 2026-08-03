@@ -211,18 +211,36 @@ describe('ConversationMinimap', () => {
     await vi.waitFor(() => expect(host.querySelector('[role="tooltip"]')).toBeNull())
   })
 
-  it('interpolates the lens continuously between neighboring prompts while reading', async () => {
+  it('keeps idle markers short while tracking the current prompt with thickness and opacity', async () => {
     const { host, thread } = await mountMinimap()
-    thread.container.scrollTop = 20
+    thread.container.scrollTop = 1000
     thread.container.dispatchEvent(new Event('scroll'))
     await new Promise(resolve => window.requestAnimationFrame(() => resolve(undefined)))
 
     const rows = markers(host)
-    const scale = (index: number) => Number(rows[index].style.getPropertyValue('--conversation-minimap-line-scale-x'))
-    expect(scale(0)).toBeCloseTo(scale(1), 3)
-    expect(scale(0)).toBeGreaterThan(scale(2))
-    expect(rows[0].getAttribute('aria-current')).toBe('location')
+    const styleValue = (index: number, property: string) => (
+      Number(rows[index].style.getPropertyValue(property))
+    )
+    const widthScale = (index: number) => styleValue(
+      index,
+      '--conversation-minimap-line-scale-x',
+    )
+    const heightScale = (index: number) => styleValue(
+      index,
+      '--conversation-minimap-line-scale-y',
+    )
+    const opacity = (index: number) => styleValue(
+      index,
+      '--conversation-minimap-line-opacity',
+    )
+
+    expect(rows.map((_, index) => widthScale(index))).toEqual(Array(8).fill(0.2667))
+    expect(rows[2].getAttribute('aria-current')).toBe('location')
     expect(rows.filter(row => row.hasAttribute('aria-current'))).toHaveLength(1)
+    expect(heightScale(2)).toBe(1)
+    expect(opacity(2)).toBe(1)
+    expect(heightScale(1)).toBe(0.5)
+    expect(opacity(1)).toBe(0.45)
   })
 
   it('uses a continuous neighboring lens without remounting the preview while scrubbing', async () => {
@@ -245,7 +263,34 @@ describe('ConversationMinimap', () => {
     expect(scale(3)).toBeCloseTo(scale(4), 3)
     expect(scale(3)).toBeGreaterThan(scale(2))
     expect(scale(4)).toBeGreaterThan(scale(5))
+    expect(Number(
+      rows[0].style.getPropertyValue('--conversation-minimap-line-scale-y'),
+    )).toBe(1)
+    expect(Number(
+      rows[3].style.getPropertyValue('--conversation-minimap-line-scale-y'),
+    )).toBe(0.5)
     expect(host.querySelector('[role="tooltip"]')).toBe(initialTooltip)
+  })
+
+  it('collapses the pointer lens after leaving the rail', async () => {
+    const { host } = await mountMinimap()
+    const rows = markers(host)
+    const widthScale = (index: number) => Number(
+      rows[index].style.getPropertyValue('--conversation-minimap-line-scale-x'),
+    )
+
+    rows[3].dispatchEvent(new MouseEvent('mouseenter'))
+    await nextTick()
+    expect(widthScale(3)).toBe(1)
+    expect(widthScale(2)).toBeGreaterThan(0.2667)
+
+    host.querySelector<HTMLElement>('.conversation-minimap__list')?.dispatchEvent(
+      new MouseEvent('pointerleave'),
+    )
+    await nextTick()
+
+    expect(rows.map((_, index) => widthScale(index))).toEqual(Array(8).fill(0.2667))
+    await vi.waitFor(() => expect(host.querySelector('[role="tooltip"]')).toBeNull())
   })
 
   it('jumps to a prompt without forcing the conversation to the live edge', async () => {
@@ -339,6 +384,18 @@ describe('ConversationMinimap', () => {
     const next = markers(host)[3]
     expect(document.activeElement).toBe(next)
     expect(next.tabIndex).toBe(0)
+    expect(Number(
+      next.style.getPropertyValue('--conversation-minimap-line-scale-x'),
+    )).toBe(1)
+    expect(Number(
+      markers(host)[2].style.getPropertyValue('--conversation-minimap-line-scale-x'),
+    )).toBeGreaterThan(0.2667)
+    expect(Number(
+      markers(host)[2].style.getPropertyValue('--conversation-minimap-line-scale-y'),
+    )).toBe(1)
+    expect(Number(
+      next.style.getPropertyValue('--conversation-minimap-line-scale-y'),
+    )).toBe(0.5)
     next.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
     expect(thread.scrollTo).toHaveBeenLastCalledWith({ top: thread.offsets[3] - 16, behavior: 'smooth' })
     expect(document.activeElement).toBe(thread.container.querySelector('[data-chat-turn-key="user-3"]'))

@@ -79,7 +79,8 @@ def test_coding_mode_is_a_web_only_local_slash_command() -> None:
     cmd = DEFAULT_REGISTRY.find("/coding", Surface.WEB_CHAT)
     assert cmd is not None
     assert cmd.surfaces == frozenset({Surface.WEB_CHAT})
-    assert [choice.value for choice in cmd.argument_choices] == ["on", "off", "status"]
+    assert cmd.argument_choices == ()
+    assert cmd.usage == "/coding [on|off|status]"
 
     execution = cmd.execution_for(Surface.WEB_CHAT)
     assert execution is not None

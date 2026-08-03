@@ -69,7 +69,9 @@ const fieldTooltipId = computed(() => `${fieldId.value}-info-tooltip`)
 
 const query = computed(() => String(props.value || '').trim().toLowerCase())
 const catalogAvailable = computed(() => (
-  !props.disabled && props.modelSource === 'live' && props.models.length > 0
+  !props.disabled
+  && (props.modelSource === 'live' || props.modelSource === 'catalog')
+  && props.models.length > 0
 ))
 const describedBy = computed(() => {
   const ids: string[] = []
@@ -344,7 +346,14 @@ function onKeydown(event: KeyboardEvent) {
         :aria-activedescendant="catalogAvailable ? activeOptionId : undefined"
         :aria-describedby="describedBy"
         :aria-label="cell ? field.label : undefined"
-        autocomplete="off"
+        autocomplete="one-time-code"
+        autocapitalize="off"
+        data-1p-ignore
+        data-bwignore
+        data-form-type="other"
+        data-lpignore="true"
+        data-protonpass-ignore="true"
+        spellcheck="false"
         :disabled="disabled"
         :value="value"
         :placeholder="field.placeholder || t('setup.provider.modelSearchOrCustom')"

@@ -64,6 +64,39 @@ function historyMessage(id: string): NonNullable<ChatHistoryResponse['messages']
 }
 
 describe('useChatHistory canonical pagination', () => {
+  it('does not expose an ordinary send disposition as same-turn steer status', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'user-send',
+          message_id: 'user-send',
+          role: 'user',
+          text: 'ordinary queued follow-up',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-send',
+            client_message_id: 'client-send',
+            intent: 'send',
+            disposition: 'applied',
+            revision: 1,
+          },
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      role: 'user',
+      text: 'ordinary queued follow-up',
+      turnId: 'turn-send',
+    })
+    expect(messages.value[0]?.inputDisposition).toBeUndefined()
+    expect(messages.value[0]?.inputDispositionRevision).toBeUndefined()
+    expect(messages.value[0]?.steerClientMessageId).toBeUndefined()
+  })
+
   it('requests canonical messages without compaction summaries', async () => {
     const { api, rpc } = makeHistory()
 
@@ -315,6 +348,211 @@ describe('useChatHistory canonical pagination', () => {
     await api.loadHistory()
 
     expect(messages.value[0]?.turnId).toBe('turn-1')
+  })
+
+  it('interleaves cold same-turn output when the steer crosses a page boundary', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'assistant-1',
+          message_id: 'assistant-1',
+          role: 'assistant',
+          text: '前😀后续',
+          timestamp: '2026-07-06T00:00:02Z',
+          turn_context: { turn_id: 'turn-1' },
+          usage: {
+            model_call_segments: [{
+              model_call_id: '2.0',
+              iteration: 2,
+              start_codepoint: 2,
+              end_codepoint: 4,
+            }],
+          },
+        }],
+        has_more: true,
+        oldest_cursor: 'cursor-assistant',
+        newest_cursor: 'cursor-assistant',
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'user-1',
+            message_id: 'user-1',
+            role: 'user',
+            text: '原始问题',
+            timestamp: '2026-07-06T00:00:00Z',
+            turn_context: { turn_id: 'turn-1' },
+          },
+          {
+            id: 'steer-1',
+            message_id: 'steer-1',
+            role: 'user',
+            text: '请补充细节',
+            timestamp: '2026-07-06T00:00:01Z',
+            turn_context: {
+              turn_id: 'turn-1',
+              disposition: 'applied',
+              revision: 2,
+              model_call_id: '2.0',
+              applied_iteration: 2,
+            },
+          },
+        ],
+        has_more: false,
+        oldest_cursor: 'cursor-user',
+        newest_cursor: 'cursor-steer',
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['user', '原始问题'],
+      ['assistant', '前😀'],
+      ['user', '请补充细节'],
+      ['assistant', '后续'],
+    ])
+    expect(messages.value[2]).toMatchObject({
+      messageId: 'steer-1',
+      inputDisposition: 'applied',
+      steerModelCallId: '2.0',
+      steerAppliedIteration: 2,
+    })
+    expect(messages.value[3]?.messageId).toBe('assistant-1')
+  })
+
+  it('restores a promoted steer under its new turn instead of the completed target turn', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        // Persistence keeps the steer row's original receive sequence. The
+        // history projection must move it behind the completed old turn and
+        // ahead of output belonging to its promoted follow-up.
+        messages: [
+          {
+            id: 'user-old',
+            message_id: 'user-old',
+            role: 'user',
+            text: 'original request',
+            timestamp: '2026-07-06T00:00:00Z',
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'steer-1',
+            message_id: 'steer-1',
+            role: 'user',
+            text: 'use the new constraint',
+            timestamp: '2026-07-06T00:00:01Z',
+            turn_context: {
+              turn_id: 'turn-new',
+              target_turn_id: 'turn-old',
+              promoted_turn_id: 'turn-new',
+              promoted_from_turn_id: 'turn-old',
+              disposition: 'promoted',
+              revision: 2,
+            },
+          },
+          {
+            id: 'assistant-old',
+            message_id: 'assistant-old',
+            role: 'assistant',
+            text: 'completed old-turn output',
+            timestamp: '2026-07-06T00:00:02Z',
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'assistant-new',
+            message_id: 'assistant-new',
+            role: 'assistant',
+            text: 'promoted follow-up output',
+            timestamp: '2026-07-06T00:00:03Z',
+            turn_context: { turn_id: 'turn-new' },
+          },
+        ],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'user-old',
+      'assistant-old',
+      'steer-1',
+      'assistant-new',
+    ])
+    expect(messages.value[2]).toMatchObject({
+      turnId: 'turn-new',
+      promotedFromTurnId: 'turn-old',
+      inputDisposition: 'promoted',
+      inputDispositionRevision: 2,
+    })
+  })
+
+  it('re-homes a promoted steer when its completed turn crosses a page boundary', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'assistant-old',
+            message_id: 'assistant-old',
+            role: 'assistant',
+            text: 'completed old-turn output',
+            timestamp: '2026-07-06T00:00:02Z',
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'assistant-new',
+            message_id: 'assistant-new',
+            role: 'assistant',
+            text: 'promoted follow-up output',
+            timestamp: '2026-07-06T00:00:03Z',
+            turn_context: { turn_id: 'turn-new' },
+          },
+        ],
+        has_more: true,
+        oldest_cursor: 'cursor-assistant-old',
+        newest_cursor: 'cursor-assistant-new',
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'user-old',
+            message_id: 'user-old',
+            role: 'user',
+            text: 'original request',
+            timestamp: '2026-07-06T00:00:00Z',
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'steer-1',
+            message_id: 'steer-1',
+            role: 'user',
+            text: 'use the new constraint',
+            timestamp: '2026-07-06T00:00:01Z',
+            turn_context: {
+              turn_id: 'turn-new',
+              promoted_from_turn_id: 'turn-old',
+              disposition: 'promoted',
+              revision: 2,
+            },
+          },
+        ],
+        has_more: false,
+        oldest_cursor: 'cursor-user-old',
+        newest_cursor: 'cursor-steer',
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'user-old',
+      'assistant-old',
+      'steer-1',
+      'assistant-new',
+    ])
   })
 
   it('restores immutable plan revisions from typed transcript segments', async () => {
@@ -603,12 +841,15 @@ describe('useChatHistory canonical pagination', () => {
         text: 'still running',
         ts: '2026-07-06T01:00:00Z',
         messageId: 'live-user-server',
+        turnId: 'turn-live',
       },
       {
-        role: 'assistant',
-        text: 'Stopped locally',
+        role: 'user',
+        text: 'adjust while running',
         ts: '2026-07-06T01:00:01Z',
-        stopNotice: true,
+        clientId: 'local-steer',
+        turnId: 'turn-live',
+        inputDisposition: 'steering',
       },
     )
 
@@ -617,7 +858,10 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value[0].messageId).toBe('m-200')
     expect(messages.value.some(message => message.messageId === 'm-300')).toBe(true)
     expect(messages.value.some(message => message.messageId === 'm-500')).toBe(true)
-    expect(messages.value[messages.value.length - 1]?.stopNotice).toBe(true)
+    expect(messages.value[messages.value.length - 1]).toMatchObject({
+      clientId: 'local-steer',
+      inputDisposition: 'steering',
+    })
     expect(api.historyState.value).toMatchObject({
       hasMore: true,
       oldestCursor: 'cursor-200',
@@ -1198,7 +1442,7 @@ describe('useChatHistory optimistic local rows', () => {
     expect(messages.value).toEqual(localMessages)
   })
 
-  it('keeps a local stopped-output notice when the settled server history only has the user turn', async () => {
+  it('drops a legacy synthetic stop bubble and uses the typed turn outcome', async () => {
     const { api, messages } = makeHistory(true, {
       messages: [
         { role: 'user', text: 'stop immediately', ts: '2026-07-07T10:00:00Z', messageId: 'user-1' },
@@ -1219,8 +1463,20 @@ describe('useChatHistory optimistic local rows', () => {
             role: 'user',
             text: 'stop immediately',
             timestamp: '2026-07-07T10:00:00Z',
+            turn_context: { turn_id: 'turn-1' },
           },
         ],
+        turn_outcomes: [{
+          turn_id: 'turn-1',
+          task_id: 'task-1',
+          status: 'cancelled',
+          started_at: 1_000,
+          finished_at: 2_000,
+          outcome: {
+            kind: 'cancelled',
+            cancellation_source: 'webui_stop',
+          },
+        }],
         has_more: false,
         oldest_cursor: null,
         newest_cursor: null,
@@ -1232,9 +1488,12 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', 'stop immediately'],
-      ['assistant', 'Stopped after 1s'],
     ])
-    expect(messages.value[1]?.stopNotice).toBe(true)
+    expect(messages.value[0]?.turnOutcome).toMatchObject({
+      turnId: 'turn-1',
+      status: 'cancelled',
+      cancellationSource: 'webui_stop',
+    })
   })
 
   it('keeps a terminal replay error until server history contains a durable error row', async () => {
@@ -1278,7 +1537,7 @@ describe('useChatHistory optimistic local rows', () => {
     })
   })
 
-  it('keeps multiple local stopped-output notices when repeated user prompts reload with server ids', async () => {
+  it('does not infer interruption bubbles from adjacent repeated user messages', async () => {
     const prompt = '调研一下上下文相关的sota论文'
     const { api, messages } = makeHistory(true, {
       messages: [
@@ -1345,12 +1604,9 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', prompt],
-      ['assistant', '输出被中断'],
       ['user', prompt],
-      ['assistant', '输出被中断'],
       ['user', prompt],
-      ['assistant', '输出被中断'],
     ])
-    expect(messages.value.filter(message => message.stopNotice)).toHaveLength(3)
+    expect(messages.value.some(message => message.stopNotice)).toBe(false)
   })
 })

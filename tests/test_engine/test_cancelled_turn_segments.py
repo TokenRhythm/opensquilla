@@ -147,7 +147,7 @@ async def test_cancelled_turn_persists_trailing_text_segment(tmp_path) -> None:
         assert assistants
         assistant = assistants[-1]
         assert PARTIAL_ANSWER in assistant.content
-        assert "[interrupted]" in assistant.content
+        assert "[interrupted]" not in assistant.content
 
         segments = assistant.tool_calls or []
         segment_types = [str(seg.get("type")) for seg in segments if isinstance(seg, dict)]

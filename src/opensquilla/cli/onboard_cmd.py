@@ -21,6 +21,7 @@ from opensquilla.cli.ui import (
     markup_escape,
     warning_panel,
 )
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.config_store import load_config, resolve_config_path
 from opensquilla.onboarding.errors import UserCancelledError
 from opensquilla.onboarding.flow import (
@@ -29,6 +30,7 @@ from opensquilla.onboarding.flow import (
     run_interactive_onboard,
 )
 from opensquilla.onboarding.legacy_data import legacy_data_payload
+from opensquilla.onboarding.mutations import capability_resettable
 from opensquilla.onboarding.next_steps import (
     env_recovery_commands,
     env_reference_warnings,
@@ -736,7 +738,7 @@ _STATUS_STYLE: dict[SectionStatus, str] = {
 }
 
 
-def _status_payload(status: OnboardingStatus) -> dict:
+def _status_payload(status: OnboardingStatus, *, config: GatewayConfig) -> dict:
     """Machine-readable ``onboard status --json`` payload.
 
     Superset contract: every key of the RPC ``onboarding.status`` payload
@@ -783,6 +785,17 @@ def _status_payload(status: OnboardingStatus) -> dict:
         "memoryEmbeddingProvider": status.memory_embedding_provider,
         "memoryEmbeddingSource": status.memory_embedding_source,
         "memoryEmbeddingEnvKey": status.memory_embedding_env_key,
+        "capabilityConfiguration": {
+            capability_id: {
+                "resettable": capability_resettable(config, capability_id=capability_id)
+            }
+            for capability_id in (
+                "search",
+                "image_generation",
+                "audio",
+                "memory_embedding",
+            )
+        },
         "ensembleCredentialStatus": list(status.ensemble_credential_status),
         "envRecoveryCommands": env_recovery_commands(status),
         "channelCount": status.channel_count,
@@ -1205,7 +1218,7 @@ def onboard_status_command(
     status = get_onboarding_status(cfg)
 
     if json_output:
-        typer.echo(_json.dumps(_status_payload(status), ensure_ascii=False))
+        typer.echo(_json.dumps(_status_payload(status, config=cfg), ensure_ascii=False))
         return
 
     console.print(banner_panel("OpenSquilla Setup Cockpit", _status_cockpit_summary(status)))

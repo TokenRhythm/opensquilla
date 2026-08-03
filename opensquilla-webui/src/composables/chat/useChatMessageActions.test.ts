@@ -311,4 +311,55 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
       'Implementation complete.\n\nAI generated',
     )
   })
+
+  it('copies only the terminal answer from an ordinary tool transcript', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Checking.\n\nPreparing.\n\n---\n\n## Final answer',
+      timelineItems: [
+        { type: 'text', key: 'work', html: 'Checking.', rawText: 'Checking.' },
+        {
+          type: 'tool-group',
+          key: 'request',
+          group: {
+            groupId: 'request',
+            operationKey: 'web.read',
+            label: 'Read',
+            iconName: 'search',
+            calls: [{
+              toolId: 'request',
+              renderKey: 'request',
+              name: 'http_request',
+              displayName: 'Request',
+              inputRaw: '{}',
+              inputPreview: '',
+              isRunning: false,
+              status: 'success',
+              isError: false,
+              result: 'ok',
+              resultPreview: 'ok',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: false,
+            status: 'success',
+          },
+        },
+        {
+          type: 'text',
+          key: 'terminal',
+          html: 'Preparing.<hr><h2>Final answer</h2>',
+          rawText: 'Preparing.\n\n---\n\n## Final answer',
+        },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith(
+      '## Final answer\n\nAI generated',
+    )
+  })
 })

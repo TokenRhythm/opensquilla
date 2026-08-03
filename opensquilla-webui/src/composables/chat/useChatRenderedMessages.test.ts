@@ -159,6 +159,56 @@ describe('useChatRenderedMessages internal control turns', () => {
   })
 })
 
+describe('useChatRenderedMessages immutable route history', () => {
+  it('keeps the logical RoutePlan model after a provider fallback leg', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Solve this', ts: 1, turnId: 'turn-route' },
+        {
+          role: 'assistant',
+          text: 'Solved',
+          ts: 2,
+          turnId: 'turn-route',
+          usage: {
+            routed_tier: 'c2',
+            routed_model: 'provider/fallback-model',
+            routing_source: 'classifier',
+            routing_applied: true,
+            route_plan: {
+              tier: 'c2',
+              model: 'provider/original-model',
+              source: 'classifier',
+              routing_applied: true,
+            },
+            execution_legs: [
+              { kind: 'primary', model: 'provider/original-model' },
+              { kind: 'provider_fallback', model: 'provider/fallback-model' },
+            ],
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:test'),
+      routerSlots: ref(['c1', 'c2']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c1: { model: 'provider/fast-model', supportsImage: false, imageOnly: false },
+        c2: { model: '', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    const winner = strip?.gridCells?.[strip.winnerIdx ?? -1]
+    expect(winner?.model).toBe('provider/original-model')
+    expect(strip?.routerSource).toBe('classifier')
+  })
+})
+
 describe('useChatRenderedMessages router visual mode', () => {
   it('keeps real-candidates mode limited to callable router tiers', () => {
     const api = renderedMessagesForRouterVisualMode('real_candidates')
@@ -602,6 +652,195 @@ describe('useChatRenderedMessages router visual mode', () => {
     const settledKey = api.renderedMessages.value.find(message => message.isRouterStrip)?.routerTurnKey
     expect(liveKey).toBe('router-turn:local-user-turn')
     expect(settledKey).toBe(liveKey)
+  })
+
+  it('keeps same-turn steer rows under one explicit turn and one Router strip', () => {
+    const messages = ref<ChatMessage[]>([{
+        role: 'user',
+        text: 'original request',
+        ts: 1,
+        messageId: 'user-original',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'router',
+        text: '',
+        ts: 2,
+        messageId: 'router-turn-1',
+        turnId: 'turn-1',
+        provenanceKind: 'router_decision',
+        routerDecision: {
+          tier: 'c1',
+          model: 'qwen/qwen3.7-plus',
+          source: 'squilla_router',
+        },
+      },
+      {
+        role: 'assistant',
+        text: 'first segment',
+        ts: 3,
+        messageId: 'assistant-first',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'focus on compatibility',
+        ts: 4,
+        messageId: 'user-steer',
+        turnId: 'turn-1',
+        inputDisposition: 'applied',
+      },
+      {
+        role: 'assistant',
+        text: 'continued segment',
+        ts: 5,
+        messageId: 'assistant-continuation',
+        turnId: 'turn-1',
+      },
+    ])
+    const api = useChatRenderedMessages({
+      messages,
+      sessionKey: ref('same-turn-steer-router'),
+      routerSlots: ref(['fast', 'balanced']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        fast: { model: 'openai/gpt-5.4-mini', supportsImage: false, imageOnly: false },
+        balanced: { model: 'qwen/qwen3.7-plus', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      modelRoutingMode: ref('squilla_router'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const rendered = api.renderedMessages.value
+    expect(rendered.filter(message => message.isRouterStrip)).toHaveLength(1)
+    expect(rendered.filter(message => !message.isRouterStrip).map(message => message.turnKey))
+      .toEqual([
+        'turn:turn-1',
+        'turn:turn-1',
+        'turn:turn-1',
+        'turn:turn-1',
+      ])
+    expect(rendered.find(message => message.messageId === 'user-steer')).toMatchObject({
+      inputDisposition: 'applied',
+      turnKey: 'turn:turn-1',
+    })
+  })
+
+  it('uses explicit turn ids from assistant and Router rows without an adjacent user anchor', () => {
+    const messages = ref<ChatMessage[]>([
+      {
+        role: 'assistant',
+        text: 'completed old turn',
+        ts: 1,
+        messageId: 'assistant-old',
+        turnId: 'turn-old',
+      },
+      {
+        role: 'router',
+        text: '',
+        ts: 2,
+        messageId: 'router-new',
+        turnId: 'turn-new',
+        provenanceKind: 'router_decision',
+        routerDecision: {
+          tier: 'c1',
+          model: 'qwen/qwen3.7-plus',
+          source: 'squilla_router',
+        },
+      },
+      {
+        role: 'assistant',
+        text: 'continued new turn',
+        ts: 3,
+        messageId: 'assistant-new',
+        turnId: 'turn-new',
+      },
+    ])
+    const api = useChatRenderedMessages({
+      messages,
+      sessionKey: ref('explicit-role-turns'),
+      routerSlots: ref(['fast', 'balanced']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        fast: { model: 'openai/gpt-5.4-mini', supportsImage: false, imageOnly: false },
+        balanced: { model: 'qwen/qwen3.7-plus', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      modelRoutingMode: ref('squilla_router'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    expect(api.renderedMessages.value.map(message => [
+      message.messageId,
+      message.turnKey,
+    ])).toEqual([
+      ['assistant-old', 'turn:turn-old'],
+      ['router-new', 'turn:turn-new'],
+      ['assistant-new', 'turn:turn-new'],
+    ])
+  })
+
+  it('adopts a late explicit Router turn id onto its optimistic user row', () => {
+    const messages = ref<ChatMessage[]>([
+      {
+        role: 'user',
+        text: 'optimistic request',
+        ts: 1,
+        clientId: 'local-user',
+      },
+      {
+        role: 'router',
+        text: '',
+        ts: 2,
+        messageId: 'router-server',
+        turnId: 'turn-server',
+        provenanceKind: 'router_decision',
+        routerDecision: {
+          tier: 'c1',
+          model: 'qwen/qwen3.7-plus',
+          source: 'squilla_router',
+        },
+      },
+      {
+        role: 'assistant',
+        text: 'server output',
+        ts: 3,
+        turnId: 'turn-server',
+      },
+    ])
+    const api = useChatRenderedMessages({
+      messages,
+      sessionKey: ref('late-explicit-turn'),
+      routerSlots: ref(['fast', 'balanced']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        fast: { model: 'openai/gpt-5.4-mini', supportsImage: false, imageOnly: false },
+        balanced: { model: 'qwen/qwen3.7-plus', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      modelRoutingMode: ref('squilla_router'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    expect(api.renderedMessages.value.map(message => message.turnKey)).toEqual([
+      'turn:turn-server',
+      'turn:turn-server',
+      'turn:turn-server',
+    ])
+    expect(api.renderedMessages.value[1]?.routerTurnKey).toBe('router-turn:turn-server')
   })
 })
 

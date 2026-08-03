@@ -28,7 +28,7 @@
       </span>
       <div class="chat-pending-actions">
         <button
-          v-if="!item.hiddenControl || item.deliveryState === 'retryable'"
+          v-if="canShowSteer(item)"
           type="button"
           class="chat-pending-action chat-pending-action--steer"
           :title="steerTitle(item)"
@@ -99,6 +99,7 @@ import {
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
 } from '@/utils/chat/attachments'
+import { isControlInput } from '@/utils/chat/inputSemantics'
 
 const { t } = useI18n()
 
@@ -114,6 +115,7 @@ const props = defineProps<{
   items: PendingQueueItem[]
   maxPending: number
   imageBlockedMessage?: string
+  steerAvailable?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -131,6 +133,10 @@ function displayText(item: PendingQueueItem): string {
 
 function isSteering(item: PendingQueueItem): boolean {
   return item.deliveryState === 'steering'
+}
+
+function canShowSteer(item: PendingQueueItem): boolean {
+  return !item.hiddenControl
 }
 
 function hasUnsendableAttachment(item: PendingQueueItem): boolean {
@@ -151,7 +157,11 @@ function attachmentBlockMessage(item: PendingQueueItem): string {
 }
 
 function isSteerDisabled(item: PendingQueueItem): boolean {
-  if (attachmentBlockMessage(item)) return true
+  if (
+    isControlInput(item.text)
+    || Boolean(item.attachments?.length)
+    || (!props.steerAvailable && item.deliveryState !== 'retryable')
+  ) return true
   return props.items.some(
     candidate => candidate !== item && Boolean(candidate.deliveryState),
   ) || isSteering(item)
@@ -159,6 +169,11 @@ function isSteerDisabled(item: PendingQueueItem): boolean {
 
 function steerTitle(item: PendingQueueItem): string {
   return attachmentBlockMessage(item)
+    || (
+      isControlInput(item.text) || !props.steerAvailable
+        ? t('chat.sendQueues')
+        : ''
+    )
     || (
       item.deliveryState === 'retryable'
         ? t('chat.retry')

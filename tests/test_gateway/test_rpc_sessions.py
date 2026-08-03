@@ -32,7 +32,7 @@ from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig
 from opensquilla.gateway.input_normalization import LARGE_PASTE_CHARS, estimate_text_tokens
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
-from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE
+from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
@@ -50,6 +50,10 @@ _DEFAULT_PRINCIPAL = Principal(
 
 def test_sessions_messages_hydrate_scope_contract() -> None:
     assert METHOD_SCOPES["sessions.messages.hydrate"] == READ_SCOPE
+
+
+def test_sessions_steer_v2_scope_contract() -> None:
+    assert METHOD_SCOPES["sessions.steer.v2"] == WRITE_SCOPE
 
 
 @dataclass
@@ -3219,6 +3223,148 @@ class TestSessionsSend:
 
 class TestSessionsSteer:
     @pytest.mark.asyncio
+    async def test_steer_v2_is_expected_turn_bound_and_idempotent(
+        self,
+        dispatcher,
+        tmp_path,
+    ) -> None:
+        from opensquilla.gateway.routing import RouteEnvelope, SourceKind
+        from opensquilla.gateway.task_runtime import TaskRuntime
+        from opensquilla.session.manager import SessionManager
+        from opensquilla.session.models import SessionNode
+        from opensquilla.session.storage import SessionStorage
+
+        key = "agent:main:webchat:steer-v2"
+        store = SessionStorage(str(tmp_path / "steer-v2.db"))
+        await store.connect()
+        await store.upsert_session(
+            SessionNode(
+                session_key=key,
+                session_id="session-steer-v2",
+                agent_id="main",
+                created_at=100,
+                updated_at=100,
+            )
+        )
+        manager = SessionManager(store, inject_time_prefix=False)
+        started = asyncio.Event()
+        blocker = asyncio.Event()
+
+        async def _handler(_run: Any) -> None:
+            started.set()
+            await blocker.wait()
+
+        runtime = TaskRuntime(storage=store, turn_handler=_handler)
+        handle = await runtime.enqueue(
+            RouteEnvelope(
+                source_kind=SourceKind.WEB,
+                source_name="test",
+                agent_id="main",
+                session_key=key,
+                input_provenance={"kind": "test"},
+            ),
+            "first",
+        )
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+        params = {
+            "key": key,
+            "message": "change direction",
+            "expected_turn_id": handle.task_id,
+            "client_request_id": "request-steer-v2",
+            "client_message_id": "client-steer-v2",
+            "surface_id": "webui",
+        }
+        try:
+            accepted = await dispatcher.dispatch(
+                "r-steer-v2",
+                "sessions.steer.v2",
+                params,
+                ctx,
+            )
+            replayed = await dispatcher.dispatch(
+                "r-steer-v2-replay",
+                "sessions.steer.v2",
+                params,
+                ctx,
+            )
+            mismatch = await dispatcher.dispatch(
+                "r-steer-v2-mismatch",
+                "sessions.steer.v2",
+                {
+                    **params,
+                    "client_request_id": "request-steer-v2-mismatch",
+                    "client_message_id": "client-steer-v2-mismatch",
+                    "expected_turn_id": "another-turn",
+                },
+                ctx,
+            )
+
+            assert accepted.ok is True
+            assert accepted.payload["accepted"] is True
+            assert accepted.payload["replayed"] is False
+            assert accepted.payload["turn_id"] == handle.task_id
+            assert accepted.payload["disposition"] == "steering"
+            assert accepted.payload["revision"] == 1
+            assert replayed.ok is True
+            assert replayed.payload["accepted"] is True
+            assert replayed.payload["replayed"] is True
+            assert replayed.payload["revision"] == 1
+            assert replayed.payload["user_message_id"] == accepted.payload["user_message_id"]
+            assert mismatch.ok is True
+            assert mismatch.payload["accepted"] is False
+            assert mismatch.payload["failure_code"] == "EXPECTED_TURN_MISMATCH"
+            assert mismatch.payload["fallback_safe"] is True
+
+            transcript = await store.get_transcript("session-steer-v2")
+            assert len(transcript) == 1
+            assert transcript[0].content == "change direction"
+            assert transcript[0].turn_context == {
+                "turn_id": handle.task_id,
+                "target_turn_id": handle.task_id,
+                "client_request_id": "request-steer-v2",
+                "client_message_id": "client-steer-v2",
+                "surface_id": "webui",
+                "intent": "steer",
+                "disposition": "steering",
+                "revision": 1,
+            }
+        finally:
+            await runtime.cancel(task_id=handle.task_id, source="test_cleanup")
+            await runtime.wait(handle.task_id, timeout=2.0)
+            await store.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("message", ["/compact", "!model openai/test"])
+    async def test_steer_v2_routes_control_text_to_visible_fallback(
+        self,
+        dispatcher,
+        session,
+        message: str,
+    ) -> None:
+        manager = FakeSessionManager([session])
+        ctx = make_ctx(session_manager=manager, task_runtime=SimpleNamespace())
+
+        response = await dispatcher.dispatch(
+            "r-steer-v2-control",
+            "sessions.steer.v2",
+            {
+                "key": session.session_key,
+                "message": message,
+                "expected_turn_id": "turn-running",
+                "client_request_id": f"request-{message}",
+                "client_message_id": f"client-{message}",
+            },
+            ctx,
+        )
+
+        assert response.ok is True
+        assert response.payload["accepted"] is False
+        assert response.payload["failure_code"] == "STEER_UNSUPPORTED_INPUT"
+        assert response.payload["fallback_safe"] is True
+        assert manager.created_messages == []
+
+    @pytest.mark.asyncio
     async def test_steer_persists_and_injects_into_active_task(
         self,
         dispatcher,
@@ -5705,11 +5851,20 @@ class TestSessionsMessagesSubscribe:
         ]
         subscriptions = SubscriptionManager()
         pending = [{"kind": "user_input", "request_id": "request-hydrate"}]
+        steer_capability = {
+            "mode": "same_turn",
+            "expected_turn_id": "task-hydrate",
+            "input_kinds": ["text"],
+            "reason": None,
+        }
         context = make_ctx(
             session_manager=manager,
             subscription_manager=subscriptions,
             task_runtime=SimpleNamespace(
-                pending_user_inputs=lambda candidate: pending if candidate == key else []
+                pending_user_inputs=lambda candidate: pending if candidate == key else [],
+                steer_capability=lambda candidate: (
+                    steer_capability if candidate == key else None
+                ),
             ),
         )
 
@@ -5726,6 +5881,11 @@ class TestSessionsMessagesSubscribe:
         assert response.payload["projectWorkspace"] is None
         assert response.payload["projectWorkspaceDeferred"] is True
         assert response.payload["active_task"]["task_id"] == "task-hydrate"
+        assert (
+            response.payload["active_task"]["steer_capability"]
+            == steer_capability
+        )
+        assert response.payload["tasks"][0]["steer_capability"] == steer_capability
         assert response.payload["run_status"] == "running"
         assert response.payload["pendingUserInputs"] == pending
         assert response.payload["epoch"] == 7
@@ -6671,10 +6831,20 @@ class TestSessionsBootstrap:
             "session.event.text_delta",
             {"text": "partial"},
         )
+        steer_capability = {
+            "mode": "same_turn",
+            "expected_turn_id": "task-1",
+            "input_kinds": ["text"],
+            "reason": None,
+        }
         workspace = tmp_path / "workspace"
         ctx = make_ctx(
             session_manager=manager,
-            task_runtime=None,
+            task_runtime=SimpleNamespace(
+                steer_capability=lambda candidate: (
+                    steer_capability if candidate == key else None
+                ),
+            ),
             config=GatewayConfig(workspace_dir=str(workspace)),
         )
 
@@ -6701,6 +6871,8 @@ class TestSessionsBootstrap:
         assert res.payload["history"]["history_scope"] == "complete"
         assert res.payload["active_task"]["turn_id"] == "task-1"
         assert res.payload["active_task"]["user_message_id"] == "durable-msg-1"
+        assert res.payload["active_task"]["steer_capability"] == steer_capability
+        assert res.payload["tasks"][0]["steer_capability"] == steer_capability
         assert res.payload["queue"] == {
             "mode": "followup",
             "queued_count": 1,

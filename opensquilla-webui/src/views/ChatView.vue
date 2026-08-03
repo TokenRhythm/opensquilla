@@ -207,16 +207,16 @@
           />
         </template>
 
-        <!-- Streaming AI message: activity stays open and flat while the turn
-             is live. The trailing text segment is rendered below it as the
-             current answer candidate; if a later tool starts, that text moves
-             back into the chronological activity transcript. -->
+        <!-- Streaming AI message: activity stays open while the turn is live.
+             Gateway-marked intermediate text remains in the transcript, while
+             gateway-marked answer text streams below the activity boundary. -->
         <!-- No blanket aria-live here: the phase label inside ActivityDisclosure
              is the single live announcement point, so streaming DOM churn (tool
              rows, answer tokens) is not read out mutation-by-mutation. -->
         <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
           <div class="msg-ai-main">
             <ActivityDisclosure
+              default-open
               :lifecycle="liveAnswerPart ? 'answering' : 'working'"
               :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
               :failure-count="liveActivityFailureCount"
@@ -263,19 +263,15 @@
               </AssistantActivityTimeline>
             </ActivityDisclosure>
 
-            <!-- Provisional answer candidate: the left rule + draft tag mark
-                 it as not-final, because a later tool start moves this text
-                 back into the activity transcript. The tag sits outside the
-                 candidate box so the candidate's own text stays the answer. -->
-            <template v-if="liveAnswerPart">
-              <span class="live-answer-candidate-tag">{{ t('chat.metaRuns.draft') }}</span>
-              <div class="live-answer-candidate">
-                <TextPart
-                  :part="liveAnswerPart"
-                  :sources="[]"
-                />
-              </div>
-            </template>
+            <!-- The gateway marks text as intermediate or answer. Only the
+                 semantic answer span streams below the activity boundary; no
+                 timeout or draft heuristic is involved. -->
+            <div v-if="liveAnswerPart" class="live-answer">
+              <TextPart
+                :part="liveAnswerPart"
+                :sources="[]"
+              />
+            </div>
             <span
               v-if="liveAnswerPart && !streamActivityStale"
               class="stream-caret"
@@ -449,7 +445,7 @@
         :key="cmd.cmd"
         class="chat-slash-item"
         :class="{ 'chat-slash-item--active': i === slashIdx }"
-        @click="selectSlashCmd(cmd)"
+        @click="completeSlashCmd(cmd)"
       >
         <span class="chat-slash-cmd">{{ cmd.cmd }}</span>
         <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
@@ -460,6 +456,7 @@
       :items="pendingQueue"
       :max-pending="maxPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
+      :steer-available="sameTurnSteerAvailable"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
       @remove="removePendingChip"
@@ -485,6 +482,8 @@
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
       :model-routing-settings-busy="modelRoutingSettingsBusy"
+      :coding-mode-enabled="codingModeEnabled"
+      :coding-mode-settings-busy="codingModeSettingsBusy"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -509,6 +508,7 @@
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
       @set-model-routing-mode="setComposerModelRoutingMode"
+      @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
@@ -628,7 +628,6 @@ import {
   truncate,
   useChatRenderedMessages,
 } from '@/composables/chat/useChatRenderedMessages'
-import { messagesWithStoppedOutputNotice } from '@/composables/chat/stoppedOutputNotice'
 import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDecisionRuntime'
 import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
@@ -991,6 +990,7 @@ const chatStream = useChatStream({
   lastHeaderRole,
   aborted,
   autoScroll,
+  runStatus,
   applySessionRunState: source => applySessionRunState(source),
   renderMarkdown,
   stripDirectiveTags,
@@ -1106,6 +1106,7 @@ const {
   enqueuePendingPayload,
   enqueuePendingInput,
   enqueueHiddenControl,
+  enqueuePendingSteerRetry,
   removePendingChip,
   beginPendingDelivery,
   settlePendingDelivery,
@@ -1173,6 +1174,7 @@ const {
   routerVisualEffectsEnabled,
   routerVisualMode,
   codingModeEnabled,
+  codingModeSettingsBusy,
   routerTierConfigs,
   loadFeatureToggles,
   setModelRoutingMode,
@@ -1275,13 +1277,7 @@ const {
   replanActive,
 } = chatPlans
 
-const renderSourceMessages = computed(() =>
-  messagesWithStoppedOutputNotice(
-    messages.value,
-    runStatus.value,
-    t('sessions.status.outputInterrupted'),
-  ),
-)
+const renderSourceMessages = computed(() => messages.value)
 const chatRenderedMessages = useChatRenderedMessages({
   messages: renderSourceMessages,
   interruptState,
@@ -1315,10 +1311,14 @@ function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
 const routerStripReserve = computed<ChatRenderedMessage | null>(() => {
   if (!isStreaming.value || !routerEnabled.value || !routerVisualEffectsEnabled.value) return null
   const rendered = renderedMessages.value
+  const liveTurnKey = [...rendered]
+    .reverse()
+    .find(message => message.displayRole === 'user')
+    ?.turnKey
   for (let i = rendered.length - 1; i >= 0; i--) {
     const msg = rendered[i]
-    if (msg.isRouterStrip) return null
-    if (msg.displayRole === 'user') break
+    if (msg.isRouterStrip && (!liveTurnKey || msg.turnKey === liveTurnKey)) return null
+    if (msg.displayRole === 'user' && msg.turnKey !== liveTurnKey) break
   }
   if (modelRoutingMode.value === 'llm_ensemble') {
     return {
@@ -1764,7 +1764,8 @@ const {
   loadSlashCommands,
   handleSlashInput,
   closeSlashMenu,
-  selectSlashCmd,
+  completeSlashCmd,
+  activateSlashCmd,
   executeSlashCommand,
 } = chatSlashCommands
 
@@ -1781,7 +1782,8 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   autoResizeTextarea,
   handleSlashInput,
   closeSlashMenu,
-  selectSlashCmd,
+  completeSlashCmd,
+  activateSlashCmd,
   popPendingTail,
   enqueuePendingInput,
   sendCurrentInput: () => sendCurrentInput(),
@@ -1795,6 +1797,11 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
   rpc,
+  supportsMethod: method => rpc.supportsMethod(method),
+  activeSteerCapability: computed(() => {
+    const task = runStatus.value.task
+    return task?.steer_capability || task?.steerCapability || null
+  }),
   inputText,
   messages,
   sessionKey,
@@ -1848,6 +1855,8 @@ const chatSend = useChatSend({
   enqueuePendingInput,
   enqueuePendingPayload,
   enqueueHiddenControl,
+  enqueuePendingSteerRetry,
+  restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   executeSlashCommand,
   closeSlashMenu,
@@ -1863,6 +1872,21 @@ const {
   dispatchHiddenSend,
   sendHiddenMetaPreflightConfirmation,
 } = chatSend
+const sameTurnSteerAvailable = computed(() => (
+  isStreaming.value
+  && chatSend.supportsSameTurnSteer()
+))
+const composerSameTurnSteerAvailable = computed(() => (
+  sameTurnSteerAvailable.value
+  && pendingAttachments.value.length === 0
+  && !pendingSessionIntent.value
+  && !pendingForkBeforeMessageId.value
+))
+watch(composerSameTurnSteerAvailable, (available) => {
+  if (!available && busySendMode.value === 'steer') {
+    busySendMode.value = 'queue'
+  }
+})
 
 async function onComposerSend() {
   // All composer submission modes, including keyboard-driven plan revision,
@@ -2011,6 +2035,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
+  restoreSteerIntoComposer: text => appendComposerText(text),
   saveWidgetState,
   handleSessionConnectionState: state =>
     handleSessionConnectionState(state, !isDraftRoute()),
@@ -2039,7 +2064,9 @@ watchEffect(() => assertLiveParity(streamThinkingText))
 const liveTimelineItems = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.timelineItems : streamTimelineItems.value,
 )
-const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value))
+const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value, {
+  keepToolTurnTextInActivity: true,
+}))
 const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() => {
   const candidate = liveTimelineSplit.value.answerItem
   if (!candidate) return null
@@ -2503,7 +2530,7 @@ const sendButtonTitle = computed(() => {
   if (composerSendBlockedMessage.value) return composerSendBlockedMessage.value
   if (isCompactInFlightForCurrentSession()) return t('chat.sendQueuesUntilCompaction')
   if (isStreaming.value) {
-    return busySendMode.value === 'steer'
+    return busySendMode.value === 'steer' && composerSameTurnSteerAvailable.value
       ? t('chat.sendSteers')
       : t('chat.sendQueues')
   }
@@ -2598,6 +2625,15 @@ async function setComposerRunMode(mode: SandboxRunMode) {
 async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
   await setModelRoutingMode(mode)
   scheduleHistorySync()
+}
+
+async function setComposerCodingModeEnabled(enabled: boolean) {
+  const updated = await setCodingModeEnabled(enabled)
+  pushToast(t(
+    updated
+      ? (enabled ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
+      : 'chat.codingMode.updateFailed',
+  ))
 }
 
 // A suggestion chip is an explicit task choice. Route it through the same

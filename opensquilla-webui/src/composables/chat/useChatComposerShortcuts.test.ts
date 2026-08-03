@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { ref } from 'vue'
 import { useChatComposerShortcuts } from './useChatComposerShortcuts'
+import type { ChatSlashCommand } from './useChatSlashCommands'
 import type { ChatMessage, ChatPendingItem } from '@/types/chat'
 
 // The composable gates the Alt+Arrow queue chords on caret position via
@@ -42,6 +43,8 @@ function harness(over: {
   pendingQueue?: ChatPendingItem[]
   canQueueMore?: boolean
   safari?: boolean
+  slashOpen?: boolean
+  filteredSlashCmds?: ChatSlashCommand[]
 } = {}) {
   const inputText = ref(over.inputText ?? '')
   const spies = {
@@ -51,7 +54,8 @@ function harness(over: {
     autoResizeTextarea: vi.fn(),
     handleSlashInput: vi.fn(),
     closeSlashMenu: vi.fn(),
-    selectSlashCmd: vi.fn(),
+    completeSlashCmd: vi.fn(),
+    activateSlashCmd: vi.fn(),
   }
   const api = useChatComposerShortcuts({
     inputText,
@@ -59,9 +63,9 @@ function harness(over: {
     messages: ref<ChatMessage[]>([]),
     pendingQueue: ref<ChatPendingItem[]>(over.pendingQueue ?? []),
     canQueueMore: ref(over.canQueueMore ?? true),
-    slashOpen: ref(false),
+    slashOpen: ref(over.slashOpen ?? false),
     slashIdx: ref(0),
-    filteredSlashCmds: ref([]),
+    filteredSlashCmds: ref(over.filteredSlashCmds ?? []),
     isStreaming: ref(false),
     isSafariWebKit: () => over.safari ?? false,
     ...spies,
@@ -98,6 +102,48 @@ function inputEvent(inputType: string, target: unknown): InputEvent {
 const QUEUE = [{ id: 'q1', text: 'queued' }] as unknown as ChatPendingItem[]
 
 describe('useChatComposerShortcuts', () => {
+  describe('Slash completion safety', () => {
+    const coding = {
+      name: '/coding',
+      cmd: '/coding',
+      label: '/coding',
+      desc: 'Toggle Coding mode',
+      aliases: [],
+      execution: { action: 'coding.mode' },
+    }
+
+    it('uses Tab only to complete the active candidate', () => {
+      const { api, spies } = harness({
+        inputText: '/co',
+        slashOpen: true,
+        filteredSlashCmds: [coding],
+      })
+      const e = keydown({ key: 'Tab', target: field('/co', 'end') })
+
+      api.onTextareaKeydown(e)
+
+      expect(spies.completeSlashCmd).toHaveBeenCalledWith(coding)
+      expect(spies.activateSlashCmd).not.toHaveBeenCalled()
+      expect(e.preventDefault).toHaveBeenCalled()
+    })
+
+    it('routes Enter through exact-aware activation instead of executing directly', () => {
+      const { api, spies } = harness({
+        inputText: '/co',
+        slashOpen: true,
+        filteredSlashCmds: [coding],
+      })
+      const e = keydown({ key: 'Enter', target: field('/co', 'end') })
+
+      api.onTextareaKeydown(e)
+
+      expect(spies.activateSlashCmd).toHaveBeenCalledWith(coding)
+      expect(spies.completeSlashCmd).not.toHaveBeenCalled()
+      expect(spies.sendCurrentInput).not.toHaveBeenCalled()
+      expect(e.preventDefault).toHaveBeenCalled()
+    })
+  })
+
   describe('IME composition guard', () => {
     it('does not send on Enter while the IME is composing (isComposing)', () => {
       const { api, spies } = harness({ inputText: '你好' })

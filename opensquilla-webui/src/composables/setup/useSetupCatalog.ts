@@ -121,6 +121,7 @@ interface ProviderSpec {
   defaultBaseUrl?: string
   defaultDirectModel?: string
   defaultModel?: string
+  suggestedModels?: string[]
   deployment?: string
   presets?: ProviderPresetSpec[]
 }
@@ -172,6 +173,7 @@ interface OnboardingStatus {
   configPath?: string
   channelCount?: number
   searchConfigured?: boolean
+  searchProvider?: string
   searchSource?: string
   searchEnvKey?: string
   imageGenerationEnabled?: boolean
@@ -184,6 +186,11 @@ interface OnboardingStatus {
   memoryEmbeddingSource?: string
   memoryEmbeddingEnvKey?: string
   memoryEmbeddingProvider?: string
+  audioConfigured?: boolean
+  audioEnabled?: boolean
+  audioSource?: string
+  audioEnvKey?: string
+  capabilityConfiguration?: Partial<Record<CapabilityId, { resettable?: boolean }>>
   llmCredentialStatus?: {
     provider?: string
     available?: boolean
@@ -332,7 +339,8 @@ interface ConfigData {
   }
   audio?: {
     enabled?: boolean
-    providers?: Record<string, { api_key?: string; api_key_env?: string }>
+    tts?: { voice?: string; model?: string; language_code?: string }
+    providers?: Record<string, { api_key?: string; api_key_env?: string; base_url?: string }>
   }
   privacy?: {
     disable_network_observability?: boolean
@@ -343,6 +351,8 @@ interface ConfigData {
 interface EffectiveConfigData {
   fields?: Record<string, { value?: unknown; source?: string }>
 }
+
+type CapabilityId = 'search' | 'image_generation' | 'audio' | 'memory_embedding'
 
 export interface SettingsActionItem {
   label: string
@@ -366,6 +376,7 @@ const effectiveConfig = ref<EffectiveConfigData>({})
 const loaded = ref(false)
 const { section, setSection } = useSettingsSection('provider')
 const disableNetworkObservability = ref(false)
+const capabilityResetPending = ref<CapabilityId | ''>('')
 const saveAllPending = ref(false)
 const providerSavePending = ref(false)
 // The reactive flag drives UI feedback; this synchronous guard closes the
@@ -403,6 +414,15 @@ const tierModelCatalogs = ref<DiscoveredModelsByProvider>({})
 const tierModelDiscoveries = new Map<string, Promise<void>>()
 const tierModelDiscoveryCompleted = new Set<string>()
 let tierModelDiscoveryEpoch = 0
+type ImageModelCatalogSource = 'live' | 'catalog' | 'none'
+interface ImageModelCatalog {
+  models: DiscoveredModel[]
+  source: ImageModelCatalogSource
+}
+const imageModelCatalogs = ref<Record<string, ImageModelCatalog>>({})
+const imageModelDiscoveries = new Map<string, Promise<void>>()
+const imageModelDiscoveryCompleted = new Set<string>()
+let imageModelDiscoveryEpoch = 0
 
 function normalizeProviderId(value: unknown): string {
   return String(value || '').trim().toLowerCase()
@@ -431,6 +451,106 @@ function resetTierModelDiscovery() {
   tierModelCatalogs.value = {}
   tierModelDiscoveries.clear()
   tierModelDiscoveryCompleted.clear()
+}
+
+function resetImageModelDiscovery() {
+  imageModelDiscoveryEpoch += 1
+  imageModelCatalogs.value = {}
+  imageModelDiscoveries.clear()
+  imageModelDiscoveryCompleted.clear()
+}
+
+function curatedImageModelCatalog(providerId: string): ImageModelCatalog {
+  const provider = normalizeProviderId(providerId)
+  const spec = imageProviders.value.find(
+    item => normalizeProviderId(item.providerId) === provider,
+  )
+  const prefix = `${provider}/`
+  const rawModels = spec?.suggestedModels?.length
+    ? spec.suggestedModels
+    : (spec?.defaultModel ? [spec.defaultModel] : [])
+  const models = Array.from(new Set(
+    rawModels
+      .map(model => String(model || '').trim())
+      .map(model => model.startsWith(prefix) ? model.slice(prefix.length) : model)
+      .filter(Boolean),
+  )).map<DiscoveredModel>(id => ({
+    id,
+    name: id,
+    contextWindow: null,
+    maxOutputTokens: null,
+    capabilities: [],
+    pricing: null,
+    capabilitySource: '',
+  }))
+  return {
+    models,
+    source: models.length ? 'catalog' : 'none',
+  }
+}
+
+function discoverImageGenerationModels(providerId: string): Promise<void> {
+  const provider = normalizeProviderId(providerId)
+  if (!provider) return Promise.resolve()
+
+  const curated = curatedImageModelCatalog(provider)
+  if (!imageModelCatalogs.value[provider]) {
+    imageModelCatalogs.value = {
+      ...imageModelCatalogs.value,
+      [provider]: curated,
+    }
+  }
+  if (
+    typeof rpc.supportsMethod === 'function'
+    && !rpc.supportsMethod('onboarding.imageGeneration.models.discover')
+  ) {
+    return Promise.resolve()
+  }
+  const existing = imageModelDiscoveries.get(provider)
+  if (existing) return existing
+  if (imageModelDiscoveryCompleted.has(provider)) return Promise.resolve()
+
+  const epoch = imageModelDiscoveryEpoch
+  imageModelDiscoveryCompleted.add(provider)
+  const request = (async () => {
+    try {
+      const res = await rpc.call<{
+        ok?: boolean
+        providerId?: string
+        source?: string
+        models?: unknown
+      }>('onboarding.imageGeneration.models.discover', { providerId: provider })
+      if (epoch !== imageModelDiscoveryEpoch) return
+      const models = res?.ok ? normalizeDiscoveredModels(res.models) : []
+      const source: ImageModelCatalogSource = (
+        models.length && res.source === 'live'
+          ? 'live'
+          : (models.length ? 'catalog' : curated.source)
+      )
+      imageModelCatalogs.value = {
+        ...imageModelCatalogs.value,
+        [provider]: models.length ? { models, source } : curated,
+      }
+    } catch {
+      if (epoch !== imageModelDiscoveryEpoch) return
+      imageModelCatalogs.value = {
+        ...imageModelCatalogs.value,
+        [provider]: curated,
+      }
+    }
+  })()
+  const tracked = request.finally(() => {
+    if (imageModelDiscoveries.get(provider) === tracked) {
+      imageModelDiscoveries.delete(provider)
+    }
+  })
+  imageModelDiscoveries.set(provider, tracked)
+  return tracked
+}
+
+function maybeDiscoverImageGenerationModels(): Promise<void> {
+  if (section.value !== 'capabilities') return Promise.resolve()
+  return discoverImageGenerationModels(capabilitiesForm.selectedImageProvider.value)
 }
 
 function discoverTierProviderModels(providerId: string): Promise<void> {
@@ -541,6 +661,7 @@ async function maybeDiscoverModelsForStrategy(): Promise<void> {
 watch(section, value => {
   if (value === 'modelStrategy') providerOwnsFixedModelDraft.value = false
   void maybeDiscoverModelsForStrategy()
+  void maybeDiscoverImageGenerationModels()
 })
 
 // ---------------------------------------------------------------------------
@@ -562,6 +683,7 @@ onUnmounted(() => {
 async function loadData(options: {
   preserveFormDrafts?: boolean
   resetProviderConnection?: boolean
+  throwOnError?: boolean
 } = {}) {
   try {
     await rpc.waitForConnection()
@@ -583,6 +705,7 @@ async function loadData(options: {
     configuredProbeEpoch += 1
     configuredProviderProbes.value = {}
     resetTierModelDiscovery()
+    resetImageModelDiscovery()
     if (options.resetProviderConnection) providerForm.resetConnectionState()
 
     if (!options.preserveFormDrafts) {
@@ -627,11 +750,13 @@ async function loadData(options: {
     // provider. Start it after core state is ready, but never hold settings
     // loading/saving open while that network request runs.
     void maybeDiscoverModelsForStrategy()
+    void maybeDiscoverImageGenerationModels()
     // Every save funnels through this reload, so this is the one spot that can
     // tell snapshot holders outside the dialog (the sidebar banner) that the
     // hot-applied config may have changed readiness.
     invalidateReadiness()
   } catch (err) {
+    if (options.throwOnError) throw err
     pushToast(t('setup.toast.loadFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
   }
 }
@@ -1027,38 +1152,118 @@ const providerProxy = computed(() => {
 
 const configPath = computed(() => status.value.configPath || '')
 
+const savedSearchProvider = computed(() => (
+  status.value.searchProvider
+  || config.value.search_provider
+  || 'duckduckgo'
+))
 const searchSpec = computed(() => searchProviders.value.find(p => p.providerId === capabilitiesForm.selectedSearchProvider.value) || searchProviders.value[0] || null)
 const searchRequiresKey = computed(() => searchSpec.value?.requiresApiKey === true)
+const searchCurrentAvailable = computed(() => (
+  status.value.searchConfigured === true || savedSearchProvider.value === 'duckduckgo'
+))
+const searchDraftMissingKey = computed(() => (
+  capabilitiesForm.searchDirty.value
+  && searchRequiresKey.value
+  && !capabilitiesForm.searchApiKeyValue.value.trim()
+  && !capabilitiesForm.searchApiKeyEnvValue.value.trim()
+  && !(
+    capabilitiesForm.selectedSearchProvider.value === savedSearchProvider.value
+    && status.value.searchConfigured === true
+  )
+))
+const searchKeyPlaceholder = computed(() => (
+  searchRequiresKey.value
+  && capabilitiesForm.selectedSearchProvider.value === savedSearchProvider.value
+  && status.value.searchConfigured === true
+    ? t('setup.common.leaveBlankKeep')
+    : t('setup.capabilities.searchPasteKey')
+))
+const savedSearchProviderLabel = computed(() => (
+  searchProviders.value.find(provider => provider.providerId === savedSearchProvider.value)?.label
+  || savedSearchProvider.value
+))
+const searchDraftStatusText = computed(() => {
+  if (!capabilitiesForm.searchDirty.value) return ''
+  const nextProvider = searchSpec.value?.label || capabilitiesForm.selectedSearchProvider.value
+  if (capabilitiesForm.selectedSearchProvider.value !== savedSearchProvider.value) {
+    return t(
+      searchDraftMissingKey.value
+        ? 'setup.capabilities.searchDraftSwitchMissingKey'
+        : 'setup.capabilities.searchDraftSwitch',
+      { current: savedSearchProviderLabel.value, next: nextProvider },
+    )
+  }
+  return t('setup.capabilities.searchDraftCredential', {
+    current: savedSearchProviderLabel.value,
+  })
+})
 const searchEnvPlaceholder = computed(() => searchRequiresKey.value ? (searchSpec.value?.envKey || 'SEARCH_API_KEY') : t('setup.common.notRequiredForProvider'))
 const searchNeeds = computed(() => credentialNeedList(searchSpec.value?.whatYouNeed, capabilitiesForm.searchApiKeyEnvValue.value || searchSpec.value?.envKey))
 
+const savedMemoryProvider = computed(() => {
+  const embedding = config.value.memory?.embedding || {}
+  return embedding.provider || embedding.mode || status.value.memoryEmbeddingProvider || 'auto'
+})
+const savedMemoryProviderLabel = computed(() => (
+  memoryProviders.value.find(provider => provider.providerId === savedMemoryProvider.value)?.label
+  || savedMemoryProvider.value
+))
 const memorySpec = computed(() => memoryProviders.value.find(p => p.providerId === capabilitiesForm.selectedMemoryProvider.value) || memoryProviders.value[0] || null)
 const memoryApiKeyEnabled = computed(() => capabilitiesForm.selectedMemoryProvider.value === 'auto' || memorySpec.value?.requiresApiKey === true)
 const memoryApiKeyPlaceholder = computed(() => memoryApiKeyEnabled.value ? t('setup.common.leaveBlankKeep') : t('setup.common.notRequiredForProvider'))
 const memoryEnvPlaceholder = computed(() => memorySpec.value?.envKey || 'PROVIDER_API_KEY')
 const memoryNeeds = computed(() => memoryNeedList(memorySpec.value, capabilitiesForm.selectedMemoryProvider.value, capabilitiesForm.memoryApiKeyEnvValue.value || memorySpec.value?.envKey))
-const memoryStatusText = computed(() => _memoryEmbeddingStatusText(capabilitiesForm.selectedMemoryProvider.value))
+const memoryStatusText = computed(() => _memoryEmbeddingStatusText())
+const memoryModeTitle = computed(() => {
+  if (savedMemoryProvider.value === 'none') return t('setup.capabilities.memoryKeywordTitle')
+  if (['auto', 'local'].includes(savedMemoryProvider.value)) {
+    return capabilityResettable('memory_embedding')
+      ? t('setup.capabilities.memoryCustomTitle', { provider: savedMemoryProviderLabel.value })
+      : t('setup.capabilities.memoryBuiltInTitle')
+  }
+  return t('setup.capabilities.memoryCustomTitle', { provider: savedMemoryProviderLabel.value })
+})
+const memoryModeDescription = computed(() => {
+  if (savedMemoryProvider.value === 'none') return t('setup.capabilities.memoryKeywordDesc')
+  if (['auto', 'local'].includes(savedMemoryProvider.value)) {
+    return capabilityResettable('memory_embedding')
+      ? t('setup.capabilities.memoryCustomDesc', { provider: savedMemoryProviderLabel.value })
+      : t('setup.capabilities.memoryBuiltInRuntime')
+  }
+  return t('setup.capabilities.memoryCustomDesc', { provider: savedMemoryProviderLabel.value })
+})
+const memoryExpandable = computed(() => capabilityResettable('memory_embedding'))
 
 const imageSpec = computed(() => imageProviders.value.find(p => p.providerId === capabilitiesForm.selectedImageProvider.value) || imageProviders.value[0] || null)
+const imageModelCatalog = computed<ImageModelCatalog>(() => {
+  const provider = normalizeProviderId(capabilitiesForm.selectedImageProvider.value)
+  if (!provider) return { models: [], source: 'none' }
+  return imageModelCatalogs.value[provider] || curatedImageModelCatalog(provider)
+})
 const imageNeeds = computed(() => {
   if (!capabilitiesForm.imageIsEnabled.value) return [t('setup.image.noKeyWhileDisabled')]
   return credentialNeedList(imageSpec.value?.whatYouNeed, capabilitiesForm.imageApiKeyEnvValue.value || imageSpec.value?.envKey)
 })
 const imageStatusText = computed(() => _imageGenerationStatusText())
 
-const audioKeyReferenced = computed(() => promotedForm.audioKeyConfigured.value || Boolean(promotedForm.audioApiKeyEnv.value.trim()) || Boolean(promotedForm.audioApiKey.value.trim()))
 const audioStatusText = computed(() => {
-  if (!promotedForm.audioEnabled.value) return t('setup.audio.statusDisabled')
-  if (audioKeyReferenced.value) return t('setup.audio.statusReady')
+  if (status.value.audioEnabled !== true) return t('setup.audio.statusDisabled')
+  if (status.value.audioConfigured === true) return t('setup.audio.statusReady')
+  if (status.value.audioSource === 'missing_env') {
+    return _missingEnvStatusText(t('setup.audio.title'), status.value.audioEnvKey, t('setup.audio.statusNeedsKey'))
+  }
   return t('setup.audio.statusNeedsKey')
 })
 const audioBadgeTone = computed(() => {
-  if (!promotedForm.audioEnabled.value) return 'is-muted'
-  return audioKeyReferenced.value ? 'is-ok' : 'is-warn'
+  if (status.value.audioEnabled !== true) return 'is-muted'
+  return status.value.audioConfigured === true ? 'is-ok' : 'is-warn'
 })
 const audioBadgeLabel = computed(() => {
-  if (!promotedForm.audioEnabled.value) return t('setup.readiness.optional')
-  return audioKeyReferenced.value ? t('setup.readiness.ready') : t('setup.readiness.needsAction')
+  if (status.value.audioEnabled !== true) return t('setup.capabilities.statusPending')
+  return status.value.audioConfigured === true
+    ? t('setup.capabilities.statusAvailable')
+    : t('setup.capabilities.statusNeedsAction')
 })
 const audioKeyPlaceholder = computed(() => promotedForm.audioKeyConfigured.value ? t('setup.common.leaveBlankKeep') : t('setup.audio.pasteKey'))
 
@@ -1399,6 +1604,8 @@ const behaviorPanel = behaviorForm.createPanel({
 const privacyPanel = computed(() => ({
   disableNetworkObservability: disableNetworkObservability.value,
   disableNetworkObservabilityDirty: privacyDirty.value,
+  memoryAutoCapture: promotedForm.memoryAutoCapture.value,
+  memoryAutoCaptureDirty: promotedForm.captureDirty.value,
   statusText: privacyStatusText.value,
 }))
 
@@ -1565,7 +1772,13 @@ const capabilitiesPanel = capabilitiesForm.createPanel({
   memoryProviders,
   imageProviders,
   imageSpec,
+  imageModels: computed(() => imageModelCatalog.value.models),
+  imageModelSource: computed(() => imageModelCatalog.value.source),
   searchRequiresKey,
+  searchKeyPlaceholder,
+  searchDraftDirty: capabilitiesForm.searchDirty,
+  searchDraftMissingKey,
+  searchDraftStatusText,
   searchEnvPlaceholder,
   searchAdvancedOpen: capabilitiesForm.searchAdvancedOpen,
   searchNeeds,
@@ -1582,13 +1795,15 @@ const capabilitiesPanel = capabilitiesForm.createPanel({
   memoryEnvPlaceholder,
   memoryNeeds,
   memoryStatusText,
+  memoryModeTitle,
+  memoryModeDescription,
+  memoryExpandable,
   memoryEnvCommand,
   imageNeeds,
   imageStatusText,
   imageEnvCommand,
   capabilityBadgeTone,
   capabilityBadgeLabel,
-  capabilitySaveButtonClass,
   memoryAutoCapture: promotedForm.memoryAutoCapture,
   audioEnabled: promotedForm.audioEnabled,
   audioApiKey: promotedForm.audioApiKey,
@@ -1601,6 +1816,8 @@ const capabilitiesPanel = capabilitiesForm.createPanel({
   audioBadgeTone,
   audioBadgeLabel,
   audioKeyPlaceholder,
+  resettable: capabilityResettable,
+  resetPending: capabilityResetPending,
 })
 
 const hasSetupAction = computed(() => {
@@ -1809,7 +2026,7 @@ const providerDirty = computed(() => (
   || (editingPrimaryProvider.value && promotedForm.contextWindowDirty.value)
 ))
 const behaviorDirty = computed(() => behaviorForm.isDirty.value)
-const privacySectionDirty = computed(() => privacyDirty.value)
+const privacySectionDirty = computed(() => privacyDirty.value || promotedForm.captureDirty.value)
 const modelStrategyDirty = computed(() => (
   routerForm.isDirty.value
   || ensembleForm.isDirty.value
@@ -1820,7 +2037,6 @@ const capabilitiesDirty = computed(() => (
   capabilitiesForm.searchDirty.value
   || capabilitiesForm.memoryDirty.value
   || capabilitiesForm.imageDirty.value
-  || promotedForm.captureDirty.value
   || promotedForm.audioDirty.value
 ))
 
@@ -1852,7 +2068,7 @@ async function saveDirtySections() {
       behavior: behaviorDirty.value,
       modelStrategy: modelStrategyDirty.value,
       search: capabilitiesForm.searchDirty.value,
-      memory: capabilitiesForm.memoryDirty.value || promotedForm.captureDirty.value,
+      memory: capabilitiesForm.memoryDirty.value,
       image: capabilitiesForm.imageDirty.value,
       audio: promotedForm.audioDirty.value,
     }
@@ -1865,6 +2081,10 @@ async function saveDirtySections() {
       && !modelStrategyForm.fixedModel.value.trim()
     ) {
       pushToast(t('setup.toast.chooseFixedModel'), { tone: 'danger' })
+      return
+    }
+    if (work.search && searchDraftMissingKey.value) {
+      pushToast(t('setup.capabilities.searchKeyRequired'), { tone: 'danger' })
       return
     }
 
@@ -2170,6 +2390,10 @@ function setAutoSessionTitles(enabled: boolean) {
 
 function setDisableNetworkObservability(enabled: boolean) {
   disableNetworkObservability.value = enabled
+}
+
+function setMemoryAutoCapture(enabled: boolean) {
+  promotedForm.setMemoryAutoCapture(enabled)
 }
 
 function onProviderChange() {
@@ -2523,6 +2747,7 @@ function onImageProviderChange(providerId: string) {
   capabilitiesForm.onImageProviderChange(
     imageProviders.value.find(provider => provider.providerId === providerId),
   )
+  void discoverImageGenerationModels(providerId)
 }
 
 function updateCapabilityField(
@@ -2568,15 +2793,13 @@ function memoryNeedList(spec: ProviderSpec | null, providerId: string, envKey: s
 // ---------------------------------------------------------------------------
 
 function searchStatusText(): string {
-  if (!config.value.search_provider) {
-    return t('setup.search.statusOff')
-  }
   if (status.value.searchConfigured === true) {
     return t('setup.search.statusReady')
   }
   if (status.value.searchSource === 'missing_env') {
     return _missingEnvStatusText(t('setup.search.title'), status.value.searchEnvKey, t('setup.search.statusNeedsKey'))
   }
+  if (savedSearchProvider.value === 'duckduckgo') return t('setup.search.statusReady')
   return t('setup.search.statusNeedsKey')
 }
 
@@ -2636,24 +2859,119 @@ function _missingEnvStatusText(capability: string, envKey: string | undefined, f
 // Readiness helpers
 // ---------------------------------------------------------------------------
 
-function capabilityBadgeTone(name: string): string {
-  const detail = (status.value.sectionDetails || {})[name] || {}
-  if (detail.blocking || detail.actionRequired) return 'is-warn'
-  if (detail.status === 'ok') return 'is-ok'
+function capabilityBadgeTone(name: CapabilityId): string {
+  if (name === 'search') {
+    if (status.value.searchConfigured === true || savedSearchProvider.value === 'duckduckgo') {
+      return 'is-ok'
+    }
+    return savedSearchProvider.value === 'duckduckgo' ? 'is-muted' : 'is-warn'
+  }
+  if (name === 'memory_embedding') {
+    if (status.value.memoryEmbeddingSource === 'missing_env') return 'is-warn'
+    if (['auto', 'local', 'none'].includes(savedMemoryProvider.value)) return 'is-ok'
+    return status.value.memoryEmbeddingConfigured === true ? 'is-ok' : 'is-warn'
+  }
+  if (name === 'image_generation') {
+    if (status.value.imageGenerationEnabled !== true) return 'is-muted'
+    return status.value.imageGenerationConfigured === true ? 'is-ok' : 'is-warn'
+  }
+  if (name === 'audio') return audioBadgeTone.value
   return 'is-muted'
 }
 
-function capabilityBadgeLabel(name: string): string {
-  const detail = (status.value.sectionDetails || {})[name] || {}
-  if (detail.blocking || detail.actionRequired) return t('setup.readiness.needsAction')
-  return readinessLabel(detail.status || '') || t('setup.readiness.optional')
+function capabilityBadgeLabel(name: CapabilityId): string {
+  if (name === 'search') {
+    if (searchCurrentAvailable.value) {
+      return t(capabilitiesForm.searchDirty.value
+        ? 'setup.capabilities.statusCurrentAvailable'
+        : 'setup.capabilities.statusAvailable')
+    }
+    return t(capabilitiesForm.searchDirty.value
+      ? 'setup.capabilities.statusCurrentNeedsAction'
+      : 'setup.capabilities.statusNeedsAction')
+  }
+  if (name === 'memory_embedding') {
+    if (status.value.memoryEmbeddingSource === 'missing_env') {
+      return t('setup.capabilities.statusNeedsAction')
+    }
+    if (savedMemoryProvider.value === 'none') return t('setup.capabilities.statusAvailable')
+    if (['auto', 'local'].includes(savedMemoryProvider.value)) {
+      return t('setup.capabilities.statusBuiltIn')
+    }
+    return status.value.memoryEmbeddingConfigured === true
+      ? t('setup.capabilities.statusAvailable')
+      : t('setup.capabilities.statusNeedsAction')
+  }
+  if (name === 'image_generation') {
+    if (status.value.imageGenerationEnabled !== true) return t('setup.capabilities.statusPending')
+    return status.value.imageGenerationConfigured === true
+      ? t('setup.capabilities.statusAvailable')
+      : t('setup.capabilities.statusNeedsAction')
+  }
+  if (name === 'audio') return audioBadgeLabel.value
+  return t('setup.capabilities.statusPending')
 }
 
-function capabilitySaveButtonClass(name: string): string {
-  const detail = (status.value.sectionDetails || {})[name] || {}
-  return detail.blocking || detail.actionRequired
-    ? 'btn btn--primary'
-    : 'btn'
+function capabilityResettable(name: CapabilityId): boolean {
+  return status.value.capabilityConfiguration?.[name]?.resettable === true
+}
+
+function capabilityHasDraft(name: CapabilityId): boolean {
+  if (name === 'search') return capabilitiesForm.searchDirty.value
+  if (name === 'memory_embedding') return capabilitiesForm.memoryDirty.value
+  if (name === 'image_generation') return capabilitiesForm.imageDirty.value
+  return promotedForm.audioDirty.value
+}
+
+function capabilityTitle(name: CapabilityId): string {
+  if (name === 'search') return t('setup.search.title')
+  if (name === 'memory_embedding') return t('setup.memory.title')
+  if (name === 'image_generation') return t('setup.image.title')
+  return t('setup.audio.title')
+}
+
+async function resetCapability(name: CapabilityId) {
+  if (capabilityResetPending.value || !capabilityResettable(name)) return
+  const title = capabilityTitle(name)
+  const ok = await confirm({
+    title: t('setup.capabilities.resetConfirmTitle', { capability: title }),
+    body: t(
+      capabilityHasDraft(name)
+        ? 'setup.capabilities.resetConfirmBodyWithDraft'
+        : 'setup.capabilities.resetConfirmBody',
+      { capability: title },
+    ),
+    primaryLabel: name === 'search' || name === 'memory_embedding'
+      ? t('setup.capabilities.restorePrimary')
+      : t('setup.capabilities.removePrimary'),
+  })
+  if (!ok) return
+
+  capabilityResetPending.value = name
+  try {
+    const response = await rpc.call<{ restartRequired?: boolean }>('onboarding.capability.reset', {
+      capabilityId: name,
+    })
+    // Refresh server-owned status while preserving unrelated drafts, then
+    // reseed only the capability that the user explicitly reset.
+    await loadData({ preserveFormDrafts: true, throwOnError: true })
+    if (name === 'search') {
+      capabilitiesForm.initSearchFromConfig(config.value, searchProviders.value)
+    } else if (name === 'memory_embedding') {
+      capabilitiesForm.initMemoryFromConfig(config.value)
+    } else if (name === 'image_generation') {
+      capabilitiesForm.initImageFromConfig(config.value, status.value, imageProviders.value)
+    } else {
+      promotedForm.initAudioFromConfig(config.value)
+    }
+    pushToast(response?.restartRequired
+      ? t('setup.toast.capabilityResetRestart', { capability: title })
+      : t('setup.toast.capabilityReset', { capability: title }))
+  } catch (err) {
+    pushToast(saveFailedMessage(err), { tone: 'danger' })
+  } finally {
+    capabilityResetPending.value = ''
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2846,6 +3164,7 @@ async function savePrivacy(
   try {
     const restart = await safePatchConfig({
       'privacy.disable_network_observability': value,
+      ...promotedForm.memoryPatches(),
     })
     if (options.reload === false) {
       config.value = {
@@ -3003,6 +3322,10 @@ async function applyProviderPreset() {
 }
 
 async function saveSearch(options: SaveOptions = {}): Promise<boolean> {
+  if (searchDraftMissingKey.value) {
+    pushToast(t('setup.capabilities.searchKeyRequired'), { tone: 'danger' })
+    return false
+  }
   const params = capabilitiesForm.searchPayload()
   try {
     await rpc.call('onboarding.search.configure', params)
@@ -3025,9 +3348,6 @@ async function saveMemory(options: SaveOptions = {}): Promise<boolean> {
       const remote = res?.entry?.remote || {}
       envToastShown = _toastEnvReferenceSave(t('setup.toast.memorySurface'), remote.api_key_env, '', remote.api_key ?? '', res?.restartRequired)
     }
-    // The capture toggle rides config.patch and hot-applies; only embedding
-    // changes need a gateway restart.
-    await patchConfig(promotedForm.memoryPatches())
     if (!envToastShown) {
       pushToast(embeddingDirty ? t('setup.toast.memorySavedRestart') : t('setup.toast.memorySaved'))
     }
@@ -3165,6 +3485,7 @@ async function copyConfigPath() {
     cancelProviderEdit,
     setAutoSessionTitles,
     setDisableNetworkObservability,
+    setMemoryAutoCapture,
     setModelStrategy: modelStrategyForm.setStrategy,
     setFixedProvider,
     setFixedModel,
@@ -3202,6 +3523,7 @@ async function copyConfigPath() {
     onSearchProviderChange,
     onMemoryProviderChange,
     onImageProviderChange,
+    resetCapability,
     saveProvider,
     saveBehavior,
     savePrivacy,

@@ -151,6 +151,8 @@ def test_runtime_state_drains_pending_inputs_for_agent_injection() -> None:
     state.enqueue("third")
 
     assert isinstance(state, PendingInputProvider)
+    assert state.peek_pending() == ["second", "third"]
+    assert state.pending_items == ("second", "third")
     assert state.drain_pending() == ["second", "third"]
     assert state.pending_items == ()
 
@@ -777,23 +779,29 @@ async def test_runtime_late_steer_falls_back_to_visible_queue() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_dirty_steer_failure_does_not_duplicate_into_local_queue() -> None:
+async def test_runtime_dirty_steer_failure_is_retained_without_followup() -> None:
     inputs: asyncio.Queue[Any] = asyncio.Queue()
     surface = _FakeSurface(inputs)
     state = TuiRuntimeState()
     first_started = asyncio.Event()
+    release_first = asyncio.Event()
     notices: list[str] = []
+    steer_calls = 0
+    dispatched: list[str] = []
 
     class DirtySteerError(RuntimeError):
         data = {"fallback_safe": False, "orphan_message_id": "message-orphan"}
 
     async def _dispatch(user_input: str) -> bool:
+        dispatched.append(user_input)
         if user_input == "first":
             first_started.set()
-            await asyncio.sleep(5)
+            await release_first.wait()
         return True
 
     async def _dirty(_text: str) -> bool:
+        nonlocal steer_calls
+        steer_calls += 1
         raise DirtySteerError("steer rollback left a durable orphan")
 
     task = asyncio.create_task(
@@ -816,34 +824,48 @@ async def test_runtime_dirty_steer_failure_does_not_duplicate_into_local_queue()
             client_message_id="client-dirty",
         )
     )
-    await _wait_until(lambda: any("Steer failed" in notice for notice in notices))
+    await _wait_until(lambda: state.pending_items == ("must not duplicate",))
 
-    assert state.pending_items == ()
-    assert "echo:must not duplicate" not in surface.writes
-    assert not any("queued" in notice.lower() for notice in notices)
+    assert surface.writes.count("echo:must not duplicate") == 1
+    assert any("retained for a safe retry" in notice for notice in notices)
 
-    active_cb = next(cb for cb in reversed(surface.cancel_callbacks) if cb is not None)
-    active_cb()
+    release_first.set()
+    await _wait_until(lambda: steer_calls == 2)
+    assert state.pending_items == ("must not duplicate",)
+    assert dispatched == ["first"]
+    assert any("still unknown" in notice for notice in notices)
+
     await inputs.put(None)
     await asyncio.wait_for(task, timeout=2.0)
 
 
 @pytest.mark.asyncio
-async def test_runtime_ambiguous_steer_transport_failure_fails_closed() -> None:
+async def test_runtime_ambiguous_steer_retries_with_same_identity() -> None:
     inputs: asyncio.Queue[Any] = asyncio.Queue()
     surface = _FakeSurface(inputs)
     state = TuiRuntimeState()
     first_started = asyncio.Event()
+    release_first = asyncio.Event()
     notices: list[str] = []
+    steer_identities: list[str | None] = []
+    dispatched: list[str] = []
 
     async def _dispatch(user_input: str) -> bool:
+        dispatched.append(user_input)
         if user_input == "first":
             first_started.set()
-            await asyncio.sleep(5)
+            await release_first.wait()
         return True
 
     async def _ambiguous(_text: str) -> bool:
-        raise ConnectionError("reply lost after request write")
+        from opensquilla.cli.tui.backend.input_identity import (
+            current_tui_client_message_id,
+        )
+
+        steer_identities.append(current_tui_client_message_id())
+        if len(steer_identities) == 1:
+            raise ConnectionError("reply lost after request write")
+        return True
 
     task = asyncio.create_task(
         run_tui_runtime(
@@ -865,14 +887,20 @@ async def test_runtime_ambiguous_steer_transport_failure_fails_closed() -> None:
             client_message_id="client-ambiguous",
         )
     )
-    await _wait_until(lambda: any("Steer failed" in notice for notice in notices))
+    await _wait_until(lambda: state.pending_items == ("maybe already accepted",))
 
-    assert state.pending_items == ()
-    assert "echo:maybe already accepted" not in surface.writes
-    assert not any("queued" in notice.lower() for notice in notices)
+    assert surface.writes.count("echo:maybe already accepted") == 1
+    assert any("retained for a safe retry" in notice for notice in notices)
 
-    active_cb = next(cb for cb in reversed(surface.cancel_callbacks) if cb is not None)
-    active_cb()
+    release_first.set()
+    await _wait_until(lambda: len(steer_identities) == 2)
+    await _wait_until(lambda: state.pending_items == ())
+
+    assert steer_identities == ["client-ambiguous", "client-ambiguous"]
+    assert dispatched == ["first"]
+    assert surface.writes.count("echo:maybe already accepted") == 1
+    assert any("Pending steer confirmed" in notice for notice in notices)
+
     await inputs.put(None)
     await asyncio.wait_for(task, timeout=2.0)
 

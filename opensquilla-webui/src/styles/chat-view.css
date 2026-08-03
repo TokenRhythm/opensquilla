@@ -307,24 +307,11 @@
   color: var(--text-muted);
 }
 
-/* Live answer candidate: provisional text that can still migrate back into
-   the activity transcript when a later tool starts. A quiet left rule plus a
-   small uppercase tag mark it as a draft — flat, no background, no motion. */
-.live-answer-candidate-tag {
-  display: block;
-  margin: 0.375rem 0 0.125rem;
-  padding-left: 0.75rem;
-  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
-  color: var(--text-dim);
-  font-size: 0.6875rem;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-}
-
-.live-answer-candidate {
-  padding-left: 0.75rem;
-  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
+/* Gateway-confirmed answer text streams in its final visual position. */
+.live-answer {
+  margin-top: 0;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--hairline);
 }
 
 /* ── Jump-to-latest pill (floats above the composer when scrolled up) ─── */

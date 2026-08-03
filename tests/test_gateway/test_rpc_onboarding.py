@@ -1750,6 +1750,69 @@ async def test_models_discover_unverified_provider_stays_empty_without_build(
     }
 
 
+@pytest.mark.asyncio
+async def test_image_models_discover_requires_admin_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.imageGeneration.models.discover",
+        {"providerId": "openrouter"},
+        _read_ctx(),
+    )
+
+    assert res.error is not None
+    assert "scope" in res.error.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_image_models_discover_returns_image_specific_catalog(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+
+    async def _discover(provider_id: str):
+        assert provider_id == "openrouter"
+        return {
+            "ok": True,
+            "providerId": provider_id,
+            "source": "live",
+            "models": [{"id": "vendor/image-live"}],
+        }
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.image_generation_model_discovery."
+        "discover_image_generation_models",
+        _discover,
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.imageGeneration.models.discover",
+        {"providerId": "openrouter"},
+        _admin_ctx(),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["source"] == "live"
+    assert res.payload["models"] == [{"id": "vendor/image-live"}]
+
+
+@pytest.mark.asyncio
+async def test_image_models_discover_rejects_unknown_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.imageGeneration.models.discover",
+        {"providerId": "not-a-provider"},
+        _admin_ctx(),
+    )
+
+    assert res.error is not None
+    assert res.error.code == "onboarding.imageGeneration.invalid"
+
+
 @pytest.fixture()
 def _clean_channels_reconciler():
     from opensquilla.gateway.channels_bridge import reset_channels_reconciler

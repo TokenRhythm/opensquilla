@@ -18,6 +18,7 @@
       :strip-time-prefix="stripTimePrefix"
       :copy-message="copyMessage"
       :download-attachment="downloadAttachment"
+      :show-turn-outcome="isTurnTip(index)"
       @edit="$emit('editMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
     />
@@ -45,6 +46,7 @@
       :fork-busy="forkBusy"
       :plan-action-pending="planActionPending"
       :plan-actions-disabled="planActionsDisabled"
+      :show-turn-outcome="isTurnTip(index)"
       @fork="$emit('forkConversation')"
       @regenerate="$emit('regenerateMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
@@ -141,4 +143,18 @@ const lastAssistantIndex = computed(() => {
   }
   return -1
 })
+
+function isTurnTip(index: number): boolean {
+  const message = props.messages[index]
+  if (!message?.turnOutcome || !message.turnKey) return false
+  for (let nextIndex = index + 1; nextIndex < props.messages.length; nextIndex++) {
+    const next = props.messages[nextIndex]
+    if (next.turnKey === message.turnKey) {
+      if (next.displayRole === 'user' || next.displayRole === 'assistant') return false
+      continue
+    }
+    if (next.displayRole === 'user') break
+  }
+  return true
+}
 </script>

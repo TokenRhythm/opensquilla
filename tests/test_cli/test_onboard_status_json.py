@@ -50,6 +50,7 @@ RPC_STATUS_KEYS = frozenset(
         "memoryEmbeddingProvider",
         "memoryEmbeddingSource",
         "memoryEmbeddingEnvKey",
+        "capabilityConfiguration",
         "channelCount",
         "channelsConfigured",
         "ensembleCredentialStatus",
@@ -108,6 +109,7 @@ def test_status_json_is_a_superset_of_the_rpc_payload(tmp_path, monkeypatch):
     missing = set(rpc_payload) - set(cli_payload)
     assert not missing, f"CLI status --json lost RPC keys: {sorted(missing)}"
     assert set(cli_payload) - set(rpc_payload) == {"sectionAliases"}
+    assert cli_payload["capabilityConfiguration"] == rpc_payload["capabilityConfiguration"]
 
 
 def test_status_json_new_keys_carry_the_expected_values(tmp_path, monkeypatch):
