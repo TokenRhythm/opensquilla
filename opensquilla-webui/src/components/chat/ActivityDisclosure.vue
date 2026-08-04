@@ -15,9 +15,17 @@
       :aria-controls="bodyId"
       @click.stop="open = !open"
     >
+      <ThinkingOrb
+        v-if="!stale"
+        :state="orbState"
+        :size="28"
+        theme="auto"
+        class="assistant-activity__live-orb"
+        aria-hidden="true"
+      />
       <span
-        class="assistant-activity__live-dot"
-        :class="{ 'is-active': !stale, 'is-stale': stale }"
+        v-else
+        class="assistant-activity__live-dot is-stale"
         aria-hidden="true"
       />
       <span
@@ -113,6 +121,8 @@
 import { computed, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ThinkingOrb from '@/components/thinking-orb/ThinkingOrb.vue'
+import { resolveOrbState } from '@/components/thinking-orb/purposeToOrbState'
 import {
   readAssistantActivityExpansion,
   writeAssistantActivityExpansion,
@@ -128,6 +138,8 @@ const props = withDefaults(defineProps<{
   detailLabel?: string
   phaseLabel?: string
   elapsedLabel?: string
+  /** 当前活动集群的 purpose code（如 'chat.activity.purpose.search'），用于细化动画状态 */
+  purposeCode?: string
   stale?: boolean
   defaultOpen?: boolean
   stateKey?: string
@@ -172,6 +184,10 @@ watch(
 
 const isLive = computed(() =>
   props.lifecycle === 'working' || props.lifecycle === 'answering',
+)
+
+const orbState = computed(() =>
+  resolveOrbState(props.lifecycle, props.purposeCode),
 )
 
 const liveStatusLabel = computed(() => props.phaseLabel || t('chat.activityWorking'))
@@ -254,6 +270,11 @@ const resolvedSummaryLabel = computed(() => {
 
 .assistant-activity__live-dot.is-stale {
   background: var(--warn-fill);
+}
+
+.assistant-activity__live-orb {
+  flex: 0 0 auto;
+  vertical-align: middle;
 }
 
 .assistant-activity__live-label {

@@ -225,6 +225,7 @@
               :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
               :failure-count="liveActivityFailureCount"
               :phase-label="liveActivityPhaseLabel"
+              :purpose-code="liveActivityPurposeCode"
               :elapsed-label="streamPhaseElapsed"
               :stale="streamActivityStale"
             >
@@ -2120,6 +2121,15 @@ const liveActivityProjection = computed(() =>
     statusHistory: liveActivityStatusHistory.value,
   }),
 )
+/** 当前活动集群的 purpose code，用于细化 ThinkingOrb 动画状态 */
+const liveActivityPurposeCode = computed(() => {
+  const projection = liveActivityProjection.value
+  if (!projection.currentClusterKey) return null
+  const cluster = projection.activityClusters.find(
+    c => c.key === projection.currentClusterKey,
+  )
+  return cluster?.purpose.code ?? null
+})
 const liveActivityPhaseLabel = computed(() => {
   if (streamActivityStale.value) return streamPhaseLabel.value
   const currentStatus = [...liveActivityProjection.value.statusSteps]
