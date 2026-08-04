@@ -25,10 +25,18 @@ ALTER TABLE goal_runs ADD COLUMN last_error TEXT
 
 def apply_step(conn) -> None:
     cur = conn.cursor()
-    cur.execute(ADD_FAILURE_RETRIES)
-    cur.execute(ADD_NEXT_RETRY_AT_MS)
-    cur.execute(ADD_PAUSE_REASON)
-    cur.execute(ADD_LAST_ERROR)
+    existing = {
+        row[1]
+        for row in cur.execute("PRAGMA table_info(goal_runs)").fetchall()
+    }
+    if "failure_retries" not in existing:
+        cur.execute(ADD_FAILURE_RETRIES)
+    if "next_retry_at_ms" not in existing:
+        cur.execute(ADD_NEXT_RETRY_AT_MS)
+    if "pause_reason" not in existing:
+        cur.execute(ADD_PAUSE_REASON)
+    if "last_error" not in existing:
+        cur.execute(ADD_LAST_ERROR)
 
 
 def rollback_step(conn) -> None:
