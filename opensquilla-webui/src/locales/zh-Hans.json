@@ -600,7 +600,14 @@
     "title": "出错了",
     "defaultMessage": "发生意外错误。",
     "reload": "重新加载页面",
-    "dismiss": "关闭"
+    "dismiss": "关闭",
+    "detailsLabel": "错误详情",
+    "copyDetails": "复制详情",
+    "copied": "已复制",
+    "openLogs": "打开日志文件夹",
+    "privacyHint": "分享前请先检查。错误详情可能包含文件路径、网址或账户信息。",
+    "copyFailed": "复制失败。请展开详情后手动复制。",
+    "openLogsFailed": "无法打开日志文件夹。"
   },
   "errors": {
     "saveFailed": "保存失败",

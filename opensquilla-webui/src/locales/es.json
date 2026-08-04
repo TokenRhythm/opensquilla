@@ -549,7 +549,14 @@
     "title": "Algo salió mal",
     "defaultMessage": "Se produjo un error inesperado.",
     "reload": "Recargar página",
-    "dismiss": "Descartar"
+    "dismiss": "Descartar",
+    "detailsLabel": "Detalles del error",
+    "copyDetails": "Copiar detalles",
+    "copied": "Copiado",
+    "openLogs": "Abrir carpeta de registros",
+    "privacyHint": "Revise el contenido antes de compartirlo. Los detalles pueden contener rutas, URL o información de la cuenta.",
+    "copyFailed": "No se pudo copiar. Seleccione los detalles y cópielos manualmente.",
+    "openLogsFailed": "No se pudo abrir la carpeta de registros."
   },
   "errors": {
     "saveFailed": "Error al guardar",
