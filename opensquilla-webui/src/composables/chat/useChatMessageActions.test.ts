@@ -147,6 +147,30 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.notifyMessagePending).toHaveBeenCalledOnce()
   })
 
+  it('blocks edit while streaming with visible feedback instead of a silent no-op', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+    options.isStreaming.value = true
+    const notifyEditBlocked = vi.fn()
+    options.notifyEditBlocked = notifyEditBlocked
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+
+    expect(options.messages.value.map(message => message.text)).toEqual(['A'])
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.focusComposer).not.toHaveBeenCalled()
+    expect(notifyEditBlocked).toHaveBeenCalledOnce()
+  })
+
   it('does not regenerate as a parent send when the durable fork id is missing', async () => {
     const messages: ChatMessage[] = [
       { role: 'user', text: 'still saving', ts: null, clientId: 'client-only' },

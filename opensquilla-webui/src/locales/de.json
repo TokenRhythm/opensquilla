@@ -3535,6 +3535,7 @@
       "queueHint": "Warteschlangenmodus: Diese Nachrichten werden der Reihe nach automatisch gesendet, wenn die aktuelle Antwort abgeschlossen ist",
       "clearAll": "Alle löschen",
       "editMessage": "Nachricht bearbeiten",
+      "editWhileStreaming": "Warten Sie, bis die aktuelle Antwort fertig ist, bevor Sie bearbeiten",
       "attachmentNeedsAttention": "Anhang prüfen",
       "fixAttachmentBeforeSteer": "Bearbeite diese Nachricht und wiederhole den fehlgeschlagenen Anhang oder entferne ihn, bevor du sendest",
       "clearQueue": "Warteschlange leeren",

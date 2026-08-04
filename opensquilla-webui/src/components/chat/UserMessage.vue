@@ -94,7 +94,15 @@
         <Icon :name="copyIconName" :size="12" />
       </button>
       <span class="msg-copy-live" aria-live="polite">{{ copyLiveText }}</span>
-      <button type="button" class="msg-action" :title="t('chat.edit')" :aria-label="t('chat.edit')" @click="$emit('edit', message)">
+      <button
+        type="button"
+        class="msg-action"
+        :class="{ 'msg-action--disabled': isStreaming }"
+        :title="isStreaming ? t('chat.pending.editWhileStreaming') : t('chat.edit')"
+        :aria-label="isStreaming ? t('chat.pending.editWhileStreaming') : t('chat.edit')"
+        :disabled="isStreaming"
+        @click="$emit('edit', message)"
+      >
         <Icon name="edit" :size="12" />
       </button>
       <time v-if="timeIso" class="msg-time" :datetime="timeIso" :title="timeFull">
@@ -128,6 +136,7 @@ const props = defineProps<{
   copyMessage: (message: ChatRenderedMessage) => Promise<boolean>
   downloadAttachment: (attachment: DisplayAttachment) => Promise<boolean>
   showTurnOutcome?: boolean
+  isStreaming?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -454,6 +463,19 @@ function attachmentMeta(attachment: DisplayAttachment): string {
 .msg-action:hover {
   color: var(--text-muted);
   background: var(--bg-hover);
+}
+
+.msg-action:disabled,
+.msg-action.msg-action--disabled {
+  cursor: not-allowed;
+  color: var(--text-dim);
+  opacity: 0.45;
+}
+
+.msg-action:disabled:hover,
+.msg-action.msg-action--disabled:hover {
+  color: var(--text-dim);
+  background: none;
 }
 
 .msg-action.msg-action--ok,

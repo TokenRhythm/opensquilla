@@ -19,6 +19,7 @@
       :copy-message="copyMessage"
       :download-attachment="downloadAttachment"
       :show-turn-outcome="isTurnTip(index)"
+      :is-streaming="isStreaming"
       @edit="$emit('editMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
     />
@@ -118,6 +119,7 @@ const props = defineProps<{
   forkBusy?: boolean
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
+  isStreaming?: boolean
 }>()
 
 defineEmits<{

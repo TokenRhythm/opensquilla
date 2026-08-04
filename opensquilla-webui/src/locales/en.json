@@ -3586,6 +3586,7 @@
       "queueHint": "Queue mode: these messages auto-send in order when the current response finishes",
       "clearAll": "Clear all",
       "editMessage": "Edit message",
+      "editWhileStreaming": "Wait for the current reply to finish before editing",
       "attachmentNeedsAttention": "Needs attention",
       "fixAttachmentBeforeSteer": "Edit this message and retry or remove the failed attachment before sending",
       "clearQueue": "Clear queue",

@@ -3535,6 +3535,7 @@
       "queueHint": "キューモード: これらのメッセージは現在の応答が完了すると順番に自動送信されます",
       "clearAll": "すべてクリア",
       "editMessage": "メッセージを編集",
+      "editWhileStreaming": "現在の返信が終わってから編集してください",
       "attachmentNeedsAttention": "添付を確認",
       "fixAttachmentBeforeSteer": "このメッセージを編集し、失敗した添付を再試行または削除してから送信してください",
       "clearQueue": "キューをクリア",

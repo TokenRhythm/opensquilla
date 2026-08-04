@@ -3535,6 +3535,7 @@
       "queueHint": "Mode file d'attente : ces messages s'envoient automatiquement dans l'ordre à la fin de la réponse actuelle",
       "clearAll": "Tout effacer",
       "editMessage": "Modifier le message",
+      "editWhileStreaming": "Attendez la fin de la réponse en cours avant de modifier",
       "attachmentNeedsAttention": "Pièce jointe à vérifier",
       "fixAttachmentBeforeSteer": "Modifiez ce message, puis réessayez ou supprimez la pièce jointe en échec avant l'envoi",
       "clearQueue": "Vider la file",

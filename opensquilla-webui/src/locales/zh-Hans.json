@@ -3586,6 +3586,7 @@
       "queueHint": "排队模式：这些消息会在当前回复结束后按顺序自动发送",
       "clearAll": "全部清除",
       "editMessage": "编辑消息",
+      "editWhileStreaming": "等待当前回复完成后再编辑",
       "attachmentNeedsAttention": "附件需处理",
       "fixAttachmentBeforeSteer": "请先编辑这条消息，重试或移除失败的附件后再发送",
       "clearQueue": "清空队列",
