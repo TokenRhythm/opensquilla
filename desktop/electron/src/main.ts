@@ -104,6 +104,10 @@ import {
 } from './native-workbench-surface.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 import {
+  buildRendererConsoleLogEntry,
+  buildRendererGoneLogEntry,
+} from './desktop-renderer-log.js'
+import {
   ArtifactPreviewLeaseBroker,
 } from './artifact-preview-lease-broker.js'
 
@@ -8051,6 +8055,34 @@ async function createMainWindow(): Promise<BrowserWindow> {
     () => nativeWorkbenchSurfaces.refreshBounds(window),
   )
   installEditingContextMenu(window)
+
+  // Forward renderer console errors/warnings to desktop.log. The Control UI runs
+  // in the renderer, so a purely front-end failure (a thrown error, an unhandled
+  // rejection, or a stuck UI that logs a warning) otherwise leaves no trace: it
+  // never reaches the gateway log, and DevTools is disabled on Windows. Persisting
+  // error/warning-level messages makes those front-end problems diagnosable from a
+  // user's log folder without a reproduction. The level filter and entry shaping
+  // live in desktop-renderer-log.ts so they can be unit-tested.
+  window.webContents.on('console-message', (details) => {
+    const entry = buildRendererConsoleLogEntry({
+      level: details.level,
+      message: details.message,
+      sourceId: details.sourceId,
+      lineNumber: details.lineNumber,
+    })
+    if (entry) desktopLog(entry.event, entry.detail)
+  })
+
+  // Record renderer crashes/hangs. A gone render process is the most opaque
+  // failure of all — the whole UI freezes with nothing in any log — so stamping
+  // the reason and exit code gives a first, always-present breadcrumb.
+  window.webContents.on('render-process-gone', (_event, details) => {
+    const entry = buildRendererGoneLogEntry({
+      reason: details.reason,
+      exitCode: details.exitCode,
+    })
+    desktopLog(entry.event, entry.detail)
+  })
 
   window.webContents.setWindowOpenHandler(({ url }) => {
     // Forward real outbound links to the system browser; deny everything else.
