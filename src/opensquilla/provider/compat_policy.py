@@ -109,6 +109,12 @@ class OpenAICompatPolicy:
     # artifact locally.
     supports_native_json_schema_output: bool = True
 
+    # Whether the endpoint supports the less expressive
+    # ``response_format.type=json_object`` mode.  This is useful when native
+    # JSON Schema is unavailable: the schema remains in the trusted system
+    # prompt while the request still asks the upstream for a JSON object.
+    supports_json_object_output: bool = False
+
     # Text-to-tool execution is deliberately dialect- and model-scoped.  This
     # record is trusted packaged metadata: an online model catalog must never
     # be able to grant text the authority to become an executable tool call.
@@ -299,6 +305,8 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "deepseek": OpenAICompatPolicy(
         display_name="DeepSeek",
         default_reasoning_format="deepseek",
+        supports_native_json_schema_output=False,
+        supports_json_object_output=True,
         # Reasoning replay is gated on the exact V4 ids (below), not on the
         # capability format: non-V4 DeepSeek models must not get replay.
         thinking_toggle_model_ids=DEEPSEEK_V4_MODEL_IDS,

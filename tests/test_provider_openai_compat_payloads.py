@@ -2153,6 +2153,115 @@ def test_tokenrhythm_embeds_json_schema_without_response_format(
     assert config.output_json_schema == schema
 
 
+def test_deepseek_embeds_json_schema_and_requests_json_object(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = build_provider(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_key="test",
+    )
+    assert isinstance(provider, OpenAIProvider)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"schema_version": {"type": "integer", "const": 1}},
+        "required": ["schema_version"],
+    }
+    config = ChatConfig(
+        system="Fuse the imported profile.",
+        output_json_schema=schema,
+        output_json_schema_strict=True,
+    )
+
+    _collect(provider, config)
+
+    payload = captured["payload"]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["messages"][0] == {
+        "role": "system",
+        "content": (
+            "Fuse the imported profile.\n\n"
+            "Return exactly one JSON value that validates against the authoritative "
+            "JSON Schema below. Do not use Markdown fences or add commentary.\n"
+            f"{json.dumps(schema, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}"
+        ),
+    }
+    assert config.system == "Fuse the imported profile."
+    assert config.output_json_schema == schema
+
+
+def test_deepseek_schema_prompt_message_projection_matches_payload_without_system(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = build_provider(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_key="test",
+    )
+    assert isinstance(provider, OpenAIProvider)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"schema_version": {"type": "integer", "const": 1}},
+        "required": ["schema_version"],
+    }
+    config = ChatConfig(output_json_schema=schema)
+
+    projection = provider.project_message_count(
+        [Message(role="user", content="hi")],
+        config,
+    )
+    _collect(provider, config)
+
+    payload_messages = captured["payload"]["messages"]
+    assert projection.actual_wire_messages == len(payload_messages) == 2
+    assert projection.system_messages == 1
+    assert payload_messages[0]["role"] == "system"
+    assert payload_messages[1] == {"role": "user", "content": "hi"}
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        None,
+        {"type": "array", "items": {"type": "string"}},
+    ],
+)
+def test_deepseek_omits_json_object_mode_without_an_object_schema(
+    monkeypatch: Any,
+    schema: dict[str, Any] | None,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        provider_kind="deepseek",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(system="Return JSON.", output_json_schema=schema),
+    )
+
+    payload = captured["payload"]
+    assert "response_format" not in payload
+    if schema is not None:
+        serialized_schema = json.dumps(
+            schema,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        assert serialized_schema in payload["messages"][0]["content"]
+
+
 def test_openrouter_omits_response_format_without_output_schema(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)

@@ -704,7 +704,7 @@ def _unavailable_info(ctx: RpcContext) -> dict[str, Any]:
         "model": model,
         "isLocal": _is_loopback_deployment(provider, base_url),
         "maxInputBytes": 262_144,
-        "promptVersion": "profile-fusion-v2",
+        "promptVersion": "profile-fusion-v3",
         "recentImport": None,
     }
 

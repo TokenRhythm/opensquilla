@@ -118,7 +118,7 @@ async function installImportGateway(page: Page): Promise<ImportGateway> {
           model: 'synthetic-model',
           isLocal: true,
           maxInputBytes: 262144,
-          promptVersion: 'profile-fusion-v2',
+          promptVersion: 'profile-fusion-v3',
           recentImport: null,
           draftJob: null,
         }))

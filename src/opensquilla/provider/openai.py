@@ -2898,9 +2898,10 @@ class OpenAIProvider:
         ):
             raise ValueError("additional_messages must be a non-negative integer")
         cfg = config or ChatConfig()
+        wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         wire_messages = _build_openai_wire_messages(
             messages,
-            cfg,
+            wire_cfg,
             policy=self._compat,
             provider_kind=self._provider_kind,
             model=self._model,
@@ -2996,6 +2997,12 @@ class OpenAIProvider:
                     "schema": cfg.output_json_schema,
                 },
             }
+        elif (
+            cfg.output_json_schema is not None
+            and self._compat.supports_json_object_output
+            and cfg.output_json_schema.get("type") == "object"
+        ):
+            payload["response_format"] = {"type": "json_object"}
         if (
             include_reasoning_content
             and model_basename(self._model)

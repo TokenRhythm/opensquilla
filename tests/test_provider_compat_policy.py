@@ -107,6 +107,14 @@ def test_native_json_schema_output_stays_enabled_by_default() -> None:
     assert compat_policy_for_kind("openai").supports_native_json_schema_output is True
     assert compat_policy_for_kind("openrouter").supports_native_json_schema_output is True
     assert OpenAICompatPolicy().supports_native_json_schema_output is True
+    assert OpenAICompatPolicy().supports_json_object_output is False
+
+
+def test_deepseek_uses_json_object_fallback_for_output_schemas() -> None:
+    policy = compat_policy_for_kind("deepseek")
+
+    assert policy.supports_native_json_schema_output is False
+    assert policy.supports_json_object_output is True
 
 
 def test_deepseek_replay_stays_v4_gated() -> None:

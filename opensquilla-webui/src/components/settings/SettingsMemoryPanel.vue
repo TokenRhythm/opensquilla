@@ -115,6 +115,7 @@ const submitAttempted = ref(false)
 const busy = ref(false)
 const errorCode = ref('')
 const previewErrorVisible = ref(false)
+const retryErrorVisible = ref(false)
 const lastOperation = ref<Operation>('info')
 const previewMode = ref<'import' | 'undo'>('import')
 const successKind = ref<'import' | 'undo'>('import')
@@ -158,10 +159,12 @@ const inputError = computed(() => {
 })
 const providerLabel = computed(() => info.value?.provider || preview.value?.provider || '')
 const modelLabel = computed(() => info.value?.model || preview.value?.model || '')
-const hasCanonicalDeletion = computed(() => Boolean(
-  preview.value?.files.some(file => (
-    (file.target === 'USER' || file.target === 'MEMORY') && file.deletions > 0
-  )),
+const hasCanonicalRemovalOnly = computed(() => Boolean(
+  preview.value?.files.some(file => {
+    if (file.target !== 'USER' && file.target !== 'MEMORY') return false
+    return file.status === 'deleted'
+      || (file.status === 'modified' && file.deletions > 0 && file.additions === 0)
+  }),
 ))
 const totalAdditions = computed(() => (
   preview.value?.files.reduce((total, file) => total + file.additions, 0) || 0
@@ -196,10 +199,20 @@ const recentTargets = computed(() => {
   const targets = new Set(recentImport.value?.targets || [])
   return (['USER', 'MEMORY', 'IMPORT'] as ImportTarget[]).filter(target => targets.has(target))
 })
-const recentSummaryItems = computed(() => recentImport.value?.summary.slice(0, 3) || [])
-const noChangeReason = computed(() => (
-  recentImport.value?.summary[0] || t('settings.memoryImport.noChangesDescription')
-))
+const pausedMessage = computed(() => {
+  const current = importJob.value
+  if (
+    current?.status === 'failed'
+    && (
+      current.errorCode === 'MEMORY_IMPORT_MODEL_FAILED'
+      || current.errorCode === 'MEMORY_IMPORT_INVALID_OUTPUT'
+    )
+  ) {
+    const key = current.errorCode === 'MEMORY_IMPORT_MODEL_FAILED' ? 'modelFailed' : 'invalidOutput'
+    return t(`settings.memoryImport.errors.${key}`)
+  }
+  return t(`settings.memoryImport.jobStates.${current?.status || 'failed'}.description`)
+})
 
 function objectValue(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {}
@@ -301,6 +314,17 @@ function normalizeJob(value: unknown): ImportJob | null {
   const jobId = textValue(data.jobId)
   if (!jobId) return null
   const status = textValue(data.status) as JobStatus
+  if (![
+    'queued',
+    'analyzing',
+    'cancelling',
+    'cancelled',
+    'interrupted',
+    'ready',
+    'failed',
+    'applied',
+    'discarded',
+  ].includes(status)) return null
   const stageValue = textValue(data.stage)
   return {
     schemaVersion: numberValue(data.schemaVersion),
@@ -402,6 +426,7 @@ async function loadInfo() {
   lastOperation.value = 'info'
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
   try {
     await rpc.waitForConnection(8000)
     if (!rpc.supportsMethod(INFO_METHOD)) {
@@ -464,6 +489,7 @@ async function requestPreview() {
   lastOperation.value = 'preview'
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
   if (!previewRequestId.value) previewRequestId.value = createRequestId()
   state.value = 'analyzing'
   await analyzingEntered
@@ -541,6 +567,7 @@ async function pollJob() {
 
 async function handleJob(current: ImportJob) {
   clearJobTimers()
+  retryErrorVisible.value = false
   importJob.value = current
   phase.value = current.stage
   if (current.status === 'ready' && current.preview) {
@@ -589,6 +616,7 @@ async function retryImport() {
   const current = importJob.value
   if (!current || !info.value || busy.value) return
   busy.value = true
+  retryErrorVisible.value = false
   try {
     const result = normalizeJob(await rpc.call(RETRY_METHOD, {
       schemaVersion: CLIENT_SCHEMA_VERSION,
@@ -599,10 +627,14 @@ async function retryImport() {
       expectedModel: info.value.model,
       expectedIsLocal: info.value.isLocal,
     }))
-    if (result) await handleJob(result)
-  } catch (error) {
-    errorCode.value = rpcErrorCode(error)
-    state.value = 'paused'
+    if (!result || result.schemaVersion !== CLIENT_SCHEMA_VERSION) {
+      throw Object.assign(new Error('Invalid profile import retry job'), {
+        code: 'MEMORY_IMPORT_INVALID_OUTPUT',
+      })
+    }
+    await handleJob(result)
+  } catch {
+    retryErrorVisible.value = true
   } finally {
     busy.value = false
   }
@@ -622,6 +654,7 @@ async function discardJob() {
     importJob.value = null
     preview.value = null
     previewRequestId.value = ''
+    retryErrorVisible.value = false
     state.value = 'input'
   } finally {
     busy.value = false
@@ -651,6 +684,7 @@ async function backFromPreview() {
   submitAttempted.value = false
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
   state.value = 'input'
 }
 
@@ -813,6 +847,7 @@ function resetForAnother() {
   submitAttempted.value = false
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
   previewMode.value = 'import'
   state.value = 'input'
 }
@@ -840,6 +875,7 @@ function handleRawInput() {
   previewRequestId.value = ''
   errorCode.value = ''
   previewErrorVisible.value = false
+  retryErrorVisible.value = false
 }
 
 onMounted(() => {
@@ -901,9 +937,6 @@ onUnmounted(() => {
                 <dd>{{ recentImport.provider }} / {{ recentImport.model }}</dd>
               </div>
             </dl>
-            <ul v-if="recentSummaryItems.length" class="memory-import__summary-list">
-              <li v-for="item in recentSummaryItems" :key="item">{{ item }}</li>
-            </ul>
             <p v-if="recentImport.indexStatus === 'pending'" class="memory-import__index-note">
               {{ t('settings.memoryImport.indexPending') }}
             </p>
@@ -1052,9 +1085,6 @@ onUnmounted(() => {
                   <dd>{{ recentImport.provider }} / {{ recentImport.model }}</dd>
                 </div>
               </dl>
-              <ul v-if="recentSummaryItems.length" class="memory-import__summary-list">
-                <li v-for="item in recentSummaryItems" :key="item">{{ item }}</li>
-              </ul>
               <p v-if="recentImport.indexStatus === 'pending'" class="memory-import__index-note">
                 {{ t('settings.memoryImport.indexPending') }}
               </p>
@@ -1122,7 +1152,19 @@ onUnmounted(() => {
       >
         <Icon name="info" :size="24" aria-hidden="true" />
         <h4>{{ t(`settings.memoryImport.jobStates.${importJob?.status || 'failed'}.title`) }}</h4>
-        <p>{{ t(`settings.memoryImport.jobStates.${importJob?.status || 'failed'}.description`) }}</p>
+        <p>{{ pausedMessage }}</p>
+        <div
+          v-if="retryErrorVisible"
+          class="memory-import__notice memory-import__notice--error"
+          role="alert"
+          data-testid="memory-import-retry-error"
+        >
+          <Icon name="info" :size="18" aria-hidden="true" />
+          <div>
+            <h4>{{ t('settings.memoryImport.retryFailedTitle') }}</h4>
+            <p>{{ t('settings.memoryImport.retryFailedDescription') }}</p>
+          </div>
+        </div>
         <div class="memory-import__actions">
           <button
             type="button"
@@ -1131,7 +1173,7 @@ onUnmounted(() => {
             data-testid="memory-import-retry-job"
             @click="retryImport"
           >
-            {{ t('settings.memoryImport.continueImport') }}
+            {{ t('settings.memoryImport.regeneratePreview') }}
           </button>
           <button
             type="button"
@@ -1171,9 +1213,12 @@ onUnmounted(() => {
           </p>
         </div>
 
-        <ul v-if="preview?.summary.length" class="memory-import__summary-list">
-          <li v-for="item in preview.summary" :key="item">{{ item }}</li>
-        </ul>
+        <div v-if="preview?.summary.length" class="memory-import__model-analysis">
+          <h5>{{ t('settings.memoryImport.modelAnalysisTitle') }}</h5>
+          <ul class="memory-import__summary-list">
+            <li v-for="item in preview.summary" :key="item">{{ item }}</li>
+          </ul>
+        </div>
 
         <div class="memory-import__decision-counts">
           <span v-if="preview?.decisionCounts.duplicate">
@@ -1184,11 +1229,14 @@ onUnmounted(() => {
           </span>
         </div>
 
-        <div v-if="hasCanonicalDeletion" class="memory-import__notice memory-import__notice--warn">
+        <div
+          v-if="hasCanonicalRemovalOnly"
+          class="memory-import__notice memory-import__notice--warn"
+        >
           <Icon name="info" :size="18" aria-hidden="true" />
           <div>
-            <h4>{{ t('settings.memoryImport.deletionWarningTitle') }}</h4>
-            <p>{{ t('settings.memoryImport.deletionWarning') }}</p>
+            <h4>{{ t('settings.memoryImport.removalWarningTitle') }}</h4>
+            <p>{{ t('settings.memoryImport.removalWarning') }}</p>
           </div>
         </div>
 
@@ -1266,7 +1314,7 @@ onUnmounted(() => {
       >
         <Icon name="check" :size="24" aria-hidden="true" />
         <h4 ref="previewHeading" tabindex="-1">{{ t('settings.memoryImport.noChangesTitle') }}</h4>
-        <p>{{ noChangeReason }}</p>
+        <p>{{ t('settings.memoryImport.noChangesDescription') }}</p>
         <button type="button" class="btn btn--primary" @click="backFromPreview">
           {{ previewMode === 'undo' ? t('settings.memoryImport.done') : t('settings.memoryImport.pasteAnother') }}
         </button>
@@ -1319,9 +1367,6 @@ onUnmounted(() => {
                   <dd>{{ recentImport.provider }} / {{ recentImport.model }}</dd>
                 </div>
               </dl>
-              <ul v-if="recentSummaryItems.length" class="memory-import__summary-list">
-                <li v-for="item in recentSummaryItems" :key="item">{{ item }}</li>
-              </ul>
               <p v-if="recentImport.indexStatus === 'pending'" class="memory-import__index-note">
                 {{ t('settings.memoryImport.indexPending') }}
               </p>
@@ -1687,6 +1732,12 @@ onUnmounted(() => {
 
 .memory-import__preview-title:focus-visible {
   box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+.memory-import__model-analysis h5 {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  margin: 0 0 var(--sp-1);
 }
 
 .memory-import__summary-list {
