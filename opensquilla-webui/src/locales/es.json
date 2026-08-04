@@ -2975,9 +2975,9 @@
         "short": "mixto"
       },
       "unpriced": {
-        "label": "Sin precio",
-        "tooltip": "Sin precio: no hay entrada en la tabla de precios para este modelo",
-        "short": "sin precio"
+        "label": "Poco usado",
+        "tooltip": "Poco usado — aún no hay entrada en la tabla de precios para este modelo (habitual con poco volumen de llamadas)",
+        "short": "poco usado"
       },
       "none": {
         "label": "Ninguno",

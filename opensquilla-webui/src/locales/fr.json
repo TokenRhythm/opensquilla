@@ -2975,9 +2975,9 @@
         "short": "mixte"
       },
       "unpriced": {
-        "label": "Sans tarif",
-        "tooltip": "Sans tarif — aucune entrée de table de tarification pour ce modèle",
-        "short": "sans tarif"
+        "label": "Peu utilisé",
+        "tooltip": "Peu utilisé — aucune entrée de table de tarification pour ce modèle pour l'instant (fréquent avec un faible volume d'appels)",
+        "short": "peu utilisé"
       },
       "none": {
         "label": "Aucun",

@@ -2975,9 +2975,9 @@
         "short": "gemischt"
       },
       "unpriced": {
-        "label": "Ohne Preis",
-        "tooltip": "Ohne Preis — kein Eintrag in der Preistabelle für dieses Modell",
-        "short": "ohne Preis"
+        "label": "Selten genutzt",
+        "tooltip": "Selten genutzt — noch kein Eintrag in der Preistabelle für dieses Modell (üblich bei geringer Aufrufzahl)",
+        "short": "selten genutzt"
       },
       "none": {
         "label": "Keine",

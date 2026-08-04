@@ -2975,9 +2975,9 @@
         "short": "mixed"
       },
       "unpriced": {
-        "label": "Unpriced",
-        "tooltip": "Unpriced — no pricing table entry for this model",
-        "short": "unpriced"
+        "label": "Rarely called",
+        "tooltip": "Rarely called — no pricing-table entry for this model yet (common while call volume is low)",
+        "short": "rarely called"
       },
       "none": {
         "label": "None",
