@@ -551,14 +551,19 @@ async def run_channel_dispatch(
                 )
                 pairing_code = admission.pairing_id[:8]
 
-                notice = _route_envelope_reply_message(
-                    render_channel_message(
-                        "pairing_required",
-                        config=config,
-                        pairing_code=pairing_code,
+                notice = _route_control_reply(
+                    channel,
+                    _route_envelope_reply_message(
+                        render_channel_message(
+                            "pairing_required",
+                            config=config,
+                            pairing_code=pairing_code,
+                        ),
+                        route_envelope,
+                        metadata={"pairing_required": True, "pairing_code": pairing_code},
                     ),
+                    msg,
                     route_envelope,
-                    metadata={"pairing_required": True, "pairing_code": pairing_code},
                 )
                 try:
                     await channel.send(notice)
@@ -594,7 +599,9 @@ async def run_channel_dispatch(
         )
         if approval_reply is not None:
             try:
-                await channel.send(_preserve_route_channel_metadata(approval_reply, route_envelope))
+                await channel.send(
+                    _route_control_reply(channel, approval_reply, msg, route_envelope)
+                )
             except Exception as exc:  # noqa: BLE001 - reply delivery is best-effort
                 # The approval outcome is already recorded; a failed reply
                 # send must not escape the loop and burn the channel's
@@ -615,6 +622,9 @@ async def run_channel_dispatch(
                 route_envelope=route_envelope, msg=msg, session_manager=session_manager, session_key=session_key, session_prefix=session_prefix, rpc_dispatcher=rpc_dispatcher, context_factory=channel_rpc_context_factory, config=config  # noqa: E501
             )
             if command_reply is not None:
+                command_reply = _route_control_reply(
+                    channel, command_reply, msg, route_envelope
+                )
                 emit = log.warning if command_reply.metadata.get("denied") else log.info
                 if command_reply.metadata.get("denied"):
                     event = "channel.command_denied"
@@ -630,6 +640,7 @@ async def run_channel_dispatch(
                     command_reply,
                     route_envelope=route_envelope,
                     session_key=session_key,
+                    msg=msg,
                 )
                 if delivery_store is not None:
                     delivery_store.complete_inbound(
@@ -725,8 +736,13 @@ async def run_channel_dispatch(
                 )
                 try:
                     await channel.send(
-                        _route_envelope_reply_message(
-                            "Server busy, please retry",
+                        _route_control_reply(
+                            channel,
+                            _route_envelope_reply_message(
+                                "Server busy, please retry",
+                                route_envelope,
+                            ),
+                            msg,
                             route_envelope,
                         )
                     )
@@ -818,8 +834,13 @@ async def run_channel_dispatch(
                 if isinstance(exc, StorageBusyError):
                     await status_reactor.failed(msg)
                     await channel.send(
-                        _route_envelope_reply_message(
-                            "Session storage is busy. Please retry this message.",
+                        _route_control_reply(
+                            channel,
+                            _route_envelope_reply_message(
+                                "Session storage is busy. Please retry this message.",
+                                route_envelope,
+                            ),
+                            msg,
                             route_envelope,
                         )
                     )
@@ -829,8 +850,13 @@ async def run_channel_dispatch(
                 if isinstance(exc, StaleEpochError):
                     await status_reactor.failed(msg)
                     await channel.send(
-                        _route_envelope_reply_message(
-                            "The session changed while accepting this message. Please retry.",
+                        _route_control_reply(
+                            channel,
+                            _route_envelope_reply_message(
+                                "The session changed while accepting this message. Please retry.",
+                                route_envelope,
+                            ),
+                            msg,
                             route_envelope,
                         )
                     )
@@ -844,8 +870,16 @@ async def run_channel_dispatch(
                         session_key=session_key,
                     )
                     await channel.send(
-                        _route_envelope_reply_message(
-                            "This channel message id was already used; the duplicate was ignored.",
+                        _route_control_reply(
+                            channel,
+                            _route_envelope_reply_message(
+                                (
+                                    "This channel message id was already used; "
+                                    "the duplicate was ignored."
+                                ),
+                                route_envelope,
+                            ),
+                            msg,
                             route_envelope,
                         )
                     )
@@ -862,8 +896,13 @@ async def run_channel_dispatch(
                         else "The project workspace is unavailable. Restore access and retry."
                     )
                     await channel.send(
-                        _route_envelope_reply_message(
-                            workspace_message,
+                        _route_control_reply(
+                            channel,
+                            _route_envelope_reply_message(
+                                workspace_message,
+                                route_envelope,
+                            ),
+                            msg,
                             route_envelope,
                         )
                     )
@@ -876,11 +915,16 @@ async def run_channel_dispatch(
                     raise
                 await status_reactor.failed(msg)
                 await channel.send(
-                    _route_envelope_reply_message(
-                        (
-                            "The session task queue is full. "
-                            f"Try again after queued work completes. ({exc})"
+                    _route_control_reply(
+                        channel,
+                        _route_envelope_reply_message(
+                            (
+                                "The session task queue is full. "
+                                f"Try again after queued work completes. ({exc})"
+                            ),
+                            route_envelope,
                         ),
+                        msg,
                         route_envelope,
                     )
                 )
@@ -1518,7 +1562,9 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         route_envelope=route_envelope,
     )
     if approval_reply is not None:
-        await channel.send(_preserve_route_channel_metadata(approval_reply, route_envelope))
+        await channel.send(
+            _route_control_reply(channel, approval_reply, msg, route_envelope)
+        )
         return
     _get_lock = getattr(turn_runner, "_get_session_lock", None)
     session_lock = _get_lock(session_key) if callable(_get_lock) else None
@@ -1569,8 +1615,13 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
                 cap=_in_flight.cap,
             )
             await channel.send(
-                _route_envelope_reply_message(
-                    "Server busy, please retry",
+                _route_control_reply(
+                    channel,
+                    _route_envelope_reply_message(
+                        "Server busy, please retry",
+                        route_envelope,
+                    ),
+                    msg,
                     route_envelope,
                 )
             )
@@ -1631,16 +1682,46 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
 
         if isinstance(exc, StorageBusyError):
             await status_reactor.failed(msg)
-            await channel.send(_route_envelope_reply_message("Session storage is busy. Please retry these messages.", route_envelope))  # noqa: E501
+            await channel.send(
+                _route_control_reply(
+                    channel,
+                    _route_envelope_reply_message(
+                        "Session storage is busy. Please retry these messages.",
+                        route_envelope,
+                    ),
+                    msg,
+                    route_envelope,
+                )
+            )
             return
         if isinstance(exc, StaleEpochError):
             await status_reactor.failed(msg)
-            await channel.send(_route_envelope_reply_message("The session changed while accepting these messages. Please retry.", route_envelope))  # noqa: E501
+            await channel.send(
+                _route_control_reply(
+                    channel,
+                    _route_envelope_reply_message(
+                        "The session changed while accepting these messages. Please retry.",
+                        route_envelope,
+                    ),
+                    msg,
+                    route_envelope,
+                )
+            )
             return
         if isinstance(exc, TurnIngressConflictError):
             await status_reactor.failed(msg)
             log.warning("channel.ingress_idempotency_conflict", session_key=session_key)
-            await channel.send(_route_envelope_reply_message("This channel message id was already used; the duplicate was ignored.", route_envelope))  # noqa: E501
+            await channel.send(
+                _route_control_reply(
+                    channel,
+                    _route_envelope_reply_message(
+                        "This channel message id was already used; the duplicate was ignored.",
+                        route_envelope,
+                    ),
+                    msg,
+                    route_envelope,
+                )
+            )
             return
         if isinstance(exc, ProjectWorkspaceStateError):
             await status_reactor.failed(msg)
@@ -1650,8 +1731,13 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
                 else "The project workspace is unavailable. Restore access and retry."
             )
             await channel.send(
-                _route_envelope_reply_message(
-                    workspace_message,
+                _route_control_reply(
+                    channel,
+                    _route_envelope_reply_message(
+                        workspace_message,
+                        route_envelope,
+                    ),
+                    msg,
                     route_envelope,
                 )
             )
@@ -1659,7 +1745,20 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         if isinstance(exc, TaskQueueFullError):
             await status_reactor.failed(msg)
             log.warning("channel_dispatch.debounce_enqueue_failed", session_key=session_key, reason="queue_full", coalesced_count=combined.coalesced_count)  # noqa: E501
-            await channel.send(_route_envelope_reply_message("Your messages couldn't be processed because the queue is full. Please retry.", route_envelope))  # noqa: E501
+            await channel.send(
+                _route_control_reply(
+                    channel,
+                    _route_envelope_reply_message(
+                        (
+                            "Your messages couldn't be processed because the "
+                            "queue is full. Please retry."
+                        ),
+                        route_envelope,
+                    ),
+                    msg,
+                    route_envelope,
+                )
+            )
             return
         log.exception("channel_dispatch.debounce_enqueue_failed", session_key=session_key, reason="unexpected")  # noqa: E501
         await status_reactor.failed(msg)
@@ -2137,6 +2236,47 @@ def _preserve_route_channel_metadata(
     if metadata == reply.metadata:
         return _sanitize_outgoing_message(reply)
     return _sanitize_outgoing_message(reply.model_copy(update={"metadata": metadata}))
+
+
+def _route_control_reply(
+    channel: Any,
+    reply: OutgoingMessage,
+    msg: IncomingMessage | None,
+    route_envelope: Any,
+) -> OutgoingMessage:
+    """Route a control-plane reply through the channel's own reply builder.
+
+    Command, approval, pairing, busy, and delivery-failure replies must land
+    in the same conversation as a normal turn reply on every adapter. Building
+    through ``channel.build_reply_message(content, inbound)`` inherits each
+    adapter's transport routing (QQ ``chat_type``/``openid``, Slack channel,
+    Telegram ``chat_id``, Matrix room, ...); the reply's control-plane
+    metadata (command markers, pairing codes, failure flags) is overlaid on
+    top so the caller's intent survives. Falls back to metadata preservation
+    when the adapter has no builder or the inbound message is unavailable.
+    """
+
+    builder = getattr(channel, "build_reply_message", None)
+    if callable(builder) and isinstance(msg, IncomingMessage):
+        try:
+            routed = builder(reply.content, msg)
+        except Exception:  # noqa: BLE001 - fall back to metadata preservation
+            routed = None
+        if isinstance(routed, OutgoingMessage):
+            metadata = dict(routed.metadata or {})
+            for key, value in (reply.metadata or {}).items():
+                if value is not None:
+                    metadata[key] = value
+            return _sanitize_outgoing_message(
+                routed.model_copy(
+                    update={
+                        "content": reply.content,
+                        "attachments": list(reply.attachments or []),
+                        "metadata": metadata,
+                    }
+                )
+            )
+    return _preserve_route_channel_metadata(reply, route_envelope)
 
 
 def _status_reactor(channel: Any) -> Any:
@@ -3476,6 +3616,7 @@ async def _notify_channel_reply_lost(
     route_envelope: Any,
     session_key: str,
     error_class: str,
+    msg: IncomingMessage | None = None,
 ) -> None:
     """Tell the user their answer exists but could not be delivered.
 
@@ -3487,12 +3628,17 @@ async def _notify_channel_reply_lost(
         return
     try:
         await channel.send(
-            _route_envelope_reply_message(
-                "I finished this reply but could not deliver it to this chat. "
-                "Ask again to have it re-sent, or check the gateway's channel "
-                "diagnostics if it keeps happening.",
+            _route_control_reply(
+                channel,
+                _route_envelope_reply_message(
+                    "I finished this reply but could not deliver it to this chat. "
+                    "Ask again to have it re-sent, or check the gateway's channel "
+                    "diagnostics if it keeps happening.",
+                    route_envelope,
+                    metadata={"delivery_failure_notice": True, "error_class": error_class},
+                ),
+                msg,
                 route_envelope,
-                metadata={"delivery_failure_notice": True, "error_class": error_class},
             )
         )
     except asyncio.CancelledError:
@@ -3560,6 +3706,7 @@ async def _deliver_reply_or_notify(
     *,
     route_envelope: Any,
     session_key: str,
+    msg: IncomingMessage | None = None,
 ) -> bool:
     """Send a reply; on final failure tell the user rather than going silent."""
     error_class: str | None = None
@@ -3579,6 +3726,7 @@ async def _deliver_reply_or_notify(
         route_envelope=route_envelope,
         session_key=session_key,
         error_class=error_class,
+        msg=msg,
     )
     return False
 
@@ -3713,6 +3861,7 @@ async def _deliver_runtime_channel_reply(
                     ),
                     route_envelope=route_envelope,
                     session_key=session_key,
+                    msg=inbound,
                 )
             undelivered = await _deliver_artifacts_as_channel_files(
                 channel,
@@ -3732,6 +3881,7 @@ async def _deliver_runtime_channel_reply(
                     ),
                     route_envelope=route_envelope,
                     session_key=session_key,
+                    msg=inbound,
                 )
         else:
             fallback_lines = _artifact_fallback_lines(artifacts)
@@ -3748,6 +3898,7 @@ async def _deliver_runtime_channel_reply(
                     ),
                     route_envelope=route_envelope,
                     session_key=session_key,
+                    msg=inbound,
                 )
 
 
