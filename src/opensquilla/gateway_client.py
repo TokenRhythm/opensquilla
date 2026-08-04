@@ -11,6 +11,10 @@ from urllib.parse import urlparse, urlunparse
 from opensquilla.contracts.gateway_transport import (
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
     GATEWAY_CLIENT_MAX_QUEUE,
+    GATEWAY_HISTORY_MAX_RESPONSE_BUDGET_BYTES,
+    GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+    GATEWAY_HISTORY_RESPONSE_RETRY_CODES,
+    gateway_feature_methods,
 )
 
 
@@ -81,10 +85,13 @@ class GatewayRPCClient:
         self._heartbeat_interval = 48.0
         self._connection_error: ConnectionError | None = None
         self._closing = False
+        self._server_methods: frozenset[str] | None = None
+        self._known_missing_server_methods: set[str] = set()
 
     async def connect(self, url: str = "ws://localhost:18791/ws") -> None:
         if self._ws is not None:
             await self.close()
+        self._reset_server_capabilities()
         self._closing = False
         self._connection_error = None
         try:
@@ -129,6 +136,7 @@ class GatewayRPCClient:
             await self._close_failed_connect()
             raise
 
+        self._server_methods = gateway_feature_methods(hello)
         policy = hello.get("policy") if isinstance(hello.get("policy"), dict) else {}
         self._heartbeat_interval = _heartbeat_interval_from_policy(policy)
         self._listener_task = asyncio.create_task(self._listen())
@@ -163,11 +171,14 @@ class GatewayRPCClient:
             raise TimeoutError(f"{method} timed out after {self.request_timeout_s:g}s") from exc
         if not res.get("ok"):
             err = res.get("error", {})
+            raw_details = err.get("data")
+            if not isinstance(raw_details, dict):
+                raw_details = err.get("details")
             raise GatewayRPCError(
                 method,
                 code=err.get("code"),
                 message=err.get("message") or "RPC failed",
-                data=err.get("data") if isinstance(err.get("data"), dict) else None,
+                data=raw_details if isinstance(raw_details, dict) else None,
             )
         payload = res.get("payload")
         return {} if payload is None else payload
@@ -197,6 +208,41 @@ class GatewayRPCClient:
             params["includeCanonical"] = include_canonical
         if include_summaries is not None:
             params["includeSummaries"] = include_summaries
+        if include_canonical is False:
+            return cast(
+                dict[str, Any],
+                await self.call("chat.history", params),
+            )
+        if self._server_method_support("chat.history.v2") is not False:
+            try:
+                return cast(
+                    dict[str, Any],
+                    await self.call(
+                        "chat.history.v2",
+                        {
+                            **params,
+                            "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+                        },
+                    ),
+                )
+            except GatewayRPCError as exc:
+                error_code = str(exc.code or "").upper()
+                if error_code in GATEWAY_HISTORY_RESPONSE_RETRY_CODES:
+                    return cast(
+                        dict[str, Any],
+                        await self.call(
+                            "chat.history.v2",
+                            {
+                                **params,
+                                "maxResponseBytes": (
+                                    GATEWAY_HISTORY_MAX_RESPONSE_BUDGET_BYTES
+                                ),
+                            },
+                        ),
+                    )
+                if error_code != "METHOD_NOT_FOUND":
+                    raise
+                self._mark_server_method_missing("chat.history.v2")
         return cast(
             dict[str, Any],
             await self.call("chat.history", params),
@@ -222,8 +268,10 @@ class GatewayRPCClient:
         self._ws = None
         self._heartbeat_task = None
         self._listener_task = None
+        self._reset_server_capabilities()
 
     async def _close_failed_connect(self) -> None:
+        self._reset_server_capabilities()
         ws = self._ws
         self._ws = None
         if ws is not None:
@@ -262,6 +310,7 @@ class GatewayRPCClient:
             self._mark_connection_failed(exc)
 
     def _mark_connection_failed(self, exc: BaseException) -> ConnectionError:
+        self._reset_server_capabilities()
         if isinstance(exc, ConnectionError):
             err = exc
         else:
@@ -279,6 +328,20 @@ class GatewayRPCClient:
             if task is not None and task is not current_task and not task.done():
                 task.cancel()
         return err
+
+    def _reset_server_capabilities(self) -> None:
+        self._server_methods = None
+        self._known_missing_server_methods.clear()
+
+    def _server_method_support(self, method: str) -> bool | None:
+        if method in self._known_missing_server_methods:
+            return False
+        if self._server_methods is None:
+            return None
+        return method in self._server_methods
+
+    def _mark_server_method_missing(self, method: str) -> None:
+        self._known_missing_server_methods.add(method)
 
 
 def _heartbeat_interval_from_policy(policy: dict[str, Any]) -> float:

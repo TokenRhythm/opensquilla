@@ -340,6 +340,119 @@ async def test_gateway_runtime_dispatches_messages_slash_commands_and_exit(
 
 
 @pytest.mark.asyncio
+async def test_session_switch_subscribes_from_the_snapshot_applied_to_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.repl import gateway_runtime
+    from opensquilla.cli.tui.opentui.history import (
+        apply_bootstrap_to_state,
+        history_replace_from_bootstrap,
+    )
+
+    old_key = "agent:main:old"
+    new_key = "agent:main:new"
+
+    class _Subscription:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[None] = asyncio.Queue()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> dict[str, Any]:
+            await self.queue.get()
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            self.queue.put_nowait(None)
+
+    class _Client:
+        instances: list[_Client] = []
+
+        def __init__(self) -> None:
+            self.bootstrap_calls: list[tuple[str, int]] = []
+            self.subscribe_calls: list[tuple[str, int | None]] = []
+            _Client.instances.append(self)
+
+        async def connect(self, url: str, *, token: str | None = None) -> None:
+            return None
+
+        async def create_session(self, model: str | None = None) -> str:
+            return old_key
+
+        async def bootstrap_session(self, key: str, *, limit: int = 200) -> dict[str, Any]:
+            self.bootstrap_calls.append((key, limit))
+            # A second snapshot of the switched session observes a later
+            # cursor. Subscribing from it would skip the event between the
+            # history replacement and subscription.
+            new_reads = sum(call_key == new_key for call_key, _ in self.bootstrap_calls)
+            cursor = 10 if key == old_key else 19 + new_reads
+            return {
+                "session": {"session_key": key, "model": "gateway/model"},
+                "history": {
+                    "messages": [],
+                    "history_scope": "complete",
+                    "loaded_count": 0,
+                    "canonical_available": True,
+                },
+                "stream_cursor": cursor,
+                "queue": {"running_count": 0, "queued_count": 0},
+            }
+
+        async def subscribe_session_events(
+            self,
+            key: str,
+            *,
+            since_stream_seq: int | None = None,
+        ) -> _Subscription:
+            self.subscribe_calls.append((key, since_stream_seq))
+            return _Subscription()
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+
+    async def handle_slash(
+        _cmd: str,
+        state: ChatSessionState,
+        client: _Client,
+        _elevated_state: dict[str, str | None],
+        *,
+        tui_output: object | None = None,
+    ) -> bool:
+        snapshot = await client.bootstrap_session(new_key, limit=200)
+        history = history_replace_from_bootstrap(
+            snapshot,
+            fallback_session_key=new_key,
+        )
+        apply_bootstrap_to_state(state, snapshot, history)
+        return True
+
+    async def input_loop(*, scope, dispatch, abort_active_turn=None) -> None:
+        assert await dispatch("/switch") is True
+        assert await dispatch("/exit") is False
+
+    deps = gateway_runtime.GatewayRuntimeDependencies(
+        stream_response=cast(Any, None),
+        handle_slash_command=handle_slash,
+        run_input_loop=input_loop,
+        get_tui_output=lambda _scope: None,
+        is_exit_command=lambda value: value == "/exit",
+        notify=lambda _notice: None,
+    )
+
+    await gateway_runtime.run_gateway_chat(model=None, session_id=None, deps=deps)
+
+    client = _Client.instances[-1]
+    assert client.subscribe_calls == [(old_key, 10), (new_key, 20)]
+    assert client.bootstrap_calls[:2] == [(old_key, 200), (new_key, 200)]
+    # The only later switched-session bootstrap is the bounded exit receipt,
+    # after the observer has already subscribed from cursor 20.
+    assert client.bootstrap_calls == [(old_key, 200), (new_key, 200), (new_key, 1)]
+
+
+@pytest.mark.asyncio
 async def test_gateway_abort_targets_active_turn_session_after_session_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1052,6 +1165,7 @@ async def test_external_turn_discovery_routes_interleaved_turns_once(
 
     session_key = "agent:main:shared"
     client = GatewayClient()
+    client._server_methods = frozenset({"sessions.bootstrap"})  # noqa: SLF001
 
     async def call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         if method == "sessions.messages.subscribe":

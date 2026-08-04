@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from opensquilla.gateway_client import GatewayRPCError
 from opensquilla.mcp_server.bridge import OpenSquillaMCPBridge
 
 
@@ -32,8 +35,26 @@ class FakeGatewayClient:
         self.calls.append(("sessions.resolve", {"key": key}))
         return {"key": key, "session_id": "sid-1", "agent_id": "main"}
 
-    async def session_history(self, session_key: str, limit: int = 1000) -> dict[str, Any]:
-        self.calls.append(("chat.history", {"sessionKey": session_key, "limit": limit}))
+    async def session_history(
+        self,
+        session_key: str,
+        limit: int = 1000,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        include_canonical: bool | None = None,
+        include_summaries: bool | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"sessionKey": session_key, "limit": limit}
+        if before is not None:
+            params["before"] = before
+        if after is not None:
+            params["after"] = after
+        if include_canonical is not None:
+            params["includeCanonical"] = include_canonical
+        if include_summaries is not None:
+            params["includeSummaries"] = include_summaries
+        self.calls.append(("chat.history", params))
         return {
             "messages": [
                 {
@@ -95,6 +116,61 @@ class FakeGatewayClient:
         return await asyncio.wait_for(self.events.get(), timeout=timeout)
 
 
+class PagedHistoryGatewayClient(FakeGatewayClient):
+    def __init__(
+        self,
+        pages: dict[str | None, dict[str, Any]],
+        *,
+        detail_message: bytes | None = None,
+    ) -> None:
+        super().__init__()
+        self.pages = pages
+        self.detail_message = detail_message
+
+    async def session_history(
+        self,
+        session_key: str,
+        limit: int = 1000,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        include_canonical: bool | None = None,
+        include_summaries: bool | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"sessionKey": session_key, "limit": limit}
+        if before is not None:
+            params["before"] = before
+        if after is not None:
+            params["after"] = after
+        if include_canonical is not None:
+            params["includeCanonical"] = include_canonical
+        if include_summaries is not None:
+            params["includeSummaries"] = include_summaries
+        self.calls.append(("chat.history", params))
+        return dict(self.pages[before])
+
+    async def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        if method != "chat.history.entry.v1":
+            return await super().call(method, params)
+        assert params is not None
+        assert self.detail_message is not None
+        self.calls.append((method, dict(params)))
+        offset = int(params["offset"])
+        end = min(len(self.detail_message), offset + int(params["chunkBytes"]))
+        return {
+            "session_key": params["sessionKey"],
+            "cursor": params["cursor"],
+            "encoding": "base64",
+            "field": params["field"],
+            "content_type": "application/json",
+            "chunk_base64": base64.b64encode(self.detail_message[offset:end]).decode("ascii"),
+            "offset": offset,
+            "next": end if end < len(self.detail_message) else None,
+            "total": len(self.detail_message),
+            "sha256": hashlib.sha256(self.detail_message).hexdigest(),
+        }
+
+
 @pytest.mark.asyncio
 async def test_bridge_reuses_gateway_read_rpcs() -> None:
     client = FakeGatewayClient()
@@ -116,6 +192,236 @@ async def test_bridge_reuses_gateway_read_rpcs() -> None:
         ("sessions.resolve", {"key": "agent:main:main"}),
         ("chat.history", {"sessionKey": "agent:main:main", "limit": 5}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_bridge_messages_read_forwards_bounded_page_cursors() -> None:
+    client = FakeGatewayClient()
+    bridge = OpenSquillaMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.messages_read("agent:main:main", limit=25, before="12|4")
+    await bridge.messages_read("agent:main:main", limit=10, after="18|9")
+
+    assert client.calls == [
+        (
+            "chat.history",
+            {"sessionKey": "agent:main:main", "limit": 25, "before": "12|4"},
+        ),
+        (
+            "chat.history",
+            {"sessionKey": "agent:main:main", "limit": 10, "after": "18|9"},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transcript_jsonl_pages_up_to_total_limit_in_chronological_order() -> None:
+    pages = {
+        None: {
+            "messages": [
+                {"message_id": "m3", "role": "user", "text": "three", "timestamp": 3},
+                {
+                    "message_id": "m4",
+                    "role": "assistant",
+                    "text": "four",
+                    "timestamp": 4,
+                },
+            ],
+            "has_more": True,
+            "oldest_cursor": "3|3",
+            "newest_cursor": "4|4",
+            "canonical_available": True,
+            "canonical_complete": True,
+        },
+        "3|3": {
+            "messages": [
+                {"message_id": "m1", "role": "user", "text": "one", "timestamp": 1},
+                {
+                    "message_id": "m2",
+                    "role": "assistant",
+                    "text": "two",
+                    "timestamp": 2,
+                },
+            ],
+            "has_more": False,
+            "oldest_cursor": "1|1",
+            "newest_cursor": "2|2",
+            "canonical_available": True,
+            "canonical_complete": True,
+        },
+    }
+    client = PagedHistoryGatewayClient(pages)
+    bridge = OpenSquillaMCPBridge(gateway_client_factory=lambda: client)
+
+    transcript = await bridge.transcript_jsonl("agent:main:main", limit=4)
+
+    rows = [json.loads(line) for line in transcript.splitlines()]
+    assert [row["message"]["content"][0]["text"] for row in rows] == [
+        "one",
+        "two",
+        "three",
+        "four",
+    ]
+    history_calls = [params for method, params in client.calls if method == "chat.history"]
+    assert [params.get("before") for params in history_calls] == [None, "3|3"]
+    assert [params["limit"] for params in history_calls] == [4, 2]
+    assert all(params["includeCanonical"] is True for params in history_calls)
+    assert all(params["includeSummaries"] is False for params in history_calls)
+
+
+@pytest.mark.asyncio
+async def test_transcript_jsonl_limit_is_total_not_page_size() -> None:
+    pages = {
+        None: {
+            "messages": [
+                {"message_id": "m3", "role": "user", "text": "three", "timestamp": 3},
+                {"message_id": "m4", "role": "assistant", "text": "four", "timestamp": 4},
+            ],
+            "has_more": True,
+            "oldest_cursor": "3|3",
+            "newest_cursor": "4|4",
+            "canonical_available": True,
+            "canonical_complete": True,
+        },
+        "3|3": {
+            "messages": [
+                {"message_id": "m1", "role": "user", "text": "one", "timestamp": 1},
+                {"message_id": "m2", "role": "assistant", "text": "two", "timestamp": 2},
+            ],
+            "has_more": False,
+            "oldest_cursor": "1|1",
+            "newest_cursor": "2|2",
+            "canonical_available": True,
+            "canonical_complete": True,
+        },
+    }
+    client = PagedHistoryGatewayClient(pages)
+    bridge = OpenSquillaMCPBridge(gateway_client_factory=lambda: client)
+
+    transcript = await bridge.transcript_jsonl("agent:main:main", limit=2)
+
+    rows = [json.loads(line) for line in transcript.splitlines()]
+    assert [row["message"]["content"][0]["text"] for row in rows] == ["three", "four"]
+    history_calls = [params for method, params in client.calls if method == "chat.history"]
+    assert len(history_calls) == 1
+    assert history_calls[0]["limit"] == 2
+
+
+@pytest.mark.asyncio
+async def test_transcript_jsonl_resolves_giant_detail_without_dropping_preview() -> None:
+    content = "详情开头🦐" + ("x" * 1_100_000) + "详情结尾"
+    full_message = {
+        "message_id": "giant-message",
+        "transcript_id": 9,
+        "role": "assistant",
+        "text": content,
+        "timestamp": 9,
+    }
+    detail_message = json.dumps(
+        full_message,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    pages = {
+        None: {
+            "messages": [
+                {
+                    "message_id": "giant-message",
+                    "transcript_id": 9,
+                    "role": "assistant",
+                    "preview": "详情开头🦐",
+                    "timestamp": 9,
+                    "original_bytes": len(detail_message),
+                    "detail_ref": {
+                        "method": "chat.history.entry.v1",
+                        "sessionKey": "agent:main:main",
+                        "cursor": "9|9",
+                    },
+                    "truncated_by_bytes": True,
+                }
+            ],
+            "has_more": False,
+            "oldest_cursor": "9|9",
+            "newest_cursor": "9|9",
+            "canonical_available": True,
+            "canonical_complete": True,
+        }
+    }
+    client = PagedHistoryGatewayClient(pages, detail_message=detail_message)
+    bridge = OpenSquillaMCPBridge(gateway_client_factory=lambda: client)
+
+    transcript = await bridge.transcript_jsonl("agent:main:main")
+
+    row = json.loads(transcript)
+    assert row["message"]["role"] == "assistant"
+    assert row["message"]["content"][0]["text"] == content
+    detail_calls = [
+        params for method, params in client.calls if method == "chat.history.entry.v1"
+    ]
+    assert len(detail_calls) > 2
+    assert [params["offset"] for params in detail_calls] == [
+        index * 128 * 1024 for index in range(len(detail_calls))
+    ]
+    assert all(params["field"] == "message" for params in detail_calls)
+
+
+@pytest.mark.parametrize("preview_field", ["preview", "text"])
+@pytest.mark.asyncio
+async def test_transcript_jsonl_rejects_any_truncated_message_without_detail_ref(
+    preview_field: str,
+) -> None:
+    pages = {
+        None: {
+            "messages": [
+                {
+                    "message_id": "truncated-message",
+                    "transcript_id": 9,
+                    "role": "assistant",
+                    preview_field: "incomplete preview",
+                    "timestamp": 9,
+                    "truncated_by_bytes": True,
+                }
+            ],
+            "has_more": False,
+            "oldest_cursor": "9|9",
+            "newest_cursor": "9|9",
+            "canonical_available": True,
+            "canonical_complete": True,
+        }
+    }
+    client = PagedHistoryGatewayClient(pages)
+    bridge = OpenSquillaMCPBridge(gateway_client_factory=lambda: client)
+
+    with pytest.raises(GatewayRPCError) as exc_info:
+        await bridge.transcript_jsonl("agent:main:main")
+
+    assert exc_info.value.code == "HISTORY_DETAIL_REFERENCE_MISSING"
+
+
+@pytest.mark.asyncio
+async def test_bridge_message_detail_read_exposes_one_bounded_chunk() -> None:
+    detail_message = b'{"message_id":"m1","text":"hello"}'
+    client = PagedHistoryGatewayClient({}, detail_message=detail_message)
+    bridge = OpenSquillaMCPBridge(gateway_client_factory=lambda: client)
+
+    chunk = await bridge.message_detail_read(
+        "agent:main:main",
+        "1|1",
+        offset=5,
+        chunk_bytes=7,
+    )
+
+    assert base64.b64decode(chunk["chunk_base64"]) == detail_message[5:12]
+    assert client.calls[-1] == (
+        "chat.history.entry.v1",
+        {
+            "sessionKey": "agent:main:main",
+            "cursor": "1|1",
+            "offset": 5,
+            "chunkBytes": 7,
+            "field": "message",
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -148,7 +454,14 @@ async def test_messages_send_subscribes_before_accepting_turn() -> None:
     }
     assert client.closed is True
     assert client.calls == [
-        ("sessions.messages.subscribe", {"key": "agent:main:main", "since_stream_seq": None}),
+        (
+            "sessions.messages.subscribe",
+            {
+                "key": "agent:main:main",
+                "since_stream_seq": None,
+                "fast_ack": True,
+            },
+        ),
         (
             "sessions.send",
             {

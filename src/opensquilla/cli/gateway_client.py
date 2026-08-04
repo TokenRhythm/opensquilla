@@ -15,6 +15,10 @@ from urllib.parse import urlparse
 from opensquilla.contracts.gateway_transport import (
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
     GATEWAY_CLIENT_MAX_QUEUE,
+    GATEWAY_HISTORY_MAX_RESPONSE_BUDGET_BYTES,
+    GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+    GATEWAY_HISTORY_RESPONSE_RETRY_CODES,
+    gateway_feature_methods,
 )
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
@@ -361,6 +365,8 @@ class GatewayClient:
         self._heartbeat_interval: float = 48.0
         self._connection_error: ConnectionError | None = None
         self._closing = False
+        self._server_methods: frozenset[str] | None = None
+        self._known_missing_server_methods: set[str] = set()
         self._http_base: str | None = None
         self._auth_token: str | None = None
         self.surface_id = f"tui:{uuid.uuid4().hex}"
@@ -395,6 +401,7 @@ class GatewayClient:
         )
         if has_existing_connection:
             await self.close()
+        self._reset_server_capabilities()
         self._closing = False
         self._connection_error = None
         try:
@@ -479,6 +486,7 @@ class GatewayClient:
             raise SystemExit(f"Handshake failed: {hello!r}")
         if hello.get("type") != "hello-ok":
             raise SystemExit(f"Handshake failed: {hello}")
+        self._server_methods = gateway_feature_methods(hello)
         policy_value = hello.get("policy")
         policy = cast(dict[str, Any], policy_value) if isinstance(policy_value, dict) else {}
         self._heartbeat_interval = _heartbeat_interval_from_policy(policy)
@@ -491,6 +499,20 @@ class GatewayClient:
         """Cache a bearer token used for HTTP-side requests (e.g. uploads)."""
 
         self._auth_token = token
+
+    def _reset_server_capabilities(self) -> None:
+        self._server_methods = None
+        self._known_missing_server_methods.clear()
+
+    def _server_method_support(self, method: str) -> bool | None:
+        if method in self._known_missing_server_methods:
+            return False
+        if self._server_methods is None:
+            return None
+        return method in self._server_methods
+
+    def _mark_server_method_missing(self, method: str) -> None:
+        self._known_missing_server_methods.add(method)
 
     @property
     def is_local_gateway(self) -> bool:
@@ -708,20 +730,50 @@ class GatewayClient:
         *,
         limit: int = 200,
     ) -> dict[str, Any]:
-        """Return a session startup snapshot, including an rc4-daemon fallback.
+        """Return a bounded session startup snapshot, including old-daemon fallbacks.
 
-        ``sessions.bootstrap`` is additive.  A user can upgrade the CLI while
+        Both bootstrap methods are additive. A user can upgrade the CLI while
         an older Gateway process is still serving the same profile, so a
         method-missing response must not break either the plain rescue renderer
-        or the TUI before the user has a chance to restart that daemon.  The
-        legacy composition deliberately stays read-only and uses only RPCs
-        already present in Preview 4.
+        or the TUI before the user has a chance to restart that daemon.
         """
+
+        legacy_params = {"key": key, "limit": limit}
+        if self._server_method_support("sessions.bootstrap.v2") is not False:
+            try:
+                return cast(
+                    dict[str, Any],
+                    await self._call(
+                        "sessions.bootstrap.v2",
+                        {
+                            **legacy_params,
+                            "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+                        },
+                    ),
+                )
+            except GatewayRPCError as exc:
+                error_code = str(exc.code or "").upper()
+                if error_code in GATEWAY_HISTORY_RESPONSE_RETRY_CODES:
+                    return cast(
+                        dict[str, Any],
+                        await self._call(
+                            "sessions.bootstrap.v2",
+                            {
+                                **legacy_params,
+                                "maxResponseBytes": (
+                                    GATEWAY_HISTORY_MAX_RESPONSE_BUDGET_BYTES
+                                ),
+                            },
+                        ),
+                    )
+                if error_code != "METHOD_NOT_FOUND":
+                    raise
+                self._mark_server_method_missing("sessions.bootstrap.v2")
 
         try:
             return cast(
                 dict[str, Any],
-                await self._call("sessions.bootstrap", {"key": key, "limit": limit}),
+                await self._call("sessions.bootstrap", legacy_params),
             )
         except GatewayRPCError as exc:
             if str(exc.code or "").upper() != "METHOD_NOT_FOUND":
@@ -779,6 +831,41 @@ class GatewayClient:
             params["includeCanonical"] = include_canonical
         if include_summaries is not None:
             params["includeSummaries"] = include_summaries
+        if include_canonical is False:
+            return cast(
+                dict[str, Any],
+                await self._call("chat.history", params),
+            )
+        if self._server_method_support("chat.history.v2") is not False:
+            try:
+                return cast(
+                    dict[str, Any],
+                    await self._call(
+                        "chat.history.v2",
+                        {
+                            **params,
+                            "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+                        },
+                    ),
+                )
+            except GatewayRPCError as exc:
+                error_code = str(exc.code or "").upper()
+                if error_code in GATEWAY_HISTORY_RESPONSE_RETRY_CODES:
+                    return cast(
+                        dict[str, Any],
+                        await self._call(
+                            "chat.history.v2",
+                            {
+                                **params,
+                                "maxResponseBytes": (
+                                    GATEWAY_HISTORY_MAX_RESPONSE_BUDGET_BYTES
+                                ),
+                            },
+                        ),
+                    )
+                if error_code != "METHOD_NOT_FOUND":
+                    raise
+                self._mark_server_method_missing("chat.history.v2")
         return cast(
             dict[str, Any],
             await self._call("chat.history", params),
@@ -997,7 +1084,7 @@ class GatewayClient:
                     subscription.replay["replay_gap_reason"] = "client_backlog_window_missed"
                 subscription._activate(replay_frames)
                 return subscription
-            params: dict[str, Any] = {"key": session_key}
+            params: dict[str, Any] = {"key": session_key, "fast_ack": True}
             if since_stream_seq is not None:
                 params["since_stream_seq"] = since_stream_seq
             try:
@@ -1225,11 +1312,13 @@ class GatewayClient:
         self._session_event_backlog.clear()
         self._active_turn_ids.clear()
         self._pending_steer_v2.clear()
+        self._reset_server_capabilities()
         for subscription in tuple(self._event_subscriptions.values()):
             subscription._close_from_client()
         self._event_subscriptions.clear()
 
     def _mark_connection_failed(self, exc: BaseException) -> ConnectionError:
+        self._reset_server_capabilities()
         if isinstance(exc, ConnectionError) and str(exc).startswith("Gateway connection lost"):
             err = exc
         else:

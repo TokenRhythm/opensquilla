@@ -390,7 +390,8 @@ async def run_gateway_chat(
         if (
             session_id
             and (exc.code or "").upper() == "NOT_FOUND"
-            and exc.method in {"sessions.bootstrap", "sessions.resolve"}
+            and exc.method
+            in {"sessions.bootstrap", "sessions.bootstrap.v2", "sessions.resolve"}
         ):
             message = (
                 f"Session '{session_id}' was not found. Run `opensquilla sessions list` "

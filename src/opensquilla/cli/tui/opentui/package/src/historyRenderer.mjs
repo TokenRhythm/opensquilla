@@ -18,6 +18,35 @@ function optionalNumber(value) {
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
+function byteSizeText(value) {
+  const bytes = optionalNumber(value);
+  if (bytes === null) return "";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let amount = bytes;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  const digits = Number.isInteger(amount) || amount >= 10 ? 0 : 1;
+  return `${amount.toFixed(digits)} ${units[unit]}`;
+}
+
+function historyPreviewText(message) {
+  if (!message?.truncated_by_bytes) return "";
+  const originalSize = byteSizeText(message.original_bytes);
+  const size = originalSize ? ` · full entry ${originalSize}` : "";
+  return `byte-limited preview${size} · use /save to export complete content`;
+}
+
+function addHistoryPreviewNotice(view, message, blockPrefix) {
+  const text = historyPreviewText(message);
+  if (!text) return;
+  const blockId = `${blockPrefix}-byte-preview`;
+  view.begin(blockId, "history-detail", { text });
+  view.end(blockId);
+}
+
 function attachmentTail(message) {
   const names = Array.isArray(message?.attachments)
     ? message.attachments.map((item) => itemName(item, "attachment")).filter(Boolean)
@@ -150,14 +179,17 @@ function ensembleReceipt(message) {
 export function historyBoundaryText(message) {
   const count = Number(message?.loaded_count ?? message?.messages?.length ?? 0);
   const scope = String(message?.history_scope ?? "complete");
+  const byteTail = message?.truncated_by_bytes ? " · byte-limited" : "";
   if (scope === "compacted") {
     const summaries = Array.isArray(message?.compaction_summaries) ? message.compaction_summaries.length : 0;
     const summaryTail = summaries ? ` · ${summaries} earlier ${summaries === 1 ? "summary" : "summaries"}` : "";
-    return `history · compacted · ${count} recent messages${summaryTail}`;
+    return `history · compacted · ${count} recent messages${summaryTail}${byteTail}`;
   }
-  if (scope === "latest_window" || message?.has_more) return `history · latest ${count} messages · older messages available`;
+  if (scope === "latest_window" || message?.has_more) {
+    return `history · latest ${count} messages${byteTail} · older messages available`;
+  }
   if (count === 0) return "";
-  return `history · complete · ${count} messages`;
+  return `history · complete · ${count} messages${byteTail}`;
 }
 
 /** Clear old renderables, create a fresh flow, and synchronously replay one frame. */
@@ -209,6 +241,7 @@ export function replayHistory({ messages, flow, nextId }) {
         intent: safeText(context?.intent || "send"),
         disposition: safeText(context?.disposition || ""),
       });
+      addHistoryPreviewNotice(view, raw, blockPrefix);
       legacyAdjacentTurnOpen = true;
       continue;
     }
@@ -245,6 +278,7 @@ export function replayHistory({ messages, flow, nextId }) {
       if (kind !== "error") view.append(blockId, text);
       view.end(blockId);
     }
+    addHistoryPreviewNotice(view, raw, blockPrefix);
     const artifacts = artifactText(raw);
     if (artifacts) {
       const blockId = `${blockPrefix}-artifacts`;

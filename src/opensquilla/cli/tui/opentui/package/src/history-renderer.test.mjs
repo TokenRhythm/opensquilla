@@ -39,6 +39,7 @@ function harness() {
 test("history boundary labels complete, windowed, and compacted snapshots", () => {
   assert.equal(historyBoundaryText({ history_scope: "complete", loaded_count: 4 }), "history · complete · 4 messages");
   assert.equal(historyBoundaryText({ history_scope: "latest_window", loaded_count: 20 }), "history · latest 20 messages · older messages available");
+  assert.equal(historyBoundaryText({ history_scope: "latest_window", loaded_count: 1, truncated_by_bytes: true }), "history · latest 1 messages · byte-limited · older messages available");
   assert.equal(historyBoundaryText({ history_scope: "compacted", loaded_count: 8, compaction_summaries: [{ id: "s1" }] }), "history · compacted · 8 recent messages · 1 earlier summary");
   assert.equal(historyBoundaryText({ history_scope: "complete", loaded_count: 0 }), "");
 });
@@ -107,6 +108,46 @@ test("canonical history reuses live turn blocks and deduplicates durable ids", (
   ));
   assert.equal(events.filter((event) => event[0] === "finish").length, 1);
   assert.equal(events.some((event) => event.includes("duplicate")), false);
+});
+
+test("byte-truncated history labels user and assistant previews with a save hint", () => {
+  const { flow, views } = harness();
+  replayHistory({
+    flow,
+    nextId: (id) => `history-${id}`,
+    messages: [
+      {
+        id: "preview-user",
+        role: "user",
+        text: "partial question",
+        truncated_by_bytes: true,
+        original_bytes: 98_304,
+        detail_ref: { method: "chat.history.entry.v1", cursor: "1|1" },
+      },
+      {
+        id: "preview-assistant",
+        role: "assistant",
+        text: "partial answer",
+        truncated_by_bytes: true,
+        original_bytes: 2_048,
+        detail_ref: { method: "chat.history.entry.v1", cursor: "2|2" },
+      },
+      { id: "complete-assistant", role: "assistant", text: "complete answer" },
+    ],
+  });
+
+  const events = views.flatMap((view) => view.events);
+  const notices = events.filter(
+    (event) => event[0] === "begin"
+      && event[2] === "history-detail"
+      && event[1].endsWith("-byte-preview"),
+  );
+  assert.deepEqual(notices.map((event) => event[3].text), [
+    "byte-limited preview · full entry 96 KiB · use /save to export complete content",
+    "byte-limited preview · full entry 2 KiB · use /save to export complete content",
+  ]);
+  assert.ok(events.some((event) => event[0] === "append" && event[2] === "partial answer"));
+  assert.equal(notices.some((event) => event[1].includes("complete-assistant")), false);
 });
 
 test("causal turn identity groups prompt, reasoning, tools, and answer after hydrate", () => {

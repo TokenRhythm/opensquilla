@@ -798,10 +798,28 @@ async def run_gateway_chat(
                     if session_context.session_key != slash_session_key and callable(
                         getattr(client, "subscribe_session_events", None)
                     ):
-                        switch_snapshot = await client.bootstrap_session(
-                            session_context.session_key,
-                            limit=1,
+                        switch_snapshot = session_context.state.gateway_bootstrap
+                        raw_applied_session = (
+                            switch_snapshot.get("session")
+                            if isinstance(switch_snapshot, dict)
+                            else None
                         )
+                        applied_session = (
+                            raw_applied_session
+                            if isinstance(raw_applied_session, dict)
+                            else {}
+                        )
+                        if (
+                            not isinstance(switch_snapshot, dict)
+                            or str(applied_session.get("session_key") or "")
+                            != session_context.session_key
+                        ):
+                            # Compatibility for custom slash adapters that
+                            # mutate state without applying a bootstrap.
+                            switch_snapshot = await client.bootstrap_session(
+                                session_context.session_key,
+                                limit=1,
+                            )
                         session_context.scope["bootstrap"] = switch_snapshot
                         raw_switch_session = switch_snapshot.get("session")
                         switch_session = (

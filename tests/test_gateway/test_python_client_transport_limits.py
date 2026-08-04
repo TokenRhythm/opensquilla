@@ -73,6 +73,7 @@ async def _handshake(websocket: Any) -> None:
         _json_frame(
             {
                 "type": "hello-ok",
+                "features": {"methods": ["sessions.bootstrap"]},
                 "policy": {"client_ws_keepalive_timeout_ms": 120_000},
             }
         )

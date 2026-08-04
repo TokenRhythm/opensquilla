@@ -59,6 +59,51 @@ def test_bootstrap_projection_preserves_scope_content_and_durable_ids() -> None:
     assert history.messages[1].artifacts == ({"id": "artifact-1"},)
 
 
+def test_bootstrap_projection_renders_one_bounded_v2_preview() -> None:
+    snapshot = _snapshot()
+    snapshot["history"] = {
+        "history_scope": "latest_window",
+        "has_more": True,
+        "loaded_count": 1,
+        "canonical_available": True,
+        "truncated_by_bytes": True,
+        "messages": [
+            {
+                "message_id": "large-message",
+                "role": "assistant",
+                "preview": "bounded preview",
+                "detail_ref": {
+                    "method": "chat.history.entry.v1",
+                    "sessionKey": "agent:main:canonical",
+                    "cursor": "1|1",
+                },
+                "original_bytes": 98_304,
+                "truncated_by_bytes": True,
+            }
+        ],
+    }
+
+    history = history_replace_from_bootstrap(
+        snapshot,
+        fallback_session_key="agent:main:alias",
+    )
+
+    assert history.history_scope == "latest_window"
+    assert history.has_more is True
+    assert history.loaded_count == 1
+    assert history.truncated_by_bytes is True
+    assert len(history.messages) == 1
+    message = history.messages[0]
+    assert message.text == "bounded preview"
+    assert message.truncated_by_bytes is True
+    assert message.original_bytes == 98_304
+    assert message.detail_ref == {
+        "method": "chat.history.entry.v1",
+        "sessionKey": "agent:main:canonical",
+        "cursor": "1|1",
+    }
+
+
 def test_bootstrap_replaces_local_transcript_without_partial_usage_total() -> None:
     state = ChatSessionState(session_key="agent:main:old", model="old")
     state.transcript.add("user", "stale")

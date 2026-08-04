@@ -17,9 +17,10 @@ from typing import Any, Protocol
 from rich.table import Table
 
 import opensquilla.cli.tui.adapters.input_bridge as _input_bridge
-from opensquilla.cli.chat.session_state import ChatSessionState, messages_to_markdown
+from opensquilla.cli.chat.session_state import ChatSessionState
 from opensquilla.cli.chat.turn import TurnResult
-from opensquilla.cli.gateway_client import GatewayRPCError, session_history_all
+from opensquilla.cli.gateway_client import GatewayRPCError
+from opensquilla.cli.history_export import export_session_history_markdown
 from opensquilla.cli.tui.adapters.commands import render_help_table, render_keys_table
 from opensquilla.cli.tui.adapters.slash_common import (
     compact_skipped_line,
@@ -31,7 +32,6 @@ from opensquilla.cli.tui.adapters.slash_common import (
     record_turn,
     registry_handler_words,
     resolve_transcript_target,
-    save_transcript_markdown,
 )
 from opensquilla.cli.tui.adapters.slash_common import (
     slash_parts as _slash_parts,
@@ -920,20 +920,16 @@ async def _save_gateway_transcript_command(
 ) -> None:
     target = resolve_transcript_target(cmd, state.session_key)
     try:
-        history = await session_history_all(client.session_history, state.session_key)
+        await export_session_history_markdown(
+            client,
+            state.session_key,
+            target,
+            fallback_markdown=state.transcript.to_markdown(),
+        )
     except GatewayRPCError as exc:
         console.print(error_panel(str(exc), title="Could not save transcript"))
         return
-    messages = history.get("messages") or []
-    markdown = messages_to_markdown(messages) if isinstance(messages, list) else ""
-    if not markdown.strip():
-        markdown = state.transcript.to_markdown()
-    save_transcript_markdown(
-        target,
-        markdown,
-        output_console=console,
-        error_panel_factory=error_panel,
-    )
+    console.print(f"[green]Saved transcript:[/green] {target}")
 
 
 def _image_prompt_from_command(command: str) -> str:

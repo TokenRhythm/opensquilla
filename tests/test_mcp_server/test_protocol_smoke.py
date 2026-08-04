@@ -106,6 +106,22 @@ async def test_stdio_mcp_protocol_lists_calls_tools_and_reads_resources(tmp_path
                 async def messages_read(self, key, limit=1000):
                     return {"messages": [{"role": "user", "text": f"hello {key}"}], "limit": limit}
 
+                async def message_detail_read(
+                    self,
+                    key,
+                    cursor,
+                    offset=0,
+                    chunk_bytes=131072,
+                    field="message",
+                ):
+                    return {
+                        "key": key,
+                        "cursor": cursor,
+                        "offset": offset,
+                        "chunk_bytes": chunk_bytes,
+                        "field": field,
+                    }
+
                 async def messages_send(self, key, message, intent="continue"):
                     return {
                         "status": "accepted",
@@ -172,6 +188,7 @@ async def test_stdio_mcp_protocol_lists_calls_tools_and_reads_resources(tmp_path
                     "conversations_list",
                     "session_resolve",
                     "messages_read",
+                    "message_detail_read",
                     "messages_send",
                     "events_wait",
                     "transcript_export",
@@ -301,10 +318,10 @@ async def test_bridge_runs_against_real_gateway_websocket_session_flow(tmp_path:
 
                 async def append_message(self, key, role="user", content=""):
                     session = self._storage.sessions[key]
-                    message_id = (
-                        f"msg-{{len(self._storage.transcripts[session.session_id]) + 1}}"
-                    )
+                    transcript_id = len(self._storage.transcripts[session.session_id]) + 1
+                    message_id = f"msg-{{transcript_id}}"
                     entry = SimpleNamespace(
+                        id=transcript_id,
                         role=role,
                         content=content,
                         message_id=message_id,
@@ -319,6 +336,69 @@ async def test_bridge_runs_against_real_gateway_websocket_session_flow(tmp_path:
                     if session is None:
                         return []
                     return list(self._storage.transcripts.get(session.session_id, []))
+
+                async def get_canonical_transcript_cursor_page(
+                    self,
+                    key,
+                    *,
+                    limit,
+                    before=None,
+                    after=None,
+                ):
+                    entries = await self.get_transcript(key)
+                    if before is not None:
+                        entries = [
+                            entry
+                            for entry in entries
+                            if (entry.created_at, entry.id) < before
+                        ]
+                    elif after is not None:
+                        entries = [
+                            entry
+                            for entry in entries
+                            if (entry.created_at, entry.id) > after
+                        ]
+                    if after is not None and before is None:
+                        selected = entries[: limit + 1]
+                        has_more = len(selected) > limit
+                        selected = selected[:limit]
+                    else:
+                        selected = entries[-(limit + 1) :]
+                        has_more = len(selected) > limit
+                        selected = selected[-limit:]
+                    return (
+                        [
+                            SimpleNamespace(
+                                cursor=(entry.created_at, entry.id),
+                                stored_bytes=len(entry.content.encode("utf-8")),
+                                content_prefix=entry.content[:2048],
+                                message_id=entry.message_id,
+                                role=entry.role,
+                                provenance_kind=None,
+                                provenance_origin_session_id=None,
+                                provenance_source_session_key=None,
+                                provenance_source_channel=None,
+                                provenance_source_tool=None,
+                                turn_id=None,
+                            )
+                            for entry in selected
+                        ],
+                        has_more,
+                        True,
+                    )
+
+                async def get_canonical_transcript_entry_by_cursor(self, key, *, cursor):
+                    return next(
+                        (
+                            entry
+                            for entry in await self.get_transcript(key)
+                            if (entry.created_at, entry.id) == cursor
+                        ),
+                        None,
+                    )
+
+                async def get_summary_metadata(self, key):
+                    return [], False, 0
 
                 async def apply_intent(self, key, intent, **kwargs):
                     return self._storage.sessions[key], False

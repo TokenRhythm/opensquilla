@@ -165,6 +165,9 @@ class HistoryMessage:
     tool_calls: tuple[dict[str, Any], ...] = ()
     usage: dict[str, Any] | None = None
     turn_context: dict[str, Any] | None = None
+    truncated_by_bytes: bool = False
+    original_bytes: int | None = None
+    detail_ref: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +179,7 @@ class HistoryReplace:
     has_more: bool = False
     loaded_count: int = 0
     canonical_available: bool = False
+    truncated_by_bytes: bool = False
     messages: tuple[HistoryMessage, ...] = ()
     compaction_summaries: tuple[dict[str, Any], ...] = ()
 

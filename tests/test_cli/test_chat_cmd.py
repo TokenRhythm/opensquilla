@@ -1945,6 +1945,13 @@ async def test_gateway_slash_delete_resolves_and_reports_errors(monkeypatch) -> 
 
 @pytest.mark.asyncio
 async def test_gateway_slash_save_exports_persisted_history(monkeypatch, tmp_path) -> None:
+    def fail_if_history_is_aggregated(*args, **kwargs):
+        raise AssertionError("/save must stream pages instead of aggregating history")
+
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.session_history_all",
+        fail_if_history_is_aggregated,
+    )
     _FakeGatewayClient.instances.clear()
     monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _FakeGatewayClient)
     fake = _FakeGatewayClient()

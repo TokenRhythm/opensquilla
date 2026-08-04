@@ -19,6 +19,8 @@ from opensquilla.cli.gateway_client import (
 from opensquilla.contracts.gateway_transport import (
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
     GATEWAY_CLIENT_MAX_QUEUE,
+    GATEWAY_HISTORY_MAX_RESPONSE_BUDGET_BYTES,
+    GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
 )
 
 _STOP = object()
@@ -122,13 +124,20 @@ def test_gateway_client_error_normalization_preserves_generic_error_detail() -> 
     assert payload["error_message"] == "Tool failed with exit code 2"
 
 
-def _handshake_frames(*, keepalive_ms: int = 60_000) -> list[dict[str, Any]]:
+def _handshake_frames(
+    *,
+    keepalive_ms: int = 60_000,
+    methods: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    hello: dict[str, Any] = {
+        "type": "hello-ok",
+        "policy": {"client_ws_keepalive_timeout_ms": keepalive_ms},
+    }
+    if methods is not None:
+        hello["features"] = {"methods": methods}
     return [
         {"type": "event", "event": "connect.challenge", "payload": {"nonce": "n"}},
-        {
-            "type": "hello-ok",
-            "policy": {"client_ws_keepalive_timeout_ms": keepalive_ms},
-        },
+        hello,
     ]
 
 
@@ -147,6 +156,7 @@ async def test_gateway_client_connect_uses_bounded_transport_limits(
 
     await client.connect("ws://127.0.0.1:18791/ws")
     try:
+        assert client._server_methods is None  # noqa: SLF001
         assert observed_connect == {
             "url": "ws://127.0.0.1:18791/ws",
             "max_size": GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
@@ -154,6 +164,37 @@ async def test_gateway_client_connect_uses_bounded_transport_limits(
         }
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("methods", "expected_support"),
+    [
+        (["sessions.bootstrap.v2", "chat.history.v2"], True),
+        ([], False),
+    ],
+)
+async def test_gateway_client_saves_advertised_methods_and_close_resets_them(
+    monkeypatch: pytest.MonkeyPatch,
+    methods: list[str],
+    expected_support: bool,
+) -> None:
+    ws = _FakeWebSocket(_handshake_frames(methods=methods))
+    _install_fake_websockets(monkeypatch, ws)
+    client = GatewayClient()
+
+    await client.connect()
+
+    assert client._server_methods == frozenset(methods)  # noqa: SLF001
+    assert (  # noqa: SLF001
+        client._server_method_support("sessions.bootstrap.v2") is expected_support
+    )
+    assert client._server_method_support("sessions.bootstrap") is False  # noqa: SLF001
+
+    await client.close()
+
+    assert client._server_methods is None  # noqa: SLF001
+    assert client._known_missing_server_methods == set()  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -261,11 +302,15 @@ async def test_listener_close_stops_heartbeat_task() -> None:
 async def test_call_after_send_failure_raises_clear_connection_error() -> None:
     client = GatewayClient()
     client._ws = _BrokenSendWebSocket()  # noqa: SLF001
+    client._server_methods = frozenset({"chat.history.v2"})  # noqa: SLF001
+    client._known_missing_server_methods.add("sessions.bootstrap.v2")  # noqa: SLF001
 
     with pytest.raises(ConnectionError, match="Gateway connection lost"):
         await client._call("sessions.messages.subscribe", {"key": "agent:main:x"})  # noqa: SLF001
 
     assert client._pending == {}  # noqa: SLF001
+    assert client._server_methods is None  # noqa: SLF001
+    assert client._known_missing_server_methods == set()  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -307,6 +352,7 @@ async def test_bootstrap_session_uses_additive_snapshot_rpc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = GatewayClient()
+    client._server_methods = frozenset({"sessions.bootstrap"})  # noqa: SLF001
     call = AsyncMock(return_value={"session": {"session_key": "agent:main:x"}})
     monkeypatch.setattr(client, "_call", call)
 
@@ -320,10 +366,110 @@ async def test_bootstrap_session_uses_additive_snapshot_rpc(
 
 
 @pytest.mark.asyncio
+async def test_bootstrap_session_prefers_advertised_bounded_v2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GatewayClient()
+    client._server_methods = frozenset({"sessions.bootstrap.v2"})  # noqa: SLF001
+    rpc_call = AsyncMock(return_value={"session": {"session_key": "agent:main:x"}})
+    monkeypatch.setattr(client, "_call", rpc_call)
+
+    result = await client.bootstrap_session("agent:main:x", limit=75)
+
+    assert result["session"]["session_key"] == "agent:main:x"
+    rpc_call.assert_awaited_once_with(
+        "sessions.bootstrap.v2",
+        {
+            "key": "agent:main:x",
+            "limit": 75,
+            "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_session_retries_v2_at_bounded_max_without_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GatewayClient()
+    rpc_call = AsyncMock(
+        side_effect=[
+            GatewayRPCError(
+                "sessions.bootstrap.v2",
+                code="BOOTSTRAP_RESPONSE_TOO_LARGE",
+                message="retry with a larger bounded response",
+            ),
+            {"session": {"session_key": "agent:main:x"}},
+        ]
+    )
+    monkeypatch.setattr(client, "_call", rpc_call)
+
+    result = await client.bootstrap_session("agent:main:x", limit=75)
+
+    assert result["session"]["session_key"] == "agent:main:x"
+    assert rpc_call.await_args_list == [
+        call(
+            "sessions.bootstrap.v2",
+            {
+                "key": "agent:main:x",
+                "limit": 75,
+                "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+            },
+        ),
+        call(
+            "sessions.bootstrap.v2",
+            {
+                "key": "agent:main:x",
+                "limit": 75,
+                "maxResponseBytes": GATEWAY_HISTORY_MAX_RESPONSE_BUDGET_BYTES,
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_session_unknown_capability_falls_back_once_and_remembers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GatewayClient()
+    rpc_call = AsyncMock(
+        side_effect=[
+            GatewayRPCError(
+                "sessions.bootstrap.v2",
+                code="METHOD_NOT_FOUND",
+                message="Method not found: sessions.bootstrap.v2",
+            ),
+            {"session": {"session_key": "agent:main:x"}},
+            {"session": {"session_key": "agent:main:x"}},
+        ]
+    )
+    monkeypatch.setattr(client, "_call", rpc_call)
+
+    await client.bootstrap_session("agent:main:x", limit=75)
+    await client.bootstrap_session("agent:main:x", limit=25)
+
+    assert client._server_methods is None  # noqa: SLF001
+    assert client._server_method_support("sessions.bootstrap.v2") is False  # noqa: SLF001
+    assert rpc_call.await_args_list == [
+        call(
+            "sessions.bootstrap.v2",
+            {
+                "key": "agent:main:x",
+                "limit": 75,
+                "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+            },
+        ),
+        call("sessions.bootstrap", {"key": "agent:main:x", "limit": 75}),
+        call("sessions.bootstrap", {"key": "agent:main:x", "limit": 25}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_session_composes_preview4_read_only_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = GatewayClient()
+    client._server_methods = frozenset()  # noqa: SLF001
     rpc_call = AsyncMock(
         side_effect=[
             GatewayRPCError(
@@ -371,6 +517,7 @@ async def test_session_history_forwards_optional_paging_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = GatewayClient()
+    client._server_methods = frozenset()  # noqa: SLF001
     calls: list[tuple[str, dict[str, Any]]] = []
 
     async def fake_call(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -408,12 +555,147 @@ async def test_session_history_forwards_optional_paging_fields(
 
 
 @pytest.mark.asyncio
+async def test_session_history_prefers_advertised_bounded_v2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GatewayClient()
+    client._server_methods = frozenset({"chat.history.v2"})  # noqa: SLF001
+    rpc_call = AsyncMock(return_value={"messages": []})
+    monkeypatch.setattr(client, "_call", rpc_call)
+
+    await client.session_history(
+        "agent:main:test",
+        limit=25,
+        before="12|message-12",
+        include_canonical=True,
+        include_summaries=False,
+    )
+
+    rpc_call.assert_awaited_once_with(
+        "chat.history.v2",
+        {
+            "sessionKey": "agent:main:test",
+            "limit": 25,
+            "before": "12|message-12",
+            "includeCanonical": True,
+            "includeSummaries": False,
+            "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_history_explicit_noncanonical_view_uses_legacy_method(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GatewayClient()
+    client._server_methods = frozenset({"chat.history.v2"})  # noqa: SLF001
+    rpc_call = AsyncMock(return_value={"messages": []})
+    monkeypatch.setattr(client, "_call", rpc_call)
+
+    await client.session_history(
+        "agent:main:test",
+        limit=25,
+        before="12|message-12",
+        include_canonical=False,
+        include_summaries=False,
+    )
+
+    rpc_call.assert_awaited_once_with(
+        "chat.history",
+        {
+            "sessionKey": "agent:main:test",
+            "limit": 25,
+            "before": "12|message-12",
+            "includeCanonical": False,
+            "includeSummaries": False,
+        },
+    )
+    assert client._server_method_support("chat.history.v2") is True  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_session_history_retries_v2_at_bounded_max_without_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GatewayClient()
+    rpc_call = AsyncMock(
+        side_effect=[
+            GatewayRPCError(
+                "chat.history.v2",
+                code="HISTORY_RESPONSE_TOO_LARGE",
+                message="retry with a larger bounded response",
+            ),
+            {"messages": []},
+        ]
+    )
+    monkeypatch.setattr(client, "_call", rpc_call)
+
+    await client.session_history("agent:main:test", limit=25)
+
+    assert rpc_call.await_args_list == [
+        call(
+            "chat.history.v2",
+            {
+                "sessionKey": "agent:main:test",
+                "limit": 25,
+                "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+            },
+        ),
+        call(
+            "chat.history.v2",
+            {
+                "sessionKey": "agent:main:test",
+                "limit": 25,
+                "maxResponseBytes": GATEWAY_HISTORY_MAX_RESPONSE_BUDGET_BYTES,
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_history_unknown_capability_falls_back_once_and_remembers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GatewayClient()
+    rpc_call = AsyncMock(
+        side_effect=[
+            GatewayRPCError(
+                "chat.history.v2",
+                code="METHOD_NOT_FOUND",
+                message="Method not found: chat.history.v2",
+            ),
+            {"messages": []},
+            {"messages": []},
+        ]
+    )
+    monkeypatch.setattr(client, "_call", rpc_call)
+
+    await client.session_history("agent:main:test", limit=5)
+    await client.session_history("agent:main:test", limit=10)
+
+    assert client._server_method_support("chat.history.v2") is False  # noqa: SLF001
+    assert rpc_call.await_args_list == [
+        call(
+            "chat.history.v2",
+            {
+                "sessionKey": "agent:main:test",
+                "limit": 5,
+                "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+            },
+        ),
+        call("chat.history", {"sessionKey": "agent:main:test", "limit": 5}),
+        call("chat.history", {"sessionKey": "agent:main:test", "limit": 10}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_session_does_not_mask_non_capability_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = GatewayClient()
     error = GatewayRPCError(
-        "sessions.bootstrap",
+        "sessions.bootstrap.v2",
         code="NOT_FOUND",
         message="Session not found",
     )
@@ -425,8 +707,12 @@ async def test_bootstrap_session_does_not_mask_non_capability_errors(
 
     assert raised.value is error
     rpc_call.assert_awaited_once_with(
-        "sessions.bootstrap",
-        {"key": "missing", "limit": 200},
+        "sessions.bootstrap.v2",
+        {
+            "key": "missing",
+            "limit": 200,
+            "maxResponseBytes": GATEWAY_HISTORY_RESPONSE_BUDGET_BYTES,
+        },
     )
 
 
@@ -469,7 +755,15 @@ async def test_event_multiplexer_broadcasts_without_cross_session_consumption(
     assert session_a.replay["current_stream_seq"] == 4
     call.assert_any_await(
         "sessions.messages.subscribe",
-        {"key": "agent:main:a", "since_stream_seq": 3},
+        {
+            "key": "agent:main:a",
+            "fast_ack": True,
+            "since_stream_seq": 3,
+        },
+    )
+    call.assert_any_await(
+        "sessions.messages.subscribe",
+        {"key": "agent:main:b", "fast_ack": True},
     )
 
     await session_a.close()

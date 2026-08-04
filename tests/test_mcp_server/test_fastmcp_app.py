@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -41,8 +42,37 @@ class FakeBridge:
     async def session_resolve(self, key: str) -> dict[str, Any]:
         return {"key": key, "session_id": "sid-1"}
 
-    async def messages_read(self, key: str, limit: int = 1000) -> dict[str, Any]:
-        return {"messages": [{"role": "user", "text": key}], "limit": limit}
+    async def messages_read(
+        self,
+        key: str,
+        limit: int = 1000,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "messages": [{"role": "user", "text": key}],
+            "limit": limit,
+            "before": before,
+            "after": after,
+        }
+
+    async def message_detail_read(
+        self,
+        key: str,
+        cursor: str,
+        *,
+        offset: int = 0,
+        chunk_bytes: int = 128 * 1024,
+        field: str = "message",
+    ) -> dict[str, Any]:
+        return {
+            "key": key,
+            "cursor": cursor,
+            "offset": offset,
+            "chunk_bytes": chunk_bytes,
+            "field": field,
+        }
 
     async def messages_send(
         self, key: str, message: str, intent: str = "continue"
@@ -78,6 +108,7 @@ def test_create_mcp_server_registers_product_tools_and_resources() -> None:
         "conversations_list",
         "session_resolve",
         "messages_read",
+        "message_detail_read",
         "messages_send",
         "events_wait",
         "transcript_export",
@@ -96,6 +127,44 @@ def test_create_mcp_server_has_no_benchmark_or_mock_public_tools() -> None:
     names = " ".join([*app.tools, *app.resources])
     assert "benchmark" not in names
     assert "mock" not in names
+
+
+def test_messages_read_tool_exposes_bounded_page_cursors() -> None:
+    app = create_mcp_server(FakeBridge(), fastmcp_cls=FakeFastMCP)
+
+    payload = asyncio.run(
+        app.tools["messages_read"](
+            "agent:main:main",
+            limit=25,
+            before="12|4",
+        )
+    )
+
+    assert payload["limit"] == 25
+    assert payload["before"] == "12|4"
+    assert payload["after"] is None
+
+
+def test_message_detail_read_tool_exposes_bounded_chunk_parameters() -> None:
+    app = create_mcp_server(FakeBridge(), fastmcp_cls=FakeFastMCP)
+
+    payload = asyncio.run(
+        app.tools["message_detail_read"](
+            "agent:main:main",
+            "9|9",
+            offset=128,
+            chunk_bytes=256,
+            field="text",
+        )
+    )
+
+    assert payload == {
+        "key": "agent:main:main",
+        "cursor": "9|9",
+        "offset": 128,
+        "chunk_bytes": 256,
+        "field": "text",
+    }
 
 
 def test_optional_mcp_dependency_minimum_supports_fastmcp() -> None:

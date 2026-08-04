@@ -743,6 +743,13 @@ def test_sessions_abort_resolves_then_aborts(monkeypatch):
 
 
 def test_sessions_export_reads_more_than_gateway_page_limit(tmp_path: Path, monkeypatch) -> None:
+    def fail_if_history_is_aggregated(*args, **kwargs):
+        raise AssertionError("sessions export must stream pages instead of aggregating history")
+
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_client.session_history_all",
+        fail_if_history_is_aggregated,
+    )
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {
         "sessions.resolve": {

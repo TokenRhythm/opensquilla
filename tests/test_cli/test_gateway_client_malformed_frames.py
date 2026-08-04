@@ -70,9 +70,13 @@ def test_connect_challenge_handshake_malformed_json_raises_systemexit(
     _install_fake_websockets(monkeypatch, ws)
 
     client = GatewayClient()
+    client._server_methods = frozenset({"chat.history.v2"})  # noqa: SLF001
+    client._known_missing_server_methods.add("sessions.bootstrap.v2")  # noqa: SLF001
     with pytest.raises(SystemExit) as excinfo:
         asyncio.run(client.connect())
     assert "Malformed handshake frame" in str(excinfo.value)
+    assert client._server_methods is None  # noqa: SLF001
+    assert client._known_missing_server_methods == set()  # noqa: SLF001
 
 
 def test_connect_hello_handshake_malformed_json_raises_systemexit(

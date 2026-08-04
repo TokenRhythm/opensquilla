@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,9 +11,11 @@ from typing import Any
 import typer
 from rich.table import Table
 
-from opensquilla.cli.chat.session_state import messages_to_markdown
-from opensquilla.cli.gateway_client import session_history_all
 from opensquilla.cli.gateway_rpc import run_gateway_sync
+from opensquilla.cli.history_export import (
+    export_session_history_json,
+    export_session_history_markdown,
+)
 from opensquilla.cli.output import print_json
 from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
 from opensquilla.cli.url_utils import normalize_gateway_url
@@ -284,23 +285,46 @@ def sessions_export(
     output: Path | None = typer.Option(None, "--output", "-o", help="Output file"),
     format: str = typer.Option("md", "--format", help="Export format: md|json"),
 ) -> None:
-    """Export session transcript and metadata.
-
-    Uses the existing chat.history RPC for persisted transcript messages and
-    falls back to session preview when no messages are available.
-    """
+    """Export session transcript and metadata without aggregating it in memory."""
     if format not in {"md", "json"}:
         console.print("[red]--format must be md or json[/red]")
         raise typer.Exit(2)
+
+    target = output or Path(f"{session_id.replace(':', '-')}.{format}")
 
     async def _run(client):
         resolved = await client.resolve_session(session_id)
         key = _resolved_key(resolved, session_id)
         preview = await client.preview_sessions(keys=[key])
-        history = await session_history_all(client.session_history, key)
-        return {"resolved": resolved, "preview": preview, "history": history}
+        if format == "json":
+            await export_session_history_json(
+                client,
+                key,
+                target,
+                resolved=resolved,
+                preview=preview,
+            )
+            return target
 
-    result: dict[str, Any] | None = asyncio.run(_with_client(_run))
+        previews = preview.get("previews", []) if isinstance(preview, dict) else []
+        first_preview = previews[0] if previews and isinstance(previews[0], dict) else {}
+        header = (
+            f"# Session {key}\n\n"
+            f"- Status: {resolved.get('status', '')}\n"
+            f"- Model: {resolved.get('model') or ''}\n"
+            f"- Updated: {resolved.get('updated_at', '')}\n\n"
+        )
+        fallback = f"## Preview\n\n{first_preview.get('lastMessage', '')}\n"
+        await export_session_history_markdown(
+            client,
+            key,
+            target,
+            header=header,
+            fallback_markdown=fallback,
+        )
+        return target
+
+    result = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
         console.print("[dim]Session export requires a running gateway.[/dim]")
         return
@@ -309,24 +333,4 @@ def sessions_export(
     if result is None:
         console.print("[red]Session export returned no data.[/red]")
         return
-    target = output or Path(f"{session_id.replace(':', '-')}.{format}")
-    if format == "json":
-        target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    else:
-        resolved = result.get("resolved", {})
-        key = _resolved_key(resolved, session_id)
-        previews = result.get("preview", {}).get("previews", [])
-        preview = previews[0] if previews else {}
-        messages = result.get("history", {}).get("messages", [])
-        transcript = messages_to_markdown(messages) if isinstance(messages, list) else ""
-        if not transcript.strip():
-            transcript = f"## Preview\n\n{preview.get('lastMessage', '')}\n"
-        body = (
-            f"# Session {key}\n\n"
-            f"- Status: {resolved.get('status', '')}\n"
-            f"- Model: {resolved.get('model') or ''}\n"
-            f"- Updated: {resolved.get('updated_at', '')}\n\n"
-            f"{transcript}"
-        )
-        target.write_text(body, encoding="utf-8")
     console.print(f"[green]Exported:[/green] {target}")

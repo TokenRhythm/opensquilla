@@ -249,6 +249,7 @@
       "tests/test_cli/test_gateway_reload_cmd.py",
       "tests/test_cli/test_gateway_rpc.py",
       "tests/test_cli/test_help_theme.py",
+      "tests/test_cli/test_history_export.py",
       "tests/test_cli/test_memory_dream_cmd.py",
       "tests/test_cli/test_memory_flush_cmd.py",
       "tests/test_cli/test_models_probe.py",

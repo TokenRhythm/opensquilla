@@ -120,12 +120,19 @@ def test_python_message_to_json_serializes_atomic_history_replace() -> None:
             has_more=True,
             loaded_count=1,
             canonical_available=True,
+            truncated_by_bytes=True,
             messages=(
                 HistoryMessage(
                     id="message-1",
                     role="user",
                     text="你好",
                     attachments=({"name": "brief.pdf"},),
+                    truncated_by_bytes=True,
+                    original_bytes=98_304,
+                    detail_ref={
+                        "method": "chat.history.entry.v1",
+                        "cursor": "1|1",
+                    },
                 ),
             ),
         ),
@@ -134,6 +141,9 @@ def test_python_message_to_json_serializes_atomic_history_replace() -> None:
     assert payload.endswith("\n")
     assert '"type":"history.replace"' in payload
     assert '"history_scope":"latest_window"' in payload
+    assert '"truncated_by_bytes":true' in payload
+    assert '"original_bytes":98304' in payload
+    assert '"detail_ref":{"method":"chat.history.entry.v1","cursor":"1|1"}' in payload
     assert '"id":"message-1"' in payload
     assert '"attachments":[{"name":"brief.pdf"}]' in payload
 

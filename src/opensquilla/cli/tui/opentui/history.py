@@ -49,6 +49,7 @@ def history_replace_from_bootstrap(
         has_more=bool(history.get("has_more")),
         loaded_count=int(history.get("loaded_count") or len(messages)),
         canonical_available=bool(history.get("canonical_available")),
+        truncated_by_bytes=bool(history.get("truncated_by_bytes")),
         messages=messages,
         compaction_summaries=summaries,
     )
@@ -63,6 +64,7 @@ def apply_bootstrap_to_state(
 
     raw_session = snapshot.get("session")
     session = raw_session if isinstance(raw_session, dict) else {}
+    state.gateway_bootstrap = snapshot
     state.session_key = history.session_key
     if "effective_model" in session or "model" in session:
         model = session.get("effective_model") or session.get("model")
@@ -138,6 +140,14 @@ def _history_message(row: dict[str, Any], *, ordinal: int) -> HistoryMessage:
     )
     raw_usage = row.get("usage") or row.get("turn_usage")
     usage = dict(raw_usage) if isinstance(raw_usage, dict) else _flattened_usage(row)
+    raw_original_bytes = row.get("original_bytes")
+    original_bytes = (
+        raw_original_bytes
+        if isinstance(raw_original_bytes, int)
+        and not isinstance(raw_original_bytes, bool)
+        and raw_original_bytes >= 0
+        else None
+    )
     return HistoryMessage(
         id=message_id,
         role=role,
@@ -153,6 +163,13 @@ def _history_message(row: dict[str, Any], *, ordinal: int) -> HistoryMessage:
             if isinstance(row.get("turn_context"), dict)
             else None
         ),
+        truncated_by_bytes=bool(row.get("truncated_by_bytes")),
+        original_bytes=original_bytes,
+        detail_ref=(
+            dict(row["detail_ref"])
+            if isinstance(row.get("detail_ref"), dict)
+            else None
+        ),
     )
 
 
@@ -160,6 +177,8 @@ def _display_text(row: dict[str, Any]) -> str:
     value = row.get("text")
     if value is None:
         value = row.get("content")
+    if value is None:
+        value = row.get("preview")
     return value if isinstance(value, str) else str(value or "")
 
 

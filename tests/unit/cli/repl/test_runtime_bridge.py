@@ -204,8 +204,10 @@ async def test_gateway_runtime_bridge_prints_failure_receipt_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bootstrap_method", ["sessions.bootstrap", "sessions.bootstrap.v2"])
 async def test_gateway_runtime_bridge_formats_missing_resume_without_traceback(
     monkeypatch: pytest.MonkeyPatch,
+    bootstrap_method: str,
 ) -> None:
     from opensquilla.cli.gateway_client import GatewayRPCError
     from opensquilla.cli.repl import runtime_bridge
@@ -214,7 +216,7 @@ async def test_gateway_runtime_bridge_formats_missing_resume_without_traceback(
 
     async def fake_run_gateway_chat(**_kwargs: Any) -> gateway_runtime.SessionExitSummary:
         raise GatewayRPCError(
-            "sessions.bootstrap",
+            bootstrap_method,
             code="NOT_FOUND",
             message="Session not found: main",
         )

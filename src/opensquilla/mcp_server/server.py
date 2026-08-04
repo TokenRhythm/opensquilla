@@ -40,10 +40,38 @@ def create_mcp_server(
         return await bridge.session_resolve(key)
 
     @mcp.tool(name="messages_read")
-    async def messages_read(key: str, limit: int = 1000) -> dict[str, Any]:
-        """Read persisted messages for an OpenSquilla session."""
+    async def messages_read(
+        key: str,
+        limit: int = 1000,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> dict[str, Any]:
+        """Read one bounded page of persisted messages for a session."""
 
-        return await bridge.messages_read(key, limit=limit)
+        kwargs: dict[str, Any] = {"limit": limit}
+        if before is not None:
+            kwargs["before"] = before
+        if after is not None:
+            kwargs["after"] = after
+        return await bridge.messages_read(key, **kwargs)
+
+    @mcp.tool(name="message_detail_read")
+    async def message_detail_read(
+        key: str,
+        cursor: str,
+        offset: int = 0,
+        chunk_bytes: int = 128 * 1024,
+        field: str = "message",
+    ) -> dict[str, Any]:
+        """Read one bounded chunk referenced by a history message's detail_ref."""
+
+        return await bridge.message_detail_read(
+            key,
+            cursor,
+            offset=offset,
+            chunk_bytes=chunk_bytes,
+            field=field,
+        )
 
     @mcp.tool(name="messages_send")
     async def messages_send(key: str, message: str, intent: str = "continue") -> dict[str, Any]:

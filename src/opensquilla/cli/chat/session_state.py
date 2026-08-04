@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from opensquilla.cli.chat.turn import UsageCounter
 
@@ -89,6 +90,15 @@ class ChatSessionState:
     elevated: str | None = None
     transcript: ChatTranscript = field(default_factory=ChatTranscript)
     usage: UsageCounter = field(default_factory=UsageCounter)
+    # Most recent canonical Gateway snapshot applied to this state. Keeping the
+    # exact snapshot cursor lets a session switch subscribe from the same
+    # history boundary instead of taking a second snapshot and creating a
+    # replay gap between the two reads.
+    gateway_bootstrap: dict[str, Any] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def prompt_state(self) -> PromptState:
         return PromptState(model=self.model, elevated=self.elevated)
