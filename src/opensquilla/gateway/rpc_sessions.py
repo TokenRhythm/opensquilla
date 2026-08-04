@@ -11,6 +11,7 @@ import time
 import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import structlog
@@ -38,7 +39,13 @@ from opensquilla.gateway.project_workspace_runtime import (
     persisted_project_workspace_snapshot,
     project_workspace_snapshot,
 )
-from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.rpc import (
+    BudgetedRpcResult,
+    RpcContext,
+    RpcHandlerError,
+    RpcUnavailableError,
+    get_dispatcher,
+)
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_services import (
     get_session_epoch,
@@ -160,6 +167,8 @@ _MAX_TEXT_ATTACHMENT_BYTES = _attachment_ingest.TEXT_ATTACHMENT_BYTES
 _MAX_TOTAL_ATTACHMENT_BYTES = _attachment_ingest.MAX_TOTAL_ATTACHMENT_BYTES
 _MAX_ATTACHMENTS = _attachment_ingest.MAX_ATTACHMENTS
 _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS = 2.0
+_SESSIONS_BOOTSTRAP_V2_ENVELOPE_RESERVE_BYTES = 8 * 1024
+_SESSIONS_BOOTSTRAP_V2_DISPLAY_NAME_BYTES = 4 * 1024
 
 
 def _accepts_keyword_arg(func: Any, name: str) -> bool:
@@ -6839,14 +6848,91 @@ async def _handle_plans_cancel_run(params: dict | None, ctx: RpcContext) -> dict
     return {"sessionKey": key, "planRun": snapshot}
 
 
-@_d.method("sessions.bootstrap", scope="operator.read")
-async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> dict:
-    """Return the canonical startup snapshot for an interactive session client.
+def _sessions_bootstrap_history_params(
+    params: dict | None,
+    *,
+    session_key: str,
+) -> dict[str, Any]:
+    history_params: dict[str, Any] = {
+        "sessionKey": session_key,
+        "limit": (params or {}).get("limit", 200),
+    }
+    for source, target in (
+        ("before", "before"),
+        ("after", "after"),
+        ("includeCanonical", "includeCanonical"),
+        ("include_canonical", "includeCanonical"),
+        ("includeSummaries", "includeSummaries"),
+        ("include_summaries", "includeSummaries"),
+    ):
+        if isinstance(params, dict) and source in params:
+            history_params[target] = params[source]
+    return history_params
 
-    This composes existing session, history, task-ledger, epoch, and stream
-    services.  It intentionally does not subscribe the connection: clients use
-    the returned ``stream_cursor`` with ``sessions.messages.subscribe`` so no
-    events are consumed or routed away from other surfaces during bootstrap.
+
+def _bounded_plan_revision_snapshot(metadata: object) -> dict[str, Any] | None:
+    """Project plan identity without loading the revision body."""
+
+    if not isinstance(metadata, dict):
+        return None
+    revision_id = metadata.get("revision_id")
+    plan_id = metadata.get("plan_id")
+    if not isinstance(revision_id, str) or not isinstance(plan_id, str):
+        return None
+    return {
+        "revisionId": revision_id,
+        "planId": plan_id,
+        "parentRevisionId": metadata.get("parent_revision_id"),
+        "generation": metadata.get("generation"),
+        # The bounded bootstrap is a startup window, not the plan-body RPC.
+        # Keep the established shape while making the omitted body explicit.
+        "title": "",
+        "markdown": "",
+        "steps": [],
+        "contentHash": metadata.get("content_hash"),
+        "current": True,
+        "createdAt": metadata.get("created_at"),
+        "bodyDeferred": True,
+    }
+
+
+def _bounded_plan_run_snapshot(metadata: object) -> dict[str, Any] | None:
+    """Project active plan-run identity without loading step-state JSON."""
+
+    if not isinstance(metadata, dict):
+        return None
+    run_id = metadata.get("run_id")
+    revision_id = metadata.get("plan_revision_id")
+    if not isinstance(run_id, str) or not isinstance(revision_id, str):
+        return None
+    return {
+        "runId": run_id,
+        "planRevisionId": revision_id,
+        "status": metadata.get("status"),
+        "currentStepId": metadata.get("current_step_id"),
+        "steps": [],
+        "stateRevision": metadata.get("state_revision"),
+        "driverKind": metadata.get("driver_kind"),
+        "driverId": metadata.get("driver_id"),
+        "activeTaskId": metadata.get("active_task_id"),
+        "createdAt": metadata.get("created_at"),
+        "updatedAt": metadata.get("updated_at"),
+        "startedAt": metadata.get("started_at"),
+        "finishedAt": metadata.get("finished_at"),
+        "stateDeferred": True,
+    }
+
+
+async def _sessions_bootstrap_base(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    bounded: bool = False,
+) -> dict:
+    """Build bootstrap state without eagerly reading transcript history.
+
+    The stream cursor is still captured before slower durable reads. Callers add
+    either legacy or byte-bounded history to the returned placeholder.
     """
 
     key = _require_key(params)
@@ -6862,29 +6948,31 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     # subscribes from this cursor may see duplicate state (deduped by stable
     # ids), but cannot miss a live event emitted while bootstrap is reading.
     stream_cursor = get_session_streams().current_seq(session_key)
-    history_params: dict[str, Any] = {
-        "sessionKey": session_key,
-        "limit": (params or {}).get("limit", 200),
-    }
-    for source, target in (
-        ("before", "before"),
-        ("after", "after"),
-        ("includeCanonical", "includeCanonical"),
-        ("include_canonical", "includeCanonical"),
-        ("includeSummaries", "includeSummaries"),
-        ("include_summaries", "includeSummaries"),
-    ):
-        if isinstance(params, dict) and source in params:
-            history_params[target] = params[source]
-
-    # Local import avoids making rpc_chat/rpc_sessions module registration
-    # order part of the public RPC contract.
-    from opensquilla.gateway.rpc_chat import _handle_chat_history
-
-    history = await _handle_chat_history(history_params, ctx)
-    task_rows = await _list_task_rows(ctx, storage, session_key)
+    deferred_fields: list[str] = []
+    if bounded:
+        task_metadata_getter = getattr(storage, "list_recent_agent_task_metadata", None)
+        raw_task_rows = (
+            await task_metadata_getter(session_key)
+            if callable(task_metadata_getter)
+            else []
+        )
+        task_rows = [
+            SimpleNamespace(**{**dict(row), "details": None})
+            for row in raw_task_rows or []
+            if isinstance(row, dict)
+        ]
+        if task_rows:
+            deferred_fields.extend(
+                [
+                    "tasks[].details",
+                    "tasks[].terminal_message",
+                ]
+            )
+    else:
+        task_rows = await _list_task_rows(ctx, storage, session_key)
     task_state = _task_state_summary(task_rows)
-    await _attach_active_steer_capability(ctx, session_key, task_state)
+    if not bounded:
+        await _attach_active_steer_capability(ctx, session_key, task_state)
     epoch = await _bootstrap_epoch(ctx.session_manager, storage, session, session_key)
     queued_count = sum(
         1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "queued"
@@ -6931,20 +7019,67 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         "queue_mode": getattr(session, "queue_mode", None),
         **_derive_source_metadata(session),
     }
-    get_current_plan = getattr(storage, "get_current_plan_revision", None)
-    get_active_run = getattr(storage, "get_active_plan_run", None)
-    current_plan = (
-        await get_current_plan(session_key) if callable(get_current_plan) else None
-    )
-    active_plan_run = (
-        await get_active_run(session_key) if callable(get_active_run) else None
-    )
-    from opensquilla.session.plans import plan_revision_snapshot, plan_run_snapshot
+    if bounded:
+        get_current_plan_metadata = getattr(
+            storage,
+            "get_current_plan_revision_metadata",
+            None,
+        )
+        get_active_run_metadata = getattr(storage, "get_active_plan_run_metadata", None)
+        current_plan_payload = _bounded_plan_revision_snapshot(
+            await get_current_plan_metadata(session_key)
+            if callable(get_current_plan_metadata)
+            else None
+        )
+        active_plan_run_payload = _bounded_plan_run_snapshot(
+            await get_active_run_metadata(session_key)
+            if callable(get_active_run_metadata)
+            else None
+        )
+        if current_plan_payload is not None:
+            deferred_fields.extend(
+                [
+                    "currentPlan.title",
+                    "currentPlan.markdown",
+                    "currentPlan.steps",
+                ]
+            )
+        if active_plan_run_payload is not None:
+            deferred_fields.extend(
+                [
+                    "activePlanRun.steps",
+                    "activePlanRun.pauseReason",
+                    "activePlanRun.terminalReason",
+                ]
+            )
+    else:
+        get_current_plan = getattr(storage, "get_current_plan_revision", None)
+        get_active_run = getattr(storage, "get_active_plan_run", None)
+        current_plan = (
+            await get_current_plan(session_key) if callable(get_current_plan) else None
+        )
+        active_plan_run = (
+            await get_active_run(session_key) if callable(get_active_run) else None
+        )
+        from opensquilla.session.plans import plan_revision_snapshot, plan_run_snapshot
+
+        current_plan_payload = (
+            plan_revision_snapshot(current_plan, current=True)
+            if current_plan is not None
+            else None
+        )
+        active_plan_run_payload = (
+            plan_run_snapshot(active_plan_run)
+            if active_plan_run is not None
+            else None
+        )
 
     return {
         "session": metadata,
         "agent_identity": agent_identity,
-        "history": history,
+        # Keep the established field order while allowing each protocol method
+        # to choose its own history reader after this bounded metadata snapshot.
+        "history": None,
         **task_state,
         "queue": {
             "mode": getattr(session, "queue_mode", None) or "followup",
@@ -6955,16 +7090,8 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
             "model_routing": model_routing_snapshot(ctx.config),
         },
         "collaboration": _plan_collaboration_snapshot(session),
-        "currentPlan": (
-            plan_revision_snapshot(current_plan, current=True)
-            if current_plan is not None
-            else None
-        ),
-        "activePlanRun": (
-            plan_run_snapshot(active_plan_run)
-            if active_plan_run is not None
-            else None
-        ),
+        "currentPlan": current_plan_payload,
+        "activePlanRun": active_plan_run_payload,
         "planCapabilities": {
             "planMode": True,
             "implementation": ctx.task_runtime is not None,
@@ -6973,4 +7100,254 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         },
         "epoch": epoch,
         "stream_cursor": stream_cursor,
+        **({"truncated_fields": deferred_fields} if deferred_fields else {}),
     }
+
+
+@_d.method("sessions.bootstrap", scope="operator.read")
+async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> dict:
+    """Return the canonical startup snapshot for an interactive session client.
+
+    This composes existing session, history, task-ledger, epoch, and stream
+    services.  It intentionally does not subscribe the connection: clients use
+    the returned ``stream_cursor`` with ``sessions.messages.subscribe`` so no
+    events are consumed or routed away from other surfaces during bootstrap.
+    """
+
+    snapshot = await _sessions_bootstrap_base(params, ctx)
+    session = snapshot.get("session")
+    if not isinstance(session, dict) or not session.get("session_key"):
+        raise KeyError("Bootstrap session metadata is unavailable")
+    session_key = str(session["session_key"])
+    history_params = _sessions_bootstrap_history_params(params, session_key=session_key)
+
+    # Local import avoids making rpc_chat/rpc_sessions module registration
+    # order part of the public RPC contract.
+    from opensquilla.gateway.rpc_chat import _handle_chat_history
+
+    snapshot["history"] = await _handle_chat_history(history_params, ctx)
+    return snapshot
+
+
+def _sessions_bootstrap_v2_outer_candidate(
+    base: dict[str, Any],
+    *,
+    history: dict[str, Any],
+    byte_budget: int,
+) -> tuple[dict[str, Any], int]:
+    from opensquilla.gateway.rpc_chat import _chat_history_v2_set_wire_bytes
+
+    candidate = dict(base)
+    candidate["history"] = history
+    candidate["byte_budget"] = byte_budget
+    candidate["envelope_reserve_bytes"] = _SESSIONS_BOOTSTRAP_V2_ENVELOPE_RESERVE_BYTES
+    candidate["truncated_by_bytes"] = bool(
+        history.get("truncated_by_bytes") or candidate.get("truncated_fields")
+    )
+    candidate["wire_bytes"] = 0
+    return candidate, _chat_history_v2_set_wire_bytes(candidate)
+
+
+def _sessions_bootstrap_v2_bounded_metadata(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Bound legacy-unconstrained display metadata without mutating storage."""
+
+    from opensquilla.gateway.rpc_chat import _utf8_prefix
+
+    bounded = dict(snapshot)
+    session_raw = snapshot.get("session")
+    if not isinstance(session_raw, dict):
+        return bounded
+    display_name = session_raw.get("display_name")
+    if not isinstance(display_name, str):
+        return bounded
+    original_bytes = len(display_name.encode("utf-8"))
+    if original_bytes <= _SESSIONS_BOOTSTRAP_V2_DISPLAY_NAME_BYTES:
+        return bounded
+
+    session = dict(session_raw)
+    session["display_name"] = _utf8_prefix(
+        display_name,
+        max_bytes=_SESSIONS_BOOTSTRAP_V2_DISPLAY_NAME_BYTES,
+    )
+    bounded["session"] = session
+    truncated_fields: list[object] = [
+        field
+        for field in bounded.get("truncated_fields") or []
+        if isinstance(field, str | dict)
+    ]
+    truncated_fields.append(
+        {
+            "path": "session.display_name",
+            "original_bytes": original_bytes,
+            "preview_bytes": len(session["display_name"].encode("utf-8")),
+        }
+    )
+    bounded["truncated_fields"] = truncated_fields
+    return bounded
+
+
+def _fit_sessions_bootstrap_v2_payload(
+    snapshot: dict[str, Any],
+    *,
+    session_key: str,
+    byte_budget: int,
+    retain_earliest: bool = False,
+) -> dict[str, Any]:
+    """Fit the whole bootstrap payload while preserving its legacy state snapshot."""
+
+    from opensquilla.gateway.rpc_chat import (
+        _chat_history_v2_candidate,
+        _chat_history_v2_largest_fitting_prefix,
+        _chat_history_v2_smallest_fitting_suffix,
+        _fit_chat_history_v2_payload,
+    )
+
+    payload_budget = byte_budget - _SESSIONS_BOOTSTRAP_V2_ENVELOPE_RESERVE_BYTES
+    history_raw = snapshot.get("history")
+    if not isinstance(history_raw, dict):
+        history_raw = {}
+    base = _sessions_bootstrap_v2_bounded_metadata(snapshot)
+    history_budget = payload_budget
+    history: dict[str, Any] | None = None
+    full: dict[str, Any] | None = None
+    full_size = 0
+    # A history page can fit its own allocation but still overflow once the
+    # session/task/plan snapshot surrounds it. Refit with the observed excess
+    # so a whole newest record can become a preview instead of making an
+    # otherwise readable session fail bootstrap.
+    for _ in range(8):
+        try:
+            history = _fit_chat_history_v2_payload(
+                history_raw,
+                session_key=session_key,
+                byte_budget=history_budget,
+                retain_earliest=retain_earliest,
+            )
+        except RpcHandlerError as exc:
+            raise RpcHandlerError(
+                "BOOTSTRAP_RESPONSE_TOO_LARGE",
+                "Bootstrap history cannot fit within maxResponseBytes.",
+                details={"byte_budget": byte_budget},
+            ) from exc
+        full, full_size = _sessions_bootstrap_v2_outer_candidate(
+            base,
+            history=history,
+            byte_budget=byte_budget,
+        )
+        if full_size <= payload_budget:
+            return full
+        next_budget = history_budget - (full_size - payload_budget) - 256
+        if next_budget <= 0 or next_budget >= history_budget:
+            break
+        history_budget = next_budget
+
+    assert history is not None
+    assert full is not None
+
+    messages = [
+        dict(message)
+        for message in history.get("messages") or []
+        if isinstance(message, dict)
+    ]
+    if not messages:
+        raise RpcHandlerError(
+            "BOOTSTRAP_RESPONSE_TOO_LARGE",
+            "Bootstrap metadata cannot fit within maxResponseBytes.",
+            details={"byte_budget": byte_budget},
+        )
+
+    original_has_more = bool(history.get("has_more"))
+    def _outer_suffix(start: int) -> tuple[dict[str, Any], int]:
+        history_candidate, _ = _chat_history_v2_candidate(
+            history,
+            messages=messages[start:],
+            original_message_count=len(messages),
+            original_has_more=original_has_more,
+            byte_budget=payload_budget,
+            truncated_by_bytes=True,
+        )
+        return _sessions_bootstrap_v2_outer_candidate(
+            base,
+            history=history_candidate,
+            byte_budget=byte_budget,
+        )
+
+    def _outer_prefix(end: int) -> tuple[dict[str, Any], int]:
+        history_candidate, _ = _chat_history_v2_candidate(
+            history,
+            messages=messages[:end],
+            original_message_count=len(messages),
+            original_has_more=original_has_more,
+            byte_budget=payload_budget,
+            truncated_by_bytes=True,
+        )
+        return _sessions_bootstrap_v2_outer_candidate(
+            base,
+            history=history_candidate,
+            byte_budget=byte_budget,
+        )
+
+    boundary_only, boundary_only_size = (
+        _outer_prefix(1) if retain_earliest else _outer_suffix(len(messages) - 1)
+    )
+    if boundary_only_size > payload_budget:
+        raise RpcHandlerError(
+            "BOOTSTRAP_RESPONSE_TOO_LARGE",
+            "Bootstrap metadata cannot fit alongside one history record.",
+            details={"byte_budget": byte_budget},
+        )
+    fitted = (
+        _chat_history_v2_largest_fitting_prefix(
+            _outer_prefix,
+            count=len(messages),
+            byte_budget=payload_budget,
+        )
+        if retain_earliest
+        else _chat_history_v2_smallest_fitting_suffix(
+            _outer_suffix,
+            count=len(messages),
+            byte_budget=payload_budget,
+        )
+    )
+    return fitted or boundary_only
+
+
+@_d.method("sessions.bootstrap.v2", scope="operator.read")
+async def _handle_sessions_bootstrap_v2(
+    params: dict | None,
+    ctx: RpcContext,
+) -> BudgetedRpcResult:
+    """Return the legacy bootstrap state with a bounded V2 history window."""
+
+    from opensquilla.gateway.rpc_chat import (
+        _chat_history_v2_response_budget,
+        _load_chat_history_v2_payload,
+    )
+
+    raw_params = dict(params or {})
+    byte_budget = _chat_history_v2_response_budget(raw_params)
+    snapshot = await _sessions_bootstrap_base(raw_params, ctx, bounded=True)
+    session = snapshot.get("session")
+    session_key = (
+        str(session.get("session_key"))
+        if isinstance(session, dict) and session.get("session_key")
+        else canonicalize_session_key(_require_key(raw_params))
+    )
+    history_params = _sessions_bootstrap_history_params(
+        raw_params,
+        session_key=session_key,
+    )
+    snapshot["history"] = await _load_chat_history_v2_payload(
+        history_params,
+        ctx,
+        payload_budget=byte_budget - _SESSIONS_BOOTSTRAP_V2_ENVELOPE_RESERVE_BYTES,
+    )
+    payload = _fit_sessions_bootstrap_v2_payload(
+        snapshot,
+        session_key=session_key,
+        byte_budget=byte_budget,
+        retain_earliest=(
+            raw_params.get("after") is not None and raw_params.get("before") is None
+        ),
+    )
+    return BudgetedRpcResult(payload, byte_budget)

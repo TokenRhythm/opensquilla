@@ -17,6 +17,7 @@ is what the original ``rpc.py`` did.
 from __future__ import annotations
 
 from opensquilla.gateway.rpc.registry import (
+    BudgetedRpcResult,
     RpcContext,
     RpcDispatcher,
     RpcHandlerError,
@@ -31,6 +32,7 @@ from opensquilla.gateway.rpc.registry import (
 )
 
 __all__ = [
+    "BudgetedRpcResult",
     "RpcContext",
     "RpcDispatcher",
     "RpcHandlerError",

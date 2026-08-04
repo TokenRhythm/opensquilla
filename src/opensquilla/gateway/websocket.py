@@ -59,11 +59,19 @@ log = structlog.get_logger(__name__)
 # Any future addition to this set MUST be verified against the same
 # upstream invariant.
 _LOSSY_EVENTS: frozenset[str] = frozenset({"tick"})
-_DETACHED_READ_METHODS: frozenset[str] = frozenset({"chat.history"})
+_DETACHED_READ_METHODS: frozenset[str] = frozenset(
+    {
+        "chat.history",
+        "chat.history.entry.v1",
+        "chat.history.v2",
+        "sessions.bootstrap.v2",
+    }
+)
 _MAX_DETACHED_READS_PER_CONNECTION = 4
 _DETACHED_READ_STOP_TIMEOUT_SECONDS = 2.0
 _DIRECT_SEND_TIMEOUT_SECONDS = 2.0
 _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
+_MAX_REQUEST_TEXT_BYTES = 4 * 1024
 
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
@@ -720,17 +728,17 @@ def get_registry() -> ConnectionRegistry:
 
 
 def _is_wire_text(value: str) -> bool:
-    """True when ``value`` can be re-serialized onto the wire as UTF-8.
+    """True when a protocol identifier is bounded and UTF-8 serializable.
 
     Valid JSON may carry lone-surrogate escapes (``"\\ud800"``); echoing one
     into a response frame makes ``model_dump_json`` raise at send time, long
     after the handler ran.
     """
     try:
-        value.encode("utf-8")
+        encoded = value.encode("utf-8")
     except UnicodeEncodeError:
         return False
-    return True
+    return len(encoded) <= _MAX_REQUEST_TEXT_BYTES
 
 
 def _wire_frame_id(raw_id: Any, fallback: str = "") -> str:
@@ -1102,7 +1110,7 @@ async def _message_loop(
                     make_error_res(
                         _wire_frame_id(req_id),
                         "INVALID_REQUEST",
-                        "Frame id and method must be UTF-8-encodable strings",
+                        "Frame id and method must be bounded UTF-8 strings",
                     )
                 )
                 continue

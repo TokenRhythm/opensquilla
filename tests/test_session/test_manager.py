@@ -7,6 +7,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -14,9 +15,12 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from opensquilla.session import storage as storage_module
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
     PlanRunRecord,
     SessionContextState,
     SessionIntent,
@@ -27,6 +31,7 @@ from opensquilla.session.models import (
 from opensquilla.session.plans import new_plan_revision
 from opensquilla.session.storage import (
     CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+    CanonicalTranscriptCursorInvalidatedError,
     SessionStorage,
     StaleEpochError,
 )
@@ -2564,6 +2569,859 @@ async def test_canonical_transcript_page_crosses_multiple_compaction_boundaries(
         after = (newest.created_at, newest.id)
 
     assert [entry.message_id for entry in forward] == [entry.message_id for entry in loaded]
+
+
+@pytest.mark.asyncio
+async def test_canonical_transcript_cursor_page_is_lightweight_and_keyset_complete(manager):
+    node = await manager.create("agent:main:main")
+    contents = [f"message {index}" for index in range(10)]
+    projected_text = "😀" * 3_000
+    contents[0] = json.dumps(
+        {"text": "fallback text", "display_text": projected_text},
+        ensure_ascii=False,
+    )
+    giant_json = json.dumps({"display_text": "z" * 40_000})
+    contents[1] = giant_json
+    fallback_text = "fallback-" + "y" * 3_000
+    contents[2] = json.dumps({"text": fallback_text})
+    tool_calls = [{"name": "large-tool", "arguments": {"value": "x" * 256}}]
+    turn_usage = {"input_tokens": 12, "output_tokens": 34}
+    turn_id = "turn-" + "😀" * 300
+    turn_context = {"turn_id": turn_id, "disposition": "steering"}
+    giant_turn_context = {"turn_id": "giant-" + "x" * 40_000}
+    provenance_origin_session_id = "origin-" + "😀" * 300
+    provenance_source_session_key = "agent:" + "s" * 2_000
+    provenance_source_channel = "channel-" + "c" * 2_000
+    provenance_source_tool = "tool-" + "t" * 2_000
+    for index, content in enumerate(contents):
+        await manager._storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                message_id=f"cursor-{index}",
+                role="user",
+                content=content,
+                tool_calls=tool_calls if index == 0 else None,
+                reasoning_content="reasoning" if index == 0 else None,
+                turn_usage=turn_usage if index == 0 else None,
+                turn_context=(
+                    turn_context
+                    if index == 0
+                    else giant_turn_context if index == 1 else None
+                ),
+                provenance_kind="external_user" if index == 0 else None,
+                provenance_origin_session_id=(
+                    provenance_origin_session_id if index == 0 else None
+                ),
+                provenance_source_session_key=(
+                    provenance_source_session_key if index == 0 else None
+                ),
+                provenance_source_channel=(
+                    provenance_source_channel if index == 0 else None
+                ),
+                provenance_source_tool=(
+                    provenance_source_tool if index == 0 else None
+                ),
+                created_at=1_000 + index // 2,
+            )
+        )
+
+    await manager.persist_compaction_result(
+        node.session_key,
+        "first summary",
+        [{"role": "user", "content": contents[index]} for index in range(4, 10)],
+        compaction_id="cmp-cursor-1",
+    )
+    await manager.persist_compaction_result(
+        node.session_key,
+        "second summary",
+        [{"role": "user", "content": contents[index]} for index in range(7, 10)],
+        compaction_id="cmp-cursor-2",
+    )
+
+    loaded = []
+    before = None
+    while True:
+        page = await manager.get_canonical_transcript_cursor_page(
+            node.session_key,
+            limit=3,
+            before=before,
+        )
+        assert page.canonical_complete is True
+        assert len(page.items) <= 3
+        loaded = [*page.items, *loaded]
+        if not page.has_more:
+            break
+        before = page.items[0].cursor
+
+    canonical = await manager.get_canonical_transcript(node.session_key)
+    assert [item.cursor for item in loaded] == [
+        (entry.created_at, entry.id or 0) for entry in canonical
+    ]
+    assert len({item.cursor for item in loaded}) == 10
+
+    oldest = loaded[0]
+    expected_stored_bytes = sum(
+        len(value.encode("utf-8"))
+        for value in (
+            contents[0],
+            json.dumps(tool_calls),
+            "reasoning",
+            json.dumps(turn_usage),
+            json.dumps(turn_context),
+            "cursor-0",
+            "user",
+            "external_user",
+            provenance_origin_session_id,
+            provenance_source_session_key,
+            provenance_source_channel,
+            provenance_source_tool,
+        )
+    )
+    assert oldest.stored_bytes == expected_stored_bytes
+    assert oldest.content_prefix == "😀" * 2_048
+    assert len(oldest.content_prefix.encode("utf-8")) == 8 * 1_024
+    assert loaded[1].content_prefix is None
+    assert loaded[1].turn_id is None
+    assert loaded[2].content_prefix == fallback_text[:2_048]
+    assert loaded[3].content_prefix == "message 3"
+    assert oldest.message_id == "cursor-0"
+    assert oldest.role == "user"
+    assert oldest.provenance_kind == "external_user"
+    assert oldest.provenance_origin_session_id == provenance_origin_session_id[:256]
+    assert oldest.provenance_source_session_key == provenance_source_session_key[:256]
+    assert oldest.provenance_source_channel == provenance_source_channel[:256]
+    assert oldest.provenance_source_tool == provenance_source_tool[:256]
+    assert oldest.turn_id == turn_id[:256]
+    for value in (
+        oldest.message_id,
+        oldest.role,
+        oldest.provenance_kind,
+        oldest.provenance_origin_session_id,
+        oldest.provenance_source_session_key,
+        oldest.provenance_source_channel,
+        oldest.provenance_source_tool,
+        oldest.turn_id,
+    ):
+        assert value is not None
+        assert len(value.encode("utf-8")) <= 1_024
+    assert not hasattr(oldest, "content")
+
+    forward = [loaded[0]]
+    after = loaded[0].cursor
+    while True:
+        page = await manager.get_canonical_transcript_cursor_page(
+            node.session_key,
+            limit=2,
+            after=after,
+        )
+        forward.extend(page.items)
+        if not page.has_more:
+            break
+        after = page.items[-1].cursor
+    assert [item.cursor for item in forward] == [item.cursor for item in loaded]
+
+    # A valid ``before`` cursor keeps precedence over ``after``. An unknown v2
+    # cursor fails closed so pagination cannot silently restart and loop.
+    before_wins = await manager.get_canonical_transcript_cursor_page(
+        node.session_key,
+        limit=2,
+        before=loaded[-1].cursor,
+        after=loaded[0].cursor,
+    )
+    assert [item.cursor for item in before_wins.items] == [
+        item.cursor for item in loaded[-3:-1]
+    ]
+    with pytest.raises(CanonicalTranscriptCursorInvalidatedError):
+        await manager.get_canonical_transcript_cursor_page(
+            node.session_key,
+            limit=2,
+            before=(999_999, 999_999),
+        )
+
+
+@pytest.mark.asyncio
+async def test_canonical_transcript_cursor_page_enforces_metadata_bound(manager):
+    node = await manager.create("agent:main:main")
+    await manager.append_message(node.session_key, "user", "message")
+
+    with pytest.raises(ValueError, match="between 1 and 200"):
+        await manager.get_canonical_transcript_cursor_page(node.session_key, limit=0)
+    with pytest.raises(ValueError, match="between 1 and 200"):
+        await manager.get_canonical_transcript_cursor_page(node.session_key, limit=201)
+
+
+@pytest.mark.asyncio
+async def test_canonical_cursor_survives_compaction_between_pages(manager):
+    node = await manager.create("agent:main:main")
+    for index in range(8):
+        await manager._storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                message_id=f"stable-{index}",
+                role="user",
+                content=f"message {index}",
+                created_at=10_000 + index,
+            )
+        )
+
+    before_compaction = await manager.get_canonical_transcript(node.session_key)
+    expected_cursors = [(entry.created_at, entry.id or 0) for entry in before_compaction]
+    newest_page = await manager.get_canonical_transcript_cursor_page(
+        node.session_key,
+        limit=3,
+    )
+    loaded = list(newest_page.items)
+    before = newest_page.items[0].cursor
+
+    kept = before_compaction[-4:]
+    await manager.persist_compaction_result(
+        node.session_key,
+        "stable cursor summary",
+        [{"role": entry.role, "content": entry.content} for entry in kept],
+        compaction_id="cmp-stable-cursor",
+    )
+    active_after = await manager._storage.get_transcript(node.session_id)
+    assert [entry.id for entry in active_after] == [entry.id for entry in kept]
+
+    while True:
+        page = await manager.get_canonical_transcript_cursor_page(
+            node.session_key,
+            limit=3,
+            before=before,
+        )
+        loaded = [*page.items, *loaded]
+        if not page.has_more:
+            break
+        before = page.items[0].cursor
+
+    assert [item.cursor for item in loaded] == expected_cursors
+    assert len({item.cursor for item in loaded}) == len(expected_cursors)
+
+
+@pytest.mark.asyncio
+async def test_summary_metadata_does_not_select_summary_body(manager, monkeypatch):
+    node = await manager.create("agent:main:main")
+    summary_text = "😀" * 300_000
+    compaction_id = "compaction-" + "c" * 2_000
+    await manager._storage.save_summary(
+        SessionSummary(
+            session_id=node.session_id,
+            session_key=node.session_key,
+            compaction_id=compaction_id,
+            trigger_reason="manual",
+            summary_text=summary_text,
+            summary_format="text",
+            coverage_status="complete",
+            removed_count=7,
+            kept_count=2,
+            covered_through_id=42,
+            created_at=1_234,
+        )
+    )
+
+    original_execute = manager._storage.conn.execute
+    captured_sql = []
+
+    def execute(sql: str, params: Any = ()):
+        if "AS summary_bytes" in sql:
+            captured_sql.append(sql)
+        return original_execute(sql, params)
+
+    monkeypatch.setattr(manager._storage.conn, "execute", execute)
+    metadata, has_more, total_count = await manager.get_summary_metadata(node.session_key)
+
+    assert has_more is False
+    assert total_count == 1
+    assert len(metadata) == 1
+    assert metadata[0] == {
+        "id": 1,
+        "compaction_id": compaction_id[:256],
+        "compaction_index": 0,
+        "trigger_reason": "manual",
+        "summary_format": "text",
+        "coverage_status": "complete",
+        "removed_count": 7,
+        "kept_count": 2,
+        "covered_through_id": 42,
+        "created_at": 1_234,
+        "summary_bytes": len(summary_text.encode("utf-8")),
+    }
+    assert len(captured_sql) == 1
+    assert " OVER " not in captured_sql[0]
+    assert "SELECT COUNT(*)" in captured_sql[0]
+    query_without_length_probe = captured_sql[0].replace(
+        "octet_length(summary_text)",
+        "",
+    )
+    assert "summary_text" not in query_without_length_probe
+
+
+@pytest.mark.asyncio
+async def test_summary_metadata_returns_a_hard_bounded_newest_window(manager):
+    node = await manager.create("agent:main:main")
+    for index in range(205):
+        await manager._storage.save_summary(
+            SessionSummary(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                compaction_index=index,
+                compaction_id=f"cmp-{index}",
+                summary_text=f"summary {index}",
+            )
+        )
+
+    metadata, has_more, total_count = await manager.get_summary_metadata(
+        node.session_key,
+        limit=10,
+    )
+
+    assert has_more is True
+    assert total_count == 205
+    assert [item["compaction_index"] for item in metadata] == list(range(195, 205))
+    assert all("summary_text" not in item for item in metadata)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_metadata_omits_unbounded_task_plan_and_run_payloads(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:main")
+    giant_text = "x" * ((1 * 1_024 * 1_024) + 1)
+
+    for index in range(100):
+        await manager._storage.create_agent_task(
+            AgentTaskRecord(
+                task_id=f"bounded-task-{index}",
+                session_key=node.session_key,
+                source_kind="user",
+                queue_mode="followup",
+                run_kind="default",
+                status=AgentTaskStatus.SUCCEEDED,
+                created_at=index,
+                updated_at=index,
+                started_at=index,
+                finished_at=index,
+            )
+        )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id="giant-diagnostics-task",
+            session_key=node.session_key,
+            source_kind="user",
+            queue_mode="followup",
+            run_kind="default",
+            status=AgentTaskStatus.FAILED,
+            created_at=10_000,
+            updated_at=10_001,
+            started_at=9_999,
+            finished_at=10_001,
+            terminal_reason=giant_text,
+            error_class="SyntheticError",
+            error_message=giant_text,
+            details={"diagnostic": giant_text},
+        )
+    )
+
+    revision_id = "bootstrap-bounded-revision"
+    plan_id = "bootstrap-bounded-plan"
+    content_hash = "a" * 64
+    await manager._storage.conn.execute(
+        """
+        INSERT INTO plan_revisions (
+            revision_id,
+            plan_id,
+            parent_revision_id,
+            generation,
+            source_session_key,
+            source_session_id,
+            source_epoch,
+            source_turn_id,
+            source_message_id,
+            title,
+            markdown,
+            steps,
+            content_hash,
+            created_at,
+            schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            revision_id,
+            plan_id,
+            None,
+            1,
+            node.session_key,
+            node.session_id,
+            int(node.epoch or 0),
+            "turn-bounded",
+            "message-bounded",
+            "Bounded bootstrap plan",
+            giant_text,
+            json.dumps([{"step_id": "step-1", "diagnostic": giant_text}]),
+            content_hash,
+            20_000,
+            1,
+        ),
+    )
+    await manager._storage.conn.execute(
+        "UPDATE sessions SET active_plan_revision_id = ? WHERE session_key = ?",
+        (revision_id, node.session_key),
+    )
+    await manager._storage.conn.execute(
+        """
+        INSERT INTO plan_runs (
+            run_id,
+            session_key,
+            session_id,
+            session_epoch,
+            plan_revision_id,
+            supersedes_run_id,
+            driver_kind,
+            driver_id,
+            status,
+            step_states,
+            current_step_id,
+            state_revision,
+            active_task_id,
+            pause_reason,
+            terminal_reason,
+            created_at,
+            updated_at,
+            started_at,
+            finished_at,
+            schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "bootstrap-bounded-run",
+            node.session_key,
+            node.session_id,
+            int(node.epoch or 0),
+            revision_id,
+            None,
+            "manual",
+            None,
+            "blocked",
+            json.dumps([{"step_id": "step-1", "diagnostic": giant_text}]),
+            "step-1",
+            7,
+            "giant-diagnostics-task",
+            giant_text,
+            giant_text,
+            30_000,
+            30_001,
+            30_000,
+            None,
+            1,
+        ),
+    )
+    await manager._storage.conn.commit()
+
+    original_execute = manager._storage.conn.execute
+    metadata_queries: dict[str, str] = {}
+
+    def execute(sql: str, params: Any = ()):
+        if "FROM agent_tasks" in sql:
+            metadata_queries["tasks"] = sql
+        elif "JOIN plan_revisions" in sql:
+            metadata_queries["plan"] = sql
+        elif "FROM plan_runs" in sql:
+            metadata_queries["run"] = sql
+        return original_execute(sql, params)
+
+    monkeypatch.setattr(manager._storage.conn, "execute", execute)
+    tasks = await manager._storage.list_recent_agent_task_metadata(node.session_key)
+    plan = await manager._storage.get_current_plan_revision_metadata(node.session_key)
+    run = await manager._storage.get_active_plan_run_metadata(node.session_key)
+
+    assert len(tasks) == 100
+    assert tasks[0] == {
+        "task_id": "giant-diagnostics-task",
+        "session_key": node.session_key,
+        "agent_id": "main",
+        "source_kind": "user",
+        "queue_mode": "followup",
+        "run_kind": "default",
+        "status": "failed",
+        "created_at": 10_000,
+        "updated_at": 10_001,
+        "started_at": 9_999,
+        "finished_at": 10_001,
+        "schema_version": 1,
+    }
+    assert tasks[-1]["task_id"] == "bounded-task-1"
+    assert plan == {
+        "revision_id": revision_id,
+        "plan_id": plan_id,
+        "parent_revision_id": None,
+        "generation": 1,
+        "source_session_key": node.session_key,
+        "source_session_id": node.session_id,
+        "source_epoch": int(node.epoch or 0),
+        "source_turn_id": "turn-bounded",
+        "source_message_id": "message-bounded",
+        "content_hash": content_hash,
+        "created_at": 20_000,
+        "schema_version": 1,
+    }
+    assert run == {
+        "run_id": "bootstrap-bounded-run",
+        "session_key": node.session_key,
+        "session_id": node.session_id,
+        "session_epoch": int(node.epoch or 0),
+        "plan_revision_id": revision_id,
+        "supersedes_run_id": None,
+        "driver_kind": "manual",
+        "driver_id": None,
+        "status": "blocked",
+        "current_step_id": "step-1",
+        "state_revision": 7,
+        "active_task_id": "giant-diagnostics-task",
+        "created_at": 30_000,
+        "updated_at": 30_001,
+        "started_at": 30_000,
+        "finished_at": None,
+        "schema_version": 1,
+    }
+    assert len(json.dumps({"tasks": tasks, "plan": plan, "run": run}).encode()) < 128 * 1_024
+    for query_name, omitted_columns in {
+        "tasks": ("details", "error_message", "terminal_reason"),
+        "plan": ("title", "markdown", "steps"),
+        "run": ("step_states", "pause_reason", "terminal_reason"),
+    }.items():
+        for column in omitted_columns:
+            assert column not in metadata_queries[query_name]
+    for invalid_limit in (0, 101, True):
+        with pytest.raises(ValueError, match="between 1 and 100"):
+            await manager._storage.list_recent_agent_task_metadata(
+                node.session_key,
+                limit=invalid_limit,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "force_old_sqlite",
+    [False, True],
+    ids=["native-sqlite", "forced-old-sqlite"],
+)
+async def test_task_outcome_metadata_preserves_only_byte_bounded_typed_details(
+    manager,
+    monkeypatch,
+    force_old_sqlite: bool,
+):
+    if force_old_sqlite:
+        monkeypatch.setattr(storage_module, "_SQLITE_HAS_OCTET_LENGTH", False)
+
+    node = await manager.create("agent:main:main")
+    small_details = {
+        "turn_id": "turn-小型-😀",
+        "turn_outcome": {
+            "kind": "completed",
+            "reason": "工具“完成”\\路径",
+            "retryable": False,
+            "attempt": 2,
+            "labels": ["中文", "emoji 😀"],
+        },
+    }
+    large_details = {
+        "turn_id": "turn-large",
+        "turn_outcome": {"kind": "failed", "reason": "synthetic"},
+        "diagnostic": "界😀" * 2_000,
+    }
+    cap = storage_module._AGENT_TASK_OUTCOME_DETAILS_MAX_BYTES
+    assert len(json.dumps(small_details).encode("utf-8")) <= cap
+    assert len(json.dumps(large_details).encode("utf-8")) > cap
+
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id="small-typed-outcome",
+            session_key=node.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+            started_at=101,
+            finished_at=102,
+            details=small_details,
+        )
+    )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id="large-outcome-diagnostics",
+            session_key=node.session_key,
+            status=AgentTaskStatus.FAILED,
+            started_at=201,
+            finished_at=202,
+            details=large_details,
+        )
+    )
+
+    original_execute = manager._storage.conn.execute
+    outcome_queries: list[str] = []
+
+    def execute(sql: str, params: Any = ()):
+        if "AS details" in sql and "FROM agent_tasks" in sql:
+            outcome_queries.append(sql)
+        return original_execute(sql, params)
+
+    monkeypatch.setattr(manager._storage.conn, "execute", execute)
+    rows = await manager._storage.get_agent_task_outcome_metadata_by_ids(
+        ["small-typed-outcome", "large-outcome-diagnostics"]
+    )
+
+    assert rows == [
+        {
+            "task_id": "small-typed-outcome",
+            "status": "succeeded",
+            "started_at": 101,
+            "finished_at": 102,
+            "details": small_details,
+        },
+        {
+            "task_id": "large-outcome-diagnostics",
+            "status": "failed",
+            "started_at": 201,
+            "finished_at": 202,
+            # The caller can derive the legacy failed outcome from status
+            # without materializing the oversized diagnostics JSON.
+            "details": None,
+        },
+    ]
+    assert len(outcome_queries) == 1
+    assert "THEN details ELSE NULL END AS details" in outcome_queries[0]
+    if storage_module._SQLITE_HAS_OCTET_LENGTH:
+        assert "octet_length(details)" in outcome_queries[0]
+    else:
+        assert "length(CAST(details AS BLOB))" in outcome_queries[0]
+        assert "octet_length" not in outcome_queries[0]
+
+
+@pytest.mark.asyncio
+async def test_old_sqlite_cursor_uses_bounded_blob_metadata_without_full_rows(
+    manager,
+    monkeypatch,
+):
+    monkeypatch.setattr(storage_module, "_SQLITE_HAS_OCTET_LENGTH", False)
+    node = await manager.create("agent:main:main")
+    await manager._storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=node.session_id,
+            session_key=node.session_key,
+            message_id="old-sqlite-lookahead",
+            role="user",
+            content="lookahead",
+            created_at=1_000,
+        )
+    )
+    content = "界" * 500_000
+    tool_calls = [{"name": "bounded", "arguments": {"value": "x" * 100}}]
+    turn_usage = {"input_tokens": 12, "output_tokens": 34}
+    turn_context = {"turn_id": "turn-old-sqlite", "disposition": "completed"}
+    selected = TranscriptEntry(
+        session_id=node.session_id,
+        session_key=node.session_key,
+        message_id="old-sqlite-selected",
+        role="assistant",
+        content=content,
+        tool_calls=tool_calls,
+        tool_call_id="tool-call-old-sqlite",
+        reasoning_content="bounded reasoning",
+        turn_usage=turn_usage,
+        turn_context=turn_context,
+        provenance_kind="external_user",
+        provenance_origin_session_id="origin-old-sqlite",
+        provenance_source_session_key="agent:main:source",
+        provenance_source_channel="terminal",
+        provenance_source_tool="session-test",
+        created_at=2_000,
+    )
+    await manager._storage.append_transcript_entry(selected)
+    await manager._storage.save_summary(
+        SessionSummary(
+            session_id=node.session_id,
+            session_key=node.session_key,
+            compaction_id="old-sqlite",
+            trigger_reason="manual",
+            summary_text="😀" * 500_000,
+            removed_count=1,
+        )
+    )
+
+    original_blob_metadata = manager._storage._read_canonical_transcript_blob_metadata
+    metadata_locations: list[tuple[str, int]] = []
+    original_execute = manager._storage.conn.execute
+    cursor_queries: list[str] = []
+
+    def execute(sql: str, params: Any = ()):
+        if "physical_rowid" in sql and "WITH active_page AS" in sql:
+            cursor_queries.append(sql)
+        return original_execute(sql, params)
+
+    async def read_blob_metadata(*, table: str, rowid: int):
+        metadata_locations.append((table, rowid))
+        return await original_blob_metadata(table=table, rowid=rowid)
+
+    monkeypatch.setattr(
+        manager._storage,
+        "_read_canonical_transcript_blob_metadata",
+        read_blob_metadata,
+    )
+    monkeypatch.setattr(manager._storage.conn, "execute", execute)
+    page = await manager.get_canonical_transcript_cursor_page(
+        node.session_key,
+        limit=1,
+    )
+    assert page.has_more is True
+    assert len(cursor_queries) == 1
+    for payload_column in (
+        "content",
+        "message_id",
+        "tool_calls",
+        "tool_call_id",
+        "reasoning_content",
+        "turn_usage",
+        "turn_context",
+        "provenance_kind",
+    ):
+        assert payload_column not in cursor_queries[0]
+    assert len(metadata_locations) == 1
+    item = page.items[0]
+    expected_stored_bytes = sum(
+        len(value.encode("utf-8"))
+        for value in (
+            content,
+            selected.message_id,
+            selected.role,
+            json.dumps(tool_calls),
+            selected.tool_call_id,
+            selected.reasoning_content,
+            json.dumps(turn_usage),
+            json.dumps(turn_context),
+            selected.provenance_kind,
+            selected.provenance_origin_session_id,
+            selected.provenance_source_session_key,
+            selected.provenance_source_channel,
+            selected.provenance_source_tool,
+        )
+    )
+    assert item.stored_bytes == expected_stored_bytes
+    assert item.content_prefix == "界" * 2_048
+    assert len(item.content_prefix.encode("utf-8")) <= 8 * 1_024
+    assert item.message_id == selected.message_id
+    assert item.role == selected.role
+    assert item.provenance_kind == selected.provenance_kind
+    assert item.provenance_origin_session_id == selected.provenance_origin_session_id
+    assert item.provenance_source_session_key == selected.provenance_source_session_key
+    assert item.provenance_source_channel == selected.provenance_source_channel
+    assert item.provenance_source_tool == selected.provenance_source_tool
+    assert item.turn_id == turn_context["turn_id"]
+
+    metadata, has_more, total_count = await manager.get_summary_metadata(node.session_key)
+    assert has_more is False
+    assert total_count == 1
+    assert metadata[0]["compaction_id"] is None
+    assert metadata[0]["summary_bytes"] is None
+
+
+@pytest.mark.asyncio
+async def test_detail_metadata_reports_every_oversized_stored_field_without_full_row(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:main")
+    giant_text = "y" * ((1 * 1_024 * 1_024) + 1)
+    await manager._storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=node.session_id,
+            session_key=node.session_key,
+            message_id="detail-all-fields",
+            role="assistant",
+            content="small content",
+            tool_call_id=giant_text,
+            provenance_origin_session_id=giant_text,
+            provenance_source_channel=giant_text,
+            created_at=40_000,
+        )
+    )
+    async with manager._storage.conn.execute(
+        """
+        SELECT id, created_at
+        FROM transcript_entries
+        WHERE session_id = ? AND message_id = ?
+        """,
+        (node.session_id, "detail-all-fields"),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+
+    async def fail_full_row_read(*_args: Any, **_kwargs: Any):
+        raise AssertionError("detail metadata must not materialize a full transcript row")
+
+    monkeypatch.setattr(
+        manager._storage,
+        "get_canonical_transcript_entry_by_cursor",
+        fail_full_row_read,
+    )
+    metadata = await manager._storage.get_canonical_transcript_detail_metadata(
+        node.session_id,
+        cursor=(int(row["created_at"]), int(row["id"])),
+    )
+
+    assert metadata is not None
+    assert metadata.content_prefix == "small content"
+    assert metadata.field_bytes["content"] == len(b"small content")
+    expected_giant_bytes = len(giant_text.encode())
+    assert metadata.field_bytes["tool_call_id"] == expected_giant_bytes
+    assert metadata.field_bytes["provenance_origin_session_id"] == expected_giant_bytes
+    assert metadata.field_bytes["provenance_source_channel"] == expected_giant_bytes
+    assert set(metadata.field_bytes) == set(
+        storage_module._CANONICAL_TRANSCRIPT_STORED_BYTE_FIELDS  # noqa: SLF001
+    )
+
+
+@pytest.mark.asyncio
+async def test_incremental_sqlite_worker_keeps_fallback_lock_until_cancelled_call_finishes(
+    tmp_path: Path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "cancelled-blob-worker.db"))
+    raw_connection = sqlite3.connect(":memory:", check_same_thread=False)
+
+    class _FallbackConnection:
+        def __init__(self) -> None:
+            self._conn = raw_connection
+            self._locked = asyncio.Lock()
+
+    fallback = _FallbackConnection()
+    storage._conn = fallback  # type: ignore[assignment]  # noqa: SLF001
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_callback(_connection: sqlite3.Connection) -> None:
+        started.set()
+        release.wait(timeout=5)
+
+    task = asyncio.create_task(
+        storage._run_on_sqlite_worker(_blocking_callback)  # noqa: SLF001
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0.05)
+
+        assert task.done() is False
+        assert fallback._locked.locked() is True
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert fallback._locked.locked() is False
+    finally:
+        release.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        raw_connection.close()
+        storage._conn = None  # noqa: SLF001
 
 
 @pytest.mark.asyncio

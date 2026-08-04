@@ -98,6 +98,58 @@ class CanonicalTranscriptCoverage:
     inherited_compactions: bool
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalTranscriptCursorItem:
+    """Lightweight keyset item for incrementally reading canonical history.
+
+    ``stored_bytes`` is the sum of the UTF-8 storage bytes for the transcript
+    payload columns that can dominate a projected chat message.  The prefix is
+    selected and bounded by SQLite so callers can decide whether to fetch the
+    full row without first materializing its complete content.
+    """
+
+    cursor: tuple[int, int]
+    stored_bytes: int
+    content_prefix: str | None
+    message_id: str
+    role: str
+    provenance_kind: str | None
+    provenance_origin_session_id: str | None
+    provenance_source_session_key: str | None
+    provenance_source_channel: str | None
+    provenance_source_tool: str | None
+    turn_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalTranscriptDetailMetadata:
+    """Bounded metadata for streaming one canonical row field by field."""
+
+    cursor: tuple[int, int]
+    field_bytes: dict[str, int]
+    content_prefix: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalTranscriptBlobMetadata:
+    """Bounded field metadata read through SQLite's incremental BLOB API."""
+
+    field_bytes: dict[str, int]
+    content_prefix: str | None
+    message_id: str
+    role: str
+    provenance_kind: str | None
+    provenance_origin_session_id: str | None
+    provenance_source_session_key: str | None
+    provenance_source_channel: str | None
+    provenance_source_tool: str | None
+    turn_id: str | None
+
+
+class CanonicalTranscriptCursorInvalidatedError(LookupError):
+    """Raised when a v2 keyset cursor no longer addresses a canonical row."""
+
+
 class StorageBusyError(RuntimeError):
     """Raised when a session-storage operation outlives its bounded busy budget."""
 
@@ -335,6 +387,65 @@ SCHEMA_VERSION = 16
 # without guessing about legacy prefix forks. This reuses the persisted row
 # version and does not widen or rewrite the database schema.
 CANONICAL_FORK_PROOF_SCHEMA_VERSION = 2
+
+# Gateway history count limits currently top out at 200.  Keep this storage
+# boundary explicit so an interactive cursor scan can never grow into an
+# unbounded metadata read if a caller skips request normalization.
+CANONICAL_TRANSCRIPT_CURSOR_PAGE_MAX_ENTRIES = 200
+CANONICAL_SUMMARY_METADATA_MAX_ENTRIES = 200
+
+# SQLite's substr(TEXT, ...) counts Unicode code points.  At most 2,048 code
+# points encode to 8 KiB of UTF-8, so even adversarial non-ASCII content keeps
+# each cursor preview bounded without cutting a UTF-8 sequence.
+_CANONICAL_TRANSCRIPT_CONTENT_PREFIX_CODEPOINTS = 2_048
+
+# At most 256 code points encode to 1 KiB of UTF-8.  Cursor metadata is only a
+# preview; exact values remain available through the single-row getter.
+_CANONICAL_TRANSCRIPT_METADATA_PREFIX_CODEPOINTS = 256
+
+# JSON1 validates and parses its full input.  Only use it for small values;
+# larger rows remain useful as a bounded raw preview without paying unbounded
+# SQLite parser memory or CPU before the Gateway applies its response budget.
+_CANONICAL_TRANSCRIPT_JSON_PROJECTION_MAX_BYTES = 32 * 1_024
+_CANONICAL_TRANSCRIPT_METADATA_PROJECTION_MAX_BYTES = 4 * 1_024
+_SQLITE_HAS_OCTET_LENGTH = sqlite3.sqlite_version_info >= (3, 43, 0)
+
+# Typed turn outcomes are useful to history consumers, but task diagnostics can
+# grow without bound.  Select the JSON only after SQLite has verified its stored
+# UTF-8 byte length; older SQLite releases use a BLOB cast because length(TEXT)
+# counts Unicode code points rather than bytes.
+_AGENT_TASK_OUTCOME_DETAILS_MAX_BYTES = 8 * 1_024
+
+CANONICAL_TRANSCRIPT_DETAIL_CHUNK_MAX_BYTES = 256 * 1_024
+_CANONICAL_TRANSCRIPT_STORED_BYTE_FIELDS = (
+    "content",
+    "message_id",
+    "role",
+    "tool_calls",
+    "tool_call_id",
+    "reasoning_content",
+    "turn_usage",
+    "turn_context",
+    "provenance_kind",
+    "provenance_origin_session_id",
+    "provenance_source_session_key",
+    "provenance_source_channel",
+    "provenance_source_tool",
+)
+_CANONICAL_TRANSCRIPT_DETAIL_FIELDS = frozenset(
+    {
+        "message_id",
+        "role",
+        "content",
+        "tool_calls",
+        "reasoning_content",
+        "turn_usage",
+        "turn_context",
+        "provenance_kind",
+        "provenance_source_session_key",
+        "provenance_source_tool",
+    }
+)
 
 # SQLite CREATE statements derived from SQLModel metadata
 _CREATE_SESSIONS = """
@@ -1923,6 +2034,39 @@ class SessionStorage:
         if self._conn is None:
             raise RuntimeError("Storage not connected. Call connect() first.")
         return self._conn
+
+    async def _run_on_sqlite_worker(
+        self,
+        callback: Callable[[sqlite3.Connection], Any],
+    ) -> Any:
+        """Run a raw-connection callback on the connection's owning worker.
+
+        SQLite's incremental BLOB API must run on the same thread as the raw
+        connection. Native ``aiosqlite`` exposes its worker dispatcher through
+        ``_execute``; OpenSquilla's compatibility backend instead exposes the
+        lock guarding its ``check_same_thread=False`` connection. Keeping this
+        adapter here avoids ever copying a giant TEXT value through a SQL
+        ``substr`` expression merely to return one bounded byte range.
+        """
+
+        connection = self.conn
+        raw_connection = getattr(connection, "_conn", None)
+        if not isinstance(raw_connection, sqlite3.Connection):
+            raise RuntimeError("SQLite incremental BLOB access is unavailable")
+
+        fallback_lock = getattr(connection, "_locked", None)
+        if fallback_lock is not None:
+            async with fallback_lock:
+                return await self._finish_sqlite_call(
+                    asyncio.to_thread(callback, raw_connection)
+                )
+
+        worker_execute = getattr(connection, "_execute", None)
+        if not callable(worker_execute):
+            raise RuntimeError("SQLite worker dispatch is unavailable")
+        return await self._finish_sqlite_call(
+            worker_execute(callback, raw_connection)
+        )
 
     # ── Durable usage ledger ────────────────────────────────────────────────
 
@@ -4284,6 +4428,39 @@ class SessionStorage:
         )
 
     @_serialized_read
+    async def get_current_plan_revision_metadata(
+        self,
+        session_key: str,
+    ) -> dict[str, Any] | None:
+        """Return current-plan identity metadata without plan body columns."""
+
+        session_key = canonicalize_session_key(session_key)
+        async with self.conn.execute(
+            """
+            SELECT
+                plan_revisions.revision_id,
+                plan_revisions.plan_id,
+                plan_revisions.parent_revision_id,
+                plan_revisions.generation,
+                plan_revisions.source_session_key,
+                plan_revisions.source_session_id,
+                plan_revisions.source_epoch,
+                plan_revisions.source_turn_id,
+                plan_revisions.source_message_id,
+                plan_revisions.content_hash,
+                plan_revisions.created_at,
+                plan_revisions.schema_version
+            FROM sessions
+            JOIN plan_revisions
+              ON plan_revisions.revision_id = sessions.active_plan_revision_id
+            WHERE sessions.session_key = ?
+            """,
+            (session_key,),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else dict(row)
+
+    @_serialized_read
     async def list_plan_revisions(
         self,
         *,
@@ -4560,6 +4737,45 @@ class SessionStorage:
         ) as cur:
             row = await cur.fetchone()
         return None if row is None else PlanRunRecord(**_deserialize_row(dict(row)))
+
+    @_serialized_read
+    async def get_active_plan_run_metadata(
+        self,
+        session_key: str,
+    ) -> dict[str, Any] | None:
+        """Return active-run state metadata without steps or reason text."""
+
+        session_key = canonicalize_session_key(session_key)
+        placeholders = ", ".join("?" for _ in PLAN_RUN_ACTIVE_STATUSES)
+        async with self.conn.execute(
+            f"""
+            SELECT
+                run_id,
+                session_key,
+                session_id,
+                session_epoch,
+                plan_revision_id,
+                supersedes_run_id,
+                driver_kind,
+                driver_id,
+                status,
+                current_step_id,
+                state_revision,
+                active_task_id,
+                created_at,
+                updated_at,
+                started_at,
+                finished_at,
+                schema_version
+            FROM plan_runs
+            WHERE session_key = ? AND status IN ({placeholders})
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,  # noqa: S608 - placeholder count is derived from a fixed constant
+            [session_key, *sorted(PLAN_RUN_ACTIVE_STATUSES)],
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else dict(row)
 
     async def supersede_active_plan_runs(
         self,
@@ -5043,6 +5259,53 @@ class SessionStorage:
                 rows_by_id[task.task_id] = task
         return [rows_by_id[task_id] for task_id in ids if task_id in rows_by_id]
 
+    @_serialized_read
+    async def get_agent_task_outcome_metadata_by_ids(
+        self,
+        task_ids: Iterable[str],
+    ) -> list[dict[str, Any]]:
+        """Fetch bounded terminal metadata for one history response window."""
+
+        ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
+        if len(ids) > CANONICAL_TRANSCRIPT_CURSOR_PAGE_MAX_ENTRIES:
+            raise ValueError(
+                "task_ids exceeds the canonical history page limit"
+            )
+        if not ids:
+            return []
+        details_length = (
+            "octet_length(details)"
+            if _SQLITE_HAS_OCTET_LENGTH
+            else "length(CAST(details AS BLOB))"
+        )
+        details_projection = (
+            "CASE WHEN details IS NULL OR "
+            f"{details_length} <= {_AGENT_TASK_OUTCOME_DETAILS_MAX_BYTES} "
+            "THEN details ELSE NULL END AS details"
+        )
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for index in range(0, len(ids), _SQLITE_VARIABLE_CHUNK_SIZE):
+            chunk = ids[index : index + _SQLITE_VARIABLE_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            async with self.conn.execute(
+                f"""
+                SELECT
+                    task_id,
+                    status,
+                    started_at,
+                    finished_at,
+                    {details_projection}
+                FROM agent_tasks
+                WHERE task_id IN ({placeholders})
+                """,  # noqa: S608 - placeholder count is derived from bounded ids
+                chunk,
+            ) as cur:
+                rows = await cur.fetchall()
+            for row in rows:
+                item = _deserialize_row(dict(row))
+                rows_by_id[str(item["task_id"])] = item
+        return [rows_by_id[task_id] for task_id in ids if task_id in rows_by_id]
+
     async def update_agent_task(self, task_id: str, **fields: Any) -> AgentTaskRecord:
         if not fields:
             existing = await self.get_agent_task(task_id)
@@ -5121,6 +5384,46 @@ class SessionStorage:
         ) as cur:
             rows = await cur.fetchall()
         return [AgentTaskRecord(**_deserialize_row(dict(row))) for row in rows]
+
+    @_serialized_read
+    async def list_recent_agent_task_metadata(
+        self,
+        session_key: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return a hard-bounded task window without diagnostic payload text."""
+
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("limit must be between 1 and 100")
+        async with self.conn.execute(
+            """
+            SELECT
+                task_id,
+                session_key,
+                agent_id,
+                source_kind,
+                queue_mode,
+                run_kind,
+                status,
+                created_at,
+                updated_at,
+                started_at,
+                finished_at,
+                schema_version
+            FROM agent_tasks
+            WHERE session_key = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (canonicalize_session_key(session_key), limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
 
     async def upsert_memory_durable_receipt(
         self,
@@ -6956,6 +7259,303 @@ class SessionStorage:
         return TranscriptEntry(**_deserialize_row(dict(row)))
 
     @_serialized_read
+    async def get_canonical_transcript_entry_by_cursor(
+        self,
+        session_id: str,
+        *,
+        cursor: tuple[int, int],
+    ) -> TranscriptEntry | None:
+        """Look up one canonical row by the stable history keyset cursor."""
+
+        created_at, entry_id = cursor
+        sql = """
+            SELECT
+                original_entry_id AS id,
+                session_id,
+                session_key,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                turn_context,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                schema_version
+            FROM compacted_transcript_entries
+            WHERE session_id = ? AND created_at = ? AND original_entry_id = ?
+            UNION ALL
+            SELECT
+                id,
+                session_id,
+                session_key,
+                message_id,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                turn_usage,
+                turn_context,
+                created_at,
+                token_count,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                schema_version
+            FROM transcript_entries
+            WHERE session_id = ? AND created_at = ? AND id = ?
+            LIMIT 1
+        """
+        async with self.conn.execute(
+            sql,
+            (
+                session_id,
+                created_at,
+                entry_id,
+                session_id,
+                created_at,
+                entry_id,
+            ),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return TranscriptEntry(**_deserialize_row(dict(row)))
+
+    async def _canonical_transcript_blob_location(
+        self,
+        session_id: str,
+        *,
+        cursor: tuple[int, int],
+    ) -> tuple[str, int] | None:
+        """Resolve a canonical cursor without selecting any payload column."""
+
+        created_at, entry_id = cursor
+        sql = """
+            SELECT source_table, physical_rowid FROM (
+                SELECT
+                    'compacted_transcript_entries' AS source_table,
+                    id AS physical_rowid,
+                    0 AS source_order
+                FROM compacted_transcript_entries
+                WHERE session_id = ? AND created_at = ? AND original_entry_id = ?
+                UNION ALL
+                SELECT
+                    'transcript_entries' AS source_table,
+                    id AS physical_rowid,
+                    1 AS source_order
+                FROM transcript_entries
+                WHERE session_id = ? AND created_at = ? AND id = ?
+            )
+            ORDER BY source_order
+            LIMIT 1
+        """
+        async with self.conn.execute(
+            sql,
+            (
+                session_id,
+                created_at,
+                entry_id,
+                session_id,
+                created_at,
+                entry_id,
+            ),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return str(row["source_table"]), int(row["physical_rowid"])
+
+    async def _read_canonical_transcript_blob_metadata(
+        self,
+        *,
+        table: str,
+        rowid: int,
+    ) -> _CanonicalTranscriptBlobMetadata:
+        """Read exact field sizes plus bounded text without selecting a full row."""
+
+        if table not in {"transcript_entries", "compacted_transcript_entries"}:
+            raise ValueError("unsupported canonical transcript table")
+
+        prefix_max_bytes = _CANONICAL_TRANSCRIPT_CONTENT_PREFIX_CODEPOINTS * 4
+        bounded_text_fields = {
+            "message_id",
+            "role",
+            "provenance_kind",
+            "provenance_origin_session_id",
+            "provenance_source_session_key",
+            "provenance_source_channel",
+            "provenance_source_tool",
+        }
+
+        def _read_metadata(connection: sqlite3.Connection) -> _CanonicalTranscriptBlobMetadata:
+            sizes: dict[str, int] = {}
+            bounded_text: dict[str, str | None] = {}
+            content_prefix: str | None = None
+            turn_id: str | None = None
+            for field in _CANONICAL_TRANSCRIPT_STORED_BYTE_FIELDS:
+                try:
+                    with connection.blobopen(table, field, rowid, readonly=True) as blob:
+                        field_size = len(blob)
+                        sizes[field] = field_size
+                        if field == "content" and field_size:
+                            prefix = blob.read(min(field_size, prefix_max_bytes))
+                            content_prefix = prefix.decode("utf-8", errors="ignore")
+                            content_prefix = content_prefix[
+                                :_CANONICAL_TRANSCRIPT_CONTENT_PREFIX_CODEPOINTS
+                            ]
+                        elif (
+                            field in bounded_text_fields
+                            and field_size <= _CANONICAL_TRANSCRIPT_METADATA_PROJECTION_MAX_BYTES
+                        ):
+                            value = blob.read(field_size).decode("utf-8", errors="ignore")
+                            bounded_text[field] = value[
+                                :_CANONICAL_TRANSCRIPT_METADATA_PREFIX_CODEPOINTS
+                            ]
+                        elif (
+                            field == "turn_context"
+                            and field_size <= _CANONICAL_TRANSCRIPT_JSON_PROJECTION_MAX_BYTES
+                        ):
+                            raw_context = blob.read(field_size).decode("utf-8", errors="ignore")
+                            try:
+                                context = json.loads(raw_context)
+                            except (TypeError, ValueError):
+                                context = None
+                            if isinstance(context, dict) and isinstance(
+                                context.get("turn_id"), str
+                            ):
+                                turn_id = context["turn_id"][
+                                    :_CANONICAL_TRANSCRIPT_METADATA_PREFIX_CODEPOINTS
+                                ]
+                except sqlite3.OperationalError:
+                    # ``blobopen`` rejects SQL NULL. Confirm the storage type so
+                    # unrelated I/O/database failures are never misreported as
+                    # an empty optional field.
+                    row = connection.execute(
+                        f"SELECT typeof({field}) FROM {table} WHERE id = ?",  # noqa: S608
+                        (rowid,),
+                    ).fetchone()
+                    if row is None or row[0] != "null":
+                        raise
+                    sizes[field] = 0
+                    if field in bounded_text_fields:
+                        bounded_text[field] = None
+
+            return _CanonicalTranscriptBlobMetadata(
+                field_bytes=sizes,
+                content_prefix=content_prefix,
+                message_id=str(bounded_text.get("message_id") or ""),
+                role=str(bounded_text.get("role") or "unknown"),
+                provenance_kind=bounded_text.get("provenance_kind"),
+                provenance_origin_session_id=bounded_text.get(
+                    "provenance_origin_session_id"
+                ),
+                provenance_source_session_key=bounded_text.get(
+                    "provenance_source_session_key"
+                ),
+                provenance_source_channel=bounded_text.get("provenance_source_channel"),
+                provenance_source_tool=bounded_text.get("provenance_source_tool"),
+                turn_id=turn_id,
+            )
+
+        return cast(
+            _CanonicalTranscriptBlobMetadata,
+            await self._run_on_sqlite_worker(_read_metadata),
+        )
+
+    @_serialized_read
+    async def get_canonical_transcript_detail_metadata(
+        self,
+        session_id: str,
+        *,
+        cursor: tuple[int, int],
+    ) -> CanonicalTranscriptDetailMetadata | None:
+        """Return field sizes and a bounded prefix without selecting full values."""
+
+        location = await self._canonical_transcript_blob_location(
+            session_id,
+            cursor=cursor,
+        )
+        if location is None:
+            return None
+        table, rowid = location
+        metadata = await self._read_canonical_transcript_blob_metadata(
+            table=table,
+            rowid=rowid,
+        )
+        return CanonicalTranscriptDetailMetadata(
+            cursor=cursor,
+            # Report every stored field even when the detail chunk protocol
+            # doesn't expose that field directly. Callers must see oversized
+            # auxiliary columns before deciding whether an exact row
+            # projection is safe to materialize.
+            field_bytes=dict(metadata.field_bytes),
+            content_prefix=metadata.content_prefix,
+        )
+
+    @_serialized_read
+    async def read_canonical_transcript_detail_field_chunk(
+        self,
+        session_id: str,
+        *,
+        cursor: tuple[int, int],
+        field: str,
+        offset: int,
+        max_bytes: int,
+    ) -> bytes:
+        """Read one UTF-8 storage-field byte range for a canonical row."""
+
+        if field not in _CANONICAL_TRANSCRIPT_DETAIL_FIELDS:
+            raise ValueError("unsupported canonical transcript detail field")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 1 <= max_bytes <= CANONICAL_TRANSCRIPT_DETAIL_CHUNK_MAX_BYTES
+        ):
+            raise ValueError(
+                "max_bytes must be between 1 and "
+                f"{CANONICAL_TRANSCRIPT_DETAIL_CHUNK_MAX_BYTES}"
+            )
+
+        location = await self._canonical_transcript_blob_location(
+            session_id,
+            cursor=cursor,
+        )
+        if location is None:
+            raise KeyError(f"History entry not found: {cursor[0]}|{cursor[1]}")
+        table, rowid = location
+
+        def _read_chunk(connection: sqlite3.Connection) -> bytes:
+            try:
+                with connection.blobopen(table, field, rowid, readonly=True) as blob:
+                    if offset >= len(blob):
+                        return b""
+                    blob.seek(offset)
+                    return bytes(blob.read(min(max_bytes, len(blob) - offset)))
+            except sqlite3.OperationalError:
+                row = connection.execute(
+                    f"SELECT typeof({field}) FROM {table} WHERE id = ?",  # noqa: S608
+                    (rowid,),
+                ).fetchone()
+                if row is not None and row[0] == "null":
+                    return b""
+                raise
+
+        return cast(bytes, await self._run_on_sqlite_worker(_read_chunk))
+
+    @_serialized_read
     async def list_stranded_steer_inputs(self) -> list[StrandedSteerInput]:
         """Return pending steer rows whose exact target task can no longer run.
 
@@ -7539,6 +8139,488 @@ class SessionStorage:
         return entries, has_more
 
     @_serialized_read
+    async def get_canonical_transcript_cursor_page(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        before: tuple[int, int] | None = None,
+        after: tuple[int, int] | None = None,
+    ) -> tuple[list[CanonicalTranscriptCursorItem], bool]:
+        """Return one lightweight keyset page across canonical transcript rows.
+
+        Unlike :meth:`get_canonical_transcript_page`, this method never selects
+        complete transcript payloads.  It returns at most 200 cursor items plus
+        one lightweight lookahead row; every projected-text prefix is bounded
+        to at most 2,048 Unicode code points (and therefore at most 8 KiB of
+        UTF-8), while every other returned string is bounded to 256 code points
+        (at most 1 KiB of UTF-8).
+        A caller can then fetch and release one exact row at a time through
+        :meth:`get_canonical_transcript_entry_by_cursor`.
+
+        ``before`` keeps precedence over ``after`` when both cursors exist.
+        Unlike the legacy page API, an unknown v2 cursor is rejected so a
+        reset or incompatible legacy rewrite cannot silently restart at the
+        newest page and create an export loop. Active and archived rows remain
+        in one SQLite statement so a compaction cannot create a gap or
+        duplicate within the page snapshot.
+        """
+
+        page_size = int(limit)
+        if not 1 <= page_size <= CANONICAL_TRANSCRIPT_CURSOR_PAGE_MAX_ENTRIES:
+            raise ValueError(
+                "limit must be between 1 and "
+                f"{CANONICAL_TRANSCRIPT_CURSOR_PAGE_MAX_ENTRIES}"
+            )
+        fetch_size = page_size + 1
+
+        resolved_before = before
+        if resolved_before is not None and not await self._canonical_transcript_cursor_exists(
+            session_id,
+            resolved_before,
+        ):
+            raise CanonicalTranscriptCursorInvalidatedError(
+                f"Canonical history cursor no longer exists: {resolved_before}"
+            )
+
+        resolved_after = None
+        if resolved_before is None and after is not None:
+            if await self._canonical_transcript_cursor_exists(session_id, after):
+                resolved_after = after
+            else:
+                raise CanonicalTranscriptCursorInvalidatedError(
+                    f"Canonical history cursor no longer exists: {after}"
+                )
+
+        cursor = resolved_before or resolved_after
+        ascending = resolved_after is not None
+        comparator = ">" if ascending else "<"
+        direction = "ASC" if ascending else "DESC"
+
+        active_params: list[Any] = [session_id]
+        active_cursor_clause = ""
+        if cursor is not None:
+            created_at, entry_id = cursor
+            active_cursor_clause = (
+                f"AND (created_at {comparator} ? "
+                f"OR (created_at = ? AND id {comparator} ?))"
+            )
+            active_params.extend((created_at, created_at, entry_id))
+        active_params.append(fetch_size)
+
+        archived_params: list[Any] = [session_id]
+        archived_cursor_clause = ""
+        if cursor is not None:
+            created_at, entry_id = cursor
+            archived_cursor_clause = (
+                f"AND (created_at {comparator} ? "
+                f"OR (created_at = ? AND original_entry_id {comparator} ?))"
+            )
+            archived_params.extend((created_at, created_at, entry_id))
+        archived_params.append(fetch_size)
+
+        if not _SQLITE_HAS_OCTET_LENGTH:
+            # SQLite before 3.43 has no metadata-only UTF-8 byte-length
+            # primitive. Do not emulate it with length/substr or a Python UDF:
+            # each option materializes an arbitrarily large TEXT value. Select
+            # only one page of numeric locations, then inspect each selected row
+            # through SQLite's incremental BLOB API. Field sizes are exact and
+            # only fixed-size prefixes enter Python memory.
+            sql = f"""
+                WITH active_page AS (
+                    SELECT
+                        created_at,
+                        id AS entry_id,
+                        'transcript_entries' AS source_table,
+                        id AS physical_rowid
+                    FROM transcript_entries
+                    WHERE session_id = ?
+                      {active_cursor_clause}
+                    ORDER BY created_at {direction}, id {direction}
+                    LIMIT ?
+                ),
+                archived_page AS (
+                    SELECT
+                        created_at,
+                        original_entry_id AS entry_id,
+                        'compacted_transcript_entries' AS source_table,
+                        id AS physical_rowid
+                    FROM compacted_transcript_entries
+                    WHERE session_id = ?
+                      AND original_entry_id IS NOT NULL
+                      {archived_cursor_clause}
+                    ORDER BY
+                        created_at {direction},
+                        original_entry_id {direction},
+                        id {direction}
+                    LIMIT ?
+                ),
+                merged AS (
+                    SELECT * FROM active_page
+                    UNION ALL
+                    SELECT * FROM archived_page
+                )
+                SELECT created_at, entry_id, source_table, physical_rowid
+                FROM merged
+                ORDER BY created_at {direction}, entry_id {direction}
+                LIMIT ?
+            """
+            params = [*active_params, *archived_params, fetch_size]
+            async with self.conn.execute(sql, params) as cur:
+                rows = await cur.fetchall()
+            has_more = len(rows) > page_size
+            rows = rows[:page_size]
+            items = []
+            for row in rows:
+                metadata = await self._read_canonical_transcript_blob_metadata(
+                    table=str(row["source_table"]),
+                    rowid=int(row["physical_rowid"]),
+                )
+                items.append(
+                    CanonicalTranscriptCursorItem(
+                        cursor=(int(row["created_at"]), int(row["entry_id"])),
+                        stored_bytes=sum(metadata.field_bytes.values()),
+                        content_prefix=metadata.content_prefix,
+                        message_id=metadata.message_id,
+                        role=metadata.role,
+                        provenance_kind=metadata.provenance_kind,
+                        provenance_origin_session_id=metadata.provenance_origin_session_id,
+                        provenance_source_session_key=metadata.provenance_source_session_key,
+                        provenance_source_channel=metadata.provenance_source_channel,
+                        provenance_source_tool=metadata.provenance_source_tool,
+                        turn_id=metadata.turn_id,
+                    )
+                )
+            if not ascending:
+                items.reverse()
+            return items, has_more
+
+        # ``octet_length(column)`` reads the stored byte count from SQLite
+        # metadata without loading an overflow TEXT value into the VM. Every
+        # selected text value is guarded and SQL-bounded below.
+        payload_size_sql = """
+            COALESCE(octet_length(content), 0)
+            + COALESCE(octet_length(message_id), 0)
+            + COALESCE(octet_length(role), 0)
+            + COALESCE(octet_length(tool_calls), 0)
+            + COALESCE(octet_length(tool_call_id), 0)
+            + COALESCE(octet_length(reasoning_content), 0)
+            + COALESCE(octet_length(turn_usage), 0)
+            + COALESCE(octet_length(turn_context), 0)
+            + COALESCE(octet_length(provenance_kind), 0)
+            + COALESCE(octet_length(provenance_origin_session_id), 0)
+            + COALESCE(octet_length(provenance_source_session_key), 0)
+            + COALESCE(octet_length(provenance_source_channel), 0)
+            + COALESCE(octet_length(provenance_source_tool), 0)
+        """
+        content_prefix_codepoints = _CANONICAL_TRANSCRIPT_CONTENT_PREFIX_CODEPOINTS
+        metadata_prefix_codepoints = _CANONICAL_TRANSCRIPT_METADATA_PREFIX_CODEPOINTS
+        json_projection_max_bytes = _CANONICAL_TRANSCRIPT_JSON_PROJECTION_MAX_BYTES
+        metadata_projection_max_bytes = _CANONICAL_TRANSCRIPT_METADATA_PROJECTION_MAX_BYTES
+        sql = f"""
+            WITH active_page AS (
+                SELECT
+                    created_at,
+                    id AS entry_id,
+                    {payload_size_sql} AS stored_bytes,
+                    CASE
+                        WHEN COALESCE(octet_length(content), 0)
+                             <= {json_projection_max_bytes}
+                            THEN CASE
+                                WHEN json_valid(content)
+                                    THEN CASE
+                                        WHEN json_type(
+                                            content,
+                                            '$.display_text'
+                                        ) = 'text'
+                                            THEN substr(
+                                                json_extract(
+                                                    content,
+                                                    '$.display_text'
+                                                ),
+                                                1,
+                                                {content_prefix_codepoints}
+                                            )
+                                        WHEN json_type(content, '$.text') = 'text'
+                                            THEN substr(
+                                                json_extract(content, '$.text'),
+                                                1,
+                                                {content_prefix_codepoints}
+                                            )
+                                        ELSE substr(
+                                            content,
+                                            1,
+                                            {content_prefix_codepoints}
+                                        )
+                                    END
+                                ELSE substr(content, 1, {content_prefix_codepoints})
+                            END
+                        ELSE NULL
+                    END AS content_prefix,
+                    CASE WHEN COALESCE(octet_length(message_id), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(message_id, 1, {metadata_prefix_codepoints})
+                        ELSE NULL END AS message_id,
+                    CASE WHEN COALESCE(octet_length(role), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(role, 1, {metadata_prefix_codepoints})
+                        ELSE NULL END AS role,
+                    CASE WHEN COALESCE(octet_length(provenance_kind), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(provenance_kind, 1, {metadata_prefix_codepoints})
+                        ELSE NULL END AS provenance_kind,
+                    CASE WHEN COALESCE(octet_length(provenance_origin_session_id), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(
+                            provenance_origin_session_id,
+                            1,
+                            {metadata_prefix_codepoints}
+                        )
+                        ELSE NULL END AS provenance_origin_session_id,
+                    CASE WHEN COALESCE(octet_length(provenance_source_session_key), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(
+                            provenance_source_session_key,
+                            1,
+                            {metadata_prefix_codepoints}
+                        )
+                        ELSE NULL END AS provenance_source_session_key,
+                    CASE WHEN COALESCE(octet_length(provenance_source_channel), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(
+                            provenance_source_channel,
+                            1,
+                            {metadata_prefix_codepoints}
+                        )
+                        ELSE NULL END AS provenance_source_channel,
+                    CASE WHEN COALESCE(octet_length(provenance_source_tool), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(
+                            provenance_source_tool,
+                            1,
+                            {metadata_prefix_codepoints}
+                        )
+                        ELSE NULL END AS provenance_source_tool,
+                    CASE
+                        WHEN COALESCE(octet_length(turn_context), 0)
+                             <= {json_projection_max_bytes}
+                            THEN CASE
+                                WHEN json_valid(turn_context)
+                                    THEN CASE
+                                        WHEN json_type(
+                                            turn_context,
+                                            '$.turn_id'
+                                        ) = 'text'
+                                            THEN substr(
+                                                json_extract(
+                                                    turn_context,
+                                                    '$.turn_id'
+                                                ),
+                                                1,
+                                                {metadata_prefix_codepoints}
+                                            )
+                                        ELSE NULL
+                                    END
+                                ELSE NULL
+                            END
+                        ELSE NULL
+                    END AS turn_id
+                FROM transcript_entries
+                WHERE session_id = ?
+                  {active_cursor_clause}
+                ORDER BY created_at {direction}, id {direction}
+                LIMIT ?
+            ),
+            archived_page AS (
+                SELECT
+                    created_at,
+                    original_entry_id AS entry_id,
+                    {payload_size_sql} AS stored_bytes,
+                    CASE
+                        WHEN COALESCE(octet_length(content), 0)
+                             <= {json_projection_max_bytes}
+                            THEN CASE
+                                WHEN json_valid(content)
+                                    THEN CASE
+                                        WHEN json_type(
+                                            content,
+                                            '$.display_text'
+                                        ) = 'text'
+                                            THEN substr(
+                                                json_extract(
+                                                    content,
+                                                    '$.display_text'
+                                                ),
+                                                1,
+                                                {content_prefix_codepoints}
+                                            )
+                                        WHEN json_type(content, '$.text') = 'text'
+                                            THEN substr(
+                                                json_extract(content, '$.text'),
+                                                1,
+                                                {content_prefix_codepoints}
+                                            )
+                                        ELSE substr(
+                                            content,
+                                            1,
+                                            {content_prefix_codepoints}
+                                        )
+                                    END
+                                ELSE substr(content, 1, {content_prefix_codepoints})
+                            END
+                        ELSE NULL
+                    END AS content_prefix,
+                    CASE WHEN COALESCE(octet_length(message_id), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(message_id, 1, {metadata_prefix_codepoints})
+                        ELSE NULL END AS message_id,
+                    CASE WHEN COALESCE(octet_length(role), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(role, 1, {metadata_prefix_codepoints})
+                        ELSE NULL END AS role,
+                    CASE WHEN COALESCE(octet_length(provenance_kind), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(provenance_kind, 1, {metadata_prefix_codepoints})
+                        ELSE NULL END AS provenance_kind,
+                    CASE WHEN COALESCE(octet_length(provenance_origin_session_id), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(
+                            provenance_origin_session_id,
+                            1,
+                            {metadata_prefix_codepoints}
+                        )
+                        ELSE NULL END AS provenance_origin_session_id,
+                    CASE WHEN COALESCE(octet_length(provenance_source_session_key), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(
+                            provenance_source_session_key,
+                            1,
+                            {metadata_prefix_codepoints}
+                        )
+                        ELSE NULL END AS provenance_source_session_key,
+                    CASE WHEN COALESCE(octet_length(provenance_source_channel), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(
+                            provenance_source_channel,
+                            1,
+                            {metadata_prefix_codepoints}
+                        )
+                        ELSE NULL END AS provenance_source_channel,
+                    CASE WHEN COALESCE(octet_length(provenance_source_tool), 0)
+                                   <= {metadata_projection_max_bytes}
+                        THEN substr(
+                            provenance_source_tool,
+                            1,
+                            {metadata_prefix_codepoints}
+                        )
+                        ELSE NULL END AS provenance_source_tool,
+                    CASE
+                        WHEN COALESCE(octet_length(turn_context), 0)
+                             <= {json_projection_max_bytes}
+                            THEN CASE
+                                WHEN json_valid(turn_context)
+                                    THEN CASE
+                                        WHEN json_type(
+                                            turn_context,
+                                            '$.turn_id'
+                                        ) = 'text'
+                                            THEN substr(
+                                                json_extract(
+                                                    turn_context,
+                                                    '$.turn_id'
+                                                ),
+                                                1,
+                                                {metadata_prefix_codepoints}
+                                            )
+                                        ELSE NULL
+                                    END
+                                ELSE NULL
+                            END
+                        ELSE NULL
+                    END AS turn_id
+                FROM compacted_transcript_entries
+                WHERE session_id = ?
+                  AND original_entry_id IS NOT NULL
+                  {archived_cursor_clause}
+                ORDER BY
+                    created_at {direction},
+                    original_entry_id {direction},
+                    id {direction}
+                LIMIT ?
+            ),
+            merged AS (
+                SELECT * FROM active_page
+                UNION ALL
+                SELECT * FROM archived_page
+            )
+            SELECT
+                created_at,
+                entry_id,
+                stored_bytes,
+                content_prefix,
+                message_id,
+                role,
+                provenance_kind,
+                provenance_origin_session_id,
+                provenance_source_session_key,
+                provenance_source_channel,
+                provenance_source_tool,
+                turn_id
+            FROM merged
+            ORDER BY created_at {direction}, entry_id {direction}
+            LIMIT ?
+        """
+        params = [*active_params, *archived_params, fetch_size]
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+
+        has_more = len(rows) > page_size
+        rows = rows[:page_size]
+        items = [
+            CanonicalTranscriptCursorItem(
+                cursor=(int(row["created_at"]), int(row["entry_id"])),
+                stored_bytes=int(row["stored_bytes"]),
+                content_prefix=(
+                    str(row["content_prefix"])
+                    if row["content_prefix"] is not None
+                    else None
+                ),
+                message_id=str(row["message_id"] or ""),
+                role=str(row["role"] or "unknown"),
+                provenance_kind=(
+                    str(row["provenance_kind"])
+                    if row["provenance_kind"] is not None
+                    else None
+                ),
+                provenance_origin_session_id=(
+                    str(row["provenance_origin_session_id"])
+                    if row["provenance_origin_session_id"] is not None
+                    else None
+                ),
+                provenance_source_session_key=(
+                    str(row["provenance_source_session_key"])
+                    if row["provenance_source_session_key"] is not None
+                    else None
+                ),
+                provenance_source_channel=(
+                    str(row["provenance_source_channel"])
+                    if row["provenance_source_channel"] is not None
+                    else None
+                ),
+                provenance_source_tool=(
+                    str(row["provenance_source_tool"])
+                    if row["provenance_source_tool"] is not None
+                    else None
+                ),
+                turn_id=str(row["turn_id"]) if row["turn_id"] is not None else None,
+            )
+            for row in rows
+        ]
+        if not ascending:
+            items.reverse()
+        return items, has_more
+
+    @_serialized_read
     async def get_canonical_transcript_coverage(
         self,
         session_id: str,
@@ -7933,6 +9015,32 @@ class SessionStorage:
                 else None,
             )
 
+            # Retained transcript ids are public history cursor identities.
+            # Capture the ids that genuinely belong to this session before the
+            # rewrite so only those rows are reinserted with an explicit id;
+            # synthetic entries (or a caller accidentally carrying another
+            # session's id) continue through SQLite's AUTOINCREMENT path.
+            candidate_ids = {
+                int(entry.id)
+                for entry in entries
+                if entry.id is not None and not isinstance(entry.id, bool)
+            }
+            retained_entry_ids: set[int] = set()
+            ordered_candidate_ids = sorted(candidate_ids)
+            for index in range(0, len(ordered_candidate_ids), _SQLITE_VARIABLE_CHUNK_SIZE):
+                chunk = ordered_candidate_ids[
+                    index : index + _SQLITE_VARIABLE_CHUNK_SIZE
+                ]
+                placeholders = ", ".join("?" for _ in chunk)
+                async with conn.execute(
+                    "SELECT id FROM transcript_entries "
+                    f"WHERE session_id = ? AND id IN ({placeholders})",
+                    (node.session_id, *chunk),
+                ) as cur:
+                    retained_entry_ids.update(
+                        int(row["id"])
+                        for row in await cur.fetchall()
+                    )
             await conn.execute(
                 "DELETE FROM transcript_entries WHERE session_id = ?",
                 (node.session_id,),
@@ -7967,15 +9075,20 @@ class SessionStorage:
             for entry in entries:
                 entry.session_id = node.session_id
                 entry.session_key = node.session_key
-                entry_data = entry.model_dump(exclude={"id"})
+                preserve_id = entry.id is not None and entry.id in retained_entry_ids
+                entry_data = entry.model_dump(
+                    exclude=set() if preserve_id else {"id"},
+                )
                 entry_cols = list(entry_data.keys())
                 entry_placeholders = ", ".join("?" for _ in entry_cols)
                 entry_values = [_serialize(entry_data[c]) for c in entry_cols]
-                await conn.execute(
+                async with conn.execute(
                     "INSERT INTO transcript_entries "
                     f"({', '.join(entry_cols)}) VALUES ({entry_placeholders})",
                     entry_values,
-                )
+                ) as cur:
+                    if not preserve_id:
+                        entry.id = cur.lastrowid
 
             node_data = node.model_dump()
             node_cols = list(node_data.keys())
@@ -8010,6 +9123,90 @@ class SessionStorage:
     @_serialized_read
     async def get_all_summaries(self, session_id: str) -> list[SessionSummary]:
         return await self._select_all_summaries(self.conn, session_id)
+
+    @_serialized_read
+    async def get_summary_metadata(
+        self,
+        session_id: str,
+        *,
+        limit: int = CANONICAL_SUMMARY_METADATA_MAX_ENTRIES,
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        """Return a hard-bounded newest window of compaction metadata."""
+
+        page_size = int(limit)
+        if not 1 <= page_size <= CANONICAL_SUMMARY_METADATA_MAX_ENTRIES:
+            raise ValueError(
+                "limit must be between 1 and "
+                f"{CANONICAL_SUMMARY_METADATA_MAX_ENTRIES}"
+            )
+        metadata_prefix_codepoints = _CANONICAL_TRANSCRIPT_METADATA_PREFIX_CODEPOINTS
+        metadata_projection_max_bytes = _CANONICAL_TRANSCRIPT_METADATA_PROJECTION_MAX_BYTES
+        if _SQLITE_HAS_OCTET_LENGTH:
+            bounded_strings = f"""
+                CASE WHEN COALESCE(octet_length(compaction_id), 0)
+                               <= {metadata_projection_max_bytes}
+                    THEN substr(compaction_id, 1, {metadata_prefix_codepoints})
+                    ELSE NULL END AS compaction_id,
+                CASE WHEN COALESCE(octet_length(trigger_reason), 0)
+                               <= {metadata_projection_max_bytes}
+                    THEN substr(trigger_reason, 1, {metadata_prefix_codepoints})
+                    ELSE NULL END AS trigger_reason,
+                CASE WHEN COALESCE(octet_length(summary_format), 0)
+                               <= {metadata_projection_max_bytes}
+                    THEN substr(summary_format, 1, {metadata_prefix_codepoints})
+                    ELSE NULL END AS summary_format,
+                CASE WHEN COALESCE(octet_length(coverage_status), 0)
+                               <= {metadata_projection_max_bytes}
+                    THEN substr(coverage_status, 1, {metadata_prefix_codepoints})
+                    ELSE NULL END AS coverage_status,
+            """
+            summary_size = "octet_length(summary_text)"
+        else:
+            # Old SQLite has no metadata-only byte-length primitive. Returning
+            # only numeric boundaries is preferable to reading arbitrarily
+            # large text into the VM during session bootstrap.
+            bounded_strings = """
+                NULL AS compaction_id,
+                NULL AS trigger_reason,
+                NULL AS summary_format,
+                NULL AS coverage_status,
+            """
+            summary_size = "NULL"
+        async with self.conn.execute(
+            f"""
+            WITH newest AS (
+                SELECT
+                    id,
+                    {bounded_strings}
+                    compaction_index,
+                    removed_count,
+                    kept_count,
+                    covered_through_id,
+                    created_at,
+                    {summary_size} AS summary_bytes,
+                    (
+                        SELECT COUNT(*)
+                        FROM session_summaries AS counted
+                        WHERE counted.session_id = ?
+                    ) AS total_count
+                FROM session_summaries AS summary
+                WHERE summary.session_id = ?
+                ORDER BY compaction_index DESC, id DESC
+                LIMIT ?
+            )
+            SELECT * FROM newest
+            ORDER BY compaction_index ASC, id ASC
+            """,
+            (session_id, session_id, page_size),
+        ) as cur:
+            rows = await cur.fetchall()
+        total_count = int(rows[0]["total_count"] or 0) if rows else 0
+        metadata = []
+        for row in rows:
+            item = dict(row)
+            item.pop("total_count", None)
+            metadata.append(item)
+        return metadata, total_count > len(metadata), total_count
 
     @_serialized_read
     async def list_degraded_summaries(

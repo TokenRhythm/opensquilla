@@ -206,6 +206,25 @@ async def test_lone_surrogate_id_rejected_and_connection_survives() -> None:
     assert ws.close_codes == []
 
 
+async def test_oversized_request_id_gets_bounded_error_and_connection_survives() -> None:
+    ws = await _run(
+        [
+            _CONNECT_FRAME,
+            json.dumps({"type": "req", "id": "x" * 70_000, "method": "noop"}),
+            json.dumps({"type": "req", "id": "after-large-id", "method": "noop"}),
+        ]
+    )
+
+    responses = ws.responses()
+    errors = [response for response in responses if not response["ok"]]
+    assert len(errors) == 1
+    assert errors[0]["id"] == ""
+    assert errors[0]["error"]["code"] == "INVALID_REQUEST"
+    assert len(json.dumps(errors[0]).encode("utf-8")) < 64 * 1024
+    assert any(response["ok"] and response["id"] == "after-large-id" for response in responses)
+    assert ws.close_codes == []
+
+
 async def test_lone_surrogate_frame_type_error_still_serializes() -> None:
     ws = await _run(
         [

@@ -33,6 +33,7 @@ from opensquilla import __version__
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.protocol import (
     ERROR_METHOD_NOT_FOUND,
+    ERROR_RESPONSE_BUDGET_EXCEEDED,
     ERROR_UNAUTHORIZED,
     ERROR_UNAVAILABLE,
     ResFrame,
@@ -50,6 +51,11 @@ from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
+
+_MIN_BUDGETED_RPC_RESPONSE_BYTES = 64 * 1024
+_DEFAULT_HISTORY_RPC_RESPONSE_BYTES = 768 * 1024
+_MAX_HISTORY_RPC_RESPONSE_BYTES = 4 * 1024 * 1024
+_BYTE_BUDGETED_METHODS = frozenset({"chat.history.v2", "sessions.bootstrap.v2"})
 
 # Handler type: (params, context) -> payload or raises
 RpcHandlerFn = Callable[[Any, "RpcContext"], Coroutine[Any, Any, Any]]
@@ -159,6 +165,34 @@ class RpcHandlerError(Exception):
         self.accepted = accepted
 
 
+@dataclass(frozen=True, slots=True)
+class BudgetedRpcResult:
+    """Handler result whose final response frame must fit a byte budget.
+
+    Additive RPC methods can return this wrapper to have the dispatcher check
+    the fully serialized :class:`ResFrame`, including the actual request id.
+    Existing handlers continue returning their payload directly and bypass
+    this opt-in guard.
+
+    If ``payload`` is a dictionary that already declares ``wire_bytes``, the
+    dispatcher replaces that value with the exact UTF-8 frame size before it
+    applies the budget. Other payload shapes aren't changed.
+    """
+
+    payload: Any
+    max_response_bytes: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_response_bytes, bool)
+            or not isinstance(self.max_response_bytes, int)
+            or self.max_response_bytes < _MIN_BUDGETED_RPC_RESPONSE_BYTES
+        ):
+            raise ValueError(
+                "max_response_bytes must be an integer greater than or equal to 65536"
+            )
+
+
 class ScopeDriftError(RuntimeError):
     """Raised when a registered scope disagrees with the central table."""
 
@@ -229,6 +263,19 @@ class RpcRegistry:
         return self._methods.get(name)
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: RpcContext) -> ResFrame:
+        response = await self._dispatch(req_id, method, params, ctx)
+        byte_budget = _declared_response_budget(method, params)
+        if byte_budget is None:
+            return response
+        return _enforce_response_budget(req_id, response, byte_budget)
+
+    async def _dispatch(
+        self,
+        req_id: str,
+        method: str,
+        params: Any,
+        ctx: RpcContext,
+    ) -> ResFrame:
         entry = self._methods.get(method)
         if entry is None:
             return make_error_res(req_id, ERROR_METHOD_NOT_FOUND, f"Method not found: {method}")
@@ -247,6 +294,8 @@ class RpcRegistry:
 
         try:
             result = await entry.handler(params, ctx)
+            if isinstance(result, BudgetedRpcResult):
+                return _make_budgeted_response(req_id, result)
             return make_ok_res(req_id, result)
         except RpcHandlerError as exc:
             return make_error_res(
@@ -289,6 +338,107 @@ class RpcRegistry:
                 exc_info=True,
             )
             return make_error_res(req_id, "INTERNAL_ERROR", str(exc))
+
+
+def _res_frame_wire_bytes(frame: ResFrame) -> int:
+    """Return the bytes sent by ``WsConnection`` for a response frame."""
+
+    return len(frame.model_dump_json().encode("utf-8"))
+
+
+def _declared_response_budget(method: str, params: Any) -> int | None:
+    """Resolve the hard response boundary for byte-budgeted public methods.
+
+    Invalid budget values are still handled by the RPC handler, but their
+    error frame is bounded by the safe default. This keeps every response for
+    these methods bounded, including authorization, validation, and internal
+    errors raised before a handler can return ``BudgetedRpcResult``.
+    """
+
+    if method not in _BYTE_BUDGETED_METHODS:
+        return None
+    if not isinstance(params, dict):
+        return _DEFAULT_HISTORY_RPC_RESPONSE_BYTES
+    value = params.get("maxResponseBytes")
+    if value is None:
+        value = params.get("max_response_bytes")
+    if isinstance(value, bool):
+        return _DEFAULT_HISTORY_RPC_RESPONSE_BYTES
+    if value is None:
+        return _DEFAULT_HISTORY_RPC_RESPONSE_BYTES
+    try:
+        parsed = int(value) if isinstance(value, int | str) else None
+    except ValueError:
+        parsed = None
+    if (
+        parsed is not None
+        and _MIN_BUDGETED_RPC_RESPONSE_BYTES <= parsed <= _MAX_HISTORY_RPC_RESPONSE_BYTES
+    ):
+        return parsed
+    return _DEFAULT_HISTORY_RPC_RESPONSE_BYTES
+
+
+def _response_budget_error(req_id: str, byte_budget: int, wire_bytes: int) -> ResFrame:
+    error = make_error_res(
+        req_id,
+        ERROR_RESPONSE_BUDGET_EXCEEDED,
+        "Serialized RPC response exceeds maxResponseBytes.",
+        details={"byte_budget": byte_budget, "wire_bytes": wire_bytes},
+    )
+    if _res_frame_wire_bytes(error) <= byte_budget:
+        return error
+
+    # A pathological request id must not defeat the response budget. The
+    # WebSocket ingress rejects such ids, while this empty-id fallback also
+    # keeps direct/in-process dispatcher callers bounded.
+    fallback = make_error_res(
+        "",
+        ERROR_RESPONSE_BUDGET_EXCEEDED,
+        "Serialized RPC response exceeds maxResponseBytes.",
+        details={"byte_budget": byte_budget, "wire_bytes": wire_bytes},
+    )
+    if _res_frame_wire_bytes(fallback) > byte_budget:  # pragma: no cover - 64 KiB minimum.
+        raise RuntimeError("response budget is too small for its structured error")
+    return fallback
+
+
+def _enforce_response_budget(
+    req_id: str,
+    response: ResFrame,
+    byte_budget: int,
+) -> ResFrame:
+    measured = _res_frame_wire_bytes(response)
+    if measured <= byte_budget:
+        return response
+    return _response_budget_error(req_id, byte_budget, measured)
+
+
+def _make_budgeted_response(req_id: str, result: BudgetedRpcResult) -> ResFrame:
+    """Build and validate an opted-in byte-bounded response."""
+
+    payload = result.payload
+    if isinstance(payload, dict) and "wire_bytes" in payload:
+        payload = dict(payload)
+        # The value contributes to its own serialized length. Iteration reaches
+        # a fixed point as soon as the decimal digit count stops changing.
+        wire_bytes = 0
+        for _ in range(16):
+            payload["wire_bytes"] = wire_bytes
+            frame = make_ok_res(req_id, payload)
+            measured = _res_frame_wire_bytes(frame)
+            if measured == wire_bytes:
+                break
+            wire_bytes = measured
+        else:  # pragma: no cover - integer digit lengths converge immediately.
+            raise RuntimeError("response wire_bytes did not converge")
+    else:
+        frame = make_ok_res(req_id, payload)
+        measured = _res_frame_wire_bytes(frame)
+
+    if measured <= result.max_response_bytes:
+        return frame
+
+    return _response_budget_error(req_id, result.max_response_bytes, measured)
 
 
 # Backwards-compatible alias: the historical class name remains importable.

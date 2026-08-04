@@ -23,20 +23,27 @@ _CONNECT_FRAME = json.dumps(
         "params": {"minProtocol": 1, "role": "operator", "auth": {}},
     }
 )
+_DETACHED_READ_METHODS = (
+    "chat.history",
+    "chat.history.entry.v1",
+    "chat.history.v2",
+    "sessions.bootstrap.v2",
+)
 
 
 class _HistoryDispatcher:
-    def __init__(self) -> None:
+    def __init__(self, history_method: str = "chat.history") -> None:
+        self.history_method = history_method
         self.history_started = asyncio.Event()
         self.history_cancelled = asyncio.Event()
         self.release_history = asyncio.Event()
         self.quick_dispatched = asyncio.Event()
 
     def list_methods(self) -> list[str]:
-        return ["chat.history", "noop"]
+        return [self.history_method, "noop"]
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
-        if method == "chat.history":
+        if method == self.history_method:
             self.history_started.set()
             try:
                 await self.release_history.wait()
@@ -163,17 +170,19 @@ class _HistoryWebSocket:
 
 
 @pytest.mark.parametrize("writer_queue_enabled", [False, True])
-async def test_slow_chat_history_does_not_block_later_interactive_rpc(
+@pytest.mark.parametrize("history_method", _DETACHED_READ_METHODS)
+async def test_slow_detached_read_does_not_block_later_interactive_rpc(
     writer_queue_enabled: bool,
+    history_method: str,
 ) -> None:
-    dispatcher = _HistoryDispatcher()
+    dispatcher = _HistoryDispatcher(history_method)
     ws = _HistoryWebSocket(
         [
             _CONNECT_FRAME,
             json.dumps({
                 "type": "req",
                 "id": "history",
-                "method": "chat.history",
+                "method": history_method,
                 "params": {"sessionKey": "agent:main:webchat:slow-history"},
             }),
             json.dumps({"type": "req", "id": "quick", "method": "noop"}),

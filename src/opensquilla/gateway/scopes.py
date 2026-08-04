@@ -98,6 +98,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.preview": READ_SCOPE,
     "sessions.resolve": READ_SCOPE,
     "sessions.bootstrap": READ_SCOPE,
+    "sessions.bootstrap.v2": READ_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
@@ -137,6 +138,8 @@ METHOD_SCOPES: dict[str, str] = {
     "channels.status": READ_SCOPE,
     "commands.list_for_surface": READ_SCOPE,  # OpenSquilla-only.
     "chat.history": READ_SCOPE,
+    "chat.history.v2": READ_SCOPE,
+    "chat.history.entry.v1": READ_SCOPE,
     "agents.list": READ_SCOPE,
     "agents.files.list": READ_SCOPE,
     "agents.files.get": READ_SCOPE,

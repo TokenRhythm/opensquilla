@@ -41,6 +41,8 @@ from opensquilla.session.models import (
 )
 from opensquilla.session.storage import (
     CANONICAL_FORK_PROOF_SCHEMA_VERSION,
+    CanonicalTranscriptCursorItem,
+    CanonicalTranscriptDetailMetadata,
     ResetArchiveSnapshot,
     SessionStorage,
 )
@@ -57,6 +59,15 @@ class CanonicalTranscriptPage:
     """Bounded user-visible transcript page and archive coverage metadata."""
 
     entries: list[TranscriptEntry]
+    has_more: bool
+    canonical_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalTranscriptCursorPage:
+    """Lightweight canonical cursors for one incremental history scan."""
+
+    items: list[CanonicalTranscriptCursorItem]
     has_more: bool
     canonical_complete: bool
 
@@ -1569,6 +1580,90 @@ class SessionManager:
             canonical_complete=canonical_complete,
         )
 
+    async def get_canonical_transcript_entry_by_cursor(
+        self,
+        session_key: str,
+        *,
+        cursor: tuple[int, int],
+    ) -> TranscriptEntry | None:
+        """Return one canonical row addressed by a history page cursor."""
+
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        return await self._storage.get_canonical_transcript_entry_by_cursor(
+            node.session_id,
+            cursor=cursor,
+        )
+
+    async def get_canonical_transcript_detail_metadata(
+        self,
+        session_key: str,
+        *,
+        cursor: tuple[int, int],
+    ) -> CanonicalTranscriptDetailMetadata | None:
+        """Return bounded metadata for a field-streamed canonical detail."""
+
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        return await self._storage.get_canonical_transcript_detail_metadata(
+            node.session_id,
+            cursor=cursor,
+        )
+
+    async def read_canonical_transcript_detail_field_chunk(
+        self,
+        session_key: str,
+        *,
+        cursor: tuple[int, int],
+        field: str,
+        offset: int,
+        max_bytes: int,
+    ) -> bytes:
+        """Read one bounded raw field chunk from a canonical detail row."""
+
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        return await self._storage.read_canonical_transcript_detail_field_chunk(
+            node.session_id,
+            cursor=cursor,
+            field=field,
+            offset=offset,
+            max_bytes=max_bytes,
+        )
+
+    async def get_canonical_transcript_cursor_page(
+        self,
+        session_key: str,
+        *,
+        limit: int,
+        before: tuple[int, int] | None = None,
+        after: tuple[int, int] | None = None,
+    ) -> CanonicalTranscriptCursorPage:
+        """Return bounded metadata so callers can fetch exact rows one at a time."""
+
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        items, has_more = await self._storage.get_canonical_transcript_cursor_page(
+            node.session_id,
+            limit=limit,
+            before=before,
+            after=after,
+        )
+        canonical_complete = await self._storage.is_canonical_transcript_complete(node.session_id)
+        return CanonicalTranscriptCursorPage(
+            items=items,
+            has_more=has_more,
+            canonical_complete=canonical_complete,
+        )
+
     async def get_summaries(self, session_key: str) -> list[SessionSummary]:
         """Return durable compaction summaries for a session key."""
         session_key = canonicalize_session_key(session_key)
@@ -1576,6 +1671,20 @@ class SessionManager:
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
         return await self._storage.get_all_summaries(node.session_id)
+
+    async def get_summary_metadata(
+        self,
+        session_key: str,
+        *,
+        limit: int = 200,
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        """Return compaction boundary metadata without loading summary bodies."""
+
+        session_key = canonicalize_session_key(session_key)
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        return await self._storage.get_summary_metadata(node.session_id, limit=limit)
 
     async def list_degraded_compactions(
         self,
