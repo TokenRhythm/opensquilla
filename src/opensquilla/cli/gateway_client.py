@@ -746,6 +746,27 @@ class GatewayClient:
     async def reset_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("sessions.reset", {"key": key}))
 
+    async def fork_session(
+        self,
+        parent_key: str,
+        before_message_id: str | None = None,
+        title: str | None = None,
+    ) -> str:
+        """Fork a session into a new child session; return the child key.
+
+        ``before_message_id`` keeps every message before that durable id in
+        the child transcript (the message itself is the fork point and is not
+        copied), which is how the TUI rewinds a conversation from an earlier
+        user message.
+        """
+        params: dict[str, Any] = {"key": parent_key}
+        if before_message_id:
+            params["beforeMessageId"] = before_message_id
+        if title:
+            params["title"] = title
+        result = await self._call("sessions.fork", params)
+        return cast(str, result["key"])
+
     async def compact_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("sessions.contextCompact", {"key": key}))
 

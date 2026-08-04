@@ -900,6 +900,7 @@ export function createComposer(deps) {
     destroyRenderable(overlayLayer, "theme-picker");
     destroyRenderable(overlayLayer, "approval-overlay");
     destroyRenderable(overlayLayer, "session-picker");
+    destroyRenderable(overlayLayer, "rewind-picker");
     destroyRenderable(overlayLayer, "model-routing-picker");
     destroyRenderable(overlayLayer, "model-picker");
     // Hide the layer again so it stops intercepting wheel events — otherwise a
@@ -965,6 +966,8 @@ export function createComposer(deps) {
   let themePicker = null;
   const SESSION_PICKER_WIDTH = 72;
   let sessionPicker = null;
+  const REWIND_PICKER_WIDTH = 72;
+  let rewindPicker = null;
   const MODEL_ROUTING_PICKER_WIDTH = 46;
   let modelRoutingPicker = null;
   const MODEL_PICKER_WIDTH = 72;
@@ -1218,6 +1221,159 @@ export function createComposer(deps) {
       sessionPicker.query += key.sequence;
       sessionPicker.selected = 0;
       renderSessionPicker();
+      renderer.requestRender?.();
+    }
+    return true;
+  }
+
+  // ---- Rewind picker --------------------------------------------------------
+  // The Python side owns the rewind points (user messages from canonical
+  // history); the host only filters and returns a normal /rewind command, so
+  // session mutation stays in the existing Python command path. Mirrors the
+  // session picker contract: open with a rewind.pick frame, confirm with an
+  // input.submit carrying the durable message id.
+  function filteredRewindPoints() {
+    if (!rewindPicker?.active) return [];
+    const query = String(rewindPicker.query ?? "").trim().toLowerCase();
+    if (!query) return rewindPicker.points;
+    return rewindPicker.points.filter((item) =>
+      `#${item.ordinal} ${item.preview}`.toLowerCase().includes(query));
+  }
+
+  function renderRewindPicker() {
+    if (!rewindPicker?.active) return;
+    destroyRenderable(overlayLayer, "rewind-picker");
+    const geometry = overlayPanelGeometry(REWIND_PICKER_WIDTH);
+    const available = Math.max(4, viewportHeight() - effFooterHeight() - 1);
+    const rows = filteredRewindPoints();
+    rewindPicker.selected = clamp(rewindPicker.selected, 0, Math.max(0, rows.length - 1));
+    const visible = Math.max(1, Math.min(rows.length || 1, available - 4, 8));
+    let start = Math.max(0, rewindPicker.selected - Math.floor(visible / 2));
+    start = Math.min(start, Math.max(0, rows.length - visible));
+    const node = new BoxRenderable(renderer, {
+      id: "rewind-picker",
+      position: "absolute",
+      left: COMPLETION_MENU_LEFT,
+      width: geometry.width,
+      bottom: effFooterHeight(),
+      height: Math.min(available, visible + 4),
+      borderStyle: "rounded",
+      borderColor: THEME.brandAccent,
+      backgroundColor: THEME.overlayBg,
+      title: " rewind ",
+      titleAlignment: "left",
+      flexDirection: "column",
+      paddingLeft: 1,
+      paddingRight: 1,
+    });
+    node.add(new TextRenderable(renderer, {
+      id: "rewind-picker-query",
+      content: clipToCells(`search: ${rewindPicker.query || "_"}`, geometry.inner),
+      fg: THEME.text,
+      wrapMode: "none",
+    }));
+    if (rows.length === 0) {
+      node.add(new TextRenderable(renderer, {
+        id: "rewind-picker-empty",
+        content: "  no matching messages",
+        fg: THEME.muted,
+      }));
+    } else {
+      rows.slice(start, start + visible).forEach((item, offset) => {
+        const index = start + offset;
+        const marker = item.ordinal === rewindPicker.currentOrdinal ? "●" : " ";
+        const label = `#${item.ordinal}  ${item.preview}`;
+        node.add(new TextRenderable(renderer, {
+          id: `rewind-picker-row-${index}`,
+          content: clipToCells(
+            `${index === rewindPicker.selected ? "›" : " "} ${marker} ${label}`,
+            geometry.inner,
+          ),
+          fg: index === rewindPicker.selected ? THEME.brandAccentSoft : THEME.muted,
+          wrapMode: "none",
+        }));
+      });
+    }
+    node.add(new TextRenderable(renderer, {
+      id: "rewind-picker-hint",
+      content: clipToCells("type to filter · ↑↓ choose · enter rewind here · esc", geometry.inner),
+      fg: THEME.detailText,
+      wrapMode: "none",
+    }));
+    overlayLayer.add(node);
+    overlayLayer.visible = true;
+  }
+
+  function closeRewindPicker() {
+    rewindPicker = null;
+    clearOverlay();
+  }
+
+  function openRewindPicker(message) {
+    if (themePicker?.active) handleThemePickerKey("escape");
+    if (sessionPicker?.active) closeSessionPicker();
+    if (modelRoutingPicker?.active) closeModelRoutingPicker();
+    if (modelPicker?.active) closeModelPicker();
+    resetMenu();
+    const points = (Array.isArray(message?.points) ? message.points : [])
+      .map((item) => ({
+        id: String(item?.id ?? ""),
+        ordinal: Number(item?.ordinal ?? 0),
+        preview: String(item?.preview ?? ""),
+      }))
+      .filter((item) => item.id);
+    rewindPicker = {
+      active: true,
+      currentOrdinal: Number(message?.current_ordinal ?? 0),
+      points,
+      query: "",
+      selected: 0,
+    };
+    renderRewindPicker();
+    renderer.requestRender?.();
+  }
+
+  function handleRewindPickerKey(key) {
+    if (!rewindPicker?.active) return false;
+    if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+      closeRewindPicker();
+      rerenderInputRegion();
+      return true;
+    }
+    const rows = filteredRewindPoints();
+    if (key.name === "up" || key.name === "down") {
+      const delta = key.name === "up" ? -1 : 1;
+      rewindPicker.selected = clamp(
+        rewindPicker.selected + delta,
+        0,
+        Math.max(0, rows.length - 1),
+      );
+      renderRewindPicker();
+      renderer.requestRender?.();
+      return true;
+    }
+    if (key.name === "return") {
+      const selected = rows[rewindPicker.selected];
+      if (!selected) return true;
+      closeRewindPicker();
+      sendHostMessage({ type: "input.submit", text: `/rewind ${selected.id}` });
+      rerenderInputRegion();
+      return true;
+    }
+    if (key.name === "backspace") {
+      rewindPicker.query = Array.from(rewindPicker.query).slice(0, -1).join("");
+      rewindPicker.selected = 0;
+      renderRewindPicker();
+      renderer.requestRender?.();
+      return true;
+    }
+    const printable = !key.ctrl && !key.meta && !key.alt && !key.option
+      && typeof key.sequence === "string"
+      && !/[\u0000-\u001f\u007f]/u.test(key.sequence);
+    if (printable) {
+      rewindPicker.query += key.sequence;
+      rewindPicker.selected = 0;
+      renderRewindPicker();
       renderer.requestRender?.();
     }
     return true;
@@ -2155,6 +2311,10 @@ export function createComposer(deps) {
         handleSessionPickerKey(key);
         return;
       }
+      if (rewindPicker?.active) {
+        handleRewindPickerKey(key);
+        return;
+      }
       if (modelRoutingPicker?.active) {
         handleModelRoutingPickerKey(key.name);
         return;
@@ -2596,6 +2756,7 @@ export function createComposer(deps) {
     syncCursor,
     openThemePicker,
     openSessionPicker,
+    openRewindPicker,
     openModelRoutingPicker,
     openModelPicker,
     openApprovalOverlay,

@@ -622,6 +622,16 @@ _COMMANDS: tuple[CommandDef, ...] = (
         order=150,
     ),
     CommandDef(
+        name="/rewind",
+        usage="/rewind [message-id|#]",
+        description="Rewind this conversation to an earlier message in a new session.",
+        execution={_T: _local("session.rewind")},
+        category=CommandCategory.NAVIGATION,
+        busy_policy=CommandBusyPolicy.REQUIRE_IDLE,
+        presentation=CommandPresentation.NOTICE,
+        order=155,
+    ),
+    CommandDef(
         name="/delete",
         usage="/delete <id>",
         description="Delete a session.",
