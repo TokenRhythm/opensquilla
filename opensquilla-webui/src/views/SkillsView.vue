@@ -1279,6 +1279,7 @@ async function uninstallSkillAndClose(name: string) {
 .sk-group--skills > .sk-group__head {
   border-bottom: 0;
   padding: 14px 2px 12px;
+  border-radius: var(--radius-lg);
 }
 .sk-group--skills > .sk-grid {
   padding: 16px 0 18px;
