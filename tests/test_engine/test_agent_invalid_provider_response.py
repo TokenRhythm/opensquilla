@@ -1016,6 +1016,52 @@ async def test_repeated_large_dashscope_reasoning_only_disables_thinking_after_n
 
 
 @pytest.mark.asyncio
+async def test_ensemble_usage_total_does_not_misclassify_small_final_aggregator_as_large_input(
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=92_213,
+                    output_tokens=12_209,
+                    reasoning_tokens=10_580,
+                    reasoning_content="internal reasoning only",
+                    model_usage_breakdown=[
+                        {"role": "proposer", "input_tokens": 17_700},
+                        {"role": "proposer", "input_tokens": 14_378},
+                        {"role": "proposer", "input_tokens": 14_380},
+                        {"role": "proposer", "input_tokens": 14_379},
+                        {
+                            "role": "aggregator",
+                            "input_tokens": 26_399,
+                            "output_tokens": 12_209,
+                            "reasoning_tokens": 10_580,
+                        },
+                    ],
+                )
+            ]
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=0,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    error = next(event for event in events if event.kind == "error")
+    assert error.code == "empty_response"
+    assert "large input" not in error.message
+    assert len(provider.calls) == 1
+
+
+
+@pytest.mark.asyncio
 async def test_large_empty_response_without_fallback_surfaces_clear_error() -> None:
     provider = _SequenceProvider(
         [[ProviderDone(stop_reason="stop", input_tokens=35_000, output_tokens=0)]]
