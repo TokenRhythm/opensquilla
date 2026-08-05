@@ -482,11 +482,2226 @@ class LlmEnsembleCandidateConfig(BaseModel):
 
     @field_validator("thinking_level", mode="before")
     @classmethod
-    def _normalize_thinking_level(cls, value: object) -> s
+    def _normalize_thinking_level(cls, value: object) -> str:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return ""
+        valid = {"off", "minimal", "low", "medium", "high", "xhigh", "adaptive"}
+        return normalized if normalized in valid else ""
 
-... [OUTPUT TRUNCATED - 96,061 chars omitted out of 145,987 total] ...
+    @model_validator(mode="after")
+    def _validate_candidate(self) -> LlmEnsembleCandidateConfig:
+        if not self.provider:
+            raise ValueError("llm_ensemble.candidates.provider must be non-empty")
+        if not self.model:
+            raise ValueError("llm_ensemble.candidates.model must be non-empty")
+        self.provider = self.provider.lower()
+        return self
 
-ILLA_CHANNEL_INFLIGHT_CAP=%r is below minimum 1; "
+
+class LlmEnsembleConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_LLM_ENSEMBLE_",
+        env_nested_delimiter="__",
+        extra="ignore",
+    )
+
+    # Model router is the default routing surface. The legacy static selection
+    # value remains below for read compatibility, but it is dormant until an
+    # operator explicitly enables the ensemble surface.
+    enabled: bool = False
+    mode: Literal["b5_fusion"] = "b5_fusion"
+    selection_mode: Literal[
+        "router_dynamic", "static_openrouter_b5", "static_tokenrhythm_b5", "custom_b5"
+    ] = "static_openrouter_b5"
+    # Expose tool schemas to proposers as advisory vocabulary only. Proposer
+    # output is never dispatched; only the aggregator owns an executable tool
+    # boundary.
+    proposer_tools: bool = False
+    min_successful_proposers: int = Field(default=1, ge=1)
+    all_failed_policy: Literal["fallback_single", "error"] = "fallback_single"
+    model_options: list[str] = Field(default_factory=_default_llm_ensemble_model_options)
+    candidates: list[LlmEnsembleCandidateConfig] = Field(default_factory=list)
+    candidate_max_chars: int = Field(default=24_000, ge=0)
+    proposer_timeout_seconds: float = Field(default=3600.0, gt=0.0)
+    aggregator_timeout_seconds: float = Field(default=3600.0, gt=0.0)
+    shuffle_candidates: bool = True
+    record_candidates: bool = False
+
+    @model_validator(mode="after")
+    def _validate_model_options(self) -> LlmEnsembleConfig:
+        model_options: list[str] = []
+        seen_options: set[str] = set()
+        for model in self.model_options:
+            normalized = str(model or "").strip()
+            if not normalized or normalized in seen_options:
+                continue
+            seen_options.add(normalized)
+            model_options.append(normalized)
+        self.model_options = model_options
+        return self
+
+    @model_validator(mode="after")
+    def _validate_custom_b5_lineup(self) -> LlmEnsembleConfig:
+        """Bound the explicit custom_b5 lineup.
+
+        Only the custom mode is checked: static profiles carry fixed lineups
+        and router_dynamic selects members per turn, so neither can exceed the
+        cap. The aggregator is structural — at most one candidate may carry
+        the role; the last enabled proposer count must stay within
+        [CUSTOM_B5_MIN_PROPOSERS, CUSTOM_B5_MAX_PROPOSERS]. Disabled rows are
+        kept (read compatibility) but never counted.
+        """
+        aggregators = [
+            candidate
+            for candidate in self.candidates
+            if candidate.enabled and candidate.role == "aggregator"
+        ]
+        if len(aggregators) > 1:
+            raise ValueError(
+                "llm_ensemble.candidates may mark at most one enabled "
+                "candidate with role='aggregator'"
+            )
+        if self.selection_mode != "custom_b5":
+            return self
+        proposers = [
+            candidate
+            for candidate in self.candidates
+            if candidate.enabled and candidate.role != "aggregator"
+        ]
+        if len(proposers) < CUSTOM_B5_MIN_PROPOSERS:
+            raise ValueError(
+                "llm_ensemble.selection_mode='custom_b5' needs at least "
+                f"{CUSTOM_B5_MIN_PROPOSERS} enabled proposer candidates"
+            )
+        if len(proposers) > CUSTOM_B5_MAX_PROPOSERS:
+            raise ValueError(
+                "llm_ensemble.selection_mode='custom_b5' allows at most "
+                f"{CUSTOM_B5_MAX_PROPOSERS} enabled proposer candidates"
+            )
+        # Total per-turn call ceiling (proposers + aggregator). Today k is
+        # fixed at 1 per member; the ceiling still guards a future k surface.
+        if len(proposers) + 1 > CUSTOM_B5_MAX_TOTAL_CALLS:
+            raise ValueError(
+                "llm_ensemble custom_b5 lineup exceeds "
+                f"{CUSTOM_B5_MAX_TOTAL_CALLS} total per-turn calls"
+            )
+        if self.min_successful_proposers > len(proposers):
+            raise ValueError(
+                "llm_ensemble.min_successful_proposers cannot exceed the "
+                f"custom_b5 proposer count ({len(proposers)})"
+            )
+        return self
+
+
+STATIC_OPENROUTER_B5_SELECTION_MODE = "static_openrouter_b5"
+STATIC_TOKENRHYTHM_B5_SELECTION_MODE = "static_tokenrhythm_b5"
+# selection_mode → member provider id for the static B5 profiles. Must stay
+# in lockstep with provider.ensemble.STATIC_B5_PROFILES (gateway must not be
+# imported from provider, so a parity test pins the two tables together).
+STATIC_B5_SELECTION_MODE_PROVIDERS: dict[str, str] = {
+    STATIC_OPENROUTER_B5_SELECTION_MODE: "openrouter",
+    STATIC_TOKENRHYTHM_B5_SELECTION_MODE: "tokenrhythm",
+}
+STATIC_B5_SELECTION_MODES = frozenset(STATIC_B5_SELECTION_MODE_PROVIDERS)
+STATIC_OPENROUTER_B5_MIN_AGENT_STREAM_IDLE_TIMEOUT_SECONDS = 1200.0
+STATIC_OPENROUTER_B5_MIN_WEBUI_STREAM_IDLE_GRACE_SECONDS = 1260.0
+
+
+def _non_negative_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0.0, parsed)
+
+
+def static_b5_ensemble_enabled(config: Any) -> bool:
+    ensemble_cfg = getattr(config, "llm_ensemble", None)
+    if ensemble_cfg is None:
+        return False
+    return bool(getattr(ensemble_cfg, "enabled", False)) and (
+        str(getattr(ensemble_cfg, "selection_mode", "") or "") in STATIC_B5_SELECTION_MODES
+    )
+
+
+def static_b5_ensemble_active(config: Any) -> bool:
+    """True when a static-B5 profile is enabled *and* resolves a credential.
+
+    The stream-idle floors below exist for the real (slow) static-B5
+    ensembles. A keyless install can never run those members — the wrap is
+    skipped at turn time — so it keeps the default hang-detection budgets.
+    The credential check is the shared ensemble-side helper (lazy import;
+    ``provider`` never imports from ``gateway``, so no cycle) and therefore
+    cannot disagree with the turn-time wrap guard.
+    """
+    if not static_b5_ensemble_enabled(config):
+        return False
+    from opensquilla.provider.ensemble import static_b5_credential_available
+
+    selection_mode = str(
+        getattr(getattr(config, "llm_ensemble", None), "selection_mode", "") or ""
+    )
+    return static_b5_credential_available(
+        config, getattr(config, "llm", None), selection_mode
+    )
+
+
+def effective_agent_stream_idle_timeout_seconds(config: Any) -> float:
+    value = _non_negative_float(
+        getattr(config, "agent_stream_idle_timeout_seconds", 600.0),
+        600.0,
+    )
+    if static_b5_ensemble_active(config):
+        value = max(value, STATIC_OPENROUTER_B5_MIN_AGENT_STREAM_IDLE_TIMEOUT_SECONDS)
+    return value
+
+
+def effective_webui_stream_idle_grace_seconds(config: Any) -> float:
+    value = _non_negative_float(
+        getattr(config, "webui_stream_idle_grace_seconds", 630.0),
+        630.0,
+    )
+    if static_b5_ensemble_active(config):
+        server_idle = effective_agent_stream_idle_timeout_seconds(config)
+        value = max(
+            value,
+            STATIC_OPENROUTER_B5_MIN_WEBUI_STREAM_IDLE_GRACE_SECONDS,
+            server_idle + 60.0,
+        )
+    return value
+
+
+# Module-level dedupe state for the legacy ``enabled`` deprecation warning.
+# A plain ``bool`` flag guarded by a ``Lock`` makes the check-and-set atomic
+# across concurrent constructors; ``threading.Event`` is *not* atomic for
+# the test-then-set pattern (two threads can both observe is_set()==False
+# before either calls set()), which would emit duplicate warnings.
+_LEGACY_ENABLED_WARN_LOCK = threading.Lock()
+_LEGACY_ENABLED_WARNED = False
+
+# Pydantic-style truthy/falsy string sets (case-insensitive). Mirrors the
+# loose ``bool`` validator semantics so the migrated ``enabled`` key behaves
+# the way pydantic-settings v2 would have validated it before the field was
+# removed.
+_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on", "y", "t"})
+_FALSY_STRINGS = frozenset({"0", "false", "no", "off", "n", "f"})
+
+
+def _coerce_legacy_enabled(value: Any) -> bool:
+    """Strict bool coercion for the deprecated ``enabled`` legacy key.
+
+    Matches pydantic v2 loose-bool semantics for strings (case-insensitive
+    accept of ``{1, true, y, yes, on, t}`` / ``{0, false, n, no, off, f}``)
+    and ints ``0``/``1``. Any other value raises ``ValueError`` so invalid
+    inputs (e.g. ``"maybe"``) surface as a ``ValidationError`` rather than
+    being silently mapped to ``mode="off"``.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUTHY_STRINGS:
+            return True
+        if normalized in _FALSY_STRINGS:
+            return False
+    elif isinstance(value, int):
+        # ``bool`` is a subclass of ``int`` so it was handled above; only the
+        # unambiguous 0/1 ints match pydantic loose bool.
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+    raise ValueError(f"prompt_cache.enabled: cannot coerce {value!r} to bool")
+
+
+class PromptCacheConfig(BaseSettings):
+    # ``env_prefix`` stays so ``OPENSQUILLA_CACHE_MODE`` continues to bind the
+    # ``mode`` field. The legacy ``OPENSQUILLA_CACHE_ENABLED`` env var is no
+    # longer a field — it is probed explicitly in ``__init__`` below and
+    # routed through the legacy migration validator, because pydantic-
+    # settings only surfaces env keys that correspond to declared fields
+    # to ``model_validator(mode='before')``.
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_CACHE_")
+
+    mode: Literal["off", "auto", "on"] = "auto"
+
+    def __init__(self, **data: Any) -> None:
+        # Surface the legacy ``OPENSQUILLA_CACHE_ENABLED`` env var to the
+        # before-validator. Without this probe the env var would be
+        # silently dropped after the field was removed from the model.
+        if "enabled" not in data:
+            legacy_env = os.environ.get("OPENSQUILLA_CACHE_ENABLED")
+            if legacy_env is not None and legacy_env != "":
+                data["enabled"] = legacy_env
+        super().__init__(**data)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_enabled(cls, data: Any) -> Any:
+        """Map the deprecated ``enabled`` key onto ``mode`` (one warn/proc)."""
+        if not isinstance(data, dict):
+            return data
+        if "enabled" in data and "mode" not in data:
+            legacy = _coerce_legacy_enabled(data.pop("enabled"))
+            data["mode"] = "on" if legacy else "off"
+            # Atomic check-and-set under the lock so concurrent constructors
+            # cannot both win the dedupe race. The actual ``warnings.warn``
+            # call is performed *outside* the lock to avoid holding it across
+            # user-supplied warning filters/handlers (which could deadlock or
+            # be slow).
+            global _LEGACY_ENABLED_WARNED
+            with _LEGACY_ENABLED_WARN_LOCK:
+                should_warn = not _LEGACY_ENABLED_WARNED
+                if should_warn:
+                    _LEGACY_ENABLED_WARNED = True
+            if should_warn:
+                warnings.warn(
+                    f"prompt_cache.enabled is deprecated; use prompt_cache.mode "
+                    f"({{off|auto|on}}). Mapped enabled={legacy!r} -> "
+                    f"mode={data['mode']!r}. Removal target: 0.next+2.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+        elif "enabled" in data:
+            # Explicit ``mode`` wins; drop legacy silently.
+            data.pop("enabled")
+        return data
+
+    @property
+    def effective_mode(self) -> Literal["off", "auto", "on"]:
+        """Return the product-facing prompt-cache mode.
+
+        ``mode`` is the single source of truth; legacy ``enabled`` keys
+        are migrated by ``_migrate_legacy_enabled`` before they reach
+        this property.
+        """
+        return self.mode
+
+
+class DreamConfig(BaseModel):
+    """Per-agent Dream consolidation cron configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    interval_h: int = Field(default=24, ge=1)
+    cron: str | None = None  # e.g. "0 3 * * *"; overrides interval_h when set
+    max_batch_size: int = Field(default=20, ge=1)
+    max_iterations: int = Field(default=15, ge=1)
+    min_batch_size: int = Field(default=1, ge=1)
+    preview_mode: bool = True
+    auto_schedule: bool = False
+    input_slimming: Literal["off", "shadow", "on"] = "off"
+    memory_max_chars: int = Field(default=12_000, ge=0)
+    candidate_file_max_chars: int = Field(default=4_000, ge=0)
+    candidate_total_max_chars: int = Field(default=24_000, ge=0)
+    fallback_total_max_chars: int = Field(default=80_000, ge=0)
+    evidence_min_score: float = Field(default=0.55, ge=0.0, le=1.0)
+    evidence_min_seen_count: int = Field(default=1, ge=1)
+    evidence_negative_recurrence_threshold: int = Field(default=2, ge=1)
+    evidence_curated_writes_enabled: bool = True
+    evidence_quarantine_enabled: bool = True
+
+
+class SafetyConfig(BaseModel):
+    """Prompt-ingress safety controls."""
+
+    wrap_untrusted_workspace: bool = True
+    injection_scan_mode: Literal["off", "report", "enforce"] = "report"
+
+
+class PromptConfig(BaseModel):
+    """Prompt-layer feature flags."""
+
+    mode: Literal[
+        "auto",
+        "full",
+        "minimal",
+        "none",
+        "headless_source_edit",
+        "headless_repo_coding_scaffold",
+    ] = "auto"
+    platform_hint_enabled: bool = True
+    # Opt-in additive "Patch Evidence Protocol" system-prompt section for
+    # repo-coding/patching sessions. Overridable per run via the
+    # OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL env var ("on"/"off").
+    patch_evidence_protocol: bool = False
+    # Opt-in additive "Reproduction Evidence" system-prompt section plus the
+    # loop-side finalize-time red-evidence gate (engine.finalize_evidence_gate).
+    # Overridable per run via the OPENSQUILLA_FINALIZE_EVIDENCE_GATE env var
+    # ("on"/"off").
+    finalize_evidence_gate: bool = False
+    # Opt-in switch restoring the earlier compact "Tool Call Style" and
+    # "Reply Guidelines" system-prompt directives (single-line narration,
+    # concise replies) for deployments tuned against the previous wording.
+    # Overridable per run via the OPENSQUILLA_LEGACY_PROMPT_STYLE env var
+    # ("on"/"off"). Off keeps the current wording unchanged.
+    legacy_prompt_style: bool = False
+
+
+MemoryEmbeddingProvider = Literal[
+    "auto",
+    "none",
+    "local",
+    "openai",
+    "openai-compatible",
+    "ollama",
+]
+
+
+class MemoryEmbeddingLocalConfig(BaseModel):
+    """Local memory embedding settings."""
+
+    onnx_dir: str | None = None
+
+
+class MemoryEmbeddingRemoteConfig(BaseModel):
+    """OpenAI-compatible remote memory embedding settings."""
+
+    api_key: str | None = None
+    api_key_env: str | None = None
+    base_url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    model: str | None = None
+    dimensions: int | None = Field(default=None, ge=1)
+
+
+class MemoryEmbeddingOllamaConfig(BaseModel):
+    """Ollama memory embedding settings."""
+
+    base_url: str | None = None
+    model: str | None = None
+
+
+class MemoryEmbeddingConfig(BaseModel):
+    """Embedding provider selection for the stable memory search index.
+
+    ``provider`` is the canonical field. ``mode`` and the flat
+    ``api_key``/``base_url``/``model`` fields remain for older configs.
+    Concrete ``provider`` values win over legacy ``mode``. The default
+    ``provider="auto"`` still honors legacy ``mode`` so old configs keep
+    round-tripping safely.
+    """
+
+    provider: MemoryEmbeddingProvider = "auto"
+    mode: MemoryEmbeddingProvider | None = None
+    model: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    local: MemoryEmbeddingLocalConfig = Field(default_factory=MemoryEmbeddingLocalConfig)
+    remote: MemoryEmbeddingRemoteConfig = Field(default_factory=MemoryEmbeddingRemoteConfig)
+    ollama: MemoryEmbeddingOllamaConfig = Field(default_factory=MemoryEmbeddingOllamaConfig)
+
+    @property
+    def requested_provider(self) -> MemoryEmbeddingProvider:
+        if self.provider == "auto" and self.mode:
+            return self.mode
+        return self.provider
+
+
+class MemoryCostConfig(BaseModel):
+    """Stable memory implementation cost knobs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query_embedding_cache: Literal["off", "shadow", "on"] = "on"
+
+
+class MemoryConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_MEMORY_",
+        env_nested_delimiter="__",
+        extra="forbid",
+    )
+
+    cost: MemoryCostConfig = Field(default_factory=MemoryCostConfig)
+
+    # Markdown memory source location: "state" keeps internal state layout;
+    # "workspace" stores MEMORY.md and memory/*.md under the active agent workspace.
+    source: Literal["state", "workspace"] = "workspace"
+    retrieval_mode: Literal["hybrid", "fts_only"] = "hybrid"
+    embedding: MemoryEmbeddingConfig = Field(default_factory=MemoryEmbeddingConfig)
+    sync_interval_minutes: float = Field(default=0.0, ge=0.0)
+    session_source_enabled: bool = False
+
+    # Passive injection
+    inject_limit: int = 4000  # max chars for passive memory injection into system prompt
+
+    # Size limits (0 = disabled)
+    max_file_size_kb: int = 1024  # 1 MB per file
+    max_total_size_kb: int = 102400  # 100 MB total
+    max_files: int = 500  # max number of memory files
+
+    # TTL (0 = disabled, no auto-prune)
+    entry_ttl_days: int = 0
+    # Background TTL sweep cadence (minutes). Set to 0 to opt out of
+    # background sweep while keeping in-line TTL on memory_save. No-op
+    # when entry_ttl_days = 0.
+    ttl_sweep_interval_minutes: float = Field(default=60.0, ge=0.0)
+
+    # Flush (pre-compaction memory save)
+    flush_enabled: bool = False
+    flush_triggers: list[FlushTrigger] = Field(
+        default_factory=lambda: list(DEFAULT_FLUSH_TRIGGERS)
+    )
+    flush_pre_compaction: bool = False
+    flush_timeout_seconds: float = 15.0
+    flush_background_timeout_seconds: float = 120.0
+    flush_backoff_initial_seconds: float = 30.0
+    flush_backoff_max_seconds: float = 300.0
+    flush_archive_max_bytes: int = 800_000
+    flush_compaction_requires_safe_receipt: bool = False
+    flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"] = "protect"
+    repair_enabled: bool = True
+    repair_interval_seconds: float = Field(default=60.0, ge=0.0)
+    repair_max_items_per_tick: int = Field(default=5, ge=1)
+
+    @field_validator("flush_triggers", mode="before")
+    @classmethod
+    def _normalize_flush_triggers(cls, value: object) -> list[FlushTrigger]:
+        return list(normalize_flush_triggers_strict(value))
+
+    # Per-turn auto capture / recall
+    auto_capture_enabled: bool = True
+    capture_mode: Literal["turn_pair", "off"] = "turn_pair"
+    capture_user: bool = True
+    capture_assistant: bool = False
+    capture_excluded_run_kinds: list[str] = Field(
+        default_factory=lambda: ["recall", "session_recall"]
+    )
+    capture_excluded_provenance_kinds: list[str] = Field(
+        default_factory=lambda: ["recall", "tool_result", "memory_injected", "internal_system"]
+    )
+    capture_max_chars: int = 2000
+    capture_roll_max_chars: int = Field(default=50_000, ge=0)
+    daily_note_max_chars: int = Field(default=4000, ge=0)
+    daily_notes_total_max_chars: int = Field(default=8000, ge=0)
+
+    # Retriever tuning
+    temporal_decay_enabled: bool = False
+    temporal_decay_half_life_days: float = 30.0
+    mmr_enabled: bool = False
+    mmr_lambda: float = 0.7
+    vector_weight: float = 0.7
+    text_weight: float = 0.3
+
+    # Dream consolidation
+    dream: DreamConfig = Field(default_factory=DreamConfig)
+
+
+def _default_tiers() -> dict:
+    """Default model routing config (the packaged openrouter preset)."""
+    return _router_tier_profile_defaults("openrouter")
+
+
+# Accepted (persistable) squilla_router.tier_profile ids. Derived from the
+# packaged preset registry's non-synthesized ids, with an internal equality
+# check against the pinned legacy-nine literal (see preset_registry). Synthesized
+# presets are deliberately EXCLUDED: an rc1 gateway bricks on an unknown
+# tier_profile, so the accepted set stays pinned to the legacy nine (downgrade
+# contract). Kept as a module-level frozenset for compat with existing importers.
+ROUTER_TIER_PROFILE_IDS = legacy_profile_ids()
+
+
+def _merge_tier_dicts(defaults: dict, overrides: object) -> dict:
+    merged = {name: dict(value) for name, value in defaults.items()}
+    if not overrides:
+        return merged
+    if not isinstance(overrides, dict):
+        return merged
+    for tier_name, override in overrides.items():
+        if isinstance(override, dict) and isinstance(merged.get(tier_name), dict):
+            tier = dict(merged[tier_name])
+            tier.update(override)
+            merged[tier_name] = tier
+        else:
+            merged[tier_name] = override
+    return merged
+
+
+def _router_tier_profile_defaults(profile: str | None) -> dict:
+    """Effective tier defaults for a legacy tier_profile id.
+
+    Thin adapter over the packaged preset registry. Membership stays pinned
+    to the legacy nine ids (ROUTER_TIER_PROFILE_IDS): synthesized presets
+    exist in the registry but are rejected here, because a persisted
+    tier_profile outside the legacy set bricks rc1 loaders on downgrade.
+    """
+    normalized = (profile or "openrouter").strip().lower()
+    if normalized not in ROUTER_TIER_PROFILE_IDS:
+        allowed = ", ".join(sorted(ROUTER_TIER_PROFILE_IDS))
+        raise ValueError(
+            f"unknown squilla_router.tier_profile {profile!r}; expected one of {allowed}"
+        )
+    preset = get_preset(normalized)
+    if preset is None or preset.synthesized:  # pragma: no cover - packaging drift guard
+        allowed = ", ".join(sorted(ROUTER_TIER_PROFILE_IDS))
+        raise ValueError(
+            f"unknown squilla_router.tier_profile {profile!r}; expected one of {allowed}"
+        )
+    return preset.tier_defaults()
+
+
+class RouterBudgetConfig(BaseModel):
+    """Additive, opt-in per-session spend gate for the router.
+
+    Default state is a complete no-op: with no ``limit_usd`` set (or
+    ``action = "off"``) the routing policy's budget stage never runs, so the
+    chosen tier is byte-identical to a build without this block (the routing
+    parity golden pins that). The gate READS the session's already-accumulated
+    billed/estimated spend — it never recomputes cost math — and, when that
+    spend crosses ``limit_usd``, takes ``action``:
+
+    - ``"warn"`` (the default action) — annotate routing metadata + emit a
+      ``router_budget.warn`` log, but leave the routed tier UNCHANGED.
+    - ``"cap"`` — lower the routed tier to ``cap_tier`` (or the router
+      ``default_tier`` when unset), never raising it.
+    - ``"off"`` — disable the gate regardless of ``limit_usd``.
+
+    When the accumulated spend (or a required forward price) cannot be
+    determined, the gate SUSPENDS (a no-op) rather than acting on missing data.
+
+    ``extra="ignore"`` keeps the block downgrade-tolerant: an older loader
+    reading a config that carries it simply drops it and falls back to today's
+    un-gated routing. Nothing that activates the gate is persisted while it is
+    unset — ``limit_usd``/``cap_tier`` default to ``None`` and drop out of the
+    ``exclude_none`` TOML dump.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    action: Literal["off", "warn", "cap"] = "warn"
+    # Per-session ceiling in USD. ``None`` (or a non-positive value) disables
+    # the gate — this is the default, byte-identical no-op state.
+    limit_usd: float | None = None
+    # Cap target for ``action = "cap"``. ``None`` falls back to the router's
+    # ``default_tier`` at gather time. Normalized through router_tiers.
+    cap_tier: str | None = None
+    # Opt-in forward projection: add an estimate of the next turn's marginal
+    # input cost to the accumulated spend before comparing to ``limit_usd``.
+    # When the estimate cannot be determined the gate SUSPENDS.
+    include_next_turn_estimate: bool = False
+
+
+class RouterSelfLearningConfig(BaseModel):
+    """Squilla Router self-learning loop (capture + offline retrain).
+
+    Opt-in. ``enabled`` is the master switch; capture and training each have
+    their own sub-toggle so an operator can collect data without yet training.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False  # master switch; off => zero overhead on the hot path
+    capture_enabled: bool = True  # gates inference-time feature emission
+    enable_mlp: bool = False  # also store raw_bge_1536 for MLP fine-tune (phase 2)
+    store_audit_summary: bool = False  # opt-in redacted summary, audit only
+    # Trigger gating (evaluated cheaply on each post-dream hook).
+    train_min_samples: int = Field(default=200, ge=1)
+    idle_hours: float = Field(default=2.0, ge=0.0)
+    cooldown_hours: float = Field(default=72.0, ge=0.0)
+    retention_days: int = Field(default=30, ge=1)
+    # Training (LightGBM incremental) — consumed by the offline trainer/worker.
+    num_boost_round: int = Field(default=60, ge=1)
+    train_timeout_seconds: float = Field(default=900.0, gt=0.0)
+    # Promotion / rollback.
+    auto_rollback: bool = True
+    golden_eval_path: str | None = None
+    cost_tolerance_pct: float = Field(default=5.0, ge=0.0)
+    max_critical_under_routing: float = Field(default=0.30, ge=0.0, le=1.0)
+    min_golden_agreement: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Online rollback monitor (M4).
+    min_monitor_samples: int = Field(default=30, ge=1)
+    complaint_regression_delta: float = Field(default=0.05, ge=0.0, le=1.0)
+    # Second rollback trigger: explicit down-vote-rate regression (F7).
+    # Feedback is far sparser than samples, hence its own minimum and a
+    # wider delta than the complaint monitor.
+    min_feedback_monitor_samples: int = Field(default=5, ge=1)
+    downvote_regression_delta: float = Field(default=0.15, ge=0.0, le=1.0)
+    # Rolling holdout (per-agent progress metric).
+    holdout_pct: float = Field(default=0.10, ge=0.0, le=0.5)
+    holdout_repeats: int = Field(default=5, ge=1)
+    holdout_min_size: int = Field(default=30, ge=1)
+    holdout_granularity: Literal["session", "alignment_group"] = "session"
+
+
+# Resolve this model's own forward refs (Literal) before it is nested below, so
+# rebuilding the parent does not leave it "not fully defined" under the
+# unregistered-module exec path used by tests. See the rebuild note below.
+RouterSelfLearningConfig.model_rebuild()
+
+
+class SquillaRouterConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_SQUILLA_ROUTER_",
+        extra="ignore",  # tolerate removed legacy router fields in old configs
+    )
+
+    enabled: bool = True
+    auto_thinking: bool = True
+    rollout_phase: str = "full"  # "observe" | "prompt_only" | "full"
+    strategy: str = "v4_phase3"
+    tier_profile: str | None = None
+    # Explicit ownership for the router ladder.  ``follow_primary`` means
+    # OpenSquilla owns the ladder and may replace it with the active
+    # provider's preset when the primary provider changes.  ``custom`` means
+    # the operator owns the ladder and provider switches must preserve it.
+    # ``None`` is deliberately retained for pre-field configs: treating an
+    # unclassified historical ladder as custom is the only non-destructive
+    # upgrade behavior.  A later explicit Router save records one of the two
+    # concrete values.  Additive and downgrade-safe because this settings
+    # section ignores unknown fields in older gateways.
+    preset_binding: Literal["follow_primary", "custom"] | None = None
+    visual_mode: str = "real_candidates"
+    # Preview: execute router tiers whose provider differs from llm.provider,
+    # resolving credentials from [llm_profiles.<id>] or the provider's env
+    # key. Off: such tiers run on the active provider (with a logged
+    # mismatch warning), preserving the historical behavior.
+    cross_provider_tiers: bool = False
+    # What routing does when it lands on a tier naming a provider other than
+    # llm.provider while cross_provider_tiers is off. "route" preserves the
+    # historical, documented-intentional behavior: flag the mismatch loudly
+    # (warning log + router_tier_provider_mismatch metadata) but still run
+    # the tier's model id on the active provider's credentials. "veto"
+    # rebinds the turn to the nearest tier that executes on the active
+    # provider (or the default tier), recording the veto in the routing
+    # trail; without a usable rebind target it falls back to route-and-flag.
+    # Downgrade note: additive key. This section is extra="ignore", so an
+    # rc1 loader reading a config that carries this key simply drops it and
+    # falls back to the historical route-and-flag behavior — persisting it
+    # never bricks a downgraded gateway.
+    tier_provider_mismatch: Literal["route", "veto"] = "route"
+    tiers: dict = Field(default_factory=_default_tiers)
+    default_tier: str = DEFAULT_TEXT_TIER
+    confidence_threshold: float = 0.5
+    confidence_high_tier_margin: float = Field(default=0.05, ge=0.0)
+    v4_bundle_dir: str | None = None  # V4 Phase 3 bundle root; defaults to bundled assets
+    v4_use_aux_head: bool | None = True  # override router.runtime.yaml aux head when set
+    routing_timeout_seconds: float = Field(default=5.0, gt=0.0)
+    kv_cache_anti_downgrade_enabled: bool = True
+    kv_cache_anti_downgrade_window_seconds: int = 600
+    complaint_upgrade_enabled: bool = True
+    complaint_upgrade_steps: int = 1
+    complaint_upgrade_max_chars: int = 160
+    require_router_runtime: bool = True
+    # Days router decision records (V017 router_decisions) are retained in
+    # the session DB before the writer's write-time opportunistic pruning
+    # deletes them. Additive key: the class-level extra="ignore" keeps old
+    # builds rollback-tolerant when this key is present in config files.
+    decision_retention_days: int = Field(default=30, ge=1)
+    # Opt-in on-device router calibration. When true, the routing policy applies
+    # the hard-clamped adjustment in <state>/router_calibration.json as a bias
+    # on the confidence gate, and the gateway runs a 24h in-process calibration
+    # job over local decision records. Default-off: the confidence gate stays
+    # byte-identical to today and no calibration job is scheduled. Additive key
+    # (class extra="ignore" keeps old builds rollback-tolerant). Never touches
+    # the router savings/cost math.
+    calibration_enabled: bool = False
+    # Opt-in per-session spend gate. Default (no limit) is a complete no-op:
+    # the routing policy's budget stage never runs, so the chosen tier stays
+    # byte-identical to today. Reads accumulated session spend; never
+    # recomputes cost. Additive key (class extra="ignore" keeps old builds
+    # rollback-tolerant).
+    budget: RouterBudgetConfig = Field(default_factory=RouterBudgetConfig)
+    estimated_output_savings_pct: float = 0.03
+    upgrade_to_c3_compaction_enabled: bool = True
+    self_learning: RouterSelfLearningConfig = Field(default_factory=RouterSelfLearningConfig)
+    vision_history_lookback_turns: int = Field(default=8, ge=0)
+    vision_history_candidate_turns: int = Field(default=8, ge=0)
+    vision_sticky_followup_turns: int = Field(default=3, ge=0)
+    vision_followup_gate_enabled: bool = True
+    vision_followup_gate_tier: str = "c0"
+    vision_followup_gate_model: str | None = None
+    vision_followup_gate_timeout_seconds: float = Field(default=10.0, ge=0.1)
+    vision_followup_gate_max_output_tokens: int = Field(default=512, ge=16)
+    vision_followup_gate_fallback_recent_turns: int = Field(default=2, ge=0)
+    vision_followup_gate_unknown_policy: str = "image_if_recent"
+
+    @field_validator("visual_mode", mode="before")
+    @classmethod
+    def _normalize_visual_mode(cls, value: Any) -> str:
+        raw = "real_candidates" if value is None else str(value).strip().lower()
+        normalized = raw.replace("-", "_")
+        if normalized in {"", "real_candidates", "candidates"}:
+            return "real_candidates"
+        if normalized in {"legacy_grid", "model_space", "modelspace"}:
+            return "legacy_grid"
+        raise ValueError("visual_mode must be one of: real_candidates, legacy_grid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_tier_profile_defaults(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        values = dict(values)
+        if (
+            "upgrade_to_c3_compaction_enabled" not in values
+            and "upgrade_to_t3_compaction_enabled" in values
+        ):
+            values["upgrade_to_c3_compaction_enabled"] = values[
+                "upgrade_to_t3_compaction_enabled"
+            ]
+        if "default_tier" in values:
+            values["default_tier"] = normalize_text_tier(values.get("default_tier")) or values.get(
+                "default_tier"
+            )
+        if isinstance(values.get("tiers"), dict):
+            values["tiers"] = normalize_tier_mapping(values["tiers"])
+        profile = values.get("tier_profile")
+        if profile is None:
+            return values
+        if (
+            "tiers" in values
+            and values["tiers"] is not None
+            and not isinstance(values["tiers"], dict)
+        ):
+            raise ValueError(
+                "squilla_router.tiers must be a mapping when squilla_router.tier_profile is set"
+            )
+        normalized = str(profile).strip().lower()
+        defaults = _router_tier_profile_defaults(normalized)
+        merged = _merge_tier_dicts(defaults, values.get("tiers"))
+        next_values = dict(values)
+        next_values["tier_profile"] = normalized
+        next_values["tiers"] = merged
+        return next_values
+
+
+# Eagerly resolve the ``self_learning: RouterSelfLearningConfig`` forward ref
+# (``from __future__ import annotations`` makes it a string). Without this the
+# model stays "not fully defined" when this file is exec'd as an unregistered
+# module (e.g. tests load it via spec_from_file_location), since pydantic falls
+# back to ``sys.modules[__module__]`` which is absent in that scenario.
+SquillaRouterConfig.model_rebuild()
+
+
+class AgentTokenSavingConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_AGENT_TOKEN_SAVING_")
+
+    # Tokenjuice projection is the default tool-result path.
+    tool_result_projection_max_inline_chars: int = Field(default=60_000, ge=1000)
+    tool_result_fresh_diagnostic_policy_enabled: bool = Field(default=False)
+    tool_result_diagnostic_retrieval_gate_enabled: bool = Field(default=False)
+    tool_result_fresh_diagnostic_inline_max_chars: int = Field(default=64_000, ge=0)
+    tool_result_dispatch_max_chars: int = Field(default=0, ge=0)
+    tool_result_dispatch_turn_max_chars: int = Field(default=0, ge=0)
+    tool_result_store_full_trace: bool = Field(default=False)
+    tool_result_store_max_bytes: int = Field(default=8 * 1024 * 1024, ge=0)
+    tool_result_store_disk_budget_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+    tool_result_store_retention_seconds: int = Field(default=7 * 24 * 60 * 60, ge=0)
+
+
+class CompactionLlmConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_COMPACTION_")
+
+    model: str | None = None  # None = use session model
+    timeout_seconds: float = 90.0
+    enabled: bool = True
+    compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
+    protected_recent_messages: int = Field(default=0, ge=0)
+
+
+class SessionNamingConfig(BaseSettings):
+    """LLM-generated session titles (auto-naming).
+
+    After the first user message, a one-shot LLM call summarizes it into a short
+    title written to SessionNode.derived_title. Model selection mirrors compaction
+    but defaults to the router's default text tier rather than the session model:
+    ``model`` (explicit) > ``tier`` model > squilla_router.default_tier model.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_NAMING_")
+
+    enabled: bool = True
+    # Surfaces eligible for auto-naming. webchat/cli are chat; channel covers
+    # inbound channel conversations. cron/subagent intentionally excluded.
+    surfaces: list[str] = Field(default_factory=lambda: ["webchat", "cli", "channel"])
+    tier: str | None = None  # None = use squilla_router.default_tier
+    model: str | None = None  # None = use the resolved tier's model
+    timeout_seconds: float = 30.0
+    max_chars: int = Field(default=48, ge=8)
+    language: str = "auto"  # follow the conversation language
+
+
+class MCPServerEntry(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_MCP_SERVER_")
+
+    name: str = ""
+    transport: str = "stdio"  # "stdio" | "sse"
+    command: str | None = None  # for stdio
+    args: list[str] = Field(default_factory=list)  # for stdio
+    url: str | None = None  # for sse
+    env: dict[str, str] = Field(default_factory=dict)
+    tool_timeout_seconds: float = 30.0
+
+
+class MCPConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_MCP_")
+
+    enabled: bool = False
+    servers: list[MCPServerEntry] = Field(default_factory=list)
+    connect_timeout_seconds: float = 5.0
+
+
+class KeepaliveConfig(BaseSettings):
+    """KV cache keep-alive configuration.
+
+    Periodically sends a lightweight ping to the LLM provider (appended to the
+    last known conversation prefix) to keep the server-side KV cache warm.
+    This prevents expensive cold cache rebuilds when returning from a break.
+
+    Inspired by claude-code-coffee (https://github.com/cnighswonger/claude-code-coffee).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_KEEPALIVE_",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    enabled: bool = False
+    # How often to send keep-alive pings (in seconds).
+    interval_seconds: int = Field(
+        default=480,
+        ge=30,
+        validation_alias=AliasChoices("interval_seconds", "intervalSeconds"),
+    )
+    # The keep-alive message content. Keep it short — the model will reply
+    # with a minimal response (e.g. "ok").
+    message: str = "Keep-alive ping. Do not execute any tool calls or reasoning. Reply 'ok' only."
+    # Whether to disable tool calling for keep-alive requests.
+    tool_choice_none: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("tool_choice_none", "toolChoiceNone"),
+    )
+    # Max tokens for the keep-alive response (keep it tiny).
+    max_tokens: int = Field(default=10, ge=1, le=100)
+    # How many recent turns of conversation history to include in the
+    # keep-alive ping. 0 = include all available history. Higher values
+    # keep more context but cost more tokens per ping.
+    history_turns: int = Field(default=0, ge=0)
+    # Max keep-alive pings per idle session. After this many pings the
+    # loop stops to avoid wasting tokens on long absences.
+    # Resets to 0 when user activity is detected (new message arrives).
+    # Default 20 pings × 480s = ~2.7 hours of idle coverage.
+    max_pings: int = Field(default=20, ge=0)
+
+
+class HeartbeatConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_HEARTBEAT_",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    enabled: bool = False
+    interval_ms: int = Field(
+        default=60000,
+        ge=1,
+        validation_alias=AliasChoices("interval_ms", "intervalMs"),
+    )
+    target: str = "last"
+    to: str = ""
+    account_id: str = Field(default="", validation_alias=AliasChoices("account_id", "accountId"))
+    thread_id: str = Field(default="", validation_alias=AliasChoices("thread_id", "threadId"))
+    prompt: str | None = "Reply HEARTBEAT_OK."
+    ack_max_chars: int = Field(
+        default=500,
+        ge=0,
+        validation_alias=AliasChoices("ack_max_chars", "ackMaxChars"),
+    )
+    light_context: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("light_context", "lightContext"),
+    )
+    # Path to HEARTBEAT.md for live-reload of cadence + Loop overrides.
+    # ``None`` resolves to ``<workspace_dir>/HEARTBEAT.md``
+    # at boot. When the file is absent the loop falls back to the bootstrap
+    # values above; a malformed frontmatter is fail-open (defaults).
+    config_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("config_path", "configPath"),
+    )
+
+    @field_validator("target")
+    @classmethod
+    def _validate_target(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("target must be a non-empty string")
+        return value.strip()
+
+
+class ImageGenerationOpenAIProviderConfig(BaseModel):
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    api_key_env: str = "OPENAI_API_KEY"
+
+
+class ImageGenerationOpenRouterProviderConfig(BaseModel):
+    base_url: str = "https://openrouter.ai/api/v1"
+    api_key: str = ""
+    api_key_env: str = "OPENROUTER_API_KEY"
+
+
+class ImageGenerationTokenRhythmProviderConfig(BaseModel):
+    base_url: str = "https://tokenrhythm.studio/v1"
+    api_key: str = ""
+    api_key_env: str = "TOKENRHYTHM_API_KEY"
+
+
+class ImageGenerationQwenTokenPlanProviderConfig(BaseModel):
+    base_url: str = "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
+    api_key: str = ""
+    api_key_env: str = "QWEN_TOKEN_PLAN_API_KEY"
+
+
+class ImageGenerationProvidersConfig(BaseModel):
+    openai: ImageGenerationOpenAIProviderConfig = Field(
+        default_factory=ImageGenerationOpenAIProviderConfig
+    )
+    openrouter: ImageGenerationOpenRouterProviderConfig = Field(
+        default_factory=ImageGenerationOpenRouterProviderConfig
+    )
+    tokenrhythm: ImageGenerationTokenRhythmProviderConfig = Field(
+        default_factory=ImageGenerationTokenRhythmProviderConfig
+    )
+    qwen_token_plan: ImageGenerationQwenTokenPlanProviderConfig = Field(
+        default_factory=ImageGenerationQwenTokenPlanProviderConfig
+    )
+
+
+class ImageGenerationConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_IMAGE_GENERATION_",
+        env_nested_delimiter="__",
+    )
+
+    enabled: bool = False
+    # ``follow_llm`` is written only by an explicit provider-configuration
+    # intent. Existing image sections load as ``custom`` so upgrades never
+    # silently replace an operator-owned route or re-enable a disabled tool.
+    binding: Literal["custom", "follow_llm"] = "custom"
+    primary: str = "openai/gpt-image-1"
+    fallbacks: list[str] = Field(default_factory=list)
+    size: str = "1024x1024"
+    timeout_seconds: float = 180.0
+    output_format: Literal["png", "jpeg", "webp"] = "png"
+    providers: ImageGenerationProvidersConfig = Field(
+        default_factory=ImageGenerationProvidersConfig
+    )
+
+
+class AudioElevenLabsProviderConfig(BaseModel):
+    base_url: str = "https://api.elevenlabs.io"
+    api_key: str = ""
+    api_key_env: str = "ELEVENLABS_API_KEY"
+    speech_to_text_model: str = "scribe_v2"
+    voice_conversion_model: str = "eleven_multilingual_sts_v2"
+    music_model: str = "music_v1"
+    music_output_format: str = "mp3_44100_128"
+
+
+class AudioProvidersConfig(BaseModel):
+    elevenlabs: AudioElevenLabsProviderConfig = Field(
+        default_factory=AudioElevenLabsProviderConfig
+    )
+
+
+class AudioTTSConfig(BaseModel):
+    model: str = "eleven_multilingual_v2"
+    voice: str = "21m00Tcm4TlvDq8ikWAM"
+    language_code: str = ""
+    output_format: str = "mp3_44100_128"
+    timeout_seconds: float = 120.0
+    stability: float | None = None
+    similarity_boost: float | None = None
+    style: float | None = None
+    use_speaker_boost: bool | None = None
+    speed: float = 1.0
+
+
+class AudioConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_AUDIO_",
+        env_nested_delimiter="__",
+    )
+
+    enabled: bool = False
+    tts: AudioTTSConfig = Field(default_factory=AudioTTSConfig)
+    providers: AudioProvidersConfig = Field(default_factory=AudioProvidersConfig)
+
+
+# ---------------------------------------------------------------------------
+# Channel config (BaseModel — no env-var binding, validated at TOML load)
+# Names use *Entry suffix to avoid shadowing adapter-level *ChannelConfig.
+# ---------------------------------------------------------------------------
+
+
+class ConfiguredChannelEntry(BaseModel):
+    """Common fields shared by gateway-managed channel entries."""
+
+    name: str
+    type: str
+    enabled: bool = True
+    agent_id: str = "main"
+    debounce_window_s: float = 0.0
+    status_reactions_enabled: bool = False
+    dm_access: Literal["pairing", "open", "allowlist"] = "pairing"
+    # When a pairing is approved, tell the sender they can start — otherwise
+    # approval is silent and they never know to send another message.
+    pairing_approved_notice: bool = True
+    allowed_senders: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_senders", mode="before")
+    @classmethod
+    def _normalize_allowed_senders(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = value.split(",")
+        if not isinstance(value, list | tuple | set | frozenset):
+            return value
+        return list(
+            dict.fromkeys(str(item).strip() for item in value if str(item).strip())
+        )
+
+    @model_validator(mode="after")
+    def _validate_dm_access(self) -> ConfiguredChannelEntry:
+        if self.dm_access == "allowlist" and not self.allowed_senders:
+            raise ValueError("dm_access=allowlist requires allowed_senders")
+        return self
+    # Group conversations are isolated by sender by default. Deployments that
+    # intentionally want one transcript shared by the whole room can opt in.
+    group_session_scope: Literal["per_sender", "shared_room"] = "per_sender"
+    # Controls what happens when another channel message arrives while the
+    # same session is busy. TaskRuntime validates and executes these modes.
+    busy_input_mode: Literal["followup", "queue", "steer", "interrupt"] = "followup"
+
+    @field_validator("debounce_window_s")
+    @classmethod
+    def _validate_debounce_window(cls, value: float) -> float:
+        if value != 0.0 and not 0.1 <= value <= 30.0:
+            raise ValueError("debounce_window_s must be 0 or in [0.1, 30.0]")
+        return value
+
+
+class SlackChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for a Slack channel."""
+
+    type: Literal["slack"] = "slack"
+    token: str
+    slack_channel_id: str = ""
+    signing_secret: str | None = None
+    reply_in_thread: bool = False
+    # ``socket`` uses Slack Socket Mode (an outbound websocket long-connection,
+    # like Feishu) and needs no public Request URL; ``webhook`` keeps the
+    # Events API webhook. Socket Mode additionally requires ``app_token``.
+    connection_mode: Literal["webhook", "socket"] = "webhook"
+    app_token: str = ""
+
+    @model_validator(mode="after")
+    def _validate_socket_app_token(self) -> SlackChannelEntry:
+        if self.connection_mode == "socket" and not self.app_token.strip():
+            raise ValueError("slack socket channels require app_token")
+        return self
+
+
+class FeishuChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for a Feishu (Lark) channel."""
+
+    type: Literal["feishu"] = "feishu"
+    status_reactions_enabled: bool = True
+    app_id: str
+    app_secret: str
+    encrypt_key: str = ""
+    verification_token: str = ""
+    default_chat_id: str = ""
+    webhook_path: str = "/feishu/events"
+    api_base: str = "https://open.feishu.cn/open-apis"
+    connection_mode: Literal["webhook", "websocket"] = "websocket"
+    domain: Literal["feishu", "lark"] = "feishu"
+
+    @model_validator(mode="after")
+    def _validate_webhook_verification(self) -> FeishuChannelEntry:
+        # Webhook ingress authenticates via the encrypt_key HMAC signature
+        # and/or the verification token — either one is a real credential
+        # (configs from earlier releases commonly carry encrypt_key alone).
+        # Disabled entries stay loadable so config migration can park an
+        # unverifiable legacy entry instead of failing the whole boot.
+        if (
+            self.enabled
+            and self.connection_mode == "webhook"
+            and not self.verification_token.strip()
+            and not self.encrypt_key.strip()
+        ):
+            raise ValueError(
+                "feishu webhook channels require verification_token or encrypt_key"
+            )
+        return self
+
+
+class DiscordChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for a Discord channel."""
+
+    type: Literal["discord"] = "discord"
+    token: str
+    application_id: str = ""
+    default_channel_id: str = ""
+    gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
+    # GUILDS | GUILD_MESSAGES | GUILD_MESSAGE_REACTIONS | DIRECT_MESSAGES |
+    # DIRECT_MESSAGE_REACTIONS | MESSAGE_CONTENT. Keep this aligned with
+    # channels.discord.GATEWAY_INTENTS.
+    intents: int = 46593
+
+
+class DingTalkChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for a DingTalk channel."""
+
+    type: Literal["dingtalk"] = "dingtalk"
+    client_id: str
+    client_secret: str
+
+
+class WeComChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for WeCom AI Bot or corp-app callback."""
+
+    type: Literal["wecom"] = "wecom"
+    connection_mode: Literal["webhook", "websocket"] = "webhook"
+    bot_id: str = ""
+    bot_secret: str = ""
+    websocket_url: str = "wss://openws.work.weixin.qq.com"
+    corp_id: str = ""
+    corp_secret: str = ""
+    agent_id_int: int = 0
+    token: str = ""
+    encoding_aes_key: str = ""
+    webhook_path: str = "/wecom/events"
+    api_base: str = "https://qyapi.weixin.qq.com"
+
+    @model_validator(mode="after")
+    def validate_wecom_mode(self) -> WeComChannelEntry:
+        if self.connection_mode == "websocket":
+            missing = [
+                field
+                for field in ("bot_id", "bot_secret")
+                if not str(getattr(self, field)).strip()
+            ]
+            if missing:
+                raise ValueError(
+                    "wecom websocket mode requires bot_id and bot_secret; "
+                    "corp_id/corp_secret/access_token are for webhook mode"
+                )
+            if not self.websocket_url.strip():
+                raise ValueError("wecom websocket mode requires websocket_url")
+            return self
+
+        missing = [
+            field
+            for field in (
+                "corp_id",
+                "corp_secret",
+                "token",
+                "encoding_aes_key",
+            )
+            if not str(getattr(self, field)).strip()
+        ]
+        if self.agent_id_int <= 0:
+            missing.append("agent_id_int")
+        if missing:
+            raise ValueError(
+                "wecom webhook mode requires corp_id, corp_secret, agent_id_int, "
+                "token, and encoding_aes_key"
+            )
+        return self
+
+
+class QQChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for a QQ Bot channel."""
+
+    type: Literal["qq"] = "qq"
+    app_id: str
+    app_secret: str
+
+
+class MSTeamsChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for an MS Teams channel."""
+
+    type: Literal["msteams"] = "msteams"
+    app_id: str
+    app_password: str
+    webhook_path: str = "/msteams/messages"
+
+
+class MatrixChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for a Matrix channel."""
+
+    type: Literal["matrix"] = "matrix"
+    homeserver_url: str
+    user_id: str
+    password: str = ""
+    access_token: str = ""
+    device_id: str = ""
+    encryption: Literal["off", "required", "best_effort"] = "off"
+
+
+class TelegramChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for a Telegram Bot API channel."""
+
+    type: Literal["telegram"] = "telegram"
+    token: str
+    default_chat_id: str = ""
+    api_base: str = "https://api.telegram.org"
+    transport_name: Literal["polling", "webhook"] = "polling"
+    webhook_path: str = "/telegram/events"
+    webhook_url: str = ""
+    webhook_secret_token: str = ""
+    drop_pending_updates: bool = False
+    poll_timeout_s: int = 30
+    poll_limit: int = 100
+    poll_idle_sleep_s: float = 0.1
+
+    @model_validator(mode="after")
+    def _validate_webhook_auth(self) -> TelegramChannelEntry:
+        if self.transport_name == "webhook":
+            if not self.webhook_url:
+                raise ValueError("webhook_url is required for telegram webhook mode")
+            if not self.webhook_secret_token:
+                raise ValueError(
+                    "webhook_secret_token is required for telegram webhook mode"
+                )
+        return self
+
+
+ChannelConfigEntry = ConfiguredChannelEntry
+
+
+class ChannelsConfig(BaseModel):
+    """Container for all channel entries."""
+
+    channels: list[SerializeAsAny[ChannelConfigEntry]] = Field(default_factory=list)
+
+    @field_validator("channels", mode="before")
+    @classmethod
+    def _resolve_channel_entries(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, tuple):
+            value = list(value)
+        if not isinstance(value, list):
+            return value
+
+        from opensquilla.channels.registry import parse_channel_entry
+
+        return [parse_channel_entry(item) for item in value]
+
+
+class AgentSubagentDefaults(BaseModel):
+    """Per-agent subagent governance defaults.
+
+    All fields are optional. ``None`` means "unset"; downstream code falls
+    back to ``GatewayConfig.agents_defaults.subagents`` and then to "preserve
+    current behavior". Only ``cascade_on_parent_kill`` has a non-None default
+    because killing children is the safer behavior when in doubt.
+    """
+
+    model: str | None = None
+    """Default LLM model for subagents spawned under this agent. ``None`` →
+    fall back to caller's model (current behavior)."""
+
+    max_children_per_session: int | None = None
+    """Max active children one parent session can hold. ``None`` → no
+    enforcement (current behavior)."""
+
+    allow_agents: list[str] | None = None
+    """Cross-agent spawn allowlist. ``None`` = unset (current behavior); ``[]``
+    = self only; ``["*"]`` = any. Other values are exact agent_id matches."""
+
+    cascade_on_parent_kill: bool = True
+    """When ``True``, killing a parent session also cancels its descendants."""
+
+
+class AgentRoutingConfig(BaseModel):
+    """Per-agent router tier overrides for a durable agent profile.
+
+    Both fields are optional and default to ``None`` ("unset"). Tier strings are
+    canonicalized to ``c0``–``c3`` exactly the way :class:`SquillaRouterConfig`
+    normalizes its ``default_tier``: legacy ``t0``–``t3`` aliases and a leading
+    ``tier:`` prefix are accepted, and an unrecognized value is kept verbatim
+    (normalize-or-keep). This matches every other tier-accepting surface in the
+    codebase (``SquillaRouterConfig``, ``engine/routing/policy.py``) rather than
+    inventing a stricter rejection path the rest of the codebase lacks.
+
+    Ordering between ``default_tier`` and ``max_tier`` is intentionally NOT
+    enforced: ``SquillaRouterConfig`` enforces no analogous ceiling constraint,
+    so this block mirrors that rigor. The block is additive schema only — no
+    consumer reads it yet, so it does not change routing behavior for any
+    existing config. Wiring ``max_tier`` as a routing ceiling / ``default_tier``
+    as a per-agent starting tier is a documented follow-up.
+    """
+
+    default_tier: str | None = None
+    """Preferred starting tier for turns run under this agent. ``None`` → unset;
+    routing falls back to ``squilla_router.default_tier`` (current behavior)."""
+
+    max_tier: str | None = None
+    """Ceiling tier this agent's turns may be routed to. ``None`` → unset; no
+    per-agent ceiling is applied (current behavior)."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_tiers(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        values = dict(values)
+        for key in ("default_tier", "max_tier"):
+            raw = values.get(key)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if text[:5].lower() == "tier:":
+                text = text[5:]
+            values[key] = normalize_text_tier(text) or raw
+        return values
+
+
+class AgentEntryConfig(BaseModel):
+    """Gateway config entry for a durable, user-managed agent."""
+
+    id: str
+    name: str | None = None
+    description: str | None = None
+    model: str | None = None
+    workspace: str | None = None
+    agent_dir: str | None = None
+    tools: dict[str, Any] | list[str] | str | None = None
+    enabled: bool = True
+    system_prompt: str | None = None
+    subagents: AgentSubagentDefaults | None = None
+    routing: AgentRoutingConfig | None = None
+    """Additive per-agent tier overrides. ``None`` → unset (nothing persisted;
+    current routing behavior preserved)."""
+
+    @field_validator("id")
+    @classmethod
+    def _normalize_id(cls, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("agent id must be non-empty")
+        from opensquilla.session.keys import normalize_agent_id
+
+        return normalize_agent_id(raw)
+
+
+class AgentDefaults(BaseModel):
+    """Global fallback defaults applied when an agent does not override."""
+
+    subagents: AgentSubagentDefaults | None = None
+
+
+class SubagentsGatewayConfig(BaseModel):
+    """Gateway-level subagent governance knobs."""
+
+    enforce_disabled_agents: bool = False
+    """When True, ``sessions_spawn`` rejects requests targeting an agent whose
+    ``enabled=False``. Default off so existing deployments are unaffected."""
+
+    subagent_reserved_slots: int = Field(default=2, ge=0)
+    """Number of slots in ``task_runtime.max_concurrency`` reserved for
+    non-subagent tasks so a fan-out parent never starves itself."""
+
+    archive_after_minutes: int = Field(default=60, ge=0)
+    """Minutes after a subagent session goes terminal before its transcript
+    is archived. ``0`` disables auto-archive."""
+
+    prompt_compact: bool = False
+    """When enabled, subagent bootstrap prompts keep only AGENTS.md and TOOLS.md."""
+
+
+class MetaSkillPersistenceConfig(BaseSettings):
+    """Persistence/audit ledger for meta-skill executions (G4)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_META_SKILL_PERSISTENCE_",
+        extra="forbid",
+    )
+    enabled: bool = True
+    orphan_cleanup_age_seconds: int = 3600
+    # Per-DAG memory persist: when False the orchestrator skips any step
+    # whose ``skill`` is "memory" (the conventional last-step pattern that
+    # archives DAG output to memory/*.md). Defaults to True to preserve
+    # existing behaviour. Toggle off for exploratory runs where polluting
+    # the long-term memory store is undesirable.
+    memory_persist_enabled: bool = True
+
+
+class MetaSkillAutoProposeConfig(BaseSettings):
+    """Unattended synthesis: drive meta-skill-creator from co-occurrence
+    patterns observed in ``~/.opensquilla/logs/decisions-*.jsonl``.
+
+    Two independent triggers feed the same library function
+    (``skills.creator.auto_propose``):
+      * ``enabled`` schedules a recurring cron job
+      * ``on_dream_complete`` piggybacks on memory-consolidation dreams
+
+    Both default off. Operators flip them on after reviewing
+    meta-skill-creator's gated output once.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_META_SKILL_AUTO_PROPOSE_",
+        extra="forbid",
+    )
+
+    enabled: bool = False
+    """Path 1: schedule the auto-propose cron job. When false no
+    handler is registered at all (zero-impact code path)."""
+
+    cron: str = "0 5 * * *"
+    """Cron expression (5-field, local time) for the scheduled job."""
+
+    window_days: int = Field(default=30, ge=1, le=365)
+    """How many days of decision-log history to aggregate."""
+
+    min_freq: int = Field(default=3, ge=1)
+    """Drop co-occurrence chains observed fewer than this many times."""
+
+    top_k: int = Field(default=5, ge=1, le=50)
+    """At most this many distinct patterns considered per fire."""
+
+    on_dream_complete: bool = False
+    """Path 2: also run after a successful memory-consolidation dream.
+    Independent of ``enabled`` — either, both, or neither may be on."""
+
+    auto_enable: bool = False
+    """When true, eligible low-risk proposals are promoted to MANAGED
+    automatically after the creator gates pass. Defaults off."""
+
+    auto_enable_max_risk: Literal["low", "medium", "high"] = "low"
+    """Highest deterministic risk class that unattended promotion may accept."""
+
+    agent_ids: list[str] = Field(default_factory=list)
+    """Restrict to these agent IDs; empty = all configured agents."""
+
+
+class MetaSkillConfig(BaseSettings):
+    """Top-level meta-skill subsystem configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_META_SKILL_",
+        env_nested_delimiter="__",
+        extra="forbid",
+    )
+    enabled: bool = True
+    auto_trigger: bool = False
+    """When False (default), meta-skills are manual-only: no prompt guidance, no
+    keyword/semantic auto-trigger, ``meta_invoke`` is not exposed for automatic
+    invocation, and meta-skills are hidden from ``<available_skills>``. They run
+    only via the explicit ``/meta`` command. Set True to restore automatic
+    activation."""
+    persistence: MetaSkillPersistenceConfig = Field(
+        default_factory=MetaSkillPersistenceConfig,
+    )
+    auto_propose: MetaSkillAutoProposeConfig = Field(
+        default_factory=MetaSkillAutoProposeConfig,
+    )
+
+
+class TlsConfig(BaseSettings):
+    """Optional TLS termination at the gateway itself.
+
+    When ``keyfile`` and ``certfile`` are set, ``run_gateway`` passes
+    ``ssl_keyfile`` / ``ssl_certfile`` to uvicorn so the gateway speaks
+    HTTPS / WSS on its bound port. Disabled by default — gateways
+    behind a reverse proxy (nginx + LetsEncrypt) keep using plain HTTP.
+
+    Self-signed certs are fine for IP-based access (browser prints a
+    one-time "not trusted" warning); for a real CA-signed cert wire
+    via the same fields.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_TLS_",
+        extra="forbid",
+    )
+    keyfile: str = ""
+    certfile: str = ""
+
+
+class LlmProviderProfile(BaseModel):
+    """Named credential profile for a non-primary LLM provider.
+
+    Written as ``[llm_profiles.<provider_id>]`` in the config TOML and
+    referenced by router tiers through their existing ``provider`` field.
+    Resolution order per field matches the primary provider: explicit value,
+    then ``api_key_env_pool`` (when non-empty), then ``api_key_env`` (or the
+    registry env key), then the registry default base URL.
+    """
+
+    # Profiles are config records, not independent settings roots.  Reading
+    # process variables here would give every profile the same unscoped
+    # ``API_KEY`` / ``API_KEY_ENV`` values whenever a field is absent (for
+    # example after an explicit credential clear).  Named environment sources
+    # are resolved deliberately by provider.deployment instead.
+    model_config = ConfigDict(extra="ignore")
+
+    # Remember the provider-scoped direct/fallback model while this deployment
+    # is not primary.  Older configs omit it and continue to resolve the
+    # provider catalog default; older binaries ignore this additive field.
+    model: str = ""
+    api_key: str = ""
+    api_key_env: str = ""
+    # Rotation pool of env-var NAMES (never key values) for this profile,
+    # e.g. ["OPENAI_KEY_A", "OPENAI_KEY_B"]. Resolved from the environment at
+    # runtime; secrets are never persisted or logged. Profiles-only this
+    # cycle: the top-level [llm] model must NOT gain this field — [llm] is
+    # extra="forbid", so a stamped default would brick downgrade to 0.5.0rc1,
+    # while this profile model is extra="ignore" and rc1 tolerates the field
+    # on load (rc1's first persist silently strips it; release-noted).
+    api_key_env_pool: list[str] = Field(default_factory=list)
+    base_url: str = ""
+    proxy: str = ""
+
+
+class ModelCatalogConfig(BaseSettings):
+    """Model metadata catalog behavior (offline-first).
+
+    Schema-first landing: these knobs are validated and persisted now; the
+    provider layer consumes them in a follow-up change. ``refresh`` controls
+    whether the gateway may fetch model *metadata* (context windows, output
+    caps, pricing, capability flags) from the network at all. The default
+    ``"off"`` keeps every install fully offline — metadata resolves from
+    bundled/registry defaults, an optional ``pin_path`` file, and per-model
+    ``[models.*]`` overrides. Today's OpenRouter live model-list fetch is a
+    separate, existing mechanism that this flag does not govern yet.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_MODEL_CATALOG_")
+
+    # "off" = never fetch model metadata (offline-first default);
+    # "startup" = allow one refresh when the gateway boots.
+    refresh: Literal["off", "startup"] = "off"
+    # Local JSON/TOML catalog override file for air-gapped deploys. Validated
+    # only as a string here; existence/shape checks happen when the catalog
+    # wiring consumes it.
+    pin_path: str = ""
+    # Advisory age threshold (days) for doctor warnings about stale pinned or
+    # cached model metadata. Never blocks a turn.
+    stale_after_days: int = Field(default=45, ge=1)
+
+
+# Known provider reasoning-format dialects accepted by
+# ``ModelOverrideConfig.reasoning_format``. Deliberately a conservative
+# literal rather than an import: the canonical dialect registry may land in
+# a parallel branch, and this set must stay valid either way. Fold it into
+# the registry (and keep the names identical) once that lands.
+KNOWN_REASONING_FORMATS: frozenset[str] = frozenset(
+    {
+        "openrouter",
+        "openai",
+        "deepseek",
+        "gemini",
+        "zai",
+        "dashscope",
+        "moonshot",
+        "volcengine",
+        "none",
+    }
+)
+
+
+class ModelOverrideConfig(BaseModel):
+    """Per-model metadata override, written as ``[models.<provider_id>."<model_id>"]``.
+
+    Every field is optional; ``None`` means "no override" and the value keeps
+    resolving from the model catalog / provider registry as before. Model ids
+    are matched *exactly* (TOML quoted keys carry dots and slashes verbatim).
+    Globs are deliberately not supported in user config: exact ids keep
+    override semantics unambiguous, and the shipped catalog corrections layer
+    owns pattern matching. Keys are not screened for glob-looking syntax
+    either — a key that matches no model is simply inert, and rejecting
+    characters here could break unusual but legitimate model ids.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    context_window: int | None = Field(default=None, ge=1)
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    reasoning_format: str | None = None
+    supports_reasoning: bool | None = None
+    supports_tools: bool | None = None
+    supports_vision: bool | None = None
+    input_cost_per_mtok: float | None = Field(default=None, ge=0)
+    output_cost_per_mtok: float | None = Field(default=None, ge=0)
+    cache_read_cost_per_mtok: float | None = Field(default=None, ge=0)
+    cache_write_cost_per_mtok: float | None = Field(default=None, ge=0)
+    thinking_level_map: dict[str, str] | None = None
+
+    @field_validator("reasoning_format")
+    @classmethod
+    def _validate_reasoning_format(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in KNOWN_REASONING_FORMATS:
+            allowed = ", ".join(sorted(KNOWN_REASONING_FORMATS))
+            raise ValueError(
+                f"reasoning_format {value!r} is not a known dialect; "
+                f"expected one of {allowed}"
+            )
+        return normalized
+
+
+class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
+    """Env-backed settings source that never yields ``config_version``.
+
+    ``config_version`` is the migration stamp owned by the config payload:
+    ``migrate_config_payload`` injects it at every disk-load boundary, and
+    injected payload keys already outrank environment values. This wrapper
+    closes the remaining gap — bare ``GatewayConfig()`` constructions with no
+    payload at all (e.g. the no-file default branch of ``GatewayConfig.load``
+    and ``config_store.load_config``) — so
+    ``OPENSQUILLA_GATEWAY_CONFIG_VERSION`` can never gate or skip migrations.
+    Only this one key is filtered; every other env override is untouched.
+    """
+
+    def __init__(self, inner: PydanticBaseSettingsSource) -> None:
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = dict(self._inner())
+        values.pop("config_version", None)
+        return values
+
+
+class GatewayConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_GATEWAY_",
+        env_nested_delimiter="__",
+    )
+
+    tls: TlsConfig = Field(default_factory=TlsConfig)
+
+    # bind defaults to 127.0.0.1 (loopback only).
+    # OPENSQUILLA_LISTEN is recognised as a short-name env alias for ``host``
+    # alongside the canonical OPENSQUILLA_GATEWAY_HOST; resolution is performed
+    # by ``resolve_listen_address`` below at the CLI boundary so the
+    # precedence order (explicit kwarg/flag > OPENSQUILLA_LISTEN > OPENSQUILLA_GATEWAY_HOST
+    # > default) is testable without the pydantic-settings env cache.
+    host: str = "127.0.0.1"
+    port: int = 18791
+    # Resolved from installed distribution metadata (opensquilla.__version__),
+    # not operator config. UI/RPC surfaces read __version__ directly, so any
+    # stale value persisted in config.toml has no display effect.
+    version: str = __version__
+    debug: bool = False
+    log_file_enabled: bool = True
+    log_level: str = "DEBUG"
+    log_file_max_bytes: int = Field(default=5_000_000, ge=0)
+    log_file_backup_count: int = Field(default=3, ge=0)
+    workspace_dir: str | None = Field(
+        default_factory=lambda: str(default_opensquilla_home() / "workspace")
+    )
+    workspace_strict: bool | None = None
+    bootstrap_max_chars: int = Field(default=20_000, ge=1)
+    bootstrap_total_max_chars: int = Field(default=50_000, ge=1)
+
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+    cors: CorsConfig = Field(default_factory=CorsConfig)
+    attachments: AttachmentsConfig = Field(default_factory=AttachmentsConfig)
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
+    task_runtime: TaskRuntimeConfig = Field(default_factory=TaskRuntimeConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    llm: LlmProviderConfig = Field(default_factory=LlmProviderConfig)
+    # Credential profiles for non-primary providers, keyed by registry
+    # provider id; consumed by cross-provider router tiers.
+    llm_profiles: dict[str, LlmProviderProfile] = Field(default_factory=dict)
+    llm_ensemble: LlmEnsembleConfig = Field(default_factory=LlmEnsembleConfig)
+    # Model metadata catalog behavior (offline-first; see ModelCatalogConfig).
+    model_catalog: ModelCatalogConfig = Field(default_factory=ModelCatalogConfig)
+    # Per-model metadata overrides keyed [models.<provider_id>."<model_id>"].
+    # Exact model ids only (quoted TOML keys); see ModelOverrideConfig.
+    models: dict[str, dict[str, ModelOverrideConfig]] = Field(default_factory=dict)
+    prompt_cache: PromptCacheConfig = Field(default_factory=PromptCacheConfig)
+    safety: SafetyConfig = Field(default_factory=SafetyConfig)
+    prompt: PromptConfig = Field(default_factory=PromptConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    squilla_router: SquillaRouterConfig = Field(default_factory=SquillaRouterConfig)
+    agent_token_saving: AgentTokenSavingConfig = Field(default_factory=AgentTokenSavingConfig)
+    compaction: CompactionLlmConfig = Field(default_factory=CompactionLlmConfig)
+    naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
+    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
+    audio: AudioConfig = Field(default_factory=AudioConfig)
+    keepalive: KeepaliveConfig = Field(default_factory=KeepaliveConfig)
+    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
+    channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+    agents: list[AgentEntryConfig] = Field(default_factory=list)
+    agents_defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    subagents: SubagentsGatewayConfig = Field(default_factory=SubagentsGatewayConfig)
+    meta_skill: MetaSkillConfig = Field(default_factory=MetaSkillConfig)
+
+    # Component enable flags
+    control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
+    privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
+    diagnostics_enabled: bool = False
+    channel_admin_senders: dict[str, list[str]] = Field(default_factory=dict)
+
+    @property
+    def effective_run_mode(self) -> str:
+        """Return the canonical sandbox run mode for this validated config."""
+
+        from opensquilla.sandbox.run_mode import config_run_mode
+
+        return config_run_mode(self).value
+
+    def _resolve_image_generation_llm_runtime(self) -> object:
+        """Expose primary LLM resolution through a provider-safe capability."""
+
+        from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+
+        return resolve_llm_runtime_config(self)
+
+    def _acquire_image_generation_profile_credential(
+        self,
+        provider_id: str,
+        env_pool: list[str],
+        session_key: str,
+    ) -> object | None:
+        """Acquire from the shared profile pool without provider back-imports."""
+
+        from opensquilla.gateway.llm_runtime import profile_credential_pools
+
+        return profile_credential_pools().acquire_for_session(
+            provider_id,
+            env_pool,
+            session_key,
+        )
+
+    def _report_image_generation_profile_credential_failure(
+        self,
+        provider_id: str,
+        session_key: str,
+        kind: object,
+        retry_after_seconds: float | None,
+    ) -> None:
+        """Report an Image request failure to the shared profile pool."""
+
+        from typing import cast
+
+        from opensquilla.gateway.llm_runtime import profile_credential_pools
+        from opensquilla.provider.failures import ProviderFailureKind
+
+        profile_credential_pools().report_failure(
+            provider_id,
+            session_key,
+            cast(ProviderFailureKind, kind),
+            retry_after_seconds=retry_after_seconds,
+        )
+
+    @model_validator(mode="after")
+    def _resolve_default_llm_provider(self) -> GatewayConfig:
+        """Resolve the built-in provider default for configs that never chose one.
+
+        The built-in default is tokenrhythm, but configs authored while
+        openrouter was the default may rely on it without naming a provider.
+        With ``llm.provider`` unset, openrouter intent is detected from
+        provider-coupled fields authored against the old default (an explicit
+        ``model``/``base_url``/``api_key``/``api_key_env``, or a persisted
+        ``squilla_router.tier_profile = "openrouter"``, which validation
+        requires to match the provider) or from the environment carrying only
+        the openrouter credential. Detected intent restores the full legacy
+        trio for whichever of provider/model/base_url is unset; the same
+        model/base_url backfill applies to an explicit ``provider =
+        "openrouter"``, whose unset fields meant the old defaults when they
+        were written. Runs before the router-profile validators so the
+        tier_profile match check sees the resolved provider.
+
+        Resolution never persists: it lands in the load-time sparse-persist
+        baseline, so saves keep the file provider-less and every boot
+        re-resolves against the then-current environment.
+        """
+        llm = self.llm
+        fields_set = set(getattr(llm, "model_fields_set", set()))
+        provider = str(llm.provider or "").strip().lower()
+        resolution = {
+            "status": "explicit",
+            "effective_provider": provider,
+            "source": "config",
+            "reason_code": "provider_explicit",
+            "action_required": False,
+            "action_recommended": False,
+        }
+        if "provider" not in fields_set:
+            profile = str(getattr(self.squilla_router, "tier_profile", "") or "")
+            router_fields_set = set(
+                getattr(self.squilla_router, "model_fields_set", set())
+            )
+            legacy_intent = bool(
+                {"model", "base_url", "api_key", "api_key_env"} & fields_set
+            ) or (
+                "tier_profile" in router_fields_set
+                and profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
+            )
+            credential_hints = {
+                hint
+                for hint in (
+                    credential_provider_hint(
+                        llm.api_key if "api_key" in fields_set else ""
+                    ),
+                    credential_provider_hint(
+                        "",
+                        api_key_env=(
+                            llm.api_key_env if "api_key_env" in fields_set else ""
+                        ),
+                    ),
+                )
+                if hint
+            }
+            origin_hint = endpoint_provider_hint(
+                llm.base_url if "base_url" in fields_set else ""
+            )
+            explicit_profile_hint = (
+                LEGACY_DEFAULT_LLM_PROVIDER
+                if "tier_profile" in router_fields_set
+                and profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
+                else ""
+            )
+            env_openrouter = bool(os.environ.get("OPENROUTER_API_KEY", "").strip())
+            env_tokenrhythm = bool(os.environ.get("TOKENRHYTHM_API_KEY", "").strip())
+            ambient_credential_hints = (
+                {
+                    hint
+                    for hint, available in (
+                        (LEGACY_DEFAULT_LLM_PROVIDER, env_openrouter),
+                        (TOKENRHYTHM_DEFAULT_LLM_PROVIDER, env_tokenrhythm),
+                    )
+                    if available
+                }
+                if not ({"api_key", "api_key_env"} & fields_set)
+                else set()
+            )
+            strong_hints = {
+                hint
+                for hint in (
+                    *credential_hints,
+                    *ambient_credential_hints,
+                    origin_hint,
+                    explicit_profile_hint,
+                )
+                if hint
+            }
+            if strong_hints == {TOKENRHYTHM_DEFAULT_LLM_PROVIDER}:
+                provider = TOKENRHYTHM_DEFAULT_LLM_PROVIDER
+                resolution = {
+                    "status": "recovered",
+                    "effective_provider": provider,
+                    "source": "strong_evidence",
+                    "reason_code": "providerless_tokenrhythm_recovered",
+                    "action_required": False,
+                    "action_recommended": True,
+                }
+            elif len(strong_hints) > 1:
+                provider = LEGACY_DEFAULT_LLM_PROVIDER
+                resolution = {
+                    "status": "conflict",
+                    "effective_provider": "",
+                    "source": "conflicting_evidence",
+                    "reason_code": "providerless_provider_conflict",
+                    "action_required": True,
+                    "action_recommended": True,
+                }
+            elif legacy_intent or (env_openrouter and not env_tokenrhythm):
+                provider = LEGACY_DEFAULT_LLM_PROVIDER
+                explicit_openrouter = (
+                    strong_hints == {LEGACY_DEFAULT_LLM_PROVIDER}
+                    or (env_openrouter and not env_tokenrhythm and not legacy_intent)
+                )
+                resolution = {
+                    "status": "legacy_inferred",
+                    "effective_provider": provider,
+                    "source": (
+                        "strong_evidence" if explicit_openrouter else "legacy_compat"
+                    ),
+                    "reason_code": (
+                        "providerless_openrouter_evidence"
+                        if explicit_openrouter
+                        else "providerless_ambiguous_legacy_openrouter"
+                    ),
+                    "action_required": False,
+                    "action_recommended": not explicit_openrouter,
+                }
+            else:
+                resolution = {
+                    "status": "default",
+                    "effective_provider": provider,
+                    "source": "built_in_default",
+                    "reason_code": "provider_unset_default_tokenrhythm",
+                    "action_required": False,
+                    "action_recommended": False,
+                }
+        self._provider_resolution = resolution
+        if provider != LEGACY_DEFAULT_LLM_PROVIDER:
+            return self
+        payload = llm.model_dump(mode="python")
+        payload["provider"] = LEGACY_DEFAULT_LLM_PROVIDER
+        if "model" not in fields_set:
+            payload["model"] = LEGACY_DEFAULT_LLM_MODEL
+        if "base_url" not in fields_set:
+            payload["base_url"] = LEGACY_DEFAULT_LLM_BASE_URL
+        if payload != llm.model_dump(mode="python"):
+            self.llm = LlmProviderConfig(**payload)
+            # The rebuild marks every field explicitly set; restore the
+            # operator's actual field provenance so fresh-install detection
+            # (e.g. onboard's keep-current router gate) still sees a config
+            # that never chose these values.
+            object.__setattr__(self.llm, "__pydantic_fields_set__", fields_set)
+        return self
+
+    @model_validator(mode="after")
+    def _default_squilla_router_profile_for_direct_provider(self) -> GatewayConfig:
+        router = self.squilla_router
+        if not router or not getattr(router, "enabled", False):
+            return self
+        # An explicit custom binding is an operator ownership boundary.  Do
+        # not turn a sparse custom ladder into a provider preset at load time.
+        if getattr(router, "preset_binding", None) == "custom":
+            return self
+        if getattr(router, "tier_profile", None):
+            return self
+        provider = str(getattr(self.llm, "provider", "") or "").strip().lower()
+        # Boot auto-default: persistable packaged profiles write the compact
+        # tier_profile form; curated-inline presets (e.g. tokenrhythm) apply
+        # their ladder as inline tiers because their ids must never persist
+        # as a tier_profile (downgrade contract). Synthesized presets are
+        # applied by onboarding/provider saves only, never at boot.
+        if provider == "openrouter":
+            return self
+        curated_inline_preset = None
+        if provider not in ROUTER_TIER_PROFILE_IDS:
+            preset = get_preset(provider)
+            if preset is None or preset.synthesized or preset.persistable:
+                return self
+            curated_inline_preset = preset
+        fields_set = set(getattr(router, "model_fields_set", set()))
+        has_custom_tiers = (
+            "tiers" in fields_set and getattr(router, "tiers", {}) != _default_tiers()
+        )
+        if "tier_profile" in fields_set or has_custom_tiers:
+            return self
+        payload = router.model_dump(mode="python")
+        if curated_inline_preset is None:
+            payload["tier_profile"] = provider
+            payload.pop("tiers", None)
+            self.squilla_router = SquillaRouterConfig(**payload)
+            return self
+        payload["tier_profile"] = None
+        payload["tiers"] = curated_inline_preset.tier_defaults()
+        self.squilla_router = SquillaRouterConfig(**payload)
+        # The rebuild marks every field explicitly set; restore the original
+        # provenance so the seeded ladder stays in-memory only (the load-time
+        # sparse-persist baseline keeps it out of config.toml) and a fresh
+        # default config still reads as one (onboard's keep-current router
+        # gate and custom-tiers detection rely on it).
+        object.__setattr__(self.squilla_router, "__pydantic_fields_set__", fields_set)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_squilla_router_tier_profile_provider(self) -> GatewayConfig:
+        profile = getattr(self.squilla_router, "tier_profile", None)
+        if not profile:
+            return self
+        provider = str(getattr(self.llm, "provider", "") or "").strip().lower()
+        normalized_profile = str(profile).strip().lower()
+        if provider != normalized_profile:
+            # An atomic primary/profile swap deliberately leaves the router's
+            # preset and switches untouched while demoting its old provider
+            # into llm_profiles. That is a valid mixed-provider deployment:
+            # keep rejecting stale mismatches unless the profile provider has
+            # an actual stored deployment to execute against.
+            has_profile_deployment = any(
+                str(key or "").strip().lower() == normalized_profile
+                for key in (getattr(self, "llm_profiles", None) or {})
+            )
+            if has_profile_deployment:
+                return self
+            raise ValueError(
+                "squilla_router.tier_profile requires llm.provider to match "
+                f"({normalized_profile!r} != {provider!r})"
+            )
+        return self
+
+    # --- Context overflow policy -----------------------------------------
+    # Budget and policy consulted in gateway/rpc_chat.py before dispatching
+    # a turn. ``context_budget_tokens`` is a soft cap: when an estimated
+    # turn payload exceeds this, the policy branch fires.
+    context_budget_tokens: int = 100_000
+    context_overflow_policy: ContextOverflowPolicy = ContextOverflowPolicy.AUTO_SUMMARIZE
+    preflight_compact_ratio: float = Field(default=0.85, gt=0.0, le=1.0)
+
+    # Agent runtime timeout (whole turn lifecycle). ``None`` means use the
+    # long built-in runtime default; ``0`` disables the runtime budget.
+    agent_runtime_timeout_seconds: float | None = None
+    # Optional safety cap for ordinary interactive Web chat turns. Coding and
+    # meta turns retain the regular agent runtime budget. Disabled by default;
+    # an explicit TurnRunner timeout still has priority when the cap is enabled.
+    web_chat_runtime_timeout_seconds: float = Field(default=0.0, ge=0.0)
+    # Per-iteration timeout: one LLM call + its tool executions. ``None``
+    # means use the AgentConfig default.
+    agent_iteration_timeout_seconds: float | None = None
+    # Per-tool execution timeout. ``None`` means use the AgentConfig default.
+    agent_tool_timeout_seconds: float | None = None
+    # Per-turn override for the single LLM HTTP/streaming request timeout.
+    # ``None`` defers to ``llm_request_timeout_seconds`` so existing
+    # deployments keep their tuned value.
+    agent_request_timeout_seconds: float | None = None
+    # Maximum provider-level retries for transient errors. ``None`` means
+    # use the AgentConfig default.
+    agent_max_provider_retries: int | None = None
+    # Agent model/tool loop budget for a single turn. 0 disables this cap.
+    agent_max_iterations: int = Field(default=0, ge=0)
+    # Source diff preservation protects already-mutated source files from
+    # high-confidence destructive git restore/checkout/reset/clean commands.
+    source_diff_preservation_mode: Literal["off", "log", "block"] = "log"
+    # Source diff candidate ledger records recoverable source edit patches and
+    # can surface lost candidate ids in final-diff recovery diagnostics.
+    source_diff_candidate_mode: Literal["off", "log", "warn_model"] = "log"
+    # Runtime state capsule is an opt-in provider-visible factual summary for
+    # coding turns. ``log`` records telemetry only; ``inject`` adds it to the
+    # provider request view.
+    runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"
+    # Text-only tool recovery is an opt-in guard for tool-capable turns where
+    # a model emits prose instead of a tool call.
+    text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "off"
+    # Provider request timeout (single LLM HTTP/streaming request).
+    llm_request_timeout_seconds: float = 120.0
+    # Agent stream liveness events. The heartbeat interval only affects
+    # non-persistent UI/CLI feedback while a turn is still active; the idle
+    # timeout remains the real upstream stall detector.
+    agent_stream_heartbeat_interval_seconds: float = 15.0
+    agent_stream_idle_timeout_seconds: float = 600.0
+    # Browser-side fallback grace. Keep this above the gateway stream idle
+    # timeout so server terminal errors arrive before the WebUI local fallback.
+    webui_stream_idle_grace_seconds: float = 630.0
+    # Maximum time the WebUI WebSocket may sit silent before the gateway
+    # closes it with code 1011 and emits ``gateway.client_ws_keepalive_timeout``.
+    # ``0`` disables the keepalive deadline entirely (legacy behaviour).
+    # Sleeping browsers commonly stop sending pings; without this knob the
+    # server retains half-open connections after suspend.
+    client_ws_keepalive_timeout_s: float = 120.0
+    # WebSocket per-connection outbound writer queue. When enabled, every connection gets a
+    # bounded asyncio.Queue + dedicated writer task; producers enqueue and
+    # return immediately. Slow clients trigger a fast 1011 close instead of
+    # back-pressuring the turn pipeline. Kill switch is read at connection
+    # registration time only — affects new connections only; existing
+    # connections retain their startup-time behavior.
+    ws_writer_queue_enabled: bool = True
+    # Per-connection outbox depth. 512 is ~17s of buffered text_delta at
+    # 30 Hz, comfortably within the SessionStreamRegistry replay window
+    # (max_events_per_session=500). Minimum 16 to avoid pathological
+    # configurations that can never enqueue.
+    ws_writer_queue_maxsize: int = Field(default=512, ge=16)
+    # Legacy alias for the old runtime timeout setting. Kept so existing
+    # configs that set llm_timeout_seconds still affect the agent runtime
+    # budget until operators move to agent_runtime_timeout_seconds.
+    llm_timeout_seconds: float | None = None
+
+    # Search
+    search_provider: str = "duckduckgo"
+    search_api_key: str = ""
+    search_api_key_env: str = ""
+    search_max_results: int = Field(
+        default=DEFAULT_SEARCH_MAX_RESULTS, ge=1, le=MAX_SEARCH_RESULTS
+    )
+    search_proxy: str = ""
+    search_use_env_proxy: bool = False
+    search_fallback_policy: Literal["off", "network"] = "off"
+    search_diagnostics: bool = False
+
+    # State/config paths
+    state_dir: str | None = Field(default_factory=lambda: str(default_opensquilla_home() / "state"))
+    config_path: str | None = None
+
+    # Config schema migration stamp. Owned by migrate_config_payload
+    # (gateway/config_migration.py), which injects LATEST_CONFIG_VERSION into
+    # every payload it returns so version-gated one-time migrations run
+    # exactly once per config file. Must stay optional with a default: a bare
+    # GatewayConfig() is constructed throughout the codebase.
+    config_version: int = LATEST_CONFIG_VERSION
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Default source order, with env-backed sources filtered so
+        # OPENSQUILLA_GATEWAY_CONFIG_VERSION can never populate the migration
+        # stamp — see _EnvWithoutConfigVersion for the full rationale.
+        return (
+            init_settings,
+            _EnvWithoutConfigVersion(env_settings),
+            _EnvWithoutConfigVersion(dotenv_settings),
+            file_secret_settings,
+        )
+
+    def model_post_init(self, __context: Any) -> None:
+        self._apply_concurrency_env_overrides()
+
+    def _apply_concurrency_env_overrides(self) -> None:
+        """Apply task/channel concurrency environment overrides.
+
+        Invalid (non-integer) values fall back to the config default with a warning log.
+        """
+        import logging
+
+        _log = logging.getLogger(__name__)
+
+        task_env = os.environ.get("OPENSQUILLA_TASK_MAX_CONCURRENCY")
+        if task_env is not None:
+            try:
+                task_val = int(task_env)
+            except (ValueError, TypeError):
+                _log.warning(
+                    "OPENSQUILLA_TASK_MAX_CONCURRENCY=%r is not a valid integer; "
+                    "falling back to default max_concurrency=%d",
+                    task_env,
+                    self.task_runtime.max_concurrency,
+                )
+            else:
+                if task_val < 1:
+                    _log.warning(
+                        "OPENSQUILLA_TASK_MAX_CONCURRENCY=%r is below minimum 1; "
+                        "falling back to default max_concurrency=%d",
+                        task_env,
+                        self.task_runtime.max_concurrency,
+                    )
+                else:
+                    self.task_runtime.max_concurrency = task_val
+
+        channel_env = os.environ.get("OPENSQUILLA_CHANNEL_INFLIGHT_CAP")
+        if channel_env is not None:
+            try:
+                channel_val = int(channel_env)
+            except (ValueError, TypeError):
+                _log.warning(
+                    "OPENSQUILLA_CHANNEL_INFLIGHT_CAP=%r is not a valid integer; "
+                    "falling back to default channel_inflight_cap=%d",
+                    channel_env,
+                    self.task_runtime.channel_inflight_cap,
+                )
+            else:
+                if channel_val < 1:
+                    _log.warning(
+                        "OPENSQUILLA_CHANNEL_INFLIGHT_CAP=%r is below minimum 1; "
                         "falling back to default channel_inflight_cap=%d",
                         channel_env,
                         self.task_runtime.channel_inflight_cap,
