@@ -87,6 +87,32 @@ async def test_launch_turn_sentinel_tolerates_surrounding_whitespace() -> None:
 
 
 @pytest.mark.asyncio
+async def test_launch_turn_accepts_a_concrete_request_after_the_skill_name() -> None:
+    pending_meta_launch_put("S-request", "meta-tiny")
+
+    ctx = _make_ctx(
+        "S-request",
+        "/meta meta-tiny create a competitor research meta-skill",
+    )
+    await meta_command_launch(ctx)
+
+    assert ctx.metadata["meta_launch"] == {"name": "meta-tiny"}
+    assert pending_meta_launch_peek("S-request") is None
+
+
+@pytest.mark.asyncio
+async def test_launch_turn_rejects_a_skill_name_prefix_collision() -> None:
+    pending_meta_launch_put("S-prefix", "meta-tiny")
+
+    ctx = _make_ctx("S-prefix", "/meta meta-tiny-extra create something")
+    await meta_command_launch(ctx)
+
+    assert "meta_launch" not in ctx.metadata
+    assert pending_meta_launch_peek("S-prefix") == "meta-tiny"
+    pending_meta_launch_pop("S-prefix")
+
+
+@pytest.mark.asyncio
 async def test_meta_command_launch_no_pending_is_noop() -> None:
     # Ensure no residual entry for this session.
     pending_meta_launch_pop("S-empty")
