@@ -571,8 +571,7 @@ _COMMANDS: tuple[CommandDef, ...] = (
     CommandDef(
         name="/goal",
         usage="/goal [status|clear|pause|resume|<description>]",
-        description="Set a long-running goal; the agent keeps working toward it "
-                    "turn after turn until complete or blocked.",
+        description="Set a long-running goal for the agent to pursue.",
         execution={
             _T: _local("goal.set"),
             _W: _local("goal.set"),
