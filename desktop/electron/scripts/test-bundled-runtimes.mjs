@@ -34,17 +34,17 @@ try {
   )
   assert.deepEqual(
     tarExtractArgs(
-      String.raw`D:\a\opensquilla\.runtime-cache\python.tar.gz`,
-      String.raw`D:\a\opensquilla\runtime\python.staging`,
+      String.raw`Z:\fixture\.runtime-cache\python.tar.gz`,
+      String.raw`Z:\fixture\runtime\python.staging`,
       1,
       'win32',
     ),
     [
       '--force-local',
       '-xf',
-      String.raw`D:\a\opensquilla\.runtime-cache\python.tar.gz`,
+      String.raw`Z:\fixture\.runtime-cache\python.tar.gz`,
       '-C',
-      String.raw`D:\a\opensquilla\runtime\python.staging`,
+      String.raw`Z:\fixture\runtime\python.staging`,
       '--strip-components=1',
     ],
     'GNU tar must treat Windows drive-letter paths as local archives',
