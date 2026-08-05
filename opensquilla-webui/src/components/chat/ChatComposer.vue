@@ -72,6 +72,7 @@
             :aria-label="t('chat.messageToSend')"
             :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
             @beforeinput="emit('expand'); emit('beforeinput', $event)"
+            @paste="onTextareaPaste"
             @input="emit('input', $event)"
             @keydown="emit('keydown', $event)"
             @compositionstart="emit('compositionChange', true)"
@@ -474,6 +475,23 @@ const { t } = useI18n()
 const inputText = defineModel<string>({ required: true })
 const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
+
+function onTextareaPaste() {
+  // vModelText skips model updates while the element's internal IME
+  // composition flag is set (`if (e.target.composing) return` in
+  // @vue/runtime-dom). On Windows a paste can land while that flag is stale
+  // after a composition round-trip, leaving the model — and the send
+  // button's readiness — out of sync with what the textarea displays.
+  // Force the model to follow the DOM value after every paste; this is a
+  // no-op whenever v-model already picked up the change.
+  nextTick(() => {
+    const field = textareaEl.value
+    if (field && inputText.value !== field.value) {
+      inputText.value = field.value
+    }
+  })
+}
+
 const fileInputEl = ref<HTMLInputElement | null>(null)
 const addMenuOpen = ref(false)
 const modelRoutingOpen = ref(false)
