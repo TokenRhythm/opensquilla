@@ -3191,11 +3191,11 @@ class TaskRuntime:
             )
 
     async def _emit_plan_run(self, session_key: str, run: Any) -> None:
-        from opensquilla.session.plans import plan_run_snapshot
+        from opensquilla.session.plans import plan_run_event_name, plan_run_snapshot
 
         await self._emit(
             session_key,
-            "session.event.plan_run",
+            plan_run_event_name(run),
             {
                 "session_key": session_key,
                 "plan_run": plan_run_snapshot(run),
@@ -3203,6 +3203,18 @@ class TaskRuntime:
         )
 
     async def _emit_plan_revision_if_changed(self, task: _RuntimeTask) -> None:
+        # Goal runs use a private single-step plan revision only to reuse the
+        # durable execution machinery. Publishing that revision through the
+        # generic plan event would make Plan mode render the goal as a user
+        # authored plan (and leave a stale plan card after the goal finishes).
+        runtime_services = getattr(task.envelope, "runtime_services", {}) or {}
+        attached_plan_run = (
+            runtime_services.get("plan_run")
+            if isinstance(runtime_services, dict)
+            else None
+        )
+        if str(getattr(attached_plan_run, "driver_kind", "") or "") == "goal":
+            return
         getter = getattr(self._storage, "get_session", None)
         get_revision = getattr(self._storage, "get_plan_revision", None)
         if not callable(getter) or not callable(get_revision):

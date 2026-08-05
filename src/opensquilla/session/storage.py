@@ -4358,6 +4358,8 @@ class SessionStorage:
         self,
         session_key: str,
     ) -> PlanRevisionRecord | None:
+        """Return the current user-visible Plan revision, never Goal internals."""
+
         session_key = canonicalize_session_key(session_key)
         async with self.conn.execute(
             """
@@ -4366,6 +4368,12 @@ class SessionStorage:
             JOIN plan_revisions
               ON plan_revisions.revision_id = sessions.active_plan_revision_id
             WHERE sessions.session_key = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM plan_runs
+                  WHERE plan_runs.plan_revision_id = plan_revisions.revision_id
+                    AND plan_runs.driver_kind = 'goal'
+              )
             """,
             (session_key,),
         ) as cur:
@@ -4633,6 +4641,26 @@ class SessionStorage:
     @_serialized_read
     async def get_plan_run(self, run_id: str) -> PlanRunRecord | None:
         return await self._select_plan_run_on_conn(self.conn, run_id)
+
+    @_serialized_read
+    async def get_latest_plan_run_for_revision(
+        self,
+        plan_revision_id: str,
+    ) -> PlanRunRecord | None:
+        """Return the newest execution overlay attached to a plan revision."""
+
+        async with self.conn.execute(
+            """
+            SELECT *
+            FROM plan_runs
+            WHERE plan_revision_id = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (plan_revision_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else PlanRunRecord(**_deserialize_row(dict(row)))
 
     @_serialized_read
     async def get_active_plan_run(

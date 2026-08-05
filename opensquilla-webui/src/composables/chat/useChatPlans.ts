@@ -22,7 +22,6 @@ type RpcClient = {
   call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
   on: (event: string, handler: (...args: unknown[]) => void) => () => void
 }
-
 interface PlanMutationResponse extends Record<string, unknown> {
   sessionKey?: string
   session_key?: string

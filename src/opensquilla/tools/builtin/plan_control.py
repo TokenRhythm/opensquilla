@@ -494,7 +494,11 @@ async def plan_run_checkpoint(
     current = await storage.get_plan_run(run_id)
     if current is None:
         raise ValueError("The active PlanRun no longer exists")
-    from opensquilla.session.plans import PlanRunConflictError, plan_run_snapshot
+    from opensquilla.session.plans import (
+        PlanRunConflictError,
+        plan_run_event_name,
+        plan_run_snapshot,
+    )
 
     try:
         updated = await storage.checkpoint_plan_run(
@@ -528,7 +532,7 @@ async def plan_run_checkpoint(
         try:
             await emitter(
                 ctx.session_key,
-                "session.event.plan_run",
+                plan_run_event_name(updated),
                 {"session_key": ctx.session_key, "plan_run": snapshot},
             )
         except Exception as exc:  # noqa: BLE001 - durable checkpoint already committed

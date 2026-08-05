@@ -25,7 +25,10 @@ from opensquilla.gateway.rpc_goals import (
     _handle_goals_set,
     _handle_goals_status,
 )
-from opensquilla.gateway.rpc_sessions import _handle_sessions_send
+from opensquilla.gateway.rpc_sessions import (
+    _handle_sessions_send,
+    _hydrate_sessions_messages_metadata,
+)
 from opensquilla.gateway.task_runtime import TaskRun, TaskRuntime
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import AgentTaskStatus
@@ -266,6 +269,52 @@ async def test_goals_status_snapshots_active_goal_and_plan_run(
         assert status["planRun"]["driverKind"] == "goal"
         assert status["planRun"]["driverId"] == set_response["goalId"]
         assert status["planRun"]["status"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_goal_internal_plan_revision_stays_hidden_after_goal_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(run: TaskRun) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-hidden-plan.sqlite",
+        handler=handler,
+    ) as stack:
+        response = await _handle_goals_set(
+            {
+                "sessionKey": SOURCE_KEY,
+                "message": "Keep the internal plan private.",
+                "clientRequestId": "goal-hidden-plan",
+            },
+            stack.context,
+        )
+        await stack.runtime.wait(response["turnId"], timeout=2.0)
+
+        goal = await stack.storage.get_goal_run(response["goalId"])
+        assert goal is not None
+        completed_goal = await stack.storage.complete_goal_run(
+            goal.goal_id,
+            expected_updated_at=goal.updated_at,
+        )
+        plan_run = await stack.storage.get_plan_run(response["planRun"]["runId"])
+        assert plan_run is not None
+        await stack.storage.cancel_plan_run(
+            plan_run.run_id,
+            expected_state_revision=plan_run.state_revision,
+            reason="goal_complete",
+        )
+
+        assert completed_goal.status == "complete"
+        metadata = await _hydrate_sessions_messages_metadata(stack.context, SOURCE_KEY)
+        assert metadata["currentPlan"] is None
+        assert metadata["activePlanRun"] is None
 
 
 @pytest.mark.asyncio

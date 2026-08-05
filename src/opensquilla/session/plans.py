@@ -484,3 +484,18 @@ def plan_run_snapshot(run: PlanRunRecord) -> dict[str, Any]:
         "startedAt": run.started_at,
         "finishedAt": run.finished_at,
     }
+
+
+def plan_run_event_name(run: PlanRunRecord) -> str:
+    """Return the event namespace owned by the run's execution driver.
+
+    Goal runs reuse durable PlanRun state, but they are not Plan mode state.
+    Keeping their live updates on a goal-specific event prevents generic Plan
+    clients from having to discover and filter that distinction.
+    """
+
+    return (
+        "session.event.goal_run"
+        if str(getattr(run, "driver_kind", "") or "") == "goal"
+        else "session.event.plan_run"
+    )

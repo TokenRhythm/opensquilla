@@ -413,7 +413,10 @@ def _goal_turn_id(frame: Mapping[str, Any]) -> str | None:
 
 def _goal_plan_run(frame: Mapping[str, Any]) -> dict[str, Any] | None:
     """Extract the ``plan_run`` snapshot from a plan run event frame."""
-    if str(frame.get("event") or "") != "session.event.plan_run":
+    if str(frame.get("event") or "") not in {
+        "session.event.plan_run",
+        "session.event.goal_run",
+    }:
         return None
     run = _goal_payload(frame).get("plan_run")
     return run if isinstance(run, dict) else None

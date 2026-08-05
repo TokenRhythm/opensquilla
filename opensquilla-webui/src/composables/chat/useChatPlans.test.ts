@@ -680,6 +680,3 @@ describe('useChatPlans', () => {
 
     expect(api.activePlanRun.value).toBeNull()
   })
-
-
-
