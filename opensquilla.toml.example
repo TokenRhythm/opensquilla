@@ -533,6 +533,35 @@ security_grading = false
 # with the sandbox section.
 default_mode = "bypass"                 # off | on | bypass | full
 
+# ─────────────────────────────────────────────────────────────────────────────
+# KV cache keep-alive
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Periodically sends a lightweight ping to the LLM provider (appended to the
+# last known conversation prefix) to keep the server-side KV cache warm.
+# This prevents expensive cold cache rebuilds when returning from a break.
+#
+# Inspired by claude-code-coffee (https://github.com/cnighswonger/claude-code-coffee).
+#
+# [keepalive]
+# enabled = false
+# # How often to send keep-alive pings (in seconds, minimum 30).
+# interval_seconds = 480
+# # The keep-alive message content. Keep it short — the model will reply
+# # with a minimal response (e.g. "ok").
+# message = "Keep-alive ping. Do not execute any tool calls or reasoning. Reply 'ok' only."
+# # Whether to disable tool calling for keep-alive requests.
+# tool_choice_none = true
+# # Max tokens for the keep-alive response (keep it tiny).
+# max_tokens = 10
+# # How many recent turns of conversation history to include in the
+# # keep-alive ping. 0 = include all available history.
+# history_turns = 0
+# # Max keep-alive pings per idle session. After this many pings the
+# # loop stops to avoid wasting tokens on long absences.
+# # 0 = unlimited. Default 20 × 480s = ~2.7h coverage.
+# max_pings = 20
+
 # [auth]
 # mode = "none"         # none | token | password
 # token = ""

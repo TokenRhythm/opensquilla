@@ -827,4 +827,14 @@ def create_gateway_app(
     # mounted at "/" so dynamically registered API routes are still reachable.
     app.router.routes.extend(create_control_ui_routes(config))
 
+    # ── KV cache keep-alive loop ──────────────────────────────────────
+    if config.keepalive.enabled:
+        from opensquilla.scheduler.keepalive import KeepaliveLoop
+
+        keepalive_loop = KeepaliveLoop(config=config)
+        keepalive_loop.start()
+        app.state.keepalive_loop = keepalive_loop
+        log.info("keepalive: KV cache keep-alive loop enabled")
+    # ── done ──────────────────────────────────────────────────────────
+
     return app
