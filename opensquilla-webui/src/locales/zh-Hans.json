@@ -3484,11 +3484,12 @@
       "couldNotRunSkillError": "无法运行 meta-skill：{error}"
     },
     "compact": {
-      "compacting": "正在压缩上下文",
-      "compacted": "上下文已压缩",
-      "failed": "压缩失败",
-      "withinBudget": "上下文在预算范围内。",
-      "cancelled": "压缩已取消"
+      "compacting": "正在整理上下文…",
+      "compacted": "上下文已整理",
+      "failed": "上下文整理失败",
+      "withinBudget": "无需整理，上下文空间充足",
+      "cancelled": "上下文整理已取消",
+      "requestScoped": "仅对本次请求生效；会话历史未被重写"
     },
     "tool": {
       "discoverLinks": "发现链接",

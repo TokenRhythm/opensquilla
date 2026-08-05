@@ -3488,7 +3488,8 @@
       "compacted": "Kontext verdichtet",
       "failed": "Verdichtung fehlgeschlagen",
       "withinBudget": "Kontext innerhalb des Budgets.",
-      "cancelled": "Verdichtung abgebrochen"
+      "cancelled": "Verdichtung abgebrochen",
+      "requestScoped": "Nur für diese Anfrage; der Sitzungsverlauf wurde nicht neu geschrieben"
     },
     "tool": {
       "discoverLinks": "Links entdecken",

@@ -3488,7 +3488,8 @@
       "compacted": "コンテキストを圧縮しました",
       "failed": "圧縮に失敗しました",
       "withinBudget": "コンテキストは予算内です。",
-      "cancelled": "圧縮をキャンセルしました"
+      "cancelled": "圧縮をキャンセルしました",
+      "requestScoped": "このリクエストにのみ適用され、セッション履歴は書き換えられていません"
     },
     "tool": {
       "discoverLinks": "リンクを検出",

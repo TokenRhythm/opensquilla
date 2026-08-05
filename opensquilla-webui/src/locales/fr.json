@@ -3488,7 +3488,8 @@
       "compacted": "Contexte compacté",
       "failed": "Échec du compactage",
       "withinBudget": "Contexte dans les limites du budget.",
-      "cancelled": "Compactage annulé"
+      "cancelled": "Compactage annulé",
+      "requestScoped": "Limité à cette requête ; l’historique de session n’a pas été réécrit"
     },
     "tool": {
       "discoverLinks": "Découvrir des liens",

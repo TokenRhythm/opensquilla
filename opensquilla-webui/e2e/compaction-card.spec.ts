@@ -41,22 +41,36 @@ test.describe('Compaction maintenance card', () => {
       const samples: Array<{
         title: string | null
         elapsed: string | null
-        busyDot: boolean
-        gaugeBreathing: boolean
+        busyIndicator: boolean
+        gaugeIndeterminate: boolean
         gaugeDone: boolean
+        gaugeAriaValueNow: string | null
+        gaugeFillRatio: number | null
       }> = []
       while (Date.now() - t0 < 120000) {
         const cardEl = document.querySelector('.chat-compact-status')
         const titleEl = document.querySelector('.chat-compact-status__title')
         const elapsedEl = document.querySelector('.chat-compact-status__elapsed')
+        const gaugeEl = document.querySelector<HTMLElement>('.chat-compact-status__gauge')
+        const gaugeFillEl = document.querySelector<HTMLElement>('.chat-compact-status__gauge-fill')
+        const gaugeWidth = gaugeEl?.getBoundingClientRect().width ?? 0
         samples.push({
           title: titleEl ? titleEl.textContent : null,
           elapsed: elapsedEl ? elapsedEl.textContent : null,
-          busyDot: !!document.querySelector('.chat-compact-status__dot--pulsing'),
-          gaugeBreathing: !!document.querySelector('.chat-compact-status__gauge-fill--breathing'),
+          busyIndicator: !!document.querySelector(
+            '.chat-compact-status__indicator--busy',
+          ),
+          gaugeIndeterminate: !!document.querySelector(
+            '.chat-compact-status__gauge-fill--indeterminate',
+          ),
           gaugeDone: !!document.querySelector('.chat-compact-status__gauge-fill--done'),
+          gaugeAriaValueNow: gaugeEl?.getAttribute('aria-valuenow') ?? null,
+          gaugeFillRatio: gaugeFillEl && gaugeWidth > 0
+            ? gaugeFillEl.getBoundingClientRect().width / gaugeWidth
+            : null,
         })
-        const settled = cardEl !== null && !document.querySelector('.chat-compact-status__dot--pulsing')
+        const settled = cardEl !== null
+          && !document.querySelector('.chat-compact-status__indicator--busy')
         if ((settled || cardEl === null) && samples.length > 2) break
         await new Promise((resolve) => setTimeout(resolve, 150))
       }
@@ -66,15 +80,31 @@ test.describe('Compaction maintenance card', () => {
     // Lifecycle: the card rendered a title and reached a terminal state.
     const titles = observed.map((s) => s.title).filter((t): t is string => t !== null)
     expect(titles.length).toBeGreaterThan(0)
-    expect(titles.some((t) => /^(Compacting context|Context compacted|Already within context budget)/.test(t))).toBe(true)
+    expect(
+      titles.some(
+        (t) => /^(Compacting context|Context compacted|Already within context budget|Context within budget\.?)/.test(t),
+      ),
+    ).toBe(true)
     const last = observed[observed.length - 1]
-    expect(last.busyDot).toBe(false)
-    expect(last.title === null || /^(Context compacted|Already within context budget)/.test(last.title)).toBe(true)
+    expect(last.busyIndicator).toBe(false)
+    expect(
+      last.title === null
+      || /^(Context compacted|Already within context budget|Context within budget\.?)/.test(last.title),
+    ).toBe(true)
 
-    const busySamples = observed.filter((s) => s.busyDot)
+    const busySamples = observed.filter((s) => s.busyIndicator)
     if (busySamples.length > 0) {
-      // While busy the gauge breathes (real fill or indeterminate full width).
-      expect(busySamples.some((s) => s.gaugeBreathing)).toBe(true)
+      // While busy the operation exposes no fake percentage: a short
+      // indeterminate segment moves across the track and omits aria-valuenow.
+      expect(busySamples.some((s) => s.gaugeIndeterminate)).toBe(true)
+      expect(busySamples.every((s) => s.gaugeAriaValueNow === null)).toBe(true)
+      expect(
+        busySamples.some(
+          (s) => s.gaugeFillRatio !== null
+            && s.gaugeFillRatio >= 0.38
+            && s.gaugeFillRatio <= 0.46,
+        ),
+      ).toBe(true)
     }
     // Tick proof: ~2.4s of busy time (16 samples at 150ms) must show at
     // least two distinct elapsed second values.
@@ -87,7 +117,10 @@ test.describe('Compaction maintenance card', () => {
     // elapsed stops ticking, observable inside the 5s auto-dismiss window.
     if (last.title !== null && /^Context compacted/.test(last.title)) {
       expect(last.gaugeDone).toBe(true)
-      expect(last.gaugeBreathing).toBe(false)
+      expect(last.gaugeIndeterminate).toBe(false)
+      expect(last.gaugeAriaValueNow).toBe('100')
+      expect(last.gaugeFillRatio).not.toBeNull()
+      expect(last.gaugeFillRatio ?? 0).toBeGreaterThanOrEqual(0.99)
       if (last.elapsed !== null && (await card.count()) > 0) {
         const frozen = await card.locator('.chat-compact-status__elapsed').textContent().catch(() => null)
         if (frozen !== null) {

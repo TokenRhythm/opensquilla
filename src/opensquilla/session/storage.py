@@ -1038,6 +1038,45 @@ def _serialize(value: Any) -> Any:
     return value
 
 
+def _transcript_preimage(
+    entries: Sequence[TranscriptEntry],
+) -> tuple[tuple[Any, ...], ...]:
+    """Return the context-relevant identity used by compaction CAS checks."""
+
+    def _stable_json(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    return tuple(
+        (
+            entry.session_id,
+            entry.session_key,
+            entry.id,
+            entry.message_id,
+            entry.role,
+            entry.content,
+            entry.tool_call_id,
+            entry.reasoning_content,
+            entry.created_at,
+            entry.token_count,
+            entry.provenance_kind,
+            entry.provenance_origin_session_id,
+            entry.provenance_source_session_key,
+            entry.provenance_source_channel,
+            entry.provenance_source_tool,
+            entry.schema_version,
+            _stable_json(entry.tool_calls),
+            _stable_json(entry.turn_usage),
+            _stable_json(entry.turn_context),
+        )
+        for entry in entries
+    )
+
+
 def _ordered_detail_message_ids(*values: Any) -> list[str]:
     """Normalize persisted-message detail fields without changing order."""
 
@@ -7907,12 +7946,92 @@ class SessionStorage:
         entries: list[TranscriptEntry],
         context_states: list[SessionContextState] | None = None,
         archived_entries: list[TranscriptEntry] | None = None,
-    ) -> None:
+        expected_source_entries: Sequence[TranscriptEntry] | None = None,
+        expected_source_preimage: Sequence[Sequence[Any]] | None = None,
+        expected_source_boundary_message_id: str | None = None,
+        expected_source_boundary_entry_id: int | None = None,
+        expected_context_fingerprint: str | None = None,
+    ) -> bool:
         """Atomically persist a compaction rewrite for one session."""
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
 
         async with self._write_transaction("rewrite_compacted_session") as conn:
+            preserve_surviving_rows = expected_source_entries is not None
+            if expected_source_entries is not None:
+                expected_prefix = list(expected_source_entries)
+                async with conn.execute(
+                    "SELECT * FROM transcript_entries WHERE session_id = ? "
+                    "ORDER BY created_at ASC, id ASC",
+                    (node.session_id,),
+                ) as cur:
+                    current_rows = await cur.fetchall()
+                current_entries = [
+                    TranscriptEntry(**_deserialize_row(dict(row))) for row in current_rows
+                ]
+                source_count = len(expected_prefix)
+                frozen_preimage = tuple(
+                    tuple(item) for item in (expected_source_preimage or ())
+                )
+                if (
+                    len(current_entries) < source_count
+                    or frozen_preimage != _transcript_preimage(expected_prefix)
+                    or _transcript_preimage(current_entries[:source_count])
+                    != frozen_preimage
+                ):
+                    return False
+                boundary = expected_prefix[-1] if expected_prefix else None
+                if expected_source_boundary_message_id is not None and (
+                    boundary is None
+                    or boundary.message_id != expected_source_boundary_message_id
+                ):
+                    return False
+                if expected_source_boundary_entry_id is not None and (
+                    boundary is None
+                    or boundary.id != expected_source_boundary_entry_id
+                ):
+                    return False
+                archived_prefix = list(archived_entries or [])
+                archived_count = len(archived_prefix)
+                if (
+                    archived_count > source_count
+                    or _transcript_preimage(archived_prefix)
+                    != _transcript_preimage(expected_prefix[:archived_count])
+                    or _transcript_preimage(entries)
+                    != _transcript_preimage(expected_prefix[archived_count:])
+                    or any(entry.id is None for entry in archived_prefix)
+                ):
+                    return False
+
+            if expected_context_fingerprint is not None:
+                from opensquilla.session.context_view import (
+                    compaction_context_fingerprint,
+                )
+
+                current_summaries = await self._select_all_summaries(
+                    conn,
+                    node.session_id,
+                )
+                async with conn.execute(
+                    "SELECT * FROM session_context_states "
+                    "WHERE session_key = ? AND valid = 1 "
+                    "ORDER BY created_at ASC, id ASC",
+                    (node.session_key,),
+                ) as cur:
+                    context_rows = await cur.fetchall()
+                current_context_states = [
+                    SessionContextState(**_deserialize_row(dict(row)))
+                    for row in context_rows
+                ]
+                if (
+                    compaction_context_fingerprint(
+                        context_states=current_context_states,
+                        summaries=current_summaries,
+                    )
+                    != expected_context_fingerprint
+                ):
+                    return False
+
             if summary is not None:
                 summary.session_id = node.session_id
                 summary.session_key = node.session_key
@@ -7933,10 +8052,36 @@ class SessionStorage:
                 else None,
             )
 
-            await conn.execute(
-                "DELETE FROM transcript_entries WHERE session_id = ?",
-                (node.session_id,),
-            )
+            if preserve_surviving_rows:
+                # Delete only the archived frozen prefix. The surviving source
+                # tail and rows appended after the frozen boundary stay in
+                # place, preserving their stable transcript ids and external
+                # keyset cursors.
+                archived_ids = [
+                    int(entry.id)
+                    for entry in (archived_entries or [])
+                    if entry.id is not None
+                ]
+                chunk_size = max(1, _SQLITE_VARIABLE_CHUNK_SIZE - 1)
+                deleted_count = 0
+                for start in range(0, len(archived_ids), chunk_size):
+                    chunk = archived_ids[start : start + chunk_size]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    cursor = await conn.execute(
+                        "DELETE FROM transcript_entries "
+                        f"WHERE session_id = ? AND id IN ({placeholders})",  # noqa: S608
+                        (node.session_id, *chunk),
+                    )
+                    deleted_count += max(0, int(cursor.rowcount or 0))
+                if deleted_count != len(archived_ids):
+                    raise RuntimeError(
+                        "compaction source changed while deleting frozen prefix"
+                    )
+            else:
+                await conn.execute(
+                    "DELETE FROM transcript_entries WHERE session_id = ?",
+                    (node.session_id,),
+                )
 
             if summary is not None:
                 summary_data = summary.model_dump(exclude={"id"})
@@ -7964,36 +8109,64 @@ class SessionStorage:
                 ) as cur:
                     state.id = cur.lastrowid
 
-            for entry in entries:
-                entry.session_id = node.session_id
-                entry.session_key = node.session_key
-                entry_data = entry.model_dump(exclude={"id"})
-                entry_cols = list(entry_data.keys())
-                entry_placeholders = ", ".join("?" for _ in entry_cols)
-                entry_values = [_serialize(entry_data[c]) for c in entry_cols]
-                await conn.execute(
-                    "INSERT INTO transcript_entries "
-                    f"({', '.join(entry_cols)}) VALUES ({entry_placeholders})",
-                    entry_values,
-                )
+            if not preserve_surviving_rows:
+                for entry in entries:
+                    entry.session_id = node.session_id
+                    entry.session_key = node.session_key
+                    entry_data = entry.model_dump(exclude={"id"})
+                    entry_cols = list(entry_data.keys())
+                    entry_placeholders = ", ".join("?" for _ in entry_cols)
+                    entry_values = [_serialize(entry_data[c]) for c in entry_cols]
+                    await conn.execute(
+                        "INSERT INTO transcript_entries "
+                        f"({', '.join(entry_cols)}) VALUES ({entry_placeholders})",
+                        entry_values,
+                    )
 
-            node_data = node.model_dump()
-            node_cols = list(node_data.keys())
-            node_placeholders = ", ".join("?" for _ in node_cols)
-            node_updates: list[str] = []
-            for col in node_cols:
-                if col == "session_key":
-                    continue
-                if col == "epoch":
-                    node_updates.append("epoch = MAX(sessions.epoch, excluded.epoch)")
-                else:
-                    node_updates.append(f"{col}=excluded.{col}")
-            node_values = [_serialize(node_data[c]) for c in node_cols]
-            await conn.execute(
-                f"INSERT INTO sessions ({', '.join(node_cols)}) VALUES ({node_placeholders}) "
-                f"ON CONFLICT(session_key) DO UPDATE SET {', '.join(node_updates)}",
-                node_values,
-            )
+            if preserve_surviving_rows:
+                # A suffix append is allowed after the frozen source boundary.
+                # Its transaction has already advanced token totals/freshness
+                # and updated_at, so never replace those fields from the stale
+                # node snapshot captured before compaction began.
+                async with conn.execute(
+                    """
+                    UPDATE sessions
+                    SET compaction_count = MAX(compaction_count, ?),
+                        updated_at = MAX(updated_at, ?)
+                    WHERE session_key = ? AND session_id = ? AND epoch = ?
+                    """,
+                    (
+                        node.compaction_count,
+                        node.updated_at,
+                        node.session_key,
+                        node.session_id,
+                        node.epoch,
+                    ),
+                ) as cur:
+                    if (cur.rowcount or 0) != 1:
+                        raise RuntimeError(
+                            "session changed while committing compaction metadata"
+                        )
+            else:
+                node_data = node.model_dump()
+                node_cols = list(node_data.keys())
+                node_placeholders = ", ".join("?" for _ in node_cols)
+                node_updates: list[str] = []
+                for col in node_cols:
+                    if col == "session_key":
+                        continue
+                    if col == "epoch":
+                        node_updates.append("epoch = MAX(sessions.epoch, excluded.epoch)")
+                    else:
+                        node_updates.append(f"{col}=excluded.{col}")
+                node_values = [_serialize(node_data[c]) for c in node_cols]
+                await conn.execute(
+                    f"INSERT INTO sessions ({', '.join(node_cols)}) "
+                    f"VALUES ({node_placeholders}) "
+                    f"ON CONFLICT(session_key) DO UPDATE SET {', '.join(node_updates)}",
+                    node_values,
+                )
+        return True
 
     @_serialized_read
     async def get_latest_summary(self, session_id: str) -> SessionSummary | None:

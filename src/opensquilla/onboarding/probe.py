@@ -27,6 +27,10 @@ import httpx
 import structlog
 
 from opensquilla.provider.app_attribution import is_host_or_subdomain
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.protocol import LLMProvider
 from opensquilla.provider.registry import get_provider_spec
@@ -162,8 +166,24 @@ async def probe_llm_provider(
             message=redact_error_text(str(exc), known_secrets=(resolved_key,)),
         )
 
-    cfg = ChatConfig(max_tokens=1, timeout=timeout, thinking=False)
+    request_budget = resolve_auxiliary_request_budget(
+        provider,
+        provider_id=provider_id,
+        model=model,
+        max_output_tokens=1,
+    )
+    cfg = ChatConfig(
+        max_tokens=1,
+        timeout=timeout,
+        thinking=False,
+        provider_request_max_chars=request_budget.provider_request_max_chars,
+    )
     messages = [Message(role="user", content="ping")]
+    ensure_auxiliary_text_fits(
+        messages,
+        max_chars=request_budget.provider_request_max_chars,
+        max_tokens=request_budget.max_input_tokens,
+    )
     start = time.monotonic()
     first_response_ms: int | None = None
     try:

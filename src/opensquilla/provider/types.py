@@ -146,6 +146,26 @@ class ProviderMessageCountProjection:
 
 
 @dataclass(frozen=True)
+class ProviderFinalRequestProjection:
+    """Pure admission evidence for one adapter's exact outbound payload.
+
+    ``payload`` is retained so tests and higher-level admission coordinators
+    can prove that projection and transport use the same envelope.  It is
+    deliberately excluded from ``repr`` because provider requests may contain
+    user content.  ``fits_message_count`` is ``None`` when the adapter has no
+    authoritative message limit; the exact wire count remains available
+    without pretending that an unknown limit was proved.
+    """
+
+    payload: dict[str, Any] = field(repr=False, compare=False)
+    proof: dict[str, Any]
+    wire_message_count: int
+    message_limit: int | None
+    fits_message_count: bool | None
+    fits: bool
+
+
+@dataclass(frozen=True)
 class ProviderMessageLimitProof:
     """Structured proof of an upstream wire-message cardinality rejection."""
 
@@ -386,9 +406,47 @@ class ChatConfig(BaseModel):
     model_capabilities: ModelCapabilities | None = None
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
+    # Runtime-only provenance for an explicit global
+    # ``llm.context_window_tokens`` override. Selector fallback must resolve the
+    # new physical model with this same operator setting; zero means the active
+    # window came from per-model/catalog/default resolution and may be rebound.
+    context_window_tokens_global_override: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        repr=False,
+    )
+    # Preserve the operator-owned portion of ``provider_request_max_chars``
+    # separately from the cap derived for one physical deployment.  Selector
+    # fallback may replace a derived cap when it rebinds to a different
+    # context window, but it must never enlarge an explicit caller limit.
+    provider_request_max_chars_explicit_cap: int | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    # Index of the real active user request in the final logical ``messages``
+    # list.  Provider wrappers may append synthetic user-role context (for
+    # example an ensemble candidate bundle); carrying the anchor separately
+    # prevents request compaction from protecting the synthetic message while
+    # rewriting the user's actual prompt.
+    active_user_message_index: int | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
     tool_choice: Any | None = None
     candidate_output_mode: Literal["normal", "inert_artifact"] = Field(
         default="normal",
+        exclude=True,
+        repr=False,
+    )
+    # Runtime-only bound for adapter-internal physical transport attempts.
+    # Zero preserves each adapter's compatibility behavior; auxiliary
+    # compaction binds this to one so its operation-level two-call cap is real.
+    physical_attempt_limit: int = Field(
+        default=0,
+        ge=0,
         exclude=True,
         repr=False,
     )
@@ -402,6 +460,12 @@ class ChatConfig(BaseModel):
         if self.thinking_budget_explicit is None:
             self.thinking_budget_explicit = (
                 "thinking_budget_tokens" in self.model_fields_set
+            )
+        if self.provider_request_max_chars_explicit_cap is None:
+            self.provider_request_max_chars_explicit_cap = (
+                max(0, int(self.provider_request_max_chars or 0))
+                if "provider_request_max_chars" in self.model_fields_set
+                else 0
             )
 
 

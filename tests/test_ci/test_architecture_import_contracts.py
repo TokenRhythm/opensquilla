@@ -112,6 +112,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # orchestrator (offline retrain; default-off, fail-open).
     ("gateway", "squilla_router"),
     ("gateway", "tools"),
+    # The reusable Python Gateway client shares the bounded WebSocket receive
+    # contract with the CLI client; contracts remains implementation-free.
+    ("gateway_client.py", "contracts"),
     ("identity", "safety"),
     ("identity", "session"),
     ("mcp", "tools"),

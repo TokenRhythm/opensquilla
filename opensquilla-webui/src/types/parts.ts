@@ -150,6 +150,14 @@ export interface StatusPart {
   action: string
   label: string
   at: number
+  /** Stable lifecycle id for a maintenance event; phase rows omit it. */
+  id?: string
+  /** Maintenance rows are context housekeeping, not semantic task steps. */
+  category?: 'phase' | 'maintenance'
+  state?: 'running' | 'completed' | 'skipped' | 'stale' | 'cancelled' | 'failed'
+  source?: string
+  durability?: string
+  detail?: string
 }
 
 export interface TurnMessageParts {

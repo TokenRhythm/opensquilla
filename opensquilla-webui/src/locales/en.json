@@ -3484,11 +3484,12 @@
       "couldNotRunSkillError": "Could not run meta-skill: {error}"
     },
     "compact": {
-      "compacting": "Compacting context",
-      "compacted": "Context compacted",
-      "failed": "Compact failed",
-      "withinBudget": "Context within budget.",
-      "cancelled": "Compact cancelled"
+      "compacting": "Organizing context…",
+      "compacted": "Context organized",
+      "failed": "Context organization failed",
+      "withinBudget": "No organization needed; context has enough space",
+      "cancelled": "Context organization cancelled",
+      "requestScoped": "Request-scoped; session history was not rewritten"
     },
     "tool": {
       "discoverLinks": "Discover links",

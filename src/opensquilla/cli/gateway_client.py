@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from opensquilla.contracts.gateway_transport import (
+    GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+    GATEWAY_CLIENT_MAX_QUEUE,
+)
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 
@@ -399,7 +403,11 @@ class GatewayClient:
             raise SystemExit("websockets package is required: uv pip install websockets")
 
         try:
-            self._ws = await websockets.connect(url)
+            self._ws = await websockets.connect(
+                url,
+                max_size=GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+                max_queue=GATEWAY_CLIENT_MAX_QUEUE,
+            )
         except Exception as exc:
             raise SystemExit(
                 f"Cannot connect to OpenSquilla gateway at {url}\n"

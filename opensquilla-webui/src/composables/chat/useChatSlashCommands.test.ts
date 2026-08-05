@@ -42,6 +42,7 @@ function harness(
     resetCurrentSession: vi.fn(),
     setCompactInFlight: vi.fn(),
     showCompactStatus: vi.fn(),
+    showCompactionToast: vi.fn(),
     notify,
     dispatchHidden,
     dispatchPlanPrompt,

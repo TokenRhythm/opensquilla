@@ -3488,7 +3488,8 @@
       "compacted": "Contexto compactado",
       "failed": "Error al compactar",
       "withinBudget": "Contexto dentro del presupuesto.",
-      "cancelled": "Compactación cancelada"
+      "cancelled": "Compactación cancelada",
+      "requestScoped": "Solo para esta solicitud; no se reescribió el historial de la sesión"
     },
     "tool": {
       "discoverLinks": "Descubrir enlaces",

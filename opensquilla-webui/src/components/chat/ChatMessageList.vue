@@ -22,6 +22,10 @@
       @edit="$emit('editMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
     />
+    <CompactionEvent
+      v-else-if="message.displayRole === 'maintenance' && message.maintenance?.kind === 'context_compaction'"
+      :message="message"
+    />
     <AssistantMessage
       v-else-if="message.displayRole === 'assistant'"
       :message="message"
@@ -76,6 +80,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import AssistantMessage from '@/components/chat/AssistantMessage.vue'
+import CompactionEvent from '@/components/chat/CompactionEvent.vue'
 import SystemMessage from '@/components/chat/SystemMessage.vue'
 import UserMessage from '@/components/chat/UserMessage.vue'
 import type {

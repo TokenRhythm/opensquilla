@@ -55,6 +55,12 @@ export type Frame =
       action: string   // stable phase key (streamActivity.key)
       label: string    // human label (streamActivity.label)
       at: number       // phase startedAt
+      id?: string
+      category?: 'phase' | 'maintenance'
+      state?: 'running' | 'completed' | 'skipped' | 'stale' | 'cancelled' | 'failed'
+      source?: string
+      durability?: string
+      detail?: string
     }
 
 /** A frame as emitted by a mutator; `appendFrame` stamps the `seq` index. */

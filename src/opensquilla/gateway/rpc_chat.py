@@ -13,6 +13,11 @@ import structlog
 from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.chat.source import chat_source_metadata
+from opensquilla.gateway.compaction_target import (
+    effective_session_model,
+    resolve_gateway_compaction_target,
+    resolve_selected_compaction_provider,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.context_overflow import apply_context_overflow_policy
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
@@ -414,40 +419,11 @@ async def _chat_history_summaries(
 
 
 def _effective_compaction_model(session: object | None) -> str | None:
-    if session is None:
-        return None
-    return getattr(session, "model_override", None) or getattr(session, "model", None)
+    return effective_session_model(session)
 
 
 def _resolve_compaction_provider(ctx: RpcContext, session: object | None) -> object | None:
-    selector = getattr(ctx, "provider_selector", None)
-    if selector is None:
-        return None
-
-    resolved_selector = selector
-    clone = getattr(selector, "clone", None)
-    if callable(clone):
-        try:
-            resolved_selector = clone()
-        except Exception:  # noqa: BLE001
-            resolved_selector = selector
-
-    model = _effective_compaction_model(session)
-    if model and resolved_selector is not selector:
-        override = getattr(resolved_selector, "override_model", None)
-        if callable(override):
-            try:
-                override(model)
-            except Exception:  # noqa: BLE001
-                pass
-
-    resolver = getattr(resolved_selector, "resolve", None)
-    if not callable(resolver):
-        return None
-    try:
-        return cast(object | None, resolver())
-    except Exception:  # noqa: BLE001
-        return None
+    return resolve_selected_compaction_provider(ctx, session)
 
 
 async def _build_context_overflow_compaction_config(ctx: RpcContext, session_key: str):
@@ -458,10 +434,12 @@ async def _build_context_overflow_compaction_config(ctx: RpcContext, session_key
             session = await storage.get_session(session_key)
         except Exception:  # noqa: BLE001
             session = None
+    compaction_target = resolve_gateway_compaction_target(ctx, session)
     return build_compaction_config_from_provider(
-        _resolve_compaction_provider(ctx, session),
-        model_override=_effective_compaction_model(session),
+        compaction_target.provider,
+        model_override=compaction_target.model or _effective_compaction_model(session),
         compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
+        compaction_plan=compaction_target.plan,
     )
 
 

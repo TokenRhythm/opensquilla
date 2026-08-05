@@ -11,6 +11,7 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
     QuotaStatus,
     StreamEvent,
@@ -72,6 +73,22 @@ class ProviderMessageCountProjector(Protocol):
         additional_messages: int = 0,
     ) -> ProviderMessageCountProjection:
         """Project the adapter's final wire count without issuing a request."""
+        ...
+
+
+@runtime_checkable
+class ProviderFinalRequestProjector(Protocol):
+    """Optional, side-effect-free projection of one exact outbound request."""
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Build and prove the adapter's exact payload without shaping or I/O."""
         ...
 
 
@@ -176,6 +193,39 @@ def project_provider_message_count(
     except Exception:  # noqa: BLE001 - optional capability must stay best-effort
         return None
     return projection if isinstance(projection, ProviderMessageCountProjection) else None
+
+
+def project_provider_final_request(
+    provider: object | None,
+    messages: list[Message],
+    tools: list[ToolDefinition] | None = None,
+    config: ChatConfig | None = None,
+    *,
+    message_limit: int | None = None,
+) -> ProviderFinalRequestProjection | None:
+    """Return an optional exact final-request admission projection.
+
+    This duck-typed capability is deliberately narrower than ``LLMProvider``.
+    Missing, raising, or invalid implementations return ``None`` so callers
+    can fail closed for durable decisions without changing ordinary chat
+    compatibility.
+    """
+
+    if provider is None:
+        return None
+    projection_fn = getattr(provider, "project_final_request", None)
+    if not callable(projection_fn):
+        return None
+    try:
+        projection = projection_fn(
+            messages,
+            tools,
+            config,
+            message_limit=message_limit,
+        )
+    except Exception:  # noqa: BLE001 - optional capability must be isolated
+        return None
+    return projection if isinstance(projection, ProviderFinalRequestProjection) else None
 
 
 def validate_provider_chat_request(

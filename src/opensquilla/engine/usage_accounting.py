@@ -36,6 +36,7 @@ from opensquilla.usage_reasons import (
 )
 
 _NANOS_PER_USD = Decimal("1000000000")
+_CANCELLED_USAGE_TERMINAL_GRACE_SECONDS = 0.25
 log = structlog.get_logger(__name__)
 
 
@@ -305,8 +306,12 @@ async def mark_usage_call_unknown(
     try:
         await asyncio.shield(unknown_task)
     except asyncio.CancelledError:
-        with contextlib.suppress(Exception):
-            await unknown_task
+        # A cancellation-resistant sink must not indefinitely retain the
+        # provider transport or the cancelled caller. The durable started row
+        # remains available to ledger recovery if this bounded attempt cannot
+        # finish.
+        unknown_task.cancel()
+        unknown_task.add_done_callback(_consume_usage_task_result)
         raise
     except Exception as exc:  # noqa: BLE001 - preserve the provider outcome
         log.warning(
@@ -315,6 +320,55 @@ async def mark_usage_call_unknown(
             reason=stable_reason,
             error=str(exc),
         )
+
+
+def _consume_usage_task_result(task: asyncio.Future[Any]) -> None:
+    """Consume a detached terminal-write result after bounded cancellation."""
+
+    if task.cancelled():
+        return
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+async def _mark_usage_call_unknown_after_cancellation(
+    scope: UsageAccountingScope,
+    call: UsageCallStart,
+    reason: str,
+) -> None:
+    """Give one terminal write a bounded grace period during cancellation."""
+
+    stable_reason = normalize_usage_unknown_reason(reason)
+    unknown_task = asyncio.create_task(scope.sink.mark_unknown(call, stable_reason))
+    try:
+        done, _pending = await asyncio.wait(
+            {unknown_task},
+            timeout=_CANCELLED_USAGE_TERMINAL_GRACE_SECONDS,
+        )
+    except asyncio.CancelledError:
+        unknown_task.cancel()
+        unknown_task.add_done_callback(_consume_usage_task_result)
+        raise
+    if unknown_task in done:
+        try:
+            unknown_task.result()
+        except Exception as exc:  # noqa: BLE001 - preserve cancellation
+            log.warning(
+                "usage_accounting.mark_unknown_failed",
+                event_id=call.event_id,
+                reason=stable_reason,
+                error=str(exc),
+            )
+        return
+
+    unknown_task.cancel()
+    unknown_task.add_done_callback(_consume_usage_task_result)
+    log.warning(
+        "usage_accounting.cancelled_terminal_timeout",
+        event_id=call.event_id,
+        reason=stable_reason,
+        timeout_seconds=_CANCELLED_USAGE_TERMINAL_GRACE_SECONDS,
+    )
 
 
 async def account_provider_stream(
@@ -337,6 +391,7 @@ async def account_provider_stream(
 
     call = await start_usage_call(scope, provider=provider, model=model)
     terminal = False
+    cancelled = False
     unknown_reason = "provider_stream_ended_without_usage"
     try:
         async for event in stream_factory():
@@ -358,6 +413,7 @@ async def account_provider_stream(
                     await finalize_usage_call(scope, call, event)
             yield event
     except asyncio.CancelledError:
+        cancelled = True
         unknown_reason = "cancelled"
         raise
     except Exception:
@@ -365,7 +421,14 @@ async def account_provider_stream(
         raise
     finally:
         if not terminal:
-            await mark_usage_call_unknown(scope, call, unknown_reason)
+            if cancelled:
+                await _mark_usage_call_unknown_after_cancellation(
+                    scope,
+                    call,
+                    unknown_reason,
+                )
+            else:
+                await mark_usage_call_unknown(scope, call, unknown_reason)
 
 
 def _usage_int(value: Any) -> int:

@@ -556,6 +556,9 @@ class CostRollupResult:
     cache_read: int
     cache_write: int
     model_override: str | None
+    # Physical provider paired with ``model_override``.  Kept separate from
+    # the user's explicit ``provider_override`` so routing is not pinned.
+    model_provider: str | None = None
 
 # ---------------------------------------------------------------------------
 # Stage I/O dataclasses

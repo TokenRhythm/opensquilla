@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -166,6 +167,70 @@ def _ctx(session_key: str = "agent:caller:main", agent_id: str = "caller") -> To
         session_key=session_key,
         task_id="task-parent",
     )
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_rejects_unbounded_inline_task_before_creating_child() -> None:
+    mgr = _StubSessionManager(
+        {"caller": {"id": "caller", "name": "Caller", "enabled": True}}
+    )
+    rt = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(rt)
+    token = current_tool_context.set(_ctx())
+    try:
+        with pytest.raises(sessions_tool.ToolError, match="artifact or workspace file"):
+            await sessions_tool.sessions_spawn(task="x" * 60_001)
+    finally:
+        current_tool_context.reset(token)
+
+    assert mgr.created == []
+    assert rt.enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_applies_declared_child_budget_before_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_models: list[str] = []
+
+    def resolve_budget(_provider: object, **kwargs: object) -> SimpleNamespace:
+        captured_models.append(str(kwargs.get("model") or ""))
+        return SimpleNamespace(
+            provider_id="fake",
+            model=str(kwargs.get("model") or ""),
+            context_window_tokens=2048,
+            max_output_tokens=2047,
+            provider_request_max_chars=4096,
+        )
+
+    monkeypatch.setattr(
+        sessions_tool,
+        "resolve_auxiliary_request_budget",
+        resolve_budget,
+    )
+    mgr = _StubSessionManager(
+        {
+            "caller": {"id": "caller", "enabled": True},
+            "worker": {"id": "worker", "enabled": True, "model": "worker-small"},
+        }
+    )
+    rt = _StubTaskRuntime()
+    sessions_tool.set_session_manager(mgr)
+    sessions_tool.set_task_runtime(rt)
+    token = current_tool_context.set(_ctx())
+    try:
+        with pytest.raises(
+            sessions_tool.ToolError,
+            match="resolved child deployment",
+        ):
+            await sessions_tool.sessions_spawn(agent_id="worker", task="bounded task")
+    finally:
+        current_tool_context.reset(token)
+
+    assert captured_models == ["worker-small"]
+    assert mgr.created == []
+    assert rt.enqueued == []
 
 
 @pytest.mark.asyncio

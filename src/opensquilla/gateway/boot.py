@@ -3611,13 +3611,23 @@ async def start_gateway_server(
         session_key: str,
         payload: dict[str, Any],
     ) -> None:
+        from opensquilla.gateway.session_streams import get_session_streams
+
         event_payload = dict(payload or {})
         event_payload.setdefault("status", "completed")
         event_payload.setdefault("source", "automatic")
+        # Lifecycle claiming and replay append now happen in one synchronous
+        # call stack. Network delivery remains asynchronous and at-least-once.
+        event_payload = get_session_streams().record(
+            session_key,
+            "session.event.compaction",
+            event_payload,
+        )
         emit_coro = runtime_event_bridge.emit(
             session_key,
             "session.event.compaction",
             event_payload,
+            replay_recorded=True,
         )
         try:
             create_background_task(emit_coro)

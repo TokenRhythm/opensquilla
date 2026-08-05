@@ -18,6 +18,7 @@ import pytest_asyncio
 
 from opensquilla.compat import aiosqlite
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.provider.auxiliary_budget import AuxiliaryRequestBudget
 from opensquilla.provider.protocol import ProviderConnectionConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.manager import SessionManager
@@ -366,6 +367,67 @@ async def test_call_naming_llm_payload_and_sanitization(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer test-key"
     assert captured["headers"]["HTTP-Referer"] == "https://opensquilla.ai"
     assert captured["headers"]["X-Title"] == "OpenSquilla"
+
+
+@pytest.mark.asyncio
+async def test_call_naming_llm_truncates_to_resolved_token_budget(monkeypatch):
+    captured: dict = {}
+    monkeypatch.setattr(
+        "opensquilla.session.naming.httpx.AsyncClient",
+        lambda **kwargs: _fake_client(captured),
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.naming.resolve_auxiliary_request_budget",
+        lambda *args, **kwargs: AuxiliaryRequestBudget(
+            provider_id="test",
+            model="tiny",
+            context_window_tokens=1024,
+            max_output_tokens=64,
+            max_input_tokens=160,
+            provider_request_max_chars=4096,
+            context_window_source="test",
+        ),
+    )
+    original = "中文🙂" * 1000
+
+    title = await call_naming_llm(
+        original,
+        model="tiny",
+        api_key="test-key",
+    )
+
+    assert title == "Reset my password"
+    sent = captured["json"]["messages"][1]["content"]
+    assert len(sent) < len(original)
+    assert captured["json"]["max_tokens"] == 64
+
+
+@pytest.mark.asyncio
+async def test_call_naming_llm_skips_when_request_framing_cannot_fit(monkeypatch):
+    called = False
+
+    def fake_client(**kwargs):
+        nonlocal called
+        del kwargs
+        called = True
+        return _fake_client({})
+
+    monkeypatch.setattr("opensquilla.session.naming.httpx.AsyncClient", fake_client)
+    monkeypatch.setattr(
+        "opensquilla.session.naming.resolve_auxiliary_request_budget",
+        lambda *args, **kwargs: AuxiliaryRequestBudget(
+            provider_id="test",
+            model="tiny",
+            context_window_tokens=32,
+            max_output_tokens=16,
+            max_input_tokens=1,
+            provider_request_max_chars=1,
+            context_window_source="test",
+        ),
+    )
+
+    assert await call_naming_llm("hello", model="tiny", api_key="test-key") is None
+    assert called is False
 
 
 @pytest.mark.asyncio

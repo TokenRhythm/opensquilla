@@ -16,6 +16,10 @@ from opensquilla.cli.gateway_client import (
     _task_terminal_as_session_event,
     session_history_all,
 )
+from opensquilla.contracts.gateway_transport import (
+    GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+    GATEWAY_CLIENT_MAX_QUEUE,
+)
 
 _STOP = object()
 
@@ -62,8 +66,15 @@ async def _wait_for(predicate, *, timeout: float = 1.0) -> None:
         await asyncio.sleep(0.005)
 
 
-def _install_fake_websockets(monkeypatch: pytest.MonkeyPatch, ws: _FakeWebSocket) -> None:
-    async def _connect(url: str) -> _FakeWebSocket:
+def _install_fake_websockets(
+    monkeypatch: pytest.MonkeyPatch,
+    ws: _FakeWebSocket,
+    *,
+    observed_connect: dict[str, Any] | None = None,
+) -> None:
+    async def _connect(url: str, **kwargs: Any) -> _FakeWebSocket:
+        if observed_connect is not None:
+            observed_connect.update({"url": url, **kwargs})
         return ws
 
     monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=_connect))
@@ -119,6 +130,30 @@ def _handshake_frames(*, keepalive_ms: int = 60_000) -> list[dict[str, Any]]:
             "policy": {"client_ws_keepalive_timeout_ms": keepalive_ms},
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_client_connect_uses_bounded_transport_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _FakeWebSocket(_handshake_frames())
+    observed_connect: dict[str, Any] = {}
+    _install_fake_websockets(
+        monkeypatch,
+        ws,
+        observed_connect=observed_connect,
+    )
+    client = GatewayClient()
+
+    await client.connect("ws://127.0.0.1:18791/ws")
+    try:
+        assert observed_connect == {
+            "url": "ws://127.0.0.1:18791/ws",
+            "max_size": GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+            "max_queue": GATEWAY_CLIENT_MAX_QUEUE,
+        }
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

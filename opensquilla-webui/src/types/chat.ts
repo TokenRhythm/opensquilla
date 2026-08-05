@@ -374,6 +374,18 @@ export interface ChatReasoning {
   seconds: number
 }
 
+/** A non-conversational maintenance event rendered inside transcript chronology. */
+export interface ChatMaintenanceEvent {
+  kind: 'context_compaction'
+  compactionId: string
+  source: string
+  state: 'running' | 'completed' | 'skipped' | 'stale' | 'cancelled' | 'failed'
+  durability: string
+  detail?: string
+  removedCount?: number
+  keptCount?: number
+}
+
 export interface ChatMessage {
   role: ChatRole
   text: string
@@ -422,6 +434,8 @@ export interface ChatMessage {
   output?: number
   output_tokens?: number
   restoredFromHistory?: boolean
+  /** Durable transcript maintenance restored from chat.history metadata. */
+  maintenance?: ChatMaintenanceEvent
   statusHistory?: import('./parts').StatusPart[]
   /** Live approval/clarify snapshots referenced by interrupt timeline segments. */
   interrupts?: Extract<import('./parts').ChatPart, { type: 'interrupt' }>[]
@@ -465,9 +479,11 @@ export interface ChatRenderedMessage {
   showHeader: boolean
   isStreaming?: boolean
   messageId?: string
+  restoredFromHistory?: boolean
   /** Stable identity of the owning user turn for client-only UI continuity. */
   turnKey?: string
   inputDisposition?: ChatSteerDisposition
+  maintenance?: ChatMaintenanceEvent
   inputDispositionRevision?: number
   turnOutcome?: ChatTurnOutcome
   hasAttachments?: boolean

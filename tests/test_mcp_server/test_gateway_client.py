@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from opensquilla.contracts.gateway_transport import (
+    GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+    GATEWAY_CLIENT_MAX_QUEUE,
+)
 from opensquilla.gateway_client import GatewayRPCClient, normalize_gateway_url
 
 
@@ -87,8 +92,10 @@ async def test_gateway_connect_closes_socket_after_bad_handshake(monkeypatch) ->
             return json.dumps({"type": "event", "event": "unexpected"})
 
     ws = BadHandshakeWebSocket()
+    observed_connect: dict[str, Any] = {}
 
-    async def connect(_url: str):
+    async def connect(url: str, **kwargs: Any):
+        observed_connect.update({"url": url, **kwargs})
         return ws
 
     monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=connect))
@@ -99,3 +106,8 @@ async def test_gateway_connect_closes_socket_after_bad_handshake(monkeypatch) ->
 
     assert ws.closed is True
     assert client._ws is None
+    assert observed_connect == {
+        "url": "ws://127.0.0.1:18791/ws",
+        "max_size": GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+        "max_queue": GATEWAY_CLIENT_MAX_QUEUE,
+    }

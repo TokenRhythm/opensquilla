@@ -173,6 +173,33 @@
           </template>
         </ChatMessageList>
 
+        <!-- Manual or turn-boundary compaction has no assistant turn to own
+             it. Keep one quiet transcript maintenance row instead of a
+             floating success card or a second task-like animation. -->
+        <div
+          v-if="compactStatus.visible && !compactStatus.compactionId"
+          class="chat-compaction-event"
+          :class="{
+            'chat-compaction-event--running': compactStatus.isBusy,
+            'chat-compaction-event--failed': compactStatus.tone === 'err',
+          }"
+          data-testid="compaction-event"
+          :data-compaction-id="compactStatus.compactionId"
+          :data-status="compactStatus.status"
+          :data-source="compactStatus.source"
+          :data-durability="compactStatus.durability"
+          data-placement="turn-boundary"
+          :role="compactStatus.tone === 'err' ? 'alert' : 'status'"
+          :aria-live="compactStatus.tone === 'err' ? 'assertive' : 'polite'"
+          aria-atomic="true"
+        >
+          <span class="chat-compaction-event__marker" aria-hidden="true" />
+          <span class="chat-compaction-event__title">{{ compactStatus.message }}</span>
+          <span v-if="compactStatus.detail" class="chat-compaction-event__detail">
+            {{ compactStatus.detail }}
+          </span>
+        </div>
+
         <PlanCard
           v-if="currentPlan && !currentPlanInHistory"
           :plan="currentPlan"
@@ -371,30 +398,6 @@
           @navigate="onHistoryNavigate"
           @navigate-end="onHistoryNavigateEnd"
         />
-      </div>
-    </div>
-
-    <!-- Compaction maintenance card -->
-    <div v-if="compactStatus.visible" class="chat-compact-status" :class="`chat-compact-status--${compactStatus.tone}`" role="status" aria-live="polite">
-      <div class="chat-compact-status__head">
-        <span class="chat-compact-status__dot" :class="{ 'chat-compact-status__dot--pulsing': compactStatus.isBusy }" aria-hidden="true" />
-        <span class="chat-compact-status__title">{{ compactStatus.message }}</span>
-        <span v-if="compactElapsed" class="chat-compact-status__elapsed">{{ compactElapsed }}</span>
-      </div>
-      <p v-if="compactStatus.detail" class="chat-compact-status__detail">{{ compactStatus.detail }}</p>
-      <div v-if="compactGaugeVisible" class="chat-compact-status__gauge" aria-hidden="true">
-        <span
-          class="chat-compact-status__gauge-fill"
-          :class="{
-            'chat-compact-status__gauge-fill--breathing': compactStatus.isBusy,
-            'chat-compact-status__gauge-fill--done': compactStatus.status === 'completed',
-          }"
-          :style="compactStatus.occupancyPercent !== null ? { width: `${compactStatus.occupancyPercent}%` } : undefined"
-        />
-      </div>
-      <div v-if="compactGaugeVisible && compactStatus.occupancyPercent !== null" class="chat-compact-status__legend">
-        <span>context {{ compactStatus.occupancyPercent }}%</span>
-        <span v-if="compactStatus.contextWindowLabel">{{ compactStatus.contextWindowLabel }}</span>
       </div>
     </div>
 
@@ -694,6 +697,7 @@ import {
 import { useFreshTaskDraft } from '@/composables/useFreshTaskDraft'
 import type {
   Attachment,
+  ChatMaintenanceEvent,
   ChatMessage,
   ChatPendingItem,
   ChatRenderedMessage,
@@ -1151,7 +1155,7 @@ const chatCompaction = useChatCompaction({
 })
 const {
   compactStatus,
-  compactElapsed,
+  getCompactionPlacement,
   setCompactInFlight,
   hideCompactStatus,
   showCompactStatus,
@@ -1160,10 +1164,47 @@ const {
 } = chatCompaction
 isCompactInFlightForCurrentSession = chatCompaction.isCompactInFlightForCurrentSession
 
-// The context gauge stays up while compaction runs and settles on completed;
-// skipped/failed/cancelled keep the card head only.
-const compactGaugeVisible = computed(() =>
-  compactStatus.value.isBusy || compactStatus.value.status === 'completed')
+function transcriptCompactionState(status: string): ChatMaintenanceEvent['state'] {
+  if (status === 'skipped') return 'skipped'
+  if (status === 'stale') return 'stale'
+  if (status === 'cancelled') return 'cancelled'
+  if (['failed', 'error', 'timed_out'].includes(status)) return 'failed'
+  if (['completed', 'emergency_ephemeral'].includes(status)) return 'completed'
+  return 'running'
+}
+
+// Standalone compaction has no assistant turn to own it. Anchor its lifecycle
+// in the transcript at first observation and update that same row by id, so a
+// later user turn cannot make the maintenance boundary drift down the page.
+watch(compactStatus, (status) => {
+  const compactionId = String(status.compactionId || '').trim()
+  if (!status.visible || !compactionId) return
+  const maintenance: ChatMaintenanceEvent = {
+    kind: 'context_compaction',
+    compactionId,
+    source: status.source || 'manual',
+    state: transcriptCompactionState(status.status),
+    durability: status.durability || '',
+    ...(status.detail ? { detail: status.detail } : {}),
+  }
+  const index = messages.value.findIndex(message => (
+    message.role === 'maintenance'
+    && message.maintenance?.kind === 'context_compaction'
+    && message.maintenance.compactionId === compactionId
+  ))
+  if (index >= 0) {
+    const previous = messages.value[index]!
+    messages.value.splice(index, 1, { ...previous, maintenance })
+    return
+  }
+  messages.value.push({
+    role: 'maintenance',
+    text: '',
+    ts: Date.now(),
+    clientId: `live-maintenance:context-compaction:${compactionId}`,
+    maintenance,
+  })
+}, { flush: 'sync' })
 
 const chatUsageWidget = useChatUsageWidget({
   rpc,
@@ -1673,6 +1714,7 @@ watch(activeWorkspaceStatus, (status, previousStatus) => {
 const sessionHasActiveWork = computed(() => (
   isStreaming.value
   || activeTaskGroups.value.size > 0
+  || isCompactInFlightForCurrentSession()
   || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status)
   || activePlanRun.value?.status === 'queued'
   || activePlanRun.value?.status === 'running'
@@ -1768,6 +1810,7 @@ const chatSlashCommands = useChatSlashCommands({
   },
   setCompactInFlight,
   showCompactStatus,
+  showCompactionToast,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
   dispatchHidden: (providerText: string, displayText: string) => dispatchHiddenForMeta(providerText, displayText),
   dispatchPlanPrompt: (prompt: string, composerText: string) => {
@@ -2062,6 +2105,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   clearPendingRouterDecision,
   handleRouterControlReplay,
   showCompactionToast,
+  getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
@@ -2127,6 +2171,7 @@ const liveActivityPhaseLabel = computed(() => {
     .find(step => step.isCurrent)
   if (
     currentStatus
+    && currentStatus.category !== 'maintenance'
     && !currentStatus.label.code.startsWith('chat.activity.lifecycle.')
     && !liveActivityProjection.value.currentClusterKey
   ) {

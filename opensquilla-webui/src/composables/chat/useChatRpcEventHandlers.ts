@@ -26,6 +26,7 @@ import type {
 import type { ChatRpcSubscriptionHandlers } from '@/composables/chat/useChatRpcSubscriptions'
 import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
 import type { FrameInput } from '@/types/turnlog'
+import type { StatusPart } from '@/types/parts'
 import type { FoldLiveTurnMode } from '@/composables/chat/useChatTurnLog'
 import {
   FINISHED_STREAM_TASK_ID,
@@ -74,6 +75,7 @@ export interface ChatRpcStreamApi {
   resetStreamIdleTimer: () => void
   clearStreamIdleTimer: () => void
   setStreamActivity: (label: string) => void
+  recordCompactionActivity?: (payload: CompactionPayload) => void
   showThinkingIndicator: () => void
   hideThinkingIndicator: () => void
   // live-turn shadow log: the thinking ref lives here, so this composable appends
@@ -81,6 +83,9 @@ export interface ChatRpcStreamApi {
   appendFrame: (frame: FrameInput) => void
   useReducer: Ref<FoldLiveTurnMode>
 }
+
+type ChatCompactionPlacement = 'activity' | 'standalone'
+type ChatCompactionPresentationResult = boolean | ChatCompactionPlacement | void
 
 export interface UseChatRpcEventHandlersOptions {
   sessionKey: Ref<string>
@@ -106,7 +111,11 @@ export interface UseChatRpcEventHandlersOptions {
   flushPendingRouterDecision: () => void
   clearPendingRouterDecision: () => void
   handleRouterControlReplay: () => void
-  showCompactionToast: (payload: CompactionPayload, meta?: Record<string, unknown>) => void
+  showCompactionToast: (
+    payload: CompactionPayload,
+    meta?: Record<string, unknown>,
+  ) => ChatCompactionPresentationResult
+  getCompactionPlacement?: (compactionId: string) => ChatCompactionPlacement | undefined
   showWarningToast: (message: string) => void
   scheduleHistorySync: () => void
   schedulePendingDrainAfterTerminal: () => void
@@ -152,10 +161,35 @@ type BufferedPendingStreamEvent = {
   payload: SessionEventPayload
 }
 
+type BufferedPendingReplayEntry =
+  | {
+      kind: 'stream'
+      event: string
+      payload: SessionEventPayload
+      order: number
+    }
+  | {
+      kind: 'terminal'
+      terminal: BufferedTerminalEvent
+      payload: SessionEventPayload
+      order: number
+    }
+
 const MAX_PENDING_TASK_BUCKETS = 8
 const MAX_PENDING_STREAM_EVENTS_PER_TASK = 64
 const SERVER_CLOCK_TOLERANCE_MS = 5_000
 const MAX_TRUSTED_REASONING_AGE_MS = 60 * 60 * 1_000
+
+const COMPACTION_TERMINAL_STATUSES = new Set([
+  'completed',
+  'skipped',
+  'failed',
+  'error',
+  'cancelled',
+  'timed_out',
+  'stale',
+  'emergency_ephemeral',
+])
 
 type LiveThinking = {
   text: string
@@ -245,6 +279,97 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   const settledTaskIds = new Set<string>()
   const restoredSteerRequestIds = new Set<string>()
 
+  function compactionStatus(payload: CompactionPayload): string {
+    const status = String(payload.status || '').toLowerCase()
+    if (status) return status
+    if (Object.prototype.hasOwnProperty.call(payload, 'compacted')) {
+      return payload.compacted ? 'completed' : 'skipped'
+    }
+    return ''
+  }
+
+  function payloadCompactionId(payload: CompactionPayload): string {
+    return String(payload.compaction_id || payload.compactionId || '').trim()
+  }
+
+  function compactionTerminalActivityState(status: string): StatusPart['state'] | undefined {
+    if (status === 'completed' || status === 'emergency_ephemeral') return 'completed'
+    if (status === 'skipped') return 'skipped'
+    if (status === 'stale' || status === 'cancelled') return 'cancelled'
+    if (status === 'failed' || status === 'error' || status === 'timed_out') return 'failed'
+    return undefined
+  }
+
+  function settleCommittedCompactionActivity(payload: CompactionPayload): boolean {
+    const id = payloadCompactionId(payload)
+    const state = compactionTerminalActivityState(compactionStatus(payload))
+    if (!id || !state) return false
+
+    for (let messageIndex = messages.value.length - 1; messageIndex >= 0; messageIndex -= 1) {
+      const message = messages.value[messageIndex]
+      if (message?.role !== 'assistant' || !message.statusHistory) continue
+      for (let statusIndex = message.statusHistory.length - 1; statusIndex >= 0; statusIndex -= 1) {
+        const marker = message.statusHistory[statusIndex]
+        if (marker?.action !== 'context_compaction' || marker.id !== id) continue
+        message.statusHistory[statusIndex] = {
+          ...marker,
+          state,
+          // The lifecycle stays anchored where its started frame first appeared.
+          at: marker.at,
+        }
+        return true
+      }
+    }
+    return false
+  }
+
+  function trackedLateCompactionPlacement(
+    payload: CompactionPayload,
+  ): ChatCompactionPlacement | undefined {
+    if (activeStreamTaskId.value !== FINISHED_STREAM_TASK_ID) return undefined
+    if (!isCurrentSessionPayload(payload)) return undefined
+    if (!COMPACTION_TERMINAL_STATUSES.has(compactionStatus(payload))) return undefined
+    const id = payloadCompactionId(payload)
+    if (!id) return undefined
+    return options.getCompactionPlacement?.(id)
+  }
+
+  function bufferedStreamSeq(payload: SessionEventPayload): number | null {
+    const sequence = payload.stream_seq
+    return typeof sequence === 'number' && Number.isFinite(sequence) ? sequence : null
+  }
+
+  function withoutBufferedStreamSeq(payload: SessionEventPayload): SessionEventPayload {
+    const replayPayload = { ...payload }
+    delete replayPayload.stream_seq
+    return replayPayload
+  }
+
+  function comparePendingReplayEntries(
+    left: BufferedPendingReplayEntry,
+    right: BufferedPendingReplayEntry,
+  ): number {
+    const leftSequence = bufferedStreamSeq(left.payload)
+    const rightSequence = bufferedStreamSeq(right.payload)
+    if (leftSequence !== null && rightSequence !== null && leftSequence !== rightSequence) {
+      return leftSequence - rightSequence
+    }
+    // Mixed-version gateways may omit sequence numbers. Preserve their old
+    // stream-before-terminal behavior while still sorting every numbered frame.
+    if (leftSequence !== null && rightSequence === null) {
+      return right.kind === 'terminal' ? -1 : 1
+    }
+    if (leftSequence === null && rightSequence !== null) {
+      return left.kind === 'terminal' ? 1 : -1
+    }
+    if (leftSequence !== null && leftSequence === rightSequence && left.kind !== right.kind) {
+      // A terminal owns the cursor for a shared sequence, after all visible
+      // frames at that sequence have been applied.
+      return left.kind === 'terminal' ? 1 : -1
+    }
+    return left.order - right.order
+  }
+
   function terminalEventPriority(event: string): number {
     if (event === 'session.event.done' || event === 'chat.done' || event.endsWith('.error')) return 3
     if (eventTaskTerminalStatus(event)) return 2
@@ -330,6 +455,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       handleRpcEnsembleProgress(payload as EnsembleProgressPayload)
     } else if (event === 'session.event.router_control_replay') {
       handleRpcRouterControlReplay(payload)
+    } else if (event === 'session.event.compaction') {
+      // A live snapshot is the authoritative base for the active stream, not
+      // historical replay. Compaction deliberately ignores replayed
+      // non-terminal events, so mark this as live to restore the busy/Stop
+      // state before subscribing from snapshot.current_stream_seq.
+      handleRpcCompaction(payload as CompactionPayload, {
+        authoritativeLive: true,
+        replayed: false,
+      })
     } else if (event === 'session.event.thinking') {
       handleRpcAny(event, payload)
     }
@@ -367,6 +501,14 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }
 
+  function replayPendingTerminalEvent(entry: BufferedTerminalEvent) {
+    if (entry.kind === 'session-change') {
+      handleRpcSessionsChanged(entry.payload)
+    } else {
+      handleRpcAny(entry.event, entry.payload)
+    }
+  }
+
   function bindActiveStreamTask(taskId: string) {
     if (!taskId) return
     const bufferedTerminal = pendingTerminalEvents.get(taskId)
@@ -381,12 +523,42 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       return
     }
     activeStreamTaskId.value = taskId
-    for (const entry of bufferedStream) replayPendingStreamEvent(entry)
-    if (!bufferedTerminal) return
-    if (bufferedTerminal.kind === 'session-change') {
-      handleRpcSessionsChanged(bufferedTerminal.payload)
-    } else {
-      handleRpcAny(bufferedTerminal.event, bufferedTerminal.payload)
+
+    const replayEntries: BufferedPendingReplayEntry[] = bufferedStream.map(
+      (entry, order) => ({ kind: 'stream', ...entry, order }),
+    )
+    if (bufferedTerminal) {
+      replayEntries.push({
+        kind: 'terminal',
+        terminal: bufferedTerminal,
+        payload: bufferedTerminal.payload,
+        order: bufferedStream.length,
+      })
+    }
+    replayEntries.sort(comparePendingReplayEntries)
+
+    const terminalSequence = bufferedTerminal
+      ? bufferedStreamSeq(bufferedTerminal.payload)
+      : null
+    let taskTerminalReplayed = false
+    for (const entry of replayEntries) {
+      if (entry.kind === 'terminal') {
+        replayPendingTerminalEvent(entry.terminal)
+        taskTerminalReplayed = true
+        continue
+      }
+
+      const sequence = bufferedStreamSeq(entry.payload)
+      const sharesTerminalSequence = terminalSequence !== null && sequence === terminalSequence
+      const maintenanceAfterTerminal = taskTerminalReplayed
+        && entry.event === 'session.event.compaction'
+      // Let the terminal own a shared cursor. A tracked compaction terminal may
+      // still close its existing UI after task completion, but it must not move
+      // the task cursor past the terminal that closed the stream.
+      const payload = sharesTerminalSequence || maintenanceAfterTerminal
+        ? withoutBufferedStreamSeq(entry.payload)
+        : entry.payload
+      replayPendingStreamEvent({ event: entry.event, payload })
     }
   }
 
@@ -722,9 +894,64 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function handleRpcCompaction(payload: CompactionPayload, meta: unknown) {
     if (isStaleEpoch(payload)) return
+    if (bufferPendingStreamEvent('session.event.compaction', payload)) return
+    const trackedPlacement = trackedLateCompactionPlacement(payload)
+    if (!isCurrentTaskPayload(payload) && !trackedPlacement) return
     if (!acceptStreamSeq(payload)) return
     const safeMeta = (meta && typeof meta === 'object' ? meta : {}) as Record<string, unknown>
-    options.showCompactionToast(payload || {}, safeMeta)
+    const source = String(payload.source || '').toLowerCase()
+    const status = compactionStatus(payload)
+    const userVisible = payload.user_visible ?? payload.userVisible ?? true
+    const taskId = payloadTaskId(payload)
+    const ownedByCurrentTask = Boolean(
+      taskId
+      && activeStreamTaskId.value
+      && taskId === activeStreamTaskId.value,
+    )
+    const canOwnActivity = source !== 'manual'
+      && userVisible !== false
+      && !['skipped', 'stale'].includes(status)
+    const prefersActivity = canOwnActivity
+      && (
+        stream.isStreaming.value
+        || safeMeta.authoritativeLive === true
+        || ownedByCurrentTask
+      )
+    const settleCommittedActivity = trackedPlacement === 'activity'
+      && !stream.isStreaming.value
+    // An authoritative snapshot can contain compaction before any state/text
+    // frame. Open the live reducer first so a later startStreaming() cannot
+    // reset and discard the restored maintenance marker.
+    if (prefersActivity && !stream.isStreaming.value && !settleCommittedActivity) {
+      stream.startStreaming()
+    }
+
+    const requestedPlacement: ChatCompactionPlacement = trackedPlacement
+      || (prefersActivity ? 'activity' : 'standalone')
+    const presentation = options.showCompactionToast(payload || {}, {
+      ...safeMeta,
+      placement: requestedPlacement,
+    })
+    if (presentation === false) return
+    const placement: ChatCompactionPlacement = presentation === 'activity'
+      || presentation === 'standalone'
+      ? presentation
+      : requestedPlacement
+    if (placement === 'activity') {
+      if (settleCommittedActivity) {
+        settleCommittedCompactionActivity(payload)
+      } else {
+        if (!stream.isStreaming.value && (safeMeta.authoritativeLive === true || ownedByCurrentTask)) {
+          stream.startStreaming()
+        }
+        stream.recordCompactionActivity?.(payload)
+      }
+    }
+    const compactionId = payloadCompactionId(payload)
+    const durable = String(payload.durability || '').toLowerCase() === 'durable'
+    if (source === 'manual' && status === 'completed' && (durable || compactionId)) {
+      options.scheduleHistorySync()
+    }
   }
 
   function handleRpcWarning(payload: WarningPayload) {
@@ -733,7 +960,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // Silent compatibility warnings still own their stream sequence. Consuming
     // it before the display filter prevents a later replay from being accepted.
     if (!acceptStreamSeq(payload)) return
-    if (payload.code === 'provider_reasoning_only_retry') return
+    if (
+      payload.code === 'provider_reasoning_only_retry'
+      || payload.code === 'provider_request_message_limit_recovery_success'
+      || payload.code === 'context_auto_compaction_start'
+      || payload.code === 'context_auto_compaction_retry'
+    ) return
     // Let the view provide the locale-specific fallback when older gateways
     // omit a warning message.
     options.showWarningToast(String(payload.message || ''))

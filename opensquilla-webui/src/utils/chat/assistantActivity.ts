@@ -108,12 +108,23 @@ export interface AssistantActivityCluster {
 export type AssistantActivityStatusCode =
   | AssistantActivityLifecycleCode
   | AssistantActivityPurposeCode
+  | 'chat.compact.compacting'
+  | 'chat.compact.compacted'
+  | 'chat.compact.withinBudget'
+  | 'chat.compact.cancelled'
+  | 'chat.compact.failed'
 
 export interface AssistantActivityStatusStep {
   key: string
   label: AssistantActivityCodeDescriptor<AssistantActivityStatusCode>
   at: number
   isCurrent: boolean
+  id?: string
+  category?: 'phase' | 'maintenance'
+  state?: 'running' | 'completed' | 'skipped' | 'stale' | 'cancelled' | 'failed'
+  source?: string
+  durability?: string
+  detail?: string
 }
 
 export interface AssistantActivityTimelineProjection {
@@ -794,6 +805,15 @@ function statusLabelFor(
   entry: StatusPart,
   clusters: AssistantActivityCluster[],
 ): AssistantActivityCodeDescriptor<AssistantActivityStatusCode> | null {
+  if (entry.category === 'maintenance') {
+    if (entry.state === 'failed') return codeDescriptor('chat.compact.failed')
+    if (entry.state === 'skipped') return codeDescriptor('chat.compact.withinBudget')
+    if (entry.state === 'stale' || entry.state === 'cancelled') {
+      return codeDescriptor('chat.compact.cancelled')
+    }
+    if (entry.state === 'running') return codeDescriptor('chat.compact.compacting')
+    return codeDescriptor('chat.compact.compacted')
+  }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
   if (normalized.startsWith('tool:')) {
@@ -821,7 +841,51 @@ function statusLabelFor(
  * by construction.
  */
 export function isSemanticActivityStatusStep(step: AssistantActivityStatusStep): boolean {
-  return !step.isCurrent && !step.label.code.startsWith('chat.activity.lifecycle.')
+  return step.category !== 'maintenance'
+    && !step.isCurrent
+    && !step.label.code.startsWith('chat.activity.lifecycle.')
+}
+
+function isAutomaticCompletedMaintenance(step: AssistantActivityStatusStep): boolean {
+  return step.category === 'maintenance'
+    && step.state === 'completed'
+    && String(step.source || '').toLowerCase() === 'automatic'
+    && Boolean(step.id)
+}
+
+/**
+ * One automatic compaction may be observed through both a transient request
+ * lifecycle and the durable history rewrite. When the backend uses different
+ * ids for those adjacent terminal observations, present them as one maintenance
+ * result. A failure or any intervening phase is a hard boundary.
+ */
+function mergeAdjacentAutomaticCompletedMaintenance(
+  steps: AssistantActivityStatusStep[],
+): AssistantActivityStatusStep[] {
+  const merged: AssistantActivityStatusStep[] = []
+  for (const step of steps) {
+    const previous = merged[merged.length - 1]
+    if (
+      previous
+      && isAutomaticCompletedMaintenance(previous)
+      && isAutomaticCompletedMaintenance(step)
+      && previous.id !== step.id
+    ) {
+      const preferred = step.durability === 'durable' && previous.durability !== 'durable'
+        ? step
+        : previous
+      merged[merged.length - 1] = {
+        ...preferred,
+        // Preserve the first visual position and keyed DOM row while allowing
+        // durable metadata (including its id) to become authoritative.
+        key: previous.key,
+        at: previous.at,
+      }
+      continue
+    }
+    merged.push(step)
+  }
+  return merged
 }
 
 function projectStatusSteps(
@@ -830,9 +894,31 @@ function projectStatusSteps(
   lifecycle: AssistantActivityLifecycle,
 ): AssistantActivityStatusStep[] {
   const steps: AssistantActivityStatusStep[] = []
+  const maintenanceById = new Map<string, number>()
   for (const entry of history) {
     const label = statusLabelFor(entry, clusters)
     if (!label) continue
+    if (entry.category === 'maintenance') {
+      const step: AssistantActivityStatusStep = {
+        key: `activity-maintenance:${entry.id || stableHash(`${entry.at}`)}`,
+        label,
+        at: entry.at,
+        isCurrent: entry.state === 'running',
+        id: entry.id,
+        category: 'maintenance',
+        state: entry.state,
+        source: entry.source,
+        durability: entry.durability,
+        detail: entry.detail,
+      }
+      if (entry.id && maintenanceById.has(entry.id)) {
+        steps[maintenanceById.get(entry.id)!] = step
+      } else {
+        if (entry.id) maintenanceById.set(entry.id, steps.length)
+        steps.push(step)
+      }
+      continue
+    }
     const previous = steps[steps.length - 1]
     if (previous?.label.code === label.code) continue
     steps.push({
@@ -840,16 +926,19 @@ function projectStatusSteps(
       label,
       at: entry.at,
       isCurrent: false,
+      category: 'phase',
     })
   }
+  const mergedSteps = mergeAdjacentAutomaticCompletedMaintenance(steps)
   if (
-    steps.length
+    mergedSteps.length
     && !clusters.some(cluster => cluster.isCurrent)
     && (lifecycle === 'working' || lifecycle === 'answering')
   ) {
-    steps[steps.length - 1].isCurrent = true
+    const lastPhase = [...mergedSteps].reverse().find(step => step.category !== 'maintenance')
+    if (lastPhase) lastPhase.isCurrent = true
   }
-  return steps
+  return mergedSteps
 }
 
 /**
