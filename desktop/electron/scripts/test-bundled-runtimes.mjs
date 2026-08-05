@@ -12,6 +12,7 @@ import {
   downloadVerifiedAsset,
   loadRuntimeManifest,
   packagedRuntimeTarget,
+  tarExtractArgs,
   validateRuntimeManifest,
 } from './fetch-bundled-runtimes.mjs'
 
@@ -30,6 +31,28 @@ try {
     defaultRuntimeCacheRoot.startsWith(defaultRuntimeRoot),
     false,
     'download archives must stay outside packaged runtime resources',
+  )
+  assert.deepEqual(
+    tarExtractArgs(
+      String.raw`D:\a\opensquilla\.runtime-cache\python.tar.gz`,
+      String.raw`D:\a\opensquilla\runtime\python.staging`,
+      1,
+      'win32',
+    ),
+    [
+      '--force-local',
+      '-xf',
+      String.raw`D:\a\opensquilla\.runtime-cache\python.tar.gz`,
+      '-C',
+      String.raw`D:\a\opensquilla\runtime\python.staging`,
+      '--strip-components=1',
+    ],
+    'GNU tar must treat Windows drive-letter paths as local archives',
+  )
+  assert.deepEqual(
+    tarExtractArgs('/tmp/python.tar.gz', '/tmp/python.staging', 0, 'darwin'),
+    ['-xf', '/tmp/python.tar.gz', '-C', '/tmp/python.staging'],
+    'non-Windows tar arguments must stay portable',
   )
   const releaseManifest = await loadRuntimeManifest(defaultManifestPath)
   const requiredTargets = [

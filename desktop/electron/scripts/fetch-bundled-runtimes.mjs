@@ -184,6 +184,18 @@ function runChecked(command, args, options = {}) {
   }
 }
 
+export function tarExtractArgs(
+  archive,
+  destination,
+  stripComponents,
+  platform = process.platform,
+) {
+  const args = platform === 'win32' ? ['--force-local'] : []
+  args.push('-xf', archive, '-C', destination)
+  if (stripComponents > 0) args.push(`--strip-components=${stripComponents}`)
+  return args
+}
+
 async function extractAsset(asset, archive, destination) {
   await rm(destination, { recursive: true, force: true })
   await mkdir(destination, { recursive: true })
@@ -209,9 +221,7 @@ async function extractAsset(asset, archive, destination) {
     }
     return
   }
-  const args = ['-xf', archive, '-C', destination]
-  if (asset.stripComponents > 0) args.push(`--strip-components=${asset.stripComponents}`)
-  runChecked('tar', args)
+  runChecked('tar', tarExtractArgs(archive, destination, asset.stripComponents))
 }
 
 function targetAssets(manifest, target) {
