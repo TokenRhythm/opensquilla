@@ -202,6 +202,35 @@ metadata:
     ]
 
 
+def test_non_string_trigger_elements_are_stringified(tmp_path: Path) -> None:
+    """Numeric or nested-list trigger elements must not leak into the wire contract.
+
+    The WebUI filter and the in-process trigger matcher both call
+    ``.lower()`` on every trigger, so a non-string element crashes them
+    (issue #1018: ``e.toLowerCase is not a function``).
+    """
+    _write_skill(
+        tmp_path,
+        "mixed-triggers",
+        """---
+name: mixed-triggers
+description: Skill whose trigger list contains non-string elements.
+triggers:
+  - dubbing
+  - 123
+  - ["nested", "list"]
+---
+
+# body
+""",
+    )
+    loader = SkillLoader(bundled_dir=tmp_path)
+    spec = loader.get_by_name("mixed-triggers")
+    assert spec is not None
+    assert spec.triggers == ["dubbing", "123", "['nested', 'list']"]
+    assert all(isinstance(trigger, str) for trigger in spec.triggers)
+
+
 def test_existing_bundled_skills_still_parse() -> None:
     """Regression guard: every bundled SKILL.md must still parse after the patch."""
     loader = SkillLoader(bundled_dir=BUNDLED)

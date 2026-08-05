@@ -345,7 +345,7 @@ export function useSkillsCatalog(
       skills = skills.filter(s =>
         (s.name || '').toLowerCase().includes(ft) ||
         (s.description || '').toLowerCase().includes(ft) ||
-        (s.triggers || []).some(t => t.toLowerCase().includes(ft))
+        (s.triggers || []).some(t => String(t).toLowerCase().includes(ft))
       )
     }
     if (statusFilter.value === 'ready') {

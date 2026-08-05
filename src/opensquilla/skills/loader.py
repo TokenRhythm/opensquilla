@@ -1171,6 +1171,12 @@ class SkillLoader:
             triggers = frontmatter.get("triggers", [])
             if not isinstance(triggers, list):
                 triggers = [str(triggers)]
+            else:
+                # The wire contract is ``list[str]`` and both the WebUI filter
+                # and the in-process trigger matcher call ``.lower()`` on every
+                # element. Stringify list elements so a numeric scalar or a
+                # nested YAML list in a community SKILL.md cannot crash them.
+                triggers = [str(trigger) for trigger in triggers]
 
             # Platform metadata fields
             metadata = _resolve_metadata(frontmatter)
