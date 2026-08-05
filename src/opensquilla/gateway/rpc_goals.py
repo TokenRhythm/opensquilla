@@ -105,6 +105,19 @@ async def _cancel_orphan_goal_run(storage: Any, goal_id: str) -> None:
 
 @_d.method("goals.set", scope="operator.write")
 async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
+    async def _ensure_goal_session(ctx: RpcContext, key: str) -> Any:
+        manager = getattr(ctx, "session_manager", None)
+        create = getattr(manager, "create", None)
+        if not callable(create):
+            return None
+        try:
+            from opensquilla.gateway.rpc_sessions import normalize_agent_id
+
+            agent_id = normalize_agent_id(key.split(":")[1] if key.count(":") >= 2 else "main")
+            return await create(session_key=key, agent_id=agent_id)
+        except Exception:  # noqa: BLE001 - best effort; caller raises if still absent
+            return None
+
     from opensquilla.gateway.rpc_sessions import (
         _emit_to_subscribers,
         _handle_sessions_send,
@@ -119,7 +132,12 @@ async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
         raise ValueError("params.message is required")
     session = await storage.get_session(key)
     if session is None:
-        raise KeyError(f"Session not found: {key}")
+        # A goal may target a session that has not been materialized yet (the
+        # Web UI new-chat landing is a client-side draft until first send).
+        # Create it on demand so a goal is self-contained end to end.
+        session = await _ensure_goal_session(ctx, key)
+        if session is None:
+            raise KeyError(f"Session not found: {key}")
     session_id = getattr(session, "session_id", None)
     session_id = (
         session_id if isinstance(session_id, str) and session_id else key.split(":")[-1] or key
@@ -214,9 +232,10 @@ async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
         "queueMode": "followup",
         "inputProvenanceKind": "goal_implementation",
         "noMemoryCapture": True,
-        # Control-plane input: the goal instruction is durable and
-        # provider-visible but must not appear in the visible transcript.
-        "displayText": "",
+        # The visible transcript keeps the user's own goal text (the composer
+        # clears its draft after goals.set succeeds); the provider-facing
+        # instruction envelope stays hidden from the UI.
+        "displayText": message,
         "source": {
             "caller_kind": "web",
             "source_name": "goals.set",

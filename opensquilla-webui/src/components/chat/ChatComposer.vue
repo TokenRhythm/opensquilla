@@ -199,6 +199,18 @@
                 @set-run-mode="emit('setRunMode', $event)"
               />
             </div>
+            <button
+              v-if="goalDraftArmed"
+              type="button"
+              class="chat-goal-draft-chip"
+              :title="t('chat.goal.draftChipTitle')"
+              :aria-label="t('chat.goal.draftChipTitle')"
+              @click="emit('disarmGoal')"
+            >
+              <Icon name="target" :size="13" aria-hidden="true" />
+              <span>{{ t('chat.goal.draftChip') }}</span>
+              <Icon name="x" :size="12" aria-hidden="true" />
+            </button>
             <div ref="moreActionsAnchorEl" class="chat-settings-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-more-actions-btn"
@@ -374,6 +386,7 @@ const props = withDefaults(defineProps<{
   modelRoutingSettingsBusy: boolean
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
+  goalDraftArmed?: boolean
   voiceBusy: boolean
   voiceRecording: boolean
   voiceReady: boolean
@@ -395,6 +408,7 @@ const props = withDefaults(defineProps<{
   canChooseProject: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
+  goalDraftArmed: false,
   inputDisabled: false,
   safeSetupAvailable: false,
 })
@@ -413,6 +427,7 @@ const emit = defineEmits<{
   setModelRoutingMode: [mode: ModelRoutingMode]
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
+  disarmGoal: []
   cancelReplan: []
   voiceInput: []
   voiceSetup: []
@@ -779,6 +794,37 @@ defineExpose<ChatComposerExpose>({
     color var(--dur-fast),
     background var(--dur-fast),
     transform var(--dur-fast);
+}
+.chat-goal-draft-chip {
+  flex: 0 0 auto;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px 3px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 650;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast),
+    background var(--dur-fast),
+    color var(--dur-fast);
+}
+.chat-goal-draft-chip:hover,
+.chat-goal-draft-chip:focus-visible {
+  outline: 0;
+  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent-hover);
+}
+.chat-goal-draft-chip:focus-visible {
+  box-shadow: var(--focus-ring);
 }
 .chat-project-choose > .icon:first-child { color: var(--accent); }
 .chat-project-choose__chevron {

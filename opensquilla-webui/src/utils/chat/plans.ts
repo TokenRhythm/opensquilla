@@ -9,6 +9,18 @@ import type {
   PlanRunStepStatus,
 } from '@/types/plans'
 
+export function isGoalDrivenSnapshot(value: unknown): boolean {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null
+  if (!source) return false
+  const driverKind =
+    (typeof source.driverKind === 'string' && source.driverKind) ||
+    (typeof source.driver_kind === 'string' && source.driver_kind)
+  return driverKind === 'goal'
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>

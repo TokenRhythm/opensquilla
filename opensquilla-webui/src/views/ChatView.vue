@@ -200,7 +200,15 @@
             {{ compactStatus.detail }}
           </span>
         </div>
-
+        <!-- Durable goal outcome line at the transcript tail: once a goal
+             reaches a terminal state the ribbon above the composer fades,
+             but the conversation keeps a small "Goal complete · 6m 52s"
+             record where the work ended. -->
+        <GoalOutcomeNotice
+          v-if="goalOutcomeGoal"
+          :goal="goalOutcomeGoal"
+          :elapsed="goalLastElapsed"
+        />
         <PlanCard
           v-if="currentPlan && !currentPlanInHistory"
           :plan="currentPlan"
@@ -421,6 +429,21 @@
         />
       </div>
     </Transition>
+    <!-- Long-running goal progress lives in the same dock as plan execution so
+         the active objective stays visible above the composer across turns. -->
+    <Transition name="goal-run-dock">
+      <div v-if="activeGoalRun" class="goal-run-dock">
+        <GoalRibbon
+          :goal="activeGoalRun"
+          :elapsed="goalElapsed"
+          :busy="goalBusy"
+          @pause="pauseGoal"
+          @resume="resumeGoal"
+          @clear="clearGoal"
+          @dismiss="dismissGoalRibbon"
+        />
+      </div>
+    </Transition>
     <!-- Jump-to-latest: floats above the composer once the reader has scrolled up
          off the live edge, so a long streaming answer is never lost below the fold. -->
     <Transition name="jump-latest">
@@ -499,6 +522,7 @@
       :model-routing-settings-busy="modelRoutingSettingsBusy"
       :coding-mode-enabled="codingModeEnabled"
       :coding-mode-settings-busy="codingModeSettingsBusy"
+      :goal-draft-armed="goalDraftArmed"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -528,6 +552,7 @@
       @set-model-routing-mode="setComposerModelRoutingMode"
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
+      @disarm-goal="disarmGoalMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
       @voice-setup="onVoiceSetup"
@@ -636,6 +661,8 @@ import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
+import GoalRibbon from '@/components/chat/GoalRibbon.vue'
+import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
@@ -649,6 +676,7 @@ import { useChatApprovals } from '@/composables/chat/useChatApprovals'
 import { useChatAttachments } from '@/composables/chat/useChatAttachments'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
+import { goalStatusIsTerminal, useChatGoals } from '@/composables/chat/useChatGoals'
 import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersistence'
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
@@ -1909,6 +1937,48 @@ function switchToSession(nextSessionKey: string) {
   return switchRuntimeToSession(nextSessionKey)
 }
 
+const chatGoals = useChatGoals({
+  rpc,
+  sessionKey,
+  ensureSessionKey: async () => {
+    // A goal needs a durable session before it can be registered. On the
+    // new-chat landing the session key is empty (or the route is a draft);
+    // materialize a session and switch the view onto it so the ribbon tracks
+    // the right session.
+    if (sessionKey.value && !isDraftRoute()) return sessionKey.value
+    const created = await rpc.call<{ key?: string }>('sessions.create', {
+      agentId: 'main',
+      kind: 'webchat',
+    })
+    const key = String(created?.key || '').trim()
+    if (!key) throw new Error('failed to create a session for the goal')
+    switchToSession(key)
+    return key
+  },
+  notify: message => pushToast(message, { duration: 6000 }),
+})
+const {
+  draftArmed: goalDraftArmed,
+  activeGoal: activeGoalRun,
+  lastGoal: lastGoalRun,
+  busy: goalBusy,
+  elapsed: goalElapsed,
+  lastGoalElapsed: goalLastElapsed,
+  arm: armGoalMode,
+  disarm: disarmGoalMode,
+  startGoal,
+  pause: pauseGoal,
+  resume: resumeGoal,
+  clear: clearGoal,
+  dismissRibbon: dismissGoalRibbon,
+} = chatGoals
+
+// The transcript-tail outcome line only renders terminal goals; active and
+// paused goals stay on the ribbon above the composer.
+const goalOutcomeGoal = computed(() =>
+  goalStatusIsTerminal(lastGoalRun.value?.status) ? lastGoalRun.value : null,
+)
+
 const chatSlashCommands = useChatSlashCommands({
   rpc,
   catalogCallOptions: optionalSessionRpcCallOptions,
@@ -1936,6 +2006,7 @@ const chatSlashCommands = useChatSlashCommands({
   planModeAvailable: () => planUiAvailable.value,
   codingModeEnabled,
   setCodingModeEnabled,
+  armGoal: () => armGoalMode(),
 })
 const {
   slashOpen,
@@ -2075,6 +2146,18 @@ async function onComposerSend() {
   // Serialize an existing-session mode mutation before accepting another
   // composer turn, so the send cannot race the collaboration CAS update.
   if (planModeBusy.value) return
+  // Goal draft mode: the composer text is the goal description. Register it
+  // with the goal driver instead of sending a normal chat turn.
+  if (goalDraftArmed.value) {
+    const goalText = inputText.value.trim()
+    if (!goalText) return
+    const started = await startGoal(goalText)
+    if (!started) return
+    disarmGoalMode()
+    inputText.value = ''
+    autoResizeTextarea()
+    return
+  }
   const target = replanTarget.value
   if (!target) {
     onSend()
@@ -2549,6 +2632,7 @@ const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession
 const composerPlaceholder = computed(() => {
   if (dockedPlanQuestionnaire.value) return t('chat.clarify.answerPlanQuestionnaire')
   if (replanActive.value) return t('chat.plan.revisePromptPlaceholder')
+  if (goalDraftArmed.value) return t('chat.goal.placeholder')
   if (collaboration.value.mode === 'plan') return t('chat.planMode.placeholder')
   if (isNewChatLanding.value) return t('chat.placeholderLanding')
   return isCompactViewport.value ? t('chat.placeholderCompact') : t('chat.placeholder')

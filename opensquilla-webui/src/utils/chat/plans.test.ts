@@ -6,6 +6,7 @@ import {
   normalizePlanRunSnapshot,
   payloadBelongsToSession,
   planRevisionsFromToolSegments,
+  isGoalDrivenSnapshot,
 } from './plans'
 
 describe('plan payload normalization', () => {
@@ -108,5 +109,31 @@ describe('plan payload normalization', () => {
       'agent:main:webchat:one',
     )).toBe(false)
     expect(payloadBelongsToSession({ planRun: {} }, 'agent:main:webchat:one')).toBe(true)
+  })
+})
+describe('isGoalDrivenSnapshot', () => {
+  it('returns true for goal-driven plan runs', () => {
+    expect(isGoalDrivenSnapshot({ driverKind: 'goal' })).toBe(true)
+    expect(isGoalDrivenSnapshot({ driver_kind: 'goal' })).toBe(true)
+  })
+
+  it('returns false for manual runs and non-objects', () => {
+    expect(isGoalDrivenSnapshot({ driverKind: 'manual' })).toBe(false)
+    expect(isGoalDrivenSnapshot(null)).toBe(false)
+    expect(isGoalDrivenSnapshot(undefined)).toBe(false)
+    expect(isGoalDrivenSnapshot('goal')).toBe(false)
+  })
+})
+describe('isGoalDrivenSnapshot', () => {
+  it('returns true for goal-driven plan runs', () => {
+    expect(isGoalDrivenSnapshot({ driverKind: 'goal' })).toBe(true)
+    expect(isGoalDrivenSnapshot({ driver_kind: 'goal' })).toBe(true)
+  })
+
+  it('returns false for manual runs and non-objects', () => {
+    expect(isGoalDrivenSnapshot({ driverKind: 'manual' })).toBe(false)
+    expect(isGoalDrivenSnapshot(null)).toBe(false)
+    expect(isGoalDrivenSnapshot(undefined)).toBe(false)
+    expect(isGoalDrivenSnapshot('goal')).toBe(false)
   })
 })

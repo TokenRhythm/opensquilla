@@ -99,6 +99,9 @@ export interface UseChatSlashCommandsOptions {
   planModeAvailable?: () => boolean
   codingModeEnabled: Ref<boolean>
   setCodingModeEnabled: (enabled: boolean) => Promise<boolean>
+  // Arm the goal composer: selecting /goal switches the composer into goal
+  // draft mode so the user types the goal normally and sends it.
+  armGoal?: () => void
 }
 
 function slashCommandKey(value: string): string {
@@ -283,6 +286,15 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   function completeSlashCmd(cmd: ChatSlashCommand) {
     closeSlashMenu()
     const needsArgument = !cmd.argValue && (cmd.argumentChoices?.length ?? 0) > 0
+    const action = cmd?.execution?.action || cmd.cmd || cmd.name
+    if (action === 'goal.set' && !cmd.argValue) {
+      // Selecting /goal arms the goal composer: the Goal chip appears next to
+      // the access-mode controls and the user types the goal normally.
+      options.inputText.value = ''
+      options.autoResizeTextarea()
+      options.armGoal?.()
+      return
+    }
     options.inputText.value = cmd.cmd + (needsArgument ? ' ' : '')
     options.autoResizeTextarea()
     if (needsArgument) handleSlashInput()
@@ -382,6 +394,21 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       return
     }
 
+    if (action === 'goal.set' || action === '/goal') {
+      closeSlashMenu()
+      const goalText = String(args || '').trim()
+      const firstWord = goalText.split(/\s+/, 1)[0]?.toLowerCase() || ''
+      const isSubcommand = ['status', 'clear', 'pause', 'resume'].includes(firstWord)
+      if (!isSubcommand) {
+        // Goal draft mode: the composer arms a Goal chip and the user types
+        // (or keeps) the goal text, then sends it like a normal message.
+        options.inputText.value = goalText
+        options.autoResizeTextarea()
+        options.armGoal?.()
+        return
+      }
+    }
+
     closeSlashMenu()
     options.inputText.value = ''
     options.autoResizeTextarea()
@@ -474,41 +501,29 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
           }))
         }
         if (first === 'status') {
-          options.rpc.call<GoalStatusResult>('goals.status', { key: goalKey })
+          options.rpc.call<GoalStatusResult>('goals.status', { sessionKey: goalKey })
             .then(status)
             .catch(fail)
           break
         }
         if (first === 'clear') {
-          options.rpc.call('goals.clear', { key: goalKey })
+          options.rpc.call('goals.clear', { sessionKey: goalKey })
             .then(() => options.notify(i18n.global.t('chat.slashCommands.goal.clearOk')))
             .catch(fail)
           break
         }
         if (first === 'pause') {
-          options.rpc.call('goals.pause', { key: goalKey })
+          options.rpc.call('goals.pause', { sessionKey: goalKey })
             .then(() => options.notify(i18n.global.t('chat.slashCommands.goal.pauseOk')))
             .catch(fail)
           break
         }
         if (first === 'resume') {
-          options.rpc.call('goals.resume', { key: goalKey })
+          options.rpc.call('goals.resume', { sessionKey: goalKey })
             .then(() => options.notify(i18n.global.t('chat.slashCommands.goal.resumeOk')))
             .catch(fail)
           break
         }
-        if (!goalText) {
-          options.notify(i18n.global.t('chat.slashCommands.goal.usage'))
-          break
-        }
-        // Start a new goal run and register this client as its watcher so the
-        // continuation driver keeps the loop running for the Web surface.
-        options.rpc.call('goals.set', { key: goalKey, message: goalText })
-          .then(() => {
-            options.rpc.call('goals.observe', { key: goalKey, watch: true }).catch(() => undefined)
-            options.notify(i18n.global.t('chat.slashCommands.goal.setOk', { goal: goalText }))
-          })
-          .catch(fail)
         break
       }
     }

@@ -7186,12 +7186,16 @@ async def _hydrate_sessions_messages_metadata(
         )
 
         if current_plan is not None:
-            current_plan_payload = plan_revision_snapshot(
-                current_plan,
-                current=True,
-            )
+            if active_plan_run is None or active_plan_run.driver_kind != "goal":
+                current_plan_payload = plan_revision_snapshot(
+                    current_plan,
+                    current=True,
+                )
         if active_plan_run is not None:
-            active_plan_run_payload = plan_run_snapshot(active_plan_run)
+            if active_plan_run.driver_kind == "goal":
+                current_plan_payload = None
+            else:
+                active_plan_run_payload = plan_run_snapshot(active_plan_run)
 
     project_workspace_deferred = bool(workspace_id) and not include_project_workspace
     return {

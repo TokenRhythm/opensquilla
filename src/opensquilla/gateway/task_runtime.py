@@ -3139,9 +3139,15 @@ class TaskRuntime:
                         for state in step_states
                     )
                 )
+                # Goal-driven runs are never completed by the generic settle
+                # path: the goal continuation driver owns their lifecycle and
+                # only operates on runs paused at a resumable anchor. A
+                # completed run would strand the goal ledger as "running"
+                # forever (the driver short-circuits on terminal runs).
                 if (
                     task.status == AgentTaskStatus.SUCCEEDED
                     and delivery_ready
+                    and driver_kind != "goal"
                     and callable(complete)
                 ):
                     updated = await complete(

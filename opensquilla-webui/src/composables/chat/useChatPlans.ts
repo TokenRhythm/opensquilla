@@ -15,6 +15,7 @@ import {
   normalizePlanRevisionSnapshot,
   normalizePlanRunSnapshot,
   payloadBelongsToSession,
+  isGoalDrivenSnapshot,
 } from '@/utils/chat/plans'
 
 type RpcClient = {
@@ -263,6 +264,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
   function applyPlanRevision(value: unknown, envelope: unknown = value): boolean {
     const plan = normalizePlanRevisionSnapshot(value)
     if (!plan) return false
+    if (isGoalDrivenSnapshot(value)) return false
     if (!shouldAdoptPlanRevision(
       plan,
       currentPlan.value,
@@ -286,6 +288,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
       || !currentPlan.value
       || run.planRevisionId !== currentPlan.value.revisionId
       || !shouldAdoptPlanRun(run, activePlanRun.value)
+      || isGoalDrivenSnapshot(value)
     ) return false
     activePlanRun.value = run
     return true
@@ -307,7 +310,9 @@ export function useChatPlans(options: UseChatPlansOptions) {
       ?? source.snapshot
     if (rawPlan !== undefined) {
       if (rawPlan !== null) {
-        if (!staleEnvelope) applyPlanRevision(rawPlan, source)
+        if (!staleEnvelope && !isGoalDrivenSnapshot(rawPlan)) {
+          applyPlanRevision(rawPlan, source)
+        }
       } else if (!staleEnvelope) {
         currentPlan.value = null
         activePlanRun.value = null
@@ -320,7 +325,9 @@ export function useChatPlans(options: UseChatPlansOptions) {
       ?? source.run
     if (rawRun !== undefined) {
       if (rawRun !== null) {
-        if (!staleEnvelope) applyPlanRun(rawRun)
+        if (!staleEnvelope && !isGoalDrivenSnapshot(rawRun)) {
+          applyPlanRun(rawRun)
+        }
       } else if (!staleEnvelope) {
         activePlanRun.value = null
       }
@@ -343,6 +350,9 @@ export function useChatPlans(options: UseChatPlansOptions) {
   function applyPlanRunEvent(payload: unknown) {
     if (!payloadBelongsToSession(payload, options.sessionKey.value)) return
     if (!acceptEpoch(payload)) return
+    const source = objectRecord(payload) ?? {}
+    const rawRun = source.planRun ?? source.plan_run ?? source.activePlanRun ?? source.active_plan_run
+    if (isGoalDrivenSnapshot(rawRun)) return
     applyPlanRun(payload)
   }
 
@@ -579,3 +589,4 @@ export function useChatPlans(options: UseChatPlansOptions) {
     cancelRun,
   }
 }
+

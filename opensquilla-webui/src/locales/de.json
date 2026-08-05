@@ -3526,6 +3526,22 @@
         "actionError": "Zielaktion fehlgeschlagen: {error}"
       }
     },
+    "goal": {
+      "placeholder": "Beschreibe das Ziel und sende, um daran zu arbeiten",
+      "draftChip": "Ziel",
+      "draftChipTitle": "Zielmodus bereit. Zum Abbrechen klicken.",
+      "activeTitle": "Laufendes Ziel",
+      "pausedTitle": "Ziel angehalten",
+      "completeTitle": "Ziel abgeschlossen",
+      "blockedTitle": "Ziel blockiert",
+      "cancelledTitle": "Ziel abgebrochen",
+      "pause": "Ziel anhalten",
+      "resume": "Ziel fortsetzen",
+      "clear": "Ziel löschen",
+      "dismiss": "Zielstatus ausblenden",
+      "turns": "{turns} Runden",
+      "pausedByUser": "von dir angehalten"
+    },
     "codingMode": {
       "enabled": "Coding mode für alle Chats aktiviert.",
       "disabled": "Coding mode deaktiviert.",

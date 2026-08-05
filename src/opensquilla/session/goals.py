@@ -15,9 +15,7 @@ GOAL_RUN_ACTIVE_STATUSES = frozenset({"running", "paused"})
 GOAL_RUN_TERMINAL_STATUSES = frozenset({"complete", "blocked", "cancelled"})
 GOAL_RUN_STATUSES = GOAL_RUN_ACTIVE_STATUSES | GOAL_RUN_TERMINAL_STATUSES
 
-_GOAL_STATUS_MARKER_PATTERN = re.compile(
-    r"\[goal:(continue|complete|blocked)(?::([^\]]+))?\]"
-)
+_GOAL_STATUS_MARKER_PATTERN = re.compile(r"\[goal:(continue|complete|blocked)(?::([^\]]+))?\]")
 
 IDLE_PROGRESS_PROMPT = (
     "You have not made progress; either take a concrete action or mark "
@@ -60,6 +58,8 @@ class GoalFailureAdvance:
 
 
 def _now_ms() -> int:
+    """Return the current UTC time as epoch milliseconds."""
+
     return int(datetime.now(UTC).timestamp() * 1000)
 
 
@@ -136,15 +136,15 @@ def advance_goal_after_failure(
 
 
 def _bounded_goal_text(value: Any) -> str:
+    """Normalize and length-check raw goal text for the durable contract."""
+
     if not isinstance(value, str):
         raise GoalValidationError("goal_text must be a string")
     normalized = value.strip()
     if not normalized:
         raise GoalValidationError("goal_text must not be empty")
     if len(normalized) > MAX_GOAL_TEXT_CHARS:
-        raise GoalValidationError(
-            f"goal_text exceeds {MAX_GOAL_TEXT_CHARS} characters"
-        )
+        raise GoalValidationError(f"goal_text exceeds {MAX_GOAL_TEXT_CHARS} characters")
     return normalized
 
 
@@ -233,6 +233,107 @@ def parse_goal_status_marker(text: str) -> tuple[str, str | None] | None:
     return (kind, None)
 
 
+def _validate_advance_guards(
+    marker: tuple[str, str | None] | None,
+    *,
+    max_turns: int,
+    idle_turns: int,
+    blocked_retries: int,
+) -> None:
+    """Reject malformed markers and non-positive guard limits.
+
+    Centralizes the wire-contract validation so ``advance_goal_after_turn``
+    stays focused on the decision tree itself.
+    """
+
+    if marker is not None and marker[0] not in {"continue", "complete", "blocked"}:
+        raise GoalValidationError(f"unknown goal status marker: {marker[0]}")
+    if max_turns < 1:
+        raise GoalValidationError("max_turns must be positive")
+    if idle_turns < 1:
+        raise GoalValidationError("idle_turns must be positive")
+    if blocked_retries < 1:
+        raise GoalValidationError("blocked_retries must be positive")
+
+
+def _runtime_budget_advance(
+    goal: GoalRunRecord,
+    *,
+    runtime_budget_seconds: int | None,
+    now_ms: int,
+) -> GoalAdvance | None:
+    """Return a terminal advance when the run exceeds its wall-clock budget."""
+
+    if (
+        runtime_budget_seconds is not None
+        and now_ms - goal.started_at > runtime_budget_seconds * 1000
+    ):
+        return GoalAdvance(
+            continue_=False,
+            inject_prompt=None,
+            terminal=True,
+            terminal_reason="goal_runtime_budget_exceeded",
+        )
+    return None
+
+
+def _turn_limit_advance(goal: GoalRunRecord, *, max_turns: int) -> GoalAdvance | None:
+    """Return a terminal advance when the run reaches ``max_turns``."""
+
+    if goal.turns + 1 >= max_turns:
+        return GoalAdvance(
+            continue_=False,
+            inject_prompt=None,
+            terminal=True,
+            terminal_reason="goal_continuation_limit_reached",
+        )
+    return None
+
+
+def _missing_marker_advance(goal: GoalRunRecord, *, idle_turns: int) -> GoalAdvance:
+    """Advance a markerless turn, nudging the agent after ``idle_turns``."""
+
+    if goal.idle_turns + 1 >= idle_turns:
+        return GoalAdvance(
+            continue_=True,
+            inject_prompt=IDLE_PROGRESS_PROMPT,
+            terminal=False,
+            terminal_reason=None,
+        )
+    return GoalAdvance(
+        continue_=True,
+        inject_prompt=None,
+        terminal=False,
+        terminal_reason=None,
+    )
+
+
+def _blocked_marker_advance(
+    goal: GoalRunRecord,
+    *,
+    reason: str | None,
+    blocked_retries: int,
+) -> GoalAdvance:
+    """Advance a blocked turn, retrying the same cause up to ``blocked_retries``."""
+
+    reason_text = reason or ""
+    same_cause = goal.blocked_reason is not None and goal.blocked_reason == reason_text
+    retries_after = goal.blocked_retries + 1 if same_cause else 1
+    if retries_after >= blocked_retries:
+        return GoalAdvance(
+            continue_=False,
+            inject_prompt=None,
+            terminal=True,
+            terminal_reason=f"blocked_after_retries:{reason_text}",
+        )
+    return GoalAdvance(
+        continue_=True,
+        inject_prompt=None,
+        terminal=False,
+        terminal_reason=None,
+    )
+
+
 def advance_goal_after_turn(
     goal: GoalRunRecord,
     marker: tuple[str, str | None] | None,
@@ -256,52 +357,34 @@ def advance_goal_after_turn(
     - otherwise the marker decides: ``complete`` finishes the run,
       ``blocked`` retries up to ``blocked_retries`` consecutive same-cause
       blocks, and a missing marker counts toward the idle prompt.
+
+    Each guard and marker branch delegates to a dedicated helper
+    (``_runtime_budget_advance``, ``_turn_limit_advance``,
+    ``_missing_marker_advance``, ``_blocked_marker_advance``) so the decision
+    tree stays readable and each policy is independently unit-testable.
     """
 
-    if marker is not None and marker[0] not in {"continue", "complete", "blocked"}:
-        raise GoalValidationError(f"unknown goal status marker: {marker[0]}")
-    if max_turns < 1:
-        raise GoalValidationError("max_turns must be positive")
-    if idle_turns < 1:
-        raise GoalValidationError("idle_turns must be positive")
-    if blocked_retries < 1:
-        raise GoalValidationError("blocked_retries must be positive")
+    _validate_advance_guards(
+        marker,
+        max_turns=max_turns,
+        idle_turns=idle_turns,
+        blocked_retries=blocked_retries,
+    )
 
-    if (
-        runtime_budget_seconds is not None
-        and now_ms - goal.started_at > runtime_budget_seconds * 1000
-    ):
-        return GoalAdvance(
-            continue_=False,
-            inject_prompt=None,
-            terminal=True,
-            terminal_reason="goal_runtime_budget_exceeded",
-        )
+    budget_advance = _runtime_budget_advance(
+        goal,
+        runtime_budget_seconds=runtime_budget_seconds,
+        now_ms=now_ms,
+    )
+    if budget_advance is not None:
+        return budget_advance
 
-    turns_after = goal.turns + 1
-    if turns_after >= max_turns:
-        return GoalAdvance(
-            continue_=False,
-            inject_prompt=None,
-            terminal=True,
-            terminal_reason="goal_continuation_limit_reached",
-        )
+    limit_advance = _turn_limit_advance(goal, max_turns=max_turns)
+    if limit_advance is not None:
+        return limit_advance
 
     if marker is None:
-        idle_after = goal.idle_turns + 1
-        if idle_after >= idle_turns:
-            return GoalAdvance(
-                continue_=True,
-                inject_prompt=IDLE_PROGRESS_PROMPT,
-                terminal=False,
-                terminal_reason=None,
-            )
-        return GoalAdvance(
-            continue_=True,
-            inject_prompt=None,
-            terminal=False,
-            terminal_reason=None,
-        )
+        return _missing_marker_advance(goal, idle_turns=idle_turns)
 
     kind, reason = marker
     if kind == "continue":
@@ -318,22 +401,8 @@ def advance_goal_after_turn(
             terminal=True,
             terminal_reason=None,
         )
-
-    reason_text = reason or ""
-    same_cause = (
-        goal.blocked_reason is not None and goal.blocked_reason == reason_text
-    )
-    retries_after = goal.blocked_retries + 1 if same_cause else 1
-    if retries_after >= blocked_retries:
-        return GoalAdvance(
-            continue_=False,
-            inject_prompt=None,
-            terminal=True,
-            terminal_reason=f"blocked_after_retries:{reason_text}",
-        )
-    return GoalAdvance(
-        continue_=True,
-        inject_prompt=None,
-        terminal=False,
-        terminal_reason=None,
+    return _blocked_marker_advance(
+        goal,
+        reason=reason,
+        blocked_retries=blocked_retries,
     )

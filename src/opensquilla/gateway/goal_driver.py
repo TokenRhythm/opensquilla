@@ -74,6 +74,7 @@ _GOAL_RESUMABLE_PAUSE_REASONS = frozenset(
         "goal_unwatched",
         "goal_turn_cancelled",
         "goal_turn_abandoned",
+        "goal_run_reopened",
     }
 )
 
@@ -81,6 +82,7 @@ _GOAL_RESUMABLE_PAUSE_REASONS = frozenset(
 _GOAL_PAUSE_REASON_UNWATCHED = "goal_unwatched"
 _GOAL_PAUSE_REASON_TURN_CANCELLED = "goal_turn_cancelled"
 _GOAL_PAUSE_REASON_TURN_ABANDONED = "goal_turn_abandoned"
+_GOAL_PAUSE_REASON_REOPENED = "goal_run_reopened"
 
 
 class GoalWatcherRegistry:
@@ -1069,6 +1071,13 @@ async def recover_goal_runs_after_restart(
     except Exception:  # noqa: BLE001 - recovery must not fail boot
         log.warning("goal_driver.restart_recovery_scan_failed", exc_info=True)
         return {"recovered": 0, "paused_unwatched": 0}
+    repaired = await repair_goal_runs_with_completed_plan_runs(
+        runtime,
+        storage,
+        config=config,
+        goals=goals,
+        now_ms=now,
+    )
     for goal in goals:
         plan_run = (
             await get_plan_run(goal.plan_run_id)
@@ -1114,7 +1123,202 @@ async def recover_goal_runs_after_restart(
                 session_key=goal.session_key,
                 goal_id=goal.goal_id,
             )
-    return {"recovered": recovered, "paused_unwatched": paused_unwatched}
+    return {
+        "recovered": recovered,
+        "paused_unwatched": paused_unwatched,
+        "repaired_completed_runs": repaired,
+    }
+
+
+async def repair_goal_runs_with_completed_plan_runs(
+    runtime: Any,
+    storage: Any,
+    *,
+    config: GoalConfig,
+    goals: Any | None = None,
+    now_ms: int | None = None,
+) -> int:
+    """Reconcile active goal runs whose plan run was completed out from under
+    them.
+
+    Historical settle paths could complete a goal-driven plan run at a turn
+    boundary (all steps checkpointed) before the continuation driver ran; the
+    driver only operates on paused runs, so the goal ledger row stranded as
+    "running" forever and the UI ribbon never showed the terminal outcome.
+    This scan reopens the run at its first step with the resumable
+    ``goal_run_reopened`` anchor, resolves the last goal turn's marker from
+    the transcript, and applies the same terminal/continuation decision the
+    post-turn hook would have made.
+    """
+
+    now = now_ms if now_ms is not None else _now_ms()
+    list_active = getattr(storage, "list_active_goal_runs", None)
+    get_plan_run = getattr(storage, "get_plan_run", None)
+    reopen = getattr(storage, "reopen_completed_plan_run", None)
+    list_tasks = getattr(storage, "list_recent_agent_tasks", None)
+    if not callable(list_active) or not callable(get_plan_run) or not callable(reopen):
+        return 0
+    if goals is None:
+        try:
+            goals = await list_active()
+        except Exception:  # noqa: BLE001 - repair must never break its caller
+            log.warning("goal_driver.completed_run_repair_scan_failed", exc_info=True)
+            return 0
+    repaired = 0
+    for goal in goals:
+        if str(getattr(goal, "status", "")) != "running":
+            continue
+        if not goal.plan_run_id:
+            continue
+        try:
+            plan_run = await get_plan_run(goal.plan_run_id)
+        except Exception:  # noqa: BLE001 - best-effort per goal
+            continue
+        if plan_run is None or str(getattr(plan_run, "status", "")) != "completed":
+            continue
+        try:
+            reopened = await reopen(
+                plan_run.run_id,
+                expected_state_revision=int(getattr(plan_run, "state_revision", 0) or 0),
+                reason=_GOAL_PAUSE_REASON_REOPENED,
+            )
+        except Exception:  # noqa: BLE001 - concurrent controller may have won
+            continue
+        repaired += 1
+        await _apply_reopened_goal_decision(
+            runtime,
+            storage,
+            goal=goal,
+            plan_run=reopened,
+            config=config,
+            list_tasks=list_tasks,
+            now_ms=now,
+        )
+    if repaired:
+        log.info("goal_driver.completed_run_repaired", count=repaired)
+    return repaired
+
+
+async def _apply_reopened_goal_decision(
+    runtime: Any,
+    storage: Any,
+    *,
+    goal: Any,
+    plan_run: Any,
+    config: GoalConfig,
+    list_tasks: Any,
+    now_ms: int,
+) -> None:
+    """Apply the marker-driven decision for a reopened goal run."""
+
+    task_id: str | None = None
+    if callable(list_tasks):
+        try:
+            tasks = await list_tasks(goal.session_key, limit=8)
+        except Exception:  # noqa: BLE001 - transcript fallback below
+            tasks = []
+        for task in tasks:
+            details = getattr(task, "details", None)
+            metadata = details.get("metadata") if isinstance(details, dict) else None
+            metadata = metadata if isinstance(metadata, dict) else {}
+            if str(metadata.get("plan_run_id") or "") != str(plan_run.run_id):
+                continue
+            task_id = str(getattr(task, "task_id", "") or "") or None
+            break
+    marker = None
+    if task_id:
+        marker_text = await _last_assistant_text(storage, goal.session_key, task_id)
+        marker = parse_goal_status_marker(marker_text) if marker_text else None
+    advance = advance_goal_after_turn(
+        goal,
+        marker,
+        max_turns=int(config.max_turns),
+        idle_turns=int(config.idle_turns),
+        blocked_retries=int(config.blocked_retries),
+        runtime_budget_seconds=config.runtime_budget_seconds,
+        now_ms=now_ms,
+    )
+    fields: dict[str, Any] = {
+        "turns": int(getattr(goal, "turns", 0) or 0) + 1,
+        "last_turn_at": now_ms,
+    }
+    if marker is None:
+        fields["idle_turns"] = int(getattr(goal, "idle_turns", 0) or 0) + 1
+    else:
+        fields["idle_turns"] = 0
+    if marker is not None and marker[0] == "blocked":
+        fields["blocked_reason"] = marker[1] or ""
+        fields["blocked_retries"] = 1
+    if advance.terminal or marker is not None:
+        terminal_reason = advance.terminal_reason
+        if terminal_reason is None:
+            fields["status"] = "complete"
+            fields["finished_at"] = now_ms
+            fields["terminal_reason"] = None
+            plan_terminal_reason = _PLAN_RUN_TERMINAL_REASON_GOAL_COMPLETE
+        else:
+            fields["status"] = "blocked"
+            fields["finished_at"] = now_ms
+            fields["terminal_reason"] = terminal_reason
+            plan_terminal_reason = _PLAN_RUN_TERMINAL_REASON_GOAL_BLOCKED
+        try:
+            await storage.update_goal_run(
+                goal.goal_id,
+                expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
+                **fields,
+            )
+        except GoalConflictError:
+            return
+        await _terminalize_plan_run(storage, plan_run, reason=plan_terminal_reason)
+        log.info(
+            "goal_driver.goal_terminal",
+            session_key=goal.session_key,
+            run_id=plan_run.run_id,
+            goal_id=goal.goal_id,
+            status=fields["status"],
+            terminal_reason=terminal_reason,
+            turns=fields["turns"],
+        )
+        return
+    # No marker and no terminal decision: keep the loop resumable. Continue
+    # immediately when watched (or unwatched continuation is enabled); park
+    # otherwise so a later goals.resume restarts cleanly.
+    if config.continue_unwatched or get_goal_watcher_registry().has_watchers(
+        goal.session_key, ttl_ms=int(config.watcher_ttl_seconds) * 1000
+    ):
+        session = await storage.get_session(goal.session_key)
+        envelope_seed = build_goal_route_envelope(
+            session_key=goal.session_key,
+            agent_id=goal.agent_id,
+            session_id=(
+                str(getattr(session, "session_id", "") or "")
+                if session is not None
+                else None
+            ),
+            goal_id=goal.goal_id,
+            run_id=plan_run.run_id,
+            plan_revision_id=str(getattr(plan_run, "plan_revision_id", "") or "") or None,
+            source_name="goal_completed_run_repair",
+        )
+        await enqueue_goal_continuation(
+            runtime,
+            session_key=goal.session_key,
+            run_id=plan_run.run_id,
+            goal_id=goal.goal_id,
+            message=GOAL_CONTINUATION_MESSAGE,
+            envelope_seed=envelope_seed,
+        )
+        return
+    try:
+        await storage.update_goal_run(
+            goal.goal_id,
+            expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
+            status="paused",
+            pause_reason=_GOAL_PAUSE_REASON_UNWATCHED,
+            last_turn_at=now_ms,
+        )
+    except GoalConflictError:
+        return
 
 
 def _now_ms() -> int:

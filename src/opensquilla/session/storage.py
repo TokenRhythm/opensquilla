@@ -4968,6 +4968,73 @@ class SessionStorage:
             assert updated is not None
             return updated
 
+    async def reopen_completed_plan_run(
+        self,
+        run_id: str,
+        *,
+        expected_state_revision: int,
+        reason: str,
+    ) -> PlanRunRecord:
+        """Reopen a completed run at its first step as paused.
+
+        Recovery-only transition for goal-driven runs whose generic settle
+        path completed the run before the goal continuation driver could
+        terminalize it: the goal ledger row is left stranded as "running"
+        while the driver refuses to operate on a terminal run. Reopening at
+        the first step restores the resumable ``goal_turn_finished`` anchor
+        so the driver/recovery can parse the last turn's marker and apply the
+        correct terminal outcome.
+        """
+
+        reason = reason.strip()
+        if not reason:
+            raise PlanValidationError("reopen reason is required")
+        async with self._write_transaction("reopen_completed_plan_run") as conn:
+            run = await self._load_plan_run_for_cas(
+                conn,
+                run_id=run_id,
+                expected_state_revision=expected_state_revision,
+            )
+            if run.status != PlanRunStatus.COMPLETED.value:
+                raise PlanRunConflictError(
+                    f"cannot reopen a {run.status} plan run"
+                )
+            if not run.step_states:
+                raise PlanRunConflictError("plan run has no steps to reopen")
+            states = [dict(state) for state in run.step_states]
+            states[0]["status"] = "in_progress"
+            states[0].pop("reason", None)
+            timestamp = _now_ms()
+            async with conn.execute(
+                """
+                UPDATE plan_runs
+                SET status = 'paused',
+                    step_states = ?,
+                    current_step_id = ?,
+                    state_revision = state_revision + 1,
+                    active_task_id = NULL,
+                    pause_reason = ?,
+                    terminal_reason = NULL,
+                    finished_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ? AND state_revision = ?
+                """,
+                (
+                    _serialize(states),
+                    str(states[0].get("step_id") or ""),
+                    reason,
+                    timestamp,
+                    run_id,
+                    expected_state_revision,
+                ),
+            ) as cur:
+                changed = cur.rowcount or 0
+            if changed == 0:
+                raise PlanRunConflictError("plan run state changed before the update")
+            updated = await self._select_plan_run_on_conn(conn, run_id)
+            assert updated is not None
+            return updated
+
     async def pause_plan_run(
         self,
         run_id: str,
@@ -5438,6 +5505,27 @@ class SessionStorage:
                 task = AgentTaskRecord(**_deserialize_row(dict(row)))
                 rows_by_id[task.task_id] = task
         return [rows_by_id[task_id] for task_id in ids if task_id in rows_by_id]
+
+    @_serialized_read
+    async def list_recent_agent_tasks(
+        self,
+        session_key: str,
+        limit: int = 8,
+    ) -> list[AgentTaskRecord]:
+        """Newest-first task rows for one session (recovery scans)."""
+
+        limit = max(1, min(int(limit), 64))
+        async with self.conn.execute(
+            """
+            SELECT * FROM agent_tasks
+            WHERE session_key = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (canonicalize_session_key(session_key), limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [AgentTaskRecord(**_deserialize_row(dict(row))) for row in rows]
 
     async def update_agent_task(self, task_id: str, **fields: Any) -> AgentTaskRecord:
         if not fields:

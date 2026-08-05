@@ -30,6 +30,7 @@ from opensquilla.gateway.goal_driver import (
     get_goal_watcher_registry,
     maybe_continue_goal,
     recover_goal_runs_after_restart,
+    repair_goal_runs_with_completed_plan_runs,
 )
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_goals import _handle_goals_set
@@ -861,7 +862,11 @@ async def test_restart_recovery_parks_unwatched_goal_when_continue_disabled(
             stack.storage,
             config=GoalConfig(continue_unwatched=False),
         )
-        assert result == {"recovered": 0, "paused_unwatched": 1}
+        assert result == {
+            "recovered": 0,
+            "paused_unwatched": 1,
+            "repaired_completed_runs": 0,
+        }
 
         goal = await stack.storage.get_goal_run(goal_id)
         assert goal is not None
@@ -898,7 +903,11 @@ async def test_restart_recovery_auto_resumes_when_continue_unwatched_enabled(
             stack.storage,
             config=GoalConfig(continue_unwatched=True),
         )
-        assert result == {"recovered": 1, "paused_unwatched": 0}
+        assert result == {
+            "recovered": 1,
+            "paused_unwatched": 0,
+            "repaired_completed_runs": 0,
+        }
         # Recovery enqueued the next turn. The stack's runtime still uses
         # continue_unwatched=false for the post-turn hook, so the loop parks at
         # the finished anchor after the turn instead of auto-enqueueing again
@@ -907,6 +916,80 @@ async def test_restart_recovery_auto_resumes_when_continue_unwatched_enabled(
         goal = await stack.storage.get_goal_run(goal_id)
         assert goal is not None
         assert goal.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_repair_terminalizes_goal_whose_plan_run_was_completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    script = _MarkerScript([])
+    async with _open_goal_driver_stack(
+        tmp_path / "driver-repair.sqlite",
+        handler=script,
+        goal_config=GoalConfig(continue_unwatched=False),
+    ) as stack:
+        script.manager = stack.manager
+        response = await _start_goal(stack)
+        goal_id = response["goalId"]
+        run_id = response["planRun"]["runId"]
+        task_id = response["turnId"]
+        await _wait_for_plan_paused(stack.storage, run_id, "goal_turn_finished")
+
+        # Simulate the historical settle bug: the run is completed out from
+        # under the goal ledger (all steps checkpointed, then completed).
+        run = await stack.storage.get_plan_run(run_id)
+        assert run is not None
+        run = await stack.storage.mark_plan_run_running(
+            run_id,
+            expected_state_revision=int(run.state_revision),
+            active_task_id=task_id,
+        )
+        run = await stack.storage.checkpoint_plan_run(
+            run_id,
+            expected_state_revision=int(run.state_revision),
+            step_id="goal",
+            step_status="completed",
+            expected_active_task_id=task_id,
+        )
+        await stack.storage.complete_plan_run(
+            run_id,
+            expected_state_revision=int(run.state_revision),
+            expected_active_task_id=task_id,
+        )
+
+        # The last goal turn's transcript carries the completion marker.
+        entry, expected_epoch = await stack.manager.prepare_message(
+            SOURCE_KEY,
+            "assistant",
+            "All done.\n[goal:complete]",
+            turn_context={"turn_id": task_id},
+        )
+        await stack.storage.append_transcript_entry_and_touch(
+            entry,
+            expected_epoch=expected_epoch,
+            updated_at=int(time.time() * 1000),
+        )
+
+        repaired = await repair_goal_runs_with_completed_plan_runs(
+            stack.runtime,
+            stack.storage,
+            config=GoalConfig(continue_unwatched=False),
+        )
+        assert repaired == 1
+
+        goal = await stack.storage.get_goal_run(goal_id)
+        assert goal is not None
+        assert goal.status == "complete"
+        assert goal.finished_at is not None
+        run = await stack.storage.get_plan_run(run_id)
+        assert run is not None
+        assert run.status == "cancelled"
+        assert run.terminal_reason == "goal_complete"
 
 
 @pytest.mark.asyncio

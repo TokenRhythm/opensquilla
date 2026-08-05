@@ -3526,6 +3526,22 @@
         "actionError": "目標操作に失敗しました：{error}"
       }
     },
+    "goal": {
+      "placeholder": "目標を説明して送信すると、取り組みを開始します",
+      "draftChip": "目標",
+      "draftChipTitle": "目標モード準備完了。クリックでキャンセル。",
+      "activeTitle": "進行中の目標",
+      "pausedTitle": "目標を一時停止中",
+      "completeTitle": "目標完了",
+      "blockedTitle": "目標がブロックされました",
+      "cancelledTitle": "目標をキャンセルしました",
+      "pause": "目標を一時停止",
+      "resume": "目標を再開",
+      "clear": "目標をクリア",
+      "dismiss": "目標の状態を隠す",
+      "turns": "{turns} ターン",
+      "pausedByUser": "あなたが一時停止中"
+    },
     "codingMode": {
       "enabled": "すべてのチャットで Coding mode を有効にしました。",
       "disabled": "Coding mode を無効にしました。",

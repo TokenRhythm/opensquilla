@@ -3579,6 +3579,22 @@
         "actionError": "Goal action failed: {error}"
       }
     },
+    "goal": {
+      "placeholder": "Describe the goal, then press send to start working toward it",
+      "draftChip": "Goal",
+      "draftChipTitle": "Goal mode armed. Click to cancel.",
+      "activeTitle": "Goal in progress",
+      "pausedTitle": "Goal paused",
+      "completeTitle": "Goal complete",
+      "blockedTitle": "Goal blocked",
+      "cancelledTitle": "Goal cancelled",
+      "pause": "Pause goal",
+      "resume": "Resume goal",
+      "clear": "Clear goal",
+      "dismiss": "Hide goal status",
+      "turns": "{turns} turns",
+      "pausedByUser": "paused by you"
+    },
     "codingMode": {
       "enabled": "Coding mode enabled for all chats.",
       "disabled": "Coding mode disabled.",

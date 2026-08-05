@@ -3526,6 +3526,22 @@
         "actionError": "Échec de l'action d'objectif : {error}"
       }
     },
+    "goal": {
+      "placeholder": "Décrivez l'objectif puis envoyez pour commencer à y travailler",
+      "draftChip": "Objectif",
+      "draftChipTitle": "Mode objectif armé. Cliquez pour annuler.",
+      "activeTitle": "Objectif en cours",
+      "pausedTitle": "Objectif en pause",
+      "completeTitle": "Objectif terminé",
+      "blockedTitle": "Objectif bloqué",
+      "cancelledTitle": "Objectif annulé",
+      "pause": "Mettre l'objectif en pause",
+      "resume": "Reprendre l'objectif",
+      "clear": "Effacer l'objectif",
+      "dismiss": "Masquer l'état de l'objectif",
+      "turns": "{turns} tours",
+      "pausedByUser": "mis en pause par vous"
+    },
     "codingMode": {
       "enabled": "Coding mode activé pour toutes les discussions.",
       "disabled": "Coding mode désactivé.",

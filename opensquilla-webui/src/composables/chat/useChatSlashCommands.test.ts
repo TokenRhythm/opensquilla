@@ -362,7 +362,7 @@ describe('useChatSlashCommands goal', () => {
     name: '/goal',
     cmd: '/goal',
     label: '/goal',
-    desc: 'Set a long-running goal for the agent to pursue.'
+    desc: 'Set a long-running goal for the agent to pursue.',
     aliases: [],
     execution: { action: 'goal.set' },
   }

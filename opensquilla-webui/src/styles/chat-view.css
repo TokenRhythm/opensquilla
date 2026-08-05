@@ -509,6 +509,35 @@
   transform: translate(-50%, 4px);
 }
 
+/* Goal run dock: in-flow bar above the composer so the active objective stays
+   visible without overlapping the absolute plan-run dock. */
+.goal-run-dock {
+  position: relative;
+  z-index: 3;
+  width: 100%;
+  max-width: var(--composer-col, 860px);
+  margin: 0 auto 8px;
+}
+
+.goal-run-dock-enter-active {
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+}
+
+.goal-run-dock-leave-active {
+  pointer-events: none;
+  transition:
+    opacity var(--dur-fast) var(--ease-in),
+    transform var(--dur-fast) var(--ease-in);
+}
+
+.goal-run-dock-enter-from,
+.goal-run-dock-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
+}
+
 @media (max-width: 640px) {
   .plan-questionnaire-dock {
     width: calc(100% - 24px);

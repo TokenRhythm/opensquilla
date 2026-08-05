@@ -3526,6 +3526,22 @@
         "actionError": "Error en la acción de objetivo: {error}"
       }
     },
+    "goal": {
+      "placeholder": "Describe el objetivo y envía para empezar a trabajar en él",
+      "draftChip": "Objetivo",
+      "draftChipTitle": "Modo objetivo armado. Haz clic para cancelar.",
+      "activeTitle": "Objetivo en curso",
+      "pausedTitle": "Objetivo en pausa",
+      "completeTitle": "Objetivo completado",
+      "blockedTitle": "Objetivo bloqueado",
+      "cancelledTitle": "Objetivo cancelado",
+      "pause": "Pausar objetivo",
+      "resume": "Reanudar objetivo",
+      "clear": "Borrar objetivo",
+      "dismiss": "Ocultar estado del objetivo",
+      "turns": "{turns} turnos",
+      "pausedByUser": "pausado por ti"
+    },
     "codingMode": {
       "enabled": "Coding mode activado para todos los chats.",
       "disabled": "Coding mode desactivado.",

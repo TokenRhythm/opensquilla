@@ -3579,6 +3579,22 @@
         "actionError": "目标操作失败：{error}"
       }
     },
+    "goal": {
+      "placeholder": "描述目标，然后按发送开始朝目标工作",
+      "draftChip": "目标",
+      "draftChipTitle": "目标模式已就绪。点击取消。",
+      "activeTitle": "进行中的目标",
+      "pausedTitle": "目标已暂停",
+      "completeTitle": "目标已完成",
+      "blockedTitle": "目标受阻",
+      "cancelledTitle": "目标已取消",
+      "pause": "暂停目标",
+      "resume": "恢复目标",
+      "clear": "清除目标",
+      "dismiss": "隐藏目标状态",
+      "turns": "{turns} 轮",
+      "pausedByUser": "你已暂停"
+    },
     "codingMode": {
       "enabled": "Coding mode 已为所有聊天开启。",
       "disabled": "Coding mode 已关闭。",

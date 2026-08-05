@@ -165,7 +165,7 @@ async def test_goals_set_creates_goal_plan_run_and_first_send(
         persisted = json.loads(transcript[0].content)
         assert persisted == {
             "text": expected_message,
-            "display_text": "",
+            "display_text": "Ship the goal mode.",
             "attachments": [],
         }
 
