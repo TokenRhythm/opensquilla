@@ -89,7 +89,7 @@
                 v-if="part.resolution"
                 :part="part"
                 timeline
-                @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+                @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
                 @extend="id => $emit('extendInterrupt', id)"
                 @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
                 @clarify-dismiss="$emit('clarifyDismiss')"
@@ -132,7 +132,7 @@
               v-if="part.resolution"
               :part="part"
               timeline
-              @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+              @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
               @extend="id => $emit('extendInterrupt', id)"
               @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
               @clarify-dismiss="$emit('clarifyDismiss')"
@@ -329,7 +329,7 @@
         v-for="part in standaloneInterruptParts"
         :key="part.key"
         :part="part"
-        @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+        @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
         @extend="id => $emit('extendInterrupt', id)"
         @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
         @clarify-dismiss="$emit('clarifyDismiss')"
@@ -420,7 +420,7 @@ const emit = defineEmits<{
   toggleToolItem: [renderKey: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
   fork: []
-  resolveInterrupt: [id: string, decision: 'allow-once' | 'allow-always' | 'deny', note?: string]
+  resolveInterrupt: [id: string, decision: 'allow-once' | 'allow-always' | 'deny']
   extendInterrupt: [id: string]
   clarifySubmit: [fields: Record<string, string>, request?: NonNullable<Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>['clarify']>]
   clarifyDismiss: []

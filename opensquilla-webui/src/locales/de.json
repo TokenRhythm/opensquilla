@@ -448,6 +448,52 @@
         "default": "OpenSquilla konnte diese Anfrage nicht abschließen. Es wurden keine unbestätigten Profiländerungen angewendet."
       }
     },
+    "sandbox": {
+      "back": "Zurück",
+      "eyebrow": "Sicherheit",
+      "title": "Sandbox",
+      "subtitle": "Datei-, Befehls-, Netzwerk-, Laufzeit- und LAN-Token-Regeln für den sicheren Modus.",
+      "available": "Sicherer Modus verfügbar",
+      "unavailable": "Sicherer Modus nicht verfügbar",
+      "builtin": "Integriert",
+      "actions": { "add": "Hinzufügen", "remove": "Entfernen", "retry": "Erneut versuchen", "copy": "Kopieren", "saving": "Speichern…", "redetect": "Erneut prüfen" },
+      "mode": {
+        "title": "Standardzugriffsmodus", "description": "Startmodus für neue Aufgaben. Safe bleibt bei fehlgeschlagener Prüfung nicht auswählbar.",
+        "default": "Standardmodus", "safe": "Safe", "full": "Vollzugriff", "resetWarning": "Warnung beim Start wieder anzeigen"
+      },
+      "setup": {
+        "title": "Safe-Modus einrichten", "description": "OpenSquilla benötigt einmalig eine Administratorfreigabe, um ein isoliertes Konto sowie Datei- und Netzwerkschutz einzurichten.", "descriptionWithDuration": "OpenSquilla benötigt einmalig eine Administratorfreigabe, um ein isoliertes Konto und Schutzmaßnahmen einzurichten. Die Ersteinrichtung dauert normalerweise etwa 20–30 Sekunden. Lassen Sie OpenSquilla geöffnet.",
+        "continue": "Weiter", "configuring": "Wird eingerichtet…", "requestingApproval": "Bestätigen Sie die Windows-Abfrage, um fortzufahren.", "configuringProtection": "OpenSquilla richtet den Safe-Modus fertig ein. Lassen Sie die App geöffnet.", "takingLonger": "Die Ersteinrichtung kann einige Minuten dauern. Die Überprüfung läuft automatisch.", "elapsed": "{seconds} s vergangen", "cancelled": "Einrichtung abgebrochen. Der Vollzugriff bleibt unverändert; Sie können es jederzeit erneut versuchen.",
+        "failed": "Safe-Modus konnte nicht eingerichtet werden. Der Vollzugriff bleibt unverändert.", "verificationFailed": "Die Einrichtung ist fertig, aber die Sicherheitsprüfung ist fehlgeschlagen. Der Vollzugriff bleibt unverändert.",
+        "runInBackground": "Im Hintergrund einrichten", "readyToast": "Der Safe-Modus ist bereit.", "failedToast": "Die Einrichtung des Safe-Modus konnte nicht abgeschlossen werden. Versuchen Sie es erneut über den Safe-Modus."
+      },
+      "files": {
+        "title": "Dateisicherheit", "description": "Normale Dateien sind lesbar. Änderungen an geschützten Pfaden erfordern eine Freigabe.", "readsAllowed": "Lesen erlaubt",
+        "customPath": "Eigener geschützter Pfad", "pathPlaceholder": "Geschützten Pfad hinzufügen", "backupTitle": "Vor destruktiven Dateiänderungen sichern",
+        "backupDescription": "Vor dem Löschen oder Ändern vorhandener Dateien wiederherstellbare Kopien anlegen und bei Bedarf die ältesten automatisch entfernen.", "quota": "Backup-Speicherlimit",
+        "recursiveWarning": "Ohne Backup können Löschen und Ersetzen unwiederbringlich sein. Schlägt das Backup nach dem Entfernen alter Kopien weiter fehl, fragt OpenSquilla vor dem Fortfahren erneut."
+      },
+      "commands": {
+        "title": "Befehlssicherheit", "description": "Befehle laufen standardmäßig automatisch. Riskante Aktionen wie git push brauchen eine Freigabe.",
+        "systemTools": "Systemwerkzeuge", "systemToolsAuto": "Automatisch erlauben", "systemToolsPrompt": "Vorher fragen", "systemToolsDisabled": "Deaktiviert",
+        "approvalPrefixes": "Befehlspräfixe mit Freigabe", "autoPrefixes": "Immer automatisch erlaubte Präfixe", "prefixPlaceholder": "Zum Beispiel: git push"
+      },
+      "network": {
+        "title": "Netzwerksicherheit", "description": "Öffentlicher Netzwerkzugriff ist standardmäßig erlaubt; SSRF- und Metadatenschutz bleiben aktiv.",
+        "blockAll": "Gesamten Netzwerkzugriff sperren", "blockAllDescription": "Erlaubte Domains bleiben Ausnahmen.", "allowDomains": "Erlaubte Domains", "denyDomains": "Gesperrte Domains"
+      },
+      "runtimes": { "title": "Mitgelieferte Laufzeiten", "description": "Sicher nutzt zuerst mitgelieferte Werkzeuge; Vollzugriff zuerst Host-Werkzeuge.", "target": "Paket-Ziel" },
+      "lan": {
+        "listen": "Im lokalen Netzwerk lauschen", "listenDescription": "Nach einem Neustart an alle lokalen Schnittstellen binden; öffentliche Peers bleiben gesperrt.",
+        "allowedCidrs": "Erlaubte Client-CIDRs", "cidrDescription": "Optional. Leer erlaubt Loopback, RFC1918 und IPv6 ULA; Einträge können den Bereich nur einschränken.",
+        "restartRequired": "OpenSquilla neu starten, um die Änderung anzuwenden.",
+        "title": "Web-Zugriff und benannte Tokens", "description": "Entfernter Web-Zugriff ohne gültiges Token nutzt den Gast-Sicherheitsmodus; benannte Tokens vergeben die konfigurierte Berechtigung.",
+        "guest": "Kein oder ungültiges Token:", "guestDescription": " Gast-Sicherheitsmodus: Normale Dateien sind lesbar, nur der Standard-Arbeitsbereich ist beschreibbar und Anmeldedateien sind nicht lesbar.",
+        "authenticated": "Gültiges Token:", "authenticatedDescription": " je nach Berechtigung Sicher oder Vollzugriff.",
+        "tokenName": "Token-Name, z. B. Laptop", "hostExecute": "Host-Ausführung / Vollzugriff erlauben", "createToken": "Token erstellen",
+        "copyNow": "Jetzt kopieren. Das Token wird nicht erneut angezeigt.", "fullCapable": "Sicher und Vollzugriff", "safeOnly": "Nur Sicher", "revoke": "Widerrufen"
+      }
+    },
     "dialog": {
       "title": "Einstellungen",
       "actionNeeded": "Aktion erforderlich ({count})",
@@ -483,6 +529,7 @@
       "modelStrategy": "Modellrouting",
       "behavior": "Verhalten",
       "privacy": "Datenschutz",
+      "sandbox": "Sandbox",
       "memory": "Gedächtnis und Profil",
       "router": "Router",
       "ensemble": "Ensemble",
@@ -3321,24 +3368,45 @@
     },
     "approval": {
       "required": "Genehmigung erforderlich",
-      "requiredFor": "Genehmigung erforderlich: {tool}",
-      "neededFor": "Genehmigung benötigt: {tool}",
+      "requiredFor": "Genehmigung erforderlich: {action}",
+      "neededFor": "Genehmigung benötigt: {action}",
       "command": "Befehl",
       "arguments": "Argumente",
       "extend": "Verlängern",
-      "denyReasonPlaceholder": "Ablehnungsgrund (optional) — an den Agenten gesendet",
-      "denyReasonLabel": "Ablehnungsgrund, optional, an den Agenten gesendet",
       "allowOnce": "Einmal zulassen",
+      "continueWithoutBackup": "Ohne Backup fortfahren",
       "allowSameType": "Gleichen Typ zulassen",
       "deny": "Ablehnen",
       "expiresIn": "Läuft ab in {time}",
-      "outcomeExpired": "Abgelaufen — nicht ausgeführt",
+      "outcomeExpired": "Abgelaufen, nicht ausgeführt",
       "outcomeDenied": "Abgelehnt",
-      "outcomeApproved": "Genehmigt · Lauf fortgesetzt",
+      "outcomeApproved": "Genehmigt. Lauf fortgesetzt",
       "target": "Ziel",
       "access": "Zugriff",
       "workspace": "Arbeitsbereich",
-      "outcomeUnavailable": "Genehmigung nicht mehr verfügbar"
+      "outcomeUnavailable": "Genehmigung nicht mehr verfügbar",
+      "irreversibleTitle": "Diese Aktion kann nicht rückgängig gemacht werden",
+      "irreversibleBody": "Prüfen Sie das genaue Ziel, bevor Sie fortfahren.",
+      "kinds": {
+        "delete": "Dateien oder Ordner löschen",
+        "modify": "Vorhandene Datei ändern",
+        "create": "Datei erstellen",
+        "runCommand": "Befehl ausführen",
+        "runCode": "Code ausführen",
+        "networkAccess": "Auf das Netzwerk zugreifen",
+        "pathAccess": "Auf Dateien oder Ordner zugreifen",
+        "pluginPermission": "Erweiterungsberechtigung erteilen",
+        "sensitiveOperation": "Sensible Aktion"
+      },
+      "backup": {
+        "enabledTitle": "Vor dieser Änderung wird ein wiederherstellbares Backup erstellt.",
+        "enabledBody": "Die ältesten Backups können automatisch entfernt werden, um Platz zu schaffen.",
+        "disabledTitle": "Es wird kein Backup erstellt",
+        "disabledBody": "Diese Aktion lässt sich möglicherweise nicht wiederherstellen.",
+        "settingsHint": "Aktivieren Sie Backups unter Einstellungen > Sandbox > Dateisicherheit.",
+        "unavailableTitle": "Kein Backup ist verfügbar",
+        "unavailableBody": "Diese Aktion kann nicht wiederhergestellt werden. Fahren Sie nur fort, wenn Sie dauerhaften Datenverlust akzeptieren."
+      }
     },
     "plan": {
       "label": "Plan",
@@ -3452,10 +3520,8 @@
       "modelRoutingEnsemble": "AI-gestützter Ensemble-Router",
       "modelRoutingEnsembleDesc": "AI koordiniert mehrere Modelle, um die Leistungsfähigkeit bei komplexen Aufgaben zu erhöhen.",
       "runMode": "Ausführungsmodus",
-      "runModeStandard": "Jedes Mal fragen",
-      "runModeStandardDesc": "Fragt vor Zugriffen auf Dateien außerhalb des Projekts, das Netzwerk oder Systemeinstellungen.",
-      "runModeTrusted": "Verwaltete Ausführung",
-      "runModeTrustedDesc": "Bewertet Risiken automatisch, sodass Sie Aktionen meist nicht einzeln bestätigen müssen.",
+      "runModeSafe": "Sicher",
+      "runModeSafeDesc": "Verwendet die Sandbox und Ihre Datei-, Befehls- und Netzwerkregeln.",
       "runModeFull": "Vollzugriff",
       "runModeFullDesc": "Greift ohne einzelne Rückfragen direkt auf Dateien, Netzwerk und System zu.",
       "runModeFullUnavailable": "Vollzugriff ist nur für den Eigentümer der Sitzung verfügbar.",

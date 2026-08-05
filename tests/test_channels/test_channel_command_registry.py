@@ -73,6 +73,37 @@ async def test_channel_sandbox_command_sets_run_mode_from_argument() -> None:
 
 
 @pytest.mark.asyncio
+async def test_channel_sandbox_command_canonicalizes_legacy_safe_alias() -> None:
+    msg = IncomingMessage(sender_id="admin-1", channel_id="c1", content="/sandbox trusted")
+    envelope = build_channel_route_envelope(
+        msg,
+        session_key="agent:main:feishu:admin-1",
+        session_prefix="feishu",
+        agent_id="main",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeDispatcher:
+        async def dispatch(self, req_id, method, params, ctx):
+            captured["params"] = params
+            return make_ok_res(req_id, {"runMode": "safe"})
+
+    reply = await DEFAULT_COMMAND_REGISTRY.dispatch(
+        envelope=envelope,
+        message_content=msg.content,
+        rpc_dispatcher=FakeDispatcher(),
+        context_factory=lambda _envelope: object(),
+    )
+
+    assert captured["params"] == {
+        "sessionKey": "agent:main:feishu:admin-1",
+        "runMode": "safe",
+    }
+    assert reply is not None
+    assert reply.content == "Sandbox mode set to Safe mode."
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("locale", sorted(_MESSAGES))
 async def test_channel_command_replies_follow_gateway_locale(locale: str) -> None:
     config = SimpleNamespace(control_ui=SimpleNamespace(default_locale=locale))

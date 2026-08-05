@@ -1130,29 +1130,52 @@ def _desktop_ownership_profile_home(config: GatewayConfig) -> Path:
 
 
 async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
-    """Run automatic sandbox setup when enabled."""
+    """Inspect sandbox readiness without elevating during gateway startup."""
 
     if not config.sandbox.auto_setup:
         log.info("boot.sandbox_setup_auto_disabled")
         return None
 
-    from opensquilla.sandbox.setup_runtime import ensure_sandbox_setup_auto
+    from opensquilla.sandbox.setup_runtime import (
+        current_sandbox_capability_report,
+        current_sandbox_setup_runtime_status,
+    )
 
-    result = await ensure_sandbox_setup_auto(config)
+    result = await current_sandbox_setup_runtime_status(config)
     log.info(
-        "boot.sandbox_setup_auto_completed",
+        "boot.sandbox_setup_status_completed",
         state=result.state.value,
         platform=result.platform,
         requires_admin=result.requires_admin,
         detail=result.detail,
     )
+    if result.state.value == "ready":
+        try:
+            capability = await current_sandbox_capability_report(config)
+            log.info(
+                "boot.sandbox_capability_prewarm_completed",
+                available=getattr(capability, "available", False),
+                backend=getattr(capability, "backend", ""),
+                code=getattr(capability, "code", ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - startup prewarm is best-effort.
+            log.warning(
+                "boot.sandbox_capability_prewarm_failed",
+                error=str(exc),
+            )
+    else:
+        log.info(
+            "boot.sandbox_setup_deferred",
+            state=result.state.value,
+            platform=result.platform,
+        )
     return result
 
 
 def _sandbox_settings_for_runtime(config: GatewayConfig) -> Any:
     """Return sandbox settings normalized to the config-level run mode."""
 
-    from opensquilla.sandbox.run_mode import (
+    from opensquilla.run_mode import (
         RunMode,
         config_run_mode,
         run_mode_config_patch,
@@ -1160,7 +1183,7 @@ def _sandbox_settings_for_runtime(config: GatewayConfig) -> Any:
     )
 
     configured = config_run_mode(config)
-    if configured in {RunMode.STANDARD, RunMode.TRUSTED}:
+    if configured in {RunMode.SAFE, RunMode.SAFE}:
         return config.sandbox
 
     patch = run_mode_config_patch(sandbox_runtime_capability_mode(config))
@@ -1200,6 +1223,23 @@ def _task_runtime_envelope_owner(envelope: Any) -> bool:
     if isinstance(principal_is_owner, bool):
         return principal_is_owner
     return getattr(envelope, "source_kind", None) == SourceKind.CLI
+
+
+def _task_runtime_envelope_host_execute(envelope: Any) -> bool:
+    """Resolve host-execution authority without widening owner privileges."""
+    from opensquilla.gateway.routing import (
+        PRINCIPAL_HOST_EXECUTE_METADATA_KEY,
+        SourceKind,
+    )
+
+    if getattr(envelope, "source_kind", None) == SourceKind.CHANNEL:
+        return _task_runtime_envelope_owner(envelope)
+    principal_host_execute = getattr(envelope, "metadata", {}).get(
+        PRINCIPAL_HOST_EXECUTE_METADATA_KEY
+    )
+    if isinstance(principal_host_execute, bool):
+        return principal_host_execute
+    return _task_runtime_envelope_owner(envelope)
 
 
 async def dispatch_task_runtime_turn(
@@ -1279,10 +1319,14 @@ async def dispatch_task_runtime_turn(
     tool_context = tool_context_from_envelope(
         run.envelope,
         is_owner=is_owner,
+        host_execute_allowed=_task_runtime_envelope_host_execute(run.envelope),
         workspace_dir=(str(workspace_dir) if workspace_dir is not None else None),
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),
     )
+    from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+    pin_sandbox_policy(tool_context, config)
     tool_context.task_id = run.task_id
     if (
         session is None
@@ -2485,13 +2529,29 @@ async def build_services(
 
     configure_trusted_fake_ip_cidrs(config.tools.trusted_fake_ip_cidrs)
 
+    # Canonicalize released sandbox state before opening any persistent store.
+    # A failed prepared journal is intentionally left for explicit recovery;
+    # startup never guesses or rolls the profile back automatically.
+    config_path = Path(str(getattr(config, "config_path", "") or ""))
+    if config_path.is_file():
+        from opensquilla.sandbox.upgrade_migration import (
+            ensure_sandbox_upgrade_migrated,
+        )
+
+        upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+        if not upgrade_report.ok:
+            raise RuntimeError(
+                "migration_failed_manual_recovery_required: "
+                f"{upgrade_report.error or upgrade_report.status}"
+            )
+
     # ── Sandbox runtime ─────────────────────────────────────────────
     # validate_combination emits structured warnings; configure_runtime
     # assembles the backend + gate + ledger so tool handlers can call
     # through the ``@sandboxed`` decorator.
     try:
+        from opensquilla.run_mode import config_run_mode
         from opensquilla.sandbox.integration import configure_runtime
-        from opensquilla.sandbox.run_mode import config_run_mode
 
         sandbox_settings = _sandbox_settings_for_runtime(config)
         effective = configure_runtime(

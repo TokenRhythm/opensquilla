@@ -19,7 +19,6 @@
         <div class="cmdp-search__field">
           <Icon name="search" :size="16" class="cmdp-search__icon" />
           <input
-            ref="inputRef"
             v-model="query"
             type="text"
             class="cmdp-search__input"
@@ -126,7 +125,6 @@ const rpcStore = useRpcStore()
 const { enabled: bgmEnabled, setEnabled: setBgmEnabled } = useBgm()
 
 const dialogRef = ref<HTMLElement | null>(null)
-const inputRef = ref<HTMLInputElement | null>(null)
 const listRef = ref<HTMLElement | null>(null)
 const query = ref('')
 const activeIndex = ref(0)

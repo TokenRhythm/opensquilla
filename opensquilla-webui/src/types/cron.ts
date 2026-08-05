@@ -36,7 +36,7 @@ export interface CronJob {
   target_session_key?: string
   sessionKey?: string
   session_key?: string
-  runMode?: 'standard' | 'trusted' | 'full'
+  runMode?: 'safe' | 'full'
   elevated?: string
   executionTarget?: 'sandbox' | 'host'
   deduplicated?: boolean

@@ -56,6 +56,7 @@ def test_recovery_command_surface_is_registered_with_complete_offline_actions() 
         "abandon-cleanup",
         "cleanup-inspect",
         "cleanup-apply",
+        "sandbox-upgrade-status",
     }
 
 

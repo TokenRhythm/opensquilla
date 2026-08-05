@@ -589,7 +589,7 @@ async def test_task_runtime_turn_uses_authenticated_channel_admin_boundary(
     tool_context = runner.calls[0]["tool_context"]
     assert tool_context.is_owner is expected_owner
     assert tool_context.channel_admin_verified is expected_owner
-    assert tool_context.run_mode == "trusted"
+    assert tool_context.run_mode == "safe"
 
 
 @pytest.mark.parametrize(
@@ -807,7 +807,7 @@ def test_gateway_home_falls_back_to_config_path_parent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_boot_sandbox_setup_runs_by_default(
+async def test_boot_sandbox_setup_prewarms_an_existing_ready_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
@@ -823,8 +823,8 @@ async def test_boot_sandbox_setup_runs_by_default(
         },
     )
 
-    async def fake_ensure(setup_config: GatewayConfig) -> SetupResult:
-        calls.append("setup")
+    async def fake_status(setup_config: GatewayConfig) -> SetupResult:
+        calls.append("status")
         assert setup_config is config
         return SetupResult(
             state=SandboxSetupState.READY,
@@ -834,16 +834,25 @@ async def test_boot_sandbox_setup_runs_by_default(
             detail="proxy_allowlist=ready",
         )
 
+    async def fake_capability(setup_config: GatewayConfig) -> object:
+        calls.append("capability")
+        assert setup_config is config
+        return object()
+
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.ensure_sandbox_setup_auto",
-        fake_ensure,
+        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
+        fake_status,
+    )
+    monkeypatch.setattr(
+        "opensquilla.sandbox.setup_runtime.current_sandbox_capability_report",
+        fake_capability,
     )
 
     result = await boot._ensure_sandbox_setup_on_boot(config)
 
     assert result is not None
     assert result.state is SandboxSetupState.READY
-    assert calls == ["setup"]
+    assert calls == ["status", "capability"]
 
 
 @pytest.mark.asyncio
@@ -853,10 +862,10 @@ async def test_boot_sandbox_setup_can_be_disabled(
     from opensquilla.gateway import boot
 
     async def fail_if_called(config: GatewayConfig) -> object:
-        raise AssertionError("sandbox.auto_setup=false must not trigger setup")
+        raise AssertionError("sandbox.auto_setup=false must not inspect setup")
 
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.ensure_sandbox_setup_auto",
+        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
         fail_if_called,
     )
 
@@ -875,7 +884,7 @@ async def test_boot_sandbox_setup_can_be_disabled(
 
 
 @pytest.mark.asyncio
-async def test_boot_sandbox_setup_runs_for_full_host_access_by_default(
+async def test_boot_sandbox_setup_defers_incomplete_setup_for_full_host_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import boot
@@ -890,26 +899,35 @@ async def test_boot_sandbox_setup_runs_for_full_host_access_by_default(
         },
     )
 
-    async def fake_ensure(setup_config: GatewayConfig) -> SetupResult:
-        calls.append("setup")
+    async def fake_status(setup_config: GatewayConfig) -> SetupResult:
+        calls.append("status")
         assert setup_config is config
         return SetupResult(
-            state=SandboxSetupState.READY,
+            state=SandboxSetupState.NOT_SETUP,
             platform="auto",
-            message="Sandbox setup is ready.",
-            requires_admin=False,
+            message="Sandbox setup requires administrator approval.",
+            requires_admin=True,
         )
 
+    async def fake_capability(setup_config: GatewayConfig) -> object:
+        calls.append("capability")
+        assert setup_config is config
+        return object()
+
     monkeypatch.setattr(
-        "opensquilla.sandbox.setup_runtime.ensure_sandbox_setup_auto",
-        fake_ensure,
+        "opensquilla.sandbox.setup_runtime.current_sandbox_setup_runtime_status",
+        fake_status,
+    )
+    monkeypatch.setattr(
+        "opensquilla.sandbox.setup_runtime.current_sandbox_capability_report",
+        fake_capability,
     )
 
     result = await boot._ensure_sandbox_setup_on_boot(config)
 
     assert result is not None
-    assert result.state is SandboxSetupState.READY
-    assert calls == ["setup"]
+    assert result.state is SandboxSetupState.NOT_SETUP
+    assert calls == ["status"]
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1039,7 @@ async def test_service_container_close_cancels_profile_import_maintenance() -> N
 
 
 @pytest.mark.asyncio
-async def test_bare_full_default_boots_standard_capability(
+async def test_bare_full_default_boots_full_capability(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1057,7 +1075,7 @@ async def test_bare_full_default_boots_standard_capability(
     )
     try:
         settings, default_mode = captured[0]
-        assert settings.run_mode == "standard"
+        assert settings.run_mode == "safe"
         assert settings.sandbox is True
         assert settings.security_grading is True
         assert settings.network_default == "proxy_allowlist"
@@ -2873,6 +2891,7 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
         name="Owner",
         payload={"kind": "agent_turn", "agent_id": "ops"},
         creator_is_owner=True,
+        creator_host_execute=True,
         run_mode="full",
         elevated="full",
         execution_target="host",
@@ -2923,6 +2942,16 @@ async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> Non
 def test_default_bypass_keeps_sandbox_capability_for_explicit_restricted_calls() -> None:
     settings = _sandbox_settings_for_runtime(GatewayConfig())
 
-    assert settings.run_mode == "standard"
+    assert settings.run_mode == "safe"
+    assert settings.sandbox is True
+    assert settings.security_grading is True
+
+
+def test_explicit_full_default_keeps_sandbox_capability_for_safe_mode() -> None:
+    config = GatewayConfig(sandbox={"run_mode": "full"})
+
+    settings = _sandbox_settings_for_runtime(config)
+
+    assert settings.run_mode == "safe"
     assert settings.sandbox is True
     assert settings.security_grading is True

@@ -196,6 +196,41 @@ describe('useChatSlashCommands plan compatibility', () => {
   })
 })
 
+describe('useChatSlashCommands meta requests', () => {
+  const metaCommand = {
+    name: '/meta',
+    description: 'Run a meta-skill.',
+    aliases: [],
+    execution: { action: 'meta.menu' },
+    argument_choices: [
+      { value: 'meta-skill-creator', description: 'Create a meta-skill.' },
+    ],
+  }
+
+  it('keeps the concrete request after the selected meta-skill name', async () => {
+    const { api, dispatchHidden, rpc } = harness(false, [metaCommand])
+    rpc.call.mockImplementation(async (method: string) => {
+      if (method === 'commands.list_for_surface') return { commands: [metaCommand] }
+      if (method === 'meta.run') return { ok: true }
+      return {}
+    })
+
+    await api.executeSlashCommand(
+      '/meta meta-skill-creator create a competitor research meta-skill',
+    )
+    await vi.waitFor(() => expect(dispatchHidden).toHaveBeenCalledOnce())
+
+    expect(rpc.call).toHaveBeenCalledWith('meta.run', {
+      name: 'meta-skill-creator',
+      sessionKey: 'agent:main:webchat:test',
+    })
+    expect(dispatchHidden).toHaveBeenCalledWith(
+      '/meta meta-skill-creator create a competitor research meta-skill',
+      '/meta meta-skill-creator create a competitor research meta-skill',
+    )
+  })
+})
+
 describe('useChatSlashCommands Coding mode', () => {
   const codingCommand = {
     name: '/coding',

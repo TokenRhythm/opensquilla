@@ -9,6 +9,7 @@ def test_meta_command_present_on_gateway_backed_surfaces() -> None:
     cmd = DEFAULT_REGISTRY.find("/meta")
     assert cmd is not None
     assert cmd.name == "/meta"
+    assert cmd.usage == "/meta [skill-name] [request]"
     for surface in (Surface.WEB_CHAT, Surface.CLI_GATEWAY, Surface.CHANNEL):
         assert cmd.execution_for(surface) is not None, surface
     assert cmd.execution_for(Surface.CLI_STANDALONE) is None

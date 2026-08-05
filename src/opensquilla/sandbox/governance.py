@@ -257,7 +257,7 @@ def _channel_approval_routing(
     Channel turns do not have a local approval surface. A queued approval must
     therefore carry the authenticated sender and exact session key so the
     channel notifier can deliver the prompt and authorize its response. Keep
-    this at the common governance gate because Standard-Sandbox actions reach
+    this at the common governance gate because Safe mode actions reach
     it without going through the managed-execution elevation helpers.
     """
 

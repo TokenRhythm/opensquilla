@@ -92,11 +92,11 @@ def _normalize_chat_history_limit(value: object) -> int:
 def _is_webchat_session_key(key: str) -> bool:
     parts = str(key or "").split(":")
     return (
-        len(parts) == 4
+        len(parts) >= 4
         and parts[0] == "agent"
         and bool(parts[1])
         and parts[2] == "webchat"
-        and bool(parts[3])
+        and all(parts[3:])
     )
 
 

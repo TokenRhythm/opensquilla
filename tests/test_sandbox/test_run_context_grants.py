@@ -1422,7 +1422,7 @@ async def test_enable_bundle_grant_clears_disabled_default_override(tmp_path):
         workspace=str(tmp_path),
     )
     assert disabled.bundles[0].source == "disabled"
-    assert decide_network_access("registry.npmjs.org", disabled).status == "ask"
+    assert decide_network_access("registry.npmjs.org", disabled).status == "allow"
 
     updated = await enable_bundle_grant(
         manager,
@@ -1544,7 +1544,7 @@ async def test_set_run_mode_preserves_name_agnostic_fallback_workspace(
     updated = await set_run_mode(
         manager,
         manager.node.session_key,
-        RunMode.TRUSTED,
+        RunMode.SAFE,
         config=_config(),
         workspace=fallback_workspace,
     )
@@ -1726,7 +1726,7 @@ async def test_non_root_nested_workspace_is_allowed_for_set_saved_and_fallback(
     updated = await set_run_mode(
         manager,
         manager.node.session_key,
-        RunMode.TRUSTED,
+        RunMode.SAFE,
         config=_config(),
         workspace=str(workspace_path),
     )
@@ -2038,7 +2038,7 @@ async def test_set_run_mode_preserves_non_root_credential_named_fallback_workspa
     updated = await set_run_mode(
         manager,
         manager.node.session_key,
-        RunMode.TRUSTED,
+        RunMode.SAFE,
         config=_config(),
         workspace=str(tmp_path.joinpath(*workspace_parts)),
     )
@@ -2222,7 +2222,7 @@ async def test_temporary_grants_round_trip(tmp_path):
         manager,
         manager.node.session_key,
         RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=str(tmp_path),
             public_network=(PublicNetworkGrant(scope="chat", source="manual"),),
             temporary_grants=(grant,),
@@ -2282,7 +2282,7 @@ async def test_set_run_mode_preserves_bundle_and_temporary_grants(tmp_path):
         manager,
         manager.node.session_key,
         RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=str(tmp_path),
             public_network=(public_network,),
             temporary_grants=(temporary,),
@@ -2293,7 +2293,7 @@ async def test_set_run_mode_preserves_bundle_and_temporary_grants(tmp_path):
     updated = await set_run_mode(
         manager,
         manager.node.session_key,
-        RunMode.TRUSTED,
+        RunMode.SAFE,
         config=_config(),
         workspace=str(tmp_path),
     )
@@ -2704,7 +2704,7 @@ async def test_apply_network_once_choice_stays_transient_and_updates_overlay(tmp
     )
 
     base = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -2795,7 +2795,7 @@ async def test_project_network_once_preserves_authoritative_tool_context(tmp_pat
     )
     assert params is not None
     authoritative = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         mounts=(MountGrant(path=str(workspace), access="rw", scope="chat"),),
         domains=(
@@ -2904,7 +2904,7 @@ async def test_project_network_once_preserves_authoritative_tool_context(tmp_pat
         finally:
             current_tool_context.reset(active_token)
         assert effective is not None
-        assert effective.run_mode is RunMode.STANDARD
+        assert effective.run_mode is RunMode.SAFE
         assert effective.mounts == authoritative.mounts + (overlay_mount,)
         assert effective.domains == authoritative.domains + (overlay_domain,)
         assert effective.bundles == (overlay_bundle,)
@@ -2977,7 +2977,7 @@ async def _assert_project_approval_retarget_fails_closed(
     )
     assert params is not None
     authoritative = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         mounts=(MountGrant(path=str(workspace), access="rw", scope="chat"),),
         domains=(
@@ -3127,7 +3127,7 @@ async def test_project_approval_generation_does_not_cross_directory_replacement(
     assert params is not None
 
     first_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         domains=(
             DomainGrant(
@@ -3161,7 +3161,7 @@ async def test_project_approval_generation_does_not_cross_directory_replacement(
     workspace.rename(original)
     workspace.mkdir()
     replacement_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         domains=(
             DomainGrant(
@@ -3260,7 +3260,7 @@ def test_project_approval_generation_is_cleaned_when_queue_stops_waiting(
             manager,
             str(workspace),
             RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 workspace=str(workspace),
                 source="saved",
             ),
@@ -3326,7 +3326,7 @@ async def test_project_network_once_consumption_preserves_authoritative_overlay(
     )
     manager.node.origin = {RUN_CONTEXT_ORIGIN_KEY: stale.to_origin_payload()}
     authoritative = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         domains=(
             DomainGrant(
@@ -3362,7 +3362,7 @@ async def test_project_network_once_consumption_preserves_authoritative_overlay(
         assert overlay == authoritative
         persisted = manager.node.origin[RUN_CONTEXT_ORIGIN_KEY]
         assert persisted["workspace"] == str(workspace)
-        assert persisted["run_mode"] == "standard"
+        assert persisted["run_mode"] == "safe"
         assert persisted["run_mode_source"] == "project_default"
         assert persisted["domains"] == [
             {
@@ -3415,7 +3415,7 @@ async def test_same_root_once_rw_overlay_writes_then_expiry_restores_base_ro(
         source="manual",
     )
     base = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         mounts=(
             MountGrant(
@@ -3563,7 +3563,7 @@ async def test_path_allow_once_rw_preserves_durable_same_root_ro_after_expiry(
     workspace.mkdir()
     mounted.mkdir()
     base = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         mounts=(MountGrant(path=str(mounted), access="ro", scope="chat"),),
         run_mode_source="user",
@@ -3756,7 +3756,7 @@ async def test_project_path_once_preserves_authoritative_tool_context(tmp_path):
     )
     assert params is not None
     authoritative = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         domains=(
             DomainGrant(
@@ -3810,7 +3810,7 @@ async def test_project_path_once_preserves_authoritative_tool_context(tmp_path):
             current_tool_context.reset(active_token)
         assert effective is not None
         assert effective.workspace == str(workspace)
-        assert effective.run_mode is RunMode.STANDARD
+        assert effective.run_mode is RunMode.SAFE
         assert effective.run_mode_source == "project_default"
         assert effective.domains == authoritative.domains
         assert [
@@ -3821,7 +3821,7 @@ async def test_project_path_once_preserves_authoritative_tool_context(tmp_path):
         ]
         persisted = manager.node.origin[RUN_CONTEXT_ORIGIN_KEY]
         assert persisted["workspace"] == str(workspace)
-        assert persisted["run_mode"] == "standard"
+        assert persisted["run_mode"] == "safe"
         assert persisted["run_mode_source"] == "project_default"
         assert persisted["domains"] == [
             {
@@ -3960,7 +3960,7 @@ def test_prune_once_mount_grants_expires_only_once_scoped_overlay_mounts():
     try:
         session_key = "agent:main:webchat:once"
         context = RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=None,
             mounts=(
                 MountGrant(path="/tmp/once", access="rw", scope="once"),

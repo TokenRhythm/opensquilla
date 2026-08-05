@@ -24,7 +24,7 @@
   },
   "dependencies": {
     "@types/dompurify": "^3.0.5",
-    "dompurify": "^3.4.11",
+    "dompurify": "^3.4.12",
     "highlight.js": "^11.11.1",
     "html-to-image": "^1.11.13",
     "katex": "^0.17.0",
@@ -41,6 +41,6 @@
     "typescript": "^5.4.5",
     "vite": "^8.0.16",
     "vitest": "^4.1.9",
-    "vue-tsc": "^2.0.11"
+    "vue-tsc": "^3.3.9"
   }
 }

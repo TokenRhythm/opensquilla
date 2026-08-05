@@ -8,6 +8,7 @@ import {
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
   primeSessionBootstrapAdmission,
+  sandboxSetupRpcCallOptions,
 } from './sessionBootstrapAdmission'
 
 afterEach(() => {
@@ -21,6 +22,14 @@ describe('session bootstrap admission', () => {
       timeoutMs: 10_000,
       timeoutAction: 'reconnect',
       abortAction: 'reconnect',
+    })
+  })
+
+  it('lets the first live sandbox verification finish without recycling the socket', () => {
+    expect(sandboxSetupRpcCallOptions).toEqual({
+      timeoutMs: 45_000,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
     })
   })
 

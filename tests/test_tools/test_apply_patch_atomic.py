@@ -154,6 +154,35 @@ async def test_apply_patch_commit_preflight_child_first_parent_file_conflict_is_
     assert ctx.workspace_mutation_receipts == []
 
 
+def test_patch_commit_preflights_utf8_before_mutating_any_file(tmp_path: Path) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("one\n", encoding="utf-8")
+    second.write_text("two\n", encoding="utf-8")
+    planned = [
+        patch_tool.PlannedPatchWrite(
+            path="first.txt",
+            resolved=first,
+            before=patch_tool._fingerprint_content("one\n"),
+            after_content="ONE\n",
+            operation="apply_patch_update",
+        ),
+        patch_tool.PlannedPatchWrite(
+            path="second.txt",
+            resolved=second,
+            before=patch_tool._fingerprint_content("two\n"),
+            after_content="invalid \udc80",
+            operation="apply_patch_update",
+        ),
+    ]
+
+    with pytest.raises(UnicodeEncodeError):
+        patch_tool._commit_planned_writes(planned)
+
+    assert first.read_text(encoding="utf-8") == "one\n"
+    assert second.read_text(encoding="utf-8") == "two\n"
+
+
 @pytest.mark.asyncio
 async def test_apply_patch_repeated_updates_to_same_file_compose_in_memory(
     patch_context: tuple[Path, ToolContext, list[dict[str, Any]]],

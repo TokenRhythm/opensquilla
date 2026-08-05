@@ -355,7 +355,7 @@ describe('useChatSessionSubscription', () => {
         active_task_group_ids: [],
         run_mode_lock: {
           locked: true,
-          runMode: 'standard',
+          runMode: 'safe',
           source: 'task',
         },
         current_stream_seq: 1,
@@ -387,7 +387,7 @@ describe('useChatSessionSubscription', () => {
 
     expect(onRunModeLock).toHaveBeenCalledWith({
       locked: true,
-      runMode: 'standard',
+      runMode: 'safe',
       source: 'task',
     })
   })

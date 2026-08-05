@@ -262,7 +262,11 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
     )
 
     if sandbox_approval and approved:
-        claim_token = queue.claim_resolution(params["id"])
+        claim_token = queue.claim_resolution(
+            params["id"],
+            resolution_metadata={"resolutionSource": "user_web"},
+        )
+        pending = queue.get(params["id"])
         try:
             queue.finalize_claimed_resolution(
                 params["id"],
@@ -307,6 +311,7 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
         approved,
         elevated_mode=None,
         allow_idempotent=not sandbox_approval,
+        resolution_metadata={"resolutionSource": "user_web"},
     )
     if sandbox_approval and not approved:
         remember_sandbox_approval_denial(pending.params, params["id"])

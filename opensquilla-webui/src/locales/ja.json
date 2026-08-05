@@ -448,6 +448,52 @@
         "default": "OpenSquilla はこのリクエストを完了できませんでした。未確認のプロフィール変更は適用されていません。"
       }
     },
+    "sandbox": {
+      "back": "戻る",
+      "eyebrow": "セキュリティ",
+      "title": "サンドボックス",
+      "subtitle": "安全モードのファイル、コマンド、ネットワーク、同梱ランタイム、LAN トークンを設定します。",
+      "available": "安全モード利用可能",
+      "unavailable": "安全モード利用不可",
+      "builtin": "組み込み",
+      "actions": { "add": "追加", "remove": "削除", "retry": "再試行", "copy": "コピー", "saving": "保存中…", "redetect": "再検出" },
+      "mode": {
+        "title": "既定のアクセスモード", "description": "新しいタスクの開始モードを選びます。能力検証に失敗した場合、Safe は選択できません。",
+        "default": "既定モード", "safe": "Safe", "full": "完全アクセス", "resetWarning": "起動時の警告を再表示"
+      },
+      "setup": {
+        "title": "Safe モードを設定", "description": "OpenSquilla は、分離アカウントとファイル・ネットワーク保護を設定するために、一度だけ管理者の承認を必要とします。", "descriptionWithDuration": "OpenSquilla は、分離アカウントと安全保護を設定するために、一度だけ管理者の承認を必要とします。初回設定には通常約 20～30 秒かかります。設定中は OpenSquilla を開いたままにしてください。",
+        "continue": "続ける", "configuring": "設定中…", "requestingApproval": "続行するには、Windows の確認画面で承認してください。", "configuringProtection": "OpenSquilla が Safe モードの設定を完了しています。アプリは開いたままにしてください。", "takingLonger": "初回設定には数分かかる場合があります。確認は自動的に実行されます。", "elapsed": "経過 {seconds} 秒", "cancelled": "設定をキャンセルしました。完全アクセスは変更されていません。いつでも再試行できます。",
+        "failed": "Safe モードを設定できませんでした。完全アクセスは変更されていません。", "verificationFailed": "設定は完了しましたが、安全性の確認に失敗しました。完全アクセスは変更されていません。",
+        "runInBackground": "バックグラウンドで設定", "readyToast": "Safe モードの準備ができました。", "failedToast": "Safe モードの設定を完了できませんでした。Safe モードから再試行してください。"
+      },
+      "files": {
+        "title": "ファイル保護", "description": "通常のファイルは読み取り可能です。保護パスの変更には承認が必要です。", "readsAllowed": "読み取り許可",
+        "customPath": "カスタム保護パス", "pathPlaceholder": "保護パスを追加", "backupTitle": "破壊的なファイル変更の前にバックアップ",
+        "backupDescription": "既存ファイルの削除や変更前に復元可能なコピーを作成し、必要に応じて古いバックアップを自動削除します。", "quota": "バックアップ容量上限",
+        "recursiveWarning": "バックアップがない削除や上書きは復元できない場合があります。古いコピーを削除してもバックアップできない場合は、続行前に再確認します。"
+      },
+      "commands": {
+        "title": "コマンド保護", "description": "コマンドは原則自動実行され、git push など影響の大きい操作だけ承認を求めます。",
+        "systemTools": "システムツール", "systemToolsAuto": "自動許可", "systemToolsPrompt": "事前確認", "systemToolsDisabled": "無効",
+        "approvalPrefixes": "承認が必要なコマンド接頭辞", "autoPrefixes": "常に自動許可する接頭辞", "prefixPlaceholder": "例: git push"
+      },
+      "network": {
+        "title": "ネットワーク保護", "description": "公開ネットワークは既定で許可し、SSRF とメタデータ保護を維持します。",
+        "blockAll": "すべてのネットワークを遮断", "blockAllDescription": "許可ドメインだけを例外にします。", "allowDomains": "許可ドメイン", "denyDomains": "拒否ドメイン"
+      },
+      "runtimes": { "title": "同梱ランタイム", "description": "安全モードは同梱ツールを優先し、フルアクセスはホストツールを優先します。", "target": "パッケージ対象" },
+      "lan": {
+        "listen": "ローカルネットワークで待ち受ける", "listenDescription": "再起動後に全ローカルインターフェイスへバインドします。公開ピアは引き続き拒否されます。",
+        "allowedCidrs": "許可するクライアント CIDR", "cidrDescription": "任意。空欄では loopback、RFC1918、IPv6 ULA を許可し、指定時は範囲を狭めることだけができます。",
+        "restartRequired": "変更を適用するには OpenSquilla を再起動してください。",
+        "title": "Web アクセスと名前付きトークン", "description": "有効なトークンのないリモート Web アクセスはゲスト安全モードを使用し、名前付きトークンは設定された権限を付与します。",
+        "guest": "トークンなし・誤り:", "guestDescription": " ゲスト安全モード：通常ファイルは読み取り可能、書き込みは既定ワークスペースのみ、認証情報ファイルは読み取り不可です。",
+        "authenticated": "有効なトークン:", "authenticatedDescription": " 権限に応じて安全またはフルアクセスを利用できます。",
+        "tokenName": "トークン名（例: Laptop）", "hostExecute": "ホスト実行 / フルアクセスを許可", "createToken": "トークンを作成",
+        "copyNow": "今すぐコピーしてください。再表示されません。", "fullCapable": "安全とフルアクセス", "safeOnly": "安全のみ", "revoke": "無効化"
+      }
+    },
     "dialog": {
       "title": "設定",
       "actionNeeded": "対応が必要 ({count})",
@@ -483,6 +529,7 @@
       "modelStrategy": "モデルルーティング",
       "behavior": "動作",
       "privacy": "プライバシー",
+      "sandbox": "サンドボックス",
       "memory": "メモリとプロフィール",
       "router": "ルーター",
       "ensemble": "アンサンブル",
@@ -3321,24 +3368,45 @@
     },
     "approval": {
       "required": "承認が必要です",
-      "requiredFor": "承認が必要です: {tool}",
-      "neededFor": "承認が必要です: {tool}",
+      "requiredFor": "承認が必要です: {action}",
+      "neededFor": "承認が必要です: {action}",
       "command": "コマンド",
       "arguments": "引数",
       "extend": "延長",
-      "denyReasonPlaceholder": "拒否の理由（任意）— エージェントに送信されます",
-      "denyReasonLabel": "拒否の理由（任意、エージェントに送信）",
       "allowOnce": "1 回だけ許可",
+      "continueWithoutBackup": "バックアップなしで続行",
       "allowSameType": "同じ種類を許可",
       "deny": "拒否",
       "expiresIn": "{time} で期限切れ",
-      "outcomeExpired": "期限切れ — 未実行",
+      "outcomeExpired": "期限切れ、未実行",
       "outcomeDenied": "拒否済み",
-      "outcomeApproved": "承認済み · 実行を再開",
+      "outcomeApproved": "承認済み。実行を再開しました",
       "target": "対象",
       "access": "アクセス",
       "workspace": "ワークスペース",
-      "outcomeUnavailable": "この承認は利用できなくなりました"
+      "outcomeUnavailable": "この承認は利用できなくなりました",
+      "irreversibleTitle": "この操作は元に戻せません",
+      "irreversibleBody": "続行する前に対象を確認してください。",
+      "kinds": {
+        "delete": "ファイルまたはフォルダーを削除",
+        "modify": "既存ファイルを変更",
+        "create": "ファイルを作成",
+        "runCommand": "コマンドを実行",
+        "runCode": "コードを実行",
+        "networkAccess": "ネットワークにアクセス",
+        "pathAccess": "ファイルまたはフォルダーにアクセス",
+        "pluginPermission": "拡張機能に権限を付与",
+        "sensitiveOperation": "機密性の高い操作"
+      },
+      "backup": {
+        "enabledTitle": "変更前に復元可能なバックアップを作成します。",
+        "enabledBody": "空き容量を確保するため、古いバックアップを自動削除する場合があります。",
+        "disabledTitle": "バックアップは作成されません",
+        "disabledBody": "この操作は復元できない場合があります。",
+        "settingsHint": "設定 > サンドボックス > ファイル保護でバックアップを有効にできます。",
+        "unavailableTitle": "利用できるバックアップがありません",
+        "unavailableBody": "この操作は復元できません。データの完全な消失を許容する場合のみ続行してください。"
+      }
     },
     "plan": {
       "label": "プラン",
@@ -3452,10 +3520,8 @@
       "modelRoutingEnsemble": "AI搭載アンサンブルルーター",
       "modelRoutingEnsembleDesc": "AI が複数のモデルを連携させ、複雑なタスクでの能力向上を優先します。",
       "runMode": "実行モード",
-      "runModeStandard": "毎回確認",
-      "runModeStandardDesc": "プロジェクト外のファイル、ネットワーク、システム変更の前に毎回確認します。",
-      "runModeTrusted": "おまかせ実行",
-      "runModeTrustedDesc": "操作のリスクを自動で判断するため、通常は毎回の確認が不要です。",
+      "runModeSafe": "安全モード",
+      "runModeSafeDesc": "サンドボックスと設定したファイル、コマンド、ネットワーク規則を使用します。",
       "runModeFull": "フルアクセス",
       "runModeFullDesc": "ファイル、ネットワーク、システムへ毎回確認せず直接アクセスできます。",
       "runModeFullUnavailable": "フルアクセスはセッションの所有者のみ利用できます。",

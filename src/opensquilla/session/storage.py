@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import random
+import re
 import sqlite3
 import time
 from collections.abc import (
@@ -3716,6 +3717,7 @@ class SessionStorage:
         limit: int = 100,
         offset: int = 0,
         spawned_by: str | None = None,
+        guest_owner_id: str | None = None,
     ) -> list[SessionNode]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -3728,6 +3730,16 @@ class SessionStorage:
         if spawned_by is not None:
             clauses.append("sessions.spawned_by = ?")
             params.append(canonicalize_session_key(spawned_by))
+        if guest_owner_id is not None:
+            owner_id = str(guest_owner_id).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", owner_id):
+                return []
+            clauses.append(
+                "sessions.session_key GLOB ? "
+                "AND (length(sessions.session_key) - "
+                "length(replace(sessions.session_key, ':', ''))) = 5"
+            )
+            params.append(f"agent:?*:webchat:guest:{owner_id}:?*")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
             SELECT sessions.*

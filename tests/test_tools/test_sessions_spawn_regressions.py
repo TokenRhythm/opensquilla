@@ -409,7 +409,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
     manager = SessionManager(storage, inject_time_prefix=False)
     parent_key = "agent:main:webchat:spawn-parent-restart"
     parent_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         mounts=(
             MountGrant(path=str(mounted), access="rw", scope="chat"),
@@ -566,15 +566,15 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
             event_emitter=emit,
         )
 
-        assert observations["mode"] is RunMode.STANDARD
+        assert observations["mode"] is RunMode.SAFE
         assert observations["source"] == "route_metadata"
         assert observations["run_mode_source"] == "user"
         assert [(grant.path, grant.access, grant.scope) for grant in observations["mounts"]] == [
             (str(mounted), "rw", "chat")
         ]
         assert observations["granted_network"].reason == "domain_grant"
-        assert observations["unknown_network"].status == "ask"
-        assert observations["unknown_network"].reason == "unknown_domain"
+        assert observations["unknown_network"].status == "allow"
+        assert observations["unknown_network"].reason == "public_default"
         assert observations["caller_kind"] is CallerKind.SUBAGENT
         assert observations["subagent_depth"] == 1
         assert len(backend_operations) == 1
@@ -586,7 +586,7 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
         assert child.parent_session_key == parent_key
         assert child.origin is not None
         assert child.origin["parent_task_id"] == "parent-task-restart"
-        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "standard"
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "safe"
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode_source"] == "user"
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["mounts"] == [
             {"path": str(mounted), "access": "rw", "scope": "chat"}
@@ -665,7 +665,7 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
         },
     )
     authoritative_parent = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(project_path),
         mounts=(MountGrant(path=str(mounted), access="rw", scope="chat"),),
         domains=(
@@ -792,10 +792,10 @@ async def test_project_spawned_child_persists_binding_and_revalidates_queued_exe
         assert child.workspace_id == project.workspace_id
         assert child.origin is not None
         assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["workspace"] == str(project_path)
-        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "standard"
+        assert child.origin[RUN_CONTEXT_ORIGIN_KEY]["run_mode"] == "safe"
         assert observations == [
             {
-                "mode": RunMode.STANDARD,
+                "mode": RunMode.SAFE,
                 "workspace": str(project_path),
                 "run_mode_source": "project_default",
                 "network": observations[0]["network"],

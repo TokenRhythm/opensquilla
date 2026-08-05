@@ -372,7 +372,7 @@
             :error="entry.error"
             @allow-once="resolveApproval(entry, 'allow-once')"
             @allow-always="resolveApproval(entry, 'allow-always')"
-            @deny="note => resolveApproval(entry, 'deny', note)"
+            @deny="resolveApproval(entry, 'deny')"
             @extend="extendInterrupt(entry.approval.id)"
           />
 
@@ -400,16 +400,6 @@
         />
       </div>
     </div>
-
-    <SandboxSetupBanner
-      v-if="sandboxSetupVisible"
-      :status="sandboxSetupStatus"
-      :can-setup="sandboxSetupCanSetup"
-      :ensuring="sandboxSetupEnsuring"
-      :error="sandboxSetupError"
-      @setup="ensureSandboxSetup"
-      @dismiss="dismissSandboxSetup"
-    />
 
     <!-- Composer dock: positioning context so the slash menu anchors directly
          above the composer in any layout. The new-chat landing centers the
@@ -500,7 +490,8 @@
       :send-blocked-message="composerSendBlockedMessage"
       :input-disabled="Boolean(dockedPlanQuestionnaire)"
       :run-mode="runMode"
-      :allowed-run-modes="allowedRunModes"
+      :allowed-run-modes="composerAllowedRunModes"
+      :safe-setup-available="composerSafeSetupAvailable"
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
@@ -541,6 +532,14 @@
       @stop="onComposerStop"
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
+    />
+    <SandboxSetupDialog
+      :open="composerSandboxSetupOpen"
+      :pending="sandboxSetupPending"
+      :outcome="sandboxSetupOutcome"
+      @cancel="cancelComposerSandboxSetup"
+      @background="runComposerSandboxSetupInBackground"
+      @confirm="void confirmComposerSandboxSetup()"
     />
     <ProjectWorkspacePickerDialog
       v-if="rpc.canChooseProject"
@@ -596,9 +595,11 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
+import { storeToRefs } from 'pinia'
 import { useRpcStore } from '@/stores/rpc'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
+import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
@@ -624,8 +625,8 @@ import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
 import RouterFxStrip from '@/components/chat/RouterFxStrip.vue'
-import SandboxSetupBanner from '@/components/chat/SandboxSetupBanner.vue'
 import SharePreviewModal from '@/components/chat/SharePreviewModal.vue'
+import SandboxSetupDialog from '@/components/sandbox/SandboxSetupDialog.vue'
 import ToolResultModal from '@/components/chat/ToolResultModal.vue'
 import Icon from '@/components/Icon.vue'
 import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
@@ -656,13 +657,20 @@ import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
+import {
+  composerRunModeSelectionAction,
+  effectiveComposerRunMode,
+} from '@/composables/chat/composerRunMode'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
-import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
+import {
+  shouldCanonicalizeInitialDraftRoute,
+  useChatSessionRoute,
+} from '@/composables/chat/useChatSessionRoute'
 import {
   useChatRunModePreference,
   type RunModePolicy,
@@ -673,6 +681,8 @@ import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
   optionalSessionRpcCallOptions,
+  runModeWriteRpcCallOptions,
+  sandboxSetupRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
@@ -715,7 +725,11 @@ import type {
   SessionMessagesSnapshotResponse,
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
-import { isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
+import {
+  isRecognizedSandboxRunMode,
+  normalizeSandboxRunMode,
+  type SandboxRunMode,
+} from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
 import type {
   CollaborationMode,
@@ -812,6 +826,11 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+const sandboxSetupStore = useSandboxSetupStore()
+const {
+  ensuring: sandboxSetupPending,
+  outcome: sandboxSetupOutcome,
+} = storeToRefs(sandboxSetupStore)
 // Setup runs before this view's/ancestor children's mounted hooks. Holding the
 // admission gate here prevents global onboarding/workspace metadata calls from
 // entering the serialized Gateway queue ahead of session recovery.
@@ -915,6 +934,7 @@ const {
 } = useChatRunModePreference({
   rpc,
   hydrateCallOptions: optionalSessionRpcCallOptions,
+  writeCallOptions: runModeWriteRpcCallOptions,
   runModePolicy: () => {
     const auth = rpc.auth as RpcAuthPayload | null
     return auth?.runModePolicy
@@ -931,28 +951,50 @@ async function refreshRunModePreference() {
   }
 }
 const activeRunModeLock = ref<SandboxRunMode | null>(null)
-const runMode = computed<SandboxRunMode>(
+const requestedRunMode = computed<SandboxRunMode>(
   () => activeRunModeLock.value ?? globalRunMode.value,
 )
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
   rpc: {
     call: (method, params) =>
-      rpc.call(method, params, optionalSessionRpcCallOptions),
+      rpc.call(method, params, sandboxSetupRpcCallOptions),
+    waitForConnection: () => rpc.waitForConnection(10_000),
   },
   connectionState: computed(() => rpc.state),
-  runMode,
+  runMode: requestedRunMode,
   autoRefresh: false,
+  onUnavailable: async (status) => {
+    await platform.settings.reportSandboxUnavailable?.({
+      state: status.state,
+      ...(status.message ? { message: status.message } : {}),
+    })
+  },
 })
 const {
   status: sandboxSetupStatus,
-  ensuring: sandboxSetupEnsuring,
-  error: sandboxSetupError,
-  visible: sandboxSetupVisible,
-  canSetup: sandboxSetupCanSetup,
-  ensureSetup: ensureSandboxSetup,
-  dismiss: dismissSandboxSetup,
 } = sandboxSetupRecovery
+const runMode = computed<SandboxRunMode>(() => effectiveComposerRunMode(
+  globalRunMode.value,
+  sandboxSetupStatus.value,
+  activeRunModeLock.value,
+  sandboxSetupRecovery.resolved.value,
+))
+const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
+  if (!sandboxSetupRecovery.resolved.value) {
+    return allowedRunModes.value.filter((mode) => mode !== 'safe')
+  }
+  const status = sandboxSetupStatus.value
+  if (
+    status !== null
+    && status.state !== 'ready'
+  ) {
+    return allowedRunModes.value.filter((mode) => mode !== 'safe')
+  }
+  return allowedRunModes.value
+})
+const composerSafeSetupAvailable = computed(() => sandboxSetupRecovery.canSetup.value)
+const composerSandboxSetupOpen = ref(false)
 
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()
@@ -1535,8 +1577,8 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onRunModeLock: lock => {
     if (lock.locked === false) return
-    if (isSandboxRunMode(lock.runMode)) {
-      activeRunModeLock.value = lock.runMode
+    if (isRecognizedSandboxRunMode(lock.runMode)) {
+      activeRunModeLock.value = normalizeSandboxRunMode(lock.runMode)
     } else if (activeRunModeLock.value === null) {
       activeRunModeLock.value = globalRunMode.value
     }
@@ -2023,38 +2065,12 @@ async function steerPendingMessage(index: number) {
   }
 }
 
-// Deny notes are immutable queue payloads. They never borrow or clear the
-// operator's editable composer, even if project validation or live recovery
-// delays delivery.
-function queueDenyFeedback(note: string) {
-  const context = pendingQueueOwnerContext.value
-  const owner = context?.sessionKey === sessionKey.value
-    ? { ownerRequestId: context.ownerRequestId }
-    : undefined
-  const queued = enqueuePendingPayload({
-    text: note,
-    attachments: [],
-    intent: null,
-  }, owner)
-  if (!queued) {
-    inputText.value = [note, inputText.value].filter(text => text.trim()).join('\n')
-    autoResizeTextarea()
-    pushToast(t('chat.toast.queueFull'), { tone: 'info' })
-    return
-  }
-  if (!isStreaming.value && !isCompactInFlightForCurrentSession()) {
-    schedulePendingDrainAfterTerminal()
-    flushDeferredPendingDrain()
-  }
-}
-
 const chatApprovals = useChatApprovals({
   rpc,
   sessionKey,
   runStatus,
   stream: { isStreaming, appendInterruptFrame, ensureInterruptBubble },
   interruptState,
-  onDenyFeedback: queueDenyFeedback,
   onSnapshotCount: count => appStore.setApprovalCount(count),
 })
 const {
@@ -2687,16 +2703,56 @@ function readAuthToken(): string {
   }
 }
 
-async function setComposerRunMode(mode: SandboxRunMode) {
+function reportRunModePersistenceError(cause: unknown): void {
+  const detail = cause instanceof Error ? cause.message : String(cause)
+  console.warn('Failed to persist sandbox run mode:', detail)
+  pushToast(detail, { tone: 'danger' })
+}
+
+async function persistComposerRunMode(mode: SandboxRunMode): Promise<void> {
+  await setGlobalRunMode(mode)
+  void sandboxSetupRecovery.refresh()
+}
+
+async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
   if (runModeLocked.value) return
-  try {
-    await setGlobalRunMode(mode)
-    void sandboxSetupRecovery.refresh()
-  } catch (cause) {
-    const detail = cause instanceof Error ? cause.message : String(cause)
-    console.warn('Failed to persist sandbox run mode:', detail)
-    pushToast(detail, { tone: 'danger' })
+  sandboxSetupStore.noteRunModeSelection(mode)
+  const action = composerRunModeSelectionAction(
+    mode,
+    sandboxSetupStatus.value,
+    composerSafeSetupAvailable.value,
+    sandboxSetupRecovery.resolved.value,
+  )
+  if (action === 'ignore') return
+  if (action === 'setup') {
+    sandboxSetupStore.resetOutcome()
+    composerSandboxSetupOpen.value = true
+    return
   }
+  try {
+    await persistComposerRunMode(mode)
+  } catch (cause) {
+    reportRunModePersistenceError(cause)
+  }
+}
+
+function cancelComposerSandboxSetup(): void {
+  if (sandboxSetupPending.value) return
+  composerSandboxSetupOpen.value = false
+}
+
+async function confirmComposerSandboxSetup(): Promise<void> {
+  if (sandboxSetupPending.value) return
+  const ready = await sandboxSetupStore.startSafeSetup()
+  if (ready) {
+    composerSandboxSetupOpen.value = false
+    await refreshRunModePreference()
+    await sandboxSetupRecovery.refresh()
+  }
+}
+
+function runComposerSandboxSetupInBackground(): void {
+  composerSandboxSetupOpen.value = false
 }
 
 async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
@@ -3564,6 +3620,7 @@ function enterDraft() {
 
 onMounted(async () => {
   chatViewDisposed = false
+  const initialRouteFullPath = route.fullPath
   // Initialize session key. Without an explicit ?session= the view opens as a
   // draft instead of restoring a previous session.
   const initialSession = resolveInitialSession()
@@ -3633,8 +3690,14 @@ onMounted(async () => {
 
   if (initialDraftProjectGeneration !== null) {
     const synced = await initialDraftProjectSync
-    if (synced) {
-      if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
+    if (synced && shouldCanonicalizeInitialDraftRoute({
+      disposed: chatViewDisposed,
+      initialFullPath: initialRouteFullPath,
+      currentFullPath: route.fullPath,
+      currentPathIsDraft: isDraftRoute(),
+      hasLegacyNewChatQuery: hasLegacyNewChatQuery(),
+    })) {
+      goToDraft({ replace: true })
     }
   }
 

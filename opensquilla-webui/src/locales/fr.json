@@ -448,6 +448,52 @@
         "default": "OpenSquilla n’a pas pu terminer cette demande. Aucune modification de profil non confirmée n’a été appliquée."
       }
     },
+    "sandbox": {
+      "back": "Retour",
+      "eyebrow": "Sécurité",
+      "title": "Bac à sable",
+      "subtitle": "Configurez les fichiers, commandes, réseau, runtimes et jetons LAN du mode sûr.",
+      "available": "Mode sûr disponible",
+      "unavailable": "Mode sûr indisponible",
+      "builtin": "Intégré",
+      "actions": { "add": "Ajouter", "remove": "Retirer", "retry": "Réessayer", "copy": "Copier", "saving": "Enregistrement…", "redetect": "Détecter à nouveau" },
+      "mode": {
+        "title": "Mode d’accès par défaut", "description": "Choisissez le mode initial des nouvelles tâches. Le mode sûr reste indisponible si la vérification échoue.",
+        "default": "Mode par défaut", "safe": "Sûr", "full": "Accès complet", "resetWarning": "Réafficher l’avertissement au démarrage"
+      },
+      "setup": {
+        "title": "Configurer le mode sûr", "description": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer la protection des fichiers et du réseau.", "descriptionWithDuration": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer les protections. La première configuration prend généralement environ 20 à 30 secondes. Gardez OpenSquilla ouvert.",
+        "continue": "Continuer", "configuring": "Configuration…", "requestingApproval": "Confirmez l’invite Windows pour continuer.", "configuringProtection": "OpenSquilla termine la configuration du mode sûr. Gardez l’application ouverte.", "takingLonger": "La première configuration peut prendre quelques minutes. La vérification se lancera automatiquement.", "elapsed": "{seconds} s écoulées", "cancelled": "Configuration annulée. L’accès complet reste inchangé ; vous pouvez réessayer.",
+        "failed": "Le mode sûr n’a pas pu être configuré. L’accès complet reste inchangé.", "verificationFailed": "La configuration est terminée, mais la vérification de sécurité a échoué. L’accès complet reste inchangé.",
+        "runInBackground": "Configurer en arrière-plan", "readyToast": "Le mode sûr est prêt.", "failedToast": "La configuration du mode sûr n’a pas pu se terminer. Réessayez depuis le mode sûr."
+      },
+      "files": {
+        "title": "Sécurité des fichiers", "description": "Les fichiers ordinaires sont lisibles. Les mutations des chemins protégés exigent une approbation.", "readsAllowed": "Lecture autorisée",
+        "customPath": "Chemin protégé personnalisé", "pathPlaceholder": "Ajouter un chemin protégé", "backupTitle": "Sauvegarder avant les modifications destructrices",
+        "backupDescription": "Crée des copies récupérables avant de supprimer ou modifier des fichiers existants et efface automatiquement les plus anciennes si nécessaire.", "quota": "Limite des sauvegardes",
+        "recursiveWarning": "Sans sauvegarde, une suppression ou un remplacement peut être irrécupérable. Si la sauvegarde échoue encore après le nettoyage, OpenSquilla demande une nouvelle confirmation."
+      },
+      "commands": {
+        "title": "Sécurité des commandes", "description": "Les commandes s'exécutent automatiquement ; les opérations comme git push exigent une approbation.",
+        "systemTools": "Outils système", "systemToolsAuto": "Autoriser automatiquement", "systemToolsPrompt": "Demander avant", "systemToolsDisabled": "Désactivé",
+        "approvalPrefixes": "Préfixes exigeant une approbation", "autoPrefixes": "Préfixes toujours autorisés", "prefixPlaceholder": "Par exemple : git push"
+      },
+      "network": {
+        "title": "Sécurité réseau", "description": "Le réseau public est autorisé par défaut, avec les protections SSRF et métadonnées.",
+        "blockAll": "Bloquer tout le réseau", "blockAllDescription": "Les domaines autorisés restent des exceptions.", "allowDomains": "Domaines autorisés", "denyDomains": "Domaines refusés"
+      },
+      "runtimes": { "title": "Runtimes inclus", "description": "Sûr privilégie les outils inclus ; Accès complet privilégie ceux de l'hôte.", "target": "Cible du paquet" },
+      "lan": {
+        "listen": "Écouter sur le réseau local", "listenDescription": "Lie toutes les interfaces locales après redémarrage ; les pairs publics restent refusés.",
+        "allowedCidrs": "CIDR clients autorisés", "cidrDescription": "Facultatif. Vide autorise loopback, RFC1918 et IPv6 ULA ; les entrées ne peuvent que réduire cette plage.",
+        "restartRequired": "Redémarrez OpenSquilla pour appliquer la modification.",
+        "title": "Accès Web et jetons nommés", "description": "L'accès Web distant sans jeton valide utilise le mode sûr invité ; les jetons nommés accordent les droits configurés.",
+        "guest": "Jeton absent ou incorrect :", "guestDescription": " mode sûr invité : les fichiers ordinaires sont lisibles, seul l'espace de travail par défaut est modifiable et les identifiants sont illisibles.",
+        "authenticated": "Jeton valide :", "authenticatedDescription": " peut utiliser Sûr ou Accès complet selon ses capacités.",
+        "tokenName": "Nom du jeton, par ex. Portable", "hostExecute": "Autoriser l'hôte / Accès complet", "createToken": "Créer le jeton",
+        "copyNow": "Copiez-le maintenant. Il ne sera plus affiché.", "fullCapable": "Sûr et Accès complet", "safeOnly": "Sûr uniquement", "revoke": "Révoquer"
+      }
+    },
     "dialog": {
       "title": "Paramètres",
       "actionNeeded": "Action requise ({count})",
@@ -483,6 +529,7 @@
       "modelStrategy": "Routage des modèles",
       "behavior": "Comportement",
       "privacy": "Confidentialité",
+      "sandbox": "Bac à sable",
       "memory": "Mémoire et profil",
       "router": "Routeur",
       "ensemble": "Ensemble",
@@ -3321,24 +3368,45 @@
     },
     "approval": {
       "required": "Approbation requise",
-      "requiredFor": "Approbation requise : {tool}",
-      "neededFor": "Approbation nécessaire : {tool}",
+      "requiredFor": "Approbation requise : {action}",
+      "neededFor": "Approbation nécessaire : {action}",
       "command": "Commande",
       "arguments": "Arguments",
       "extend": "Prolonger",
-      "denyReasonPlaceholder": "Motif du refus (facultatif) — envoyé à l'agent",
-      "denyReasonLabel": "Motif du refus, facultatif, envoyé à l'agent",
       "allowOnce": "Autoriser une fois",
+      "continueWithoutBackup": "Continuer sans sauvegarde",
       "allowSameType": "Autoriser le même type",
       "deny": "Refuser",
       "expiresIn": "Expire dans {time}",
-      "outcomeExpired": "Expiré — non exécuté",
+      "outcomeExpired": "Expiré, non exécuté",
       "outcomeDenied": "Refusé",
-      "outcomeApproved": "Approuvé · exécution reprise",
+      "outcomeApproved": "Approuvé. Exécution reprise",
       "target": "Cible",
       "access": "Accès",
       "workspace": "Espace de travail",
-      "outcomeUnavailable": "Approbation désormais indisponible"
+      "outcomeUnavailable": "Approbation désormais indisponible",
+      "irreversibleTitle": "Cette action est irréversible",
+      "irreversibleBody": "Vérifiez la cible exacte avant de continuer.",
+      "kinds": {
+        "delete": "Supprimer des fichiers ou dossiers",
+        "modify": "Modifier un fichier existant",
+        "create": "Créer un fichier",
+        "runCommand": "Exécuter une commande",
+        "runCode": "Exécuter du code",
+        "networkAccess": "Accéder au réseau",
+        "pathAccess": "Accéder à des fichiers ou dossiers",
+        "pluginPermission": "Accorder une autorisation à une extension",
+        "sensitiveOperation": "Opération sensible"
+      },
+      "backup": {
+        "enabledTitle": "Une sauvegarde récupérable sera créée avant cette modification.",
+        "enabledBody": "Les sauvegardes les plus anciennes peuvent être supprimées automatiquement pour libérer de l'espace.",
+        "disabledTitle": "Aucune sauvegarde ne sera créée",
+        "disabledBody": "Cette action peut être impossible à récupérer.",
+        "settingsHint": "Activez les sauvegardes dans Paramètres > Bac à sable > Sécurité des fichiers.",
+        "unavailableTitle": "Aucune sauvegarde n'est disponible",
+        "unavailableBody": "Cette action ne pourra pas être récupérée. Continuez uniquement si vous acceptez une perte définitive des données."
+      }
     },
     "plan": {
       "label": "Plan",
@@ -3452,10 +3520,8 @@
       "modelRoutingEnsemble": "Routeur d'ensemble avec IA",
       "modelRoutingEnsembleDesc": "L'IA coordonne plusieurs modèles pour améliorer les capacités sur les tâches complexes.",
       "runMode": "Mode d'exécution",
-      "runModeStandard": "Toujours demander",
-      "runModeStandardDesc": "Demande avant d'accéder aux fichiers hors projet, au réseau ou aux réglages système.",
-      "runModeTrusted": "Exécution gérée",
-      "runModeTrustedDesc": "Évalue automatiquement les risques ; vous n'avez généralement pas à confirmer chaque action.",
+      "runModeSafe": "Sûr",
+      "runModeSafeDesc": "Utilise le bac à sable et vos règles de fichiers, commandes et réseau.",
       "runModeFull": "Accès complet",
       "runModeFullDesc": "Accède directement aux fichiers, au réseau et au système sans demander à chaque fois.",
       "runModeFullUnavailable": "L'accès complet est réservé au propriétaire de la session.",

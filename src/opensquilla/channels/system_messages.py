@@ -29,6 +29,9 @@ ChannelSystemMessageKey = Literal[
     "approval_label_path",
     "approval_label_code",
     "approval_packages",
+    "approval_delete_backup_enabled",
+    "approval_delete_backup_disabled",
+    "approval_delete_backup_unavailable",
     "approval_unknown_command",
     "approval_probe_throttled",
     "approval_no_pending",
@@ -48,8 +51,7 @@ ChannelSystemMessageKey = Literal[
     "command_sandbox_denied",
     "command_sandbox_failed",
     "command_sandbox_updated",
-    "command_sandbox_standard",
-    "command_sandbox_trusted",
+    "command_sandbox_safe",
     "command_sandbox_full",
     "command_sandbox_unknown_mode",
     "command_compact_denied",
@@ -105,6 +107,18 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "Path",
         "approval_label_code": "Code",
         "approval_packages": "packages: {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "This deletion is permanent. Backup is enabled; OpenSquilla will create a "
+            "recoverable copy before deleting the target."
+        ),
+        "approval_delete_backup_disabled": (
+            "This deletion is permanent and backup is off. Turn it on in Sandbox Settings "
+            "before continuing if you want a recoverable copy."
+        ),
+        "approval_delete_backup_unavailable": (
+            "Backup is unavailable. Continuing will permanently delete the target without "
+            "a recoverable copy."
+        ),
         "approval_unknown_command": "(unknown command)",
         "approval_probe_throttled": (
             "Too many failed approval attempts — wait a minute and try again."
@@ -128,7 +142,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_approved_always": (
             "Approved {code} — this kind won't ask again this session."
         ),
-        "command_usage_sandbox": "Usage: /sandbox standard | trusted | full",
+        "command_usage_sandbox": "Usage: /sandbox safe | full",
         "command_unsupported": "Unsupported command: {command}. Try /help.",
         "command_completed": "/{name} completed",
         "command_denied": "/{name} denied{reason}",
@@ -136,8 +150,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_sandbox_denied": "Sandbox mode denied: {reason}",
         "command_sandbox_failed": "Sandbox mode failed: {reason}",
         "command_sandbox_updated": "Sandbox mode set to {mode}.",
-        "command_sandbox_standard": "Standard-Sandbox",
-        "command_sandbox_trusted": "Managed Execution",
+        "command_sandbox_safe": "Safe mode",
         "command_sandbox_full": "Full Host Access",
         "command_sandbox_unknown_mode": "updated",
         "command_compact_denied": "Compact denied: {reason}",
@@ -189,6 +202,15 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "路径",
         "approval_label_code": "代码",
         "approval_packages": "软件包：{bundle_id}",
+        "approval_delete_backup_enabled": (
+            "此删除操作不可撤回。文件安全备份已开启，OpenSquilla 会在删除前创建可恢复副本。"
+        ),
+        "approval_delete_backup_disabled": (
+            "此删除操作不可撤回，且文件安全备份未开启。如需可恢复副本，请先在沙箱设置中开启备份。"
+        ),
+        "approval_delete_backup_unavailable": (
+            "文件安全备份当前不可用。继续会永久删除目标，且不会留下可恢复副本。"
+        ),
         "approval_unknown_command": "（未知命令）",
         "approval_probe_throttled": "失败的批准尝试过多，请等待一分钟后重试。",
         "approval_no_pending": "没有待处理的批准 {code}。",
@@ -208,7 +230,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_denied": "已拒绝 {code}。",
         "approval_approved_once": "已批准 {code}，正在运行……",
         "approval_approved_always": "已批准 {code}，本次会话中将不再询问此类操作。",
-        "command_usage_sandbox": "用法：/sandbox standard | trusted | full",
+        "command_usage_sandbox": "用法：/sandbox safe | full",
         "command_unsupported": "不支持的命令：{command}。请尝试 /help。",
         "command_completed": "/{name} 已完成",
         "command_denied": "/{name} 已被拒绝{reason}",
@@ -216,8 +238,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_sandbox_denied": "沙箱模式被拒绝：{reason}",
         "command_sandbox_failed": "沙箱模式设置失败：{reason}",
         "command_sandbox_updated": "沙箱模式已设为 {mode}。",
-        "command_sandbox_standard": "标准沙箱",
-        "command_sandbox_trusted": "受管执行",
+        "command_sandbox_safe": "安全模式",
         "command_sandbox_full": "完全主机访问",
         "command_sandbox_unknown_mode": "已更新",
         "command_compact_denied": "压缩被拒绝：{reason}",
@@ -271,6 +292,16 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "パス",
         "approval_label_code": "コード",
         "approval_packages": "パッケージ: {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "この削除は取り消せません。バックアップは有効で、削除前に復元可能なコピーを作成します。"
+        ),
+        "approval_delete_backup_disabled": (
+            "この削除は取り消せず、バックアップは無効です。復元可能なコピーが必要な場合は、"
+            "先にサンドボックス設定で有効にしてください。"
+        ),
+        "approval_delete_backup_unavailable": (
+            "バックアップを利用できません。続行すると、復元可能なコピーなしで対象を完全に削除します。"
+        ),
         "approval_unknown_command": "(不明なコマンド)",
         "approval_probe_throttled": (
             "承認コードの試行回数が多すぎます。1 分待ってからもう一度試してください。"
@@ -296,7 +327,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_approved_always": (
             "{code} を承認しました。このセッションではこの種類を今後確認しません。"
         ),
-        "command_usage_sandbox": "使い方: /sandbox standard | trusted | full",
+        "command_usage_sandbox": "使い方: /sandbox safe | full",
         "command_unsupported": "未対応のコマンドです: {command}。/help を試してください。",
         "command_completed": "/{name} が完了しました",
         "command_denied": "/{name} は拒否されました{reason}",
@@ -304,8 +335,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_sandbox_denied": "サンドボックス モードは拒否されました: {reason}",
         "command_sandbox_failed": "サンドボックス モードの設定に失敗しました: {reason}",
         "command_sandbox_updated": "サンドボックス モードを {mode} に設定しました。",
-        "command_sandbox_standard": "標準サンドボックス",
-        "command_sandbox_trusted": "管理された実行",
+        "command_sandbox_safe": "セーフモード",
         "command_sandbox_full": "完全なホストアクセス",
         "command_sandbox_unknown_mode": "更新済み",
         "command_compact_denied": "コンテキスト圧縮は拒否されました: {reason}",
@@ -359,6 +389,18 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "Chemin",
         "approval_label_code": "Code",
         "approval_packages": "paquets : {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "Cette suppression est irréversible. La sauvegarde est activée et OpenSquilla "
+            "créera une copie récupérable avant la suppression."
+        ),
+        "approval_delete_backup_disabled": (
+            "Cette suppression est irréversible et la sauvegarde est désactivée. Activez-la "
+            "d'abord dans les paramètres du bac à sable pour conserver une copie récupérable."
+        ),
+        "approval_delete_backup_unavailable": (
+            "La sauvegarde est indisponible. Continuer supprimera définitivement la cible "
+            "sans copie récupérable."
+        ),
         "approval_unknown_command": "(commande inconnue)",
         "approval_probe_throttled": (
             "Trop de tentatives d'approbation ont échoué. Attendez une minute et réessayez."
@@ -386,7 +428,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_approved_always": (
             "Approbation {code} accordée - ce type ne demandera plus cette session."
         ),
-        "command_usage_sandbox": "Utilisation : /sandbox standard | trusted | full",
+        "command_usage_sandbox": "Utilisation : /sandbox safe | full",
         "command_unsupported": "Commande non prise en charge : {command}. Essayez /help.",
         "command_completed": "/{name} terminé",
         "command_denied": "/{name} refusé{reason}",
@@ -394,8 +436,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_sandbox_denied": "Mode bac à sable refusé : {reason}",
         "command_sandbox_failed": "Échec du mode bac à sable : {reason}",
         "command_sandbox_updated": "Mode bac à sable défini sur {mode}.",
-        "command_sandbox_standard": "Bac à sable standard",
-        "command_sandbox_trusted": "Exécution gérée",
+        "command_sandbox_safe": "Mode sécurisé",
         "command_sandbox_full": "Accès complet à l'hôte",
         "command_sandbox_unknown_mode": "mis à jour",
         "command_compact_denied": "Compactage refusé : {reason}",
@@ -454,6 +495,18 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "Pfad",
         "approval_label_code": "Code",
         "approval_packages": "Pakete: {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "Dieser Löschvorgang kann nicht rückgängig gemacht werden. Die Sicherung ist "
+            "aktiviert; OpenSquilla erstellt vor dem Löschen eine wiederherstellbare Kopie."
+        ),
+        "approval_delete_backup_disabled": (
+            "Dieser Löschvorgang kann nicht rückgängig gemacht werden und die Sicherung ist "
+            "deaktiviert. Aktivieren Sie sie zuerst in den Sandbox-Einstellungen."
+        ),
+        "approval_delete_backup_unavailable": (
+            "Die Sicherung ist nicht verfügbar. Beim Fortfahren wird das Ziel dauerhaft und "
+            "ohne wiederherstellbare Kopie gelöscht."
+        ),
         "approval_unknown_command": "(unbekannter Befehl)",
         "approval_probe_throttled": (
             "Zu viele fehlgeschlagene Freigabeversuche. Warten Sie eine Minute und versuchen "
@@ -482,7 +535,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_approved_always": (
             "Freigabe {code} genehmigt - diese Art wird in dieser Sitzung nicht erneut fragen."
         ),
-        "command_usage_sandbox": "Verwendung: /sandbox standard | trusted | full",
+        "command_usage_sandbox": "Verwendung: /sandbox safe | full",
         "command_unsupported": "Nicht unterstützter Befehl: {command}. Versuchen Sie /help.",
         "command_completed": "/{name} abgeschlossen",
         "command_denied": "/{name} abgelehnt{reason}",
@@ -490,8 +543,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_sandbox_denied": "Sandbox-Modus abgelehnt: {reason}",
         "command_sandbox_failed": "Sandbox-Modus fehlgeschlagen: {reason}",
         "command_sandbox_updated": "Sandbox-Modus auf {mode} gesetzt.",
-        "command_sandbox_standard": "Standard-Sandbox",
-        "command_sandbox_trusted": "Verwaltete Ausführung",
+        "command_sandbox_safe": "Sicherer Modus",
         "command_sandbox_full": "Vollständiger Hostzugriff",
         "command_sandbox_unknown_mode": "aktualisiert",
         "command_compact_denied": "Komprimierung abgelehnt: {reason}",
@@ -545,6 +597,18 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "Ruta",
         "approval_label_code": "Código",
         "approval_packages": "paquetes: {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "Esta eliminación es irreversible. La copia de seguridad está activada y "
+            "OpenSquilla creará una copia recuperable antes de eliminar el destino."
+        ),
+        "approval_delete_backup_disabled": (
+            "Esta eliminación es irreversible y la copia de seguridad está desactivada. "
+            "Actívala primero en la configuración del entorno aislado para conservar una copia."
+        ),
+        "approval_delete_backup_unavailable": (
+            "La copia de seguridad no está disponible. Si continúas, el destino se eliminará "
+            "permanentemente sin una copia recuperable."
+        ),
         "approval_unknown_command": "(comando desconocido)",
         "approval_probe_throttled": (
             "Demasiados intentos de aprobación fallidos. Espera un minuto e inténtalo de nuevo."
@@ -571,7 +635,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_approved_always": (
             "Aprobación {code} concedida - este tipo no volverá a preguntar en esta sesión."
         ),
-        "command_usage_sandbox": "Uso: /sandbox standard | trusted | full",
+        "command_usage_sandbox": "Uso: /sandbox safe | full",
         "command_unsupported": "Comando no compatible: {command}. Prueba /help.",
         "command_completed": "/{name} completado",
         "command_denied": "/{name} denegado{reason}",
@@ -579,8 +643,7 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "command_sandbox_denied": "Modo aislado denegado: {reason}",
         "command_sandbox_failed": "El modo aislado falló: {reason}",
         "command_sandbox_updated": "Modo aislado establecido en {mode}.",
-        "command_sandbox_standard": "Entorno aislado estándar",
-        "command_sandbox_trusted": "Ejecución administrada",
+        "command_sandbox_safe": "Modo seguro",
         "command_sandbox_full": "Acceso completo al host",
         "command_sandbox_unknown_mode": "actualizado",
         "command_compact_denied": "Compactación denegada: {reason}",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import os
 import re
 import sqlite3
 import time
@@ -82,21 +83,28 @@ from opensquilla.provider.types import (
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
 )
-from opensquilla.sandbox.run_context import (
-    RUN_CONTEXT_ORIGIN_KEY,
-    RunContext,
-    run_context_from_origin_payload,
-)
-from opensquilla.sandbox.run_mode import (
+from opensquilla.run_mode import (
     RunMode,
     config_run_mode,
     normalize_run_mode,
     project_default_run_mode,
 )
+from opensquilla.sandbox.guest_profile import (
+    GuestProfileBoundaryError,
+    GuestProfileFactory,
+)
+from opensquilla.sandbox.mode_resolver import ModeResolutionError, ResolvedMode, resolve_mode
+from opensquilla.sandbox.run_context import (
+    RUN_CONTEXT_ORIGIN_KEY,
+    RunContext,
+    run_context_from_origin_payload,
+)
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
+    principal_has_host_execute,
     run_mode_allowed_for_principal,
 )
+from opensquilla.sandbox.setup_runtime import current_sandbox_capability_report
 from opensquilla.session.compaction import (
     arm_compaction_deadline,
     await_compaction_phase,
@@ -177,6 +185,16 @@ _MAX_TEXT_ATTACHMENT_BYTES = _attachment_ingest.TEXT_ATTACHMENT_BYTES
 _MAX_TOTAL_ATTACHMENT_BYTES = _attachment_ingest.MAX_TOTAL_ATTACHMENT_BYTES
 _MAX_ATTACHMENTS = _attachment_ingest.MAX_ATTACHMENTS
 _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS = 2.0
+
+
+def _coerce_positive_int(value: object, *, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _accepts_keyword_arg(func: Any, name: str) -> bool:
@@ -339,10 +357,13 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
             run_mode = normalize_run_mode(value)
         except ValueError:
             return None
+        if run_mode == RunMode.FULL and not principal_has_host_execute(ctx.principal):
+            raise RpcHandlerError(
+                "HOST_CAPABILITY_REQUIRED",
+                "Full access requires a valid token with host execution permission.",
+            )
         if run_mode_allowed_for_principal(run_mode, ctx.principal):
             return run_mode
-        if run_mode == RunMode.FULL and not ctx.principal.is_owner:
-            return RunMode.TRUSTED
         return None
 
     elevated = source_hint.get("elevated")
@@ -351,10 +372,46 @@ def _trusted_run_mode_hint(ctx: RpcContext, source_hint: dict[str, Any]) -> Any 
     if not ctx.principal.is_owner:
         return None
     if elevated in _TRUSTED_ELEVATED_ALIASES:
-        return RunMode.TRUSTED
+        return RunMode.SAFE
     if elevated == "full":
         return RunMode.FULL
     return None
+
+
+def _guest_profile_for_principal(
+    principal: Any,
+    task_id: str,
+    *,
+    state_dir: str | Path,
+):
+    has_capability = getattr(principal, "has", lambda _capability: False)
+    if has_capability("guest.safe") and not principal_has_host_execute(principal):
+        runtime_roots: tuple[Path, ...] = ()
+        runtime_path: tuple[Path, ...] = ()
+        if os.name != "nt":
+            from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+
+            resolver = bundled_runtime_resolver()
+            runtime_roots = resolver.runtime_roots() if resolver is not None else ()
+            runtime_path = resolver.bundled_path() if resolver is not None else ()
+        return GuestProfileFactory.create(
+            task_id,
+            state_dir=state_dir,
+            runtime_roots=runtime_roots,
+            runtime_path=runtime_path,
+        )
+    return None
+
+
+def _is_remote_web_guest(principal: Any, source_hint: dict[str, Any]) -> bool:
+    # Source hints are client-controlled presentation metadata.  They must not
+    # weaken the server-computed authority of an unauthenticated guest.
+    del source_hint
+    has_capability = getattr(principal, "has", lambda _capability: False)
+    return bool(
+        has_capability("guest.safe")
+        and not principal_has_host_execute(principal)
+    )
 
 
 def _apply_run_context_route_metadata(
@@ -1518,7 +1575,23 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         return {"sessions": [], "count": 0, "ts": now_ms}
 
     limit = (params or {}).get("limit", 50)
-    sessions = await storage.list_sessions(limit=limit)
+    from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, guest_owns_session_key
+
+    if GuestRpcPolicy.is_guest(ctx):
+        owner_id = getattr(ctx.principal, "guest_owner_id", None)
+        try:
+            guest_limit = int(limit)
+        except (TypeError, ValueError):
+            guest_limit = 50
+        limit = max(1, min(guest_limit, 100))
+        sessions = await storage.list_sessions(limit=limit, guest_owner_id=owner_id)
+        sessions = [
+            session
+            for session in sessions
+            if guest_owns_session_key(owner_id, getattr(session, "session_key", None))
+        ]
+    else:
+        sessions = await storage.list_sessions(limit=limit)
     task_rows_by_session = await _list_task_rows_by_session(
         ctx,
         storage,
@@ -2332,7 +2405,7 @@ async def _handle_sessions_send(
         mode = project_default_run_mode(ctx.config)
         mode_source = (
             "project_default"
-            if mode is RunMode.STANDARD and config_run_mode(ctx.config) is RunMode.FULL
+            if mode is RunMode.SAFE and config_run_mode(ctx.config) is RunMode.FULL
             else "operator_default"
         )
         create_kwargs["workspace_id"] = selected_workspace.workspace_id
@@ -2652,17 +2725,45 @@ async def _handle_sessions_send(
     workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
     configured_workspace_dir = str(workspace_path) if workspace_path is not None else None
     workspace_dir = configured_workspace_dir
+    turn_id = uuid.uuid4().hex
     run_mode_hint = _trusted_run_mode_hint(ctx, source_hint)
-    try:
-        run_context, authoritative_guard = await authoritative_project_run_context(
-            storage=storage,
-            session_manager=ctx.session_manager,
-            session=session,
-            config=ctx.config,
-            default_workspace=workspace_dir,
-        )
-    except ProjectWorkspaceStateError as exc:
-        raise _project_workspace_error(exc) from exc
+    guest_profile = None
+    guest_safe = _is_remote_web_guest(ctx.principal, source_hint)
+    capability_report = None
+    if guest_safe:
+        capability_report = await current_sandbox_capability_report(ctx.config)
+        try:
+            resolve_mode(RunMode.SAFE, ctx.principal, capability_report)
+        except ModeResolutionError as exc:
+            raise RpcHandlerError(
+                "SANDBOX_UNAVAILABLE",
+                "Safe mode is unavailable for this unauthenticated request.",
+                details={"reason": exc.code, **capability_report.to_payload()},
+            ) from exc
+        try:
+            guest_profile = _guest_profile_for_principal(
+                ctx.principal,
+                turn_id,
+                state_dir=ctx.config.state_dir,
+            )
+        except GuestProfileBoundaryError as exc:
+            raise RpcHandlerError(
+                exc.code,
+                "The managed Web guest workspace is unavailable.",
+            ) from exc
+        run_context = guest_profile.run_context()
+        authoritative_guard = None
+    else:
+        try:
+            run_context, authoritative_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=ctx.session_manager,
+                session=session,
+                config=ctx.config,
+                default_workspace=workspace_dir,
+            )
+        except ProjectWorkspaceStateError as exc:
+            raise _project_workspace_error(exc) from exc
     if authoritative_guard is not None:
         workspace_guard = authoritative_guard
     run_context = replace(
@@ -2693,7 +2794,43 @@ async def _handle_sessions_send(
                     key,
                     origin=accepted_run_mode_origin,
                 )
+    if run_context.run_mode is RunMode.FULL:
+        mode_resolution = ResolvedMode(
+            desired_mode=RunMode.FULL,
+            effective_mode=RunMode.FULL,
+        )
+    else:
+        if capability_report is None:
+            capability_report = await current_sandbox_capability_report(ctx.config)
+        try:
+            mode_resolution = resolve_mode(
+                run_context.run_mode,
+                ctx.principal,
+                capability_report,
+            )
+        except ModeResolutionError as exc:
+            raise RpcHandlerError(
+                "SANDBOX_MODE_UNAVAILABLE",
+                "The requested execution mode is unavailable.",
+                details={"reason": exc.code, **capability_report.to_payload()},
+            ) from exc
+
+    def _cleanup_rejected_guest_profile() -> None:
+        if guest_profile is not None:
+            guest_profile.cleanup()
+
+    if mode_resolution.effective_mode is not run_context.run_mode:
+        accepted_run_mode_override = AcceptedRunModeOverride(
+            run_mode=mode_resolution.effective_mode,
+            run_mode_source=run_context.run_mode_source,
+            source="capability_fallback",
+        )
+        run_context = apply_accepted_run_mode_override(
+            run_context,
+            accepted_run_mode_override,
+        )
     workspace_dir = run_context.workspace or workspace_dir
+    host_execute_allowed = principal_has_host_execute(ctx.principal)
     if source_hint.get("caller_kind") == "cli" or source_hint.get("channel_kind") == "cli":
         route_envelope = build_cli_route_envelope(
             session_key=key,
@@ -2703,6 +2840,7 @@ async def _handle_sessions_send(
             sender_id=source_hint.get("sender_id"),
             session_id=getattr(session, "session_id", None),
             principal_is_owner=ctx.principal.is_owner,
+            principal_host_execute=host_execute_allowed,
             run_mode=run_context.run_mode.value,
         )
     else:
@@ -2716,12 +2854,28 @@ async def _handle_sessions_send(
             tool_source_kind=source_hint.get("source_kind"),
             session_id=getattr(session, "session_id", None),
             principal_is_owner=ctx.principal.is_owner,
+            principal_host_execute=host_execute_allowed,
         )
     _apply_run_context_route_metadata(
         route_envelope,
         run_context,
         principal_is_owner=ctx.principal.is_owner,
     )
+    route_envelope.metadata["sandbox_mode_resolution"] = mode_resolution.to_payload()
+    if guest_profile is not None:
+        route_envelope.metadata["guest_safe"] = True
+        route_envelope.metadata["guest_profile_root"] = str(guest_profile.root)
+        route_envelope.metadata["guest_managed_root"] = str(guest_profile.managed_root)
+        route_envelope.metadata["guest_environment"] = dict(
+            guest_profile.environment
+        )
+        route_envelope.runtime_services["guest_profile_factory"] = (
+            lambda task_id: _guest_profile_for_principal(
+                ctx.principal,
+                task_id,
+                state_dir=ctx.config.state_dir,
+            )
+        )
     elevated_hint = _trusted_elevated_hint(ctx, source_hint)
     if elevated_hint is not None:
         route_envelope.metadata["elevated"] = elevated_hint
@@ -2744,7 +2898,6 @@ async def _handle_sessions_send(
     # Allocate the durable causal identity before persistence.  The same id is
     # handed to TaskRuntime, live events, bootstrap history, and every transcript
     # row produced by this turn.
-    turn_id = uuid.uuid4().hex
     client_message_id = requested_client_message_id or uuid.uuid4().hex
     surface_id = (
         requested_surface_id
@@ -2799,6 +2952,7 @@ async def _handle_sessions_send(
         "intent": "send",
         "disposition": "queued" if getattr(ctx, "task_runtime", None) is not None else "applied",
         "revision": 1,
+        "sandbox_mode_resolution": mode_resolution.to_payload(),
     }
     fresh_user_session = False
     user_message_id: str | None = None
@@ -2872,16 +3026,20 @@ async def _handle_sessions_send(
             execution_session = await storage.get_session(key)
             if execution_session is None:
                 raise KeyError(f"Session not found: {key}")
-            (
-                execution_run_context,
-                _execution_workspace_guard,
-            ) = await authoritative_project_run_context(
-                storage=storage,
-                session_manager=ctx.session_manager,
-                session=execution_session,
-                config=ctx.config,
-                default_workspace=configured_workspace_dir,
-            )
+            if guest_profile is not None:
+                execution_run_context = guest_profile.run_context()
+                _execution_workspace_guard = None
+            else:
+                (
+                    execution_run_context,
+                    _execution_workspace_guard,
+                ) = await authoritative_project_run_context(
+                    storage=storage,
+                    session_manager=ctx.session_manager,
+                    session=execution_session,
+                    config=ctx.config,
+                    default_workspace=configured_workspace_dir,
+                )
             execution_run_context = apply_accepted_run_mode_override(
                 execution_run_context,
                 accepted_run_mode_override,
@@ -2900,10 +3058,14 @@ async def _handle_sessions_send(
             tool_ctx = tool_context_from_envelope(
                 route_envelope,
                 is_owner=ctx.principal.is_owner,
+                host_execute_allowed=host_execute_allowed,
                 workspace_dir=execution_workspace_dir,
                 workspace_strict=workspace_strict,
                 default_elevated=configured_default_elevated(ctx.config),
             )
+            from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+            pin_sandbox_policy(tool_ctx, ctx.config)
             raw_stream = ctx.turn_runner.run(
                 provider_message_text,
                 key,
@@ -3016,6 +3178,8 @@ async def _handle_sessions_send(
                 {"message": error_message, "code": event_code},
             )
         finally:
+            if guest_profile is not None:
+                guest_profile.cleanup()
             if "turn_scope" in locals():
                 turn_scope.__exit__(None, None, None)
             if not _terminal_emitted:
@@ -3216,7 +3380,11 @@ async def _handle_sessions_send(
                         "target_turn_id": handle.task_id,
                         "revision": max(
                             2,
-                            int(ingress_turn_context.get("revision", 1)) + 1,
+                            _coerce_positive_int(
+                                ingress_turn_context.get("revision"),
+                                default=1,
+                            )
+                            + 1,
                         ),
                     }
                     persisted_entry.turn_context = collected_context
@@ -3332,6 +3500,7 @@ async def _handle_sessions_send(
             acceptance = await complete_durable_ingress(_commit_with_session_admission())
         except TaskQueueFullError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "QUEUE_FULL",
                 "The session task queue is full. Try again after queued work completes.",
@@ -3344,6 +3513,7 @@ async def _handle_sessions_send(
             ) from exc
         except StorageBusyError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "STORAGE_BUSY",
                 "Session storage is temporarily busy. Retry this send.",
@@ -3357,6 +3527,7 @@ async def _handle_sessions_send(
             ) from exc
         except StaleEpochError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "SESSION_CHANGED",
                 "The session changed while this turn was being accepted. Retry the send.",
@@ -3365,6 +3536,7 @@ async def _handle_sessions_send(
             ) from exc
         except TurnIngressConflictError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "IDEMPOTENCY_CONFLICT",
                 str(exc),
@@ -3373,9 +3545,11 @@ async def _handle_sessions_send(
             ) from exc
         except ProjectWorkspaceStateError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise _project_workspace_error(exc) from exc
         except TaskCollectionUnavailableError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "COLLECT_RACE",
                 "The queued task started before this message could be collected. Retry it.",
@@ -3469,14 +3643,19 @@ async def _handle_sessions_send(
             ) from exc
         except sqlite3.IntegrityError as exc:
             if atomic_intent_plan.action != "create" or "sessions.session_key" not in str(exc):
+                _cleanup_rejected_guest_profile()
                 raise
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "SESSION_CONFLICT",
                 "Another request created this session first. Start a new chat and retry.",
                 retryable=False,
                 accepted=False,
             ) from exc
+        except BaseException:
+            _cleanup_rejected_guest_profile()
+            raise
 
         if not acceptance.replayed:
             notify_message_appended = getattr(ctx.session_manager, "notify_message_appended", None)
@@ -3975,7 +4154,8 @@ async def _handle_sessions_send(
             # path. The locked semantic mandates that any rejection /
             # rollback / queue-full leaves the uuid alive until TTL so
             # the user can retry against the same uuid.
-            _consumed_file_uuids = []  # noqa: F841 — explicit no-evict marker
+            _consumed_file_uuids = []  # noqa: F841 – explicit no-evict marker
+            _cleanup_rejected_guest_profile()
             from opensquilla.gateway.task_runtime import TaskQueueFullError
 
             if not isinstance(exc, TaskQueueFullError):
@@ -4027,7 +4207,14 @@ async def _handle_sessions_send(
                 **ingress_turn_context,
                 "turn_id": turn_id,
                 "target_turn_id": turn_id,
-                "revision": max(2, int(ingress_turn_context.get("revision", 1)) + 1),
+                "revision": max(
+                    2,
+                    _coerce_positive_int(
+                        ingress_turn_context.get("revision"),
+                        default=1,
+                    )
+                    + 1,
+                ),
             }
         # Eviction hook: turn was accepted into the runtime,
         # post-resolution + post-engine-acceptance. Evict consumed uuids
@@ -7749,42 +7936,55 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     agent_id = _effective_agent_id_for_session(session, session_key)
     agent_identity = await _bootstrap_agent_identity(ctx, agent_id)
     effective_model = _session_turn_model(ctx, session, agent_id)
-    from opensquilla.agents.scope import resolve_agent_workspace_dir
+    guest_safe = _is_remote_web_guest(ctx.principal, {})
+    workspace: str | None = None
+    project_snapshot: dict[str, Any] | None = None
+    if not guest_safe:
+        from opensquilla.agents.scope import resolve_agent_workspace_dir
 
-    workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
-    default_workspace = str(workspace_path) if workspace_path is not None else None
-    project_snapshot = await project_workspace_snapshot(storage, session)
-    try:
-        bootstrap_run_context, _workspace_guard = await authoritative_project_run_context(
-            storage=storage,
-            session_manager=ctx.session_manager,
-            session=session,
-            config=ctx.config,
-            default_workspace=default_workspace,
-        )
-        workspace: str | None = bootstrap_run_context.workspace or default_workspace
-    except ProjectWorkspaceStateError:
-        snapshot_path = project_snapshot.get("path") if project_snapshot is not None else None
-        workspace = str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
+        workspace_path = resolve_agent_workspace_dir(agent_id, ctx.config)
+        default_workspace = str(workspace_path) if workspace_path is not None else None
+        project_snapshot = await project_workspace_snapshot(storage, session)
+        try:
+            bootstrap_run_context, _workspace_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=ctx.session_manager,
+                session=session,
+                config=ctx.config,
+                default_workspace=default_workspace,
+            )
+            workspace = bootstrap_run_context.workspace or default_workspace
+        except ProjectWorkspaceStateError:
+            snapshot_path = (
+                project_snapshot.get("path") if project_snapshot is not None else None
+            )
+            workspace = (
+                str(snapshot_path) if isinstance(snapshot_path, str) else default_workspace
+            )
     from opensquilla.gateway.model_routing import model_routing_snapshot
 
-    metadata = {
+    metadata: dict[str, Any] = {
         "session_key": session_key,
         "session_id": session.session_id,
         "status": session.status,
         "agent_id": session.agent_id,
         "model": getattr(session, "model", None),
         "effective_model": effective_model,
-        "workspace": workspace,
-        "workspace_id": getattr(session, "workspace_id", None),
-        "workspaceId": getattr(session, "workspace_id", None),
-        "projectWorkspace": project_snapshot,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "display_name": getattr(session, "display_name", None),
         "queue_mode": getattr(session, "queue_mode", None),
         **_derive_source_metadata(session),
     }
+    if not guest_safe:
+        metadata.update(
+            {
+                "workspace": workspace,
+                "workspace_id": getattr(session, "workspace_id", None),
+                "workspaceId": getattr(session, "workspace_id", None),
+                "projectWorkspace": project_snapshot,
+            }
+        )
     get_current_plan = getattr(storage, "get_current_plan_revision", None)
     get_active_run = getattr(storage, "get_active_plan_run", None)
     current_plan = (

@@ -365,12 +365,12 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   activeTaskGroupIds?: string[]
   run_mode_lock?: {
     locked?: boolean
-    runMode?: 'standard' | 'trusted' | 'full'
+    runMode?: 'safe' | 'full'
     source?: string
   }
   runModeLock?: {
     locked?: boolean
-    runMode?: 'standard' | 'trusted' | 'full'
+    runMode?: 'safe' | 'full'
     source?: string
   }
   workspaceId?: string
@@ -399,7 +399,7 @@ export interface ChatSendParams {
   clientRequestId?: string
   /** Stable client identity for reconciling the optimistic user row. */
   clientMessageId?: string
-  _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
+  _source?: { elevated?: string; runMode?: 'safe' | 'full' }
   intent?: string
   workspaceId?: string
   collaborationMode?: import('./plans').CollaborationMode
@@ -434,7 +434,7 @@ export interface SessionSteerV2Params {
   client_request_id: string
   client_message_id: string
   surface_id?: string
-  _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
+  _source?: { elevated?: string; runMode?: 'safe' | 'full' }
 }
 
 export interface SessionSteerV2Response {

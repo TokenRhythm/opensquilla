@@ -118,7 +118,7 @@ async def test_config_patch_same_permissions_default_does_not_report_restart_req
 
 
 @pytest.mark.asyncio
-async def test_config_apply_sandbox_posture_reports_restart_required(tmp_path):
+async def test_config_apply_legacy_sandbox_posture_does_not_require_restart(tmp_path):
     cfg = GatewayConfig(config_path=str(tmp_path / "c.toml"))
     payload = cfg.model_dump(mode="python")
     payload["sandbox"]["sandbox"] = False
@@ -133,7 +133,7 @@ async def test_config_apply_sandbox_posture_reports_restart_required(tmp_path):
     )
 
     assert res.error is None, res.error
-    assert res.payload["restartRequired"] is True
+    assert res.payload["restartRequired"] is False
 
 
 @pytest.mark.asyncio

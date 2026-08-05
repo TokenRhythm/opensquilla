@@ -360,7 +360,7 @@ async def test_sessions_spawn_does_not_propagate_once_or_temporary_grants(
         {"path": one_shot_path, "access": "rw", "scope": "once"},
     ]
     parent_ctx.sandbox_run_context = RunContext(
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         workspace=workspace,
         mounts=(
             MountGrant(durable_path, scope="chat"),
@@ -401,7 +401,7 @@ async def test_sessions_spawn_does_not_propagate_once_or_temporary_grants(
     child_ctx = tool_context_from_envelope(envelope, is_owner=True)
     child_run_context = child_ctx.sandbox_run_context
     assert child_run_context is not None
-    assert child_run_context.run_mode is RunMode.TRUSTED
+    assert child_run_context.run_mode is RunMode.SAFE
     assert {grant.path for grant in child_run_context.mounts} == {durable_path}
     assert {grant.domain for grant in child_run_context.domains} == {"durable.example"}
     assert {grant.bundle_id for grant in child_run_context.bundles} == {"python-package-install"}

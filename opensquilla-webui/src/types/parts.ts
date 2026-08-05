@@ -32,6 +32,11 @@ export interface InterruptApprovalData {
   approvalKind: string                    // e.g. 'sandbox_network' / 'sandbox_path'
   args: Record<string, unknown> | null    // may be null until hydrated
   warning: string                         // '' until hydrated
+  displayKind?: string
+  displayTarget?: string
+  destructive?: boolean
+  irreversible?: boolean
+  backupState?: string
   agent: string
   sessionKey: string
   deadline: number                        // epoch seconds the request expires; 0 when unknown

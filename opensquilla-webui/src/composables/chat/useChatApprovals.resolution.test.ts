@@ -51,7 +51,6 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
   resolutionInProgress: true,
 }) {
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
-  const onDenyFeedback = vi.fn()
   const approvals = useChatApprovals({
     rpc: {
       call: vi.fn(async () => statusResponse) as <T = unknown>(
@@ -68,9 +67,8 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
       ensureInterruptBubble: vi.fn(),
     },
     interruptState,
-    onDenyFeedback,
   })
-  return { approvals, interruptState, onDenyFeedback }
+  return { approvals, interruptState }
 }
 
 describe('resolutionFromPayload', () => {
@@ -122,13 +120,24 @@ describe('resolutionFromResolveResponse', () => {
 describe('cross-surface resolve behavior', () => {
   it('labels a legacy card with the opposite canonical result', async () => {
     installApprovalFetch({ approved: true, resolved: true, pending: false })
-    const { approvals, onDenyFeedback } = approvalHarness()
+    const { approvals } = approvalHarness()
     const entry = approvalEntry()
 
-    await approvals.resolveApproval(entry, 'deny', 'do not run')
+    await approvals.resolveApproval(entry, 'deny')
 
     expect(entry.resolution).toBe('approved')
-    expect(onDenyFeedback).not.toHaveBeenCalled()
+  })
+
+  it('sends exactly one request for an explicit denial', async () => {
+    const fetchMock = installApprovalFetch({ approved: false, resolved: true, pending: false })
+    const { approvals } = approvalHarness()
+    const entry = approvalEntry()
+
+    await approvals.resolveApproval(entry, 'deny')
+
+    expect(entry.resolution).toBe('denied')
+    const resolveCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')
+    expect(resolveCalls).toHaveLength(1)
   })
 
   it('keeps a legacy card unresolved while another surface is resolving', async () => {

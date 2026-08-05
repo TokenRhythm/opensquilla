@@ -20,11 +20,13 @@ describe('ChatComposer control hierarchy', () => {
     expect(composerSource).toContain('<Icon name="shield"')
     expect(composerSource).toContain('chat-run-mode-btn--${runMode}')
     expect(composerSource).toContain(':run-mode="runMode"')
+    expect(composerSource).toContain(':safe-setup-available="safeSetupAvailable"')
     expect(composerSource).toContain('@set-run-mode="emit(\'setRunMode\', $event)"')
-    expect(composerSource).toContain("setRunMode: [mode: 'standard' | 'trusted' | 'full']")
+    expect(composerSource).toContain('setRunMode: [mode: SandboxRunMode]')
 
     expect(viewSource).toContain(':run-mode="runMode"')
-    expect(viewSource).toContain(':allowed-run-modes="allowedRunModes"')
+    expect(viewSource).toContain(':allowed-run-modes="composerAllowedRunModes"')
+    expect(viewSource).toContain(':safe-setup-available="composerSafeSetupAvailable"')
     expect(viewSource).toContain('@set-run-mode="setComposerRunMode"')
     expect(viewSource).toContain('useChatRunModePreference')
     expect(viewSource).toContain('setGlobalRunMode')
@@ -39,14 +41,31 @@ describe('ChatComposer control hierarchy', () => {
     expect(zhHans.chat.composer.runModeLocked).toBe('运行中，当前会话无法修改')
   })
 
-  it('offers exactly the three sandbox run modes from the shield popover', () => {
-    expect(runModeSource).toContain("value: 'standard'")
-    expect(runModeSource).toContain("value: 'trusted'")
+  it('shares the first-time Safe setup dialog with the composer', () => {
+    expect(viewSource).toContain('<SandboxSetupDialog')
+    expect(viewSource).toContain(':open="composerSandboxSetupOpen"')
+    expect(viewSource).toContain('@confirm="void confirmComposerSandboxSetup()"')
+    expect(viewSource).toContain('@background="runComposerSandboxSetupInBackground"')
+    expect(viewSource).toContain('useSandboxSetupStore')
+    expect(viewSource).toContain('sandboxSetupStore.startSafeSetup()')
+    expect(viewSource).not.toContain('completeComposerSafeSetup')
+    expect(viewSource).toContain('composerRunModeSelectionAction')
+  })
+
+  it('offers exactly Safe and Full from the shield popover', () => {
+    expect(runModeSource).toContain("value: 'safe'")
     expect(runModeSource).toContain("value: 'full'")
+    expect(runModeSource).not.toContain("value: 'standard'")
+    expect(runModeSource).not.toContain("value: 'trusted'")
     expect(runModeSource).not.toContain("value: 'on'")
     expect(runModeSource).not.toContain("value: 'bypass'")
-    expect(zhHans.chat.composer.runModeStandardDesc)
-      .toBe('访问项目外文件、网络或更改系统时会询问你。')
+    expect(zhHans.chat.composer.runModeSafeDesc)
+      .toBe('在沙箱中运行，并遵循你的安全规则。')
+  })
+
+  it('offers Safe from the composer only after sandbox setup is ready', () => {
+    expect(viewSource).toContain("status.state !== 'ready'")
+    expect(viewSource).toContain("allowedRunModes.value.filter((mode) => mode !== 'safe')")
   })
 
   it('moves visual effects to Appearance settings', () => {

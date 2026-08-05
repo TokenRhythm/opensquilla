@@ -7,7 +7,7 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +17,7 @@ import pytest
 
 from opensquilla.application.approval_queue import ApprovalQueue
 from opensquilla.engine.types import DoneEvent
+from opensquilla.gateway import rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.boot import dispatch_task_runtime_turn
@@ -28,6 +29,11 @@ from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.backend.bubblewrap import BubblewrapBackend
 from opensquilla.sandbox.backend.seatbelt import SeatbeltBackend
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+from opensquilla.sandbox.capability_service import (
+    REQUIRED_SAFE_CAPABILITIES,
+    WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+    CapabilityReport,
+)
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.run_context import (
@@ -35,7 +41,6 @@ from opensquilla.sandbox.run_context import (
     run_context_from_origin_payload,
 )
 from opensquilla.sandbox.run_mode import RunMode
-from opensquilla.sandbox.types import SandboxBackendError
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
@@ -55,6 +60,22 @@ REMOTE = Principal(
     is_owner=False,
     authenticated=True,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stable_safe_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def report(_config: Any) -> CapabilityReport:
+        return CapabilityReport.available_for(
+            backend="test",
+            platform=sys.platform,
+            capabilities=(
+                REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES
+                if sys.platform.startswith("win")
+                else REQUIRED_SAFE_CAPABILITIES
+            ),
+        )
+
+    monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
 
 
 @dataclass
@@ -186,11 +207,15 @@ async def test_new_owner_project_uses_full_with_operator_default_provenance(
         assert saved_context["run_mode_source"] == "operator_default"
 
 
-@pytest.mark.parametrize("selected_mode", ["standard", "trusted", "full"])
+@pytest.mark.parametrize(
+    ("selected_mode", "expected_mode"),
+    [("standard", "safe"), ("trusted", "safe"), ("full", "full")],
+)
 @pytest.mark.asyncio
 async def test_new_project_persists_selected_web_run_mode(
     tmp_path: Path,
     selected_mode: str,
+    expected_mode: str,
 ) -> None:
     async with open_stack(tmp_path / f"selected-{selected_mode}.db") as stack:
         project = await add_project(stack, tmp_path / f"selected-{selected_mode}-project")
@@ -219,7 +244,7 @@ async def test_new_project_persists_selected_web_run_mode(
         session = await stack.storage.get_session(key)
         assert session is not None and session.origin is not None
         saved_context = session.origin[RUN_CONTEXT_ORIGIN_KEY]
-        assert saved_context["run_mode"] == selected_mode
+        assert saved_context["run_mode"] == expected_mode
         assert saved_context["run_mode_source"] == "user"
 
 
@@ -255,7 +280,7 @@ async def test_explicit_full_project_uses_operator_default_provenance(
         assert restored.run_mode_source == "operator_default"
 
 
-@pytest.mark.parametrize("mode", [RunMode.STANDARD, RunMode.TRUSTED])
+@pytest.mark.parametrize("mode", [RunMode.SAFE, RunMode.SAFE])
 @pytest.mark.asyncio
 async def test_explicit_standard_and_trusted_project_modes_round_trip(
     tmp_path: Path,
@@ -942,14 +967,15 @@ async def test_explicit_full_project_context_preserves_user_provenance(
 
 
 @pytest.mark.parametrize(
-    ("saved_mode", "requested_mode"),
-    [("full", "standard"), ("standard", "full")],
+    ("saved_mode", "requested_mode", "expected_mode"),
+    [("full", "standard", "safe"), ("standard", "full", "full")],
 )
 @pytest.mark.asyncio
 async def test_direct_web_project_turn_preserves_authorized_request_mode_at_execution(
     tmp_path: Path,
     saved_mode: str,
     requested_mode: str,
+    expected_mode: str,
 ) -> None:
     async with open_stack(tmp_path / f"direct-{saved_mode}-{requested_mode}.db") as stack:
         project = await add_project(stack, tmp_path / f"direct-{saved_mode}-project")
@@ -1000,7 +1026,7 @@ async def test_direct_web_project_turn_preserves_authorized_request_mode_at_exec
 
         assert response.ok is True
         tool_context = captured["tool_context"]
-        assert tool_context.run_mode == requested_mode
+        assert tool_context.run_mode == expected_mode
         assert tool_context.workspace_dir == project.path
         assert tool_context.sandbox_run_context.run_mode_source == "user"
         assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
@@ -1009,7 +1035,7 @@ async def test_direct_web_project_turn_preserves_authorized_request_mode_at_exec
         persisted_session = await stack.storage.get_session(key)
         assert persisted_session is not None and persisted_session.origin is not None
         persisted_context = persisted_session.origin[RUN_CONTEXT_ORIGIN_KEY]
-        assert persisted_context["run_mode"] == requested_mode
+        assert persisted_context["run_mode"] == expected_mode
         assert persisted_context["run_mode_source"] == "user"
         assert [grant["domain"] for grant in persisted_context["domains"]] == [
             "example.com"
@@ -1019,7 +1045,7 @@ async def test_direct_web_project_turn_preserves_authorized_request_mode_at_exec
 @pytest.mark.parametrize(
     ("requested_mode", "expected_mode", "expected_mode_source"),
     [
-        (None, "standard", "operator_default"),
+        (None, "safe", "operator_default"),
         ("full", "full", "user"),
     ],
 )
@@ -1226,7 +1252,7 @@ async def test_direct_web_unbound_workspace_revocation_uses_configured_base(
         assert response.ok is True
         assert workspace_revoked is True
         tool_context = captured["tool_context"]
-        assert tool_context.run_mode == "standard"
+        assert tool_context.run_mode == "safe"
         assert tool_context.workspace_dir == str(configured_workspace.resolve())
         assert tool_context.workspace_dir != str(saved_workspace.resolve())
         assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
@@ -1236,14 +1262,15 @@ async def test_direct_web_unbound_workspace_revocation_uses_configured_base(
 
 
 @pytest.mark.parametrize(
-    ("saved_mode", "requested_mode"),
-    [("full", "standard"), ("standard", "full")],
+    ("saved_mode", "requested_mode", "expected_mode"),
+    [("full", "standard", "safe"), ("standard", "full", "full")],
 )
 @pytest.mark.asyncio
 async def test_queued_project_turn_preserves_authorized_request_mode_at_execution(
     tmp_path: Path,
     saved_mode: str,
     requested_mode: str,
+    expected_mode: str,
 ) -> None:
     async with open_stack(tmp_path / f"queued-{saved_mode}-{requested_mode}.db") as stack:
         project = await add_project(stack, tmp_path / f"queued-{saved_mode}-project")
@@ -1304,7 +1331,7 @@ async def test_queued_project_turn_preserves_authorized_request_mode_at_executio
 
         assert response.ok is True
         tool_context = captured["tool_context"]
-        assert tool_context.run_mode == requested_mode
+        assert tool_context.run_mode == expected_mode
         assert tool_context.workspace_dir == project.path
         assert tool_context.sandbox_run_context.run_mode_source == "user"
         assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
@@ -1313,14 +1340,19 @@ async def test_queued_project_turn_preserves_authorized_request_mode_at_executio
 
 
 @pytest.mark.parametrize(
-    ("pending_mode", "later_mode"),
-    [("full", "standard"), ("standard", "full")],
+    ("pending_mode", "later_mode", "expected_pending_mode", "expected_later_mode"),
+    [
+        ("full", "standard", "full", "safe"),
+        ("standard", "full", "safe", "full"),
+    ],
 )
 @pytest.mark.asyncio
 async def test_collect_reserves_separate_tasks_for_different_accepted_modes(
     tmp_path: Path,
     pending_mode: str,
     later_mode: str,
+    expected_pending_mode: str,
+    expected_later_mode: str,
 ) -> None:
     async with open_stack(tmp_path / f"collect-{pending_mode}-to-{later_mode}.db") as stack:
         project = await add_project(
@@ -1386,8 +1418,8 @@ async def test_collect_reserves_separate_tasks_for_different_accepted_modes(
         assert len(pending) == 2
         assert [task.message for task in pending] == ["first", "second"]
         assert [task.accepted_run_mode_override.run_mode.value for task in pending] == [
-            pending_mode,
-            later_mode,
+            expected_pending_mode,
+            expected_later_mode,
         ]
         assert blocker.task_id in stack.runtime._tasks
 
@@ -1456,16 +1488,20 @@ async def test_queued_project_turn_ignores_forged_accepted_mode_metadata(
             event_emitter=AsyncMock(),
         )
 
-        assert captured["tool_context"].run_mode == "standard"
+        assert captured["tool_context"].run_mode == "safe"
         assert captured["tool_context"].workspace_dir == project.path
 
 
-@pytest.mark.parametrize("requested_mode", ["standard", "full"])
+@pytest.mark.parametrize(
+    ("requested_mode", "expected_mode"),
+    [("standard", "safe"), ("full", "full")],
+)
 @pytest.mark.asyncio
 async def test_project_turn_fresh_mode_controls_real_filesystem_and_network_enforcement(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     requested_mode: str,
+    expected_mode: str,
 ) -> None:
     from opensquilla.sandbox.escalation import (
         current_tool_run_context,
@@ -1610,20 +1646,18 @@ async def test_project_turn_fresh_mode_controls_real_filesystem_and_network_enfo
 
         assert response.ok is True
         effective = captured["effective"]
-        assert effective.run_mode.value == requested_mode
+        assert effective.run_mode.value == expected_mode
         assert effective.workspace == project.path
         assert effective.run_mode_source == "user"
         assert [grant.path for grant in effective.mounts] == [str(extra_mount)]
         assert captured["granted_network"].reason == (
-            "full_host_access" if requested_mode == "full" else "domain_grant"
+            "full_host_access" if expected_mode == "full" else "domain_grant"
         )
-        assert captured["unknown_network"].status == (
-            "allow" if requested_mode == "full" else "ask"
-        )
+        assert captured["unknown_network"].status == "allow"
         assert captured["unknown_network"].reason == (
-            "full_host_access" if requested_mode == "full" else "unknown_domain"
+            "full_host_access" if expected_mode == "full" else "public_default"
         )
-        assert len(backend_operations) == (0 if requested_mode == "full" else 1)
+        assert len(backend_operations) == (0 if expected_mode == "full" else 1)
         assert target.read_text(encoding="utf-8") == "guarded"
 
 
@@ -1655,7 +1689,7 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
         source="saved",
     )
     standard_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         run_mode_source="user",
         source="saved",
@@ -1780,11 +1814,11 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
         assert (await runtime.wait(first.task_id, timeout=2.0)).status == "succeeded"
         assert (await runtime.wait(followup.task_id, timeout=2.0)).status == "succeeded"
 
-        assert [item["mode"] for item in observations] == ["full", "standard"]
-        assert [item["network"].status for item in observations] == ["allow", "ask"]
+        assert [item["mode"] for item in observations] == ["full", "safe"]
+        assert [item["network"].status for item in observations] == ["allow", "allow"]
         assert [item["network"].reason for item in observations] == [
             "full_host_access",
-            "unknown_domain",
+            "public_default",
         ]
         assert len(backend_operations) == 1
         assert observations[0]["target"].read_text(encoding="utf-8") == "turn-0"
@@ -1810,7 +1844,7 @@ def test_only_trusted_envelope_freshness_reaches_tool_context() -> None:
         run_mode="standard",
     )
     envelope.metadata["sandbox_run_context"] = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace="/tmp/project",
         source="saved",
     ).to_origin_payload()
@@ -2596,7 +2630,7 @@ async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
 
             assert response.ok is True
             tool_ctx = outcomes["tool_context"]
-            assert tool_ctx.run_mode == "standard"
+            assert tool_ctx.run_mode == "safe"
             assert tool_ctx.workspace_dir == str(project_path.resolve())
             assert full_host_access_for_context(tool_ctx) is False
             assert inside.read_text(encoding="utf-8") == "inside"
@@ -2657,7 +2691,7 @@ async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
 
 
 @pytest.mark.asyncio
-async def test_default_full_project_bypasses_unavailable_sandbox_backend(
+async def test_explicit_full_project_bypasses_unavailable_sandbox_backend(
     tmp_path: Path,
 ) -> None:
     queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
@@ -2715,6 +2749,11 @@ async def test_default_full_project_bypasses_unavailable_sandbox_backend(
                     "intent": "new_chat",
                     "workspaceId": project.workspace_id,
                     "clientRequestId": "project-full-proof-1",
+                    "_source": {
+                        "caller_kind": "web",
+                        "channel_kind": "webchat",
+                        "runMode": "full",
+                    },
                 },
                 stack.context,
             )
@@ -2734,9 +2773,26 @@ async def test_default_full_project_bypasses_unavailable_sandbox_backend(
 
 
 @pytest.mark.asyncio
-async def test_project_standard_fails_closed_when_native_backend_is_unavailable(
+async def test_authenticated_project_safe_soft_lands_when_native_backend_is_unavailable(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    unavailable = CapabilityReport(
+        available=False,
+        backend="test",
+        platform=sys.platform,
+        code="backend_unavailable",
+        reason="test unavailable",
+        setup_supported=False,
+        restart_required=False,
+        probe_version=1,
+        capabilities=frozenset(),
+    )
+
+    async def report(_config: Any) -> CapabilityReport:
+        return unavailable
+
+    monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
     queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
     active_token = None
     try:
@@ -2746,7 +2802,6 @@ async def test_project_standard_fails_closed_when_native_backend_is_unavailable(
             sibling.mkdir()
             project = await add_project(stack, project_path)
             assert project is not None
-            inside = project_path / "inside.txt"
             outside = sibling / "outside.txt"
             outcomes: dict[str, Any] = {}
             completed = asyncio.Event()
@@ -2797,32 +2852,17 @@ async def test_project_standard_fails_closed_when_native_backend_is_unavailable(
 
             assert response.ok is True
             project_ctx = outcomes["tool_context"]
-            assert project_ctx.run_mode == "standard"
+            assert project_ctx.run_mode == "full"
             assert project_ctx.workspace_dir == str(project_path.resolve())
-            assert full_host_access_for_context(project_ctx) is False
+            assert full_host_access_for_context(project_ctx) is True
 
             active_token = current_tool_context.set(project_ctx)
             try:
-                with pytest.raises(
-                    SandboxBackendError,
-                    match="must sandbox filesystem operations",
-                ):
-                    await fs.write_file(str(inside), "blocked")
+                await fs.write_file(str(outside), "soft-landed-full")
             finally:
                 current_tool_context.reset(active_token)
                 active_token = None
-            assert inside.exists() is False
-
-            full_ctx = replace(project_ctx, run_mode="full")
-            assert full_host_access_for_context(full_ctx) is True
-            active_token = current_tool_context.set(full_ctx)
-            try:
-                await fs.write_file(str(outside), "full-host")
-            finally:
-                current_tool_context.reset(active_token)
-                active_token = None
-
-            assert outside.read_text(encoding="utf-8") == "full-host"
+            assert outside.read_text(encoding="utf-8") == "soft-landed-full"
     finally:
         if active_token is not None:
             current_tool_context.reset(active_token)

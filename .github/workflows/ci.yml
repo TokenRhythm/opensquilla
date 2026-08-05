@@ -358,9 +358,11 @@ jobs:
           node scripts/test-desktop-gateway-ownership.mjs
           node scripts/test-desktop-gateway-lifecycle.mjs
           node scripts/test-desktop-window-lifecycle.mjs
+          node scripts/test-bundled-runtimes.mjs
           node scripts/test-desktop-cleanup-contract.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
+          node ../../.github/scripts/verify-sandbox-package.mjs --source
 
   ubuntu-quality:
     name: Lint, test, and build (ubuntu-latest, 3.12)
@@ -1079,6 +1081,7 @@ jobs:
             tests/test_root_start_scripts.py \
             tests/test_release_consistency.py \
             tests/test_public_release_hygiene.py \
+            tests/test_sandbox/test_release_contract.py \
             -q
 
   readme-locale-check:

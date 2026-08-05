@@ -229,8 +229,8 @@ from opensquilla.router_control import (
     render_router_control_prompt_block,
 )
 from opensquilla.router_tiers import HIGHEST_TEXT_TIER, normalize_text_tier, tier_index
+from opensquilla.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
-from opensquilla.sandbox.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_PERSISTED_EVENT,
@@ -5999,7 +5999,7 @@ class TurnRunner:
                 normalized_run_mode = None
             if normalized_run_mode is not None:
                 lines = [f"Run mode: {display_name(normalized_run_mode)}"]
-                if normalized_run_mode is RunMode.TRUSTED:
+                if normalized_run_mode is RunMode.SAFE:
                     lines.extend(
                         [
                             "Default execution target: sandbox",

@@ -59,7 +59,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     modelRoutingMode: ref<'off'>('off'),
     modelRoutingSettingsBusy: ref(false),
     elevatedMode: ref(''),
-    runMode: ref('trusted'),
+    runMode: ref('safe'),
     pendingAttachments: ref<Attachment[]>([]),
     pendingSessionIntent: ref(null),
     initialCollaborationMode: ref<CollaborationMode>('default'),
@@ -129,7 +129,7 @@ describe('useChatSend attachment payloads', () => {
       client_request_id: expect.any(String),
       client_message_id: expect.any(String),
       surface_id: 'webui',
-      _source: { runMode: 'trusted' },
+      _source: { runMode: 'safe' },
     })
     expect(rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
     expect(rpc.call).not.toHaveBeenCalledWith('chat.abort', expect.anything())
@@ -859,13 +859,13 @@ describe('useChatSend attachment payloads', () => {
 
   it('sends the selected sandbox run mode as trusted source metadata', async () => {
     const { api, rpc } = makeOptions({
-      runMode: ref('standard'),
+      runMode: ref('safe'),
     } as Partial<UseChatSendOptions>)
 
     await api.onSend()
 
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
-      _source: { runMode: 'standard' },
+      _source: { runMode: 'safe' },
     }))
   })
 
@@ -1399,7 +1399,7 @@ describe('useChatSend attachment payloads', () => {
     const pendingSessionIntent = ref<string | null>('NEW')
     const pendingForkBeforeMessageId = ref<string | null>('msg-B')
     const elevatedMode = ref('enabled')
-    const runMode = ref<'standard' | 'trusted' | 'full'>('standard')
+    const runMode = ref<'safe' | 'full'>('safe')
     const rpc = {
       call: vi.fn()
         .mockRejectedValueOnce(Object.assign(new Error('database busy'), {
@@ -1432,7 +1432,7 @@ describe('useChatSend attachment payloads', () => {
       sessionKey: 'agent:main:webchat:test',
       intent: 'NEW',
       forkBeforeMessageId: 'msg-B',
-      _source: { elevated: 'enabled', runMode: 'standard' },
+      _source: { elevated: 'enabled', runMode: 'safe' },
       attachments: [{ file_uuid: 'file-ready' }],
     })
 
@@ -2013,7 +2013,7 @@ describe('useChatSend attachment payloads', () => {
     const firstParams = rpc.call.mock.calls[0]?.[1]
     const secondParams = rpc.call.mock.calls[1]?.[1]
     expect(secondParams.clientRequestId).not.toBe(firstParams.clientRequestId)
-    expect(secondParams).toMatchObject({ message: 'edited', _source: { runMode: 'trusted' } })
+    expect(secondParams).toMatchObject({ message: 'edited', _source: { runMode: 'safe' } })
   })
 
   it('uses a new request when the recovered draft collaboration mode changes', async () => {

@@ -29,7 +29,9 @@ from opensquilla.gateway.attachment_ingest import (
 )
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, LlmProviderProfile
+from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
 from opensquilla.gateway.input_normalization import LARGE_PASTE_CHARS, estimate_text_tokens
+from opensquilla.gateway.routing import tool_context_from_envelope
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
@@ -39,10 +41,16 @@ from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
+from opensquilla.sandbox.capability_service import CapabilityReport
+from opensquilla.sandbox.guest_profile import (
+    GuestProfileBoundaryError,
+    cleanup_guest_profile_root,
+)
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session import storage as session_storage
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.models import TranscriptEntry
+from opensquilla.tools.visibility import guest_safe_tool_allowlist
 
 _DEFAULT_PRINCIPAL = Principal(
     role="operator", scopes=frozenset(["operator.admin"]), is_owner=True, authenticated=True
@@ -1610,6 +1618,269 @@ class TestSessionsSend:
         ]
 
     @pytest.mark.asyncio
+    async def test_safe_send_soft_lands_to_full_when_host_sandbox_is_unavailable(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        unavailable = CapabilityReport(
+            available=False,
+            backend="windows_default",
+            platform="win32",
+            code="backend_unavailable",
+            reason="not available",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(),
+        )
+
+        async def report(_config):
+            return unavailable
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        session = FakeSession(
+            session_key="agent:main:webchat:safe-fallback",
+            origin={
+                "sandbox_run_context": {
+                    "run_mode": "safe",
+                    "workspace": "/workspace",
+                }
+            },
+        )
+
+        class RecordingTaskRuntime:
+            def __init__(self) -> None:
+                self.enqueue_calls: list[dict[str, Any]] = []
+
+            async def enqueue(self, envelope, message: str, **kwargs: Any):
+                self.enqueue_calls.append({"envelope": envelope, "message": message, **kwargs})
+                return SimpleNamespace(
+                    task_id="task-safe-fallback",
+                    session_key=envelope.session_key,
+                    status="queued",
+                )
+
+        runtime = RecordingTaskRuntime()
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=runtime,
+        )
+        res = await dispatcher.dispatch(
+            "r-safe-fallback",
+            "sessions.send",
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+
+        assert res.ok is True
+        envelope = runtime.enqueue_calls[0]["envelope"]
+        assert envelope.metadata["run_mode"] == "full"
+        assert envelope.metadata["sandbox_mode_resolution"] == {
+            "desiredMode": "safe",
+            "effectiveMode": "full",
+            "fallbackReason": "backend_unavailable",
+            "confirmationRequired": True,
+        }
+        assert session.origin["sandbox_run_context"]["run_mode"] == "safe"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "source_hint",
+        [
+            None,
+            {"caller_kind": "web", "channel_kind": "web"},
+            {"caller_kind": "cli", "channel_kind": "cli"},
+        ],
+    )
+    async def test_guest_safe_send_never_soft_lands_to_host(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        source_hint: dict[str, str] | None,
+    ):
+        unavailable = CapabilityReport(
+            available=False,
+            backend="windows_default",
+            platform="win32",
+            code="backend_unavailable",
+            reason="not available",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(),
+        )
+
+        async def report(_config):
+            return unavailable
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        session = FakeSession(session_key="agent:main:webchat:guest-no-fallback")
+        guest = Principal(
+            role="operator",
+            scopes=frozenset(["operator.read", "operator.write"]),
+            is_owner=False,
+            authenticated=False,
+            auth_state="guest",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=None,
+            principal=guest,
+        )
+
+        params: dict[str, Any] = {"key": session.session_key, "message": "hello"}
+        if source_hint is not None:
+            params["_source"] = source_hint
+        with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
+            await rpc_sessions._handle_sessions_send(params, ctx)
+
+        assert raised.value.code == "SANDBOX_UNAVAILABLE"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_state", ["guest", "invalid"])
+    async def test_unauthenticated_ingress_uses_guest_workspace_and_hard_tool_allowlist(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        auth_state: str,
+    ) -> None:
+        available = CapabilityReport(
+            available=True,
+            backend="windows_default",
+            platform="win32",
+            code="ready",
+            reason="ready",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(
+                {"process", "filesystem-worker", "denyWriteCarveout", "authorityDenyRead"}
+            ),
+        )
+
+        async def report(_config):
+            return available
+
+        class RecordingTaskRuntime:
+            def __init__(self) -> None:
+                self.enqueue_calls: list[dict[str, Any]] = []
+
+            async def enqueue(self, envelope, message: str, **kwargs: Any):
+                self.enqueue_calls.append({"envelope": envelope, "message": message, **kwargs})
+                return SimpleNamespace(
+                    task_id="task-guest-managed-workspace",
+                    session_key=envelope.session_key,
+                    status="queued",
+                )
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        configured_workspace = tmp_path / "real-project"
+        configured_workspace.mkdir()
+        state_dir = tmp_path / "state"
+        config = GatewayConfig(
+            workspace_dir=str(configured_workspace),
+            state_dir=str(state_dir),
+            memory={"flush_enabled": False},
+        )
+        session = FakeSession(session_key="agent:main:webchat:guest-ingress")
+        runtime = RecordingTaskRuntime()
+        guest = Principal(
+            role="operator",
+            scopes=frozenset(["operator.read", "operator.write"]),
+            is_owner=False,
+            authenticated=False,
+            auth_state=auth_state,
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=runtime,
+            principal=guest,
+            config=config,
+        )
+
+        await rpc_sessions._handle_sessions_send(
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+
+        envelope = runtime.enqueue_calls[0]["envelope"]
+        tool_context = tool_context_from_envelope(
+            envelope,
+            is_owner=False,
+            workspace_dir=str(configured_workspace),
+        )
+        managed_root = state_dir.with_name(f"{state_dir.name}-guest-workspaces")
+        effective_workspace = Path(tool_context.workspace_dir or "")
+        assert effective_workspace != configured_workspace.resolve()
+        assert effective_workspace.parent.parent == managed_root.resolve()
+        assert effective_workspace.name == "workspace"
+        assert tool_context.guest_safe is True
+        assert tool_context.allowed_tools == set(guest_safe_tool_allowlist())
+        assert "sessions_send" not in tool_context.allowed_tools
+        assert "exec_command" not in tool_context.allowed_tools
+
+        cleanup_guest_profile_root(
+            envelope.metadata["guest_profile_root"],
+            managed_root=managed_root,
+        )
+
+    @pytest.mark.asyncio
+    async def test_guest_scratch_boundary_failure_is_a_stable_rpc_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        available = CapabilityReport(
+            available=True,
+            backend="windows_default",
+            platform="win32",
+            code="ready",
+            reason="ready",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(
+                {"process", "filesystem-worker", "denyWriteCarveout", "authorityDenyRead"}
+            ),
+        )
+
+        async def report(_config):
+            return available
+
+        def fail_profile(*_args, **_kwargs):
+            raise GuestProfileBoundaryError(
+                "GUEST_DEFAULT_WORKSPACE_UNSAFE: guest scratch directory is retargeted"
+            )
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+        monkeypatch.setattr(rpc_sessions, "_guest_profile_for_principal", fail_profile)
+        session = FakeSession(session_key="agent:main:webchat:guest-boundary")
+        guest = Principal(
+            role="operator",
+            scopes=frozenset(["operator.read", "operator.write"]),
+            is_owner=False,
+            authenticated=False,
+            auth_state="guest",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=None,
+            principal=guest,
+            config=GatewayConfig(
+                workspace_dir=str(tmp_path / "workspace"),
+                memory={"flush_enabled": False},
+            ),
+        )
+
+        with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
+            await rpc_sessions._handle_sessions_send(
+                {"key": session.session_key, "message": "hello"},
+                ctx,
+            )
+
+        assert raised.value.code == "GUEST_DEFAULT_WORKSPACE_UNSAFE"
+
+    @pytest.mark.asyncio
     async def test_legacy_direct_send_holds_registry_admission_through_register(
         self,
         dispatcher,
@@ -2072,17 +2343,35 @@ class TestSessionsSend:
     @pytest.mark.parametrize(
         ("requested_run_mode", "expected_run_mode"),
         [
-            ("full", "trusted"),
-            ("trusted", "trusted"),
-            ("standard", "standard"),
+            ("full", "full"),
+            ("trusted", "full"),
+            ("standard", "full"),
         ],
     )
-    async def test_send_non_owner_source_run_mode_is_principal_scoped_without_persisting(
+    async def test_send_host_capable_token_run_mode_is_resolved_without_persisting(
         self,
         dispatcher,
         requested_run_mode: str,
         expected_run_mode: str,
+        monkeypatch: pytest.MonkeyPatch,
     ):
+        unavailable = CapabilityReport(
+            available=False,
+            backend="test",
+            platform="test",
+            code="backend_unavailable",
+            reason="not available",
+            setup_supported=False,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(),
+        )
+
+        async def report(_config):
+            return unavailable
+
+        monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+
         class RecordingTaskRuntime:
             def __init__(self) -> None:
                 self.enqueue_calls: list[dict[str, Any]] = []
@@ -2176,7 +2465,9 @@ class TestSessionsSend:
         assert chat_session.origin["sandbox_run_context"]["run_mode"] == "standard"
 
     @pytest.mark.asyncio
-    async def test_chat_send_non_owner_full_source_run_mode_downgrades_to_trusted(self, dispatcher):
+    async def test_chat_send_host_capable_token_keeps_full_without_owner_authority(
+        self, dispatcher
+    ):
         chat_session = FakeSession(
             session_key="agent:main:webchat:chat-non-owner-full-source",
             session_id="chat-non-owner-full-source",
@@ -2216,8 +2507,10 @@ class TestSessionsSend:
         chat_task = get_agent_task_registry().get(chat_session.session_key)
         if chat_task is not None:
             await chat_task
-        assert chat_runner.run_calls[0]["tool_context"].run_mode == "trusted"
-        assert chat_runner.run_calls[0]["tool_context"].elevated != "full"
+        tool_context = chat_runner.run_calls[0]["tool_context"]
+        assert tool_context.run_mode == "full"
+        assert tool_context.elevated == "full"
+        assert tool_context.is_owner is False
         assert chat_session.origin["sandbox_run_context"]["run_mode"] == "standard"
 
     @pytest.mark.asyncio
@@ -3697,6 +3990,51 @@ class TestSessionsAbort:
             }
         ]
         assert runtime.wait_calls == ["task-old"]
+
+    @pytest.mark.asyncio
+    async def test_guest_chat_abort_never_cancels_unbound_task_id(self, dispatcher):
+        owner_id = "a" * 64
+        session = FakeSession(session_key=guest_owned_session_key(owner_id, "mine"))
+
+        class Runtime:
+            def __init__(self) -> None:
+                self.cancel_calls: list[dict[str, Any]] = []
+
+            async def list(self, session_key: str | None = None):
+                assert session_key == session.session_key
+                return []
+
+            async def cancel(self, **kwargs) -> int:
+                self.cancel_calls.append(kwargs)
+                return 1 if len(self.cancel_calls) == 1 else 0
+
+        runtime = Runtime()
+        guest = Principal(
+            role="operator",
+            scopes=frozenset({"operator.read", "operator.write"}),
+            is_owner=False,
+            authenticated=False,
+            auth_state="guest",
+            guest_owner_id=owner_id,
+            guest_session_key="osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=runtime,
+            principal=guest,
+        )
+
+        response = await dispatcher.dispatch(
+            "guest-abort",
+            "chat.abort",
+            {"sessionKey": session.session_key, "taskId": "victim-task"},
+            ctx,
+        )
+
+        assert response.ok is True
+        assert runtime.cancel_calls
+        assert all(call.get("task_id") is None for call in runtime.cancel_calls)
+        assert all(call.get("session_key") == session.session_key for call in runtime.cancel_calls)
 
     @pytest.mark.asyncio
     async def test_chat_user_stop_cancels_the_whole_session_even_with_a_stale_task_id(
@@ -6967,7 +7305,7 @@ class TestSessionsMessagesSubscribe:
         assert res.ok is True
         assert res.payload["run_mode_lock"] == {
             "locked": True,
-            "runMode": "standard",
+            "runMode": "safe",
             "source": "task",
         }
         assert manager._storage.list_agent_tasks_calls == [key]
@@ -7008,7 +7346,7 @@ class TestSessionsMessagesSubscribe:
         assert res.ok is True
         assert res.payload["run_mode_lock"] == {
             "locked": True,
-            "runMode": "trusted",
+            "runMode": "safe",
             "source": "background",
         }
         assert background_called is True
@@ -7821,6 +8159,81 @@ class TestSessionsResolve:
 
 class TestSessionsBootstrap:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_state", ["guest", "invalid"])
+    async def test_guest_bootstrap_never_resolves_or_returns_host_workspace(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        auth_state: str,
+    ) -> None:
+        owner_id = "b" * 64
+        key = guest_owned_session_key(owner_id, "bootstrap")
+        session = FakeSession(
+            session_key=key,
+            session_id="guest-bootstrap",
+            workspace_id="real-workspace-id",
+        )
+        host_workspace = tmp_path / "real-project"
+        calls: list[str] = []
+
+        from opensquilla.agents import scope as agent_scope
+
+        def resolve_workspace(*_args, **_kwargs):
+            calls.append("resolve_agent_workspace_dir")
+            return host_workspace
+
+        async def project_snapshot(*_args, **_kwargs):
+            calls.append("project_workspace_snapshot")
+            return {"id": "real-workspace-id", "path": str(host_workspace)}
+
+        async def authoritative_context(*_args, **_kwargs):
+            calls.append("authoritative_project_run_context")
+            raise AssertionError("guest bootstrap must not resolve project authority")
+
+        monkeypatch.setattr(agent_scope, "resolve_agent_workspace_dir", resolve_workspace)
+        monkeypatch.setattr(rpc_sessions, "project_workspace_snapshot", project_snapshot)
+        monkeypatch.setattr(
+            rpc_sessions,
+            "authoritative_project_run_context",
+            authoritative_context,
+        )
+        principal = Principal(
+            role="operator",
+            scopes=frozenset({"operator.read", "operator.write"}),
+            is_owner=False,
+            authenticated=False,
+            capabilities=frozenset({"guest.safe"}),
+            auth_state=auth_state,
+            guest_owner_id=owner_id,
+            guest_session_key="osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            principal=principal,
+            config=GatewayConfig(
+                workspace_dir=str(host_workspace),
+                state_dir=str(tmp_path / "state"),
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "guest-bootstrap",
+            "sessions.bootstrap",
+            {"key": key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert calls == []
+        assert "workspace" not in res.payload["session"]
+        assert "workspace_id" not in res.payload["session"]
+        assert "workspaceId" not in res.payload["session"]
+        assert "projectWorkspace" not in res.payload["session"]
+        assert str(host_workspace) not in json.dumps(res.payload)
+        assert "real-workspace-id" not in json.dumps(res.payload)
+
+    @pytest.mark.asyncio
     async def test_bootstrap_composes_history_tasks_epoch_and_stream_cursor(
         self, dispatcher, tmp_path
     ):
@@ -7917,6 +8330,45 @@ class TestSessionsBootstrap:
         assert res.payload["runtime"]["model_routing"]["mode"] == "router"
         assert res.payload["epoch"] == 3
         assert res.payload["stream_cursor"] == stream["stream_seq"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_bootstrap_preserves_transcript_larger_than_one_mib(
+        self, dispatcher
+    ):
+        key = "agent:main:webchat:synthetic-large-bootstrap"
+        session = FakeSession(
+            session_key=key,
+            session_id="synthetic-large-bootstrap",
+            status="running",
+        )
+        manager = FakeSessionManager([session])
+        manager.transcript = [
+            TranscriptEntry(
+                id=index + 1,
+                session_id=session.session_id,
+                session_key=key,
+                role="user",
+                content=f"{index:02d}:" + "x" * 17_997,
+                created_at=100 + index,
+                message_id=f"synthetic-message-{index:02d}",
+            )
+            for index in range(64)
+        ]
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch(
+            "large-bootstrap",
+            "sessions.bootstrap",
+            {"key": key, "limit": 64},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert len(res.model_dump_json().encode("utf-8")) > 1024 * 1024
+        assert res.payload["history"]["loaded_count"] == 64
+        messages = res.payload["history"]["messages"]
+        assert messages[0]["message_id"] == "synthetic-message-00"
+        assert messages[-1]["message_id"] == "synthetic-message-63"
 
     @pytest.mark.asyncio
     async def test_bootstrap_includes_only_sanitized_agent_identity_display_fields(

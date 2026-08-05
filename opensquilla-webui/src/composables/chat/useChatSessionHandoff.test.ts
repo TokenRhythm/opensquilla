@@ -245,7 +245,7 @@ describe('chat send session handoff', () => {
       modelRoutingMode: ref<'off'>('off'),
       modelRoutingSettingsBusy: ref(false),
       elevatedMode: ref(''),
-      runMode: ref('trusted'),
+      runMode: ref('safe'),
       pendingAttachments,
       pendingSessionIntent,
       initialCollaborationMode: ref<'default' | 'plan'>('default'),

@@ -83,17 +83,17 @@ def _agent_access_arguments(bundle: AgentConfigBundle) -> list[str]:
     """Return child CLI access flags matching the effective sandbox run mode."""
 
     from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.run_mode import RunMode, normalize_run_mode
 
     config = GatewayConfig(**copy.deepcopy(bundle.payload))
-    run_mode = config.effective_run_mode
-    if run_mode == "full":
+    run_mode = normalize_run_mode(config.effective_run_mode)
+    if run_mode is RunMode.FULL:
         return ["--no-workspace-strict", "--permissions", "full"]
-    permission_profile = "restricted" if run_mode == "standard" else "bypass"
     return [
         "--workspace-strict",
         "--workspace-lockdown",
         "--permissions",
-        permission_profile,
+        "restricted",
     ]
 
 

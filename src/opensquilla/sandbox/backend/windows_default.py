@@ -35,6 +35,7 @@ from opensquilla.sandbox.backend.windows_default_roots import (
     runtime_rx_roots,
     windows_platform_rx_roots,
     windows_sensitive_marker,
+    windows_system_root,
     workspace_cache_root,
 )
 from opensquilla.sandbox.backend.windows_default_setup import (
@@ -57,11 +58,10 @@ from opensquilla.sandbox.permissions import (
     logical_absolute_path,
 )
 from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest, SandboxResult
 from opensquilla.subprocess_encoding import decode_subprocess_output
 
-_HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
-_FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
 _OUTPUT_BYTE_CAP = 1_048_576
 _HELPER_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
 _HELPER_ERROR_PREFIX = "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
@@ -93,7 +93,7 @@ _WINDOWS_DOS_DEVICE_NAMES = frozenset(
 
 
 class WindowsDefaultBackend(Backend):
-    """Windows backend used by Standard-Sandbox and Managed Execution."""
+    """Windows backend used by Safe mode."""
 
     name = "windows_default"
 
@@ -166,7 +166,10 @@ class WindowsDefaultBackend(Backend):
             separators=(",", ":"),
             sort_keys=True,
         )
-        helper_argv = (sys.executable, "-m", _HELPER_MODULE, "--payload-env")
+        helper_argv = internal_child_argv(
+            ChildRole.WINDOWS_DEFAULT_RUNNER,
+            args=("--payload-env",),
+        )
         wall = request.policy.limits.wall_timeout_s
         helper_wall = _helper_supervision_timeout(wall)
         started = time.monotonic()
@@ -185,6 +188,13 @@ class WindowsDefaultBackend(Backend):
                 proc.communicate(),
                 timeout=helper_wall,
             )
+        except asyncio.CancelledError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            raise
         except TimeoutError:
             proc.kill()
             try:
@@ -256,6 +266,12 @@ def _payload_for_request(
         request,
         private_mounts_are_required=private_mounts_are_required,
     )
+    if _is_capability_probe_request(request):
+        # Capability canaries use their own short-lived capability SIDs. They
+        # must not switch the shared offline account's allow journal away from
+        # the user's real Safe profile, which can trigger expensive inherited
+        # ACL churn on a large home directory.
+        policy["capabilityProbe"] = True
     network_boundary = _windows_network_boundary_payload(request)
     if network_boundary is not None:
         policy["windowsNetworkBoundary"] = network_boundary
@@ -277,6 +293,12 @@ def _payload_for_request(
 
 def _new_helper_nonce() -> str:
     return secrets.token_hex(16)
+
+
+def _is_capability_probe_request(request: SandboxRequest) -> bool:
+    return request.action_kind == "capability.probe" or request.action_kind.startswith(
+        "capability.probe.fs.worker."
+    )
 
 
 def _authenticated_helper_error(
@@ -361,6 +383,8 @@ def _filesystem_operation_request(
     env = {
         "PATH": str(_python_executable().parent),
         "PYTHONPATH": _pythonpath_for_worker(),
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
         "TEMP": str(worker_temp),
         "TMP": str(worker_temp),
         "TMPDIR": str(worker_temp),
@@ -393,16 +417,13 @@ def _filesystem_operation_request(
             "defaultAccess": profile.default_access.value,
         },
     }
+    action_kind = f"fs.worker.{operation.kind}"
+    if operation.operation_id == "capability-probe":
+        action_kind = f"capability.probe.{action_kind}"
     return SandboxRequest(
-        argv=(
-            str(_python_executable()),
-            "-B",
-            "-m",
-            _FILESYSTEM_WORKER_MODULE,
-            "-",
-        ),
+        argv=internal_child_argv(ChildRole.FILESYSTEM_WORKER, args=("-",)),
         cwd=workspace,
-        action_kind=f"fs.worker.{operation.kind}",
+        action_kind=action_kind,
         policy=policy,
         stdin=json.dumps(worker_payload, ensure_ascii=False).encode("utf-8"),
         env=env,
@@ -763,9 +784,17 @@ def _acl_plan_payload(
     process_rx_roots = tuple(
         root for root in process_executable_rx_roots(request.argv, request.env) if root.exists()
     )
+    if request.env.get("OPENSQUILLA_GUEST_SAFE") == "1":
+        system_root = windows_system_root(request.env).resolve(strict=False)
+        process_rx_roots = tuple(
+            root
+            for root in process_rx_roots
+            if _is_relative_to_casefold(root.resolve(strict=False), system_root)
+            or profile.resolve(root) is not FileSystemAccess.DENY
+        )
     tool_rx_roots = (
         ()
-        if _is_filesystem_worker_request(request)
+        if not _request_needs_host_tool_paths(request)
         else tuple(
             root
             for root in _windows_tool_path_roots(
@@ -858,7 +887,7 @@ def _acl_plan_payload(
         "denyWritePaths": [str(path) for path in deny_write_paths],
         "denyReadPaths": [str(path) for path in deny_read_paths],
         "denyAclStatePath": str(_deny_acl_state_path()),
-        "revalidateDenyAcl": not request.action_kind.startswith("fs.worker."),
+        "revalidateDenyAcl": not _is_filesystem_worker_request(request),
         "grantCurrentUserAccess": True,
     }
 
@@ -1131,13 +1160,23 @@ def _process_base_env(request: SandboxRequest) -> dict[str, str]:
         value = request.env.get(key) or os.environ.get(key)
         if isinstance(value, str) and value:
             env[key] = value
-    if not _is_filesystem_worker_request(request):
+    if _request_needs_host_tool_paths(request):
         _prepend_windows_tool_paths(env, host_env=_host_tool_env(request))
     return env
 
 
 def _is_filesystem_worker_request(request: SandboxRequest) -> bool:
-    return request.action_kind.startswith("fs.worker.")
+    return request.action_kind.startswith(
+        ("fs.worker.", "capability.probe.fs.worker.")
+    )
+
+
+def _request_needs_host_tool_paths(request: SandboxRequest) -> bool:
+    return (
+        request.env.get("OPENSQUILLA_GUEST_SAFE") != "1"
+        and not _is_filesystem_worker_request(request)
+        and request.action_kind != "capability.probe"
+    )
 
 
 def _host_tool_env(request: SandboxRequest) -> dict[str, str]:
@@ -1325,9 +1364,14 @@ def _split_windows_path(value: str) -> list[str]:
 
 
 def _directory_has_windows_tool(path: Path) -> bool:
-    if not path.exists() or not path.is_dir():
+    try:
+        if not path.exists() or not path.is_dir():
+            return False
+        return any((path / name).exists() for name in _WINDOWS_TOOL_PATH_EXECUTABLES)
+    except OSError:
+        # Ignore malformed or oversized PATH entries instead of aborting the
+        # entire sandbox request while probing for optional Windows tools.
         return False
-    return any((path / name).exists() for name in _WINDOWS_TOOL_PATH_EXECUTABLES)
 
 
 def _windows_path_is_apps_alias_dir(path: Path) -> bool:

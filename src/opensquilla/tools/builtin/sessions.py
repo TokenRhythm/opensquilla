@@ -23,7 +23,7 @@ from opensquilla.provider.types import derive_provider_request_correlation
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
-from opensquilla.tools.run_mode import current_run_mode
+from opensquilla.tools.run_mode import current_run_mode, full_host_access_for_context
 from opensquilla.tools.types import PlanAccess, SafeToolError, ToolError, current_tool_context
 
 _log = structlog.get_logger("opensquilla.tools.sessions")
@@ -39,6 +39,14 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "You are a subagent. Execute the delegated task faithfully and return "
     "a structured result to your parent session."
 )
+
+
+def _reject_guest_session_tool(tool_name: str) -> None:
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.guest_safe:
+        raise ToolError(
+            f"GUEST_TOOL_UNAVAILABLE: {tool_name} is unavailable to anonymous guests"
+        )
 
 
 def _is_bare_sentinel_task(task: str) -> bool:
@@ -304,6 +312,7 @@ def evict_spawn_lock(parent_session_key: str) -> bool:
     required=["session_key", "message"],
 )
 async def sessions_send(session_key: str, message: str) -> str:
+    _reject_guest_session_tool("sessions_send")
     if not message:
         raise SafeToolError("Message must not be empty")
 
@@ -392,6 +401,7 @@ async def sessions_spawn(
     task: str = "",
     model: str | None = None,
 ) -> str:
+    _reject_guest_session_tool("sessions_spawn")
     if not task:
         raise ToolError("Task must not be empty")
 
@@ -518,6 +528,9 @@ async def sessions_spawn(
             parent_task_id=parent_task_id,
             spawn_depth=spawn_depth,
             principal_is_owner=getattr(ctx, "is_owner", None) if ctx is not None else None,
+            principal_host_execute=(
+                full_host_access_for_context(ctx) if ctx is not None else None
+            ),
             elevated=getattr(ctx, "elevated", None) if ctx is not None else None,
             run_mode=current_run_mode(),
             sandbox_run_context=(
@@ -636,6 +649,7 @@ async def sessions_list(
     status: str | None = None,
     limit: int = 50,
 ) -> str:
+    _reject_guest_session_tool("sessions_list")
     if status is not None and status not in _VALID_STATUSES:
         raise ToolError(f"Invalid status: {status}. Must be running|done|failed|killed|timeout")
     if not (1 <= limit <= 200):
@@ -674,6 +688,7 @@ async def sessions_list(
     plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_history(session_key: str, limit: int = 20) -> str:
+    _reject_guest_session_tool("sessions_history")
     if not (1 <= limit <= 100):
         raise ToolError("Limit must be between 1 and 100")
 
@@ -732,6 +747,7 @@ async def sessions_yield(
     timeout_seconds: int = 300,
     message: str | None = None,
 ) -> str:
+    _reject_guest_session_tool("sessions_yield")
     if not (0 <= timeout_seconds <= 3600):
         raise ToolError("Timeout must be between 0 and 3600 seconds")
     if not session_key:
@@ -884,6 +900,7 @@ async def sessions_yield(
     plan_access=PlanAccess.READ_ONLY,
 )
 async def session_status() -> str:
+    _reject_guest_session_tool("session_status")
     try:
         mgr = _get_session_manager()
         ctx = current_tool_context.get()
@@ -936,7 +953,9 @@ async def session_status() -> str:
             "runtime_ms": getattr(current, "runtime_ms", 0),
         }
         if ctx is not None:
-            run_mode = getattr(ctx, "run_mode", "trusted")
+            from opensquilla.run_mode import normalize_run_mode
+
+            run_mode = normalize_run_mode(getattr(ctx, "run_mode", None)).value
             data["run_mode"] = run_mode
             data["sandbox_enabled"] = run_mode != "full"
         return json.dumps(data)
@@ -947,10 +966,11 @@ async def session_status() -> str:
 
 
 def _run_mode_label(run_mode: str | None) -> str | None:
-    if run_mode == "full":
-        return "Full Host Access"
-    if run_mode == "trusted":
-        return "Managed Execution"
-    if run_mode == "standard":
-        return "Standard"
-    return None
+    if run_mode is None:
+        return None
+    from opensquilla.run_mode import display_name
+
+    try:
+        return display_name(run_mode)
+    except ValueError:
+        return None

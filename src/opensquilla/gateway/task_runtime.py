@@ -117,10 +117,61 @@ def _accepted_run_mode_payload(override: Any) -> dict[str, str] | None:
 def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
     """Detach one route for reuse without execution-scoped freshness."""
 
+    metadata = dict(envelope.metadata)
+    if metadata.get("guest_safe") is True:
+        for key in (
+            "guest_profile_root",
+            "guest_managed_root",
+            "guest_environment",
+            "sandbox_mounts",
+            "sandbox_run_context",
+        ):
+            metadata.pop(key, None)
     return replace(
         envelope,
-        metadata=dict(envelope.metadata),
+        metadata=metadata,
         sandbox_run_context_fresh=False,
+    )
+
+
+def _materialize_guest_task_envelope(
+    envelope: RouteEnvelope,
+    task_id: str,
+) -> RouteEnvelope:
+    """Attach one new process-local guest profile to an execution envelope."""
+
+    if envelope.metadata.get("guest_safe") is not True:
+        return envelope
+    existing_root = envelope.metadata.get("guest_profile_root")
+    if isinstance(existing_root, str) and existing_root:
+        return envelope
+    factory = envelope.runtime_services.get("guest_profile_factory")
+    if not callable(factory):
+        from opensquilla.sandbox.guest_profile import GuestProfileBoundaryError
+
+        raise GuestProfileBoundaryError(
+            f"{GuestProfileBoundaryError.code}: guest runtime profile factory is unavailable"
+        )
+    profile = factory(task_id)
+    if profile is None:
+        from opensquilla.sandbox.guest_profile import GuestProfileBoundaryError
+
+        raise GuestProfileBoundaryError(
+            f"{GuestProfileBoundaryError.code}: guest runtime profile is unavailable"
+        )
+    run_context_payload = profile.run_context().to_origin_payload()
+    metadata = {
+        **envelope.metadata,
+        "guest_profile_root": str(profile.root),
+        "guest_managed_root": str(profile.managed_root),
+        "guest_environment": dict(profile.environment),
+        "sandbox_mounts": run_context_payload["mounts"],
+        "sandbox_run_context": run_context_payload,
+    }
+    return replace(
+        envelope,
+        metadata=metadata,
+        sandbox_run_context_fresh=True,
     )
 
 
@@ -315,6 +366,7 @@ class _RuntimeTask:
     terminal_emitted: bool = False
     cancel_requested: bool = False
     execution_started: bool = False
+    guest_profile_cleaned: bool = False
     acquired_slot: bool = False
     overflow_dropped: bool = False
     cancel_source: str | None = None
@@ -344,6 +396,29 @@ class _RuntimeTask:
     ) -> None:
         self.terminal_assistant_message_id = message_id
         self.terminal_assistant_message_content = content
+
+
+def _cleanup_guest_profile(task: _RuntimeTask) -> None:
+    """Remove one task-owned guest profile exactly once."""
+
+    if task.guest_profile_cleaned:
+        return
+    task.guest_profile_cleaned = True
+    guest_profile_root = task.envelope.metadata.get("guest_profile_root")
+    guest_managed_root = task.envelope.metadata.get("guest_managed_root")
+    if not (
+        isinstance(guest_profile_root, str)
+        and guest_profile_root
+        and isinstance(guest_managed_root, str)
+        and guest_managed_root
+    ):
+        return
+    from opensquilla.sandbox.guest_profile import cleanup_guest_profile_root
+
+    cleanup_guest_profile_root(
+        guest_profile_root,
+        managed_root=guest_managed_root,
+    )
 
 
 @dataclass(frozen=True)
@@ -1210,6 +1285,18 @@ class TaskRuntime:
             self._reservations_by_session.setdefault(envelope.session_key, []).append(
                 reservation
             )
+        try:
+            runtime_task.envelope = _materialize_guest_task_envelope(
+                runtime_task.envelope,
+                runtime_task.task_id,
+            )
+            if isinstance(reservation.task_record.details, dict):
+                reservation.task_record.details["metadata"] = dict(
+                    runtime_task.envelope.metadata
+                )
+        except BaseException:
+            await self.abort_reservation(reservation)
+            raise
         return reservation
 
     async def abort_reservation(self, reservation: TaskReservation) -> None:
@@ -1228,6 +1315,7 @@ class TaskRuntime:
                     reservation.overflow_victim.task_id
                 )
             reservation.aborted = True
+        _cleanup_guest_profile(reservation.runtime_task)
 
     async def _emit_queued_activation(
         self,
@@ -2648,6 +2736,7 @@ class TaskRuntime:
         finally:
             self._user_input_broker.cancel_task(task.task_id)
             await self._settle_attached_plan_run(task)
+            _cleanup_guest_profile(task)
 
     async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
         """Snapshot session collaboration state at the actual turn boundary.
@@ -3982,15 +4071,21 @@ class TaskRuntime:
     ) -> None:
         """Finalize one task after collect and same-turn admissions settle."""
 
-        async with task.collect_claim:
-            async with task.steer_claim:
-                await self._mark_terminal_claimed(
-                    task,
-                    status,
-                    terminal_reason=terminal_reason,
-                    error_class=error_class,
-                    error_message=error_message,
-                )
+        try:
+            async with task.collect_claim:
+                async with task.steer_claim:
+                    await self._mark_terminal_claimed(
+                        task,
+                        status,
+                        terminal_reason=terminal_reason,
+                        error_class=error_class,
+                        error_message=error_message,
+                    )
+        finally:
+            # A driver cancelled before its first event-loop step never enters
+            # ``_execute`` and therefore has no execution ``finally`` block.
+            if not task.execution_started:
+                _cleanup_guest_profile(task)
 
     async def _mark_terminal_claimed(
         self,

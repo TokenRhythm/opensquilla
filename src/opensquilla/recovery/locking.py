@@ -317,6 +317,17 @@ def _prepare_posix_lock_file(path: Path, root: Path) -> int:
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+        except FileNotFoundError:
+            # Darwin can report ENOENT to one of two simultaneous openat
+            # callers racing to create the same O_NOFOLLOW leaf. Retrying the
+            # same no-follow operation preserves the safety check and opens
+            # the regular file created by the winning caller.
+            try:
+                fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+            except OSError as exc:
+                raise UnsafePathError(
+                    f"cannot open profile lock without following links: {path}"
+                ) from exc
         except OSError as exc:
             raise UnsafePathError(
                 f"cannot open profile lock without following links: {path}"

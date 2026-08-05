@@ -195,6 +195,7 @@
                 v-if="runModeOpen"
                 :run-mode="runMode"
                 :allowed-run-modes="allowedRunModes"
+                :safe-setup-available="safeSetupAvailable"
                 @close="runModeOpen = false"
                 @set-run-mode="emit('setRunMode', $event)"
               />
@@ -338,6 +339,7 @@ const props = withDefaults(defineProps<{
   inputDisabled?: boolean
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
+  safeSetupAvailable?: boolean
   runModeLocked: boolean
   runModeLockMessage: string
   modelRoutingMode: ModelRoutingMode
@@ -363,6 +365,7 @@ const props = withDefaults(defineProps<{
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
   inputDisabled: false,
+  safeSetupAvailable: false,
 })
 
 const emit = defineEmits<{
@@ -375,7 +378,7 @@ const emit = defineEmits<{
   retryAttachment: [index: number]
   send: []
   setBusySendMode: [mode: 'queue' | 'steer']
-  setRunMode: [mode: 'standard' | 'trusted' | 'full']
+  setRunMode: [mode: SandboxRunMode]
   setModelRoutingMode: [mode: ModelRoutingMode]
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
@@ -1183,7 +1186,7 @@ defineExpose<ChatComposerExpose>({
   box-shadow: 0 0 0 2px var(--bg-surface);
 }
 
-.chat-run-mode-btn--trusted {
+.chat-run-mode-btn--safe {
   --run-mode-tone: var(--ok);
   --run-mode-tint: color-mix(in srgb, var(--ok) 12%, var(--bg-surface));
   --run-mode-border: color-mix(in srgb, var(--ok) 34%, transparent);

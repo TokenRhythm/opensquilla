@@ -82,15 +82,23 @@ def _is_launch_turn(ctx: TurnContext, name: str) -> bool:
     """True when this turn is the ``/meta <name>`` launch turn for ``name``.
 
     Every surface (web SPA, CLI/TUI, channel) stamps the launch via
-    ``meta.run`` and then sends a turn whose provider text is exactly
-    ``/meta <name>`` (bypassing client slash parsing). Matching that sentinel
-    is what binds the pending launch to the turn the surface deliberately
-    issued, so an unrelated normal message never claims it.
+    ``meta.run`` and then sends a turn whose provider text is ``/meta <name>``
+    followed by an optional concrete request (bypassing client slash parsing).
+    Matching the sentinel at a whitespace boundary binds the pending launch to
+    the turn the surface deliberately issued without accepting a different
+    skill whose name merely shares the same prefix.
     """
     sentinel = f"/meta {name}"
     for text in (getattr(ctx, "message", ""), getattr(ctx, "semantic_message", "")):
-        if isinstance(text, str) and text.strip() == sentinel:
+        if not isinstance(text, str):
+            continue
+        candidate = text.strip()
+        if candidate == sentinel:
             return True
+        if candidate.startswith(sentinel):
+            suffix = candidate[len(sentinel) :]
+            if suffix and suffix[0].isspace():
+                return True
     return False
 
 
