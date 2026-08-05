@@ -102,6 +102,7 @@ def _candidate(
     ok: bool,
     outcome: str,
     usage_reported: bool,
+    stop_reason: str = "",
 ) -> dict:
     candidate = {
         "provider": "openrouter",
@@ -112,6 +113,7 @@ def _candidate(
         "completion_outcome": "complete" if ok else "partial_usable",
         "request_started": True,
         "usage_reported": usage_reported,
+        "stop_reason": stop_reason,
         "execution": {
             "provider": "openrouter",
             "model": model_id,
@@ -276,11 +278,45 @@ def test_reconciles_physical_calls_and_neutralizes_framework_tool_removal(
         "unclassified_requests": 0,
     }
     snapshot = updated["role_reliability_snapshot"]
-    assert snapshot["observation_policy"] == "aef-physical-model-calls-v3"
+    assert snapshot["observation_policy"] == "aef-physical-model-calls-v4"
     assert snapshot["completion_gate"] == "fixture_without_final_audit"
     assert snapshot["ordering_granularity"] == "task_aggregate"
     assert snapshot["base_snapshot_version"] == "base-snapshot"
     assert updated["snapshot_version"] == "base-snapshot-reliability-20260805T020000Z"
+
+
+def test_legacy_complete_length_capped_proposer_counts_as_failure(
+    tmp_path: Path,
+) -> None:
+    updater = _load_module()
+    output = tmp_path / "outputs" / "B2" / "001" / "attempt-1.json"
+    _write_output(
+        output,
+        finished_at="2026-08-05T01:00:00+00:00",
+        run_id="run-length-capped",
+        task_id="task-length-capped",
+        breakdown=[_breakdown_row("model-a", "proposer", 1)],
+        trace={
+            "physical_request_count": 1,
+            "candidates": [
+                _candidate(
+                    "model-a",
+                    "length-capped",
+                    ok=True,
+                    outcome="succeeded",
+                    usage_reported=True,
+                    stop_reason="length",
+                )
+            ],
+        },
+    )
+
+    collection = updater.collect_observations([tmp_path], allow_incomplete=True)
+
+    assert len(collection.observations) == 1
+    assert collection.observations[0].model_id == "model-a"
+    assert collection.observations[0].role == "proposer"
+    assert collection.observations[0].success is False
 
 
 @pytest.mark.parametrize(

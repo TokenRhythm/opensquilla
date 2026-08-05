@@ -1152,6 +1152,15 @@ class _CandidateResult:
     @property
     def completion_outcome(self) -> str:
         if self.ok:
+            if (
+                str(self.stop_reason or "").strip().casefold()
+                in REASONING_ONLY_LENGTH_STOP_REASONS
+            ):
+                # A closed request can still end with a useful draft after
+                # exhausting its output budget.  Preserve that draft for the
+                # aggregator, but do not report the physical model call as a
+                # complete reliability success.
+                return "partial_usable"
             return "complete"
         if self.usable_for_aggregation:
             return "partial_usable"

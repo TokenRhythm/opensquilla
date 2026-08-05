@@ -393,6 +393,27 @@ def test_substantive_failed_proposer_partial_remains_usable(text: str) -> None:
     assert candidate.completion_outcome == "partial_usable"
 
 
+def test_length_capped_completed_proposer_is_partial_usable() -> None:
+    candidate = _CandidateResult(
+        index=0,
+        sample_index=0,
+        label="length-capped",
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        requested_provider="openrouter",
+        requested_model="z-ai/glm-5.2",
+        text="A useful but output-budget-truncated draft.",
+        stop_reason="length",
+        request_started=True,
+        stream_closed=True,
+        physical_request_count=1,
+    )
+
+    assert candidate.ok is True
+    assert candidate.usable_for_aggregation is True
+    assert candidate.completion_outcome == "partial_usable"
+
+
 def test_managed_completion_keeps_physical_id_in_usage_evidence() -> None:
     physical_attempt_id = "a" * 32
     event = _done_event_with_physical_attempt_id(

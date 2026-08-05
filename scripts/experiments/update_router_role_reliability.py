@@ -22,9 +22,10 @@ from pathlib import Path
 from typing import Any
 
 SNAPSHOT_SCHEMA_VERSION = "role-reliability-snapshot-v1"
-OBSERVATION_POLICY = "aef-physical-model-calls-v3"
+OBSERVATION_POLICY = "aef-physical-model-calls-v4"
 DEFAULT_WINDOW_SIZE = 50
 ROLES = ("proposer", "aggregator")
+LENGTH_CAPPED_STOP_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
 
 
 @dataclass(frozen=True)
@@ -562,9 +563,13 @@ def _explicit_candidate_attempts(
             if isinstance(raw_attempts, list)
             else []
         )
-        candidate_failed = candidate.get("ok") is not True or _clean_string(
-            candidate.get("completion_outcome")
-        ).lower() in {"failed", "partial", "partial_usable"}
+        candidate_failed = (
+            candidate.get("ok") is not True
+            or _clean_string(candidate.get("completion_outcome")).lower()
+            in {"failed", "partial", "partial_usable"}
+            or _clean_string(candidate.get("stop_reason")).lower()
+            in LENGTH_CAPPED_STOP_REASONS
+        )
         candidate_identity = _record_identity(candidate)
         if attempts:
             for attempt_index, attempt in enumerate(attempts):
