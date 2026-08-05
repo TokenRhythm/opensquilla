@@ -71,3 +71,21 @@ describe('useChatTextRendering protocol-shaped literals', () => {
     })
   }
 })
+
+describe('useChatTextRendering goal status markers', () => {
+  it('hides the trailing goal marker from rendered and copied assistant text', () => {
+    const { renderMarkdown, sanitizeCopyText, stripGeneratedArtifactMarkers } = useChatTextRendering()
+    const text = 'The work is complete.\n[goal:complete]\n'
+
+    expect(renderMarkdown(text)).not.toContain('[goal:complete]')
+    expect(sanitizeCopyText(text)).toBe('The work is complete.')
+    expect(stripGeneratedArtifactMarkers(text)).toBe('The work is complete.')
+  })
+
+  it('does not remove a goal-looking line from the middle of a transcript', () => {
+    const { stripGeneratedArtifactMarkers } = useChatTextRendering()
+    const text = 'Example:\n[goal:complete]\nThen continue.'
+
+    expect(stripGeneratedArtifactMarkers(text)).toBe(text)
+  })
+})

@@ -42,7 +42,9 @@ describe('useChatGoals', () => {
 
   it('starts a goal, observes it, and surfaces the active snapshot', async () => {
     const { api, rpc } = harness()
+    const callOrder: string[] = []
     rpc.call.mockImplementation(async (method: string) => {
+      callOrder.push(method)
       if (method === 'goals.status') return { goal: goalPayload() }
       return {}
     })
@@ -58,6 +60,7 @@ describe('useChatGoals', () => {
       sessionKey: 'agent:main:webchat:test',
       watch: true,
     })
+    expect(callOrder.indexOf('goals.observe')).toBeLessThan(callOrder.indexOf('goals.set'))
     expect(api.activeGoal.value?.status).toBe('running')
     expect(api.activeGoal.value?.goalText).toBe('Refactor the module')
   })
@@ -82,7 +85,7 @@ describe('useChatGoals', () => {
       if (method === 'goals.status') return { goal: goalPayload('running', { turns: 3 }) }
       return {}
     })
-    handlers.get('session.event.plan_run')?.({
+    handlers.get('session.event.goal_run')?.({
       sessionKey: 'agent:main:webchat:test',
       plan_run: { driverKind: 'goal', driverId: 'g1', status: 'paused' },
     })

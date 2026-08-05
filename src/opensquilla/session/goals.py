@@ -15,7 +15,9 @@ GOAL_RUN_ACTIVE_STATUSES = frozenset({"running", "paused"})
 GOAL_RUN_TERMINAL_STATUSES = frozenset({"complete", "blocked", "cancelled"})
 GOAL_RUN_STATUSES = GOAL_RUN_ACTIVE_STATUSES | GOAL_RUN_TERMINAL_STATUSES
 
-_GOAL_STATUS_MARKER_PATTERN = re.compile(r"\[goal:(continue|complete|blocked)(?::([^\]]+))?\]")
+_GOAL_STATUS_MARKER_PATTERN = re.compile(
+    r"^\s*\[goal:(continue|complete|blocked)(?::([^\]]+))?\]\s*$"
+)
 
 IDLE_PROGRESS_PROMPT = (
     "You have not made progress; either take a concrete action or mark "
@@ -223,7 +225,7 @@ def parse_goal_status_marker(text: str) -> tuple[str, str | None] | None:
     lines = text.rstrip("\n").split("\n")
     if not lines:
         return None
-    match = _GOAL_STATUS_MARKER_PATTERN.search(lines[-1])
+    match = _GOAL_STATUS_MARKER_PATTERN.fullmatch(lines[-1])
     if match is None:
         return None
     kind = match.group(1)

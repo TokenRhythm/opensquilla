@@ -41,6 +41,7 @@ from opensquilla.session.plans import (
     PlanRunConflictError,
     PlanValidationError,
     new_goal_plan_revision,
+    plan_run_event_name,
     plan_run_snapshot,
 )
 
@@ -308,7 +309,7 @@ async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
         await _emit_to_subscribers(
             ctx,
             accepted_key,
-            "session.event.plan_run",
+            plan_run_event_name(accepted_run),
             {"session_key": accepted_key, "plan_run": run_snapshot},
         )
         return {

@@ -5,6 +5,7 @@ import katex from 'katex'
 
 const DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g
 const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*/gi
+const GOAL_STATUS_MARKER_RE = /\[goal:(?:continue|complete|blocked(?::[^\]\r\n]*)?)\][ \t]*$/i
 const TIME_PREFIX_RE = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Za-z0-9_+\-/]+\]\n/
 
 const MARKDOWN_CACHE_MAX = 500
@@ -210,8 +211,28 @@ export function useChatTextRendering() {
     return text.replace(DIRECTIVE_TAG_RE, '').replace(/^\n+/, '')
   }
 
+  function stripGoalStatusMarker(text: string): string {
+    const normalized = String(text || '').replace(/\r\n/g, '\n')
+    const lines = normalized.split('\n')
+    let markerIndex = lines.length - 1
+    while (markerIndex > 0 && lines[markerIndex].trim() === '') markerIndex -= 1
+    if (markerIndex < 0) return normalized
+    const match = lines[markerIndex].match(GOAL_STATUS_MARKER_RE)
+    if (!match || match.index === undefined) return text
+
+    lines[markerIndex] = lines[markerIndex]
+      .slice(0, match.index)
+      .replace(/[ \t]+$/, '')
+    lines.splice(markerIndex + 1)
+    if (!lines[markerIndex].trim()) lines.splice(markerIndex, 1)
+    return lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()
+  }
+
   function stripGeneratedArtifactMarkers(text: string): string {
-    text = String(text || '')
+    // Goal markers are backend control data. Keep them in the canonical
+    // transcript so the Goal driver can resume/repair correctly, but never
+    // expose the marker token as assistant-visible Markdown or copied text.
+    text = stripGoalStatusMarker(String(text || ''))
     if (!text.includes('[generated artifact omitted:')) return text
     return text.replace(/\r\n/g, '\n').replace(GENERATED_ARTIFACT_MARKER_RE, '').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
   }
@@ -270,6 +291,7 @@ export function useChatTextRendering() {
     renderMarkdown,
     sanitizeCopyText,
     stripDirectiveTags,
+    stripGoalStatusMarker,
     stripGeneratedArtifactMarkers,
     stripTimePrefix,
   }

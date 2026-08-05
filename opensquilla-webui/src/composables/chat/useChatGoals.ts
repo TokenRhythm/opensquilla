@@ -181,16 +181,25 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     }
     if (!key) return false
     busy.value = true
+    let watcherRegistered = false
+    let goalAccepted = false
     try {
-      await options.rpc.call('goals.set', { sessionKey: key, message: goalText })
-      // Register this client as a watcher so the continuation driver keeps the
-      // loop alive for the Web surface while the tab is open.
+      // Register before accepting the first turn. A fast first response can
+      // otherwise finish before the watcher exists, leaving the goal paused at
+      // the continuation anchor with no event left to restart it.
       await options.rpc
         .call('goals.observe', { sessionKey: key, watch: true })
-        .catch(() => undefined)
+      watcherRegistered = true
+      await options.rpc.call('goals.set', { sessionKey: key, message: goalText })
+      goalAccepted = true
       await refresh()
       return true
     } catch (err) {
+      if (watcherRegistered && !goalAccepted) {
+        void options.rpc
+          .call('goals.unobserve', { sessionKey: key })
+          .catch(() => undefined)
+      }
       options.notify?.(err instanceof Error ? err.message : String(err))
       return false
     } finally {
@@ -221,9 +230,10 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     activeGoal.value = null
   }
 
-  // Realtime: the gateway emits session.event.plan_run on every goal turn
-  // settle; refresh the goal ledger when a goal-driven run moves.
-  function onPlanRunEvent(payload: unknown) {
+  // Realtime: Goal runs have their own event namespace. Keep the legacy
+  // plan_run subscription as a compatibility bridge for older gateways; new
+  // Goal events never enter the generic Plan composable.
+  function onGoalRunEvent(payload: unknown) {
     if (!payloadBelongsToSession(payload, options.sessionKey.value)) return
     const source = record(payload)
     const run = record(source?.plan_run ?? source?.planRun)
@@ -233,7 +243,8 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     void refresh()
   }
 
-  const unsubscribe = options.rpc.on('session.event.plan_run', onPlanRunEvent)
+  const unsubscribeGoal = options.rpc.on('session.event.goal_run', onGoalRunEvent)
+  const unsubscribeLegacy = options.rpc.on('session.event.plan_run', onGoalRunEvent)
 
   watch(options.sessionKey, () => {
     disarm()
@@ -274,7 +285,8 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   ))
 
   onBeforeUnmount(() => {
-    unsubscribe()
+    unsubscribeGoal()
+    unsubscribeLegacy()
     clearTerminalHideTimer()
     if (pollTimer !== null) clearInterval(pollTimer)
     if (tickTimer !== null) clearInterval(tickTimer)

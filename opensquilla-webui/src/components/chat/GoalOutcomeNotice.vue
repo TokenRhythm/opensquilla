@@ -36,9 +36,11 @@ const titleText = computed(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
-  max-width: 100%;
-  padding: 6px 2px;
+  width: var(--chat-col, min(calc(100% - 48px), 980px));
+  max-width: calc(100% - 48px);
+  box-sizing: border-box;
+  margin: var(--sp-2, 8px) auto;
+  padding: 6px 0;
   font-size: 0.8125rem;
   line-height: 1.4;
   color: var(--text-muted, var(--muted));

@@ -44,6 +44,9 @@ GOAL_CONTINUATION_MESSAGE = (
     "the next best action."
 )
 
+_GOAL_PROGRESS_MAX_ENTRIES = 12
+_GOAL_PROGRESS_ENTRY_MAX_CHARS = 1_000
+
 # Plan-run terminal reasons applied by the driver when a goal run finishes.
 _PLAN_RUN_TERMINAL_REASON_GOAL_COMPLETE = "goal_complete"
 _PLAN_RUN_TERMINAL_REASON_GOAL_BLOCKED = "goal_blocked"
@@ -75,6 +78,7 @@ _GOAL_RESUMABLE_PAUSE_REASONS = frozenset(
         "goal_turn_cancelled",
         "goal_turn_abandoned",
         "goal_run_reopened",
+        "process_restart",
     }
 )
 
@@ -246,6 +250,41 @@ def _extract_transcript_text(content: Any) -> str | None:
     except (ValueError, TypeError):
         pass
     return content
+
+
+def _append_goal_progress(
+    progress: Any,
+    *,
+    turn_number: int,
+    assistant_text: str | None,
+    marker: tuple[str, str | None] | None,
+) -> list[dict[str, Any]]:
+    """Append one bounded turn summary to the durable goal progress log.
+
+    The transcript remains the source of truth for the full response. The
+    goal ledger keeps only a compact rolling handoff so later turns still have
+    explicit progress context after history compaction or a restart.
+    """
+
+    entries = [entry for entry in list(progress or []) if isinstance(entry, dict)]
+    text = str(assistant_text or "").strip()
+    if text and marker is not None:
+        lines = text.rstrip("\n").split("\n")
+        if lines:
+            text = "\n".join(lines[:-1]).strip()
+    if len(text) > _GOAL_PROGRESS_ENTRY_MAX_CHARS:
+        half = (_GOAL_PROGRESS_ENTRY_MAX_CHARS - 32) // 2
+        text = f"{text[:half]}\n…\n{text[-half:]}"
+    if not text:
+        text = "No assistant summary was recorded for this turn."
+    entries.append(
+        {
+            "turn": int(turn_number),
+            "status": marker[0] if marker is not None else "unmarked",
+            "summary": text,
+        }
+    )
+    return entries[-_GOAL_PROGRESS_MAX_ENTRIES:]
 
 
 async def _last_assistant_text(
@@ -582,7 +621,19 @@ async def _maybe_continue_goal_impl(
     fields: dict[str, Any] = {
         "turns": int(getattr(goal, "turns", 0) or 0) + 1,
         "last_turn_at": now_ms,
+        # A successfully finished turn starts a fresh transient-failure
+        # budget. Otherwise an earlier provider/queue failure would keep
+        # consuming the retry allowance after recovery.
+        "failure_retries": 0,
+        "next_retry_at_ms": None,
+        "last_error": None,
     }
+    fields["progress"] = _append_goal_progress(
+        getattr(goal, "progress", None),
+        turn_number=int(fields["turns"]),
+        assistant_text=marker_text,
+        marker=marker,
+    )
     if marker is None:
         if advance.inject_prompt is not None:
             fields["idle_turns"] = 0  # nudge injected; counter resets
@@ -715,6 +766,12 @@ async def _handle_goal_turn_failure(
         "last_turn_at": now_ms,
         "failure_retries": retries + 1,
         "last_error": f"turn_{task_status}",
+        "progress": _append_goal_progress(
+            getattr(goal, "progress", None),
+            turn_number=int(getattr(goal, "turns", 0) or 0) + 1,
+            assistant_text=f"Turn ended with {task_status}.",
+            marker=None,
+        ),
     }
     if advance.retry_at_ms is not None:
         fields["status"] = "running"
@@ -1241,15 +1298,41 @@ async def _apply_reopened_goal_decision(
     fields: dict[str, Any] = {
         "turns": int(getattr(goal, "turns", 0) or 0) + 1,
         "last_turn_at": now_ms,
+        # A successfully finished turn starts a fresh transient-failure
+        # budget. Otherwise an earlier provider/queue failure would keep
+        # consuming the retry allowance after recovery.
+        "failure_retries": 0,
+        "next_retry_at_ms": None,
+        "last_error": None,
     }
+    fields["progress"] = _append_goal_progress(
+        getattr(goal, "progress", None),
+        turn_number=int(fields["turns"]),
+        assistant_text=marker_text,
+        marker=marker,
+    )
     if marker is None:
-        fields["idle_turns"] = int(getattr(goal, "idle_turns", 0) or 0) + 1
-    else:
+        if advance.inject_prompt is not None:
+            fields["idle_turns"] = 0
+        else:
+            fields["idle_turns"] = int(getattr(goal, "idle_turns", 0) or 0) + 1
+    elif marker[0] in {"continue", "complete"}:
         fields["idle_turns"] = 0
-    if marker is not None and marker[0] == "blocked":
-        fields["blocked_reason"] = marker[1] or ""
-        fields["blocked_retries"] = 1
-    if advance.terminal or marker is not None:
+    elif marker[0] == "blocked":
+        reason_text = marker[1] or ""
+        same_cause = (
+            getattr(goal, "blocked_reason", None) is not None
+            and str(getattr(goal, "blocked_reason", "") or "") == reason_text
+        )
+        retries_after = (
+            int(getattr(goal, "blocked_retries", 0) or 0) + 1
+            if same_cause
+            else 1
+        )
+        fields["blocked_reason"] = reason_text
+        fields["blocked_retries"] = retries_after
+        fields["idle_turns"] = 0
+    if advance.terminal:
         terminal_reason = advance.terminal_reason
         if terminal_reason is None:
             fields["status"] = "complete"
@@ -1280,9 +1363,18 @@ async def _apply_reopened_goal_decision(
             turns=fields["turns"],
         )
         return
-    # No marker and no terminal decision: keep the loop resumable. Continue
-    # immediately when watched (or unwatched continuation is enabled); park
-    # otherwise so a later goals.resume restarts cleanly.
+
+    try:
+        updated_goal = await storage.update_goal_run(
+            goal.goal_id,
+            expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
+            **fields,
+        )
+    except GoalConflictError:
+        return
+
+    # No terminal marker: preserve the same watcher gate and idle nudge policy
+    # as the normal post-turn path.
     if config.continue_unwatched or get_goal_watcher_registry().has_watchers(
         goal.session_key, ttl_ms=int(config.watcher_ttl_seconds) * 1000
     ):
@@ -1300,25 +1392,38 @@ async def _apply_reopened_goal_decision(
             plan_revision_id=str(getattr(plan_run, "plan_revision_id", "") or "") or None,
             source_name="goal_completed_run_repair",
         )
-        await enqueue_goal_continuation(
+        message = GOAL_CONTINUATION_MESSAGE
+        if advance.inject_prompt:
+            message = f"{message}\n\n{advance.inject_prompt}"
+        handle = await enqueue_goal_continuation(
             runtime,
             session_key=goal.session_key,
             run_id=plan_run.run_id,
             goal_id=goal.goal_id,
-            message=GOAL_CONTINUATION_MESSAGE,
+            message=message,
             envelope_seed=envelope_seed,
         )
+        if handle is None:
+            await _record_enqueue_backoff(
+                storage,
+                updated_goal,
+                config=config,
+                now_ms=now_ms,
+            )
         return
+
     try:
         await storage.update_goal_run(
             goal.goal_id,
-            expected_updated_at=int(getattr(goal, "updated_at", 0) or 0),
+            expected_updated_at=int(getattr(updated_goal, "updated_at", 0) or 0),
             status="paused",
             pause_reason=_GOAL_PAUSE_REASON_UNWATCHED,
-            last_turn_at=now_ms,
+            next_retry_at_ms=None,
         )
     except GoalConflictError:
         return
+
+    return
 
 
 def _now_ms() -> int:

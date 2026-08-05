@@ -199,6 +199,11 @@ def test_parse_goal_status_marker_ignores_non_last_lines() -> None:
     assert parse_goal_status_marker("[goal:continue]\nmore work follows") is None
 
 
+def test_parse_goal_status_marker_requires_an_entire_last_line() -> None:
+    assert parse_goal_status_marker("I mention [goal:complete] in prose") is None
+    assert parse_goal_status_marker("[goal:complete] and more text") is None
+
+
 def test_parse_goal_status_marker_missing() -> None:
     assert parse_goal_status_marker("Just a normal reply.") is None
     assert parse_goal_status_marker("") is None
