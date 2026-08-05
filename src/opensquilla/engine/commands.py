@@ -673,8 +673,8 @@ _COMMANDS: tuple[CommandDef, ...] = (
     ),
     CommandDef(
         name="/meta",
-        usage="/meta [skill-name]",
-        description="List meta-skills, or run one with /meta <skill-name>.",
+        usage="/meta [skill-name] [request]",
+        description="List meta-skills, or run one with /meta <skill-name> [request].",
         execution={
             _W: _local("meta.menu"),
             _T: _local("meta.menu"),
