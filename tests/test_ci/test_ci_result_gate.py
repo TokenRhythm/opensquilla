@@ -29,6 +29,7 @@ def _base_env() -> dict[str, str]:
         "RESULT_MACOS_RECOVERY": "skipped",
         "RESULT_DESKTOP_RECOVERY_E2E": "skipped",
         "RESULT_RELEASE": "skipped",
+        "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS": "skipped",
     }
     env.update({_flag_env(name): "false" for name in BOOLEAN_FLAGS})
     env[_flag_env("docs_only")] = "true"
@@ -111,6 +112,41 @@ def test_ci_result_gate_requires_verified_frontend_for_wheel_builds() -> None:
     errors = check_ci_results(env)
 
     assert any("Frontend build, tests, and artifact" in error for error in errors)
+
+
+def test_ci_result_gate_requires_real_toolchain_artifacts_when_classified() -> None:
+    env = _base_env()
+    env[_flag_env("docs_only")] = "false"
+    env[_flag_env("toolchain_artifact_changed")] = "true"
+
+    errors = check_ci_results(env)
+
+    assert any("Managed Toolchain Artifact E2E" in error and "skipped" in error for error in errors)
+
+
+def test_ci_result_gate_accepts_successful_real_toolchain_artifacts() -> None:
+    env = _base_env()
+    env[_flag_env("docs_only")] = "false"
+    env[_flag_env("toolchain_artifact_changed")] = "true"
+    env["RESULT_MANAGED_TOOLCHAIN_ARTIFACTS"] = "success"
+
+    assert check_ci_results(env) == []
+
+
+def test_ci_result_gate_rejects_failed_cancelled_or_missing_real_artifacts() -> None:
+    for result in ("failure", "cancelled", ""):
+        env = _base_env()
+        env[_flag_env("docs_only")] = "false"
+        env[_flag_env("toolchain_artifact_changed")] = "true"
+        env["RESULT_MANAGED_TOOLCHAIN_ARTIFACTS"] = result
+
+        errors = check_ci_results(env)
+
+        assert any("Managed Toolchain Artifact E2E" in error for error in errors)
+
+
+def test_ci_result_gate_allows_toolchain_artifacts_to_skip_when_unrelated() -> None:
+    assert check_ci_results(_base_env()) == []
 
 
 def test_ci_result_gate_rejects_failure_cancellation_and_missing_results() -> None:

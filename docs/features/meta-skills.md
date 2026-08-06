@@ -15,9 +15,8 @@ read [`../authoring/meta-skills.md`](../authoring/meta-skills.md).
 | Skill | One focused task pattern, instruction set, script, or tool helper. |
 | Meta-skill | A reusable workflow made of multiple steps, skills, checks, or outputs. |
 
-For example, "summarize this document" is skill-shaped. "Plan a safe child
-science project with materials, adult setup, child steps, presentation notes, and
-final safety review" is meta-skill-shaped.
+For example, "summarize this document" is skill-shaped. "Draft, validate,
+compile, and deliver a cited research paper" is meta-skill-shaped.
 
 ## Stable Built-In MetaSkills
 
@@ -25,7 +24,6 @@ The retained stable catalog is intentionally small:
 
 | MetaSkill | Positioning |
 | --- | --- |
-| `meta-kid-project-planner` | Produces safe, age-appropriate plans for school projects, show-and-tell, or science activities. |
 | `meta-paper-write` | Supports academic drafts, manuscript structure, citation planning, experiment placeholders, and LaTeX/PDF paths. |
 | `meta-short-drama` | Produces short-drama scripts, visual prompts, subtitles, and local video artifacts. |
 | `meta-skill-creator` | Turns repeated multi-skill collaboration patterns into new MetaSkill proposals. |
@@ -34,18 +32,65 @@ Experimental meta-skills may exist under development trees, but this page lists
 only bundled built-ins that should be presented as retained product
 capabilities.
 
-## Requirements
+`meta-kid-project-planner` is retired. Its bundled definition is retained only
+as a compatibility tombstone so persisted or in-flight runs remain inspectable
+and recoverable after upgrade. It is excluded from `/meta`, completion,
+automatic triggering, and all new invocations.
 
-Use the Skill page detail dialog before running a MetaSkill. Its
-**Requirements** section shows the MetaSkill's own requirements plus one-hop
-requirements from child skills.
+## Requirements and Setup Lifecycle
 
-- `meta-paper-write` needs `xelatex` and `bibtex` for PDF compilation.
-- `meta-short-drama` needs `ffmpeg` and `ffprobe` for local video rendering,
-  merge, and subtitle steps.
-- MetaSkills inherit readiness from their child skills; for example,
-  `meta-paper-write` surfaces LaTeX/PDF requirements and
-  `meta-short-drama` surfaces local video-tool requirements.
+Launch preflight recursively rolls up hard requirements from every referenced
+child skill. A blocked run is not stamped or hidden in history. On Web chat, a
+supported missing toolchain produces a confirmation card; after consent,
+OpenSquilla downloads from its fixed catalog, verifies the artifact, runs the
+workflow-specific capability smoke test, activates it under
+`state/toolchains/v1`, and resumes the original request. Install failure is
+recoverable through Retry and never silently degrades the requested output.
+
+- `meta-paper-write` probes `xelatex`, `bibtex`, bibliography output, hyperlinks,
+  tables/math, and CJK rendering. Managed TinyTeX 2026.05 archives cover macOS,
+  supported Linux architectures, and Windows x64 together with a pinned Noto
+  CJK font. OpenSquilla uses the ordinary Windows ZIP and never executes the
+  upstream self-extracting installer. Fixed downloads are about 226 MB on macOS,
+  165–172 MB on Linux, and 265 MB on Windows; installed size is larger. The
+  install is self-contained and does not update `tlmgr`.
+- `meta-short-drama` probes `ffmpeg`, `ffprobe`, required filters/codecs, and a
+  CJK font. Linux glibc arm64/x64 and Windows x64 use pinned archives. macOS
+  12 or later uses pinned FFmpeg 8.1.2 and FFprobe 8.1.2 ZIPs selected for Apple
+  Silicon or Intel, totaling about 76 MB or 87 MB respectively with their
+  supporting assets. The build source is pinned to commit
+  `bb1d6db29cee948f9685bcd69e6caf17d960662b`. OpenSquilla verifies every
+  original archive by fixed byte size and SHA-256 before extraction, then
+  removes the binaries' invalid embedded signatures, applies local ad-hoc
+  signatures, and requires strict `codesign` verification. This does not provide
+  a Developer ID signature or Apple notarization. The Noto CJK font and its
+  license are also checksum-verified before installation.
+- Real image/audio/video generation for `meta-short-drama` and
+  `AwesomeWebpageMetaSkill` currently resolves the OpenRouter capability from
+  the existing provider configuration: an active OpenRouter deployment, a saved
+  secondary `llm_profiles.openrouter` connection, the legacy image-provider
+  connection, or the canonical provider environment. If none is ready, Web chat
+  keeps the original request in the current tab and deep-links to the ordinary
+  provider settings editor. Adding OpenRouter while another provider is primary
+  saves a secondary profile; it does not switch the primary model or enable
+  cross-provider routing. Saving a connection does not generate media or incur a
+  generation charge. Each workflow has an explicit boundary before paid
+  provider submits. Short-drama revisions require another preview and approval;
+  AwesomeWebpage accepts only its exact provider-send-and-cost approval choice,
+  with no default or natural-language prefill, and treats edits/ambiguous notes
+  as not approved. Only secret-free readiness and provenance labels enter run/UI data;
+  execution receives one volatile provider/key/endpoint/proxy tuple scoped to
+  the exact bundled media child. The setup contract carries
+  provider and capability identifiers rather than an OpenRouter-specific UI
+  shape, so a future media adapter can add another provider without creating a
+  separate workflow-specific settings area. Capability requirements carry an
+  ordered list of code-owned provider candidates and a profile preference;
+  OpenRouter is the only currently implemented candidate.
+
+Pinned downloads disclose source, license, version, and verified bytes before
+installation. A normal uninstall keeps managed toolchains;
+`opensquilla uninstall --purge-state` removes OpenSquilla-managed toolchain
+state.
 
 ## Run MetaSkills
 
@@ -57,7 +102,7 @@ In Web chat and the CLI gateway TUI:
 
 ```text
 /meta
-/meta meta-kid-project-planner
+/meta meta-paper-write
 ```
 
 `/meta` lists available MetaSkills. `/meta <name>` starts the selected
@@ -80,17 +125,17 @@ the model during ordinary chat turns.
 Ask for the outcome and the standard:
 
 ```text
-Plan a safe 20-minute balcony plant science project for a 7-year-old. Include
-materials, adult setup, child steps, safety notes, and a presentation outline.
+Draft a compact research paper on retrieval-augmented customer support. Include
+a citation plan, experiment placeholders, and a compiled PDF.
 ```
 
 When you start a workflow, include the task after the command:
 
 ```text
-/meta meta-kid-project-planner
+/meta meta-paper-write
 
-Plan a safe 20-minute balcony plant science project for a 7-year-old. Include
-materials, adult setup, child steps, safety notes, and a presentation outline.
+Draft a compact research paper on retrieval-augmented customer support. Include
+a citation plan, experiment placeholders, and a compiled PDF.
 ```
 
 A strong request usually includes:

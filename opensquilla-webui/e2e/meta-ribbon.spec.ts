@@ -19,6 +19,7 @@ function evt(event: string, payload: Record<string, unknown>): Frame {
 }
 
 const RUN = 'run-e2e-1'
+const PERSISTED_RUN = 'run-persisted-paper-1'
 const announce = (steps: Array<{ id: string; label: string }>) =>
   evt('session.event.meta_run_announced', {
     run_id: RUN,
@@ -42,6 +43,65 @@ const preflight = () =>
     requires_confirmation: true,
   })
 
+function persistedPaperRecovery() {
+  const skippedIds = new Set(['paper_clarify', 'final_manuscript_package'])
+  const stepIds = Array.from({ length: 36 }, (_, index) => {
+    if (index === 1) return 'paper_clarify'
+    if (index === 26) return 'final_manuscript_package'
+    if (index === 30) return 'publication_quality_gate'
+    return `paper_step_${index + 1}`
+  })
+  const steps = stepIds.map((id, index) => ({
+    id,
+    label: id.replaceAll('_', ' '),
+    kind: index === 30 ? 'skill_exec' : 'agent',
+    depends_on: index === 0 ? [] : [stepIds[index - 1]],
+  }))
+  return {
+    recovery: {
+      run_id: PERSISTED_RUN,
+      announced: {
+        run_id: PERSISTED_RUN,
+        meta_skill_name: 'meta-paper-write',
+        language: 'en',
+        steps,
+        total: steps.length,
+      },
+      step_states: steps.map((item, index) => ({
+        run_id: PERSISTED_RUN,
+        step_id: item.id,
+        state: skippedIds.has(item.id)
+          ? 'skipped'
+          : index < 30
+            ? 'succeeded'
+            : index === 30
+              ? 'failed'
+              : 'pending',
+        error: index === 30
+          ? 'This step failed in a previous run. Review its tool result before retrying.'
+          : undefined,
+        rescue: index === 30 ? {
+          actions: [
+            { id: 'retry-step', label: 'Retry failed step' },
+            { id: 'retry-with-partial-context', label: 'Retry with partial context' },
+          ],
+        } : {},
+      })),
+      completed: {
+        run_id: PERSISTED_RUN,
+        outcome: 'failed',
+        completed_steps: steps
+          .slice(0, 30)
+          .filter((item) => !skippedIds.has(item.id))
+          .map((item) => item.id),
+        failed_steps: ['publication_quality_gate'],
+        recovered_steps: [],
+        skipped_steps: [...skippedIds],
+      },
+    },
+  }
+}
+
 async function setup(page: Page): Promise<(frames: Frame[]) => Promise<void>> {
   let send: ((s: string) => void) | null = null
   await page.routeWebSocket('**/ws', (ws) => {
@@ -54,7 +114,7 @@ async function setup(page: Page): Promise<(frames: Frame[]) => Promise<void>> {
   // Wait until the proxied socket is connected and the chat view has mounted
   // its composer + registered useMetaRuns.subscribe() (settle avoids a race
   // where frames inject before the rpc.on listeners attach).
-  await expect(page.locator('.conn-pill')).toContainText('connected', { timeout: 15000 })
+  await expect(page.locator('.conn-pill')).toContainText(/connected/i, { timeout: 15000 })
   await page.waitForSelector('.chat-textarea', { timeout: 15000 })
   await expect.poll(() => (send ? 'ready' : 'pending'), { timeout: 15000 }).toBe('ready')
   await page.waitForTimeout(600)
@@ -158,7 +218,7 @@ test.describe('Meta-skill ribbon (Vue port)', () => {
       send = (s) => ws.send(s)
     })
     await page.goto(CONTROL_URL + 'chat/new')
-    await expect(page.locator('.conn-pill')).toContainText('connected', { timeout: 15000 })
+    await expect(page.locator('.conn-pill')).toContainText(/connected/i, { timeout: 15000 })
     await page.waitForSelector('.chat-textarea', { timeout: 15000 })
     await expect.poll(() => (send ? 'ready' : 'pending'), { timeout: 15000 }).toBe('ready')
     await page.waitForTimeout(600)
@@ -223,23 +283,119 @@ test.describe('Meta-skill ribbon (Vue port)', () => {
     await expect(ribbon.locator('li.chip.pending')).toHaveCount(2)
   })
 
-  test('rescue actions fire their handlers: replay RPCs (failed-step / partial-context) + guidance toast', async ({ page }) => {
+  test('reload restores a persisted 30-of-36 paper run with two skipped steps', async ({ page }) => {
+    let recoveryRequests = 0
+    await page.routeWebSocket('**/ws', (ws) => {
+      const server = ws.connectToServer()
+      ws.onMessage((message) => {
+        let frame: Record<string, unknown> | null = null
+        try { frame = JSON.parse(String(message)) } catch { /* non-JSON ping */ }
+        if (frame?.method === 'meta.runs.recovery') {
+          recoveryRequests += 1
+          ws.send(JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: true,
+            payload: persistedPaperRecovery(),
+          }))
+          return
+        }
+        server.send(message)
+      })
+      server.onMessage((message) => ws.send(message))
+    })
+
+    const assertRecovered = async () => {
+      const ribbon = page.locator(`.meta-ribbon[data-run-id="${PERSISTED_RUN}"]`)
+      await expect(ribbon).toBeVisible({ timeout: 15000 })
+      await expect(ribbon.locator('li.chip')).toHaveCount(36)
+      await expect(ribbon.locator('li.chip.succeeded')).toHaveCount(28)
+      await expect(ribbon.locator('li.chip.skipped')).toHaveCount(2)
+      await expect(ribbon.locator('li.chip.failed')).toHaveCount(1)
+      await expect(ribbon.locator('li.chip.pending')).toHaveCount(5)
+      await expect(ribbon.locator('.meta-ribbon-counter')).toHaveText('Step 30 of 36')
+      await expect(
+        ribbon.locator('button[data-action="retry-step"]'),
+      ).toHaveText('Retry failed step')
+    }
+
+    await page.goto(CONTROL_URL + 'chat/new')
+    await expect(page.locator('.conn-pill')).toContainText(/connected/i, { timeout: 15000 })
+    await assertRecovered()
+    const beforeReload = recoveryRequests
+
+    // Do not inject any session.event.meta_* frames after reload. The card
+    // must come exclusively from the durable recovery projection.
+    await page.reload()
+    await expect(page.locator('.conn-pill')).toContainText(/connected/i, { timeout: 15000 })
+    await assertRecovered()
+    expect(recoveryRequests).toBeGreaterThan(beforeReload)
+  })
+
+  test('rescue actions replay failed-step, suppress duplicate partial-context, and show guidance', async ({ page }) => {
     // Capture client → server frames through the proxy so we can assert the
     // rescue buttons actually CALL meta.runs.replay (not just render). Guards
     // the gap where the failed-run test only checked the buttons were visible.
     const outgoing: Array<Record<string, unknown>> = []
+    const replayLaunchText = '/meta-replay 0123456789abcdef0123456789abcdef'
     let send: ((s: string) => void) | null = null
     await page.routeWebSocket('**/ws', (ws) => {
       const server = ws.connectToServer()
       ws.onMessage((m) => {
-        try { outgoing.push(JSON.parse(String(m))) } catch { /* non-JSON ping */ }
+        let frame: Record<string, unknown> | null = null
+        try {
+          frame = JSON.parse(String(m))
+          outgoing.push(frame!)
+        } catch { /* non-JSON ping */ }
+        if (frame?.method === 'meta.runs.replay') {
+          const params = (frame.params || {}) as Record<string, unknown>
+          const mode = String(params.mode || 'failed-step')
+          if (!params.replayToken) {
+            ws.send(JSON.stringify({
+              type: 'res', id: frame.id, ok: true,
+              payload: {
+                replay: {
+                  message: '/meta meta-web-research-to-report -- original request',
+                  live_replay: { available: true, replay_token: `ticket-${mode}` },
+                },
+              },
+            }))
+          } else {
+            ws.send(JSON.stringify({
+              type: 'res', id: frame.id, ok: true,
+              payload: {
+                replay: {
+                  launch_text: replayLaunchText,
+                  display_text: mode === 'failed-step'
+                    ? 'Retry failed step · meta-web-research-to-report'
+                    : 'Retry with partial context · meta-web-research-to-report',
+                  live_replay: { available: true, committed: true },
+                },
+              },
+            }))
+          }
+          return
+        }
+        if (frame?.method === 'chat.send') {
+          const params = (frame.params || {}) as Record<string, unknown>
+          if (params.message === replayLaunchText) {
+            ws.send(JSON.stringify({
+              type: 'res', id: frame.id, ok: true,
+              payload: {
+                sessionKey: params.sessionKey,
+                task_status: 'succeeded',
+              },
+            }))
+            return
+          }
+        }
         server.send(m)
       })
       server.onMessage((m) => ws.send(m))
       send = (s) => ws.send(s)
     })
     await page.goto(CONTROL_URL + 'chat/new')
-    await expect(page.locator('.conn-pill')).toContainText('connected', { timeout: 15000 })
+    await expect(page.locator('.conn-pill')).toContainText(/connected/i, { timeout: 15000 })
     await page.waitForSelector('.chat-textarea', { timeout: 15000 })
     await expect.poll(() => (send ? 'ready' : 'pending'), { timeout: 15000 }).toBe('ready')
     await page.waitForTimeout(600)
@@ -281,9 +437,14 @@ test.describe('Meta-skill ribbon (Vue port)', () => {
     const actions = ribbon.locator('.meta-ribbon-actions')
     await expect(actions).toBeVisible()
     await expect(ribbon.locator('.meta-ribbon-fail-summary')).toContainText('Timed out')
-    // The 3 server-provided rescue actions + the always-appended show-detail.
-    await expect(actions.locator('button')).toHaveCount(4)
+    // partial-context currently has the same runtime seed semantics as
+    // retry-step, so the UI suppresses that duplicate choice while retaining
+    // backend compatibility for older clients.
+    await expect(actions.locator('button')).toHaveCount(3)
     await expect(actions.locator('button[data-action="retry-step"]')).toHaveText('Retry failed step')
+    await expect(
+      actions.locator('button[data-action="retry-with-partial-context"]'),
+    ).toHaveCount(0)
 
     // retry-step → meta.runs.replay with mode 'failed-step'.
     await actions.locator('button[data-action="retry-step"]').click()
@@ -296,18 +457,23 @@ test.describe('Meta-skill ribbon (Vue port)', () => {
         { timeout: 8000 },
       )
       .toBe(true)
-
-    // retry-with-partial-context → meta.runs.replay with mode 'partial-context'.
-    await actions.locator('button[data-action="retry-with-partial-context"]').click()
     await expect
       .poll(
         () => outgoing.some(
-          (f) => f?.method === 'meta.runs.replay' &&
-            (f.params as Record<string, unknown>)?.mode === 'partial-context',
+          (f) => f?.method === 'chat.send' &&
+            (f.params as Record<string, unknown>)?.message === replayLaunchText,
         ),
         { timeout: 8000 },
       )
       .toBe(true)
+    const firstReplaySend = outgoing.find(
+      (f) => f?.method === 'chat.send' &&
+        (f.params as Record<string, unknown>)?.message === replayLaunchText,
+    )!
+    expect((firstReplaySend.params as Record<string, unknown>).displayText).toContain(
+      'Retry failed step',
+    )
+    expect(JSON.stringify(firstReplaySend.params)).not.toContain('ticket-failed-step')
 
     // install-dependency → guidance toast, never a replay RPC.
     await actions.locator('button[data-action="install-dependency"]').click()

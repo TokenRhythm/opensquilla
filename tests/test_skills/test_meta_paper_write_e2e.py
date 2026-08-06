@@ -1,8 +1,10 @@
-"""End-to-end test for meta-paper-write.
+"""Offline orchestrator wiring tests for meta-paper-write.
 
 Runs the default FULL_MANUSCRIPT DAG against a tmp workspace with external,
-search, compile, and publish steps shimmed to canned outputs. The default path
-produces a PDF delivery note after the manuscript quality gates pass.
+search, compile, and publish steps shimmed to deterministic fixtures. This
+module verifies orchestration and delivery parsing only. The real default
+four-page XeLaTeX artifact contract lives in test_meta_paper_skills.py and does
+not use this compile shim.
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pypdf import PdfReader
+from reportlab.pdfgen import canvas
 
 from opensquilla.engine.types import AgentEvent, DoneEvent, TextDeltaEvent
 from opensquilla.skills.loader import SkillLoader
@@ -29,7 +33,9 @@ BUNDLED = REPO / "src" / "opensquilla" / "skills" / "bundled"
 
 
 @pytest.mark.asyncio
-async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
+async def test_meta_paper_write_orchestrator_contract_wires_compile_fixture(
+    tmp_path: Path,
+) -> None:
     snapshot = tmp_path / "snap.json"
     loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=snapshot)
     loader.invalidate_cache()
@@ -42,8 +48,8 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
     # steps that design the experiments and render LaTeX placeholder
     # figures/tables/analysis. Plus a citation_map audit step.
     # paper_collect extracts a same-turn contract instead of pausing on a
-    # form. search_query_translation then turns non-English topics into an
-    # arXiv-friendly query before hitting Brave/DDG/Tavily.
+    # form. search_query_translation then turns non-English topics into a
+    # clean academic query before hitting Crossref/Brave/Tavily.
     assert plan is not None
     assert plan.final_text_mode == "step:deliver_paper"
     steps = {step.id: step for step in plan.steps}
@@ -67,9 +73,14 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
     assert "experiment" not in steps
     assert "plot" not in steps
     # New experiment design + placeholder pipeline.
+    assert steps["source_readiness_gate"].kind == "skill_exec"
+    assert steps["source_readiness_gate"].skill == "paper-source-readiness-gate"
+    assert set(steps["source_readiness_gate"].depends_on) == {
+        "paper_contract", "paper_preferences", "source_pack", "refbib",
+    }
     assert steps["experiment_design"].kind == "llm_chat"
     assert steps["experiment_design"].depends_on == (
-        "paper_preferences", "source_pack",
+        "paper_preferences", "source_pack", "source_readiness_gate",
     )
     assert steps["figure_placeholders"].kind == "llm_chat"
     assert steps["figure_placeholders"].depends_on == ("experiment_design",)
@@ -81,9 +92,10 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
     }
     # Citation provenance audit is artifact-backed so full manuscript text
     # does not re-enter LLM context.
-    assert steps["citation_map"].kind == "tool_call"
-    assert set(steps["citation_map"].depends_on) >= {
-        "consistency_pass", "assemble_manuscript_tex", "refbib",
+    assert steps["citation_map"].kind == "skill_exec"
+    assert steps["citation_map"].skill == "paper-artifact-runtime"
+    assert set(steps["citation_map"].depends_on) == {
+        "length_repair_sanitizer", "refbib",
     }
     assert steps["search_papers"].kind == "skill_exec"
     assert steps["refbib"].kind == "skill_exec"
@@ -107,7 +119,8 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
         "outline", "citation_plan", "refbib",
         "figure_placeholders", "table_placeholders", "analysis_outline",
     }
-    assert steps["persist_sections"].kind == "tool_call"
+    assert steps["persist_sections"].kind == "skill_exec"
+    assert steps["persist_sections"].skill == "paper-artifact-runtime"
     assert steps["persist_sections"].depends_on == (
         "section_abstract", "section_introduction", "section_related_work",
         "section_method", "section_experiments", "section_discussion",
@@ -116,26 +129,48 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
     assert steps["assemble_manuscript_tex"].depends_on == (
         "writing_plan", "persist_sections", "refbib",
     )
-    # citation_integrity_gate now reads citation_map too.
-    assert set(steps["citation_integrity_gate"].depends_on) >= {
-        "final_manuscript_package", "citation_plan", "refbib", "citation_map",
+    assert steps["assemble_manuscript_tex"].kind == "skill_exec"
+    assert steps["assemble_manuscript_tex"].skill == "paper-artifact-runtime"
+    assert steps["paper_length_gate"].kind == "skill_exec"
+    assert steps["paper_length_gate"].skill == "paper-length-gate"
+    assert set(steps["paper_length_gate"].depends_on) == {
+        "paper_contract", "length_repair_sanitizer",
     }
-    assert steps["latex_sanitizer"].depends_on == (
+    assert steps["citation_integrity_gate"].kind == "skill_exec"
+    assert steps["citation_integrity_gate"].skill == "paper-citation-integrity-gate"
+    assert set(steps["citation_integrity_gate"].depends_on) == {
+        "paper_contract", "paper_preferences", "citation_map", "paper_length_gate",
+    }
+    assert steps["publication_quality_gate"].kind == "skill_exec"
+    assert steps["publication_quality_gate"].skill == "paper-quality-gate"
+    assert set(steps["publication_quality_gate"].depends_on) >= {
+        "paper_contract", "length_repair_sanitizer", "paper_length_gate",
         "citation_integrity_gate",
-    )
-    assert steps["compile_latex"].depends_on == ("latex_sanitizer",)
-    assert steps["compile_latex"].kind == "llm_chat"
+    }
+    assert steps["latex_sanitizer"].kind == "skill_exec"
+    assert steps["latex_sanitizer"].skill == "paper-latex-sanitizer"
+    assert set(steps["latex_sanitizer"].depends_on) == {
+        "paper_contract", "final_manuscript_package", "consistency_pass",
+        "assemble_manuscript_tex",
+    }
+    assert "compile_latex" not in steps
     assert steps["writing_plan"].when == (
         "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
     )
     assert steps["compile_pdf"].when == (
         "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or "
-        "'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or "
-        "'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
+        "'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
     )
+    assert steps["compile_pdf"].kind == "skill_exec"
+    assert steps["compile_pdf"].skill == "paper-artifact-runtime"
+    assert steps["paper_length_preflight"].kind == "skill_exec"
+    assert steps["precompile_length_expansion"].kind == "llm_chat"
+    assert steps["compile_probe"].kind == "skill_exec"
+    assert steps["page_shortfall_expansion"].kind == "llm_chat"
+    assert steps["final_page_length_gate"].kind == "skill_exec"
 
     # Shim: replace multi-search-engine's entrypoint with a stub that
-    # echoes a canned JSON. This keeps the test offline (no DuckDuckGo).
+    # echoes a canned JSON. This keeps the test fully offline.
     # Use real arxiv URLs so the upgraded refbib stub emits eprint /
     # archivePrefix fields and the downstream citation_map sees a
     # STRONG source quality classification.
@@ -213,7 +248,7 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
             "VENUE_STYLE: generic research paper\n"
             "LANGUAGE: English\n"
             "TARGET_LENGTH: 10 compiled pages\n"
-            "CITATION_TARGET: derived from target length and source availability\n"
+            "CITATION_TARGET: 20\n"
             "LENGTH_STRATEGY: allocate roughly ten compiled pages across the core sections\n"
             "CITATION_STRATEGY: use available verified sources across major claims\n"
             "DEPTH: deep\n"
@@ -313,8 +348,15 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
             "invalid=0, unused=0"
         ),
         "source_pack": (
-            "SOURCE_PACK:\n"
-            "PRIMARY_SOURCES:\n"
+            "SOURCE_STATUS: sufficient\n"
+            "CITATION_TARGET: 20\n"
+            "USABLE_REFERENCE_COUNT: 20\n"
+            "USABLE_KEYS:\n"
+            + "\n".join(f"- ref{i}" for i in range(1, 21))
+            + "\nEXCLUDED_KEYS:\n"
+            + "\n".join(f"- ref{i} | supporting only" for i in range(21, 26))
+            + "\nSOURCE_PACK:\n"
+            "PRIMARY_REFERENCES:\n"
             + "\n".join(
                 f"- ref{i} | Reference {i} | reliable source for claim {i}"
                 for i in range(1, 21)
@@ -362,10 +404,20 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
         [
             canned_fragments["abstract"],
             canned_fragments["introduction"],
+            "\\section{Related Work}\nRelated work fixture \\cite{ref2}.",
             canned_fragments["method"],
             canned_fragments["results"],
             canned_fragments["discussion"],
+            "\\section{Conclusion}\nConclusion fixture \\cite{ref20}.",
         ],
+    )
+    artifact_manuscript = (
+        "\\documentclass{article}\n"
+        "\\begin{document}\n"
+        f"{manuscript_body}\n"
+        "\\bibliographystyle{plain}\n"
+        "\\bibliography{references}\n"
+        "\\end{document}\n"
     )
     canned_fragments["final_manuscript_package"] = (
         "MANUSCRIPT_TEX:\n"
@@ -388,6 +440,7 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
                 "TARGET_PAGES: 10\n"
                 "AUDIENCE: academic\n"
                 "CITATION_TARGET: AUTO\n"
+                "EVIDENCE_STATUS: not_supplied\n"
                 "SEARCH_QUERY: RAG low-resource benchmark\n"
                 "NEEDS_CLARIFICATION: no\n"
                 "MISSING_FIELDS:\n  - none\n"
@@ -402,6 +455,7 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
                 "TARGET_PAGES: 10\n"
                 "AUDIENCE: academic\n"
                 "CITATION_TARGET: AUTO\n"
+                "EVIDENCE_STATUS: not_supplied\n"
                 "PDF_REQUIRED: yes\n"
                 "ASSUMPTIONS:\n  - offline fixture"
             )
@@ -433,6 +487,7 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
         if "writing blueprint" in system_prompt:
             return (
                 "TITLE: RAG in Low-Resource Settings\n"
+                "EVIDENCE_STATUS: not_supplied\n"
                 "TERMINOLOGY_LOCK: RAG, low-resource QA\n"
                 "NOTATION_LOCK: use \\(q\\) for query\n"
                 "PER_SECTION_BLUEPRINT:\n"
@@ -461,17 +516,25 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
                 return "\\section{Conclusion}\nConclusion fixture."
             return "\\section{Section}\nFixture section."
         if "E2E assembled manuscript fixture" in system_prompt:
+            paper_dir = workdir / "paper"
+            paper_dir.mkdir(parents=True, exist_ok=True)
+            tex_path = paper_dir / "paper.tex"
+            bib_path = paper_dir / "references.bib"
+            tex_path.write_text(artifact_manuscript, encoding="utf-8")
+            bib_path.write_text(refbib_text, encoding="utf-8")
             return (
-                "MANUSCRIPT_PATH: /tmp/e2e-paper.tex\n"
-                "REFERENCES_PATH: /tmp/e2e-references.bib\n"
-                "MANUSCRIPT_CHARS: 12000\n"
+                f"MANUSCRIPT_PATH: {tex_path.resolve()}\n"
+                f"REFERENCES_PATH: {bib_path.resolve()}\n"
+                f"MANUSCRIPT_CHARS: {len(artifact_manuscript)}\n"
                 "COMPILE_NOTES:\n"
                 "- full manuscript persisted on disk"
             )
         if "consistency auditor" in system_prompt:
+            tex_path = workdir / "paper" / "paper.tex"
+            bib_path = workdir / "paper" / "references.bib"
             return (
-                "MANUSCRIPT_PATH: /tmp/e2e-paper.tex\n"
-                "REFERENCES_PATH: /tmp/e2e-references.bib\n"
+                f"MANUSCRIPT_PATH: {tex_path.resolve()}\n"
+                f"REFERENCES_PATH: {bib_path.resolve()}\n"
                 "COMPILE_NOTES:\n"
                 "- consistency_findings: none\n"
                 "CONTEXT_POLICY: artifact-only; full manuscript omitted from prompt/output"
@@ -481,7 +544,10 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
         if "audit citation provenance" in system_prompt:
             return canned_fragments["citation_map"]
         if "manuscript length requirements" in system_prompt:
-            return "PASS: estimated target-length compiled pages"
+            return (
+                "LENGTH_GATE: pass\nESTIMATED_WORDS: 9000\n"
+                "BLOCKERS:\n  - none\nWARNINGS:\n  - none"
+            )
         if "citation integrity" in system_prompt:
             return (
                 "INTEGRITY: pass\nINVALID_COUNT: 0\nWEAK_PRIMARY_COUNT: 0\n"
@@ -489,6 +555,18 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
             )
         if "sanitize LaTeX" in system_prompt:
             return "PASS: no markdown fences, process text, or debug logs detected"
+        if "E2E deterministic LaTeX sanitizer fixture" in system_prompt:
+            tex_path = workdir / "paper" / "paper.tex"
+            bib_path = workdir / "paper" / "references.bib"
+            return (
+                "SANITIZER: pass\n"
+                f"MANUSCRIPT_PATH: {tex_path.resolve()}\n"
+                f"REFERENCES_PATH: {bib_path.resolve()}\n"
+                "SAFE_PUNCTUATION_REPAIRS: 0\n"
+                "EVIDENCE_PLACEHOLDER_REPAIRS: 0"
+            )
+        if "E2E publication quality gate fixture" in system_prompt:
+            return "QUALITY_GATE: pass\nBLOCKERS:\n  - none"
         if "compile handoff" in system_prompt:
             return (
                 "COMPILE_READY: yes\n"
@@ -496,9 +574,24 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
                 "BLOCKERS:\n  - none"
             )
         if "E2E compile PDF fixture" in system_prompt:
-            return "PDF_PATH: /tmp/e2e-paper.pdf\nPDF_PAGES: 10\nPDF_BYTES: 12345"
+            pdf_path = workdir / "paper" / "e2e-paper.pdf"
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            document = canvas.Canvas(str(pdf_path))
+            for page_number in range(1, 11):
+                document.drawString(72, 720, f"E2E paper page {page_number}")
+                document.showPage()
+            document.save()
+            page_count = len(PdfReader(pdf_path).pages)
+            return (
+                f"PDF_PATH: {pdf_path.resolve()}\n"
+                f"PDF_PAGES: {page_count}\n"
+                "PDF_TARGET_PAGES: 10\n"
+                f"PDF_BYTES: {pdf_path.stat().st_size}"
+            )
         if "E2E publish PDF fixture" in system_prompt:
-            return "ARTIFACT_ID: paper.pdf\nPATH: /tmp/e2e-paper.pdf"
+            pdf_path = workdir / "paper" / "e2e-paper.pdf"
+            assert pdf_path.is_file()
+            return f"ARTIFACT_ID: paper.pdf\nPATH: {pdf_path.resolve()}"
         if "E2E persist sections fixture" in system_prompt:
             return (
                 "SECTION_ARTIFACTS:\n"
@@ -509,13 +602,6 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
             )
         if "E2E citation map fixture" in system_prompt:
             return canned_fragments["citation_map"]
-        if "delivery note for a compiled academic paper" in system_prompt:
-            return (
-                "Paper compiled\n\n"
-                "- PDF: /tmp/e2e-paper.pdf\n"
-                "- Pages: 10\n"
-                "- Citations: 20 / strong=20 / invalid=0"
-            )
         raise AssertionError(f"unexpected llm_chat prompt: {system_prompt}")
 
     # Each skill_exec step writes relative paths like ``paper/results.csv``;
@@ -551,6 +637,56 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
                 "citation_map_fixture",
                 "E2E citation map fixture",
                 "Return deterministic citation audit metadata.",
+            ),
+            "publication_quality_gate": (
+                "publication_quality_gate_fixture",
+                "E2E publication quality gate fixture",
+                "Return a deterministic passing publication gate.",
+            ),
+            "latex_sanitizer": (
+                "latex_sanitizer_fixture",
+                "E2E deterministic LaTeX sanitizer fixture",
+                "Return the deterministic sanitized manuscript manifest.",
+            ),
+            "materialize_manuscript": (
+                "latex_sanitizer_fixture",
+                "E2E deterministic LaTeX sanitizer fixture",
+                "Return the deterministic materialized manuscript manifest.",
+            ),
+            "paper_length_preflight": (
+                "paper_length_gate_fixture",
+                "E2E manuscript length requirements fixture",
+                "Return a deterministic passing length preflight.",
+            ),
+            "length_repair_sanitizer": (
+                "latex_sanitizer_fixture",
+                "E2E deterministic LaTeX sanitizer fixture",
+                "Return the deterministic sanitized manuscript manifest.",
+            ),
+            "paper_length_gate": (
+                "paper_length_gate_fixture",
+                "E2E manuscript length requirements fixture",
+                "Return a deterministic passing length gate.",
+            ),
+            "compile_probe": (
+                "compile_pdf_fixture",
+                "E2E compile PDF fixture",
+                "Return deterministic PDF compile metadata.",
+            ),
+            "final_latex_sanitizer": (
+                "latex_sanitizer_fixture",
+                "E2E deterministic LaTeX sanitizer fixture",
+                "Return the deterministic final sanitized manuscript manifest.",
+            ),
+            "final_page_length_gate": (
+                "paper_length_gate_fixture",
+                "E2E manuscript length requirements fixture",
+                "Return a deterministic passing final length gate.",
+            ),
+            "final_publication_quality_gate": (
+                "publication_quality_gate_fixture",
+                "E2E publication quality gate fixture",
+                "Return a deterministic passing final publication gate.",
             ),
             "compile_pdf": (
                 "compile_pdf_fixture",
@@ -597,9 +733,26 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
 
     assert final is not None
     assert final.ok, final.error
-    assert "PDF: /tmp/e2e-paper.pdf" in final.final_text
+    pdf_path = workdir / "paper" / "e2e-paper.pdf"
+    reader = PdfReader(pdf_path)
+    assert len(reader.pages) == 10
+    assert "E2E paper page 1" in (reader.pages[0].extract_text() or "")
+    assert "E2E paper page 10" in (reader.pages[-1].extract_text() or "")
+    assert f"PDF: {pdf_path.resolve()}" in final.final_text
+    assert "Pages: 10 (target: at least 10)" in final.final_text
+    assert (
+        "Citations: cited keys 20; strong 20; acceptable 0; weak 0; "
+        "invalid 0; unused entries 0"
+    ) in final.final_text
+    assert "Warnings: none" in final.final_text
     assert "COMPILE_READY" not in final.final_text
-    assert "PDF_PATH: /tmp/e2e-paper.pdf" in final.step_outputs["compile_pdf"]
+    assert f"PDF_PATH: {pdf_path.resolve()}" in final.step_outputs["compile_pdf"]
+    assert "PDF_PAGES: 10" in final.step_outputs["compile_pdf"]
+    assert any(
+        marker in final.step_outputs["paper_length_gate"]
+        for marker in ("LENGTH_GATE: pass", "LENGTH_GATE: warn")
+    )
+    assert "INTEGRITY: pass" in final.step_outputs["citation_integrity_gate"]
     assert "ARTIFACT_ID: paper.pdf" in final.step_outputs["publish_pdf"]
     bib_text = final.step_outputs["refbib"]
     assert "@misc{ref1," in bib_text
@@ -619,6 +772,152 @@ async def test_meta_paper_write_runs_end_to_end(tmp_path: Path) -> None:
     # pipeline is purely LaTeX.
 
 
+@pytest.mark.asyncio
+async def test_meta_paper_stops_before_drafting_with_three_of_fifteen_sources(
+    tmp_path: Path,
+) -> None:
+    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snap.json")
+    loader.invalidate_cache()
+    specs = {spec.name: spec for spec in loader.load_all()}
+    plan_spec = specs.get("meta-paper-write")
+    assert plan_spec is not None
+    plan = parse_meta_plan(plan_spec)
+    assert plan is not None
+
+    fixture_steps = {
+        "search_papers": (
+            "early_gate_search_fixture",
+            "Early source gate search fixture",
+            "Return three deterministic results.",
+        ),
+        "refbib": (
+            "early_gate_refbib_fixture",
+            "Early source gate bibliography fixture",
+            "Return three deterministic BibTeX entries.",
+        ),
+    }
+
+    def replace_fixture_step(step: MetaStep) -> MetaStep:
+        fixture = fixture_steps.get(step.id)
+        if fixture is None:
+            return step
+        skill_name, system_prompt, task = fixture
+        return replace(
+            step,
+            kind="llm_chat",
+            skill=skill_name,
+            with_args={"system": system_prompt, "task": task},
+        )
+
+    run_plan = replace(plan, steps=tuple(replace_fixture_step(step) for step in plan.steps))
+    seen_prompts: list[str] = []
+
+    async def runner(_system_prompt: str, _user_message: str) -> AsyncIterator[AgentEvent]:
+        raise AssertionError("section author must not run after source readiness blocks")
+        yield DoneEvent(text="")  # pragma: no cover - keeps this an async generator
+
+    async def llm_chat(system_prompt: str, _user_message: str) -> str:
+        seen_prompts.append(system_prompt)
+        if "extract paper requirements" in system_prompt:
+            return (
+                "TOPIC: Synthetic edge routing\n"
+                "PAPER_MODE: FULL_MANUSCRIPT\n"
+                "LANGUAGE: zh\n"
+                "TARGET_PAGES: 8\n"
+                "AUDIENCE: academic\n"
+                "CITATION_TARGET: 15\n"
+                "EVIDENCE_STATUS: not_supplied\n"
+                "NEEDS_CLARIFICATION: no\n"
+                "MISSING_FIELDS:\n- none\n"
+                "CLARIFY_QUESTION: none\n"
+                "ASSUMPTIONS:\n- offline fixture"
+            )
+        if "merge extracted paper requirements" in system_prompt:
+            return (
+                "TOPIC: Synthetic edge routing\n"
+                "PAPER_MODE: FULL_MANUSCRIPT\n"
+                "LANGUAGE: zh\n"
+                "TARGET_PAGES: 8\n"
+                "AUDIENCE: academic\n"
+                "CITATION_TARGET: 15\n"
+                "EVIDENCE_STATUS: not_supplied\n"
+                "PDF_REQUIRED: yes\n"
+                "ASSUMPTIONS:\n- offline fixture"
+            )
+        if "translate paper topics" in system_prompt:
+            return "multi-agent edge task routing"
+        if "paper requirements" in system_prompt:
+            return (
+                "PAPER_MODE: FULL_MANUSCRIPT\n"
+                "MODE: DIRECT\n"
+                "TOPIC: Synthetic edge routing\n"
+                "AUDIENCE: academic\n"
+                "VENUE_STYLE: generic research paper\n"
+                "LANGUAGE: zh\n"
+                "TARGET_LENGTH: 8 compiled pages\n"
+                "CITATION_TARGET: 15\n"
+                "EVIDENCE_STATUS: not_supplied\n"
+                "LENGTH_STRATEGY: eight pages\n"
+                "CITATION_STRATEGY: use fifteen verified sources\n"
+                "CITATION_STYLE: BibTeX cite keys, LaTeX citations\n"
+                "ASSUMPTIONS:\n- none"
+            )
+        if "Early source gate search fixture" in system_prompt:
+            return (
+                '{"query":"x","results":['
+                '{"title":"A","url":"https://example.test/a"},'
+                '{"title":"B","url":"https://example.test/b"},'
+                '{"title":"C","url":"https://example.test/c"}]}'
+            )
+        if "Early source gate bibliography fixture" in system_prompt:
+            return "\n".join(
+                f"@article{{ref{i}, title={{Synthetic {i}}}, "
+                f"url={{https://example.test/{i}}}}}"
+                for i in range(1, 4)
+            )
+        if "curate paper sources" in system_prompt:
+            return (
+                "SOURCE_STATUS: insufficient\n"
+                "CITATION_TARGET: 15\n"
+                "USABLE_REFERENCE_COUNT: 3\n"
+                "USABLE_KEYS:\n- ref1\n- ref2\n- ref3\n"
+                "EXCLUDED_KEYS:\n- none\n"
+                "SOURCE_PACK:\n"
+                "PRIMARY_REFERENCES:\n"
+                "- ref1 | Synthetic 1 | background\n"
+                "- ref2 | Synthetic 2 | method\n"
+                "- ref3 | Synthetic 3 | evaluation\n"
+                "COVERAGE_GAPS:\n- twelve references missing"
+            )
+        raise AssertionError(f"downstream prompt ran after early source block: {system_prompt}")
+
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    orchestrator = MetaOrchestrator(
+        agent_runner=runner,
+        skill_loader=_PatchedLoader(loader, specs),
+        workspace_dir=str(workdir),
+        llm_chat=llm_chat,
+    )
+    final: MetaResult | None = None
+    async for event in orchestrator.iter_events(
+        MetaMatch(
+            plan=run_plan,
+            inputs={"user_message": "写8页论文，至少15篇可核验参考文献"},
+        ),
+    ):
+        if isinstance(event, MetaResult):
+            final = event
+
+    assert final is not None
+    assert not final.ok
+    assert final.failed_step_id == "source_readiness_gate"
+    assert "found 3/15 usable references" in (final.error or "")
+    assert "experiment_design" not in final.step_outputs
+    assert not any("design rigorous, falsifiable experiments" in prompt for prompt in seen_prompts)
+    assert not (workdir / "paper" / "paper.pdf").exists()
+
+
 def test_meta_paper_clarify_copy_prefers_user_language_hint(tmp_path: Path) -> None:
     loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snap.json")
     loader.invalidate_cache()
@@ -630,6 +929,11 @@ def test_meta_paper_clarify_copy_prefers_user_language_hint(tmp_path: Path) -> N
     steps = {step.id: step for step in plan.steps}
     clarify_cfg = steps["paper_clarify"].clarify_config
     assert clarify_cfg is not None
+    citation_field = next(field for field in clarify_cfg.fields if field.name == "citation_target")
+    assert citation_field.type == "int"
+    assert citation_field.required is False
+    assert citation_field.min == 1
+    assert citation_field.max == 100
 
     rendered_en = _render_clarify_config(
         clarify_cfg,
@@ -642,6 +946,10 @@ def test_meta_paper_clarify_copy_prefers_user_language_hint(tmp_path: Path) -> N
     )
     assert "Some paper details are missing" in rendered_en.intro
     assert rendered_en.fields[0].prompt == "Paper topic"
+    rendered_en_fields = {field.name: field for field in rendered_en.fields}
+    assert rendered_en_fields["citation_target"].prompt == (
+        "Minimum verifiable references (optional)"
+    )
 
     rendered_zh = _render_clarify_config(
         clarify_cfg,
@@ -654,9 +962,11 @@ def test_meta_paper_clarify_copy_prefers_user_language_hint(tmp_path: Path) -> N
     )
     assert "论文信息还不完整" in rendered_zh.intro
     assert rendered_zh.fields[0].prompt == "论文主题"
+    rendered_zh_fields = {field.name: field for field in rendered_zh.fields}
+    assert rendered_zh_fields["citation_target"].prompt == "最少可核验参考文献数量（可选）"
 
 
-def test_meta_paper_delivery_prompt_is_language_gated(tmp_path: Path) -> None:
+def test_meta_paper_delivery_is_deterministic_and_language_gated(tmp_path: Path) -> None:
     loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snap.json")
     loader.invalidate_cache()
     specs = {s.name: s for s in loader.load_all()}
@@ -666,14 +976,14 @@ def test_meta_paper_delivery_prompt_is_language_gated(tmp_path: Path) -> None:
     assert plan is not None
     steps = {step.id: step for step in plan.steps}
     deliver = steps["deliver_paper"]
-    prompt_text = "\n".join(
-        str(value) for value in (deliver.with_args or {}).values()
-    )
-    assert "USER_LANGUAGE:" in prompt_text
-    assert "en means English only" in prompt_text
-    assert "zh means Chinese only" in prompt_text
-    assert "📄 论文已生成 / Paper compiled" not in prompt_text
-    assert "⚠️ 注意 / Warning" not in prompt_text
+    payload = str((deliver.with_args or {}).get("payload"))
+    assert deliver.kind == "skill_exec"
+    assert deliver.skill == "paper-delivery-summary"
+    assert "outputs.paper_contract" in payload
+    assert "inputs.get('language_instruction'" in payload
+    assert "outputs.compile_pdf" in payload
+    assert "outputs.citation_map" in payload
+    assert "inputs.user_message" not in payload
 
 
 @pytest.mark.asyncio

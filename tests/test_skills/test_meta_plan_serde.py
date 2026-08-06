@@ -44,6 +44,12 @@ def _example_plan() -> MetaPlan:
                 with_args={"request": "{{ inputs.user_message }}"},
             ),
             MetaStep(
+                id="paid-render",
+                skill="seedance-2-prompt",
+                kind="skill_exec",
+                side_effect="external_paid_submit",
+            ),
+            MetaStep(
                 id="collect",
                 skill="collect",
                 kind="user_input",
@@ -93,12 +99,12 @@ def _example_plan() -> MetaPlan:
 def test_to_jsonable_produces_versioned_envelope():
     payload = to_jsonable(_example_plan())
     assert payload["v"] == PLAN_SERDE_VERSION
-    assert payload["v"] == 1
+    assert payload["v"] == 2
     assert "plan" in payload
     plan_obj = payload["plan"]
     assert plan_obj["name"] == "example"
     assert plan_obj["priority"] == 5
-    assert len(plan_obj["steps"]) == 3
+    assert len(plan_obj["steps"]) == 4
     assert plan_obj["steps"][0]["kind"] == "llm_classify"
     assert plan_obj["steps"][0]["label"] == "分类"
     assert plan_obj["steps"][0]["label_by_language"] == {
@@ -106,7 +112,8 @@ def test_to_jsonable_produces_versioned_envelope():
         "en": "Classify",
     }
     assert plan_obj["steps"][1]["progress_emits"] is False
-    clarify = plan_obj["steps"][2]["clarify_config"]
+    assert plan_obj["steps"][2]["side_effect"] == "external_paid_submit"
+    clarify = plan_obj["steps"][3]["clarify_config"]
     assert clarify["intro_by_language"] == {
         "zh": "请补充信息。",
         "en": "Please add details.",

@@ -28,15 +28,17 @@ import asyncio
 import hashlib
 import json
 import re
+import secrets
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import structlog
 
-from opensquilla.engine.types import AgentConfig, AgentEvent
+from opensquilla.artifacts import artifact_payload
+from opensquilla.engine.types import AgentConfig, AgentEvent, ArtifactEvent
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
     UsageEventSink,
@@ -73,10 +75,16 @@ from opensquilla.skills.meta.executors.llm_classify import (
     run_llm_classify_step,
 )
 from opensquilla.skills.meta.executors.skill_exec import run_skill_exec_step
-from opensquilla.skills.meta.executors.tool_call import run_tool_call_step
+from opensquilla.skills.meta.executors.tool_call import (
+    ToolInvocationResult,
+    run_tool_call_step,
+)
 from opensquilla.skills.meta.inputs import (
     apply_clarify_language_preference,
     language_instruction_for_user_message,
+)
+from opensquilla.skills.meta.readiness import (
+    META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
 )
 from opensquilla.skills.meta.scheduler import run_dag
 from opensquilla.skills.meta.templating import (
@@ -102,6 +110,87 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 slog = structlog.get_logger(__name__)
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_META_RUN_INPUT_KEY = "meta_run_id"
+_SAFE_META_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_PRIVATE_CURRENT_RUN_INPUT_KEYS = frozenset(
+    {
+        "paid_submission_receipt_proofs",
+        "__opensquilla_paid_submission_receipt_proofs_v1__",
+    }
+)
+
+
+def _persistence_safe_step_inputs(value: Any) -> Any:
+    """Remove current-process-only machine evidence before run persistence.
+
+    The delivery audit receives receipt proofs through its in-memory rendered
+    input, but those digests must not become replay material or history data.
+    Preserve the rest of the nested input shape for ordinary diagnostics.
+    """
+
+    if isinstance(value, Mapping):
+        return {
+            key: _persistence_safe_step_inputs(item)
+            for key, item in value.items()
+            if str(key) not in _PRIVATE_CURRENT_RUN_INPUT_KEYS
+        }
+    if isinstance(value, list):
+        return [_persistence_safe_step_inputs(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_persistence_safe_step_inputs(item) for item in value)
+    return value
+
+
+def _safe_meta_run_id(value: Any = "") -> str:
+    """Return a path-safe, bounded identifier for one meta-skill run.
+
+    The value is exposed to manifests as ``inputs.meta_run_id`` and can be
+    used as a filesystem path component. Fresh identifiers are runtime-owned;
+    an unsafe legacy value is mapped deterministically so resume remains
+    stable without permitting path traversal.
+    """
+
+    candidate = str(value or "").strip()
+    if _SAFE_META_RUN_ID_RE.fullmatch(candidate):
+        return candidate
+    if candidate:
+        digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:24]
+        return f"run-{digest}"
+    return f"run-{secrets.token_hex(12)}"
+
+
+def _seed_fresh_meta_run_id(inputs: dict[str, Any]) -> str:
+    """Seed a new runtime-owned stable id, replacing caller-supplied data."""
+
+    stable_id = _safe_meta_run_id()
+    inputs[_META_RUN_INPUT_KEY] = stable_id
+    return stable_id
+
+
+def _preserve_meta_run_id(
+    inputs: dict[str, Any],
+    *,
+    fallback_run_id: str,
+) -> str:
+    """Preserve a persisted stable id, with a safe legacy fallback."""
+
+    stable_id = _safe_meta_run_id(
+        inputs.get(_META_RUN_INPUT_KEY) or fallback_run_id,
+    )
+    inputs[_META_RUN_INPUT_KEY] = stable_id
+    return stable_id
+
+
+def _persisted_meta_run_id(record: Any) -> str:
+    """Read the reserved id from a run record without trusting its shape."""
+
+    try:
+        persisted_inputs = json.loads(str(record.inputs_json or "{}"))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    if not isinstance(persisted_inputs, dict):
+        return ""
+    return str(persisted_inputs.get(_META_RUN_INPUT_KEY) or "").strip()
 
 
 async def _to_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -188,8 +277,42 @@ AgentRunner = Callable[[str, str], AsyncIterator[AgentEvent]]
 #: Lightweight LLM-only call (no tool loop). Returns the model's reply text.
 LLMChat = Callable[[str, str], Awaitable[str]]
 
-#: Direct tool invoker — bypasses the LLM. Returns the tool's result as string.
+#: Direct tool invoker — bypasses the LLM. Returns a string-compatible result;
+#: the runtime-produced subtype also carries canonical artifact payloads.
 ToolInvoker = Callable[[str, dict[str, Any]], Awaitable[str]]
+
+_ARTIFACT_EVENT_FIELDS = frozenset(
+    {
+        "kind",
+        "id",
+        "sha256",
+        "name",
+        "mime",
+        "size",
+        "session_id",
+        "session_key",
+        "source",
+        "created_at",
+        "download_url",
+        "store",
+        "has_thumbnail",
+    }
+)
+
+
+def _meta_artifact_event(payload: dict[str, Any]) -> ArtifactEvent:
+    """Normalize a direct meta-tool artifact to the shared runtime event."""
+
+    normalized = artifact_payload(payload)
+    kwargs = {
+        key: value
+        for key, value in normalized.items()
+        if key in _ARTIFACT_EVENT_FIELDS
+    }
+    kwargs["has_thumbnail"] = bool(
+        payload.get("has_thumbnail") or normalized.get("thumbnail_url")
+    )
+    return ArtifactEvent(**kwargs)
 
 _SUBAGENT_METADATA_BLOCKLIST = {
     # These keys belong to the outer turn's meta-skill activation handshake.
@@ -198,6 +321,9 @@ _SUBAGENT_METADATA_BLOCKLIST = {
     "meta_match",
     "meta_match_tool_choice",
     "meta_match_tool_surface_restricted",
+    # This opaque parent-runtime callback can resolve paid-provider secrets.
+    # It belongs only on the outer Agent and must never reach a sub-Agent.
+    META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
 }
 
 
@@ -531,6 +657,7 @@ class MetaOrchestrator:
         turn_id: str | None = None,
         memory_persist_enabled: bool = True,
         usage_tracker: Any | None = None,
+        skill_runtime_env: Mapping[str, Mapping[str, str]] | None = None,
         # PR3: ``dao`` is the preferred alias for ``run_writer`` when the
         # caller only needs the DAO surface (try_claim_resume /
         # finish_run_sync). Defaults to ``None``; if both are supplied
@@ -575,6 +702,13 @@ class MetaOrchestrator:
         self._session_key = session_key
         self._turn_id = turn_id
         self._usage_tracker = usage_tracker
+        # Volatile, parent-resolved credentials keyed by the exact bundled
+        # skill that needs them. They are applied directly to subprocess env,
+        # never rendered through Jinja or written to run persistence.
+        self._skill_runtime_env = {
+            skill_name: dict(values)
+            for skill_name, values in (skill_runtime_env or {}).items()
+        }
         # When False the orchestrator skips any ``skill: memory`` step
         # (the conventional last-step archive pattern). Honoured by
         # ``_dispatch_step_stream`` — see GatewayConfig.meta_skill
@@ -610,7 +744,7 @@ class MetaOrchestrator:
                 run_id=run_id,
                 step=step,
                 effective_skill=effective_skill,
-                rendered_inputs=rendered_inputs,
+                rendered_inputs=_persistence_safe_step_inputs(rendered_inputs),
             )
 
         async def on_step_finish(
@@ -657,6 +791,123 @@ class MetaOrchestrator:
 
         return on_step_begin, on_step_finish, on_step_failover
 
+    async def _persist_seed_outputs(
+        self,
+        *,
+        writer: MetaRunWriter,
+        run_id: str,
+        plan: MetaPlan,
+        seed_outputs: dict[str, str],
+        replay_failover_aliases: dict[str, str] | None = None,
+    ) -> None:
+        """Materialize replayed successes in the new run's durable ledger.
+
+        The scheduler correctly skips seeded steps, so its normal lifecycle
+        hooks never write rows for them. Persisting them here keeps a replay
+        self-contained: if that replay fails again, a later retry can still
+        reuse every successful ancestor output without recursively consulting
+        older runs.
+        """
+
+        steps_by_id = {step.id: step for step in plan.steps}
+        substitute_only = {
+            substitute_id
+            for step in plan.steps
+            if (substitute_id := step.on_failure)
+        }
+        handled: set[str] = set()
+
+        async def persist_step(
+            step: MetaStep,
+            *,
+            status: Literal["ok", "substituted"],
+            output_text: str | None,
+            substitute_step_id: str | None = None,
+        ) -> None:
+            effective_skill = step.skill or step.tool or step.kind
+            await _to_thread(
+                writer.begin_step_sync,
+                run_id=run_id,
+                step=step,
+                effective_skill=effective_skill,
+                rendered_inputs={"meta_replay_reused": True},
+            )
+            await _to_thread(
+                writer.finish_step_sync,
+                run_id=run_id,
+                step_id=step.id,
+                status=status,
+                output_text=output_text,
+                substitute_step_id=substitute_step_id,
+            )
+
+        # When retrying a failed fallback, persist its paid/local primary as a
+        # substituted row immediately while leaving the fallback itself for
+        # the scheduler to execute. This makes chained retries self-contained
+        # without ever rerunning the original non-idempotent submit.
+        for substitute_id, primary_id in (replay_failover_aliases or {}).items():
+            primary = steps_by_id.get(primary_id)
+            if (
+                primary is None
+                or primary.on_failure != substitute_id
+                or primary_id not in seed_outputs
+            ):
+                continue
+            await persist_step(
+                primary,
+                status="substituted",
+                output_text=None,
+                substitute_step_id=substitute_id,
+            )
+            handled.add(primary_id)
+
+        # A successful failover is one logical result represented by two
+        # durable rows: the primary points at its substitute and only the
+        # substitute owns the output. Preserve that relationship on every
+        # replay so another failed-step retry can prove and reuse the same pair.
+        for primary in plan.steps:
+            substitute_id = primary.on_failure
+            if not substitute_id or primary.id in handled or substitute_id in handled:
+                continue
+            if primary.id not in seed_outputs or substitute_id not in seed_outputs:
+                continue
+            handled.update((primary.id, substitute_id))
+            primary_output = seed_outputs[primary.id]
+            substitute_output = seed_outputs[substitute_id]
+            if primary_output != substitute_output:
+                log.warning(
+                    "meta_orchestrator.replay_failover_seed_mismatch",
+                    primary=primary.id,
+                    substitute=substitute_id,
+                )
+                continue
+            substitute = steps_by_id.get(substitute_id)
+            if substitute is None:
+                continue
+            await persist_step(
+                primary,
+                status="substituted",
+                output_text=None,
+                substitute_step_id=substitute_id,
+            )
+            await persist_step(
+                substitute,
+                status="ok",
+                output_text=substitute_output,
+            )
+
+        for step_id, output_text in seed_outputs.items():
+            if step_id in handled or step_id in substitute_only:
+                continue
+            step = steps_by_id.get(step_id)
+            if step is None:
+                continue
+            await persist_step(
+                step,
+                status="ok",
+                output_text=output_text,
+            )
+
     async def _finish_resumed_awaiting_step(
         self,
         *,
@@ -692,6 +943,11 @@ class MetaOrchestrator:
     async def iter_events(
         self,
         match: MetaMatch,
+        *,
+        seed_outputs: dict[str, str] | None = None,
+        replay_failover_aliases: dict[str, str] | None = None,
+        trusted_preflight_replay: bool = False,
+        trusted_replay_meta_run_id: str | None = None,
     ) -> AsyncIterator[AgentEvent | MetaResult]:
         """Run the plan and stream a flat sequence of events for the UI.
 
@@ -700,6 +956,15 @@ class MetaOrchestrator:
         ``step.kind``, optional pre-step ``skill_view`` preface) wired
         to this orchestrator's instance state and delegates the DAG
         traversal there.
+
+        ``seed_outputs`` is used by a trusted failed-step replay to preserve
+        successful prior work and dispatch only the failed/missing portion of
+        the DAG.  ``trusted_preflight_replay`` bypasses a second confirmation
+        only after the gateway has validated and consumed a session-bound
+        replay capability. ``trusted_replay_meta_run_id`` is derived from that
+        source run's persisted inputs (or its safe legacy run-id mapping); it
+        keeps late replay steps in the original artifact directory without
+        accepting the new match's caller-controlled reserved input.
 
         When ``run_writer`` was injected at construction the wrapper also
         opens an audit run on entry, bridges the scheduler's three
@@ -730,8 +995,13 @@ class MetaOrchestrator:
             )
 
         run_id: str | None = (match.run_id or "").strip() or None
+        created_new_run = False
+        replay_meta_run_id = ""
+        if trusted_preflight_replay and trusted_replay_meta_run_id:
+            replay_meta_run_id = _safe_meta_run_id(trusted_replay_meta_run_id)
 
         if self._run_writer is not None:
+            existing_run: Any = None
             if run_id is not None:
                 try:
                     existing = await _to_thread(self._run_writer.get_run, run_id)
@@ -744,6 +1014,8 @@ class MetaOrchestrator:
                     session_key=self._session_key,
                 ):
                     run_id = None
+                else:
+                    existing_run = existing
             if run_id is None:
                 confirmed_run_id = _preflight_confirmation_run_id(match.inputs)
                 if confirmed_run_id:
@@ -761,7 +1033,16 @@ class MetaOrchestrator:
                         session_key=self._session_key,
                     ):
                         run_id = confirmed_run_id
+                        existing_run = existing
             if run_id is None:
+                # This reserved input must exist in the exact snapshot written
+                # by begin_run_sync. Downstream manifests may use it as a
+                # stable output directory even if user_input resume later
+                # appends additional notes to inputs.user_message.
+                if replay_meta_run_id:
+                    match.inputs[_META_RUN_INPUT_KEY] = replay_meta_run_id
+                else:
+                    _seed_fresh_meta_run_id(match.inputs)
                 try:
                     run_id = await _to_thread(
                         self._run_writer.begin_run_sync,
@@ -772,8 +1053,38 @@ class MetaOrchestrator:
                         session_key=self._session_key,
                         turn_id=self._turn_id,
                     )
+                    created_new_run = bool(run_id)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("orchestrator.begin_run_failed: %s", exc)
+            else:
+                # A confirmed preflight reuses its original persistence row.
+                # Restore the runtime-owned value from that snapshot instead
+                # of accepting a caller-provided reserved input.
+                persisted_id = _persisted_meta_run_id(existing_run)
+                match.inputs[_META_RUN_INPUT_KEY] = _safe_meta_run_id(
+                    persisted_id or run_id,
+                )
+        else:
+            # Degraded/non-persistent callers still receive a unique, safe
+            # path component for the lifetime of this in-memory run.
+            if replay_meta_run_id:
+                match.inputs[_META_RUN_INPUT_KEY] = replay_meta_run_id
+            else:
+                _seed_fresh_meta_run_id(match.inputs)
+
+        if (
+            created_new_run
+            and run_id is not None
+            and self._run_writer is not None
+            and seed_outputs
+        ):
+            await self._persist_seed_outputs(
+                writer=self._run_writer,
+                run_id=run_id,
+                plan=match.plan,
+                seed_outputs=seed_outputs,
+                replay_failover_aliases=replay_failover_aliases,
+            )
 
         on_step_begin, on_step_finish, on_step_failover = (
             self._step_persistence_hooks(
@@ -805,6 +1116,9 @@ class MetaOrchestrator:
                 usage_tracker=self._usage_tracker,
                 session_key=self._session_key,
                 usage_scope_prefix=run_id or f"meta:{match.plan.name}:{id(match)}",
+                seed_outputs=seed_outputs,
+                replay_failover_aliases=replay_failover_aliases,
+                trusted_preflight_replay=trusted_preflight_replay,
             ):
                 if isinstance(item, MetaResult):
                     # Resolve user-facing ``final_text`` per
@@ -942,11 +1256,11 @@ class MetaOrchestrator:
     ) -> AsyncIterator[AgentEvent | _StepDone]:
         """Streaming dispatch — yields nested events then a final :class:`_StepDone`.
 
-        Non-agent kinds (``llm_classify`` / ``tool_call`` / ``skill_exec``)
-        have no nested events to forward, so they just compute the text and
-        yield a single ``_StepDone``. ``agent`` kind passes the sub-Agent's
-        full event stream through to the outer iterator so the user can see
-        every inner tool call.
+        ``llm_classify`` and ``skill_exec`` compute text and yield a single
+        ``_StepDone``. ``tool_call`` additionally forwards canonical artifact
+        events returned by the shared tool boundary. ``agent`` passes the
+        sub-Agent's full event stream through to the outer iterator so the
+        user can see every inner tool call.
         """
         log.warning(
             "DEBUG_TRACE_dispatch_step_stream_entered",
@@ -988,14 +1302,23 @@ class MetaOrchestrator:
             yield _StepDone(text=text)
             return
         if step.kind == "tool_call":
-            text = await run_tool_call_step(
+            result = await run_tool_call_step(
                 step,
                 inputs,
                 outputs,
                 tool_invoker=self._tool_invoker,
                 agent_runner=self._agent_runner,
             )
-            yield _StepDone(text=text)
+            emitted: set[str] = set()
+            for artifact in result.artifacts:
+                event = _meta_artifact_event(artifact)
+                identity = event.id or f"{event.sha256}:{event.name}"
+                if identity and identity in emitted:
+                    continue
+                if identity:
+                    emitted.add(identity)
+                yield event
+            yield _StepDone(text=result.text)
             return
         if step.kind == "skill_exec":
             text = await run_skill_exec_step(
@@ -1005,6 +1328,7 @@ class MetaOrchestrator:
                 outputs,
                 skill_loader=self._skill_loader,
                 workspace_dir=self._workspace_dir,
+                trusted_env=self._skill_runtime_env.get(effective_skill),
             )
             yield _StepDone(text=text)
             return
@@ -1251,6 +1575,7 @@ class MetaOrchestrator:
         plan = from_jsonable(json.loads(payload.plan_snapshot_json))
         inputs = json.loads(payload.inputs_json or "{}")
         outputs = json.loads(payload.step_outputs_json or "{}")
+        _preserve_meta_run_id(inputs, fallback_run_id=run_id)
 
         schema_dict = json.loads(payload.awaiting_schema_json or "{}")
         cfg = clarify_config_from_jsonable(schema_dict)
@@ -1373,6 +1698,7 @@ class MetaOrchestrator:
         plan = from_jsonable(json.loads(payload.plan_snapshot_json))
         inputs = json.loads(payload.inputs_json or "{}")
         outputs = json.loads(payload.step_outputs_json or "{}")
+        _preserve_meta_run_id(inputs, fallback_run_id=run_id)
 
         schema_dict = json.loads(payload.awaiting_schema_json or "{}")
         cfg = clarify_config_from_jsonable(schema_dict)
@@ -2203,7 +2529,15 @@ def make_tool_invoker_from_handler(
             raise RuntimeError(
                 f"tool {tool_name!r} failed: {getattr(result, 'content', '')!s}",
             )
-        return str(getattr(result, "content", ""))
+        artifacts = tuple(
+            dict(item)
+            for item in (getattr(result, "artifacts", None) or [])
+            if isinstance(item, dict)
+        )
+        return ToolInvocationResult(
+            str(getattr(result, "content", "")),
+            artifacts,
+        )
 
     return _invoke
 

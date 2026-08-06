@@ -13,7 +13,7 @@ from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.types import ApprovedHostExecution, SecurityLevel
 from opensquilla.tools.builtin import code_exec, filesystem, shell
 from opensquilla.tools.builtin.code_exec import execute_code
-from opensquilla.tools.builtin.shell_policy import PolicyResult
+from opensquilla.tools.builtin.shell_policy import DEFAULT_DENYLIST, PolicyResult, SafeBinPolicy
 from opensquilla.tools.types import (
     CallerKind,
     InteractionMode,
@@ -111,6 +111,15 @@ def test_shell_approval_fingerprint_changes_when_script_content_changes(
     )
 
     assert before.fingerprint() != after.fingerprint()
+
+
+def test_safe_bin_halt_rule_allows_latex_flag_but_blocks_system_halt() -> None:
+    policy = SafeBinPolicy(denylist=DEFAULT_DENYLIST, allowlist=[], warnlist=[])
+
+    assert policy.check("xelatex -halt-on-error paper.tex").allowed is True
+    assert policy.check("sudo /sbin/halt").allowed is False
+    assert policy.check("halt --force").allowed is False
+    assert policy.check("echo ready; halt").allowed is False
 
 
 @pytest.mark.asyncio

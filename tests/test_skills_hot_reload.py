@@ -27,6 +27,37 @@ def _loader(root: Path, tmp_path: Path) -> SkillLoader:
     return SkillLoader(workspace_dir=root, snapshot_path=tmp_path / "snapshot.json")
 
 
+def test_loader_normalizes_crlf_before_parsing_yaml_block_scalars(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    skill_file = root / "crlf-meta" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    source = """---
+name: crlf-meta
+description: CRLF fixture
+kind: meta
+composition:
+  steps:
+    - id: deliver
+      kind: llm_chat
+      with:
+        task: |
+          first line
+          second line
+---
+body
+"""
+    skill_file.write_bytes(source.replace("\n", "\r\n").encode("utf-8"))
+
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    spec = loader.get_by_name("crlf-meta")
+
+    assert spec is not None
+    assert spec.composition_raw is not None
+    step = spec.composition_raw["steps"][0]
+    assert step["with"]["task"] == "first line\nsecond line"
+
+
 def test_external_add_modify_delete_publish_on_next_probe(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     loader = _loader(root, tmp_path)

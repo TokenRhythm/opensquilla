@@ -22,6 +22,7 @@ from opensquilla.gateway.config import (
 )
 from opensquilla.gateway.origin_guard import websocket_origin_allowed
 from opensquilla.gateway.protocol import (
+    ERROR_UNAVAILABLE,
     PREAUTH_TIMEOUT_MS,
     PROTOCOL_VERSION,
     WS_CLOSE_SERVICE_RESTART,
@@ -69,6 +70,9 @@ _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
 _SENTINEL_STOP: Any = object()
+_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"})
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = 4
+_DETACHED_REQUEST_DRAIN_SECONDS = 0.25
 
 
 @dataclass(slots=True)
@@ -128,6 +132,12 @@ class WsConnection:
         repr=False,
     )
     _closing: bool = field(default=False, init=False, repr=False)
+    _detached_request_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _accept_detached_responses: bool = field(default=True, init=False, repr=False)
 
     @property
     def role(self) -> str:
@@ -372,6 +382,44 @@ class WsConnection:
                 await self.ws.close(code=code)
         except Exception:
             pass
+
+    def _track_detached_request(self, task: asyncio.Task[None]) -> None:
+        self._detached_request_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._detached_request_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                log.error(
+                    "gateway.ws_detached_request_failed",
+                    conn_id=self.conn_id,
+                    error=str(error),
+                )
+
+        task.add_done_callback(finished)
+
+    async def _stop_detached_requests(self) -> None:
+        self._accept_detached_responses = False
+        tasks = tuple(self._detached_request_tasks)
+        self._detached_request_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            _, pending = await asyncio.wait(
+                tasks,
+                timeout=_DETACHED_REQUEST_DRAIN_SECONDS,
+            )
+            if pending:
+                log.warning(
+                    "gateway.ws_detached_request_drain_timeout",
+                    conn_id=self.conn_id,
+                    pending=len(pending),
+                )
 
     # ------------------------------------------------------------------
     # Writer task lifecycle
@@ -1014,6 +1062,9 @@ async def handle_ws_connection(
     except Exception as exc:
         log.error("ws.error", conn_id=conn_id, error=str(exc))
     finally:
+        # Detached optional reads must stop before the writer so a handler that
+        # suppresses cancellation cannot enqueue a late response after teardown.
+        await conn._stop_detached_requests()
         # Detached reads can still enqueue responses, so retire them before the
         # writer. Then stop the writer before tick_task.cancel() and before
         # registry.unregister. Otherwise a producer could still hold a reference
@@ -1200,6 +1251,34 @@ async def _message_loop(
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
             )
+            if method in _DETACHED_RPC_METHODS:
+                if (
+                    len(conn._detached_request_tasks)
+                    >= _MAX_DETACHED_REQUESTS_PER_CONNECTION
+                ):
+                    await conn.send_res(
+                        make_error_res(
+                            req_id,
+                            ERROR_UNAVAILABLE,
+                            "Too many optional recovery requests are already running",
+                            retryable=True,
+                        )
+                    )
+                    continue
+                task = asyncio.create_task(
+                    _dispatch_and_send(
+                        conn,
+                        dispatcher,
+                        req_id,
+                        method,
+                        params,
+                        ctx,
+                        detached=True,
+                    ),
+                    name=f"ws-detached-request-{conn.conn_id}",
+                )
+                conn._track_detached_request(task)
+                continue
             request = _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
             if method in _DETACHED_READ_METHODS:
                 if conn._try_start_detached_read(request, method=method):
@@ -1224,6 +1303,22 @@ async def _message_loop(
             await conn.send_res(
                 make_error_res("", "INVALID_REQUEST", f"Unknown frame type: {frame_type!r}")
             )
+
+
+async def _dispatch_and_send(
+    conn: WsConnection,
+    dispatcher: RpcDispatcher,
+    req_id: str,
+    method: str,
+    params: Any,
+    ctx: RpcContext,
+    *,
+    detached: bool = False,
+) -> None:
+    response = await dispatcher.dispatch(req_id, method, params, ctx)
+    if detached and not conn._accept_detached_responses:
+        return
+    await conn.send_res(response)
 
 
 def _build_features(dispatcher: RpcDispatcher) -> Any:
