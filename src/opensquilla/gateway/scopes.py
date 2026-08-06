@@ -185,6 +185,8 @@ METHOD_SCOPES: dict[str, str] = {
     "usage.cost": READ_SCOPE,
     "usage.query": READ_SCOPE,
     "meta.list": READ_SCOPE,  # OpenSquilla-only; invokable meta-skill catalog.
+    "meta.setup.plan": READ_SCOPE,  # OpenSquilla-only; dependency setup preview.
+    "meta.setup.status": READ_SCOPE,  # OpenSquilla-only; background setup progress.
     "meta.runs.list": READ_SCOPE,
     "meta.runs.failures": READ_SCOPE,
     "meta.runs.cost": READ_SCOPE,
@@ -258,6 +260,11 @@ METHOD_SCOPES: dict[str, str] = {
     "config.patch.safe": WRITE_SCOPE,
     # OpenSquilla-only; manual ``/meta`` command launch stamp.
     "meta.run": WRITE_SCOPE,
+    # Raw prompts remain owner/admin-gated inside the handlers. WRITE_SCOPE is
+    # the dispatch envelope so a locally-proven owner using a least-privilege
+    # token can reach that second, transport-proven authorization check.
+    "meta.drafts.list": WRITE_SCOPE,
+    "meta.drafts.discard": WRITE_SCOPE,
     # ----- approvals -----
     # Policy getters/setters explicitly override the ``exec.approvals.`` prefix
     # so that approval workers (which hold operator.approvals) can read/set the
@@ -312,9 +319,11 @@ METHOD_SCOPES: dict[str, str] = {
     "skills.uninstall": ADMIN_SCOPE,
     "skills.reload": ADMIN_SCOPE,
     "skills.deps.install": ADMIN_SCOPE,
+    "meta.setup.install": ADMIN_SCOPE,
     "meta.runs.show": ADMIN_SCOPE,
     "meta.runs.draft": ADMIN_SCOPE,
     "meta.runs.confirm_preflight": ADMIN_SCOPE,
+    "meta.runs.recovery": ADMIN_SCOPE,
     "meta.runs.diff": ADMIN_SCOPE,
     "meta.runs.replay": ADMIN_SCOPE,
     "meta.runs.validate": ADMIN_SCOPE,

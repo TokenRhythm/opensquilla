@@ -79,6 +79,16 @@ export interface SessionSubscriptionOutcome {
   skipSnapshotOnRetry?: boolean
 }
 
+export type SessionSubscriptionResult = boolean | void | SessionSubscriptionOutcome
+
+/** Treat only explicit structured failures (or legacy false) as non-authoritative. */
+export function isAuthoritativeSessionSubscription(
+  value: SessionSubscriptionResult,
+): boolean {
+  if (typeof value === 'object' && value !== null) return value.authoritative === true
+  return value !== false
+}
+
 const UNAVAILABLE_SUBSCRIPTION: SessionSubscriptionOutcome = {
   authoritative: false,
   live: false,

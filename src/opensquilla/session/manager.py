@@ -1044,12 +1044,13 @@ class SessionManager:
         *,
         session_id: str | None = None,
     ) -> None:
-        """Drop in-memory subagent and routing bookkeeping for ``session_key``.
+        """Drop in-memory state owned by one retired ``session_key``.
 
         History deletion calls this while its runtime/admission fences are
         still held. ``session_id`` identifies the deleted generation for
-        caches that intentionally survive same-key resets. Imports are local
-        to avoid cycles with engine/gateway packages.
+        generation-scoped caches. Session-key caches are evicted regardless of
+        whether that identifier is available. Imports are local to avoid cycles
+        with engine/gateway packages.
         """
         session_key = canonicalize_session_key(session_key)
         self._epoch_cache.pop(session_key, None)
@@ -1071,6 +1072,14 @@ class SessionManager:
             from opensquilla.tools.builtin.sessions import evict_spawn_lock
 
             evict_spawn_lock(session_key)
+        except Exception:
+            pass
+        try:
+            from opensquilla.engine.cache_break_monitor import (
+                evict_cache_break_state,
+            )
+
+            evict_cache_break_state(session_key)
         except Exception:
             pass
         if session_id:

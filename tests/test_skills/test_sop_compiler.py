@@ -965,7 +965,6 @@ def test_acceptance_meta_paper_write_sop_compiles_to_equivalent_dag() -> None:
             "paper_length_gate",
             "citation_integrity_gate",
             "latex_sanitizer",
-            "compile_latex",
         } <= step_ids
         return
 

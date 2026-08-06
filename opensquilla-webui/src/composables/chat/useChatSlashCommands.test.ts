@@ -1,7 +1,7 @@
 import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
-import { useChatSlashCommands } from './useChatSlashCommands'
+import { parseMetaCommandInvocation, useChatSlashCommands } from './useChatSlashCommands'
 import type { RpcCallOptions } from '@/lib/rpc'
 
 function deferred() {
@@ -65,6 +65,21 @@ function harness(
 }
 
 describe('useChatSlashCommands plan compatibility', () => {
+  it('requires an explicit -- separator before treating Meta trailing text as a request', () => {
+    expect(parseMetaCommandInvocation('meta-paper-write')).toEqual({
+      skillName: 'meta-paper-write',
+      launchText: '/meta meta-paper-write',
+    })
+    expect(parseMetaCommandInvocation('meta-paper-write accidental trailing words')).toEqual({
+      skillName: 'meta-paper-write',
+      launchText: '/meta meta-paper-write',
+    })
+    expect(parseMetaCommandInvocation('meta-paper-write -- preserve this request')).toEqual({
+      skillName: 'meta-paper-write',
+      launchText: '/meta meta-paper-write -- preserve this request',
+    })
+  })
+
   it('adds and executes /plan when the connected gateway advertises plan mode', async () => {
     const catalogCallOptions: RpcCallOptions = {
       timeoutMs: 2_000,
@@ -207,7 +222,7 @@ describe('useChatSlashCommands meta requests', () => {
     ],
   }
 
-  it('keeps the concrete request after the selected meta-skill name', async () => {
+  it('keeps the concrete request after the explicit Meta request separator', async () => {
     const { api, dispatchHidden, rpc } = harness(false, [metaCommand])
     rpc.call.mockImplementation(async (method: string) => {
       if (method === 'commands.list_for_surface') return { commands: [metaCommand] }
@@ -216,17 +231,21 @@ describe('useChatSlashCommands meta requests', () => {
     })
 
     await api.executeSlashCommand(
-      '/meta meta-skill-creator create a competitor research meta-skill',
+      '/meta meta-skill-creator -- create a competitor research meta-skill',
     )
     await vi.waitFor(() => expect(dispatchHidden).toHaveBeenCalledOnce())
 
-    expect(rpc.call).toHaveBeenCalledWith('meta.run', {
+    expect(rpc.call).toHaveBeenCalledWith('meta.run', expect.objectContaining({
       name: 'meta-skill-creator',
       sessionKey: 'agent:main:webchat:test',
-    })
+      clientRequestId: expect.any(String),
+      launchText: '/meta meta-skill-creator -- create a competitor research meta-skill',
+    }))
     expect(dispatchHidden).toHaveBeenCalledWith(
-      '/meta meta-skill-creator create a competitor research meta-skill',
-      '/meta meta-skill-creator create a competitor research meta-skill',
+      '/meta meta-skill-creator -- create a competitor research meta-skill',
+      '/meta meta-skill-creator -- create a competitor research meta-skill',
+      expect.any(String),
+      'agent:main:webchat:test',
     )
   })
 })

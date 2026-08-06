@@ -35,6 +35,7 @@ jobs:
       python_changed: ${{ steps.classify.outputs.python_changed }}
       platform_sensitive_changed: ${{ steps.classify.outputs.platform_sensitive_changed }}
       build_wheel_required: ${{ steps.classify.outputs.build_wheel_required }}
+      toolchain_artifact_changed: ${{ steps.classify.outputs.toolchain_artifact_changed }}
       full_required: ${{ steps.classify.outputs.full_required }}
     steps:
       - name: Check out repository
@@ -1101,6 +1102,12 @@ jobs:
         working-directory: opensquilla-webui
         run: node scripts/check-readme-locales.mjs
 
+  managed-toolchain-artifacts:
+    name: Managed Toolchain Artifact E2E
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.toolchain_artifact_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    uses: ./.github/workflows/managed-toolchain-artifacts.yml
+
   ci-result:
     name: CI result
     needs:
@@ -1118,6 +1125,7 @@ jobs:
       - macos-recovery
       - desktop-recovery-e2e
       - release-packaging
+      - managed-toolchain-artifacts
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1163,6 +1171,7 @@ jobs:
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
           RESULT_RELEASE: ${{ needs.release-packaging.result }}
+          RESULT_MANAGED_TOOLCHAIN_ARTIFACTS: ${{ needs.managed-toolchain-artifacts.result }}
           FLAG_DOCS_ONLY: ${{ needs.classify-changes.outputs.docs_only }}
           FLAG_RUNTIME_CHANGED: ${{ needs.classify-changes.outputs.runtime_changed }}
           FLAG_TEST_CHANGED: ${{ needs.classify-changes.outputs.test_changed }}
@@ -1176,5 +1185,6 @@ jobs:
           FLAG_PYTHON_CHANGED: ${{ needs.classify-changes.outputs.python_changed }}
           FLAG_PLATFORM_SENSITIVE_CHANGED: ${{ needs.classify-changes.outputs.platform_sensitive_changed }}
           FLAG_BUILD_WHEEL_REQUIRED: ${{ needs.classify-changes.outputs.build_wheel_required }}
+          FLAG_TOOLCHAIN_ARTIFACT_CHANGED: ${{ needs.classify-changes.outputs.toolchain_artifact_changed }}
           FLAG_FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
         run: python .github/scripts/check_ci_results.py

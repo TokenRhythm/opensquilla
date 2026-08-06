@@ -95,6 +95,7 @@ export interface Skill {
   status?: string
   status_detail?: string
   eligible?: boolean
+  provider_check_at_launch?: boolean
   layer?: string
   kind?: string
   sub_skills?: string[]

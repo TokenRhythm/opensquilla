@@ -38,6 +38,12 @@ def _stub_runner_for(outputs: dict[str, str]):
         text = outputs.get(step.id, f"output-of-{step.id}")
         if text == "__FAIL__":
             raise RuntimeError(f"{step.id} exploded")
+        if text == "__SAFE_PAID_FAIL__":
+            from opensquilla.skills.meta.replay_safety import encode_paid_replay_safety
+
+            raise RuntimeError(
+                encode_paid_replay_safety("pre-submit validation failed", safe_no_submit=True)
+            )
         yield _StepDone(text=text)
     return _runner
 
@@ -314,6 +320,47 @@ async def test_hard_failure_marks_step_failed(writer_db) -> None:
     # Critical: step row must be 'failed' not 'running'
     assert run.steps[0].status == "failed"
     assert run.steps[0].error  # non-empty
+
+
+@pytest.mark.asyncio
+async def test_hard_paid_failure_persists_replay_safety_marker(writer_db) -> None:
+    from opensquilla.skills.meta.replay_safety import paid_replay_is_safe
+    from opensquilla.skills.meta.run_reports import build_recovery_events
+
+    plan = MetaPlan(
+        name="hard-paid-fail",
+        triggers=("t",),
+        priority=10,
+        steps=(
+            MetaStep(
+                id="paid",
+                skill="seedance-2-prompt",
+                kind="skill_exec",
+                side_effect="external_paid_submit",
+            ),
+        ),
+    )
+    await _drive_orchestrator(
+        writer_db,
+        plan,
+        outputs={"paid": "__SAFE_PAID_FAIL__"},
+    )
+    [summary] = writer_db.list_runs(name="hard-paid-fail")
+    run = writer_db.get_run(summary.run_id)
+
+    assert run is not None
+    assert run.steps[0].status == "failed"
+    assert paid_replay_is_safe(run.steps[0].error) is True
+    recovery = build_recovery_events(run)
+    assert recovery is not None
+    failed_state = next(
+        state
+        for state in recovery["step_states"]
+        if state["step_id"] == "paid"
+    )
+    action_ids = {action["id"] for action in failed_state["rescue"]["actions"]}
+    assert "retry-step" in action_ids
+    assert "retry-run" not in action_ids
 
 
 @pytest.mark.asyncio

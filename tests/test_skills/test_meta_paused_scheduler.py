@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from opensquilla.engine.types import MetaRunCompletedEvent, MetaStepStateEvent
 from opensquilla.skills.meta.events import _StepDone
 from opensquilla.skills.meta.scheduler import run_dag
 from opensquilla.skills.meta.types import (
@@ -327,14 +328,20 @@ async def test_resume_from_skips_already_completed_steps():
 
     seed_outputs = {"a": "previously completed"}
 
-    async for ev in run_dag(
+    events = [ev async for ev in run_dag(
         match,
         dispatch_step_stream=_dispatch,
         yield_skill_view_preface=_yield_skill_view,
         seed_outputs=seed_outputs,
-    ):
-        pass
+    )]
 
     # 'a' was skipped (already in outputs); 'b' ran.
     assert "a" not in dispatched
     assert "b" in dispatched
+    reused = [
+        event for event in events
+        if isinstance(event, MetaStepStateEvent) and event.step_id == "a"
+    ]
+    assert reused and reused[0].state == "succeeded"
+    completed = next(event for event in events if isinstance(event, MetaRunCompletedEvent))
+    assert completed.completed_steps == ["a", "b"]
