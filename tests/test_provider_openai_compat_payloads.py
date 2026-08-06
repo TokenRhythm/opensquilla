@@ -2442,6 +2442,56 @@ def test_zai_non_thinking_sends_provider_disabled_for_default_thinking_model(
     assert captured["payload"]["thinking"] == {"type": "disabled"}
 
 
+def test_zai_thinking_omits_provider_thinking_object_off_official_host(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="glm-5.2",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="zhipu",
+    )
+    cfg = ChatConfig(
+        thinking=True,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="zai",
+        ),
+    )
+
+    _collect(provider, cfg)
+
+    assert "thinking" not in captured["payload"]
+
+
+def test_zai_non_thinking_omits_provider_thinking_object_off_official_host(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="glm-5.2",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="zhipu",
+    )
+    cfg = ChatConfig(
+        thinking=False,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="zai",
+        ),
+    )
+
+    _collect(provider, cfg)
+
+    assert "thinking" not in captured["payload"]
+
+
 def test_dashscope_cache_on_marks_system_and_latest_user(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
