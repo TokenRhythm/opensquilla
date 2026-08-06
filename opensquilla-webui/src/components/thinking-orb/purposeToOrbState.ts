@@ -22,9 +22,6 @@ type PurposeSuffix =
   | 'recall'
   | 'use'
 
-/** 完整的 purpose code 字符串 */
-type PurposeCode = `chat.activity.purpose.${PurposeSuffix}`
-
 /** lifecycle 值 */
 type Lifecycle = 'working' | 'answering' | 'settled' | 'interrupted' | 'failed'
 

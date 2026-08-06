@@ -66,7 +66,6 @@ export class RibbonMode implements AnimationMode {
     const ny = uz * vx - ux * vz
     const nz = ux * vy - uy * vx
 
-    const wobAmp = 0.23 * (opts.wobMul ?? 1)
     const baseR = R
     const baseLanes = opts.lanes ?? 5
     const segs = opts.segs ?? 88

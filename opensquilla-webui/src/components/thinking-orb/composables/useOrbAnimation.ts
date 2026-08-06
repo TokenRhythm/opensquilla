@@ -37,7 +37,7 @@ export function useOrbAnimation(
   dark: Ref<boolean>,
   speed: Ref<number>,
   paused: Ref<boolean>,
-  reduced: Ref<boolean>,
+  _reduced: Ref<boolean>,
 ): AnimationControls {
   const isRunning = ref(false)
   const currentFps = ref(60)
@@ -45,7 +45,6 @@ export function useOrbAnimation(
   let unsubscribe: (() => void) | null = null
   let io: IntersectionObserver | null = null
   let visible = true
-  let lastMode: AnimationMode | undefined
   let lastSize = 0
   let lastDpr = 1
 
@@ -101,8 +100,6 @@ export function useOrbAnimation(
 
       renderLayers(ctx, result, dark.value)
     }
-
-    lastMode = modeInstance
   }
 
   // 创建虚拟投影（模式类自己会创建投影）

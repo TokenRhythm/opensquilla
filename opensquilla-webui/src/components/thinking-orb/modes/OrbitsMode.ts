@@ -7,7 +7,7 @@
  */
 
 import type { AnimationMode, FrameContext } from '../engine/types'
-import { createOrthoProjector, emptyRenderResult, fibonacciSphere, hash, scaleRadius } from '../engine/core'
+import { hash, scaleRadius } from '../engine/core'
 import type { RenderResult, Particle } from '../engine/core'
 
 export class OrbitsMode implements AnimationMode {

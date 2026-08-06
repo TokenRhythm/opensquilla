@@ -59,7 +59,7 @@ const themeRef = ref(props.theme)
 const isDark = useOrbTheme(themeRef, canvasRef)
 const reduced = useReducedMotion()
 
-const { isRunning } = useOrbAnimation(
+useOrbAnimation(
   canvasRef,
   stateRef,
   sizeRef,

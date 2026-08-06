@@ -24,8 +24,6 @@ export class WebMode implements AnimationMode {
     },
   }
 
-  private _nodePositions: Array<[number, number, number]> = []
-
   init(): void {}
 
   update(ctx: FrameContext): RenderResult {

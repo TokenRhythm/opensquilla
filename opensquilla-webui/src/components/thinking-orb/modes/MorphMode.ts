@@ -7,7 +7,7 @@
  */
 
 import type { AnimationMode, FrameContext } from '../engine/types'
-import { clamp, smoothstep } from '../engine/core'
+import { smoothstep } from '../engine/core'
 import type { RenderResult, Particle } from '../engine/core'
 
 /** 路径函数：参数 f ∈ [0, 1) 返回归一化坐标 */
