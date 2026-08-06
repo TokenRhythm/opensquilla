@@ -26,18 +26,18 @@ const errorEntry = buildRendererConsoleLogEntry({
     'OPENAI_API_KEY=sk-synthetic-secret-value',
     'Authorization: Bearer synthetic-bearer-value',
     'unknown credential abcdefghijklmnopqrstuvwxyz0123456789',
-    'at /Users/alice/private/index.js',
+    'at /synthetic-profile/private/index.js',
   ].join(' '),
-  sourceId: 'file:///Users/alice/app/index.js?token=source-secret#fragment',
+  sourceId: 'file:///synthetic-profile/app/index.js?token=source-secret#fragment',
   lineNumber: 1234.9,
-}, { homeDir: '/Users/alice' })
+}, { homeDir: '/synthetic-profile' })
 assert.notEqual(errorEntry, null)
 assert.equal(errorEntry.event, 'renderer_console')
 assert.equal(errorEntry.detail.level, 'error')
 assert.match(String(errorEntry.detail.message), /\[redacted\]/)
 assert.doesNotMatch(String(errorEntry.detail.message), /synthetic-secret|synthetic-bearer/)
 assert.doesNotMatch(String(errorEntry.detail.message), /abcdefghijklmnopqrstuvwxyz0123456789/)
-assert.doesNotMatch(String(errorEntry.detail.message), /\/Users\/alice/)
+assert.doesNotMatch(String(errorEntry.detail.message), /\/synthetic-profile/)
 assert.equal(errorEntry.detail.source, '~/app/index.js')
 assert.doesNotMatch(String(errorEntry.detail.source), /token=|fragment/)
 assert.equal(errorEntry.detail.line, 1234)
