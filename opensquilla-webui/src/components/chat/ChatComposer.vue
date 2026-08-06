@@ -72,8 +72,7 @@
             :aria-label="t('chat.messageToSend')"
             :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
             @beforeinput="emit('expand'); emit('beforeinput', $event)"
-            @paste="onTextareaPaste"
-            @input="emit('input', $event)"
+            @input="onTextareaInput"
             @keydown="emit('keydown', $event)"
             @compositionstart="emit('compositionChange', true)"
             @compositionend="emit('compositionChange', false)"
@@ -476,20 +475,28 @@ const inputText = defineModel<string>({ required: true })
 const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 
-function onTextareaPaste() {
+function onTextareaInput(event: Event) {
+  emit('input', event)
   // vModelText skips model updates while the element's internal IME
   // composition flag is set (`if (e.target.composing) return` in
-  // @vue/runtime-dom). On Windows a paste can land while that flag is stale
-  // after a composition round-trip, leaving the model — and the send
-  // button's readiness — out of sync with what the textarea displays.
-  // Force the model to follow the DOM value after every paste; this is a
-  // no-op whenever v-model already picked up the change.
-  nextTick(() => {
-    const field = textareaEl.value
+  // @vue/runtime-dom). On Windows a paste can land while that flag is
+  // stale after a composition round-trip, leaving the model — and the
+  // send button's readiness — out of sync with what the textarea shows.
+  //
+  // A paste handler cannot repair this: in real browsers the paste event
+  // fires BEFORE the default insertion mutates the DOM, so any handler
+  // (or nextTick scheduled from it) still reads the empty value. The
+  // input event with inputType "insertFromPaste" fires AFTER the browser
+  // has written the pasted text, so syncing the model from the DOM at
+  // that stage restores readiness even when vModelText skipped the
+  // update. This is a no-op whenever v-model already picked up the
+  // change.
+  if (event instanceof InputEvent && event.inputType === 'insertFromPaste') {
+    const field = event.target as HTMLTextAreaElement | null
     if (field && inputText.value !== field.value) {
       inputText.value = field.value
     }
-  })
+  }
 }
 
 const fileInputEl = ref<HTMLInputElement | null>(null)
