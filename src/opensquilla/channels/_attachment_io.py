@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -129,11 +130,11 @@ async def materialize_attachment(attachment: Any) -> Path:
 def _write_temp(payload: bytes, *, name: str | None) -> Path:
     """Write bytes to a temp file with a sane suffix from the attachment name."""
 
-    suffix = Path(name or "").suffix.lower()[:16] if name else ""
+    suffix = Path(Path(name or "").name).suffix.lower()[:16] if name else ""
     fd, raw_path = tempfile.mkstemp(prefix="opensquilla-channel-", suffix=suffix)
     path = Path(raw_path)
     try:
-        with open(fd, "wb") as handle:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
     except BaseException:
         path.unlink(missing_ok=True)

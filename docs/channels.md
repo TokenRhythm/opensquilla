@@ -93,12 +93,14 @@ Both directions are supported:
 - **Inbound (user → bot)**: the adapter resolves the platform's media
   reference into an attachment that feeds the shared ingest pipeline.
   Telegram (photos/documents), Feishu (images/files), Discord, Matrix, Slack
-  (`files` array, downloaded with the bot token), and WeCom webhook images
-  (`PicUrl`) are supported. DingTalk and QQ keep a text marker for media.
+  (`files` array, downloaded with the bot token), WeCom webhook images
+  (`PicUrl`), and QQ (attachments array) are supported. DingTalk keeps a
+  text marker for media.
 - **Outbound (bot → user)**: `OutgoingMessage.attachments` are delivered via
   each channel's native upload (`send_file`); Telegram routes images to
-  `sendPhoto`, WeCom/Feishu/Slack/Discord/Matrix upload the file, and
-  DingTalk/QQ degrade to a text notice.
+  `sendPhoto`, QQ uploads via the official rich-media API, and
+  WeCom/Feishu/Slack/Discord/Matrix upload the file. DingTalk degrades to a
+  text notice (no file API on the stream robot path).
 
 ### Authenticated Admission
 

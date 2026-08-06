@@ -604,9 +604,11 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         )
         file_info = ""
         if isinstance(upload, dict):
+            data = upload.get("data")
+            data_info = data.get("file_info") if isinstance(data, dict) else None
             file_info = str(
                 upload.get("file_info")
-                or upload.get("data", {}).get("file_info")
+                or data_info
                 or ""
             )
         if not file_info:
