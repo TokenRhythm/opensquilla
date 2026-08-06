@@ -15,6 +15,9 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import httpx
 import structlog
 
+from opensquilla.contracts.attachments import (
+    IMAGE_ATTACHMENT_MIMES as _IMAGE_MIMES,
+)
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
 from opensquilla.provider.failures import classify_provider_error
@@ -467,6 +470,54 @@ def _estimate_tokens(text: str) -> int:
     return estimate_tokens(text)
 
 
+def _strip_inline_image_data(content: str) -> str:
+    """Return envelope content with image attachment base64 payloads removed.
+
+    User messages carrying images are persisted as a JSON envelope
+    ``{"text": "...", "attachments": [{"type": "image/png", "data": "<b64>"}...]}``
+    (see gateway/rpc_sessions.py:_persist_user_message). Counting the raw base64
+    string inflates the token/char estimate to millions of "tokens" for a single
+    attachment — far above any context window — which made every image-carrying
+    turn look like a durable overflow and triggered repeated compaction.
+    Providers bill image blocks by resolution, not base64 character count, so
+    the payload is excluded from the model-replay estimate. Non-image attachment
+    data is left intact because text/PDF/office payloads genuinely replay as text.
+    Non-envelope strings pass through unchanged.
+    """
+    if not content or not content.lstrip().startswith("{"):
+        return content
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return content
+    if not isinstance(parsed, dict) or "text" not in parsed:
+        return content
+    atts = parsed.get("attachments")
+    if not isinstance(atts, list) or not atts:
+        return content
+    changed = False
+    rebuilt: list[Any] = []
+    for att in atts:
+        if not isinstance(att, dict):
+            rebuilt.append(att)
+            continue
+        media = att.get("type") or att.get("mime") or att.get("media_type")
+        if (
+            isinstance(media, str)
+            and media in _IMAGE_MIMES
+            and isinstance(att.get("data"), str)
+        ):
+            changed = True
+            rebuilt.append({key: value for key, value in att.items() if key != "data"})
+            continue
+        rebuilt.append(att)
+    if not changed:
+        return content
+    rebuilt_payload = dict(parsed)
+    rebuilt_payload["attachments"] = rebuilt
+    return json.dumps(rebuilt_payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
 def _entry_get(entry: Any, key: str, default: Any = None) -> Any:
     if isinstance(entry, dict):
         return entry.get(key, default)
@@ -481,9 +532,14 @@ def _json_text(value: Any) -> str:
 
 
 def estimate_entry_replay_tokens(entry: Any) -> int:
-    """Estimate the compaction-input size of a persisted transcript entry."""
+    """Estimate the compaction-input size of a persisted transcript entry.
 
-    content = _entry_get(entry, "content") or ""
+    Attachment-envelope content is collapsed the same way the compaction LLM
+    input is built (``_summarize_if_envelope``) so the estimate measures what
+    the compactor actually consumes — never the raw attachment base64.
+    """
+
+    content = _summarize_if_envelope(str(_entry_get(entry, "content") or ""))
     token_count = _entry_get(entry, "token_count")
     try:
         persisted_tokens = int(token_count or 0)
@@ -514,15 +570,21 @@ def estimate_entry_replay_tokens(entry: Any) -> int:
 
 
 def estimate_entry_model_replay_tokens(entry: Any) -> int:
-    """Estimate the full transcript payload size replayed to the model."""
+    """Estimate the full transcript payload size replayed to the model.
 
-    content = _entry_get(entry, "content") or ""
+    Image attachment base64 is excluded from the estimate
+    (``_strip_inline_image_data``): providers bill image blocks by resolution,
+    not base64 character count, so counting the base64 made a single uploaded
+    image look like millions of tokens and triggered repeated compaction.
+    """
+
+    content = _strip_inline_image_data(str(_entry_get(entry, "content") or ""))
     token_count = _entry_get(entry, "token_count")
     try:
         persisted_tokens = int(token_count or 0)
     except (TypeError, ValueError):
         persisted_tokens = 0
-    estimated_content_tokens = _estimate_tokens(str(content)) if content else 0
+    estimated_content_tokens = _estimate_tokens(content) if content else 0
     content_tokens = max(persisted_tokens, estimated_content_tokens)
 
     extra_parts: list[str] = []
@@ -540,11 +602,16 @@ def estimate_entry_model_replay_tokens(entry: Any) -> int:
 
 
 def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
-    """Return only fields that can affect provider-visible history replay."""
+    """Return only fields that can affect provider-visible history replay.
+
+    Image attachment base64 is stripped before serialization so the char
+    estimate matches the token estimate (image blocks are billed by resolution,
+    not base64 length).
+    """
 
     payload: dict[str, Any] = {
         "role": str(_entry_get(entry, "role") or ""),
-        "content": _entry_get(entry, "content") or "",
+        "content": _strip_inline_image_data(str(_entry_get(entry, "content") or "")),
     }
     for key in ("tool_calls", "tool_call_id", "reasoning_content"):
         value = _entry_get(entry, key)

@@ -120,6 +120,144 @@ def test_image_ref_hydrates_for_current_provider_call(tmp_path: Path) -> None:
     assert image_blocks[0].data == _b64(b"\x89PNG\r\n\x1a\n")
 
 
+# ---------------------------------------------------------------------------
+# Vision degradation — images are NOT sent to a model that is definitely
+# non-vision capable (fix for "图生图/文生图上传图片，无视觉模型报错").
+# ---------------------------------------------------------------------------
+
+
+def _blocks(out: list) -> list:
+    assert out is not None
+    return list(out[0].content)
+
+
+def test_image_emits_image_block_when_vision_unknown() -> None:
+    # model_supports_vision=None (unknown catalog fact) keeps historical
+    # behavior: the image block is sent.
+    out = TurnRunner._build_attachment_messages(
+        "describe",
+        [{"type": "image/png", "data": _b64(b"\x89PNG\r\n\x1a\n"), "name": "p.png"}],
+        model_supports_vision=None,
+    )
+    assert any(isinstance(b, ContentBlockImage) for b in _blocks(out))
+
+
+def test_image_emits_image_block_when_vision_supported() -> None:
+    out = TurnRunner._build_attachment_messages(
+        "describe",
+        [{"type": "image/png", "data": _b64(b"\x89PNG\r\n\x1a\n"), "name": "p.png"}],
+        model_supports_vision=True,
+    )
+    assert any(isinstance(b, ContentBlockImage) for b in _blocks(out))
+
+
+def test_image_degraded_for_non_vision_model_materializes_to_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    out = TurnRunner._build_attachment_messages(
+        "describe",
+        [{"type": "image/png", "data": _b64(b"\x89PNG\r\n\x1a\n"), "name": "p.png"}],
+        workspace_dir=workspace,
+        session_id="s1",
+        media_root=media_root,
+        model_supports_vision=False,
+    )
+    blocks = _blocks(out)
+    assert not any(isinstance(b, ContentBlockImage) for b in blocks)
+    text_blocks = [b for b in blocks if isinstance(b, ContentBlockText)]
+    assert len(text_blocks) == 2
+    marker = text_blocks[1].text
+    assert "image omitted" in marker
+    assert "p.png" in marker
+    assert "image/png" in marker
+    # Bytes landed in the workspace so tools can still reach the image.
+    attachments_root = workspace / ".opensquilla" / "attachments"
+    materialized = [
+        p for p in attachments_root.rglob("*") if p.is_file()
+    ] if attachments_root.exists() else []
+    assert len(materialized) == 1
+    assert materialized[0].read_bytes() == b"\x89PNG\r\n\x1a\n"
+
+
+def test_image_degraded_for_non_vision_model_without_workspace() -> None:
+    # No workspace -> marker still emitted, no materialization attempt.
+    out = TurnRunner._build_attachment_messages(
+        "describe",
+        [{"type": "image/png", "data": _b64(b"\x89PNG\r\n\x1a\n"), "name": "p.png"}],
+        model_supports_vision=False,
+    )
+    blocks = _blocks(out)
+    assert not any(isinstance(b, ContentBlockImage) for b in blocks)
+    text_blocks = [b for b in blocks if isinstance(b, ContentBlockText)]
+    assert any("image omitted" in b.text for b in text_blocks)
+
+
+def test_image_ref_degraded_for_non_vision_model(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    out = TurnRunner._build_attachment_messages(
+        "describe",
+        [_ref(tmp_path, b"\x89PNG\r\n\x1a\n", name="p.png", mime="image/png")],
+        workspace_dir=workspace,
+        session_id="s1",
+        media_root=tmp_path,
+        model_supports_vision=False,
+    )
+    blocks = _blocks(out)
+    assert not any(isinstance(b, ContentBlockImage) for b in blocks)
+    text_blocks = [b for b in blocks if isinstance(b, ContentBlockText)]
+    assert any("image omitted" in b.text for b in text_blocks)
+
+
+def test_non_image_attachments_unaffected_by_vision_flag(tmp_path: Path) -> None:
+    # The vision flag only changes the image branch; text attachments still
+    # produce their file-context block.
+    out = TurnRunner._build_attachment_messages(
+        "read",
+        [
+            {
+                "type": "text/plain",
+                "data": _b64(b"hello world"),
+                "name": "a.txt",
+            }
+        ],
+        model_supports_vision=False,
+    )
+    text_blocks = [b for b in _blocks(out) if isinstance(b, ContentBlockText)]
+    assert any("<file" in b.text and "hello world" in b.text for b in text_blocks)
+
+
+def test_model_vision_capability_known_distinguishes_synthesized_models() -> None:
+    """Unknown models (synthesized floor) must NOT count as definite facts."""
+    from types import SimpleNamespace
+
+    class _FakeCatalog:
+        def resolve_entry(self, model, *, provider=""):  # noqa: ARG002
+            if model == "deepseek/deepseek-v4-flash":
+                return SimpleNamespace(source="snapshot", supports_vision=False)
+            return SimpleNamespace(source="synthesized", supports_vision=False)
+
+    runner = TurnRunner(provider_selector=object())  # type: ignore[arg-type]
+    runner._model_catalog = _FakeCatalog()  # type: ignore[attr-defined]
+    assert (
+        runner._model_vision_capability_known(
+            "deepseek/deepseek-v4-flash", "deepseek"
+        )
+        is True
+    )
+    assert (
+        runner._model_vision_capability_known("brand-new-model", "openrouter")
+        is False
+    )
+    # No catalog -> no definite knowledge.
+    runner._model_catalog = None  # type: ignore[attr-defined]
+    assert runner._model_vision_capability_known("deepseek/deepseek-v4-flash", "deepseek") is False
+
+
 def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
     content = json.dumps(
         {

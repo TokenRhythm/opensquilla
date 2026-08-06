@@ -34,6 +34,7 @@ class _RecordingBuilder:
         *,
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
+        model_supports_vision: bool | None = None,
     ) -> list[Any] | None:
         self.calls.append(
             {
@@ -41,6 +42,7 @@ class _RecordingBuilder:
                 "attachments": attachments,
                 "workspace_dir": workspace_dir,
                 "session_id": session_id,
+                "model_supports_vision": model_supports_vision,
             }
         )
         if self.raises is not None:
@@ -85,6 +87,7 @@ async def test_no_attachments_returns_runtime_message_as_turn_input(
             "attachments": [],
             "workspace_dir": None,
             "session_id": None,
+            "model_supports_vision": None,
         }
     ]
 
@@ -115,6 +118,7 @@ async def test_builder_returns_messages_clears_turn_input() -> None:
             "attachments": [{"type": "image/png", "data": "AA=="}],
             "workspace_dir": "/workspace/main",
             "session_id": "session-a",
+            "model_supports_vision": None,
         }
     ]
 

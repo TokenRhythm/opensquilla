@@ -35,6 +35,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TokenRhythm catalog refreshes now use bounded lazy caching, last-good
   snapshots, authority isolation, credential-safe persistence, and explicit
   refresh/credential lifecycle invalidation without a background timer.
+- Image attachments no longer reach a resolved model that is definitely not
+  vision-capable: the image is materialized into the agent workspace and the
+  model receives a text marker naming the workspace path instead of a doomed
+  request that upstream rejects with a vision capability error (and instead of
+  inflating the model context). Unknown models (synthesized catalog entries)
+  are left unchanged.
+- Compaction token/char estimates no longer count inline image base64 payloads
+  (providers bill image blocks by resolution, not base64 length), so a single
+  uploaded image no longer makes every image-carrying turn look like a durable
+  overflow and trigger repeated compaction.
 
 ### Changed
 

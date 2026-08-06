@@ -1398,6 +1398,7 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         *,
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
+        model_supports_vision: bool | None = None,
     ) -> list[Any] | None:
         return self._runner._build_attachment_messages(
             message,
@@ -1409,6 +1410,7 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
             workspace_attachment_budget_bytes=(
                 workspace_attachment_budget_from_config(self._runner._config)
             ),
+            model_supports_vision=model_supports_vision,
         )
 
 
