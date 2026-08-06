@@ -17,7 +17,7 @@ from opensquilla.cli.agent_cmd import (
     run_agent_command,
     run_agent_once,
 )
-from opensquilla.engine.types import ArtifactEvent, DoneEvent
+from opensquilla.engine.types import ArtifactEvent, DoneEvent, ThinkingEvent
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, PermissionsConfig
 from opensquilla.project_workspaces import (
     ProjectWorkspaceStateError,
@@ -282,6 +282,51 @@ async def test_run_agent_once_collects_artifact_events(
     assert result.artifacts[0]["download_url"] == "/api/v1/artifacts/art-cli"
 
 
+@pytest.mark.asyncio
+async def test_run_agent_once_continues_when_stderr_event_sink_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.agent_event_stream import StderrAgentEventSink
+
+    class FakeTurnRunner:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            yield ThinkingEvent(text="private")
+            yield DoneEvent(text="ok")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config)
+
+    class BrokenStream:
+        def __init__(self) -> None:
+            self.write_calls = 0
+
+        def write(self, _value: str) -> int:
+            self.write_calls += 1
+            raise BrokenPipeError("synthetic closed stderr")
+
+        def flush(self) -> None:
+            raise AssertionError("flush must not follow a failed write")
+
+    stream = BrokenStream()
+    sink = StderrAgentEventSink(stream=stream)  # type: ignore[arg-type]
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services",
+        lambda _services: FakeTurnRunner(),
+    )
+
+    result = await run_agent_once(
+        message="hello",
+        config=GatewayConfig(),
+        event_sink=sink,
+    )
+
+    assert result.status == "ok"
+    assert result.text == "ok"
+    assert sink.active is False
+    assert stream.write_calls == 2
+
+
 def test_run_agent_command_json_includes_artifacts(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -360,6 +405,7 @@ def test_run_agent_command_direct_call_normalizes_typer_defaults(
     assert captured["thinking"] is None
     assert captured["transcript_path"] is None
     assert captured["usage_path"] is None
+    assert captured["event_sink"] is None
     assert captured["session_db_path"] == ":memory:"
     assert captured["no_memory_capture"] is False
     assert captured["attachment_paths"] == []
@@ -367,6 +413,31 @@ def test_run_agent_command_direct_call_normalizes_typer_defaults(
     assert captured["stateless"] is False
     assert captured["stateless_keep_project_rules"] is False
     assert captured["permissions"] is None
+
+
+def test_run_agent_command_enables_stderr_event_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.agent_event_stream import StderrAgentEventSink
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_agent_once(**kwargs: Any) -> AgentRunResult:
+        captured.update(kwargs)
+        return AgentRunResult(
+            status="ok",
+            agent_id="main",
+            session_key="agent:main:main",
+            text="ok",
+            usage={},
+            errors=[],
+        )
+
+    monkeypatch.setattr("opensquilla.cli.agent_cmd.run_agent_once", fake_run_agent_once)
+
+    run_agent_command(message="hello", event_stream_stderr=True)
+
+    assert isinstance(captured["event_sink"], StderrAgentEventSink)
 
 
 def test_run_agent_command_json_includes_routing(
@@ -1649,6 +1720,27 @@ def test_top_level_agent_command_accepts_automation_options(
         "reports/*.txt, tmp/**",
         "generated/**",
     ]
+
+
+def test_top_level_agent_command_accepts_event_stream_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.main import app
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_agent_command(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("opensquilla.cli.main.run_agent_command", fake_run_agent_command)
+
+    result = CliRunner().invoke(
+        app,
+        ["agent", "--message", "hello", "--json", "--event-stream-stderr"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["event_stream_stderr"] is True
 
 
 def test_top_level_agent_command_accepts_length_capped_continuations(
