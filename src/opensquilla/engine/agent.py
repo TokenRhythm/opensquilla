@@ -8062,6 +8062,27 @@ class Agent:
                                             else str(self.config.model_id or "")
                                         ),
                                     )
+                                    # Done-path adds raw_ev.billed_cost to the
+                                    # turn gate accumulator; ErrorEvent has no
+                                    # billed_cost field, so sum provider_billed
+                                    # breakdown rows or the gate never fires.
+                                    for usage_row in raw_ev.model_usage_breakdown:
+                                        if not isinstance(usage_row, dict):
+                                            continue
+                                        if (
+                                            str(
+                                                usage_row.get("cost_source")
+                                                or usage_row.get("costSource")
+                                                or ""
+                                            )
+                                            != "provider_billed"
+                                        ):
+                                            continue
+                                        total_billed_cost += _usage_float(
+                                            usage_row.get("billed_cost")
+                                            or usage_row.get("billed_cost_usd")
+                                            or 0.0
+                                        )
                                     cost_receipt_counted = True
                                 # One-shot thinking/reasoning fallback
                                 _err_lower = raw_ev.message.lower()

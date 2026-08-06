@@ -674,6 +674,65 @@ async def test_agent_stops_when_turn_billed_cost_budget_is_exceeded() -> None:
     )
 
 
+class _ErrorUsageReceiptProvider:
+    """Ensemble-style error that still carries provider_billed receipts."""
+
+    provider_name = "ensemble"
+
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(messages)
+        return self._stream()
+
+    async def _stream(self) -> AsyncIterator[Any]:
+        yield ProviderError(
+            message="aggregator failed after proposer usage",
+            code="500",
+            model_usage_breakdown=[
+                {
+                    "model": "proposer-a",
+                    "provider": "tokenrhythm",
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "billed_cost": 0.25,
+                    "cost_source": "provider_billed",
+                }
+            ],
+        )
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_when_error_path_billed_cost_budget_is_exceeded() -> None:
+    """Error-path receipts must feed total_billed_cost or the gate is bypassed."""
+    provider = _ErrorUsageReceiptProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_turn_billed_cost_usd=0.1,
+            max_iterations=5,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert any(
+        event.kind == "error" and event.code == "turn_billed_cost_budget_exceeded"
+        for event in events
+    )
+    # Without the fix, retries would keep calling after the billed receipt.
+    assert len(provider.calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_agent_stops_when_turn_tool_error_budget_is_exceeded() -> None:
     provider = _LoopingToolProvider()
