@@ -45,6 +45,7 @@ from opensquilla.channels.contract import (
     ChannelSendResult,
 )
 from opensquilla.channels.types import (
+    Attachment,
     AuthenticatedPrincipal,
     ChannelHealth,
     IncomingMessage,
@@ -871,10 +872,22 @@ class WeComChannel:
         chat_id = self._xml_text(root, "ChatId") or to_user
         channel_id = chat_id if is_group else from_user
 
+        attachments: list[Attachment] = []
         if msg_type == "text":
             content = self._xml_text(root, "Content")
         elif msg_type == "image":
-            content = "[image]"
+            pic_url = self._xml_text(root, "PicUrl")
+            if pic_url:
+                attachments.append(
+                    Attachment(
+                        name="wecom-image",
+                        mime_type="image/jpeg",
+                        url=pic_url,
+                    )
+                )
+                content = "[image]"
+            else:
+                content = "[image]"
         elif msg_type == "voice":
             content = "[voice]"
         elif msg_type == "event":
@@ -903,6 +916,7 @@ class WeComChannel:
             sender_id=sender_id,
             channel_id=channel_id or "unknown",
             content=content,
+            attachments=attachments,
             metadata=metadata,
             provenance=IngressProvenance(
                 provider="wecom",
@@ -1000,6 +1014,22 @@ class WeComChannel:
         if self.config.connection_mode == "websocket":
             await self._send_websocket_message(message)
             return
+
+        attachments = list(message.attachments or [])
+        if attachments:
+            target = str(message.reply_to or message.metadata.get("touser") or "").strip()
+            if not target:
+                raise WeComApiError("an explicit touser target is required for attachments")
+            from opensquilla.channels._attachment_io import deliver_message_attachments
+
+            await deliver_message_attachments(
+                self,
+                target=target,
+                content=message.content,
+                attachments=attachments,
+            )
+            if not message.content.strip():
+                return
 
         token = await self._get_token()
         client = self._get_client()

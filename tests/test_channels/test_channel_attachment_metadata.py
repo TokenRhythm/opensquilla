@@ -11,6 +11,7 @@ from opensquilla.channels._attachment_io import (
 )
 from opensquilla.channels.discord import DiscordChannel, DiscordChannelConfig
 from opensquilla.channels.matrix import MatrixChannel, MatrixChannelConfig
+from opensquilla.channels.slack import SlackChannel, _slack_event_attachments
 from opensquilla.channels.telegram import TelegramChannel, TelegramChannelConfig
 from opensquilla.channels.types import Attachment
 from opensquilla.contracts.attachments import (
@@ -296,6 +297,58 @@ async def test_telegram_oversize_declared_attachment_skips_get_file() -> None:
                 metadata={"telegram_file_id": "file-1"},
             )
         )
+
+
+def test_slack_event_attachments_extracts_files() -> None:
+    attachments = _slack_event_attachments(
+        {
+            "files": [
+                {
+                    "name": "report.pdf",
+                    "mimetype": "application/pdf",
+                    "url_private": "https://files.slack.com/files/T1/report.pdf",
+                    "size": 2048,
+                },
+                {"name": "no-url.txt", "mimetype": "text/plain"},
+                "not-a-dict",
+            ]
+        }
+    )
+    assert len(attachments) == 1
+    assert attachments[0].name == "report.pdf"
+    assert attachments[0].mime_type == "application/pdf"
+    assert attachments[0].url == "https://files.slack.com/files/T1/report.pdf"
+    assert attachments[0].size == 2048
+
+
+def test_slack_event_without_files_yields_no_attachments() -> None:
+    assert _slack_event_attachments({"text": "hello"}) == []
+
+
+@pytest.mark.asyncio
+async def test_slack_resolve_inbound_attachment_downloads_with_token() -> None:
+    import httpx
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer xoxb-test"
+        return httpx.Response(200, content=b"pdf-bytes")
+
+    channel = SlackChannel(token="xoxb-test", slack_channel_id="C123")
+    channel._client = httpx.AsyncClient(
+        base_url="https://slack.com/api",
+        headers={"Authorization": "Bearer xoxb-test"},
+        transport=httpx.MockTransport(handler),
+    )
+    resolved = await channel.resolve_inbound_attachment(
+        Attachment(
+            name="report.pdf",
+            mime_type="application/pdf",
+            url="https://files.slack.com/files/T1/report.pdf",
+            size=9,
+        )
+    )
+    assert resolved.data == b"pdf-bytes"
+    assert resolved.size == 9
 
 
 @pytest.mark.asyncio

@@ -442,6 +442,17 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         meta = message.metadata or {}
         chat_type = meta.get("chat_type", "")
         msg_id = meta.get("msg_id") or meta.get("reply_to_msg_id") or message.reply_to
+        if message.attachments:
+            # The official QQ Bot platform has no file/media upload API on the
+            # passive message path; degrade to a text notice instead of
+            # silently dropping the attachment.
+            names = ", ".join(str(a.name or "attachment") for a in message.attachments)
+            suffix = (
+                f"\n\n[附件未支持: {names}]"
+                if message.content.strip()
+                else f"[附件未支持: {names}]"
+            )
+            message = message.model_copy(update={"content": message.content + suffix})
 
         api = self.api
         if chat_type == "group":

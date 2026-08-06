@@ -685,6 +685,29 @@ class TelegramChannel:
         return OutgoingMessage(content=content, reply_to=inbound.channel_id, metadata=metadata)
 
     async def send(self, message: OutgoingMessage) -> dict[str, Any]:
+        # Deliver file/image attachments first; the text reply follows so the
+        # caption stays attached to the last media and the text is not dropped.
+        attachments = list(message.attachments or [])
+        if attachments:
+            chat_id = str(
+                message.metadata.get("chat_id")
+                or message.metadata.get("channel_id")
+                or message.reply_to
+                or self.config.default_chat_id
+                or ""
+            )
+            if not chat_id:
+                raise ValueError("telegram.send requires chat_id for attachments")
+            from opensquilla.channels._attachment_io import deliver_message_attachments
+
+            await deliver_message_attachments(
+                self,
+                target=chat_id,
+                content=message.content,
+                attachments=attachments,
+            )
+            if not message.content.strip():
+                return {"result": "ok"}
         # Telegram hard-rejects sendMessage when text exceeds 4096 chars, which
         # would otherwise drop the entire reply. Split long content into
         # sequential messages so the full answer is delivered.
@@ -749,25 +772,30 @@ class TelegramChannel:
         if content:
             payload["caption"] = content
         client = self._get_client()
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        method = "sendPhoto" if path.suffix.lower() in image_exts else "sendDocument"
+        field = "photo" if method == "sendPhoto" else "document"
         with path.open("rb") as f:
             response = await client.post(
-                f"/bot{self.config.token}/sendDocument",
+                f"/bot{self.config.token}/{method}",
                 data=payload,
-                files={"document": (path.name, f)},
+                files={field: (path.name, f)},
             )
         response.raise_for_status()
         data = response.json()
         if data.get("ok") is not True:
-            raise TelegramApiError(data.get("description", "Telegram sendDocument failed"))
+            raise TelegramApiError(data.get("description", f"Telegram {method} failed"))
         raw_result = data.get("result")
         result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
-        raw_document = result.get("document")
-        document: dict[str, Any] = raw_document if isinstance(raw_document, dict) else {}
+        media = result.get("photo") or result.get("document")
+        media_payload: dict[str, Any] = media if isinstance(media, dict) else {}
+        if isinstance(media, list) and media:
+            media_payload = dict(media[-1])
         return ChannelSendResult.sent(
             capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
             target_id=str(chat_id),
             provider_message_id=str(result.get("message_id", "")),
-            provider_file_id=str(document.get("file_id", "")),
+            provider_file_id=str(media_payload.get("file_id", "")),
         )
 
     def _build_send_payload(self, message: OutgoingMessage) -> dict[str, Any]:
