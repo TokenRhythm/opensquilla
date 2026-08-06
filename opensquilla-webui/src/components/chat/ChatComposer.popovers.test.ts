@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, type App } from 'vue'
+import { createApp, h, nextTick, reactive, type App } from 'vue'
 import i18n from '@/i18n'
 import ChatComposer from './ChatComposer.vue'
 
@@ -160,6 +160,55 @@ describe('ChatComposer popovers', () => {
     await clickButton(el, 'Execution mode')
     expectPopover(el, '.composer-model-routing', false)
     expectPopover(el, '.composer-run-mode', true)
+
+    app.unmount()
+  })
+
+  it('closes every open popover when the composer collapses', async () => {
+    const props = reactive({
+      modelValue: '',
+      'onUpdate:modelValue': () => {},
+      attachments: [],
+      busySendMode: 'queue',
+      hasSendContent: false,
+      isStreaming: false,
+      isNewLanding: false,
+      placeholder: 'Send a message',
+      sendButtonTitle: 'Send',
+      runMode: 'safe',
+      allowedRunModes: ['safe', 'full'],
+      modelRoutingMode: 'off',
+      modelRoutingSettingsBusy: false,
+      routerVisualEffectsEnabled: true,
+      codingModeEnabled: false,
+      codingModeSettingsBusy: false,
+      voiceBusy: false,
+      voiceRecording: false,
+      voiceReady: true,
+      runModeLocked: false,
+      runModeLockMessage: '',
+      collapsed: false,
+    })
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp({ render: () => h(ChatComposer, props as any) })
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    await clickButton(el, 'More')
+    expectPopover(el, '.chat-more-actions-menu', true)
+    expect(el.querySelector('.chat-input-footer')?.classList.contains('chat-input-footer--popover-open')).toBe(true)
+
+    props.collapsed = true
+    await nextTick()
+    expectPopover(el, '.chat-more-actions-menu', false)
+    expect(el.querySelector('.chat-input-footer')?.classList.contains('chat-input-footer--popover-open')).toBe(false)
+
+    // re-expanding keeps the menu closed
+    props.collapsed = false
+    await nextTick()
+    expectPopover(el, '.chat-more-actions-menu', false)
 
     app.unmount()
   })
