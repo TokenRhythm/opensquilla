@@ -361,6 +361,7 @@ jobs:
           node scripts/test-desktop-window-lifecycle.mjs
           node scripts/test-bundled-runtimes.mjs
           node scripts/test-desktop-cleanup-contract.mjs
+          node scripts/test-desktop-renderer-log.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
           node ../../.github/scripts/verify-sandbox-package.mjs --source
