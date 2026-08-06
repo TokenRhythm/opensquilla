@@ -1,7 +1,8 @@
-import { computed, ref, type Ref } from 'vue'
+import { ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 
 export type ChatCompactStatusTone = 'info' | 'ok' | 'warn' | 'err' | string
+export type ChatCompactionPlacement = 'activity' | 'standalone'
 
 export interface ChatCompactStatus {
   visible: boolean
@@ -10,18 +11,18 @@ export interface ChatCompactStatus {
   tone: ChatCompactStatusTone
   isBusy: boolean
   status: string
-  /** Real context occupancy percent (0-100) from the event payload; null = unknown. */
-  occupancyPercent: number | null
-  /** Compact label for the context window size (e.g. "200k"); '' = unknown. */
-  contextWindowLabel: string
+  source: string
+  compactionId: string
+  durability: string
 }
 
 export interface ShowCompactStatusOptions {
   tone?: ChatCompactStatusTone
   detail?: string
   dismissMs?: number
-  occupancyPercent?: number | null
-  contextWindowLabel?: string
+  source?: string
+  compactionId?: string
+  durability?: string
 }
 
 export interface UseChatCompactionOptions {
@@ -43,10 +44,15 @@ interface ChatCompactPayload extends Record<string, unknown> {
   errorClass?: string
   error_class?: string
   error?: { reason?: string; code?: string }
-  context_window_tokens?: unknown
-  contextWindowTokens?: unknown
-  tokens_before?: unknown
-  tokensBefore?: unknown
+  compaction_id?: unknown
+  compactionId?: unknown
+  sequence?: unknown
+  heartbeat?: unknown
+  stage?: unknown
+  phase?: unknown
+  durability?: unknown
+  user_visible?: unknown
+  userVisible?: unknown
 }
 
 interface SettleCompactOptions {
@@ -55,7 +61,29 @@ interface SettleCompactOptions {
 }
 
 interface ChatCompactMeta {
-  replayed?: boolean
+  replayed?: unknown
+  placement?: unknown
+  authoritativeLive?: unknown
+}
+
+interface TrackedCompactionPlacement {
+  placement: ChatCompactionPlacement
+  provisional: boolean
+}
+
+const COMPACTION_TERMINAL_STATUSES = new Set([
+  'completed',
+  'skipped',
+  'stale',
+  'failed',
+  'error',
+  'cancelled',
+  'timed_out',
+  'emergency_ephemeral',
+])
+
+function isCompactionTerminalStatus(status: string): boolean {
+  return COMPACTION_TERMINAL_STATUSES.has(status)
 }
 
 const EMPTY_COMPACT_STATUS: ChatCompactStatus = {
@@ -65,8 +93,9 @@ const EMPTY_COMPACT_STATUS: ChatCompactStatus = {
   tone: 'info',
   isBusy: false,
   status: '',
-  occupancyPercent: null,
-  contextWindowLabel: '',
+  source: '',
+  compactionId: '',
+  durability: '',
 }
 
 function createEmptyCompactStatus(): ChatCompactStatus {
@@ -80,81 +109,15 @@ function toFiniteNumber(value: unknown): number | null {
   return Number.isFinite(num) ? num : null
 }
 
-function formatTokensCompact(tokens: number): string {
-  if (tokens >= 1000) return `${Math.round(tokens / 1000)}k`
-  return `${Math.round(tokens)}`
-}
-
-// Real occupancy needs both the window size and the current token count
-// (automatic preflight compaction sends tokens_before; manual and tier-upgrade
-// paths send only context_window_tokens). Anything less renders indeterminate.
-function parseContextOccupancy(payload: ChatCompactPayload): { percent: number; windowLabel: string } | null {
-  const windowTokens = toFiniteNumber(payload.context_window_tokens ?? payload.contextWindowTokens)
-  const usedTokens = toFiniteNumber(payload.tokens_before ?? payload.tokensBefore)
-  if (windowTokens === null || windowTokens <= 0 || usedTokens === null || usedTokens < 0) return null
-  return {
-    percent: Math.min(100, Math.max(0, Math.round((usedTokens / windowTokens) * 100))),
-    windowLabel: formatTokensCompact(windowTokens),
-  }
-}
-
 export function useChatCompaction(options: UseChatCompactionOptions) {
   const compactInFlight = ref(false)
   const compactInFlightKey = ref('')
+  const activeCompactionId = ref('')
   const compactStatus = ref<ChatCompactStatus>(createEmptyCompactStatus())
+  const lastSequenceById = new Map<string, number>()
+  const terminalCompactionIds = new Set<string>()
+  const placementByCompactionId = new Map<string, TrackedCompactionPlacement>()
   let dismissTimer: ReturnType<typeof setTimeout> | null = null
-
-  const compactTick = ref(0)
-  const compactStartedAtMs = ref(0)
-  const compactEndedAtMs = ref(0)
-  let elapsedTimer: ReturnType<typeof setInterval> | null = null
-
-  // Live elapsed seconds for the maintenance card. Empty until a real
-  // 'started' has been observed in this view, so terminal events arriving
-  // on their own (or replayed history) never show a fabricated duration.
-  const compactElapsed = computed(() => {
-    compactTick.value
-    if (!compactStartedAtMs.value) return ''
-    const end = compactEndedAtMs.value || Date.now()
-    const seconds = Math.max(0, Math.floor((end - compactStartedAtMs.value) / 1000))
-    return `${seconds}s`
-  })
-
-  function stopElapsedTimer() {
-    if (!elapsedTimer) return
-    clearInterval(elapsedTimer)
-    elapsedTimer = null
-  }
-
-  function startElapsedTicker() {
-    // A repeated 'started' (optimistic slash call followed by the gateway
-    // event) keeps the running clock instead of resetting it.
-    if (!compactStartedAtMs.value || compactEndedAtMs.value) {
-      compactStartedAtMs.value = Date.now()
-      compactEndedAtMs.value = 0
-    }
-    compactTick.value++
-    if (!elapsedTimer) {
-      elapsedTimer = setInterval(() => {
-        compactTick.value++
-      }, 1000)
-    }
-  }
-
-  function freezeElapsedTicker() {
-    stopElapsedTimer()
-    if (compactStartedAtMs.value && !compactEndedAtMs.value) {
-      compactEndedAtMs.value = Date.now()
-    }
-    compactTick.value++
-  }
-
-  function resetElapsedTicker() {
-    stopElapsedTimer()
-    compactStartedAtMs.value = 0
-    compactEndedAtMs.value = 0
-    compactTick.value++
-  }
 
   function clearDismissTimer() {
     if (!dismissTimer) return
@@ -167,14 +130,15 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     return !compactInFlightKey.value || compactInFlightKey.value === options.sessionKey.value
   }
 
-  function setCompactInFlight(active: boolean, key = options.sessionKey.value) {
+  function setCompactInFlight(active: boolean, key = options.sessionKey.value, compactionId = '') {
     compactInFlight.value = active
     compactInFlightKey.value = active ? String(key || options.sessionKey.value || '') : ''
+    if (active && compactionId) activeCompactionId.value = compactionId
+    if (!active) activeCompactionId.value = ''
   }
 
   function hideCompactStatus() {
     clearDismissTimer()
-    resetElapsedTicker()
     compactStatus.value = createEmptyCompactStatus()
   }
 
@@ -182,9 +146,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     clearDismissTimer()
     const previous = compactStatus.value
     const isBusy = status === 'started'
-    // Terminal events settle the gauge in place: keep the occupancy seen at
-    // start unless the caller supplies fresh values.
-    const carryGauge = previous.visible && !isBusy
+    // Lifecycle refinements may omit identity metadata. Keep it stable while
+    // the same standalone row is being updated.
+    const carryMetadata = previous.visible
     compactStatus.value = {
       visible: true,
       message,
@@ -192,15 +156,10 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       tone: statusOptions.tone || 'info',
       isBusy,
       status,
-      occupancyPercent: statusOptions.occupancyPercent !== undefined
-        ? statusOptions.occupancyPercent
-        : carryGauge ? previous.occupancyPercent : null,
-      contextWindowLabel: statusOptions.contextWindowLabel !== undefined
-        ? statusOptions.contextWindowLabel
-        : carryGauge ? previous.contextWindowLabel : '',
+      source: statusOptions.source ?? (carryMetadata ? previous.source : ''),
+      compactionId: statusOptions.compactionId ?? (carryMetadata ? previous.compactionId : ''),
+      durability: statusOptions.durability ?? (carryMetadata ? previous.durability : ''),
     }
-    if (isBusy) startElapsedTicker()
-    else freezeElapsedTicker()
     if (statusOptions.dismissMs && statusOptions.dismissMs > 0) {
       dismissTimer = setTimeout(() => {
         dismissTimer = null
@@ -222,7 +181,13 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     setCompactInFlight(false)
     const status = String(payload.status || '').toLowerCase()
     const compactedFlag = Object.prototype.hasOwnProperty.call(payload, 'compacted') ? !!payload.compacted : null
-    if (status === 'completed' || status === 'skipped' || (status === '' && compactedFlag !== null)) {
+    if (
+      status === 'completed'
+      || status === 'skipped'
+      || status === 'stale'
+      || status === 'emergency_ephemeral'
+      || (status === '' && compactedFlag !== null)
+    ) {
       options.schedulePendingDrainAfterTerminal()
     } else if (settleOptions.preservePending) {
       // Pending queue remains blocked until the user acts.
@@ -232,54 +197,275 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     return true
   }
 
-  function showCompactionToast(payload: ChatCompactPayload, meta: ChatCompactMeta = {}) {
-    if (meta.replayed) return
+  function payloadCompactionId(payload: ChatCompactPayload): string {
+    return String(payload.compaction_id ?? payload.compactionId ?? '').trim()
+  }
+
+  function rememberTerminalCompactionId(compactionId: string) {
+    terminalCompactionIds.add(compactionId)
+    if (terminalCompactionIds.size <= 256) return
+    const oldest = terminalCompactionIds.values().next().value
+    if (typeof oldest === 'string') {
+      terminalCompactionIds.delete(oldest)
+      lastSequenceById.delete(oldest)
+      placementByCompactionId.delete(oldest)
+    }
+  }
+
+  function resolveCompactionPlacement(
+    key: string,
+    requested: ChatCompactionPlacement,
+    options: { provisional?: boolean } = {},
+  ): TrackedCompactionPlacement {
+    const existing = placementByCompactionId.get(key)
+    if (existing) return existing
+    const tracked = {
+      placement: requested,
+      provisional: options.provisional === true,
+    }
+    placementByCompactionId.set(key, tracked)
+    return tracked
+  }
+
+  function getCompactionPlacement(compactionId: string): ChatCompactionPlacement | null {
+    const id = String(compactionId || '').trim()
+    return id ? placementByCompactionId.get(id)?.placement ?? null : null
+  }
+
+  function acceptCompactionEvent(
+    payload: ChatCompactPayload,
+    status: string,
+  ): boolean {
+    const payloadKey = String(payload.key || '')
+    if (payloadKey && payloadKey !== options.sessionKey.value) return false
+    const incomingId = payloadCompactionId(payload)
+    const terminal = isCompactionTerminalStatus(status)
+    // The wait:false RPC acknowledgement can race a very fast terminal event.
+    // Once an operation is terminal, its delayed "started" acknowledgement
+    // must not resurrect the busy indicator.
+    if (!terminal && incomingId && terminalCompactionIds.has(incomingId)) return false
+    if (terminal && incomingId && activeCompactionId.value && incomingId !== activeCompactionId.value) {
+      return false
+    }
+    // A reconnect terminal is authoritative even while an optimistic
+    // wait:false /compact is still waiting for its acknowledgement and has no
+    // id yet. Session stream cursors already scope replay to this session; the
+    // terminal-id cache prevents the delayed started acknowledgement from
+    // resurrecting the operation afterwards.
+    const sequence = toFiniteNumber(payload.sequence)
+    if (incomingId && sequence !== null) {
+      const previous = lastSequenceById.get(incomingId) ?? 0
+      if (sequence <= previous) return false
+      lastSequenceById.set(incomingId, sequence)
+    }
+    if (status === 'started' && incomingId) activeCompactionId.value = incomingId
+    if (terminal) {
+      if (incomingId) rememberTerminalCompactionId(incomingId)
+      activeCompactionId.value = ''
+    }
+    return true
+  }
+
+  function showCompactionToast(
+    payload: ChatCompactPayload,
+    meta: ChatCompactMeta = {},
+  ): false | ChatCompactionPlacement {
     let status = String(payload.status || '').toLowerCase()
     if (!status && Object.prototype.hasOwnProperty.call(payload, 'compacted')) {
       status = payload.compacted ? 'completed' : 'skipped'
     }
     const source = String(payload.source || '').toLowerCase()
+    const compactionId = payloadCompactionId(payload)
+    // Capture the active id before a terminal event settles it. Legacy id-less
+    // lifecycles still get one stable slot per source.
+    const placementKey = compactionId
+      || activeCompactionId.value
+      || `legacy:${source || 'automatic'}`
+    const terminal = isCompactionTerminalStatus(status)
+    const requestedPlacement: ChatCompactionPlacement = meta.placement === 'activity'
+      ? 'activity'
+      : 'standalone'
+    const authoritativeLive = meta.authoritativeLive === true
+    const visible = payload.user_visible ?? payload.userVisible ?? true
+    const trackedBefore = placementByCompactionId.get(placementKey)
+    let correctedPlacement: ChatCompactionPlacement | null = null
+    if (
+      trackedBefore?.provisional
+      && authoritativeLive
+      && (visible !== false || source === 'manual')
+    ) {
+      correctedPlacement = requestedPlacement === 'activity'
+        ? 'activity'
+        : trackedBefore.placement
+      placementByCompactionId.set(placementKey, {
+        placement: correctedPlacement,
+        provisional: false,
+      })
+    }
+    // Reconnect replay is authoritative for terminal state, but a replayed
+    // progress event must never resurrect an already-finished busy indicator.
+    // Legacy payloads without `status` remain supported via `compacted` above.
+    if (meta.replayed === true && !terminal) return false
+    if (!acceptCompactionEvent(payload, status)) {
+      // Snapshot ownership can arrive after the replayed terminal with the
+      // same lifecycle sequence. Placement reconciliation is still new work
+      // even though applying the terminal twice is not.
+      return terminal ? correctedPlacement ?? false : false
+    }
+    const trackedAfterAcceptance = placementByCompactionId.get(placementKey)
+    const canCloseTrackedHiddenFeedback = terminal
+      && trackedAfterAcceptance !== undefined
+      && !trackedAfterAcceptance.provisional
+    if (
+      visible === false
+      && source !== 'manual'
+      && !canCloseTrackedHiddenFeedback
+    ) return false
+
+    const optimisticStandaloneOwner = source === 'manual'
+      && (compactInFlight.value || compactStatus.value.visible)
+    if (
+      meta.replayed === true
+      && terminal
+      && !authoritativeLive
+      && !trackedAfterAcceptance
+      && !optimisticStandaloneOwner
+    ) {
+      // A replayed terminal proves the lifecycle ended but cannot identify a
+      // UI owner. Remember a non-rendering provisional placement; a subsequent
+      // authoritative live snapshot may promote it into the active Activity.
+      resolveCompactionPlacement(placementKey, requestedPlacement, { provisional: true })
+      return false
+    }
+
+    const tracked = trackedAfterAcceptance
+      ?? resolveCompactionPlacement(placementKey, requestedPlacement)
+    if (tracked.provisional) return false
+    const placement = tracked.placement
+    const inActivity = placement === 'activity'
 
     if (status === 'started') {
-      if (source === 'manual') setCompactInFlight(true, payload.key || options.sessionKey.value)
-      const occupancy = parseContextOccupancy(payload)
+      if (source === 'manual') {
+        setCompactInFlight(
+          true,
+          String(payload.key || options.sessionKey.value),
+          payloadCompactionId(payload),
+        )
+      }
+      if (inActivity) return placement
       showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
         tone: 'info',
-        occupancyPercent: occupancy ? occupancy.percent : null,
-        contextWindowLabel: occupancy ? occupancy.windowLabel : '',
+        source,
+        compactionId,
+        durability: String(payload.durability || ''),
       })
-      return
+      return placement
+    }
+    if (status === 'observed' || payload.heartbeat === true) {
+      if (inActivity) return placement
+      const stage = String(payload.stage || payload.phase || '').trim()
+      showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
+        tone: 'info',
+        detail: stage,
+      })
+      return placement
     }
     if (status === 'skipped') {
       settleCompactInFlight(payload || {})
-      showCompactStatus('skipped', i18n.global.t('chat.compact.withinBudget'), { tone: 'info', dismissMs: 5000 })
-      return
+      if (inActivity) return placement
+      showCompactStatus('skipped', i18n.global.t('chat.compact.withinBudget'), {
+        tone: 'info',
+        source,
+        compactionId,
+      })
+      return placement
+    }
+    if (status === 'stale') {
+      settleCompactInFlight(payload || {})
+      if (inActivity) return placement
+      showCompactStatus('stale', i18n.global.t('chat.compact.cancelled'), {
+        tone: 'warn',
+        detail: typeof payload.detail === 'string'
+          ? payload.detail
+          : typeof payload.reason === 'string' ? payload.reason : '',
+        dismissMs: 8000,
+      })
+      return placement
     }
     if (status === 'failed' || status === 'error') {
       const preservePending = compactFailureBlocksPending(payload || {})
       settleCompactInFlight(payload || {}, { preservePending })
-      showCompactStatus('failed', i18n.global.t('chat.compact.failed'), { tone: 'err', dismissMs: 10000 })
-      return
+      if (inActivity) return placement
+      showCompactStatus('failed', i18n.global.t('chat.compact.failed'), {
+        tone: 'err',
+        source,
+        compactionId,
+      })
+      return placement
+    }
+    if (status === 'timed_out') {
+      const preservePending = compactFailureBlocksPending(payload || {})
+      settleCompactInFlight(payload || {}, {
+        preservePending,
+        recoverPending: !preservePending,
+      })
+      if (inActivity) return placement
+      showCompactStatus('timed_out', i18n.global.t('chat.compact.failed'), {
+        tone: 'warn',
+        source,
+        compactionId,
+      })
+      return placement
     }
     if (status === 'cancelled') {
       settleCompactInFlight(payload || {}, { recoverPending: true })
-      showCompactStatus('cancelled', i18n.global.t('chat.compact.cancelled'), { tone: 'warn', dismissMs: 8000 })
-      return
+      if (inActivity) return placement
+      showCompactStatus('cancelled', i18n.global.t('chat.compact.cancelled'), {
+        tone: 'warn',
+        source,
+        compactionId,
+      })
+      return placement
+    }
+    if (status === 'emergency_ephemeral') {
+      settleCompactInFlight(payload || {})
+      if (inActivity) return placement
+      showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.compacted'), {
+        tone: 'warn',
+        detail: typeof payload.detail === 'string'
+          ? payload.detail
+          : i18n.global.t('chat.compact.requestScoped'),
+        source,
+        compactionId,
+        durability: 'request_scoped',
+      })
+      return placement
     }
     if (status === 'completed') {
       settleCompactInFlight(payload || {})
-      showCompactStatus('completed', i18n.global.t('chat.compact.compacted'), { tone: 'ok', dismissMs: 5000 })
+      if (inActivity) return placement
+      showCompactStatus('completed', i18n.global.t('chat.compact.compacted'), {
+        tone: 'ok',
+        source,
+        compactionId,
+        durability: String(payload.durability || ''),
+      })
+      return placement
     }
+    return false
   }
 
   function cleanup() {
     clearDismissTimer()
-    resetElapsedTicker()
+    activeCompactionId.value = ''
+    lastSequenceById.clear()
+    terminalCompactionIds.clear()
+    placementByCompactionId.clear()
   }
 
   return {
     compactStatus,
-    compactElapsed,
+    getCompactionPlacement,
     isCompactInFlightForCurrentSession,
     setCompactInFlight,
     hideCompactStatus,

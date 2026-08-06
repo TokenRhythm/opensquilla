@@ -36,6 +36,12 @@ from .error_redaction import redact_upstream_error_code, redact_upstream_error_t
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .openai_responses import _responses_input
 from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .request_proof import (
+    RESPONSES_REQUEST_ENVELOPE,
+    ProviderRequestBudgetExceededError,
+    project_final_request_payload,
+    prove_provider_payload_from_env,
+)
 from .stream_assembly import (
     DEFAULT_MAX_TOOL_CALLS,
     ReasoningAccumulator,
@@ -48,6 +54,7 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    ProviderFinalRequestProjection,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -118,6 +125,7 @@ def _reasoning_effort(cfg: ChatConfig) -> str:
 class OpenAICodexProvider:
     """Streams from the ChatGPT backend-api Responses endpoint via OAuth."""
 
+    final_request_admission_guaranteed = True
     provider_name = "openai_codex"
 
     def __init__(
@@ -188,33 +196,63 @@ class OpenAICodexProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
+        *,
+        logical_index_map: dict[int, int] | None = None,
+        emit_warnings: bool = True,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self._model,
             "instructions": cfg.system or "",
-            "input": _responses_input(messages),
+            "input": _responses_input(
+                messages,
+                logical_index_map=logical_index_map,
+                emit_warnings=emit_warnings,
+            ),
             "tool_choice": cfg.tool_choice or "auto",
             "parallel_tool_calls": True,
             "store": False,
             "stream": True,
             "include": ["reasoning.encrypted_content"],
         }
-        # The ChatGPT codex backend rejects max_output_tokens outright
-        # ("Unsupported parameter", verified live 2026-07-02), matching
-        # codex-rs which never sends it — subscription turns have no
-        # client-set output cap. Surface the dropped budget for operators
-        # instead of silently ignoring it.
-        if cfg.max_tokens > 0:
-            log.debug(
-                "openai_codex.max_tokens_unsupported",
-                requested_max_tokens=cfg.max_tokens,
-                model=self._model,
-            )
         if tools:
             payload["tools"] = [_codex_tool(tool) for tool in tools]
         if cfg.thinking:
             payload["reasoning"] = {"effort": _reasoning_effort(cfg), "summary": "auto"}
         return payload
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Codex Responses payload without auth I/O."""
+
+        cfg = config or ChatConfig()
+        logical_index_map: dict[int, int] = {}
+        payload = self._build_payload(
+            messages,
+            tools,
+            cfg,
+            logical_index_map=logical_index_map,
+            emit_warnings=False,
+        )
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
+        return project_final_request_payload(
+            payload,
+            projection_adapter="openai_codex",
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=wire_active_user_index,
+            message_limit=message_limit,
+        )
 
     def chat(
         self,
@@ -236,7 +274,73 @@ class OpenAICodexProvider:
             yield ErrorEvent(message=str(exc), code="401")
             return
 
-        payload = self._build_payload(messages, tools, cfg)
+        # The ChatGPT codex backend rejects max_output_tokens outright
+        # ("Unsupported parameter", verified live 2026-07-02), matching
+        # codex-rs which never sends it — subscription turns have no
+        # client-set output cap. Surface the dropped budget for operators
+        # instead of silently ignoring it.
+        if cfg.max_tokens > 0:
+            log.debug(
+                "openai_codex.max_tokens_unsupported",
+                requested_max_tokens=cfg.max_tokens,
+                model=self._model,
+            )
+        logical_index_map: dict[int, int] = {}
+        payload = self._build_payload(
+            messages,
+            tools,
+            cfg,
+            logical_index_map=logical_index_map,
+        )
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
+
+        from opensquilla.engine.context_budget import coordinate_provider_context_budget
+
+        budget_decision = coordinate_provider_context_budget(
+            payload,
+            projection_adapter="openai_codex",
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+            active_user_message_index=wire_active_user_index,
+        )
+        if budget_decision.action == "budget_limited":
+            proof = budget_decision.proof or {}
+            log.warning("provider.request_budget_exhausted", **proof)
+            yield ErrorEvent(
+                message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
+            )
+            return
+        payload = budget_decision.payload or payload
+        if budget_decision.proof is not None:
+            log.info("provider.request_proof", **budget_decision.proof)
+        try:
+            prove_provider_payload_from_env(
+                payload,
+                projection_adapter="openai_codex",
+                status_projection_mode="content_envelope",
+                envelope_shape=RESPONSES_REQUEST_ENVELOPE,
+                active_user_message_index=wire_active_user_index,
+            )
+        except ProviderRequestBudgetExceededError as exc:
+            log.warning("provider.request_budget_exhausted", **exc.proof)
+            yield ErrorEvent(
+                message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
 
         try:
             async with httpx.AsyncClient(
@@ -252,7 +356,11 @@ class OpenAICodexProvider:
                         headers=self._headers(credentials),
                         json=payload,
                     ) as response:
-                        if response.status_code == 401 and not refreshed:
+                        if (
+                            response.status_code == 401
+                            and not refreshed
+                            and cfg.physical_attempt_limit != 1
+                        ):
                             refreshed = True
                             try:
                                 credentials = await refresh_codex_credentials(

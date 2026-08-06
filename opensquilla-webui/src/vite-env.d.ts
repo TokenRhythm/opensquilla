@@ -58,8 +58,12 @@ declare global {
         mainWindowCloseBehavior?: DesktopMainWindowCloseBehavior
         workbenchPreviewMode?: WorkbenchPreviewMode
         workbenchPreviewNoticeShown?: boolean
+        sandboxUnavailableWarningSuppressed?: boolean
       },
     ) => Promise<DesktopPreferences>
+    reportSandboxUnavailable?: (
+      payload: { state: 'failed' | 'unavailable'; message?: string },
+    ) => Promise<{ shown: boolean; suppressed: boolean }>
     onWindowHidden?: (callback: () => void) => () => void
     inspectDesktopCleanup?: (payload: { mode: DesktopCleanupMode }) => Promise<{
       ok: boolean

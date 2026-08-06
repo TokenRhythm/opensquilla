@@ -1,7 +1,6 @@
 <template>
   <form class="hub-task" @submit.prevent="submit">
     <textarea
-      ref="textareaRef"
       v-model="text"
       class="hub-task__input"
       rows="1"
@@ -35,8 +34,6 @@ const emit = defineEmits<{
 }>()
 
 const text = ref('')
-const textareaRef = ref<HTMLTextAreaElement | null>(null)
-
 function submit() {
   const value = text.value.trim()
   if (!value) return

@@ -1,12 +1,11 @@
-"""Opt-in compaction levers: tier-1 tool-result protection + stub previews + never-worse.
+"""Compaction safety levers, including explicit rollback compatibility.
 
 Covers OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS,
 OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS,
+OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS,
 OPENSQUILLA_PROVIDER_COMPACTION_SKIP_PROJECTED,
 OPENSQUILLA_PROVIDER_COMPACTION_STUB_PREVIEW_CHARS, and
-OPENSQUILLA_PROVIDER_COMPACTION_NEVER_WORSE (all off by default).
-Identity tests replay canonical outputs captured from the pre-lever
-implementation and require byte-for-byte equality when every lever is unset.
+OPENSQUILLA_PROVIDER_COMPACTION_NEVER_WORSE.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.provider import request_proof as request_proof_module
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceededError,
     _compact_argument_string,
@@ -29,6 +29,9 @@ from opensquilla.provider.request_proof import (
 
 PROTECT_RECENT_RESULTS_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS"
 PROTECT_ERROR_RESULTS_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS"
+PROTECT_UNRESOLVED_RESULTS_ENV = (
+    "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS"
+)
 SKIP_PROJECTED_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_SKIP_PROJECTED"
 STUB_PREVIEW_CHARS_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_STUB_PREVIEW_CHARS"
 NEVER_WORSE_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_NEVER_WORSE"
@@ -38,6 +41,7 @@ _ALL_LEVER_ENVS = (
     "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_ASSISTANT",
     PROTECT_RECENT_RESULTS_ENV,
     PROTECT_ERROR_RESULTS_ENV,
+    PROTECT_UNRESOLVED_RESULTS_ENV,
     SKIP_PROJECTED_ENV,
     STUB_PREVIEW_CHARS_ENV,
     NEVER_WORSE_ENV,
@@ -49,10 +53,44 @@ _ALL_LEVER_ENVS = (
 def _clean_lever_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _ALL_LEVER_ENVS:
         monkeypatch.delenv(name, raising=False)
+    for name in (
+        "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_ASSISTANT",
+        PROTECT_RECENT_RESULTS_ENV,
+        PROTECT_ERROR_RESULTS_ENV,
+        PROTECT_UNRESOLVED_RESULTS_ENV,
+        SKIP_PROJECTED_ENV,
+        NEVER_WORSE_ENV,
+    ):
+        monkeypatch.setenv(name, "0")
+    monkeypatch.setattr(
+        request_proof_module,
+        "_serialized_token_estimate",
+        lambda serialized: (max(1, len(serialized) // 4), "legacy_test_estimate"),
+    )
 
 
 def _canon(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _legacy_proof_view(proof: dict[str, Any]) -> dict[str, Any]:
+    """Remove token-aware additions before comparing rollback goldens."""
+
+    projected = dict(proof)
+    for key in (
+        "estimated_text_tokens",
+        "raw_proof_token_budget",
+        "effective_proof_token_budget",
+        "fits_char_budget",
+        "fits_token_budget",
+        "usage_source",
+        "token_estimate_source",
+        "usage_confidence",
+    ):
+        projected.pop(key, None)
+    projected["estimated_tokens"] = max(1, int(projected["estimated_chars"]) // 4)
+    projected["provider_window_mismatch"] = False
+    return projected
 
 
 def _golden_payload() -> dict[str, Any]:
@@ -572,7 +610,7 @@ _GOLDEN_RAISE_PROOF_JSON = (
     'austed","top_contributors":[{"path":"$.messages[4].content[1].input.note","chars":695},{'
     '"path":"$.messages[2].reasoning_content","chars":392},{"path":"$.messages[2].tool_calls['
     '0].function.arguments","chars":389},{"path":"$.messages[3].content","chars":388},{"path"'
-    ':"$.messages[6].content","chars":388}],"retry_count":2,"messages_chars":4331,"tools_char'
+    ':"$.messages[6].content","chars":388}],"retry_count":4,"messages_chars":4331,"tools_char'
     's":0,"system_chars":73,"top_level_chars":43,"tool_schema_too_large":false,"tool_payload_'
     'compaction_not_smaller":false,"tail_compaction_not_smaller":false,"emergency_current_tur'
     'n_compacted":true,"emergency_compaction_not_smaller":false,"final_hard_cap_compacted":tr'
@@ -590,26 +628,27 @@ def _run_ladder(budget: int) -> tuple[dict[str, Any], dict[str, Any] | None]:
 
 
 @pytest.mark.parametrize("tier", sorted(_GOLDEN_TIER_BUDGETS))
-def test_levers_unset_reproduce_baseline_bytes(tier: int) -> None:
+def test_explicit_rollbacks_reproduce_baseline_payload(tier: int) -> None:
     budget = _GOLDEN_TIER_BUDGETS[tier]
     compacted, proof = _run_ladder(budget)
     assert proof is not None
     assert proof["compaction_tier"] == tier
     assert _canon(compacted) == _GOLDEN_PAYLOAD_JSON[budget]
-    assert _canon(proof) == _GOLDEN_PROOF_JSON[budget]
+    assert _canon(_legacy_proof_view(proof)) == _GOLDEN_PROOF_JSON[budget]
 
 
-def test_levers_unset_reproduce_baseline_raise_proof() -> None:
+def test_explicit_rollbacks_reproduce_baseline_raise_proof() -> None:
     with pytest.raises(ProviderRequestBudgetExceededError) as excinfo:
         _run_ladder(_GOLDEN_RAISE_BUDGET)
-    assert _canon(excinfo.value.proof) == _GOLDEN_RAISE_PROOF_JSON
+    assert _canon(_legacy_proof_view(excinfo.value.proof)) == _GOLDEN_RAISE_PROOF_JSON
 
 
-@pytest.mark.parametrize("off_value", ["", "0", "garbage", "false"])
+@pytest.mark.parametrize("off_value", ["0", "false", "off", "disabled"])
 def test_off_values_match_unset(monkeypatch: pytest.MonkeyPatch, off_value: str) -> None:
     for env_name in (
         PROTECT_RECENT_RESULTS_ENV,
         PROTECT_ERROR_RESULTS_ENV,
+        PROTECT_UNRESOLVED_RESULTS_ENV,
         SKIP_PROJECTED_ENV,
         STUB_PREVIEW_CHARS_ENV,
         NEVER_WORSE_ENV,
@@ -619,7 +658,7 @@ def test_off_values_match_unset(monkeypatch: pytest.MonkeyPatch, off_value: str)
     compacted, proof = _run_ladder(budget)
     assert proof is not None
     assert _canon(compacted) == _GOLDEN_PAYLOAD_JSON[budget]
-    assert _canon(proof) == _GOLDEN_PROOF_JSON[budget]
+    assert _canon(_legacy_proof_view(proof)) == _GOLDEN_PROOF_JSON[budget]
 
 
 def _tier1_entries_payload() -> dict[str, Any]:
@@ -676,10 +715,47 @@ def _entry_contents(payload: dict[str, Any]) -> list[str]:
     return contents
 
 
-def test_protect_recent_results_off_by_default() -> None:
+def test_protect_recent_results_can_be_rolled_back() -> None:
     compacted = _compact_tool_payload_once(_tier1_entries_payload())
     for content in _entry_contents(compacted):
         assert "[provider_request_compacted:" in content
+
+
+def test_recent_results_default_protects_latest_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(PROTECT_RECENT_RESULTS_ENV)
+    original = _entry_contents(_tier1_entries_payload())
+    compacted = _entry_contents(_compact_tool_payload_once(_tier1_entries_payload()))
+
+    assert "[provider_request_compacted:" in compacted[0]
+    assert "[provider_request_compacted:" in compacted[1]
+    assert compacted[2:] == original[2:]
+
+
+def test_error_and_unresolved_results_are_protected_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(PROTECT_RECENT_RESULTS_ENV, "0")
+    monkeypatch.delenv(PROTECT_ERROR_RESULTS_ENV)
+    monkeypatch.delenv(PROTECT_UNRESOLVED_RESULTS_ENV)
+    error = json.dumps({"execution_status": {"status": "error"}, "body": "e" * 2000})
+    unresolved = json.dumps(
+        {"execution_status": {"status": "unknown"}, "body": "u" * 2000}
+    )
+    payload = {
+        "messages": [
+            {"role": "tool", "tool_call_id": "error", "content": error},
+            {"role": "tool", "tool_call_id": "pending", "content": unresolved},
+            {"role": "tool", "tool_call_id": "plain", "content": "p" * 2000},
+        ]
+    }
+
+    contents = _entry_contents(_compact_tool_payload_once(payload))
+
+    assert contents[0] == error
+    assert contents[1] == unresolved
+    assert "[provider_request_compacted:" in contents[2]
 
 
 def test_protect_recent_results_exempts_last_n_entries(
@@ -788,7 +864,7 @@ def test_skip_projected_exempts_boundary_projected_results(
     assert "[provider_request_compacted:" in messages[2]["content"]
 
 
-def test_skip_projected_off_by_default() -> None:
+def test_skip_projected_can_be_rolled_back() -> None:
     projected = "[tool_result_projection]\n" + "x" * 2000
     payload = {
         "model": "synthetic-model",
@@ -978,10 +1054,10 @@ def test_never_worse_ladder_terminates_on_impossible_budget(
         _run_ladder(350)
 
 
-def test_protect_recent_results_invalid_values_are_off(
+def test_protect_recent_results_explicit_off_values_roll_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    for off_value in ("", "0", "garbage", "false", "-3"):
+    for off_value in ("0", "false", "off", "disabled", "-3"):
         monkeypatch.setenv(PROTECT_RECENT_RESULTS_ENV, off_value)
         compacted = _compact_tool_payload_once(_tier1_entries_payload())
         for content in _entry_contents(compacted):

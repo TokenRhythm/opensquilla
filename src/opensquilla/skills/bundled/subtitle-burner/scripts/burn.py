@@ -3,8 +3,8 @@
 
 Single-pass re-encode that overlays the SRT cues onto the video stream
 via ffmpeg's ``subtitles=`` filter (libass under the hood). The audio
-stream is copied without re-encoding. CJK-friendly font fallback is
-baked into the force_style chain.
+stream is copied without re-encoding. A managed Noto CJK font directory can
+be supplied explicitly or through ``OPENSQUILLA_MEDIA_FONTS_DIR``.
 
 Used by meta-short-drama after video-merger has produced the merged
 ``final.mp4``: this script writes ``final_subtitled.mp4`` next to it,
@@ -13,7 +13,7 @@ matching the user's voiceover language.
 Usage:
     python burn.py --input final.mp4 --subtitles drama.srt \\
         --output final_subtitled.mp4 \\
-        [--font "Microsoft YaHei,SimHei,Arial Unicode MS,Arial"] \\
+        [--font "Noto Sans CJK SC"] [--fonts-dir /path/to/fonts] \\
         [--font-size 28] [--margin-v 80] [--ffmpeg-path ffmpeg]
 
 Exit codes:
@@ -23,12 +23,16 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from glob import glob
 from pathlib import Path
+from typing import NamedTuple
 
 _WINGET_FFMPEG_GLOB = (
     "Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_*/"
@@ -36,25 +40,60 @@ _WINGET_FFMPEG_GLOB = (
 )
 
 
-def _probe_resolution(ffmpeg_bin: str, video_path: Path) -> tuple[int, int] | None:
-    """Use ffprobe (next to ffmpeg) to read the source video's W x H."""
-    ffprobe = ffmpeg_bin.replace("ffmpeg.exe", "ffprobe.exe").replace(
-        "/ffmpeg", "/ffprobe",
-    )
-    if ffprobe == ffmpeg_bin:
-        # Fallback for non-Windows / non-suffixed names.
-        ffprobe = str(Path(ffmpeg_bin).with_name(
-            "ffprobe.exe" if os.name == "nt" else "ffprobe",
-        ))
-    if not Path(ffprobe).is_file() and shutil.which(ffprobe) is None:
+class _VideoInfo(NamedTuple):
+    width: int
+    height: int
+    duration_s: float
+
+
+def _resolve_ffprobe(explicit: str, ffmpeg_bin: str) -> str:
+    """Resolve ffprobe without rewriting directory names such as ffmpeg-full."""
+    if explicit not in {"ffprobe", "ffprobe.exe"}:
+        found = shutil.which(explicit)
+        if found:
+            return found
+        if os.path.isabs(explicit) and os.path.isfile(explicit):
+            return explicit
+    ffmpeg_name = Path(ffmpeg_bin).name.lower()
+    sibling_name = "ffprobe.exe" if ffmpeg_name.endswith(".exe") else "ffprobe"
+    sibling = Path(ffmpeg_bin).with_name(sibling_name)
+    if sibling.is_file():
+        return str(sibling)
+    found = shutil.which(explicit)
+    if found:
+        return found
+    if os.path.isabs(explicit) and os.path.isfile(explicit):
+        return explicit
+    return explicit
+
+
+def _positive_float(value: object) -> float | None:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _probe_video(ffprobe_bin: str, video_path: Path) -> _VideoInfo | None:
+    """Return verified video dimensions and duration, or ``None`` on any defect."""
+    try:
+        if not video_path.is_file() or video_path.stat().st_size <= 0:
+            return None
+    except OSError:
+        return None
+    if not Path(ffprobe_bin).is_file() and shutil.which(ffprobe_bin) is None:
         return None
     try:
         proc = subprocess.run(
             [
-                ffprobe, "-v", "error",
+                ffprobe_bin, "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-of", "csv=s=x:p=0",
+                "-show_entries",
+                "stream=codec_type,width,height,duration:format=duration",
+                "-of", "json",
                 str(video_path),
             ],
             capture_output=True,
@@ -65,14 +104,73 @@ def _probe_resolution(ffmpeg_bin: str, video_path: Path) -> tuple[int, int] | No
         return None
     if proc.returncode != 0:
         return None
-    raw = proc.stdout.decode("utf-8", "replace").strip()
-    if "x" not in raw:
+    raw = (
+        proc.stdout.decode("utf-8", "replace")
+        if isinstance(proc.stdout, bytes)
+        else proc.stdout
+    )
+    try:
+        payload = json.loads(raw or "")
+    except (json.JSONDecodeError, TypeError):
         return None
     try:
-        w_s, h_s = raw.split("x", 1)
-        return int(w_s), int(h_s)
-    except ValueError:
+        streams = payload["streams"]
+        stream = next(
+            item
+            for item in streams
+            if isinstance(item, dict) and item.get("codec_type") == "video"
+        )
+        width = int(stream["width"])
+        height = int(stream["height"])
+    except (KeyError, StopIteration, TypeError, ValueError):
         return None
+    if width <= 0 or height <= 0:
+        return None
+    format_info = payload.get("format") if isinstance(payload, dict) else None
+    format_duration = format_info.get("duration") if isinstance(format_info, dict) else None
+    duration = _positive_float(format_duration) or _positive_float(stream.get("duration"))
+    if duration is None:
+        return None
+    return _VideoInfo(width=width, height=height, duration_s=duration)
+
+
+def _probe_resolution(ffmpeg_bin: str, video_path: Path) -> tuple[int, int] | None:
+    """Compatibility helper returning W x H using ffprobe next to ffmpeg."""
+    info = _probe_video(_resolve_ffprobe("ffprobe", ffmpeg_bin), video_path)
+    return (info.width, info.height) if info else None
+
+
+def _validation_error(ffprobe_bin: str, video_path: Path) -> str | None:
+    try:
+        if not video_path.is_file():
+            return "output file was not created"
+        if video_path.stat().st_size <= 0:
+            return "output file is empty"
+    except OSError as exc:
+        return f"output file is unreadable ({exc})"
+    if _probe_video(ffprobe_bin, video_path) is None:
+        return "ffprobe could not decode a positive-duration video stream"
+    return None
+
+
+def _staged_output_path(out_path: Path) -> Path:
+    """Create a closed same-directory temporary path suitable for atomic replace."""
+    suffix = out_path.suffix if out_path.suffix else ".mp4"
+    fd, raw_path = tempfile.mkstemp(
+        prefix=f".{out_path.stem}.",
+        suffix=suffix,
+        dir=out_path.parent,
+    )
+    os.close(fd)
+    return Path(raw_path)
+
+
+def _discard_staged(path: Path) -> None:
+    """Best-effort cleanup that cannot mask the primary media error."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _resolve_ffmpeg(explicit: str) -> str:
@@ -132,8 +230,13 @@ def main() -> int:
     parser.add_argument("--output", "-o", required=True, help="Output MP4 path")
     parser.add_argument(
         "--font",
-        default="Microsoft YaHei,SimHei,Arial Unicode MS,Arial",
-        help="Comma-separated font fallback chain. First wins. Defaults cover CJK.",
+        default="Noto Sans CJK SC",
+        help="One libass font family. Defaults to the managed pan-CJK family.",
+    )
+    parser.add_argument(
+        "--fonts-dir",
+        default=os.environ.get("OPENSQUILLA_MEDIA_FONTS_DIR", ""),
+        help="Directory containing managed subtitle fonts (defaults from OpenSquilla).",
     )
     parser.add_argument("--font-size", type=int, default=42)
     parser.add_argument(
@@ -169,6 +272,7 @@ def main() -> int:
                  "medium", "slow", "slower", "veryslow"],
     )
     parser.add_argument("--ffmpeg-path", default="ffmpeg")
+    parser.add_argument("--ffprobe-path", default="ffprobe")
     args = parser.parse_args()
 
     in_path = Path(args.input)
@@ -183,13 +287,63 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     ffmpeg_bin = _resolve_ffmpeg(args.ffmpeg_path)
+    ffprobe_bin = _resolve_ffprobe(args.ffprobe_path, ffmpeg_bin)
+
+    try:
+        subtitle_text = srt_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"Error: could not read --subtitles: {exc}", file=sys.stderr)
+        return 1
+    if not subtitle_text.strip():
+        if _probe_video(ffprobe_bin, in_path) is None:
+            print("Error: input is not a readable video", file=sys.stderr)
+            return 1
+        try:
+            staged_path = _staged_output_path(out_path)
+        except OSError as exc:
+            print(f"Error: could not stage subtitle-free video: {exc}", file=sys.stderr)
+            return 1
+        try:
+            shutil.copyfile(in_path, staged_path)
+            validation_error = _validation_error(ffprobe_bin, staged_path)
+            if validation_error:
+                print(
+                    f"Error: copied video validation failed: {validation_error}",
+                    file=sys.stderr,
+                )
+                return 1
+            os.replace(staged_path, out_path)
+        except OSError as exc:
+            print(f"Error: could not copy subtitle-free video: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            _discard_staged(staged_path)
+        validation_error = _validation_error(ffprobe_bin, out_path)
+        if validation_error:
+            print(f"Error: output validation failed: {validation_error}", file=sys.stderr)
+            return 1
+        print("SUBTITLES_SKIPPED: empty")
+        print(str(out_path.resolve()))
+        return 0
+
+    fonts_dir_arg = args.fonts_dir or os.environ.get("OPENSQUILLA_MEDIA_FONTS_DIR", "")
+    if fonts_dir_arg:
+        fonts_dir = Path(fonts_dir_arg).expanduser()
+        if not fonts_dir.is_dir():
+            print(f"Error: --fonts-dir not found: {fonts_dir}", file=sys.stderr)
+            return 1
+    else:
+        fonts_dir = None
+
+    input_info = _probe_video(ffprobe_bin, in_path)
+    if input_info is None:
+        print("Error: input is not a readable positive-duration video", file=sys.stderr)
+        return 1
 
     # Resolve PlayRes so MarginV / FontSize map to source-video pixels.
     play_w, play_h = 0, 0
     if args.play_res == "auto":
-        probed = _probe_resolution(ffmpeg_bin, in_path)
-        if probed:
-            play_w, play_h = probed
+        play_w, play_h = input_info.width, input_info.height
     elif "x" in args.play_res:
         try:
             play_w, play_h = (int(x) for x in args.play_res.split("x", 1))
@@ -211,8 +365,17 @@ def main() -> int:
     if play_w and play_h:
         force_style_parts.extend([f"PlayResX={play_w}", f"PlayResY={play_h}"])
     force_style = ",".join(force_style_parts)
-    vf = f"subtitles='{srt_arg}':force_style='{force_style}'"
+    filter_parts = [f"subtitles='{srt_arg}'"]
+    if fonts_dir is not None:
+        filter_parts.append(f"fontsdir='{_escape_subtitle_path(str(fonts_dir.resolve()))}'")
+    filter_parts.append(f"force_style='{force_style}'")
+    vf = ":".join(filter_parts)
 
+    try:
+        staged_path = _staged_output_path(out_path)
+    except OSError as exc:
+        print(f"Error: could not stage subtitled video: {exc}", file=sys.stderr)
+        return 1
     cmd = [
         ffmpeg_bin,
         "-y",
@@ -224,7 +387,7 @@ def main() -> int:
         "-preset", args.preset,
         "-c:a", "copy",
         "-movflags", "+faststart",
-        str(out_path),
+        str(staged_path),
     ]
     print("==> burning subtitles", file=sys.stderr)
     try:
@@ -234,11 +397,28 @@ def main() -> int:
             check=False,
         )
     except FileNotFoundError as exc:
+        _discard_staged(staged_path)
         print(f"Error: ffmpeg not found ({exc})", file=sys.stderr)
         return 1
     if proc.returncode != 0:
+        _discard_staged(staged_path)
         sys.stderr.write(proc.stderr.decode("utf-8", "replace")[-2500:])
         print(f"\nError: ffmpeg exited {proc.returncode}", file=sys.stderr)
+        return 1
+    validation_error = _validation_error(ffprobe_bin, staged_path)
+    if validation_error:
+        _discard_staged(staged_path)
+        print(f"Error: ffmpeg output validation failed: {validation_error}", file=sys.stderr)
+        return 1
+    try:
+        os.replace(staged_path, out_path)
+    except OSError as exc:
+        _discard_staged(staged_path)
+        print(f"Error: could not install subtitled video: {exc}", file=sys.stderr)
+        return 1
+    validation_error = _validation_error(ffprobe_bin, out_path)
+    if validation_error:
+        print(f"Error: output validation failed: {validation_error}", file=sys.stderr)
         return 1
     print(str(out_path.resolve()))
     return 0

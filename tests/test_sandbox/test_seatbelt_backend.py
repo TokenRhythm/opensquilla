@@ -639,10 +639,12 @@ def test_profile_adds_ambient_tmp_write_only_once_from_shared_profile(
 
     rendered = render_seatbelt_profile(_request(policy, tmp_path))
 
+    canonical_tmp = Path("/tmp").resolve(strict=False)
     tmp_write_rules = [
         line
         for line in rendered.splitlines()
-        if line.startswith("(allow file-write*") and '(subpath "/tmp")' in line
+        if line.startswith("(allow file-write*")
+        and f'(subpath "{canonical_tmp}")' in line
     ]
     assert len(tmp_write_rules) == 1
 
@@ -1031,19 +1033,30 @@ def test_filesystem_worker_runtime_roots_cover_python_and_import_closure(
 ) -> None:
     venv = tmp_path / "venv"
     base_prefix = tmp_path / "python"
+    base_alias = tmp_path / "python-current"
     python_dir = venv / "bin"
+    base_bin = base_prefix / "bin"
     stdlib = tmp_path / "python" / "lib" / "stdlib"
     purelib = venv / "site-packages"
     package = tmp_path / "checkout" / "src" / "opensquilla"
     source = package.parent
-    for root in (python_dir, base_prefix, stdlib, purelib, package):
+    for root in (python_dir, base_bin, stdlib, purelib, package):
         root.mkdir(parents=True, exist_ok=True)
+    base_alias.symlink_to(base_prefix, target_is_directory=True)
+    base_executable = base_alias / "bin" / "python"
+    (base_prefix / "bin" / "python").touch()
     (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
     executable = python_dir / "python"
     executable.touch()
     monkeypatch.setattr(seatbelt_mod, "_python_executable", lambda: executable)
     monkeypatch.setattr(seatbelt_mod.sys, "prefix", str(venv))
     monkeypatch.setattr(seatbelt_mod.sys, "base_prefix", str(base_prefix))
+    monkeypatch.setattr(
+        seatbelt_mod.sys,
+        "_base_executable",
+        str(base_executable),
+        raising=False,
+    )
     monkeypatch.setattr(
         seatbelt_mod,
         "sysconfig",
@@ -1068,12 +1081,13 @@ def test_filesystem_worker_runtime_roots_cover_python_and_import_closure(
     assert roots == (
         python_dir.resolve(),
         venv.resolve(),
+        base_alias.absolute(),
+        base_prefix.resolve(),
         stdlib.resolve(),
         purelib.resolve(),
         package.resolve(),
         source.resolve(),
     )
-    assert base_prefix.resolve() not in roots
     assert Path("/") not in roots
     assert len(roots) == len(set(roots))
 
@@ -1085,7 +1099,6 @@ def test_filesystem_worker_argv_uses_python_module_outside_frozen_runtime(
 
     assert seatbelt_mod._filesystem_worker_argv() == (
         str(seatbelt_mod._python_executable()),
-        "-B",
         "-m",
         "opensquilla.sandbox.filesystem_worker",
         "-",
@@ -1099,7 +1112,9 @@ def test_filesystem_worker_argv_uses_internal_entrypoint_when_frozen(
 
     assert seatbelt_mod._filesystem_worker_argv() == (
         str(seatbelt_mod._python_executable()),
-        "--_sandbox-filesystem-worker",
+        "--internal-child",
+        "filesystem-worker",
+        "-",
     )
 
 
@@ -1922,7 +1937,6 @@ async def test_run_operation_delegates_filesystem_to_seatbelt_worker(
     assert request.cwd == workspace.resolve()
     assert request.argv == (
         str(seatbelt_mod._python_executable()),
-        "-B",
         "-m",
         "opensquilla.sandbox.filesystem_worker",
         "-",

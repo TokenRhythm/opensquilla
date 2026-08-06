@@ -142,6 +142,40 @@ def test_openai_projection_counts_99_logical_messages_plus_system_as_100() -> No
     assert aggregator_projection.additional_messages == 1
 
 
+def test_openai_projection_uses_same_prompt_schema_fallback_as_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_chat_response(
+        monkeypatch,
+        status_code=400,
+        response_json={"message": "synthetic stop"},
+        captured=captured,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-pro",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    messages = [Message(role="user", content="return structured output")]
+    config = ChatConfig(
+        output_json_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+    )
+
+    projection = provider.project_message_count(messages, config)
+    _collect_errors(provider, messages, config)
+
+    assert projection.system_messages == 1
+    assert projection.actual_wire_messages == 2
+    assert projection.actual_wire_messages == len(captured["payload"]["messages"])
+    assert captured["payload"]["messages"][0]["role"] == "system"
+
+
 def test_tokenrhythm_original_583_envelope_yields_typed_limit_proof(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,

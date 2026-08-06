@@ -34,7 +34,7 @@ async def _direct_write_preflight(
 ) -> dict[str, object]:
     queue = ApprovalQueue(db_path=str(workspace / "native-preflight-approvals.sqlite"))
     configure_runtime(
-        SandboxSettings(),
+        SandboxSettings(run_mode="safe"),
         approval_queue=queue,
         workspace=workspace,
     )
@@ -70,7 +70,10 @@ def _native_policy(
         SecurityLevel.STANDARD,
         "shell.exec",
         workspace,
-        SandboxSettings(denied_read_roots=[str(path) for path in denied_read_roots]),
+        SandboxSettings(
+            run_mode="safe",
+            denied_read_roots=[str(path) for path in denied_read_roots],
+        ),
     )
     assert policy.file_system is not None
     return policy
@@ -238,7 +241,7 @@ async def test_bubblewrap_shell_and_worker_read_codex_host_view(
         SecurityLevel.STANDARD,
         "shell.exec",
         workspace,
-        SandboxSettings(),
+        SandboxSettings(run_mode="safe"),
     )
     assert policy.file_system is not None
 
@@ -353,7 +356,7 @@ async def test_seatbelt_shell_and_worker_share_host_read_profile(
         SecurityLevel.STANDARD,
         "shell.exec",
         workspace,
-        SandboxSettings(),
+        SandboxSettings(run_mode="safe"),
     )
     assert policy.file_system is not None
 

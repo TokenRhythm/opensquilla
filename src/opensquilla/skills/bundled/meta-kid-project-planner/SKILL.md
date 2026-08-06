@@ -1,10 +1,12 @@
 ---
 name: meta-kid-project-planner
-description: "Use this meta-skill instead of answering directly when a child or their guardian wants to plan a school project, science fair entry, hobby kit, or kid-sized creative venture (volcano model, bug-watching YouTube channel, magnet maze, model rocket). The skill assesses feasibility against the child's age band, builds an age-appropriate step plan, lists materials with budget substitutes, surfaces safety considerations, and produces a parent-facing learning-objective summary so the guardian can supervise meaningfully. Refuses inappropriate or unsafe projects."
-description_zh: "当孩子或其监护人想要规划学校项目、科学展作品、兴趣套件或适合孩子的创意活动（火山模型、观虫YouTube频道、磁力迷宫、模型火箭）时，使用此元技能而非直接回答。它会按孩子的年龄段评估可行性，制定适龄步骤计划，列出材料及预算替代方案，指出安全注意事项，并生成面向家长的学习目标摘要以便有效监督；会拒绝不当或不安全的项目。"
+description: "Retired compatibility definition for historical meta-kid-project-planner runs. It is not available for discovery, automatic activation, or new invocation; its plan remains bundled only so persisted and in-flight run snapshots can be inspected, resumed, or replayed safely."
+description_zh: "为历史 meta-kid-project-planner 运行保留的兼容定义。它不参与发现、自动激活或新调用；计划继续内置，仅用于安全检查、恢复或重放已持久化及正在运行的快照。"
 kind: meta
 meta_priority: 60
 always: false
+user-invocable: false
+disable-model-invocation: true
 final_text_mode: "step:project_pack_audit"
 request_template:
   outcome: "Age-appropriate project plan with materials, safety notes, and guardian guidance."
@@ -83,17 +85,7 @@ preference_keys:
 policy_tags:
   - child-safety
   - age-appropriate
-triggers:
-  - "school project"
-  - "science fair"
-  - "kid science"
-  - "孩子做项目"
-  - "做一个手工"
-  - "科学课作业"
-  - "help my kid build"
-  - "我要做火山"
-  - "child diy project"
-  - "课外动手项目"
+triggers: []
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

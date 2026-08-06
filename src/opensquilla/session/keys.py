@@ -135,6 +135,18 @@ def is_subagent_key(session_key: str) -> bool:
     return key.startswith("subagent:") or bool(re.match(r"^agent:[^:]+:subagent:[^:]+$", key))
 
 
+def is_guest_webchat_key(session_key: str | None) -> bool:
+    """Return True for server-owned anonymous WebChat session keys."""
+
+    key = canonicalize_session_key(session_key)
+    return bool(
+        re.fullmatch(
+            r"agent:[^:]+:webchat:guest:[0-9a-f]{64}:[^:]+",
+            key.lower(),
+        )
+    )
+
+
 def allows_private_memory_prompt_injection(session_key: str | None) -> bool:
     """Return whether automatic private memory may be injected into a prompt."""
     key = canonicalize_session_key(session_key)
@@ -142,7 +154,11 @@ def allows_private_memory_prompt_injection(session_key: str | None) -> bool:
         return True
 
     key_lower = key.lower()
-    if is_subagent_key(key_lower) or key_lower.startswith("cron:"):
+    if (
+        is_subagent_key(key_lower)
+        or is_guest_webchat_key(key_lower)
+        or key_lower.startswith("cron:")
+    ):
         return False
 
     chat_type = derive_chat_type(key_lower)

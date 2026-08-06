@@ -321,7 +321,9 @@ test('recovers from stuck automatic metadata before sending', async ({ page }) =
 
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await expect.poll(() => heldConfigRequests).toBeGreaterThan(0)
-  await expect.poll(() => socketCount, { timeout: 10_000 }).toBeGreaterThan(1)
+  // The optional metadata budget is 10 seconds; leave time for the timeout
+  // handler to retire the stuck socket and finish the replacement handshake.
+  await expect.poll(() => socketCount, { timeout: 15_000 }).toBeGreaterThan(1)
 
   const composer = page.getByRole('textbox', { name: 'Message to send' })
   const send = page.getByRole('button', { name: 'Send', exact: true })
@@ -512,8 +514,10 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
   await expect.poll(() => heldSubscribeRequests).toBeGreaterThan(0)
 
   const thread = page.locator('.chat-thread')
-  const composer = page.getByRole('textbox', { name: 'Message to send' })
-  const send = page.getByRole('button', { name: 'Send', exact: true })
+  // Keep this recovery proof locale-independent: browser locale follows the
+  // host on developer machines, so accessible names are not always English.
+  const composer = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn')
 
   await expect(page.getByTestId('chat-session-load-state')).toHaveCount(0)
   await expect(thread).toHaveAttribute('aria-busy', 'false')

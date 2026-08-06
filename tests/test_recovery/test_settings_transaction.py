@@ -343,7 +343,7 @@ def test_crash_is_detected_and_identity_proven_pair_is_recovered(
     journal_text = journal.read_text(encoding="utf-8")
     assert "synthetic-new-ciphertext" not in journal_text
     blocked = inspect_profile(home, profile_kind="desktop-primary")
-    assert blocked.outcome == "recovery_required"
+    assert blocked.outcome == "attention"
     assert blocked.stable_code == "settings_transaction_incomplete"
     assert "recover-settings" in blocked.allowed_actions
     recovered = recover_desktop_settings(home)

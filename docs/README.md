@@ -58,6 +58,8 @@ root release README with task-oriented guides.
   files, images, PDF, and TTS.
 - [`tools-and-sandbox.md`](tools-and-sandbox.md) - built-in tools, approvals,
   sandbox posture, and write policy.
+- [`sandbox-security.md`](sandbox-security.md) - Safe and Full execution modes,
+  guest isolation, policy behavior, bundled runtimes, and upgrade compatibility.
 - [`approvals-and-permissions.md`](approvals-and-permissions.md) - permission
   profiles, approval commands, workspace containment, and sandbox posture.
 - [`agents.md`](agents.md) - durable named agents and workspace defaults.

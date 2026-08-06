@@ -48,6 +48,12 @@ export interface ChatPendingItem {
   // normal user-bubble push / composer consumption on drain.
   hiddenControl?: boolean
   displayTextOverride?: string
+  // Stable ingress identity for a queued hidden control. Provider-setup
+  // handoffs reuse it across remounts/tabs so Gateway idempotency can collapse
+  // duplicate resumes of the same original intent.
+  clientRequestId?: string
+  /** Session that owns a durable hidden-control intent. */
+  hiddenControlSessionKey?: string
   /** Stable transport identity for retrying a hidden control exactly once. */
   hiddenClientRequestId?: string
   hiddenClientMessageId?: string
@@ -59,6 +65,37 @@ export interface ChatPendingItem {
   steerExpectedTurnId?: string
   /** The optimistic user row already exists in the transcript surface. */
   steerVisibleCommitted?: boolean
+}
+
+export type HiddenControlDispatchStatus =
+  | 'accepted'
+  | 'queued'
+  | 'rejected'
+  | 'unknown'
+
+export type HiddenControlDispatchReason =
+  | 'accepted'
+  | 'queued'
+  | 'already_queued'
+  | 'queue_full'
+  | 'discarded'
+  | 'invalid_request'
+  | 'outbox_conflict'
+  | 'outbox_persist_failed'
+  | 'send_rejected'
+  | 'response_unknown'
+
+/**
+ * Machine-owned result for a hidden control send. `accepted` is the only state
+ * that proves the Gateway durably owns the request; `queued` is recoverable
+ * local work and must keep its persisted source intent until a later accepted
+ * result arrives.
+ */
+export interface HiddenControlDispatchResult {
+  status: HiddenControlDispatchStatus
+  reason: HiddenControlDispatchReason
+  clientRequestId: string
+  sessionKey: string
 }
 
 export interface ChatRouterCell {
@@ -374,6 +411,18 @@ export interface ChatReasoning {
   seconds: number
 }
 
+/** A non-conversational maintenance event rendered inside transcript chronology. */
+export interface ChatMaintenanceEvent {
+  kind: 'context_compaction'
+  compactionId: string
+  source: string
+  state: 'running' | 'completed' | 'skipped' | 'stale' | 'cancelled' | 'failed'
+  durability: string
+  detail?: string
+  removedCount?: number
+  keptCount?: number
+}
+
 export interface ChatMessage {
   role: ChatRole
   text: string
@@ -422,6 +471,8 @@ export interface ChatMessage {
   output?: number
   output_tokens?: number
   restoredFromHistory?: boolean
+  /** Durable transcript maintenance restored from chat.history metadata. */
+  maintenance?: ChatMaintenanceEvent
   statusHistory?: import('./parts').StatusPart[]
   /** Live approval/clarify snapshots referenced by interrupt timeline segments. */
   interrupts?: Extract<import('./parts').ChatPart, { type: 'interrupt' }>[]
@@ -465,9 +516,11 @@ export interface ChatRenderedMessage {
   showHeader: boolean
   isStreaming?: boolean
   messageId?: string
+  restoredFromHistory?: boolean
   /** Stable identity of the owning user turn for client-only UI continuity. */
   turnKey?: string
   inputDisposition?: ChatSteerDisposition
+  maintenance?: ChatMaintenanceEvent
   inputDispositionRevision?: number
   turnOutcome?: ChatTurnOutcome
   hasAttachments?: boolean

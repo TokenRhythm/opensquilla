@@ -22,6 +22,7 @@ from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
     _native_io_path,
+    is_path_redirecting_stat,
     native_move_no_replace,
 )
 from opensquilla.recovery.config_patch import (
@@ -45,6 +46,7 @@ from opensquilla.recovery.locking import (
     ProfileOperationLock,
     acquire_profile_locks,
     replacement_history_lock_scope,
+    resolve_home_link,
 )
 from opensquilla.recovery.models import RecoveryOutcome, RecoveryReport, WorkspaceCandidate
 
@@ -187,6 +189,7 @@ class _ConfigView:
     state_explicit: bool = False
     state_from_env: bool = False
     error_code: str | None = None
+    error_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -250,6 +253,7 @@ def _read_config(home: Path) -> _ConfigView:
             workspace_from_env=True,
             state_dir=None,
             error_code=exc.stable_code,
+            error_detail=str(exc),
         )
     try:
         state_env = state_override(home)
@@ -264,6 +268,7 @@ def _read_config(home: Path) -> _ConfigView:
             state_dir=None,
             state_from_env=True,
             error_code=exc.stable_code,
+            error_detail=str(exc),
         )
     try:
         snapshot = ConfigSnapshot.capture(config_path)
@@ -279,6 +284,7 @@ def _read_config(home: Path) -> _ConfigView:
             error_code=(
                 "config_unsafe_path" if exc.stable_code == "unsafe_path" else "config_unreadable"
             ),
+            error_detail=str(exc),
         )
     exists = snapshot.identity is not None
     if not exists:
@@ -286,7 +292,7 @@ def _read_config(home: Path) -> _ConfigView:
     else:
         try:
             payload = tomllib.loads(snapshot.data.decode("utf-8"))
-        except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             return _ConfigView(
                 path=config_path,
                 exists=True,
@@ -296,6 +302,7 @@ def _read_config(home: Path) -> _ConfigView:
                 workspace_from_env=workspace_env is not None,
                 state_dir=None,
                 error_code="config_invalid",
+                error_detail=f"config.toml is not valid TOML: {exc}",
             )
 
     assert payload is not None
@@ -310,6 +317,7 @@ def _read_config(home: Path) -> _ConfigView:
             workspace_from_env=workspace_env is not None,
             state_dir=None,
             error_code="config_invalid",
+            error_detail="config_version must be an integer",
         )
     if config_version > SUPPORTED_CONFIG_VERSION:
         return _ConfigView(
@@ -321,6 +329,10 @@ def _read_config(home: Path) -> _ConfigView:
             workspace_from_env=workspace_env is not None,
             state_dir=None,
             error_code="config_schema_too_new",
+            error_detail=(
+                f"config_version {config_version} is newer than this build supports "
+                f"({SUPPORTED_CONFIG_VERSION}); upgrade OpenSquilla instead of editing"
+            ),
         )
 
     state_raw = payload.get("state_dir")
@@ -334,6 +346,7 @@ def _read_config(home: Path) -> _ConfigView:
             workspace_from_env=workspace_env is not None,
             state_dir=None,
             error_code="config_invalid",
+            error_detail="state_dir must be a path string",
         )
     if state_env is not None:
         _state_name, state_value = state_env
@@ -362,6 +375,7 @@ def _read_config(home: Path) -> _ConfigView:
             state_explicit=state_explicit,
             state_from_env=state_from_env,
             error_code="config_invalid",
+            error_detail="workspace_dir must be a path string",
         )
     if workspace_env is None or state_env is None:
         legacy_probe = _ConfigView(
@@ -385,6 +399,7 @@ def _read_config(home: Path) -> _ConfigView:
                         payload=None,
                         workspace_from_env=True,
                         error_code=exc.stable_code,
+                        error_detail=str(exc),
                     )
             if state_env is None:
                 try:
@@ -395,6 +410,7 @@ def _read_config(home: Path) -> _ConfigView:
                         payload=None,
                         state_from_env=True,
                         error_code=exc.stable_code,
+                        error_detail=str(exc),
                     )
                 if state_env is not None:
                     _state_name, state_value = state_env
@@ -447,8 +463,7 @@ def _workspace_status(path: Path, *, explicitly_configured: bool) -> WorkspaceCa
             configured=explicitly_configured,
         )
 
-    attributes = int(getattr(own_stat, "st_file_attributes", 0))
-    is_link = stat.S_ISLNK(own_stat.st_mode) or bool(attributes & 0x400)
+    is_link = is_path_redirecting_stat(own_stat)
     try:
         target_stat = _native_stat(path) if is_link and explicitly_configured else own_stat
         valid = stat.S_ISDIR(target_stat.st_mode) and _native_access(path, os.R_OK | os.X_OK)
@@ -583,10 +598,8 @@ def _regular_source_stat(path: Path) -> os.stat_result | None:
             "runtime database bundle cannot be inspected",
             stable_code="state_database_unreadable",
         ) from exc
-    attributes = int(getattr(value, "st_file_attributes", 0))
     if (
-        stat.S_ISLNK(value.st_mode)
-        or attributes & 0x400
+        is_path_redirecting_stat(value)
         or not stat.S_ISREG(value.st_mode)
         or value.st_nlink != 1
     ):
@@ -847,8 +860,7 @@ def _profile_top_level_entries(home: Path) -> tuple[str, ...] | None:
         return ()
     except OSError:
         return None
-    attributes = int(getattr(before, "st_file_attributes", 0))
-    if stat.S_ISLNK(before.st_mode) or attributes & 0x400 or not stat.S_ISDIR(before.st_mode):
+    if is_path_redirecting_stat(before) or not stat.S_ISDIR(before.st_mode):
         return None
     try:
         entries = tuple(sorted(entry.name for entry in os.scandir(_native_io_path(home))))
@@ -869,10 +881,20 @@ def _home_is_unsafe(path: Path) -> bool:
         return False
     except OSError:
         return True
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    return (
-        stat.S_ISLNK(value.st_mode) or bool(attributes & 0x400) or not stat.S_ISDIR(value.st_mode)
-    )
+    return is_path_redirecting_stat(value) or not stat.S_ISDIR(value.st_mode)
+
+
+def _elevated_windows_context() -> bool:
+    """Return whether this process runs with Windows administrator rights."""
+
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except Exception:
+        return False
 
 
 def _legacy_layout_is_proven(home: Path, config: _ConfigView) -> bool:
@@ -910,8 +932,7 @@ def _plain_role_source(path: Path, expected_type: str) -> bool:
         value = _native_lstat(path)
     except OSError:
         return False
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    if stat.S_ISLNK(value.st_mode) or attributes & 0x400:
+    if is_path_redirecting_stat(value):
         return False
     if expected_type == "directory":
         return stat.S_ISDIR(value.st_mode)
@@ -1702,12 +1723,7 @@ def _plain_canonical_directory(path: Path) -> bool:
         return True
     except OSError:
         return False
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    return (
-        not stat.S_ISLNK(value.st_mode)
-        and not attributes & 0x400
-        and stat.S_ISDIR(value.st_mode)
-    )
+    return not is_path_redirecting_stat(value) and stat.S_ISDIR(value.st_mode)
 
 
 def _recovery_profile_isolation_code(home: Path, config: _ConfigView) -> str | None:
@@ -1836,6 +1852,18 @@ def _revision(
     return int.from_bytes(digest[:8], "big") & ((1 << 53) - 1)
 
 
+def _sanitize_detail(detail: str | None, home: Path) -> str | None:
+    """Spell the profile home as ``<HOME>`` before a detail enters the protocol.
+
+    Desktop diagnostics redact the same prefix, so a detail string never
+    widens what the fixed JSON protocol reveals about the local filesystem.
+    """
+
+    if detail is None:
+        return None
+    return detail.replace(str(home), "<HOME>")
+
+
 def _report(
     *,
     home: Path,
@@ -1846,6 +1874,7 @@ def _report(
     effective_workspace: Path | None,
     allowed_actions: tuple[str, ...],
     cleanup_journal: Path | None = None,
+    detail: str | None = None,
 ) -> RecoveryReport:
     transaction_id = str(uuid.uuid5(_TRANSACTION_NAMESPACE, _path_key(home)))
     return RecoveryReport(
@@ -1863,7 +1892,18 @@ def _report(
             stable_code,
             cleanup_journal=cleanup_journal,
         ),
+        detail=_sanitize_detail(detail, home),
     )
+
+
+def _resolved_home_path(home: str | Path | None) -> Path:
+    if home is None:
+        from opensquilla.paths import default_opensquilla_home
+
+        home_path = default_opensquilla_home().expanduser().absolute()
+    else:
+        home_path = _absolute(home)
+    return resolve_home_link(home_path)
 
 
 def inspect_profile(
@@ -1875,12 +1915,7 @@ def inspect_profile(
 ) -> RecoveryReport:
     """Inspect a Desktop profile without creating or modifying any path."""
 
-    if home is None:
-        from opensquilla.paths import default_opensquilla_home
-
-        home_path = default_opensquilla_home().expanduser().absolute()
-    else:
-        home_path = _absolute(home)
+    home_path = _resolved_home_path(home)
     kind = _profile_kind(profile_kind, home=home_path)
     if _home_is_unsafe(home_path):
         config = _ConfigView(
@@ -1893,26 +1928,45 @@ def inspect_profile(
             state_dir=None,
             error_code="profile_unsafe_path",
         )
+        blocks = _elevated_windows_context()
         return _report(
             home=home_path,
             config=config,
             candidates=(),
-            outcome="recovery_required",
+            outcome="recovery_required" if blocks else "attention",
             stable_code="profile_unsafe_path",
             effective_workspace=None,
             allowed_actions=_RECOVERY_ACTIONS,
+            detail=f"{home_path} is a link or is not a plain directory",
         )
     config = _read_config(home_path)
     candidates = _candidate_set(home_path, config)
     canonical = next(candidate for candidate in candidates if candidate.kind == "canonical")
     effective = config.workspace
+    if config.error_code == "config_schema_too_new" or (
+        config.error_code == "config_unsafe_path" and _elevated_windows_context()
+    ):
+        # The two hard startup gates outrank every pending-journal warning: a
+        # config authored by a newer build must not be reinterpreted, and an
+        # elevated Windows process must not follow a link-shaped config path,
+        # no matter what interrupted transaction is also waiting.
+        return _report(
+            home=home_path,
+            config=config,
+            candidates=candidates,
+            outcome="recovery_required",
+            stable_code=config.error_code,
+            effective_workspace=None,
+            allowed_actions=_RECOVERY_ACTIONS,
+            detail=config.error_detail,
+        )
     top_level_entries = _profile_top_level_entries(home_path)
     if top_level_entries is None:
         return _report(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="unknown_layout",
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
@@ -1928,7 +1982,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="cleanup_transaction_incomplete",
             effective_workspace=effective,
             allowed_actions=_CLEANUP_RECOVERY_ACTIONS,
@@ -1939,7 +1993,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="workspace_patch_incomplete",
             effective_workspace=effective,
             allowed_actions=("reconcile", *_RECOVERY_ACTIONS),
@@ -1952,7 +2006,7 @@ def inspect_profile(
                 home=home_path,
                 config=config,
                 candidates=candidates,
-                outcome="recovery_required",
+                outcome="attention",
                 stable_code="settings_transaction_incomplete",
                 effective_workspace=effective,
                 allowed_actions=("recover-settings", *_RECOVERY_ACTIONS),
@@ -1962,20 +2016,29 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="legacy_import_transaction_incomplete",
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
         )
     if config.error_code is not None:
+        # The hard gates were handled before the journal checks above;
+        # everything reaching this branch is a warning with a repair action.
+        actions: tuple[str, ...] = _RECOVERY_ACTIONS
+        if config.error_code in ("config_invalid", "config_unreadable"):
+            # The repair restores the newest valid sibling backup or, failing
+            # that, preserves the corrupt file and starts with defaults, so it
+            # is offered whether or not a backup currently exists.
+            actions = ("recover-config", *_RECOVERY_ACTIONS)
         return _report(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code=config.error_code,
             effective_workspace=None,
-            allowed_actions=_RECOVERY_ACTIONS,
+            allowed_actions=actions,
+            detail=config.error_detail,
         )
     if kind == "desktop-recovery":
         isolation_code = _recovery_profile_isolation_code(home_path, config)
@@ -1984,7 +2047,7 @@ def inspect_profile(
                 home=home_path,
                 config=config,
                 candidates=candidates,
-                outcome="recovery_required",
+                outcome="attention",
                 stable_code=isolation_code,
                 effective_workspace=None,
                 allowed_actions=_UNSAFE_RECOVERY_PROFILE_ACTIONS,
@@ -2001,7 +2064,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="transaction_incomplete",
             effective_workspace=effective,
             allowed_actions=transaction_actions,
@@ -2041,7 +2104,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="unknown_layout",
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
@@ -2056,7 +2119,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code=(
                 "effective_state_missing"
                 if state_candidate is None or not state_candidate.exists
@@ -2071,7 +2134,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code=state_code,
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
@@ -2104,7 +2167,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code=code,
             effective_workspace=effective,
             allowed_actions=_role_actions(roles),
@@ -2116,7 +2179,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="unknown_legacy_layout",
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
@@ -2127,7 +2190,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="legacy_layout_reconcile_available",
             effective_workspace=effective,
             allowed_actions=("reconcile", *_RECOVERY_ACTIONS),
@@ -2179,7 +2242,7 @@ def inspect_profile(
             home=home_path,
             config=config,
             candidates=candidates,
-            outcome="recovery_required",
+            outcome="attention",
             stable_code="effective_workspace_missing",
             effective_workspace=effective,
             allowed_actions=_WORKSPACE_RECOVERY_ACTIONS,
@@ -2241,7 +2304,7 @@ def reconcile_profile(
 ) -> RecoveryReport:
     """Reconcile each uniquely proven, no-conflict legacy role independently."""
 
-    home_path = _absolute(home)
+    home_path = resolve_home_link(_absolute(home))
     resolved_kind = _profile_kind(profile_kind, home=home_path)
     with acquire_profile_locks(
         home_path,
@@ -2324,9 +2387,12 @@ def reconcile_profile(
                 _ignore_transaction=_ignore_replace_transaction,
             )
             if atomic_state_unknown:
+                # The native rename may already have succeeded. Never
+                # reinterpret an unverifiable post-move tree as ready; startup
+                # proceeds with a warning and mutations keep failing closed.
                 return replace(
                     final,
-                    outcome="recovery_required",
+                    outcome="attention",
                     stable_code="atomic_state_unknown",
                     allowed_actions=_RECOVERY_ACTIONS,
                 )
@@ -2337,7 +2403,7 @@ def reconcile_profile(
             if (
                 role_operation_failure
                 and effective_is_valid
-                and final.outcome == "recovery_required"
+                and final.outcome == "attention"
             ):
                 # A failure confined to an ancillary legacy role must not take
                 # a valid identity/session profile offline. Leave the source in
@@ -2349,10 +2415,10 @@ def reconcile_profile(
                     stable_code="layout_reconcile_deferred",
                     allowed_actions=_ATTENTION_ACTIONS,
                 )
-            if raw_operation_failure and final.outcome == "recovery_required":
+            if raw_operation_failure and final.outcome == "attention":
                 return replace(
                     final,
-                    outcome="recovery_required",
+                    outcome="attention",
                     stable_code="layout_reconcile_failed",
                     allowed_actions=tuple(
                         dict.fromkeys(("reconcile", *final.allowed_actions, *_RECOVERY_ACTIONS))
@@ -2376,7 +2442,7 @@ def choose_workspace(
 ) -> RecoveryReport:
     """CAS-patch the configured workspace after explicit user selection."""
 
-    home_path = _absolute(home)
+    home_path = resolve_home_link(_absolute(home))
     workspace_path = _absolute(workspace, relative_to=home_path)
     resolved_kind = _profile_kind(profile_kind, home=home_path)
     with ProfileOperationLock(home_path, timeout=lock_timeout):
@@ -2419,19 +2485,16 @@ def choose_workspace(
 
 
 def guard_desktop_profile(home: str | Path | None = None) -> RecoveryReport | None:
-    """Fail before runtime writes when a Desktop-owned profile is unsafe.
+    """Fail before runtime writes only for the two hard startup gates.
 
-    Ordinary CLI profiles are intentionally outside this reconciler. Desktop
-    must run ``reconcile`` while the gateway is stopped before invoking guarded
-    runtime entry points.
+    After the recovery-governance downgrade, ``inspect_profile`` returns
+    ``recovery_required`` only for a config authored by a newer build and for
+    unsafe path shapes in an elevated Windows process. Every other finding is
+    a warning: the profile starts and individual mutations fail closed on
+    their own checks. Ordinary CLI profiles are outside this reconciler.
     """
 
-    if home is None:
-        from opensquilla.paths import default_opensquilla_home
-
-        home_path = default_opensquilla_home().expanduser().absolute()
-    else:
-        home_path = _absolute(home)
+    home_path = _resolved_home_path(home)
     kind = _profile_kind(None, home=home_path)
     if kind not in _DESKTOP_PROFILE_KINDS:
         return None
@@ -2457,32 +2520,19 @@ def guarded_desktop_profile(
     same-process acquisition is intentionally reentrant.
     """
 
-    if home is None:
-        from opensquilla.paths import default_opensquilla_home
-
-        home_path = default_opensquilla_home().expanduser().absolute()
-    else:
-        home_path = _absolute(home)
+    home_path = _resolved_home_path(home)
     with ProfileOperationLock(home_path, timeout=lock_timeout):
         kind = _profile_kind(None, home=home_path)
         report: RecoveryReport | None = None
         if kind in _DESKTOP_PROFILE_KINDS:
             # The profile lock lives outside H and is therefore safe to take
             # before inspection.  LegacyGatewayLock may create
-            # state/gateway.pid.lock, so an unsafe Desktop profile must be
+            # state/gateway.pid.lock, so a hard-gated Desktop profile must be
             # rejected before that compatibility write can happen.
             report = inspect_profile(home_path, profile_kind=kind)
             if report.outcome == "recovery_required":
                 raise RecoveryRequiredError(report)
         with LegacyGatewayLock(home_path, timeout=lock_timeout):
-            if kind in _DESKTOP_PROFILE_KINDS:
-                # Close the race between the read-only inspection and taking
-                # the old-gateway lease.  A concurrent external mutation can
-                # make a formerly-safe profile unsafe even though RC4 writers
-                # obey the external profile lock.
-                report = inspect_profile(home_path, profile_kind=kind)
-                if report.outcome == "recovery_required":
-                    raise RecoveryRequiredError(report)
             yield report
 
 

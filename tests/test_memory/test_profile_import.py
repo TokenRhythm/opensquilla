@@ -18,6 +18,7 @@ from opensquilla.memory.profile_import import (
     ModelIdentity,
     ProfileImportInputTooLargeError,
     ProfileImportInvalidOutputError,
+    ProfileImportModelError,
     ProfileImportPaths,
     ProfileImportPreviewRequest,
     ProfileImportQuotas,
@@ -29,7 +30,7 @@ from opensquilla.memory.profile_import import (
     lookup_receipt_agent,
 )
 from opensquilla.memory.profile_import.jobs import ProfileImportJobRunner
-from opensquilla.memory.profile_import.models import FusionModelRequest
+from opensquilla.memory.profile_import.models import DecisionTarget, FusionModelRequest
 from opensquilla.memory.profile_import.prompts import (
     FUSION_SYSTEM_PROMPT,
     UNDO_SYSTEM_PROMPT,
@@ -47,12 +48,14 @@ def _fusion_json(
     memory: str,
     imported: str | None = None,
     source_excerpt: str = "likes tea",
+    decision_target: str = "USER",
+    import_source_excerpt: str = "",
 ) -> str:
     decisions = (
         [
             {
                 "outcome": "applied",
-                "target": "USER",
+                "target": decision_target,
                 "source_excerpt": source_excerpt,
                 "candidate_excerpt": source_excerpt,
                 "date": "unknown",
@@ -63,6 +66,18 @@ def _fusion_json(
         if source_excerpt
         else []
     )
+    if import_source_excerpt:
+        decisions.append(
+            {
+                "outcome": "applied",
+                "target": "IMPORT",
+                "source_excerpt": import_source_excerpt,
+                "candidate_excerpt": import_source_excerpt,
+                "date": "unknown",
+                "model_confidence": "high",
+                "reason": "Explicitly stated",
+            }
+        )
     return json.dumps(
         {
             "schema_version": 1,
@@ -121,10 +136,15 @@ def _prepare_baseline(tmp_path: Path) -> None:
 def test_fusion_and_undo_prompts_preserve_each_candidate_target_language() -> None:
     fusion = " ".join(FUSION_SYSTEM_PROMPT.split())
     undo = " ".join(UNDO_SYSTEM_PROMPT.split())
+    assert "Prompt version: profile-fusion-v3" in fusion
     assert "target's existing dominant language" in fusion
     assert "only when that target is empty" in fusion
     assert "Use the requested UI locale for summary" in fusion
     assert '"Imported from: <name>" line is provenance metadata only' in fusion
+    assert "any applied decision targets IMPORT" in fusion
+    assert "candidate.import_md must be a non-empty" in fusion
+    assert "If candidate.import_md is non-empty" in fusion
+    assert "at least one applied decision must target IMPORT" in fusion
     assert "never for candidate content" in undo
 
 
@@ -141,6 +161,7 @@ async def test_preview_apply_and_exact_undo_are_private_idempotent_and_recoverab
                 user="# User\nAlice\nLikes tea.\n",
                 memory="# Memory\nBe concise.\n",
                 imported="# Project\n[unknown] - Built a tea tracker.\n",
+                import_source_excerpt="built a tea tracker",
             )
         ],
         calls,
@@ -323,7 +344,9 @@ def test_windows_private_acl_uses_current_sid_and_a_bound_handle() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_json_fails_after_one_model_call_and_keeps_raw(tmp_path: Path) -> None:
+async def test_invalid_json_is_retried_once_and_recovers_without_user_action(
+    tmp_path: Path,
+) -> None:
     _prepare_baseline(tmp_path)
     calls: list[FusionModelRequest] = []
     service = _service(
@@ -338,23 +361,306 @@ async def test_invalid_json_fails_after_one_model_call_and_keeps_raw(tmp_path: P
         calls,
     )
 
-    with pytest.raises(ProfileImportInvalidOutputError):
-        await service.preview(
-            ProfileImportPreviewRequest(
-                raw_text="The user likes tea.",
-                client_request_id="repair-request",
-            )
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user likes tea.",
+            client_request_id="repair-request",
         )
+    )
 
-    assert len(calls) == 1
+    assert len(calls) == 2
+    assert calls[1] == calls[0]
+    assert preview.no_changes is False
     job = service.store.latest_draft_job()
     assert job is not None
-    assert job.status.value == "failed"
+    assert job.status.value == "ready"
+    assert job.attempt_count == 1
     assert service.store.read_raw(job.batch_id) == "The user likes tea."
 
 
 @pytest.mark.asyncio
-async def test_invalid_evidence_fails_without_a_second_model_call(
+async def test_full_json_code_fence_is_accepted(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    valid = _fusion_json(
+        user="# User\nAlice\nLikes tea.\n",
+        memory="# Memory\nBe concise.\n",
+    )
+    service = _service(tmp_path, [f"```json\n{valid}\n```"], calls)
+
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user likes tea.",
+            client_request_id="fenced-json-request",
+        )
+    )
+
+    assert len(calls) == 1
+    assert preview.no_changes is False
+    assert {item.target.value for item in preview.files} == {"USER"}
+
+
+@pytest.mark.asyncio
+async def test_multiple_json_roots_are_rejected_then_retry_recovers(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    valid = _fusion_json(
+        user="# User\nAlice\nLikes tea.\n",
+        memory="# Memory\nBe concise.\n",
+    )
+    service = _service(tmp_path, [f"{valid}\n{valid}", valid], calls)
+
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user likes tea.",
+            client_request_id="multiple-roots-request",
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[1] == calls[0]
+    assert preview.no_changes is False
+
+
+@pytest.mark.asyncio
+async def test_applied_import_without_content_retries_and_recovers(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    source_excerpt = "built a tea tracker"
+    service = _service(
+        tmp_path,
+        [
+            _fusion_json(
+                user="# User\nAlice\n",
+                memory="# Memory\nBe concise.\n",
+                imported=None,
+                source_excerpt=source_excerpt,
+                decision_target="IMPORT",
+            ),
+            _fusion_json(
+                user="# User\nAlice\n",
+                memory="# Memory\nBe concise.\n",
+                imported="# Projects\n- Built a tea tracker.\n",
+                source_excerpt=source_excerpt,
+                decision_target="IMPORT",
+            ),
+        ],
+        calls,
+    )
+
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user built a tea tracker.",
+            client_request_id="missing-import-content-recovers",
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[1] == calls[0]
+    assert {item.target.value for item in preview.files} == {"IMPORT"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "imported",
+    [
+        pytest.param(None, id="null"),
+        pytest.param("", id="empty"),
+        pytest.param(" \n\t", id="whitespace"),
+    ],
+)
+async def test_applied_import_without_nonblank_content_fails_closed(
+    tmp_path: Path,
+    imported: str | None,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    source_excerpt = "built a tea tracker"
+    inconsistent = _fusion_json(
+        user="# User\nAlice\n",
+        memory="# Memory\nBe concise.\n",
+        imported=imported,
+        source_excerpt=source_excerpt,
+        decision_target="IMPORT",
+    )
+    service = _service(tmp_path, [inconsistent, inconsistent], calls)
+
+    with pytest.raises(
+        ProfileImportInvalidOutputError,
+        match="applies IMPORT without non-empty IMPORT content",
+    ):
+        await service.preview(
+            ProfileImportPreviewRequest(
+                raw_text="The user built a tea tracker.",
+                client_request_id=f"missing-import-content-{imported!r}",
+            )
+        )
+
+    assert len(calls) == 2
+    assert _paths(tmp_path).user_path.read_text(encoding="utf-8") == "# User\nAlice\n"
+    assert _paths(tmp_path).memory_path.read_text(encoding="utf-8") == (
+        "# Memory\nBe concise.\n"
+    )
+    assert list(_paths(tmp_path).imports_dir.glob("*.md")) == []
+    failed = service.store.latest_draft_job()
+    assert failed is not None
+    assert failed.status.value == "failed"
+    assert failed.error_code == "MEMORY_IMPORT_INVALID_OUTPUT"
+    assert service.store.read_raw(failed.batch_id) == "The user built a tea tracker."
+
+
+@pytest.mark.asyncio
+async def test_import_content_without_applied_import_decision_retries_and_recovers(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    inconsistent = _fusion_json(
+        user="# User\nAlice\n",
+        memory="# Memory\nBe concise.\n",
+        imported="# Projects\n- Built a tea tracker.\n",
+        source_excerpt="",
+    )
+    valid_no_change = _fusion_json(
+        user="# User\nAlice\n",
+        memory="# Memory\nBe concise.\n",
+        imported=None,
+        source_excerpt="",
+    )
+    service = _service(tmp_path, [inconsistent, valid_no_change], calls)
+
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user built a tea tracker.",
+            client_request_id="unclaimed-import-content-recovers",
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[1] == calls[0]
+    assert preview.no_changes is True
+    assert preview.files == []
+
+
+@pytest.mark.asyncio
+async def test_import_content_without_applied_import_decision_fails_closed(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    inconsistent = _fusion_json(
+        user="# User\nAlice\n",
+        memory="# Memory\nBe concise.\n",
+        imported="# Projects\n- Built a tea tracker.\n",
+        source_excerpt="",
+    )
+    service = _service(tmp_path, [inconsistent, inconsistent], calls)
+
+    with pytest.raises(
+        ProfileImportInvalidOutputError,
+        match="contains IMPORT content without an applied IMPORT decision",
+    ):
+        await service.preview(
+            ProfileImportPreviewRequest(
+                raw_text="The user built a tea tracker.",
+                client_request_id="unclaimed-import-content-fails",
+            )
+        )
+
+    assert len(calls) == 2
+    assert list(_paths(tmp_path).imports_dir.glob("*.md")) == []
+
+
+@pytest.mark.asyncio
+async def test_nested_valid_json_object_in_invalid_wrapper_is_not_unwrapped(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    valid = json.loads(
+        _fusion_json(
+            user="# User\nAlice\nLikes tea.\n",
+            memory="# Memory\nBe concise.\n",
+        )
+    )
+    response = json.dumps({"result": valid})
+    service = _service(tmp_path, [response, response], calls)
+
+    with pytest.raises(ProfileImportInvalidOutputError):
+        await service.preview(
+            ProfileImportPreviewRequest(
+                raw_text="The user likes tea.",
+                client_request_id="nested-valid-object-request",
+            )
+        )
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapper", ["array", "incomplete"])
+async def test_nested_valid_json_object_in_non_object_root_is_not_unwrapped(
+    tmp_path: Path,
+    wrapper: str,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    valid = _fusion_json(
+        user="# User\nAlice\nLikes tea.\n",
+        memory="# Memory\nBe concise.\n",
+    )
+    response = f"[{valid}]\n{{}}" if wrapper == "array" else f"[prefix {valid}"
+    service = _service(tmp_path, [response, response], calls)
+
+    with pytest.raises(ProfileImportInvalidOutputError):
+        await service.preview(
+            ProfileImportPreviewRequest(
+                raw_text="The user likes tea.",
+                client_request_id=f"nested-{wrapper}-object-request",
+            )
+        )
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_schema_invalid_json_object_fails_without_writing_profile_files(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    response = json.dumps({"schema_version": 1})
+    service = _service(tmp_path, [response, response], calls)
+
+    with pytest.raises(ProfileImportInvalidOutputError):
+        await service.preview(
+            ProfileImportPreviewRequest(
+                raw_text="The user likes tea.",
+                client_request_id="schema-invalid-request",
+            )
+        )
+
+    assert len(calls) == 2
+    assert _paths(tmp_path).user_path.read_text(encoding="utf-8") == "# User\nAlice\n"
+    assert _paths(tmp_path).memory_path.read_text(encoding="utf-8") == (
+        "# Memory\nBe concise.\n"
+    )
+    failed = service.store.latest_draft_job()
+    assert failed is not None
+    assert failed.status.value == "failed"
+    assert failed.error_code == "MEMORY_IMPORT_INVALID_OUTPUT"
+    assert failed.attempt_count == 1
+    assert service.store.read_raw(failed.batch_id) == "The user likes tea."
+
+
+@pytest.mark.asyncio
+async def test_invalid_evidence_is_retried_once_and_can_recover(
     tmp_path: Path,
 ) -> None:
     _prepare_baseline(tmp_path)
@@ -376,15 +682,15 @@ async def test_invalid_evidence_fails_without_a_second_model_call(
         calls,
     )
 
-    with pytest.raises(ProfileImportInvalidOutputError):
-        await service.preview(
-            ProfileImportPreviewRequest(
-                raw_text="The user likes tea.",
-                client_request_id="evidence-repair-request",
-            )
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user likes tea.",
+            client_request_id="evidence-repair-request",
         )
+    )
 
-    assert len(calls) == 1
+    assert len(calls) == 2
+    assert preview.no_changes is False
 
 
 @pytest.mark.asyncio
@@ -401,7 +707,7 @@ async def test_invalid_model_output_never_writes_profile_files(tmp_path: Path) -
             )
         )
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert _paths(tmp_path).user_path.read_text(encoding="utf-8") == "# User\nAlice\n"
     assert _paths(tmp_path).memory_path.read_text(encoding="utf-8") == (
         "# Memory\nBe concise.\n"
@@ -409,7 +715,97 @@ async def test_invalid_model_output_never_writes_profile_files(tmp_path: Path) -
     failed = service.store.latest_draft_job()
     assert failed is not None
     assert failed.status.value == "failed"
+    assert failed.error_code == "MEMORY_IMPORT_INVALID_OUTPUT"
+    assert failed.attempt_count == 1
     assert service.store.read_raw(failed.batch_id) == "The user likes tea."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [TimeoutError("synthetic timeout"), RuntimeError("synthetic 401")],
+)
+async def test_model_transport_failures_are_not_automatically_retried(
+    tmp_path: Path,
+    failure: Exception,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    identifiers = _ids()
+
+    async def complete(request: FusionModelRequest) -> str:
+        calls.append(request)
+        raise failure
+
+    service = ProfileImportService(
+        _paths(tmp_path),
+        ModelIdentity(provider="configured-provider", model="configured-model"),
+        complete,
+        now=lambda: datetime(2026, 7, 28, 12, 0, tzinfo=UTC),
+        id_factory=lambda: next(identifiers),
+        profile_lock_factory=lambda _path: contextlib.nullcontext(),
+    )
+
+    with pytest.raises(ProfileImportModelError):
+        await service.preview(
+            ProfileImportPreviewRequest(
+                raw_text="The user likes tea.",
+                client_request_id=f"transport-failure-{type(failure).__name__}",
+            )
+        )
+
+    assert len(calls) == 1
+    failed = service.store.latest_draft_job()
+    assert failed is not None
+    assert failed.status.value == "failed"
+    assert failed.error_code == "MEMORY_IMPORT_MODEL_FAILED"
+    assert failed.attempt_count == 1
+    assert service.store.read_raw(failed.batch_id) == "The user likes tea."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("returned_value", "expected_error"),
+    [
+        pytest.param(None, ProfileImportModelError, id="non-text"),
+        pytest.param(
+            "x" * (1024 * 1024 + 1),
+            ProfileImportInvalidOutputError,
+            id="oversized-text",
+        ),
+    ],
+)
+async def test_non_text_and_oversized_model_outputs_are_not_automatically_retried(
+    tmp_path: Path,
+    returned_value: object,
+    expected_error: type[Exception],
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    identifiers = _ids()
+
+    async def complete(request: FusionModelRequest) -> str:
+        calls.append(request)
+        return returned_value  # type: ignore[return-value]
+
+    service = ProfileImportService(
+        _paths(tmp_path),
+        ModelIdentity(provider="configured-provider", model="configured-model"),
+        complete,
+        now=lambda: datetime(2026, 7, 28, 12, 0, tzinfo=UTC),
+        id_factory=lambda: next(identifiers),
+        profile_lock_factory=lambda _path: contextlib.nullcontext(),
+    )
+
+    with pytest.raises(expected_error):
+        await service.preview(
+            ProfileImportPreviewRequest(
+                raw_text="The user likes tea.",
+                client_request_id=f"invalid-return-{type(returned_value).__name__}",
+            )
+        )
+
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -965,6 +1361,156 @@ async def test_apply_rejects_a_stale_preview_without_overwriting_user_edit(
 
 
 @pytest.mark.asyncio
+async def test_old_incomplete_import_preview_loads_and_discards_but_cannot_apply(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    service = _service(
+        tmp_path,
+        [
+            _fusion_json(
+                user="# User\nAlice\nLikes tea.\n",
+                memory="# Memory\nBe concise.\n",
+            )
+        ],
+        [],
+    )
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user likes tea.",
+            client_request_id="old-incomplete-import-preview",
+        )
+    )
+    record = service.store.load_preview(preview.preview_id)
+    record.prompt_version = "profile-fusion-v2"
+    record.fusion_output = record.fusion_output.model_copy(
+        update={
+            "decisions": [
+                record.fusion_output.decisions[0].model_copy(
+                    update={"target": DecisionTarget.IMPORT}
+                )
+            ]
+        }
+    )
+    service.store.update_preview(record)
+
+    loaded = service.store.load_preview(preview.preview_id)
+    assert loaded.prompt_version == "profile-fusion-v2"
+    assert loaded.fusion_output.candidate.import_md is None
+    assert loaded.fusion_output.decisions[0].target is DecisionTarget.IMPORT
+    assert all(plan.target is not DecisionTarget.IMPORT for plan in loaded.files)
+
+    with pytest.raises(
+        ProfileImportStalePreviewError,
+        match="preview is incomplete; generate a new preview",
+    ):
+        await service.apply(
+            preview.preview_id,
+            preview.candidate_hash,
+            "must-not-bind",
+        )
+
+    rejected = service.store.load_preview(preview.preview_id)
+    assert rejected.idempotency_key_hash is None
+    assert _paths(tmp_path).user_path.read_text(encoding="utf-8") == "# User\nAlice\n"
+
+    await service.discard(preview.preview_id)
+
+    assert lookup_preview_agent(_paths(tmp_path).state_dir, preview.preview_id) is None
+
+
+@pytest.mark.asyncio
+async def test_old_incomplete_applied_preview_remains_idempotently_queryable(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    service = _service(
+        tmp_path,
+        [
+            _fusion_json(
+                user="# User\nAlice\nLikes tea.\n",
+                memory="# Memory\nBe concise.\n",
+            )
+        ],
+        [],
+    )
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user likes tea.",
+            client_request_id="old-incomplete-applied-preview",
+        )
+    )
+    first = await service.apply(
+        preview.preview_id,
+        preview.candidate_hash,
+        "old-incomplete-applied-key",
+    )
+    record = service.store.load_preview(preview.preview_id)
+    record.prompt_version = "profile-fusion-v2"
+    record.fusion_output = record.fusion_output.model_copy(
+        update={
+            "decisions": [
+                record.fusion_output.decisions[0].model_copy(
+                    update={"target": DecisionTarget.IMPORT}
+                )
+            ]
+        }
+    )
+    service.store.update_preview(record)
+
+    repeated = await service.apply(
+        preview.preview_id,
+        preview.candidate_hash,
+        "old-incomplete-applied-key",
+    )
+
+    assert repeated.status == "alreadyApplied"
+    assert repeated.receipt_id == first.receipt_id
+
+
+@pytest.mark.asyncio
+async def test_old_import_preview_with_unclaimed_import_plan_cannot_apply(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    service = _service(
+        tmp_path,
+        [
+            _fusion_json(
+                user="# User\nAlice\n",
+                memory="# Memory\nBe concise.\n",
+                imported="# Projects\n- Built a tea tracker.\n",
+                source_excerpt="built a tea tracker",
+                decision_target="IMPORT",
+            )
+        ],
+        [],
+    )
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user built a tea tracker.",
+            client_request_id="old-unclaimed-import-plan",
+        )
+    )
+    record = service.store.load_preview(preview.preview_id)
+    record.prompt_version = "profile-fusion-v2"
+    record.fusion_output = record.fusion_output.model_copy(update={"decisions": []})
+    service.store.update_preview(record)
+
+    with pytest.raises(
+        ProfileImportStalePreviewError,
+        match="preview is incomplete; generate a new preview",
+    ):
+        await service.apply(
+            preview.preview_id,
+            preview.candidate_hash,
+            "must-not-apply-unclaimed-import-plan",
+        )
+
+    assert list(_paths(tmp_path).imports_dir.glob("*.md")) == []
+
+
+@pytest.mark.asyncio
 async def test_stale_undo_returns_model_preview_and_preserves_later_changes(
     tmp_path: Path,
 ) -> None:
@@ -1020,6 +1566,92 @@ async def test_stale_undo_returns_model_preview_and_preserves_later_changes(
     assert _paths(tmp_path).user_path.read_text(encoding="utf-8") == (
         "# User\nAlice\nLater edit.\n"
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_undo_allows_nonempty_import_candidate_with_no_decisions(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    original_import = "# Projects\n- Built a tea tracker.\n"
+    later_import = "# Projects\n- Later independent note.\n"
+    service = _service(
+        tmp_path,
+        [
+            _fusion_json(
+                user="# User\nAlice\n",
+                memory="# Memory\nBe concise.\n",
+                imported=original_import,
+                source_excerpt="built a tea tracker",
+                decision_target="IMPORT",
+            ),
+            _fusion_json(
+                user="# User\nAlice\n",
+                memory="# Memory\nBe concise.\n",
+                imported=later_import,
+                source_excerpt="",
+            ),
+        ],
+        calls,
+    )
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user built a tea tracker.",
+            client_request_id="import-before-nonempty-stale-undo",
+        )
+    )
+    applied = await service.apply(
+        preview.preview_id,
+        preview.candidate_hash,
+        "apply-import-before-nonempty-stale-undo",
+    )
+    import_path = _paths(tmp_path).imports_dir / f"{preview.batch_id}.md"
+    import_path.write_text(original_import + "- Later independent note.\n", encoding="utf-8")
+
+    undo = await service.undo(applied.receipt_id, "nonempty-stale-undo")
+
+    assert undo.status == "reviewRequired"
+    assert undo.preview is not None
+    assert len(calls) == 2
+    assert {item.target.value for item in undo.preview.files} == {"IMPORT"}
+
+    undo_applied = await service.apply(
+        undo.preview.preview_id,
+        undo.preview.candidate_hash,
+        "apply-nonempty-stale-undo",
+    )
+    assert undo_applied.status == "applied"
+    assert import_path.read_text(encoding="utf-8") == later_import
+
+
+@pytest.mark.asyncio
+async def test_stale_undo_invalid_output_is_not_automatically_retried(
+    tmp_path: Path,
+) -> None:
+    _prepare_baseline(tmp_path)
+    calls: list[FusionModelRequest] = []
+    valid_import = _fusion_json(
+        user="# User\nAlice\nLikes tea.\n",
+        memory="# Memory\nBe concise.\n",
+    )
+    service = _service(tmp_path, [valid_import, "bad", valid_import], calls)
+    preview = await service.preview(
+        ProfileImportPreviewRequest(
+            raw_text="The user likes tea.",
+            client_request_id="import-before-invalid-undo",
+        )
+    )
+    applied = await service.apply(preview.preview_id, preview.candidate_hash, "apply-import")
+    _paths(tmp_path).user_path.write_text(
+        "# User\nAlice\nLikes tea.\nLater edit.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProfileImportInvalidOutputError):
+        await service.undo(applied.receipt_id, "invalid-stale-undo")
+
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio
@@ -1287,6 +1919,7 @@ async def test_quota_counts_all_existing_memory_markdown_recursively(
                 user="# User\nAlice\n",
                 memory="# Memory\nBe concise.\n",
                 imported="# Project\n[unknown] - A project.\n",
+                import_source_excerpt="described a project",
             )
         ],
         calls,
@@ -1833,6 +2466,7 @@ async def test_committed_recovery_repairs_missing_applied_context_for_idempotent
                 user="# User\nAlice\nLikes tea.\n",
                 memory="# Memory\nBe concise.\n",
                 imported="# Project\n[unknown] - Built a tea tracker.\n",
+                import_source_excerpt="built a tea tracker",
             )
         ],
         calls,
@@ -1892,6 +2526,7 @@ async def test_missing_applied_context_is_not_repaired_across_a_later_history_ed
                 user="# User\nAlice\nLikes tea.\n",
                 memory="# Memory\nBe concise.\n",
                 imported="# Project\n[unknown] - Built a tea tracker.\n",
+                import_source_excerpt="built a tea tracker",
             )
         ],
         [],

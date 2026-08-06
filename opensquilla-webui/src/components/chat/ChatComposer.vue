@@ -194,6 +194,7 @@
                 v-if="runModeOpen"
                 :run-mode="runMode"
                 :allowed-run-modes="allowedRunModes"
+                :safe-setup-available="safeSetupAvailable"
                 @close="runModeOpen = false"
                 @set-run-mode="emit('setRunMode', $event)"
               />
@@ -236,6 +237,34 @@
                 >
                   <Icon name="download" :size="16" />
                   <span>{{ t('chat.exportMarkdown') }}</span>
+                </button>
+                <button
+                  v-if="promptCacheKeepaliveAvailable"
+                  type="button"
+                  role="menuitem"
+                  data-testid="chat-composer-action-keepalive"
+                  :title="promptCacheKeepaliveSessionReady
+                    ? t('chat.promptCacheKeepalive.action')
+                    : t('chat.promptCacheKeepalive.unavailableHint')"
+                  :aria-label="promptCacheKeepaliveAriaLabel"
+                  :disabled="!promptCacheKeepaliveSessionReady"
+                  @click="openPromptCacheKeepalive"
+                >
+                  <Icon name="clock" :size="16" />
+                  <span class="chat-more-actions-menu__copy">
+                    <span>{{ t('chat.promptCacheKeepalive.action') }}</span>
+                    <small v-if="!promptCacheKeepaliveSessionReady">
+                      {{ t('chat.promptCacheKeepalive.unavailableHint') }}
+                    </small>
+                    <small
+                      v-else-if="promptCacheKeepaliveStatusText"
+                      class="chat-more-actions-menu__keepalive-status"
+                      :data-state="promptCacheKeepaliveStatus?.state"
+                    >
+                      <span class="chat-more-actions-menu__status-dot" aria-hidden="true" />
+                      {{ promptCacheKeepaliveStatusText }}
+                    </small>
+                  </span>
                 </button>
               </div>
             </div>
@@ -314,6 +343,7 @@ import type { Attachment } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { CollaborationMode } from '@/types/plans'
+import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachments'
 
 interface ChatComposerExpose {
@@ -337,6 +367,7 @@ const props = withDefaults(defineProps<{
   inputDisabled?: boolean
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
+  safeSetupAvailable?: boolean
   runModeLocked: boolean
   runModeLockMessage: string
   modelRoutingMode: ModelRoutingMode
@@ -357,11 +388,15 @@ const props = withDefaults(defineProps<{
   planModeDisabled?: boolean
   planModeAppliesNextTurn?: boolean
   replanActive?: boolean
+  promptCacheKeepaliveAvailable?: boolean
+  promptCacheKeepaliveSessionReady?: boolean
+  promptCacheKeepaliveStatus?: PromptCacheKeepaliveStatus | null
 }>(), {
   canChooseProject: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
   inputDisabled: false,
+  safeSetupAvailable: false,
 })
 
 const emit = defineEmits<{
@@ -374,7 +409,7 @@ const emit = defineEmits<{
   retryAttachment: [index: number]
   send: []
   setBusySendMode: [mode: 'queue' | 'steer']
-  setRunMode: [mode: 'standard' | 'trusted' | 'full']
+  setRunMode: [mode: SandboxRunMode]
   setModelRoutingMode: [mode: ModelRoutingMode]
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
@@ -385,6 +420,8 @@ const emit = defineEmits<{
   stop: []
   chooseProject: []
   closeProject: []
+  openPromptCacheKeepalive: []
+  refreshPromptCacheKeepalive: []
 }>()
 
 const { t } = useI18n()
@@ -399,6 +436,17 @@ const moreActionsOpen = ref(false)
 const showProjectContext = computed(() =>
   Boolean(props.projectWorkspace && (props.canCloseProject || props.projectStatusMessage)),
 )
+const promptCacheKeepaliveStatusText = computed(() => {
+  const status = props.promptCacheKeepaliveStatus
+  if (!status || status.state === 'off') return ''
+  return t(`chat.promptCacheKeepalive.states.${status.state}`)
+})
+const promptCacheKeepaliveAriaLabel = computed(() => {
+  const action = t('chat.promptCacheKeepalive.action')
+  return promptCacheKeepaliveStatusText.value
+    ? `${action}. ${promptCacheKeepaliveStatusText.value}`
+    : action
+})
 
 // "NEW" badge on the routing control — the single-model AI router is now the
 // default, so flag it until the user first opens the control, then never again.
@@ -495,6 +543,12 @@ function toggleMoreActions() {
     addMenuOpen.value = false
     modelRoutingOpen.value = false
     runModeOpen.value = false
+    if (
+      props.promptCacheKeepaliveAvailable
+      && props.promptCacheKeepaliveSessionReady
+    ) {
+      emit('refreshPromptCacheKeepalive')
+    }
   }
 }
 
@@ -519,6 +573,12 @@ function triggerVoice() {
 function exportConversation() {
   moreActionsOpen.value = false
   emit('exportMarkdown')
+}
+
+function openPromptCacheKeepalive() {
+  if (!props.promptCacheKeepaliveSessionReady) return
+  moreActionsOpen.value = false
+  emit('openPromptCacheKeepalive')
 }
 
 function attachmentIcon(att: Attachment): IconName {
@@ -990,6 +1050,43 @@ defineExpose<ChatComposerExpose>({
   opacity: var(--state-disabled-opacity);
 }
 
+.chat-more-actions-menu__copy,
+.chat-more-actions-menu__copy small {
+  display: block;
+}
+
+.chat-more-actions-menu__copy small {
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+
+.chat-more-actions-menu__keepalive-status {
+  align-items: center;
+  display: flex !important;
+  gap: 0.375rem;
+}
+
+.chat-more-actions-menu__status-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+
+.chat-more-actions-menu__keepalive-status[data-state='scheduled']
+  .chat-more-actions-menu__status-dot,
+.chat-more-actions-menu__keepalive-status[data-state='probing']
+  .chat-more-actions-menu__status-dot {
+  background: var(--accent);
+}
+
+.chat-more-actions-menu__keepalive-status[data-state='stopped']
+  .chat-more-actions-menu__status-dot {
+  background: var(--danger);
+}
+
 .chat-input-actions--right {
   flex-shrink: 0;
 }
@@ -1165,7 +1262,7 @@ defineExpose<ChatComposerExpose>({
   box-shadow: 0 0 0 2px var(--bg-surface);
 }
 
-.chat-run-mode-btn--trusted {
+.chat-run-mode-btn--safe {
   --run-mode-tone: var(--ok);
   --run-mode-tint: color-mix(in srgb, var(--ok) 12%, var(--bg-surface));
   --run-mode-border: color-mix(in srgb, var(--ok) 34%, transparent);

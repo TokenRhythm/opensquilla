@@ -148,7 +148,11 @@ def _build_cron_tool_context(
         workspace_dir, workspace_strict = workspace_resolver(agent_id)
     return tool_context_from_envelope(
         envelope,
-        is_owner=bool(getattr(job, "creator_is_owner", False)),
+        is_owner=(
+            bool(getattr(job, "creator_is_owner", False))
+            and bool(getattr(job, "creator_host_execute", False))
+        ),
+        host_execute_allowed=bool(getattr(job, "creator_host_execute", False)),
         workspace_dir=workspace_dir,
         workspace_strict=workspace_strict,
         default_elevated=_resolve_default_elevated(default_elevated),

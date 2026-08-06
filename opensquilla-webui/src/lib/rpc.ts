@@ -89,6 +89,42 @@ interface PendingRequest {
   abortHandler: (() => void) | null;
 }
 
+const GUEST_SESSION_STORAGE_KEY = 'opensquilla.guestSessionKey';
+const GUEST_SESSION_KEY_PATTERN = /^osqg_[A-Za-z0-9_-]{43}$/;
+
+function persistGuestSessionKey(value: string): void {
+  if (!GUEST_SESSION_KEY_PATTERN.test(value)) return;
+  try {
+    globalThis.localStorage?.setItem(GUEST_SESSION_STORAGE_KEY, value);
+  } catch {
+    // Storage can be disabled; the in-memory key still protects this connection.
+  }
+}
+
+function newGuestSessionKey(): string {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  const encoded = globalThis.btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+  return `osqg_${encoded}`;
+}
+
+function loadGuestSessionKey(): string {
+  try {
+    const stored = globalThis.localStorage?.getItem(GUEST_SESSION_STORAGE_KEY) || '';
+    if (GUEST_SESSION_KEY_PATTERN.test(stored)) return stored;
+  } catch {
+    // Fall through to an in-memory credential.
+  }
+  const generated = newGuestSessionKey();
+  persistGuestSessionKey(generated);
+  return generated;
+}
+
 export class RpcClient {
   private _ws: WebSocket | null = null;
   private _socketGeneration = 0;
@@ -98,6 +134,7 @@ export class RpcClient {
   private _state: ConnectionState = 'disconnected';
   private _url = '';
   private _token: string | null = null;
+  private _guestSessionKey: string | null = null;
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _reconnectDelay = 800;
   private _maxReconnectDelay = 15000;
@@ -114,6 +151,7 @@ export class RpcClient {
   connect(url: string, token?: string): void {
     this._url = url;
     this._token = token || null;
+    this._guestSessionKey = this._guestSessionKey || loadGuestSessionKey();
     this._autoReconnect = true;
     this._clearReconnectTimer();
     if (this._ws) {
@@ -345,7 +383,12 @@ export class RpcClient {
 
       // Handshake: server sends connect.challenge, we reply with connect request
       if (data.type === 'event' && data.event === 'connect.challenge') {
-        const authParams = this._token ? { auth: { token: this._token } } : {};
+        const authParams = {
+          auth: {
+            ...(this._token ? { token: this._token } : {}),
+            guestSessionKey: this._guestSessionKey || loadGuestSessionKey(),
+          },
+        };
         const id = String(++this._reqId);
         if (handshakeRequestId) return;
         handshakeRequestId = id;
@@ -386,6 +429,14 @@ export class RpcClient {
       // Handshake: HelloOk frame
       if (data.protocol !== undefined && this._state === 'connecting') {
         this._policy = data.policy || null;
+        const serverGuestSessionKey = data.auth?.guestSessionKey;
+        if (
+          typeof serverGuestSessionKey === 'string'
+          && GUEST_SESSION_KEY_PATTERN.test(serverGuestSessionKey)
+        ) {
+          this._guestSessionKey = serverGuestSessionKey;
+          persistGuestSessionKey(serverGuestSessionKey);
+        }
         if (handshakeRequestId) {
           this._resolvePending(handshakeRequestId, data, generation);
           handshakeRequestId = null;

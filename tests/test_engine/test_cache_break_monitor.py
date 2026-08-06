@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+from collections import OrderedDict
+
+import pytest
+
 from opensquilla.engine import cache_break_monitor
 from opensquilla.engine.cache_break_monitor import CacheBreakMonitor
 from opensquilla.provider import ChatConfig, Message, ToolDefinition, ToolInputSchema
+from opensquilla.session.turn_context import current_turn_context, turn_context_scope
 
 
 def _tool(name: str) -> ToolDefinition:
@@ -11,6 +17,13 @@ def _tool(name: str) -> ToolDefinition:
         description=f"{name} tool",
         input_schema=ToolInputSchema(properties={}),
     )
+
+
+def _isolate_compaction_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cache_break_monitor, "_compaction_sequences", {})
+    monkeypatch.setattr(cache_break_monitor, "_compaction_terminals", OrderedDict())
+    monkeypatch.setattr(cache_break_monitor, "_active_compaction_tasks", {})
+    monkeypatch.setattr(cache_break_monitor, "_compaction_heartbeat_tasks", {})
 
 
 def test_cache_break_monitor_initializes_then_detects_attributed_drop() -> None:
@@ -158,6 +171,82 @@ def test_notify_compaction_notifies_registered_listeners() -> None:
     ]
 
 
+def test_notify_compaction_records_durable_automatic_activity_on_current_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    events: list[dict] = []
+    remove = cache_break_monitor.add_compaction_listener(
+        lambda _session_key, payload: events.append(payload)
+    )
+    try:
+        with turn_context_scope({"turn_id": "turn-compaction-activity"}):
+            started = cache_break_monitor.notify_compaction(
+                "agent:main:activity",
+                status="started",
+                source="automatic",
+                compaction_id="compaction-activity-1",
+                applied=False,
+                durability="none",
+            )
+            completed = cache_break_monitor.notify_compaction(
+                "agent:main:activity",
+                status="completed",
+                source="automatic",
+                compaction_id="compaction-activity-1",
+                applied=True,
+                durability="durable",
+            )
+            context = current_turn_context()
+    finally:
+        remove()
+
+    assert started is not None
+    assert completed is not None
+    assert started["turn_id"] == "turn-compaction-activity"
+    assert started["task_id"] == "turn-compaction-activity"
+    assert completed["turn_id"] == "turn-compaction-activity"
+    assert completed["task_id"] == "turn-compaction-activity"
+    assert context is not None
+    assert len(context["activity_markers"]) == 1
+    marker = context["activity_markers"][0]
+    assert marker == {
+        "kind": "context_compaction",
+        "id": "compaction-activity-1",
+        "status": "completed",
+        "at": marker["at"],
+    }
+    assert isinstance(marker["at"], int)
+    assert [event["sequence"] for event in events] == [1, 2]
+    assert current_turn_context() is None
+
+
+def test_notify_compaction_does_not_record_non_durable_or_manual_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+
+    with turn_context_scope({"turn_id": "turn-compaction-filter"}):
+        cache_break_monitor.notify_compaction(
+            "agent:main:activity-filter",
+            status="completed",
+            source="automatic",
+            compaction_id="compaction-request-scoped",
+            applied=True,
+            durability="request_scoped",
+        )
+        cache_break_monitor.notify_compaction(
+            "agent:main:activity-filter",
+            status="completed",
+            source="manual",
+            compaction_id="compaction-manual",
+            applied=True,
+            durability="durable",
+        )
+
+        assert current_turn_context() == {"turn_id": "turn-compaction-filter"}
+
+
 def test_notify_compaction_resets_cache_only_after_completed_status(
     monkeypatch,
 ) -> None:
@@ -247,3 +336,234 @@ def test_notify_compaction_can_reset_cache_without_notifying_listeners(
 
     assert events == []
     assert report.reason == "baseline_reset_after_compaction"
+
+
+@pytest.mark.asyncio
+async def test_notify_compaction_sequences_started_heartbeat_terminal_and_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    session_key = "agent:main:heartbeat-lifecycle"
+    compaction_id = "compaction-heartbeat-lifecycle"
+    events: list[dict] = []
+    heartbeat_seen = asyncio.Event()
+
+    def _record_event(_session_key: str, payload: dict) -> None:
+        events.append(payload)
+        if payload.get("heartbeat") is True:
+            heartbeat_seen.set()
+
+    remove = cache_break_monitor.add_compaction_listener(_record_event)
+    heartbeat_task: asyncio.Task[None] | None = None
+    try:
+        started = cache_break_monitor.notify_compaction(
+            session_key,
+            status="started",
+            source="manual",
+            phase="manual",
+            compaction_id=compaction_id,
+            heartbeat_interval_seconds=0.01,
+        )
+
+        assert started is not None
+        assert started["sequence"] == 1
+        assert cache_break_monitor.active_compaction_ids(session_key) == (compaction_id,)
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=1.0)
+
+        heartbeat_task = cache_break_monitor._compaction_heartbeat_tasks[
+            (session_key, compaction_id)
+        ]
+        terminal = cache_break_monitor.notify_compaction(
+            session_key,
+            status="completed",
+            source="manual",
+            phase="manual",
+            compaction_id=compaction_id,
+        )
+        assert terminal is not None
+
+        await asyncio.wait_for(heartbeat_task, timeout=1.0)
+        event_count_after_terminal = len(events)
+        await asyncio.sleep(0.03)
+    finally:
+        remove()
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+    assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+    assert events[0]["status"] == "started"
+    assert all(
+        event["status"] == "observed" and event.get("heartbeat") is True
+        for event in events[1:-1]
+    )
+    assert events[-1]["status"] == "completed"
+    assert len(events) == event_count_after_terminal
+    assert cache_break_monitor.active_compaction_ids(session_key) == ()
+
+
+def test_notify_compaction_delivers_terminal_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    compaction_id = "compaction-terminal-once"
+    events: list[dict] = []
+    remove = cache_break_monitor.add_compaction_listener(
+        lambda _session_key, payload: events.append(payload)
+    )
+    try:
+        started = cache_break_monitor.notify_compaction(
+            "agent:main:terminal-once",
+            status="started",
+            compaction_id=compaction_id,
+        )
+        terminal = cache_break_monitor.notify_compaction(
+            "agent:main:terminal-once",
+            status="completed",
+            compaction_id=compaction_id,
+        )
+        duplicate = cache_break_monitor.notify_compaction(
+            "agent:main:terminal-once",
+            status="failed",
+            compaction_id=compaction_id,
+        )
+    finally:
+        remove()
+
+    assert started is not None
+    assert terminal is not None
+    assert duplicate is None
+    assert [(event["status"], event["sequence"]) for event in events] == [
+        ("started", 1),
+        ("completed", 2),
+    ]
+    assert cache_break_monitor.compaction_terminal_status(compaction_id) == "completed"
+
+
+def test_notify_compaction_treats_stale_as_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    compaction_id = "compaction-stale-terminal"
+
+    cache_break_monitor.notify_compaction(
+        "agent:main:stale-terminal",
+        status="started",
+        compaction_id=compaction_id,
+    )
+    terminal = cache_break_monitor.notify_compaction(
+        "agent:main:stale-terminal",
+        status="stale",
+        compaction_id=compaction_id,
+    )
+    duplicate = cache_break_monitor.notify_compaction(
+        "agent:main:stale-terminal",
+        status="failed",
+        compaction_id=compaction_id,
+    )
+
+    assert terminal is not None
+    assert duplicate is None
+    assert cache_break_monitor.compaction_terminal_status(compaction_id) == "stale"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cancel_owner", "expected_status", "expected_reason"),
+    [
+        (False, "failed", "owner_task_failed"),
+        (True, "cancelled", "owner_task_cancelled"),
+    ],
+)
+async def test_owner_task_exit_backstops_missing_compaction_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_owner: bool,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    session_key = "agent:main:owner-backstop"
+    compaction_id = f"compaction-owner-backstop-{expected_status}"
+    events: list[dict] = []
+    release = asyncio.Event()
+
+    async def _owner() -> None:
+        cache_break_monitor.notify_compaction(
+            session_key,
+            status="started",
+            source="automatic",
+            phase="preflight",
+            compaction_id=compaction_id,
+            heartbeat_interval_seconds=60.0,
+        )
+        if cancel_owner:
+            await release.wait()
+        raise RuntimeError("unexpected owner failure")
+
+    remove = cache_break_monitor.add_compaction_listener(
+        lambda _session_key, payload: events.append(payload)
+    )
+    owner = asyncio.create_task(_owner())
+    try:
+        await asyncio.sleep(0)
+        if cancel_owner:
+            owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+        await asyncio.sleep(0)
+    finally:
+        remove()
+        heartbeat = cache_break_monitor._compaction_heartbeat_tasks.get(
+            (session_key, compaction_id)
+        )
+        if heartbeat is not None and not heartbeat.done():
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+    assert [event["status"] for event in events] == ["started", expected_status]
+    assert events[-1]["reason"] == expected_reason
+    assert cache_break_monitor.compaction_terminal_status(compaction_id) == expected_status
+    assert cache_break_monitor.active_compaction_ids(session_key) == ()
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_compactions_is_scoped_to_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    release = asyncio.Event()
+
+    async def _wait_for_release() -> None:
+        await release.wait()
+
+    first = asyncio.create_task(_wait_for_release())
+    second = asyncio.create_task(_wait_for_release())
+    other_session = asyncio.create_task(_wait_for_release())
+    try:
+        cache_break_monitor.register_active_compaction(
+            "agent:main:target",
+            "compaction-target-1",
+            first,
+        )
+        cache_break_monitor.register_active_compaction(
+            "agent:main:target",
+            "compaction-target-2",
+            second,
+        )
+        cache_break_monitor.register_active_compaction(
+            "agent:main:other",
+            "compaction-other",
+            other_session,
+        )
+
+        cancelled = cache_break_monitor.cancel_active_compactions("agent:main:target")
+        await asyncio.gather(*cancelled, return_exceptions=True)
+
+        assert set(cancelled) == {first, second}
+        assert first.cancelled() is True
+        assert second.cancelled() is True
+        assert other_session.done() is False
+        assert cache_break_monitor.active_compaction_ids("agent:main:target") == ()
+        assert cache_break_monitor.active_compaction_ids("agent:main:other") == (
+            "compaction-other",
+        )
+    finally:
+        other_session.cancel()
+        await asyncio.gather(other_session, return_exceptions=True)

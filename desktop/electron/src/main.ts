@@ -51,7 +51,12 @@ import {
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
 import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
-import { parseOpenSquillaReleaseTag } from './update-feed-resolver.js'
+import { freshDesktopSandboxConfigLines } from './desktop-sandbox-default.js'
+import {
+  GITHUB_UPDATE_OWNER,
+  GITHUB_UPDATE_REPO,
+  parseOpenSquillaReleaseTag,
+} from './update-feed-resolver.js'
 import {
   candidateFromUpdateChannel,
   orderedUpdateSources,
@@ -244,17 +249,24 @@ interface DesktopPreferencesPayload {
   mainWindowCloseBehavior?: unknown
   workbenchPreviewMode?: unknown
   workbenchPreviewNoticeShown?: unknown
+  sandboxUnavailableWarningSuppressed?: unknown
 }
 
 interface DesktopPreferencesSnapshot {
-  schemaVersion: 2
+  schemaVersion: 3
   mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
   workbenchPreviewMode: DesktopWorkbenchPreviewMode
   effectiveWorkbenchPreviewMode: DesktopWorkbenchPreviewMode
   workbenchPreviewNoticeShown: boolean
+  sandboxUnavailableWarningSuppressed: boolean
   workbenchPreviewForcedOffline: boolean
   canRunInBackground: boolean
   platform: 'darwin' | 'win32' | 'linux' | 'other'
+}
+
+interface SandboxUnavailablePayload {
+  state: 'failed' | 'unavailable'
+  message?: string
 }
 
 interface RuntimeLaunch {
@@ -286,6 +298,7 @@ interface RecoveryProtocolResult {
   allowed_actions: string[]
   transaction_id: string | null
   revision: number
+  detail: string | null
 }
 
 type DesktopProfileConsolidationOutcome = 'noop' | 'consolidated' | 'blocked'
@@ -366,6 +379,7 @@ let desktopPreferencesCache: {
   writable: boolean
 } | null = null
 let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
+let sandboxUnavailableWarningShownThisLaunch = false
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
 
@@ -2033,13 +2047,15 @@ function desktopPreferencesSnapshot(): DesktopPreferencesSnapshot {
   const preferences = loadDesktopPreferencesRecord().value
   const previewForcedOffline = process.env.OPENSQUILLA_PREVIEW_FORCE_OFFLINE === '1'
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     mainWindowCloseBehavior: preferences.main_window_close_behavior,
     workbenchPreviewMode: preferences.workbench_preview_mode,
     effectiveWorkbenchPreviewMode: previewForcedOffline
       ? 'offline'
       : preferences.workbench_preview_mode,
     workbenchPreviewNoticeShown: preferences.workbench_preview_notice_shown,
+    sandboxUnavailableWarningSuppressed:
+      preferences.sandbox_unavailable_warning_suppressed,
     workbenchPreviewForcedOffline: previewForcedOffline,
     canRunInBackground: canRunDesktopInBackground(),
     platform: desktopPlatformName(),
@@ -2081,6 +2097,7 @@ async function saveDesktopPreferences(
   const behavior = payload?.mainWindowCloseBehavior
   const previewMode = payload?.workbenchPreviewMode
   const previewNoticeShown = payload?.workbenchPreviewNoticeShown
+  const sandboxWarningSuppressed = payload?.sandboxUnavailableWarningSuppressed
   if (
     behavior !== undefined
     && behavior !== 'background'
@@ -2098,10 +2115,14 @@ async function saveDesktopPreferences(
   if (previewNoticeShown !== undefined && typeof previewNoticeShown !== 'boolean') {
     throw new Error('The Workbench preview notice state is invalid.')
   }
+  if (sandboxWarningSuppressed !== undefined && typeof sandboxWarningSuppressed !== 'boolean') {
+    throw new Error('The sandbox availability warning preference is invalid.')
+  }
   if (
     behavior === undefined
     && previewMode === undefined
     && previewNoticeShown === undefined
+    && sandboxWarningSuppressed === undefined
   ) {
     throw new Error('No supported Desktop preference was provided.')
   }
@@ -2112,7 +2133,86 @@ async function saveDesktopPreferences(
     ...(previewNoticeShown !== undefined
       ? { workbench_preview_notice_shown: previewNoticeShown }
       : {}),
+    ...(sandboxWarningSuppressed !== undefined
+      ? { sandbox_unavailable_warning_suppressed: sandboxWarningSuppressed }
+      : {}),
   }))
+}
+
+function normalizeSandboxUnavailablePayload(raw: unknown): SandboxUnavailablePayload {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('The sandbox availability report is invalid.')
+  }
+  const payload = raw as Record<string, unknown>
+  if (payload.state !== 'failed' && payload.state !== 'unavailable') {
+    throw new Error('The sandbox availability report is invalid.')
+  }
+  if (
+    payload.message !== undefined
+    && (typeof payload.message !== 'string' || payload.message.length > 2_000)
+  ) {
+    throw new Error('The sandbox availability report is invalid.')
+  }
+  return {
+    state: payload.state,
+    ...(typeof payload.message === 'string' && payload.message.trim()
+      ? { message: payload.message.trim() }
+      : {}),
+  }
+}
+
+async function reportSandboxUnavailable(raw: unknown): Promise<{
+  shown: boolean
+  suppressed: boolean
+}> {
+  normalizeSandboxUnavailablePayload(raw)
+  const preferences = loadDesktopPreferencesRecord().value
+  if (
+    preferences.sandbox_unavailable_warning_suppressed
+    || sandboxUnavailableWarningShownThisLaunch
+  ) {
+    return {
+      shown: false,
+      suppressed: preferences.sandbox_unavailable_warning_suppressed,
+    }
+  }
+
+  // Reserve the single prompt slot before awaiting the native dialog so
+  // concurrent renderer reports cannot open duplicate prompts.
+  sandboxUnavailableWarningShownThisLaunch = true
+  const options: Electron.MessageBoxOptions = {
+    type: 'warning',
+    title: desktopT('sandboxUnavailable.title'),
+    message: desktopT('sandboxUnavailable.message'),
+    detail: desktopT('sandboxUnavailable.detail'),
+    buttons: [
+      desktopT('sandboxUnavailable.acknowledge'),
+      desktopT('sandboxUnavailable.suppress'),
+    ],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  }
+  const window = currentMainWindow()
+  const result = window
+    ? await dialog.showMessageBox(window, options)
+    : await dialog.showMessageBox(options)
+  if (result.response !== 1) {
+    return { shown: true, suppressed: false }
+  }
+
+  try {
+    await enqueueDesktopPreferencesUpdate((current) => ({
+      ...current,
+      sandbox_unavailable_warning_suppressed: true,
+    }))
+  } catch (error) {
+    desktopLog('sandbox_unavailable_warning_persist_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return { shown: true, suppressed: false }
+  }
+  return { shown: true, suppressed: true }
 }
 
 function markBackgroundCloseNoticeShown(): void {
@@ -2467,6 +2567,7 @@ function renderDesktopConfigAfterPreflight(
     ...ensembleConfigTomlLines(credential),
     ...privacyConfigTomlLines(credential),
     '',
+    ...freshDesktopSandboxConfigLines(existingRaw, process.platform),
     '[control_ui]',
     'enabled = true',
     'base_path = "/control"',
@@ -2958,6 +3059,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'closePrompt.quit': 'Quit OpenSquilla',
     'closePrompt.cancel': 'Cancel',
     'closePrompt.remember': 'Remember my choice',
+    'sandboxUnavailable.title': 'Safe mode is unavailable',
+    'sandboxUnavailable.message': 'OpenSquilla cannot start its sandbox on this device.',
+    'sandboxUnavailable.detail': 'Safe mode has been disabled. Tasks can use Full Access, which runs with host permissions and has additional security risk.',
+    'sandboxUnavailable.acknowledge': 'I understand',
+    'sandboxUnavailable.suppress': "Don't remind me again",
     'update.newVersionTitle': 'A new version is available',
     'update.newVersionDetail': 'OpenSquilla {version} is available. Download it now?',
     'update.download': 'Download',
@@ -2991,10 +3097,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'Delete all data',
     'cleanup.deleteAllTitle': 'Delete all OpenSquilla user data?',
     'cleanup.deleteAllMessage': 'OpenSquilla will close first. The deletion starts only after the app and local runtime have fully exited.',
-    'cleanup.abandonConfirm': 'Preserve and continue',
-    'cleanup.abandonTitle': 'Leave the interrupted cleanup?',
-    'cleanup.abandonMessage': 'OpenSquilla will preserve every surviving file and archive only the cleanup transaction record.',
-    'cleanup.abandonDetail': 'Nothing else will be deleted. Review the remaining profile before continuing to use it.',
     'migration.overwriteTitle': 'Replace conflicting desktop data?',
     'migration.overwriteMessage': 'The selected installation will replace the current Desktop data.',
     'migration.overwriteDetail': 'A complete timestamped backup will be retained. Confirm the source below before continuing.',
@@ -3094,6 +3196,11 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'closePrompt.quit': '退出 OpenSquilla',
     'closePrompt.cancel': '取消',
     'closePrompt.remember': '记住我的选择',
+    'sandboxUnavailable.title': '安全模式当前不可用',
+    'sandboxUnavailable.message': 'OpenSquilla 无法在此设备上启动沙箱。',
+    'sandboxUnavailable.detail': '安全模式已禁用。任务只能使用完全访问，并将以宿主机权限运行，存在额外的安全风险。',
+    'sandboxUnavailable.acknowledge': '我知道了',
+    'sandboxUnavailable.suppress': '不再提醒',
     'update.newVersionTitle': '有新版本可用',
     'update.newVersionDetail': 'OpenSquilla {version} 已发布，现在下载吗？',
     'update.download': '下载',
@@ -3127,10 +3234,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': '删除全部数据',
     'cleanup.deleteAllTitle': '删除全部 OpenSquilla 用户数据？',
     'cleanup.deleteAllMessage': 'OpenSquilla 会先退出。只有应用和本地运行时完全退出后，删除才会开始。',
-    'cleanup.abandonConfirm': '保留并继续',
-    'cleanup.abandonTitle': '结束未完成的清理？',
-    'cleanup.abandonMessage': 'OpenSquilla 会保留所有仍存在的文件，仅归档清理事务记录。',
-    'cleanup.abandonDetail': '不会继续删除任何内容。继续使用前请检查剩余的配置文件。',
     'migration.overwriteTitle': '替换冲突的桌面数据？',
     'migration.overwriteMessage': '所选安装的数据将替换当前桌面数据。',
     'migration.overwriteDetail': '系统会保留完整的时间戳备份。继续前请确认下方的数据来源。',
@@ -3261,10 +3364,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'すべてのデータを削除',
     'cleanup.deleteAllTitle': 'OpenSquilla のすべてのユーザーデータを削除しますか？',
     'cleanup.deleteAllMessage': 'OpenSquilla を先に終了します。アプリとローカルランタイムが完全に終了した後にのみ削除を開始します。',
-    'cleanup.abandonConfirm': '保持して続行',
-    'cleanup.abandonTitle': '中断したクリーンアップを終了しますか？',
-    'cleanup.abandonMessage': '残っているすべてのファイルを保持し、クリーンアップのトランザクション記録だけをアーカイブします。',
-    'cleanup.abandonDetail': 'これ以上は削除しません。使用を続ける前に残りのプロファイルを確認してください。',
     'migration.overwriteTitle': '競合するデスクトップデータを置き換えますか？',
     'migration.overwriteMessage': '選択したインストールのデータで現在の Desktop データを置き換えます。',
     'migration.overwriteDetail': 'タイムスタンプ付きの完全なバックアップが保持されます。続行する前に以下の移行元を確認してください。',
@@ -3395,10 +3494,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'Supprimer toutes les données',
     'cleanup.deleteAllTitle': 'Supprimer toutes les données utilisateur OpenSquilla ?',
     'cleanup.deleteAllMessage': 'OpenSquilla va d’abord se fermer. La suppression ne commence qu’après l’arrêt complet de l’application et de l’environnement local.',
-    'cleanup.abandonConfirm': 'Conserver et continuer',
-    'cleanup.abandonTitle': 'Quitter le nettoyage interrompu ?',
-    'cleanup.abandonMessage': 'OpenSquilla conserve tous les fichiers restants et archive uniquement l’enregistrement de transaction du nettoyage.',
-    'cleanup.abandonDetail': 'Aucun autre élément ne sera supprimé. Vérifiez le profil restant avant de continuer à l’utiliser.',
     'migration.overwriteTitle': 'Remplacer les données de bureau en conflit ?',
     'migration.overwriteMessage': 'L’installation sélectionnée remplacera les données Desktop actuelles.',
     'migration.overwriteDetail': 'Une sauvegarde complète horodatée sera conservée. Vérifiez la source ci-dessous avant de continuer.',
@@ -3529,10 +3624,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'Alle Daten löschen',
     'cleanup.deleteAllTitle': 'Alle OpenSquilla-Benutzerdaten löschen?',
     'cleanup.deleteAllMessage': 'OpenSquilla wird zuerst beendet. Die Löschung beginnt erst, wenn App und lokale Laufzeit vollständig beendet sind.',
-    'cleanup.abandonConfirm': 'Behalten und fortfahren',
-    'cleanup.abandonTitle': 'Unterbrochene Bereinigung verlassen?',
-    'cleanup.abandonMessage': 'OpenSquilla behält alle verbliebenen Dateien und archiviert nur den Transaktionsdatensatz der Bereinigung.',
-    'cleanup.abandonDetail': 'Es wird nichts weiter gelöscht. Prüfen Sie das verbleibende Profil, bevor Sie es weiter verwenden.',
     'migration.overwriteTitle': 'Konfliktierende Desktop-Daten ersetzen?',
     'migration.overwriteMessage': 'Die ausgewählte Installation ersetzt die aktuellen Desktop-Daten.',
     'migration.overwriteDetail': 'Eine vollständige Sicherung mit Zeitstempel bleibt erhalten. Prüfen Sie vor dem Fortfahren die Quelle unten.',
@@ -3663,10 +3754,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'cleanup.deleteAllConfirm': 'Eliminar todos los datos',
     'cleanup.deleteAllTitle': '¿Eliminar todos los datos de usuario de OpenSquilla?',
     'cleanup.deleteAllMessage': 'OpenSquilla se cerrará primero. La eliminación solo comienza cuando la app y el entorno local hayan terminado por completo.',
-    'cleanup.abandonConfirm': 'Conservar y continuar',
-    'cleanup.abandonTitle': '¿Salir de la limpieza interrumpida?',
-    'cleanup.abandonMessage': 'OpenSquilla conserva todos los archivos restantes y archiva únicamente el registro de transacción de limpieza.',
-    'cleanup.abandonDetail': 'No se eliminará nada más. Revisa el perfil restante antes de seguir usándolo.',
     'migration.overwriteTitle': '¿Reemplazar los datos de escritorio en conflicto?',
     'migration.overwriteMessage': 'La instalación seleccionada reemplazará los datos actuales de Desktop.',
     'migration.overwriteDetail': 'Se conservará una copia de seguridad completa con marca de tiempo. Confirma la fuente indicada abajo antes de continuar.',
@@ -6421,6 +6508,11 @@ async function probeOnboardingProvider(
 const RECOVERY_PROTOCOL_SCHEMA_VERSION = 1
 const RECOVERY_STDOUT_LIMIT = 2 * 1024 * 1024
 const RECOVERY_COMMAND_TIMEOUT_MS = 60_000
+// Mutating recovery commands fail closed with profile_lock_busy the moment
+// another writer holds the profile locks. A short in-CLI wait lets a transient
+// writer (an exiting gateway, a cron tick) finish instead of stranding startup
+// on the manual recovery page.
+const RECOVERY_LOCK_TIMEOUT_SECONDS = 5
 const RECOVERY_OUTCOMES = new Set<RecoveryOutcome>([
   'ready',
   'attention',
@@ -6489,6 +6581,14 @@ function parseRecoveryProtocol(value: unknown): RecoveryProtocolResult {
   if (!Number.isSafeInteger(record.revision) || Number(record.revision) < 0) {
     throw new Error('Recovery command returned an invalid revision.')
   }
+  // Older CLIs omit detail; absence and null both mean "no diagnosis".
+  if (
+    record.detail !== undefined
+    && record.detail !== null
+    && typeof record.detail !== 'string'
+  ) {
+    throw new Error('Recovery command returned an invalid detail.')
+  }
   return {
     schema_version: RECOVERY_PROTOCOL_SCHEMA_VERSION,
     outcome,
@@ -6499,6 +6599,7 @@ function parseRecoveryProtocol(value: unknown): RecoveryProtocolResult {
     allowed_actions: allowedActions,
     transaction_id: record.transaction_id as string | null,
     revision: Number(record.revision),
+    detail: typeof record.detail === 'string' ? record.detail : null,
   }
 }
 
@@ -6893,6 +6994,7 @@ function recoveryFailureResult(home: string, stableCode: string): RecoveryProtoc
     ],
     transaction_id: null,
     revision: 0,
+    detail: null,
   }
 }
 
@@ -7007,6 +7109,7 @@ async function recoverInspectedProfileTransaction(
     '--home', profile.home,
     '--transaction-id', inspection.transaction_id,
     '--expected-revision', String(inspection.revision),
+    '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS),
     '--json',
   ])
 }
@@ -7850,7 +7953,7 @@ async function startGateway(): Promise<GatewayState> {
 
   const child = spawn(
     runtime.command,
-    [...runtime.args, '--port', String(port), '--bind', '127.0.0.1', '--config', desktopConfigPath()],
+    [...runtime.args, '--port', String(port), '--listen', '127.0.0.1', '--config', desktopConfigPath()],
     {
       cwd: runtime.cwd,
       env: childEnv,
@@ -7977,7 +8080,7 @@ async function startGatewayWithPortRecovery(): Promise<GatewayState> {
 }
 
 async function loadControlUi(window: BrowserWindow, gatewayUrl: string): Promise<void> {
-  const url = `${gatewayUrl}/control/chat`
+  const url = `${gatewayUrl}/control/chat/new`
   let lastError: Error | null = null
   for (let attempt = 1; attempt <= 10; attempt += 1) {
     try {
@@ -8240,14 +8343,45 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
   }
   recoveryOperationError = null
   let inspection = await inspectDesktopProfile(active)
+  // Findings below are warnings (`attention`), not startup blockers: the
+  // repair action advertised by the inspector is run automatically and
+  // startup continues. Only a failed automatic repair, a config authored by
+  // a newer build, or an elevated-Windows unsafe path reaches the manual
+  // recovery page.
   if (
-    inspection.outcome === 'recovery_required'
-    && inspection.allowed_actions.includes('recover-settings')
+    inspection.allowed_actions.includes('abandon-cleanup')
+    && inspection.stable_code === 'cleanup_transaction_incomplete'
+    && inspection.transaction_id
   ) {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     try {
+      // Abandoning archives only the cleanup journal record; every surviving
+      // file is preserved, so no confirmation is needed before startup
+      // continues on the remaining profile.
       inspection = await runRecoveryCli(active, [
-        'recover-settings', '--home', active.home, '--json',
+        'abandon-cleanup',
+        '--user-data', app.getPath('userData'),
+        '--home', active.home,
+        '--profile-kind', 'desktop-primary',
+        '--transaction-id', inspection.transaction_id,
+        '--expected-revision', String(inspection.revision),
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS),
+        '--json',
+      ])
+    } catch (error) {
+      desktopLog('cleanup_auto_abandon_failed', {
+        error: error instanceof Error ? error.message : 'unknown error',
+      })
+      inspection = recoveryFailureResult(active.home, 'cleanup_auto_abandon_failed')
+    }
+  }
+
+  if (inspection.allowed_actions.includes('recover-settings')) {
+    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
+    try {
+      inspection = await runRecoveryCli(active, [
+        'recover-settings', '--home', active.home,
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json',
       ])
     } catch (error) {
       desktopLog('settings_transaction_recovery_failed', {
@@ -8258,8 +8392,7 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
   }
 
   if (
-    inspection.outcome === 'recovery_required'
-    && inspection.allowed_actions.includes('recover-transaction')
+    inspection.allowed_actions.includes('recover-transaction')
     && inspection.transaction_id
   ) {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
@@ -8273,7 +8406,25 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     }
   }
 
-  const provenReconcile = inspection.outcome === 'recovery_required'
+  if (inspection.allowed_actions.includes('recover-config')) {
+    if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
+    try {
+      // The CLI preserves the corrupt config.toml beside itself before it
+      // restores the newest valid backup (or minimal defaults), so the
+      // automatic path never destroys evidence.
+      inspection = await runRecoveryCli(active, [
+        'recover-config', '--home', active.home,
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json',
+      ])
+    } catch (error) {
+      desktopLog('config_auto_recovery_failed', {
+        error: error instanceof Error ? error.message : 'unknown error',
+      })
+      inspection = recoveryFailureResult(active.home, 'config_auto_recovery_failed')
+    }
+  }
+
+  const provenReconcile = inspection.outcome !== 'recovery_required'
     && inspection.allowed_actions.includes('reconcile')
   const safeLayoutFinalize = inspection.outcome === 'ready'
     && inspection.allowed_actions.includes('finalize-layout')
@@ -8281,7 +8432,8 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
     try {
       inspection = await runRecoveryCli(active, [
-        'reconcile', '--home', active.home, '--json',
+        'reconcile', '--home', active.home,
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json',
       ])
     } catch (error) {
       desktopLog('recovery_reconcile_failed', {
@@ -10195,6 +10347,12 @@ ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPrefere
   if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted Desktop preferences request.')
   return await saveDesktopPreferences(payload)
 })
+ipcMain.handle('desktop:sandbox:unavailable', async (event, payload: unknown) => {
+  if (!trustedMainWindowControlIpc(event)) {
+    throw new Error('Untrusted sandbox availability report.')
+  }
+  return await reportSandboxUnavailable(payload)
+})
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
 ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) return null
@@ -12087,71 +12245,6 @@ async function recoverPrimaryProfileTransaction(): Promise<RecoveryProtocolResul
   return result
 }
 
-async function abandonActiveCleanupTransaction(): Promise<RecoveryProtocolResult> {
-  const profile = activeDesktopProfile()
-  let inspection = recoveryInspection
-  if (!inspection || inspection.stable_code !== 'cleanup_transaction_incomplete') {
-    inspection = await inspectDesktopProfile(profile)
-  }
-  if (
-    inspection.stable_code !== 'cleanup_transaction_incomplete'
-    || !inspection.allowed_actions.includes('abandon-cleanup')
-    || !inspection.transaction_id
-  ) {
-    throw new Error('No interrupted cleanup is available to preserve and leave.')
-  }
-  const options: Electron.MessageBoxOptions = {
-    type: 'warning',
-    buttons: [desktopT('cleanup.cancel'), desktopT('cleanup.abandonConfirm')],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-    title: desktopT('cleanup.abandonTitle'),
-    message: desktopT('cleanup.abandonMessage'),
-    detail: desktopT('cleanup.abandonDetail'),
-  }
-  const window = currentMainWindow()
-  const choice = window
-    ? await dialog.showMessageBox(window, options)
-    : await dialog.showMessageBox(options)
-  if (choice.response !== 1) return inspection
-
-  await stopOwnedGatewayAndWait()
-  // Stopping the runtime can legitimately change state metadata. Refresh the
-  // cleanup authority after every writer is gone so a retry never reuses a
-  // cached transaction/revision.
-  inspection = await inspectDesktopProfile(profile)
-  recoveryInspection = inspection
-  primaryRecoveryInspection = inspection
-  publishRecoveryState()
-  if (
-    inspection.stable_code !== 'cleanup_transaction_incomplete'
-    || !inspection.allowed_actions.includes('abandon-cleanup')
-    || !inspection.transaction_id
-  ) {
-    throw new Error('The interrupted cleanup changed. Review the current recovery state.')
-  }
-  const result = await runRecoveryCli(profile, [
-    'abandon-cleanup',
-    '--user-data', app.getPath('userData'),
-    '--home', profile.home,
-    '--profile-kind', 'desktop-primary',
-    '--transaction-id', inspection.transaction_id,
-    '--expected-revision', String(inspection.revision),
-    '--json',
-  ])
-  recoveryInspection = result
-  primaryRecoveryInspection = result
-  publishRecoveryState()
-  if (result.outcome !== 'recovery_required') {
-    clearReusableGatewayState()
-    bootError = null
-    await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
-    void openOrResumeDesktopApp()
-  }
-  return result
-}
-
 async function choosePrimaryWorkspace(
   requestedWorkspace: unknown,
   presentation: 'workspace' | 'legacy-agent-data' = 'workspace',
@@ -12266,12 +12359,6 @@ ipcMain.handle('desktop:recovery:recover-transaction', async (event) => {
   }
   return withRecoveryOperation(recoverPrimaryProfileTransaction)
 })
-ipcMain.handle('desktop:recovery:abandon-cleanup', async (event) => {
-  if (!trustedRecoveryIpc(event)) {
-    return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
-  }
-  return withRecoveryOperation(abandonActiveCleanupTransaction)
-})
 ipcMain.handle('desktop:recovery:reveal-path', async (
   event,
   payload?: { target?: unknown },
@@ -12287,6 +12374,16 @@ ipcMain.handle('desktop:recovery:reveal-path', async (
 ipcMain.handle('desktop:recovery:copy-diagnostics', async (event) => {
   if (!trustedRecoveryIpc(event)) return false
   clipboard.writeText(sanitizedRecoveryDiagnostics())
+  return true
+})
+ipcMain.handle('desktop:recovery:open-download', async (event) => {
+  // A config authored by a newer build blocks startup until the app is
+  // updated. The recovery page offers the canonical download entry because
+  // the in-app updater is unavailable on unmanaged installs.
+  if (!trustedRecoveryIpc(event)) return false
+  await shell.openExternal(
+    `https://github.com/${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPO}/releases/latest`,
+  )
   return true
 })
 

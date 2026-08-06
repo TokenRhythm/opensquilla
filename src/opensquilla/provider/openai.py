@@ -28,9 +28,11 @@ from .app_attribution import is_provider_app_host, provider_app_headers
 from .candidate_artifact import (
     CandidateArtifactBuilder,
     CandidateArtifactLimitError,
+    InertCandidateTextNormalizer,
     strip_candidate_tool_identity,
 )
 from .compat_policy import (
+    TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
     TEXT_TOOL_DIALECT_MINIMAX_XML,
     TEXT_TOOL_DIALECT_PLAIN_JSON,
     TEXT_TOOL_DIALECT_QWEN_TAG,
@@ -56,6 +58,8 @@ from .reasoning_dialects import (
 )
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    project_final_request_payload,
+    protected_tool_result_indexes,
     prove_provider_payload_from_env,
 )
 from .stream_assembly import (
@@ -64,7 +68,9 @@ from .stream_assembly import (
     ToolStreamProtocolError,
 )
 from .text_tool_normalizer import (
+    InertDsmlSegment,
     LiteralTextSegment,
+    RejectedTextToolSegment,
     TextToolSegment,
     TextToolStreamNormalizer,
     classify_text_tool_segments,
@@ -91,6 +97,7 @@ from .types import (
     ModelCapabilities,
     ModelInfo,
     ProviderBillingReceipt,
+    ProviderFinalRequestProjection,
     ProviderHeartbeatEvent,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
@@ -115,33 +122,13 @@ _MARKDOWN_JSON_FENCE_RE = re.compile(
 )
 
 
-class _InertCandidateTextPassthrough:
-    """Keep textual tool syntax literal for non-executable proposer output."""
-
-    native_lifecycle_deferred = False
-    held_chars = 0
-    held_event_count = 0
-
-    def push(self, text: str) -> list[str]:
-        return [text] if text else []
-
-    def observe_native_tool_start(self, _tool_name: str) -> list[TextToolSegment]:
-        return []
-
-    def abandon_native_lifecycle_defer(self) -> list[TextToolSegment]:
-        return []
-
-    def finish(
-        self,
-        *,
-        successful_text_tool_terminal: bool,
-        native_calls: list[tuple[str, dict[str, Any]]] | None = None,
-    ) -> list[TextToolSegment]:
-        del successful_text_tool_terminal, native_calls
-        return []
-
-
 _MAX_CANDIDATE_WIRE_ID_CHARS = 4096
+
+
+def _has_native_tool_payload(value: object) -> bool:
+    """Distinguish absent/null/empty arrays from explicit malformed wrappers."""
+
+    return value is not None and (not isinstance(value, list) or bool(value))
 
 
 def _candidate_wire_digest(value: str) -> bytes | None:
@@ -1818,18 +1805,24 @@ def _segment_text_tool_events(
             if segment.text:
                 events.append(TextDeltaEvent(text=segment.text))
             continue
+        if isinstance(segment, RejectedTextToolSegment):
+            continue
+        if isinstance(segment, InertDsmlSegment):
+            raise AssertionError("inert DSML reached executable event conversion")
         for call in segment.calls:
             id_prefix = {
                 TEXT_TOOL_DIALECT_QWEN_TAG: "qwen_text",
                 TEXT_TOOL_DIALECT_MINIMAX_XML: "minimax_compat",
                 TEXT_TOOL_DIALECT_PLAIN_JSON: "text_compat",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: "deepseek_dsml",
             }[call.dialect]
             tool_use_id = f"{id_prefix}_{uuid4().hex[:12]}"
-            event_name = (
-                "provider.qwen_text_tool_call_parsed"
-                if call.dialect == TEXT_TOOL_DIALECT_QWEN_TAG
-                else "provider.text_tool_call_parsed"
-            )
+            event_name = {
+                TEXT_TOOL_DIALECT_QWEN_TAG: "provider.qwen_text_tool_call_parsed",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: (
+                    "provider.deepseek_dsml_tool_call_parsed"
+                ),
+            }.get(call.dialect, "provider.text_tool_call_parsed")
             log.warning(
                 event_name,
                 provider=provider_kind,
@@ -1855,6 +1848,65 @@ def _segment_text_tool_events(
                 )
             )
     return events
+
+
+def _text_tool_rejection_details(
+    segments: list[TextToolSegment],
+) -> tuple[tuple[str, ...], int] | None:
+    """Return bounded rejection metadata without retaining provider payloads."""
+
+    rejected = [
+        segment
+        for segment in segments
+        if isinstance(segment, RejectedTextToolSegment)
+    ]
+    if not rejected:
+        return None
+    reasons = tuple(sorted({segment.reason for segment in rejected}))
+    call_count = sum(max(0, segment.call_count) for segment in rejected)
+    return reasons, call_count
+
+
+def _text_tool_rejection_error(
+    segments: list[TextToolSegment],
+    *,
+    display_name: str,
+    provider_kind: str,
+    model: str,
+    phase: str,
+    cache_shape: Mapping[str, Any],
+    trace: LLMTraceRecorder,
+) -> ErrorEvent | None:
+    """Convert one rejected DSML response into a payload-free terminal error."""
+
+    details = _text_tool_rejection_details(segments)
+    if details is None:
+        return None
+    reasons, call_count = details
+    log.warning(
+        "provider.deepseek_dsml_tool_call_rejected",
+        provider=provider_kind,
+        model=model,
+        reasons=reasons,
+        call_count=call_count,
+    )
+    trace.record_error(
+        code="incomplete_tool_call",
+        message="Provider returned rejected DeepSeek DSML tool-call text",
+        metadata={
+            "phase": phase,
+            "cache_shape": cache_shape,
+            "reasons": reasons,
+            "call_count": call_count,
+        },
+    )
+    return ErrorEvent(
+        message=(
+            f"{display_name} returned an invalid DeepSeek DSML tool call; "
+            "no text-encoded tools were executed"
+        ),
+        code="incomplete_tool_call",
+    )
 
 
 def _synthesize_text_tool_events(
@@ -2673,6 +2725,7 @@ def _build_openai_wire_messages(
     model: str,
     replay_provider_state: bool,
     reasoning_echo_turns: int | None,
+    logical_index_map: dict[int, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the exact OpenAI-compatible wire-message array, without I/O."""
     openai_messages: list[dict[str, Any]] = []
@@ -2710,6 +2763,8 @@ def _build_openai_wire_messages(
         else None
     )
     for message_index, message in enumerate(messages):
+        if logical_index_map is not None:
+            logical_index_map[message_index] = len(openai_messages)
         effective_thinking = _effective_policy_thinking(
             policy, model, thinking=cfg.thinking
         )
@@ -2789,6 +2844,7 @@ def _prompt_json_schema_config(
 class OpenAIProvider:
     """Streams from OpenAI-compatible Chat Completions API (SSE)."""
 
+    final_request_admission_guaranteed = True
     provider_name = "openai"
 
     def __init__(
@@ -2898,9 +2954,10 @@ class OpenAIProvider:
         ):
             raise ValueError("additional_messages must be a non-negative integer")
         cfg = config or ChatConfig()
+        wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         wire_messages = _build_openai_wire_messages(
             messages,
-            cfg,
+            wire_cfg,
             policy=self._compat,
             provider_kind=self._provider_kind,
             model=self._model,
@@ -2920,6 +2977,220 @@ class OpenAIProvider:
             provider_kind=self._provider_kind,
             model=self._model,
             base_host=_base_url_hostname(self._base_url),
+        )
+
+    def _build_payload(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> tuple[dict[str, Any], int | None, str | None]:
+        wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
+        caps = cfg.model_capabilities
+        include_reasoning_content = _should_replay_reasoning_content(
+            policy=self._compat,
+            model=self._model,
+            caps=caps,
+            thinking=cfg.thinking,
+        )
+        logical_index_map: dict[int, int] = {}
+        openai_messages = _build_openai_wire_messages(
+            messages,
+            wire_cfg,
+            policy=self._compat,
+            provider_kind=self._provider_kind,
+            model=self._model,
+            replay_provider_state=self._replay_provider_state,
+            reasoning_echo_turns=self._reasoning_echo_turns,
+            logical_index_map=logical_index_map,
+        )
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": openai_messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if (
+            cfg.output_json_schema is not None
+            and self._compat.supports_native_json_schema_output
+        ):
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_output",
+                    "strict": cfg.output_json_schema_strict,
+                    "schema": cfg.output_json_schema,
+                },
+            }
+        elif (
+            cfg.output_json_schema is not None
+            and self._compat.supports_json_object_output
+            and cfg.output_json_schema.get("type") == "object"
+        ):
+            payload["response_format"] = {"type": "json_object"}
+        if (
+            include_reasoning_content
+            and model_basename(self._model)
+            in self._compat.preserve_thinking_model_ids
+        ) or (
+            self._provider_kind == "dashscope" and include_reasoning_content
+        ):
+            payload["preserve_thinking"] = True
+        if _should_use_max_completion_tokens(
+            self._compat,
+            self._provider_kind,
+            self._base_url,
+            self._model,
+            cfg,
+            caps,
+        ):
+            payload["max_completion_tokens"] = cfg.max_tokens
+        else:
+            payload["max_tokens"] = cfg.max_tokens
+        if self._compat.sends_usage_include:
+            payload["usage"] = {"include": True}
+        if self._compat.sends_disable_fallbacks:
+            payload["disable_fallbacks"] = True
+        if (
+            self._compat.anthropic_top_level_cache
+            and cfg.cache_mode in {"auto", "on"}
+            and _openrouter_model_is_anthropic(self._model)
+        ):
+            payload["cache_control"] = {"type": "ephemeral"}
+        if _should_send_temperature(
+            self._compat,
+            self._base_url,
+            self._model,
+            cfg,
+            caps,
+        ):
+            payload["temperature"] = cfg.temperature
+        if cfg.top_p is not None:
+            payload["top_p"] = cfg.top_p
+        if cfg.stop_sequences:
+            payload["stop"] = cfg.stop_sequences
+        if tools:
+            payload["tools"] = [
+                _build_openai_tool(
+                    tool,
+                    unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
+                )
+                for tool in tools
+            ]
+            if _should_send_tool_choice(self._provider_kind, cfg, caps):
+                payload["tool_choice"] = cfg.tool_choice
+        if self._compat.supports_provider_routing_pin:
+            pinned_provider = self._provider_routing.get(self._model)
+            if pinned_provider:
+                if self._provider_routing_strict:
+                    payload["provider"] = {
+                        "only": [pinned_provider],
+                        "allow_fallbacks": False,
+                    }
+                else:
+                    payload["provider"] = {
+                        "order": [pinned_provider],
+                        "allow_fallbacks": True,
+                    }
+
+        thinking_toggle_model = (
+            self._model.strip().lower() in self._compat.thinking_toggle_model_ids
+        )
+        if (caps and caps.supports_reasoning and cfg.thinking) or (
+            thinking_toggle_model and cfg.thinking
+        ):
+            reasoning_format = (
+                caps.reasoning_format
+                if caps is not None
+                else self._compat.default_reasoning_format
+            )
+            apply_reasoning_enable(
+                payload,
+                reasoning_format,
+                ReasoningEnableArgs(
+                    thinking_level=cfg.thinking_level,
+                    thinking_budget_tokens=cfg.thinking_budget_tokens,
+                    model=self._model,
+                    thinking_budget_explicit=bool(
+                        cfg.thinking_budget_explicit
+                    ),
+                ),
+            )
+            if reasoning_format == "dashscope":
+                env_thinking_budget = _thinking_budget_tokens_from_env()
+                if env_thinking_budget is not None:
+                    payload["thinking_budget"] = env_thinking_budget
+                elif not cfg.thinking_budget_explicit:
+                    payload.pop("thinking_budget", None)
+        elif (
+            model_basename(self._model) in self._compat.force_thinking_model_ids
+            or (
+                self._compat.thinking_required_model_prefixes
+                and self._model.strip().lower().startswith(
+                    self._compat.thinking_required_model_prefixes
+                )
+            )
+        ):
+            pass
+        elif thinking_toggle_model:
+            payload["thinking"] = {"type": "disabled"}
+        elif caps and caps.supports_reasoning:
+            apply_reasoning_disable(
+                payload,
+                caps.reasoning_format,
+                ReasoningDisableArgs(
+                    model=self._model,
+                    disable_reasoning_by_default_models=(
+                        self._compat.disable_reasoning_by_default_models
+                    ),
+                ),
+            )
+
+        _apply_compat_request_constraints(
+            payload,
+            policy=self._compat,
+            model=self._model,
+            cfg=cfg,
+            has_tools=bool(tools),
+        )
+        fallback_reason = (
+            "native_is_error_unavailable"
+            if any(message.get("role") == "tool" for message in openai_messages)
+            else None
+        )
+        return payload, wire_active_user_index, fallback_reason
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Chat Completions payload without I/O or shaping."""
+
+        cfg = config or ChatConfig()
+        payload, wire_active_user_index, fallback_reason = self._build_payload(
+            messages,
+            tools,
+            cfg,
+        )
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        return project_final_request_payload(
+            payload,
+            projection_adapter=self._provider_kind,
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            fallback_reason=fallback_reason,
+            active_user_message_index=wire_active_user_index,
+            message_limit=message_limit,
+            protected_tool_result_indexes=protected_result_indexes,
         )
 
     def chat(
@@ -2960,96 +3231,25 @@ class OpenAIProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
-        wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
-        caps = cfg.model_capabilities
-        include_reasoning_content = _should_replay_reasoning_content(
-            policy=self._compat,
-            model=self._model,
-            caps=caps,
-            thinking=cfg.thinking,
-        )
-        openai_messages = _build_openai_wire_messages(
+        payload, wire_active_user_index, fallback_reason = self._build_payload(
             messages,
-            wire_cfg,
-            policy=self._compat,
-            provider_kind=self._provider_kind,
-            model=self._model,
-            replay_provider_state=self._replay_provider_state,
-            reasoning_echo_turns=self._reasoning_echo_turns,
+            tools,
+            cfg,
         )
-
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "messages": openai_messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if (
-            cfg.output_json_schema is not None
-            and self._compat.supports_native_json_schema_output
-        ):
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "structured_output",
-                    "strict": cfg.output_json_schema_strict,
-                    "schema": cfg.output_json_schema,
-                },
-            }
-        if (
-            include_reasoning_content
-            and model_basename(self._model)
-            in self._compat.preserve_thinking_model_ids
-        ) or (
-            self._provider_kind == "dashscope" and include_reasoning_content
-        ):
-            payload["preserve_thinking"] = True
-        if _should_use_max_completion_tokens(
-            self._compat,
-            self._provider_kind,
-            self._base_url,
-            self._model,
-            cfg,
-            caps,
-        ):
-            payload["max_completion_tokens"] = cfg.max_tokens
-        else:
-            payload["max_tokens"] = cfg.max_tokens
-        if self._compat.sends_usage_include:
-            payload["usage"] = {"include": True}
-        if self._compat.sends_disable_fallbacks:
-            # Gateway proxies must not silently substitute another model:
-            # SquillaRouter is the single routing authority.
-            payload["disable_fallbacks"] = True
-        if (
-            self._compat.anthropic_top_level_cache
-            and cfg.cache_mode in {"auto", "on"}
-            and _openrouter_model_is_anthropic(self._model)
-        ):
-            payload["cache_control"] = {"type": "ephemeral"}
-        if _should_send_temperature(
-            self._compat,
-            self._base_url,
-            self._model,
-            cfg,
-            caps,
-        ):
-            payload["temperature"] = cfg.temperature
-        if cfg.top_p is not None:
-            payload["top_p"] = cfg.top_p
-        if cfg.stop_sequences:
-            payload["stop"] = cfg.stop_sequences
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        openai_messages = cast(list[dict[str, Any]], payload["messages"])
         if tools:
-            payload["tools"] = [
-                _build_openai_tool(
-                    t,
-                    unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
-                )
-                for t in tools
+            provider_tools = cast(list[dict[str, Any]], payload.get("tools", []))
+            tool_names = [
+                tool.get("function", {}).get("name", "")
+                for tool in provider_tools
             ]
-            tool_names = [tool.get("function", {}).get("name", "") for tool in payload["tools"]]
             tool_schema_hash = hashlib.sha256(
-                json.dumps(payload["tools"], ensure_ascii=False, sort_keys=True).encode("utf-8")
+                json.dumps(
+                    provider_tools,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
             ).hexdigest()[:16]
             log.info(
                 "provider.request_tool_surface",
@@ -3060,94 +3260,6 @@ class OpenAIProvider:
                 temperature=payload.get("temperature"),
                 top_p=payload.get("top_p"),
             )
-            if _should_send_tool_choice(self._provider_kind, cfg, caps):
-                payload["tool_choice"] = cfg.tool_choice
-        if self._compat.supports_provider_routing_pin:
-            pinned_provider = self._provider_routing.get(self._model)
-            if pinned_provider:
-                if self._provider_routing_strict:
-                    payload["provider"] = {
-                        "only": [pinned_provider],
-                        "allow_fallbacks": False,
-                    }
-                else:
-                    payload["provider"] = {
-                        "order": [pinned_provider],
-                        "allow_fallbacks": True,
-                    }
-
-        # Reasoning injection (gated on thinking being enabled). Gating —
-        # which model/capability profile triggers a payload at all — lives
-        # here; how each dialect spells it lives in reasoning_dialects.
-        thinking_toggle_model = (
-            self._model.strip().lower() in self._compat.thinking_toggle_model_ids
-        )
-        if (caps and caps.supports_reasoning and cfg.thinking) or (
-            thinking_toggle_model and cfg.thinking
-        ):
-            reasoning_format = (
-                caps.reasoning_format
-                if caps is not None
-                else self._compat.default_reasoning_format
-            )
-            apply_reasoning_enable(
-                payload,
-                reasoning_format,
-                ReasoningEnableArgs(
-                    thinking_level=cfg.thinking_level,
-                    thinking_budget_tokens=cfg.thinking_budget_tokens,
-                    model=self._model,
-                    thinking_budget_explicit=bool(
-                        cfg.thinking_budget_explicit
-                    ),
-                ),
-            )
-            if reasoning_format == "dashscope":
-                # DashScope thinking budget: the local env override wins;
-                # without an explicit per-call budget the field is omitted
-                # entirely so the endpoint applies its own default.
-                env_thinking_budget = _thinking_budget_tokens_from_env()
-                if env_thinking_budget is not None:
-                    payload["thinking_budget"] = env_thinking_budget
-                elif not cfg.thinking_budget_explicit:
-                    payload.pop("thinking_budget", None)
-        elif (
-            model_basename(self._model) in self._compat.force_thinking_model_ids
-            or (
-                self._compat.thinking_required_model_prefixes
-                and self._model.strip().lower().startswith(
-                    self._compat.thinking_required_model_prefixes
-                )
-            )
-        ):
-            # Forced-thinking endpoints reject enable_thinking=False; omit the
-            # off-payload so the request still succeeds. The model will still
-            # think — that is the only mode the endpoint supports.
-            pass
-        elif thinking_toggle_model:
-            # Toggle models need an explicit off payload even without a
-            # capability profile (policy gating, independent of dialect).
-            payload["thinking"] = {"type": "disabled"}
-        elif caps and caps.supports_reasoning:
-            apply_reasoning_disable(
-                payload,
-                caps.reasoning_format,
-                ReasoningDisableArgs(
-                    model=self._model,
-                    disable_reasoning_by_default_models=(
-                        self._compat.disable_reasoning_by_default_models
-                    ),
-                ),
-            )
-
-        _apply_compat_request_constraints(
-            payload,
-            policy=self._compat,
-            model=self._model,
-            cfg=cfg,
-            has_tools=bool(tools),
-        )
-
         if self._provider_kind == "dashscope":
             log.info(
                 "provider.qwen_provider_profile",
@@ -3163,11 +3275,6 @@ class OpenAIProvider:
                 stream_fallback="non_stream_once",
             )
 
-        fallback_reason = (
-            "native_is_error_unavailable"
-            if any(message.get("role") == "tool" for message in openai_messages)
-            else None
-        )
         from opensquilla.engine.context_budget import coordinate_provider_context_budget
 
         budget_decision = coordinate_provider_context_budget(
@@ -3176,6 +3283,8 @@ class OpenAIProvider:
             proof_budget=cfg.provider_request_max_chars,
             status_projection_mode="content_envelope",
             fallback_reason=fallback_reason,
+            active_user_message_index=wire_active_user_index,
+            protected_tool_result_indexes=protected_result_indexes,
         )
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
@@ -3183,6 +3292,13 @@ class OpenAIProvider:
             yield ErrorEvent(
                 message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
                 code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
             )
             return
         payload = budget_decision.payload or payload
@@ -3194,6 +3310,8 @@ class OpenAIProvider:
                 projection_adapter=self._provider_kind,
                 status_projection_mode="content_envelope",
                 fallback_reason=fallback_reason,
+                active_user_message_index=wire_active_user_index,
+                protected_tool_result_indexes=protected_result_indexes,
             )
         except ProviderRequestBudgetExceededError as exc:
             log.warning("provider.request_budget_exhausted", **exc.proof)
@@ -3224,6 +3342,17 @@ class OpenAIProvider:
                 cfg.provider_request_correlation,
             )
         )
+        correlation = cfg.provider_request_correlation
+        if (
+            self._provider_kind == "openrouter"
+            and correlation is not None
+            and correlation.call_kind == "prompt_cache_keepalive"
+            and correlation.session_id
+        ):
+            # Keep cache/routing affinity opt-in: normal OpenRouter requests
+            # must retain their existing headers when keepalive is disabled.
+            # Use the opaque random id, never a canonical session key.
+            headers["X-Session-Id"] = correlation.session_id
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
 
@@ -3242,11 +3371,13 @@ class OpenAIProvider:
         reasoning = ReasoningAccumulator()
         tools_by_name = _tool_by_name(tools)
         text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
-        text_tool_normalizer: (
-            TextToolStreamNormalizer | _InertCandidateTextPassthrough
-        )
+        text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
-            text_tool_normalizer = _InertCandidateTextPassthrough()
+            assert candidate_artifact is not None
+            text_tool_normalizer = InertCandidateTextNormalizer(
+                artifact=candidate_artifact,
+                dialects=text_tool_dialects,
+            )
         else:
             text_tool_normalizer = TextToolStreamNormalizer(
                 tools=tools,
@@ -3373,7 +3504,10 @@ class OpenAIProvider:
             async with httpx.AsyncClient(
                 timeout=(
                     _stream_timeout(cfg.timeout)
-                    if self._compat.stream_timeout_fallback
+                    if (
+                        self._compat.stream_timeout_fallback
+                        and cfg.physical_attempt_limit != 1
+                    )
                     else cfg.timeout
                 ),
                 trust_env=_trust_env(),
@@ -3887,7 +4021,27 @@ class OpenAIProvider:
                                 streamed_thought_signature = ts_delta
 
                             # Tool calls (may stream over multiple chunks)
-                            raw_tool_calls = delta.get("tool_calls") or []
+                            raw_tool_calls_value = delta.get("tool_calls")
+                            if _has_native_tool_payload(raw_tool_calls_value):
+                                pending_segments = (
+                                    text_tool_normalizer.observe_native_tool_start("")
+                                )
+                                for pending_event in _segment_text_tool_events(
+                                    pending_segments,
+                                    provider_kind=self._provider_kind,
+                                    model=self._model,
+                                ):
+                                    if isinstance(pending_event, TextDeltaEvent):
+                                        visible_assistant_text_parts.append(
+                                            pending_event.text
+                                        )
+                                        emitted_stream_event = True
+                                        yield pending_event
+                            raw_tool_calls = (
+                                []
+                                if raw_tool_calls_value is None
+                                else raw_tool_calls_value
+                            )
                             if not isinstance(raw_tool_calls, list):
                                 if inert_candidate_output:
                                     assert candidate_artifact is not None
@@ -3897,6 +4051,7 @@ class OpenAIProvider:
                                             raw_tool_calls
                                         ),
                                     )
+                                    text_tool_normalizer.observe_native_tool_start("")
                                     emitted_stream_event = True
                                 else:
                                     invalid_native_structure += 1
@@ -3915,6 +4070,7 @@ class OpenAIProvider:
                                             ("invalid_tool_call", candidate_artifact.call_count),
                                             arguments=strip_candidate_tool_identity(tc),
                                         )
+                                        text_tool_normalizer.observe_native_tool_start("")
                                         emitted_stream_event = True
                                     else:
                                         invalid_native_structure += 1
@@ -4009,6 +4165,7 @@ class OpenAIProvider:
                                         name_fragment=name_fragment,
                                         arguments_fragment=arguments_fragment,
                                     )
+                                    text_tool_normalizer.observe_native_tool_start("")
                                     candidate_artifact_open_keys.add(artifact_key)
                                     emitted_stream_event = True
                                     continue
@@ -4287,6 +4444,7 @@ class OpenAIProvider:
                     if not has_terminal_evidence:
                         if (
                             self._compat.empty_stream_fallback
+                            and cfg.physical_attempt_limit != 1
                             and not active_choice_seen
                             and not emitted_stream_event
                             and not assistant_text_parts
@@ -4493,6 +4651,18 @@ class OpenAIProvider:
                         successful_text_tool_terminal=successful_text_tool_terminal,
                         native_calls=native_calls,
                     )
+                    rejection_error = _text_tool_rejection_error(
+                        normalized_segments,
+                        display_name=self._compat.display_name,
+                        provider_kind=self._provider_kind,
+                        model=self._model,
+                        phase="stream",
+                        cache_shape=cache_shape,
+                        trace=trace,
+                    )
+                    if rejection_error is not None:
+                        yield rejection_error
+                        return
                     for event in _segment_text_tool_events(
                         normalized_segments,
                         provider_kind=self._provider_kind,
@@ -4522,7 +4692,7 @@ class OpenAIProvider:
                     deferred_post_native_events.clear()
 
                     candidate_artifact_text = ""
-                    if candidate_artifact is not None and candidate_artifact.has_calls:
+                    if candidate_artifact is not None and candidate_artifact.has_content:
                         if successful_text_tool_terminal:
                             for artifact_key in candidate_artifact_open_keys:
                                 candidate_artifact.finish(artifact_key)
@@ -4566,6 +4736,7 @@ class OpenAIProvider:
 
                     if (
                         self._compat.empty_stream_fallback
+                        and cfg.physical_attempt_limit != 1
                         and not emitted_stream_event
                         and not assistant_text_parts
                         and not tools_acc.has_calls
@@ -4654,7 +4825,11 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
-            if self._compat.stream_timeout_fallback and not emitted_stream_event:
+            if (
+                self._compat.stream_timeout_fallback
+                and cfg.physical_attempt_limit != 1
+                and not emitted_stream_event
+            ):
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"
                     if self._provider_kind == "openrouter"
@@ -5148,11 +5323,13 @@ class OpenAIProvider:
         tools_by_name = _tool_by_name(tools)
         finish_reasons: list[str] = []
         text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
-        text_tool_normalizer: (
-            TextToolStreamNormalizer | _InertCandidateTextPassthrough
-        )
+        text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
-            text_tool_normalizer = _InertCandidateTextPassthrough()
+            assert candidate_artifact is not None
+            text_tool_normalizer = InertCandidateTextNormalizer(
+                artifact=candidate_artifact,
+                dialects=text_tool_dialects,
+            )
         else:
             text_tool_normalizer = TextToolStreamNormalizer(
                 tools=tools,
@@ -5192,7 +5369,19 @@ class OpenAIProvider:
                     if reasoning_event is not None:
                         yield reasoning_event
 
-            raw_tool_calls = message.get("tool_calls") or []
+            raw_tool_calls_value = message.get("tool_calls")
+            if _has_native_tool_payload(raw_tool_calls_value):
+                for pending_event in _segment_text_tool_events(
+                    text_tool_normalizer.observe_native_tool_start(""),
+                    provider_kind=self._provider_kind,
+                    model=self._model,
+                ):
+                    if isinstance(pending_event, TextDeltaEvent):
+                        visible_assistant_text_parts.append(pending_event.text)
+                        yield pending_event
+            raw_tool_calls = (
+                [] if raw_tool_calls_value is None else raw_tool_calls_value
+            )
             if not isinstance(raw_tool_calls, list):
                 if inert_candidate_output:
                     assert candidate_artifact is not None
@@ -5200,6 +5389,7 @@ class OpenAIProvider:
                         ("invalid_tool_calls", candidate_artifact.call_count),
                         arguments=strip_candidate_tool_identity(raw_tool_calls),
                     )
+                    text_tool_normalizer.observe_native_tool_start("")
                 else:
                     invalid_native_arguments += 1
                     log.warning(
@@ -5217,6 +5407,7 @@ class OpenAIProvider:
                             ("invalid_tool_call", call_position),
                             arguments=strip_candidate_tool_identity(tc),
                         )
+                        text_tool_normalizer.observe_native_tool_start("")
                     else:
                         invalid_native_arguments += 1
                         log.warning(
@@ -5251,6 +5442,7 @@ class OpenAIProvider:
                         name_text=raw_name,
                         arguments=raw_arguments,
                     )
+                    text_tool_normalizer.observe_native_tool_start("")
                     continue
                 raw_function = tc.get("function") or {}
                 if not isinstance(raw_function, Mapping):
@@ -5458,6 +5650,18 @@ class OpenAIProvider:
             successful_text_tool_terminal=successful_text_tool_terminal,
             native_calls=native_calls,
         )
+        rejection_error = _text_tool_rejection_error(
+            normalized_segments,
+            display_name=self._compat.display_name,
+            provider_kind=self._provider_kind,
+            model=self._model,
+            phase="non_stream",
+            cache_shape=cache_shape,
+            trace=trace,
+        )
+        if rejection_error is not None:
+            yield rejection_error
+            return
         for event in _segment_text_tool_events(
             normalized_segments,
             provider_kind=self._provider_kind,
@@ -5480,7 +5684,7 @@ class OpenAIProvider:
             yield deferred_event
 
         candidate_artifact_text = ""
-        if candidate_artifact is not None and candidate_artifact.has_calls:
+        if candidate_artifact is not None and candidate_artifact.has_content:
             candidate_artifact_text = candidate_artifact.render_text()
             if candidate_artifact_text:
                 visible_assistant_text_parts.append(candidate_artifact_text)

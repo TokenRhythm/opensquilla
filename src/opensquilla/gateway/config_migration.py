@@ -25,6 +25,19 @@ from opensquilla.search.types import MAX_SEARCH_RESULTS
 # ``GatewayConfig.config_version`` (gateway/config.py) defaults to this value.
 LATEST_CONFIG_VERSION = 1
 
+
+class ConfigParseError(ValueError):
+    """A user config file holds invalid TOML.
+
+    Loaders raise this instead of a bare ``tomllib.TOMLDecodeError`` so CLI
+    surfaces can name the offending file and point at the offline repair
+    instead of printing a traceback.
+    """
+
+    def __init__(self, path: str | Path, error: Exception) -> None:
+        self.path = Path(path)
+        super().__init__(f"invalid TOML in {self.path}: {error}")
+
 DEPRECATED_MEMORY_FIELDS: frozenset[str] = frozenset(
     {
         "memory.profile",
@@ -645,15 +658,17 @@ _MIGRATIONS: list[tuple[int, Callable[[_MigrationBuilder], None]]] = [
 ]
 
 
-def backup_and_write_migrated_config(
-    path: str | Path,
-    payload: dict[str, Any],
-    result: ConfigMigrationResult,
-) -> Path:
-    """Back up and atomically replace a migrated user config file."""
-    target = Path(path)
-    backup = make_config_backup(target)
+def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
+    """Atomically replace one TOML config file (same-dir temp, fsync, 0600).
 
+    Every writer that replaces ``config.toml`` converges on this helper so the
+    crash-durability contract lives in exactly one place. The recovery module
+    is the one intentional exception: it creates the repaired file with
+    ``O_EXCL`` after parking the corrupt original, so a replace would be wrong
+    there.
+    """
+
+    target = Path(path)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{target.name}.",
         suffix=".tmp",
@@ -662,6 +677,8 @@ def backup_and_write_migrated_config(
     try:
         with os.fdopen(fd, "wb") as fh:
             tomli_w.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, native_io_path(target))
     except Exception:
@@ -671,6 +688,16 @@ def backup_and_write_migrated_config(
             pass
         raise
 
+
+def backup_and_write_migrated_config(
+    path: str | Path,
+    payload: dict[str, Any],
+    result: ConfigMigrationResult,
+) -> Path:
+    """Back up and atomically replace a migrated user config file."""
+    target = Path(path)
+    backup = make_config_backup(target)
+    atomic_write_config(target, payload)
     os.chmod(native_io_path(target), 0o600)
     logging.getLogger(__name__).warning(
         "OpenSquilla config migrated for 0.2.0 schema",
@@ -683,6 +710,33 @@ def backup_and_write_migrated_config(
         },
     )
     return backup
+
+
+_CONFIG_BACKUP_KEEP = 10
+
+
+def _prune_config_backups(source: Path, *, keep: int = _CONFIG_BACKUP_KEEP) -> None:
+    """Delete the oldest sibling backups beyond the newest ``keep`` files.
+
+    Backup names embed a lexically sortable timestamp, so name order is age
+    order. Only plain files are removed; anything link-shaped is left for the
+    inspector to flag rather than followed.
+    """
+
+    prefix = f"{source.name}.backup."
+    try:
+        siblings = sorted(
+            entry.name
+            for entry in os.scandir(native_io_path(source.parent))
+            if entry.name.startswith(prefix) and entry.is_file(follow_symlinks=False)
+        )
+    except OSError:
+        return
+    for name in siblings[: max(len(siblings) - keep, 0)]:
+        try:
+            os.unlink(native_io_path(source.parent / name))
+        except OSError:
+            continue
 
 
 def make_config_backup(target: str | Path) -> Path:
@@ -710,6 +764,7 @@ def make_config_backup(target: str | Path) -> Path:
                 pass
             raise
         native_io_path(backup).chmod(0o600)
+        _prune_config_backups(source)
         return backup
 
     raise FileExistsError(f"Could not create unique backup for {source}")

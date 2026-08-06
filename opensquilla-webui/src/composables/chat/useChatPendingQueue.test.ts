@@ -2,7 +2,7 @@ import { nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatPendingQueue } from './useChatPendingQueue'
-import type { Attachment, ChatPendingItem } from '@/types/chat'
+import type { Attachment, ChatPendingItem, HiddenControlDispatchResult } from '@/types/chat'
 
 function makeQueue(
   dispatchPendingItem?: (item: ChatPendingItem, ownerSessionKey: string) => Promise<
@@ -13,6 +13,7 @@ function makeQueue(
     item: ChatPendingItem,
     ownerSessionKey: string,
   ) => Promise<'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'>,
+  onHiddenControlDispatchResult?: (result: HiddenControlDispatchResult) => void | boolean,
 ) {
   const sessionKey = ref('agent:main:webchat:test')
   const inputText = ref('')
@@ -33,12 +34,61 @@ function makeQueue(
     hasComposer: () => true,
     dispatchPendingItem,
     dispatchHiddenControl,
+    onHiddenControlDispatchResult,
   })
 
   return { inputText, queue, sendCurrentInput, sessionKey }
 }
 
 describe('useChatPendingQueue delivery state', () => {
+  it('restores a durable draft without overwriting the active composer', () => {
+    const { inputText, queue } = makeQueue()
+    inputText.value = 'newer operator draft'
+
+    expect(queue.enqueueRecoveredInput('/meta meta-paper-write -- recovered')).toBe(true)
+    expect(inputText.value).toBe('newer operator draft')
+    expect(queue.pendingQueue.value).toMatchObject([{
+      text: '/meta meta-paper-write -- recovered',
+      attachments: [],
+      intent: null,
+    }])
+    queue.cleanup()
+  })
+
+  it('deduplicates a hidden control by durable session/request identity', () => {
+    const { queue } = makeQueue()
+    const item = {
+      text: 'provider confirmation',
+      displayText: 'Confirmed',
+      clientRequestId: 'stable-hidden-request',
+      sessionKey: 'agent:main:webchat:test',
+    }
+
+    expect(queue.enqueueHiddenControl(item)).toBe(true)
+    expect(queue.enqueueHiddenControl(item)).toBe(true)
+    expect(queue.pendingQueue.value).toHaveLength(1)
+    queue.cleanup()
+  })
+
+  it('fails closed when a hidden-control cancellation cannot be persisted', () => {
+    let canPersistCancellation = false
+    const onResult = vi.fn(() => canPersistCancellation)
+    const { queue } = makeQueue(undefined, () => false, undefined, onResult)
+    queue.enqueueHiddenControl({
+      text: 'provider confirmation',
+      displayText: 'Confirmed',
+      clientRequestId: 'must-remain-sendable',
+      sessionKey: 'agent:main:webchat:test',
+    })
+
+    queue.clearPendingQueue()
+    expect(queue.pendingQueue.value).toHaveLength(1)
+    canPersistCancellation = true
+    expect(queue.removePendingChip(0)).toBe(true)
+    expect(queue.pendingQueue.value).toEqual([])
+    queue.cleanup()
+  })
+
   it('leases one item for steer and consumes it only after confirmed acceptance', () => {
     const { inputText, queue } = makeQueue()
     inputText.value = 'send this now'

@@ -828,6 +828,129 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('secret')
   })
 
+  it('projects skipped, stale, and cancelled compactions as settled outcomes', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      statusHistory: [
+        {
+          action: 'context_compaction',
+          label: '',
+          at: 1_000,
+          id: 'cmp-skipped',
+          category: 'maintenance',
+          state: 'skipped',
+          source: 'automatic',
+        },
+        {
+          action: 'context_compaction',
+          label: '',
+          at: 2_000,
+          id: 'cmp-stale',
+          category: 'maintenance',
+          state: 'stale',
+          source: 'automatic',
+        },
+        {
+          action: 'context_compaction',
+          label: '',
+          at: 3_000,
+          id: 'cmp-cancelled',
+          category: 'maintenance',
+          state: 'cancelled',
+          source: 'automatic',
+        },
+      ],
+    })
+
+    expect(projection.statusSteps.map(step => [
+      step.state,
+      step.label.code,
+      step.isCurrent,
+    ])).toEqual([
+      ['skipped', 'chat.compact.withinBudget', false],
+      ['stale', 'chat.compact.cancelled', false],
+      ['cancelled', 'chat.compact.cancelled', false],
+    ])
+  })
+
+  it('merges adjacent automatic completions and keeps durable metadata', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      statusHistory: [
+        {
+          action: 'context_compaction',
+          label: '',
+          at: 1_000,
+          id: 'cmp-request-scoped',
+          category: 'maintenance',
+          state: 'completed',
+          source: 'automatic',
+          durability: 'request_scoped',
+        },
+        {
+          action: 'context_compaction',
+          label: '',
+          at: 2_000,
+          id: 'cmp-durable',
+          category: 'maintenance',
+          state: 'completed',
+          source: 'automatic',
+          durability: 'durable',
+        },
+      ],
+    })
+
+    expect(projection.statusSteps).toHaveLength(1)
+    expect(projection.statusSteps[0]).toMatchObject({
+      id: 'cmp-durable',
+      state: 'completed',
+      source: 'automatic',
+      durability: 'durable',
+      label: { code: 'chat.compact.compacted' },
+    })
+  })
+
+  it('does not merge automatic completion rows across a failure', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      statusHistory: [
+        {
+          action: 'context_compaction',
+          label: '',
+          at: 1_000,
+          id: 'cmp-before',
+          category: 'maintenance',
+          state: 'completed',
+          source: 'automatic',
+        },
+        {
+          action: 'context_compaction',
+          label: '',
+          at: 2_000,
+          id: 'cmp-failed',
+          category: 'maintenance',
+          state: 'failed',
+          source: 'automatic',
+        },
+        {
+          action: 'context_compaction',
+          label: '',
+          at: 3_000,
+          id: 'cmp-after',
+          category: 'maintenance',
+          state: 'completed',
+          source: 'automatic',
+        },
+      ],
+    })
+
+    expect(projection.statusSteps.map(step => step.label.code)).toEqual([
+      'chat.compact.compacted',
+      'chat.compact.failed',
+      'chat.compact.compacted',
+    ])
+  })
+
   it('returns an empty semantic projection on the legacy compatibility path', () => {
     const projection = projectAssistantActivity(
       message({
@@ -873,6 +996,15 @@ describe('isSemanticActivityStatusStep', () => {
     }))).toBe(false)
     expect(isSemanticActivityStatusStep(statusStep({
       label: { code: 'chat.activity.lifecycle.answering', params: {} },
+    }))).toBe(false)
+  })
+
+  it('rejects maintenance rows so compaction does not inflate semantic step counts', () => {
+    expect(isSemanticActivityStatusStep(statusStep({
+      id: 'cmp-1',
+      category: 'maintenance',
+      state: 'completed',
+      label: { code: 'chat.compact.compacted', params: {} },
     }))).toBe(false)
   })
 

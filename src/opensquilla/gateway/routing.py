@@ -11,12 +11,12 @@ from opensquilla.channels.admission import (
     has_verified_channel_admin_stamp,
 )
 from opensquilla.channels.types import IncomingMessage
+from opensquilla.run_mode import RunMode, execution_target, normalize_run_mode
 from opensquilla.sandbox.run_context import (
     normalize_scope,
     run_context_for_subagent,
     run_context_from_origin_payload,
 )
-from opensquilla.sandbox.run_mode import RunMode, execution_target, normalize_run_mode
 from opensquilla.session.keys import normalize_agent_id, parse_agent_id
 from opensquilla.tools.policy import apply_tool_policy_layer
 from opensquilla.tools.types import (
@@ -38,6 +38,9 @@ class SourceKind(StrEnum):
     CRON = "cron"
     SUBAGENT = "subagent"
     SYSTEM = "system"
+
+
+PRINCIPAL_HOST_EXECUTE_METADATA_KEY = "principal_host_execute"
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,7 @@ class RouteEnvelope:
         self,
         *,
         is_owner: bool = False,
+        host_execute_allowed: bool = False,
         workspace_dir: str | None = None,
         workspace_strict: bool = False,
         default_elevated: str | None = None,
@@ -98,6 +102,7 @@ class RouteEnvelope:
         return tool_context_from_envelope(
             self,
             is_owner=is_owner,
+            host_execute_allowed=host_execute_allowed,
             workspace_dir=workspace_dir,
             workspace_strict=workspace_strict,
             default_elevated=default_elevated,
@@ -127,8 +132,9 @@ def build_channel_route_envelope(
     # ``channel_dispatch`` stamps this after authenticating the sender against
     # the configured channel-admin mapping.
     metadata.pop("principal_is_owner", None)
+    metadata.pop(PRINCIPAL_HOST_EXECUTE_METADATA_KEY, None)
     metadata.pop(CHANNEL_ADMIN_VERIFIED_METADATA_KEY, None)
-    metadata.setdefault("run_mode", RunMode.TRUSTED.value)
+    metadata.setdefault("run_mode", RunMode.SAFE.value)
     resolved_agent_id = _agent_id(agent_id, session_key)
     resolved_channel_type = channel_type or session_prefix
     account_id = metadata.get("account_id")
@@ -179,6 +185,7 @@ def build_cli_route_envelope(
     sender_id: str | None = None,
     session_id: str | None = None,
     principal_is_owner: bool | None = None,
+    principal_host_execute: bool | None = None,
     interaction_mode: InteractionMode | str = InteractionMode.INTERACTIVE,
     elevated: str | None = None,
     run_mode: str | None = None,
@@ -188,6 +195,8 @@ def build_cli_route_envelope(
     metadata: dict[str, Any] = {}
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = principal_is_owner
+    if principal_host_execute is not None:
+        metadata[PRINCIPAL_HOST_EXECUTE_METADATA_KEY] = bool(principal_host_execute)
     if elevated in ("on", "bypass", "full"):
         metadata["elevated"] = elevated
     try:
@@ -223,6 +232,7 @@ def build_web_route_envelope(
     session_id: str | None = None,
     tool_source_kind: str | None = None,
     principal_is_owner: bool | None = None,
+    principal_host_execute: bool | None = None,
 ) -> RouteEnvelope:
     """Build a route for Web/RPC-originated input."""
     resolved_channel_id = channel_id or (f"web:{conn_id}" if conn_id else "web")
@@ -232,6 +242,8 @@ def build_web_route_envelope(
         metadata["tool_source_kind"] = tool_source_kind
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = principal_is_owner
+    if principal_host_execute is not None:
+        metadata[PRINCIPAL_HOST_EXECUTE_METADATA_KEY] = bool(principal_host_execute)
     return RouteEnvelope(
         source_kind=SourceKind.WEB,
         source_name=source_name,
@@ -269,9 +281,14 @@ def build_cron_route_envelope(
     sender_id = f"cron-job-{job_id}"
     metadata: dict[str, Any] = {"job_id": job_id, "job_name": job_name}
     creator_is_owner = bool(getattr(job, "creator_is_owner", False))
-    if creator_is_owner:
+    creator_host_execute = bool(getattr(job, "creator_host_execute", False))
+    trusted_creator_owner = creator_is_owner and creator_host_execute
+    if trusted_creator_owner:
         metadata["principal_is_owner"] = True
         metadata["cron_trusted_owner"] = True
+    if creator_host_execute:
+        metadata[PRINCIPAL_HOST_EXECUTE_METADATA_KEY] = True
+        metadata["cron_trusted_host"] = True
     job_run_mode = getattr(job, "run_mode", "")
     if job_run_mode:
         try:
@@ -279,9 +296,14 @@ def build_cron_route_envelope(
         except ValueError:
             normalized_job_run_mode = None
         if normalized_job_run_mode is not None:
+            if (
+                normalized_job_run_mode is RunMode.FULL
+                and not creator_host_execute
+            ):
+                normalized_job_run_mode = RunMode.SAFE
             metadata["run_mode"] = normalized_job_run_mode.value
             metadata["execution_target"] = execution_target(normalized_job_run_mode)
-            if normalized_job_run_mode is RunMode.FULL and creator_is_owner:
+            if normalized_job_run_mode is RunMode.FULL and creator_host_execute:
                 metadata["elevated"] = "full"
     tool_policy = getattr(job, "tool_policy", None)
     if isinstance(tool_policy, dict) and tool_policy:
@@ -338,6 +360,7 @@ def build_subagent_route_envelope(
     spawn_depth: int = 0,
     origin: str = "sessions_spawn",
     principal_is_owner: bool | None = None,
+    principal_host_execute: bool | None = None,
     elevated: str | None = None,
     run_mode: str | RunMode | None = None,
     sandbox_run_context: Any | None = None,
@@ -353,6 +376,8 @@ def build_subagent_route_envelope(
     }
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = bool(principal_is_owner)
+    if principal_host_execute is not None:
+        metadata[PRINCIPAL_HOST_EXECUTE_METADATA_KEY] = bool(principal_host_execute)
     if elevated in ("on", "bypass", "full"):
         metadata["elevated"] = elevated
     normalized_run_mode: RunMode | None = None
@@ -464,6 +489,7 @@ def tool_context_from_envelope(
     envelope: RouteEnvelope,
     *,
     is_owner: bool = False,
+    host_execute_allowed: bool = False,
     workspace_dir: str | None = None,
     workspace_strict: bool = False,
     default_elevated: str | None = None,
@@ -481,6 +507,8 @@ def tool_context_from_envelope(
         # resolution so a generic ``is_owner=True`` cannot widen a Channel
         # context if a future caller forgets the ingress boundary.
         is_owner = channel_admin_verified
+        host_execute_allowed = channel_admin_verified
+    full_access_allowed = is_owner or host_execute_allowed
     allowed_tools: set[str] | None = None
     denied_tools: set[str] = set()
     interaction_mode = _interaction_mode(envelope.interaction_mode)
@@ -489,12 +517,28 @@ def tool_context_from_envelope(
         and bool(envelope.metadata.get("cron_trusted_owner"))
         and is_owner
     )
+    cron_trusted_host = (
+        caller_kind is CallerKind.CRON
+        and bool(envelope.metadata.get("cron_trusted_host"))
+        and host_execute_allowed
+    )
+    cron_trusted = cron_trusted_owner or cron_trusted_host
     if caller_kind is CallerKind.CRON:
-        if not cron_trusted_owner:
+        if not cron_trusted:
             allowed_tools = set(CRON_AGENT_ALLOW)
             denied_tools = set(CRON_AGENT_DENY)
     elif caller_kind is CallerKind.SUBAGENT:
         denied_tools = set(SUBAGENT_TOOL_DENY)
+    guest_safe = bool(envelope.metadata.get("guest_safe"))
+    if guest_safe:
+        from opensquilla.tools.visibility import guest_safe_tool_allowlist
+
+        guest_allowlist = set(guest_safe_tool_allowlist())
+        allowed_tools = (
+            guest_allowlist
+            if allowed_tools is None
+            else allowed_tools & guest_allowlist
+        )
     source_kind = envelope.metadata.get("tool_source_kind") or envelope.source_kind.value
     source_name = envelope.metadata.get("tool_source_name") or envelope.source_name
     legacy_elevated = envelope.metadata.get("elevated")
@@ -505,17 +549,17 @@ def tool_context_from_envelope(
             run_mode = normalize_run_mode(run_mode_value)
         except ValueError:
             run_mode = None
-        if run_mode == RunMode.FULL and not is_owner:
-            run_mode = RunMode.TRUSTED
+        if run_mode == RunMode.FULL and not full_access_allowed:
+            run_mode = RunMode.SAFE
     elif legacy_elevated == "on" and is_owner:
-        run_mode = RunMode.TRUSTED
-    elif legacy_elevated in ("bypass", "full") and is_owner:
+        run_mode = RunMode.SAFE
+    elif legacy_elevated in ("bypass", "full") and full_access_allowed:
         run_mode = RunMode.FULL
-    elif default_elevated in ("bypass", "full") and is_owner:
+    elif default_elevated in ("bypass", "full") and full_access_allowed:
         run_mode = RunMode.FULL
     else:
         run_mode = None
-    if run_mode == RunMode.FULL and is_owner:
+    if run_mode == RunMode.FULL and full_access_allowed:
         elevated = "full"
     elif legacy_elevated == "on" and is_owner:
         elevated = legacy_elevated
@@ -535,9 +579,9 @@ def tool_context_from_envelope(
     if (
         sandbox_run_context is not None
         and sandbox_run_context.run_mode == RunMode.FULL
-        and not is_owner
+        and not full_access_allowed
     ):
-        sandbox_run_context = replace(sandbox_run_context, run_mode=RunMode.TRUSTED)
+        sandbox_run_context = replace(sandbox_run_context, run_mode=RunMode.SAFE)
     if sandbox_run_context_fresh and sandbox_run_context is not None:
         sandbox_mounts = sandbox_run_context.to_origin_payload()["mounts"]
     else:
@@ -552,6 +596,15 @@ def tool_context_from_envelope(
         subagent_depth=int(envelope.metadata.get("spawn_depth") or 0),
         agent_id=envelope.agent_id,
         workspace_dir=effective_workspace_dir,
+        guest_safe=guest_safe,
+        environment=(
+            {
+                str(key): str(value)
+                for key, value in envelope.metadata.get("guest_environment", {}).items()
+            }
+            if isinstance(envelope.metadata.get("guest_environment"), dict)
+            else None
+        ),
         workspace_strict=workspace_strict,
         run_mode=run_mode.value if run_mode is not None else None,
         sandbox_mounts=sandbox_mounts,
@@ -566,7 +619,7 @@ def tool_context_from_envelope(
         denied_tools=denied_tools,
         elevated=elevated,
         tool_policy=(
-            envelope.metadata.get("tool_policy") if cron_trusted_owner else None
+            envelope.metadata.get("tool_policy") if cron_trusted else None
         ),
         task_id=(
             str(envelope.metadata["task_id"])
@@ -601,7 +654,7 @@ def tool_context_from_envelope(
         # the only ingress that sets this field for ordinary turns.
         setattr(ctx, "_sandbox_run_context_fresh", True)
     if caller_kind is CallerKind.CRON:
-        if not cron_trusted_owner:
+        if not cron_trusted:
             ctx = apply_tool_policy_layer(
                 ctx,
                 envelope.metadata.get("tool_policy"),

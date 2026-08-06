@@ -12,12 +12,12 @@ from opensquilla.project_workspaces import (
     ValidatedProjectWorkspace,
     resolve_validated_project_workspace,
 )
+from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.run_context import (
     RunContext,
     effective_project_run_mode,
     get_run_context,
 )
-from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
 

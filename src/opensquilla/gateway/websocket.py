@@ -22,6 +22,7 @@ from opensquilla.gateway.config import (
 )
 from opensquilla.gateway.origin_guard import websocket_origin_allowed
 from opensquilla.gateway.protocol import (
+    ERROR_UNAVAILABLE,
     PREAUTH_TIMEOUT_MS,
     PROTOCOL_VERSION,
     WS_CLOSE_SERVICE_RESTART,
@@ -34,6 +35,7 @@ from opensquilla.gateway.protocol import (
     make_event,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcDispatcher
+from opensquilla.sandbox.legacy_codec import encode_payload_for_protocol
 
 log = structlog.get_logger(__name__)
 
@@ -68,6 +70,9 @@ _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
 _SENTINEL_STOP: Any = object()
+_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"})
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = 4
+_DETACHED_REQUEST_DRAIN_SECONDS = 0.25
 
 
 @dataclass(slots=True)
@@ -102,6 +107,7 @@ class WsConnection:
 
     conn_id: str
     ws: WebSocket
+    protocol: int = PROTOCOL_VERSION
     principal: Principal = field(
         default_factory=lambda: Principal(
             role="operator",
@@ -126,6 +132,12 @@ class WsConnection:
         repr=False,
     )
     _closing: bool = field(default=False, init=False, repr=False)
+    _detached_request_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _accept_detached_responses: bool = field(default=True, init=False, repr=False)
 
     @property
     def role(self) -> str:
@@ -300,7 +312,12 @@ class WsConnection:
         # Legacy direct-send path (pre-auth, kill-switch off, or post-stop).
         async with self._send_lock:
             if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
-                wire = make_event(event, payload, seq=self.next_seq(), meta=meta)
+                wire = make_event(
+                    event,
+                    encode_payload_for_protocol(payload, protocol=self.protocol),
+                    seq=self.next_seq(),
+                    meta=meta,
+                )
                 await self._send_direct_text(wire.model_dump_json())
 
     async def send_res(self, frame: ResFrame) -> None:
@@ -325,7 +342,15 @@ class WsConnection:
             return
         async with self._send_lock:
             if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
-                await self._send_direct_text(frame.model_dump_json())
+                encoded = frame.model_copy(
+                    update={
+                        "payload": encode_payload_for_protocol(
+                            frame.payload,
+                            protocol=self.protocol,
+                        )
+                    }
+                )
+                await self._send_direct_text(encoded.model_dump_json())
 
     async def send_raw_text(self, text: str) -> None:
         """Send a protocol-level raw frame through the connection writer."""
@@ -357,6 +382,44 @@ class WsConnection:
                 await self.ws.close(code=code)
         except Exception:
             pass
+
+    def _track_detached_request(self, task: asyncio.Task[None]) -> None:
+        self._detached_request_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._detached_request_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                log.error(
+                    "gateway.ws_detached_request_failed",
+                    conn_id=self.conn_id,
+                    error=str(error),
+                )
+
+        task.add_done_callback(finished)
+
+    async def _stop_detached_requests(self) -> None:
+        self._accept_detached_responses = False
+        tasks = tuple(self._detached_request_tasks)
+        self._detached_request_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            _, pending = await asyncio.wait(
+                tasks,
+                timeout=_DETACHED_REQUEST_DRAIN_SECONDS,
+            )
+            if pending:
+                log.warning(
+                    "gateway.ws_detached_request_drain_timeout",
+                    conn_id=self.conn_id,
+                    pending=len(pending),
+                )
 
     # ------------------------------------------------------------------
     # Writer task lifecycle
@@ -487,13 +550,24 @@ class WsConnection:
                     if item.event_name is not None:
                         wire = make_event(
                             item.event_name,
-                            item.payload,
+                            encode_payload_for_protocol(
+                                item.payload,
+                                protocol=self.protocol,
+                            ),
                             seq=self.next_seq(),
                             meta=item.meta,
                         )
                         text = wire.model_dump_json()
                     elif item.res_frame is not None:
-                        text = item.res_frame.model_dump_json()
+                        encoded = item.res_frame.model_copy(
+                            update={
+                                "payload": encode_payload_for_protocol(
+                                    item.res_frame.payload,
+                                    protocol=self.protocol,
+                                )
+                            }
+                        )
+                        text = encoded.model_dump_json()
                     elif item.raw_text is not None:
                         text = item.raw_text
                     else:
@@ -772,6 +846,7 @@ async def handle_ws_connection(
     memory_managers: dict[str, Any] | None = None,
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
+    prompt_cache_keepalive_service: Any = None,
 ) -> None:
     """Main WebSocket connection handler."""
     if not websocket_origin_allowed(ws, config):
@@ -862,8 +937,19 @@ async def handle_ws_connection(
         await conn.send_res(make_error_res(req_id, "UNAUTHORIZED", "Authentication failed"))
         await conn.close()
         return
+    if principal.auth_state == "invalid":
+        from opensquilla.gateway.token_store import default_auth_failure_limiter
 
-    from opensquilla.sandbox.run_mode_policy import hello_auth_payload
+        await default_auth_failure_limiter().wait_after_failure(
+            peer_ip,
+            principal.token_public_id,
+        )
+        log.warning(
+            "ws.auth_invalid_guest_only",
+            conn_id=conn_id,
+            peer_ip=peer_ip,
+            token_public_id=principal.token_public_id,
+        )
 
     # Step 5: Negotiate protocol version
     min_proto = params_raw.get("minProtocol", 1)
@@ -889,6 +975,7 @@ async def handle_ws_connection(
 
     # Assign principal
     conn.principal = principal
+    conn.protocol = negotiated
 
     # Step 6: Send HelloOk
     hello = HelloOk(
@@ -918,7 +1005,7 @@ async def handle_ws_connection(
                 * 1000
             ),
         ),
-        auth=hello_auth_payload(principal),
+        auth=_websocket_hello_auth_payload(principal),
     )
     try:
         await conn.send_raw_text(hello.model_dump_json())
@@ -968,12 +1055,16 @@ async def handle_ws_connection(
             memory_stores,
             memory_retrievers,
             provider_stats=provider_stats,
+            prompt_cache_keepalive_service=prompt_cache_keepalive_service,
         )
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         log.error("ws.error", conn_id=conn_id, error=str(exc))
     finally:
+        # Detached optional reads must stop before the writer so a handler that
+        # suppresses cancellation cannot enqueue a late response after teardown.
+        await conn._stop_detached_requests()
         # Detached reads can still enqueue responses, so retire them before the
         # writer. Then stop the writer before tick_task.cancel() and before
         # registry.unregister. Otherwise a producer could still hold a reference
@@ -989,6 +1080,23 @@ async def handle_ws_connection(
         if subscription_manager is not None:
             subscription_manager.remove_connection(conn_id)
         log.info("ws.disconnected", conn_id=conn_id)
+
+
+def _websocket_hello_auth_payload(principal: Any) -> dict[str, Any]:
+    """Add the browser guest credential only to anonymous WebSocket hellos."""
+
+    from opensquilla.sandbox.run_mode_policy import hello_auth_payload
+
+    payload = hello_auth_payload(principal)
+    payload["principal"]["guestOwnerId"] = getattr(principal, "guest_owner_id", None)
+    guest_session_key = getattr(principal, "guest_session_key", None)
+    if guest_session_key and not getattr(principal, "authenticated", False):
+        # Preserve ``invalid`` and the public id internally for rate limiting,
+        # but expose exactly the same anonymous authority as a missing token.
+        payload["principal"]["authState"] = "guest"
+        payload["principal"]["tokenPublicId"] = None
+        payload["guestSessionKey"] = guest_session_key
+    return payload
 
 
 async def _tick_loop(conn: WsConnection, tick_interval_ms: int) -> None:
@@ -1039,6 +1147,7 @@ async def _message_loop(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     provider_stats: Any = None,
+    prompt_cache_keepalive_service: Any = None,
 ) -> None:
     ws = conn.ws
     keepalive_timeout = max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 0.0)))
@@ -1111,6 +1220,8 @@ async def _message_loop(
             ctx = RpcContext(
                 conn_id=conn.conn_id,
                 principal=conn.principal,
+                protocol=conn.protocol,
+                sandbox_schema_version=2 if conn.protocol >= 4 else 1,
                 session_manager=session_manager,
                 config=config,
                 provider_selector=provider_selector,
@@ -1132,6 +1243,7 @@ async def _message_loop(
                 flush_service=flush_service,
                 heartbeat_service=heartbeat_service,
                 heartbeat_loop=heartbeat_loop,
+                prompt_cache_keepalive_service=prompt_cache_keepalive_service,
                 agent_registry=agent_registry,
                 diagnostics_state=diagnostics_state,
                 provider_stats=provider_stats,
@@ -1139,6 +1251,34 @@ async def _message_loop(
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
             )
+            if method in _DETACHED_RPC_METHODS:
+                if (
+                    len(conn._detached_request_tasks)
+                    >= _MAX_DETACHED_REQUESTS_PER_CONNECTION
+                ):
+                    await conn.send_res(
+                        make_error_res(
+                            req_id,
+                            ERROR_UNAVAILABLE,
+                            "Too many optional recovery requests are already running",
+                            retryable=True,
+                        )
+                    )
+                    continue
+                task = asyncio.create_task(
+                    _dispatch_and_send(
+                        conn,
+                        dispatcher,
+                        req_id,
+                        method,
+                        params,
+                        ctx,
+                        detached=True,
+                    ),
+                    name=f"ws-detached-request-{conn.conn_id}",
+                )
+                conn._track_detached_request(task)
+                continue
             request = _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
             if method in _DETACHED_READ_METHODS:
                 if conn._try_start_detached_read(request, method=method):
@@ -1163,6 +1303,22 @@ async def _message_loop(
             await conn.send_res(
                 make_error_res("", "INVALID_REQUEST", f"Unknown frame type: {frame_type!r}")
             )
+
+
+async def _dispatch_and_send(
+    conn: WsConnection,
+    dispatcher: RpcDispatcher,
+    req_id: str,
+    method: str,
+    params: Any,
+    ctx: RpcContext,
+    *,
+    detached: bool = False,
+) -> None:
+    response = await dispatcher.dispatch(req_id, method, params, ctx)
+    if detached and not conn._accept_detached_responses:
+        return
+    await conn.send_res(response)
 
 
 def _build_features(dispatcher: RpcDispatcher) -> Any:

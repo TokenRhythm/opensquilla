@@ -360,6 +360,7 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          npm run fetch:runtimes
           npm run build:gateway
           npm run build
           npx electron-builder --mac --publish never
@@ -457,6 +458,7 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           set -euo pipefail
+          npm run fetch:runtimes
           npm run build:gateway
           npm run build
           npx electron-builder --win --publish never

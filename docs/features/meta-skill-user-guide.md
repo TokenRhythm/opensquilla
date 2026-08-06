@@ -71,7 +71,7 @@ Web chat and the CLI gateway TUI support both list and run:
 
 ```text
 /meta
-/meta meta-kid-project-planner
+/meta meta-paper-write
 ```
 
 Channel surfaces support `/meta` listing only. Standalone CLI chat requires
@@ -104,12 +104,12 @@ A strong MetaSkill request contains four things:
 Example:
 
 ```text
-/meta meta-kid-project-planner
+/meta meta-paper-write
 
-I need a safe weekend project plan, not a generic list of ideas.
-Use only materials that are easy to buy locally.
-Separate adult-only steps from child-safe steps.
-Do not include flames, blades, solvents, or risky chemicals.
+I need a compact research paper, not a generic essay.
+Use verifiable sources and distinguish evidence from placeholders.
+Include the LaTeX source and compiled PDF.
+Do not invent citations or experimental results.
 ```
 
 The user defines the target and standard; OpenSquilla organizes the execution.
@@ -120,33 +120,84 @@ The retained built-in MetaSkills cover a focused set of high-value task classes.
 
 | MetaSkill | Positioning |
 | --- | --- |
-| `meta-kid-project-planner` | Produces safe, age-appropriate plans for school projects, show-and-tell, or science activities. |
 | `meta-paper-write` | Supports academic drafts, manuscript structure, citation planning, experiment placeholders, and LaTeX/PDF paths. |
 | `meta-short-drama` | Produces short-drama scripts, visual prompts, video assembly plans, subtitles, and rendered local video artifacts. |
+| `AwesomeWebpageMetaSkill` | Builds a packaged local multimedia webpage with researched content, generated media, validation, and usage guidance. |
 | `meta-skill-creator` | Turns repeated multi-skill collaboration patterns into new MetaSkill proposals. |
 
 These are designed around quality over quantity. Immature, duplicate, or
 single-skill wrapper MetaSkills should not remain in the bundled catalog.
 
-## Requirements Before Running MetaSkills
+`meta-kid-project-planner` is retired. Its bundled definition remains only as
+an upgrade-compatibility tombstone for inspecting, resuming, or replaying
+persisted runs. It is not shown by `/meta` and cannot start a new run or
+auto-trigger.
 
-The Skill page is the source of truth for current readiness. Open the skill
-detail dialog and check the **Requirements** section before running workflows
-that export files, compile PDFs, or render video.
+## Requirements and Managed Setup
 
-Common setup surfaces:
+You can start with `/meta <name>` without installing tools manually. Every new
+run performs a server-side readiness check before it creates hidden workflow
+state or makes a paid provider request. When a supported local dependency is
+missing, Web chat follows this flow:
 
-- Paper/PDF workflows such as `meta-paper-write` require `xelatex` and
-  `bibtex` on `PATH`. Install a TeX distribution such as TeX Live, MiKTeX, or
-  BasicTeX before requesting compiled PDFs.
-- Video workflows such as `meta-short-drama` require `ffmpeg` and `ffprobe` on
-  `PATH` for clip animation, merging, and subtitle burn-in.
-- Office-document workflows roll up requirements from child skills such as
-  `docx`, `xlsx`, `pdf-toolkit`, and `pptx`; these usually surface Python
-  package requirements in the Skill page.
-- Search, weather, image, and video-provider steps may require configured API
-  keys or provider credentials. The workflow should treat missing credentials as
-  setup blockers rather than silently degrading output.
+1. Show a setup card naming the missing capability, source, version, license,
+   and known download size.
+2. Wait for explicit confirmation. Closing or cancelling the card changes
+   nothing.
+3. Download from a code-owned catalog, verify the recorded size and SHA-256,
+   extract into user-local state, and run a real capability smoke test.
+4. Activate the verified package and automatically resume the original request.
+   Failed or interrupted installs leave the workflow unstarted and offer Retry.
+
+The active install is kept below the OpenSquilla state directory at
+`state/toolchains/v1`; it does not modify the user's shell profile or global
+`PATH`. A normal `opensquilla uninstall` preserves it with other user state.
+`opensquilla uninstall --purge-state` removes OpenSquilla-managed archives,
+receipts, and activations.
+
+| Capability | macOS | Linux | Windows |
+| --- | --- | --- | --- |
+| Paper (`xelatex`, `bibtex`, CJK/refs smoke test) | Pinned TinyTeX 2026.05 universal archive plus pinned Noto CJK | Pinned TinyTeX 2026.05 plus pinned Noto CJK for glibc arm64/x64 and musl x64 | Pinned ordinary TinyTeX 2026.05 ZIP plus pinned Noto CJK; self-extracting installers are never executed |
+| Short-drama rendering (`ffmpeg`, `ffprobe`, filters/codecs, CJK font) | Pinned FFmpeg/FFprobe 8.1.2 ZIPs for Apple Silicon or Intel plus pinned Noto CJK; macOS 12+ | Pinned GPL archive on glibc 2.28+ arm64/x64, kernel 4.18+ | Pinned x64 archive |
+
+All managed executable archives, license files, and fonts are versioned and
+checksum-verified. The macOS short-drama download totals about 76 MB on Apple
+Silicon or 87 MB on Intel. Its FFmpeg and FFprobe 8.1.2 ZIPs come from a build
+whose source is pinned to commit
+`bb1d6db29cee948f9685bcd69e6caf17d960662b`. OpenSquilla verifies each original
+archive's fixed size and SHA-256 first. It then removes the binaries' invalid
+embedded signatures, applies local ad-hoc signatures, and requires strict
+`codesign` verification before activation. The result is neither Developer ID
+signed nor Apple-notarized. Paper setup is self-contained after
+its two downloads; it never updates `tlmgr` or resolves a moving TeX Live
+package repository during installation. Fixed paper downloads total about 226
+MB on macOS, 165–172 MB on Linux, and 265 MB on Windows; extracted
+installations are larger.
+
+`meta-short-drama` and `AwesomeWebpageMetaSkill` also need an OpenRouter
+connection for their real media provider calls. Readiness reuses an active
+OpenRouter provider, a saved
+secondary `llm_profiles.openrouter` profile, the legacy image-provider
+connection, or the canonical provider environment without copying a secret into
+run metadata. If none is ready, the setup card opens the existing provider
+settings editor and preserves the original MetaSkill request. When another
+provider is primary, saving OpenRouter creates a secondary profile and does not
+switch the primary model or enable routing. Saving or rechecking the connection
+does not make a media request. Short-drama's later script-review confirmation
+is still the explicit boundary before paid image/video submits; an edit request
+only creates a revised preview and requires a new approval. AwesomeWebpage has
+its own required, no-default provider-send-and-cost approval choice. Ambiguous
+answers or any revision note do not authorize image/audio/video submission.
+Both workflows lease the credential, endpoint, and proxy to exact bundled media
+children in process memory only; these values never enter the plan, transcript,
+or run database. A missing connection blocks the run instead of producing a
+fake local substitute. Provider requirements are expressed as ordered
+code-owned candidates with a profile preference; OpenRouter is the only current
+candidate, so future providers do not require workflow-specific settings UI.
+
+An existing system installation may satisfy readiness when it passes the same
+full capability probe. The Skill page remains useful for inventory, but launch
+preflight—not a stale UI snapshot—is the final source of truth.
 
 ## Two Ways to Use MetaSkill
 
@@ -155,10 +206,10 @@ Common setup surfaces:
 Start the workflow with `/meta <name>` and then describe the outcome:
 
 ```text
-/meta meta-kid-project-planner
+/meta meta-paper-write
 
-Plan a safe 20-minute balcony plant science project for a 7-year-old. Include
-materials, steps, safety notes, and a simple presentation outline.
+Draft a compact research paper on retrieval-augmented customer support. Include
+a citation plan, experiment placeholders, and a compiled PDF.
 ```
 
 This is the normal 0.4 release-line path. It is best for important, expensive,
@@ -170,10 +221,10 @@ If `meta_skill.auto_trigger = true` is set, OpenSquilla can consider MetaSkills
 from natural-language intent:
 
 ```text
-Use meta-skill `meta-kid-project-planner`.
+Use meta-skill `meta-paper-write`.
 
-Plan a safe 20-minute balcony plant science project for a 7-year-old. Include
-materials, steps, safety notes, and a simple presentation outline.
+Draft a compact research paper on retrieval-augmented customer support. Include
+a citation plan, experiment placeholders, and a compiled PDF.
 ```
 
 This mode is for users who intentionally want the older auto-trigger behavior.
@@ -197,17 +248,15 @@ Do not:
 Example:
 
 ```text
-/meta meta-kid-project-planner
+/meta meta-paper-write
 
-Outcome: plan a child-safe weekend science project.
-Context: 7-year-old, balcony plants, 20 minutes of activity, ordinary household
-materials only.
-Decision standard: safe, age-appropriate, low mess, and easy to present at
-school.
-Expected output: materials list, adult setup, child steps, safety notes, and a
-presentation outline.
-Constraints: avoid flames, blades, solvents, and risky chemicals.
-Do not: ask the child to do adult-only setup alone.
+Outcome: produce a compact research paper and PDF.
+Context: retrieval-augmented generation for customer-support knowledge bases.
+Decision standard: source-grounded, concise, and explicit about missing
+experimental evidence.
+Expected output: manuscript structure, verified citation plan, LaTeX, and PDF.
+Constraints: keep unverified results as placeholders.
+Do not: invent sources, measurements, or comparisons.
 ```
 
 Useful constraints:
@@ -219,40 +268,6 @@ Useful constraints:
 - Ask me if a decision depends on missing information.
 
 ## Built-In MetaSkill Usage Patterns
-
-### `meta-kid-project-planner`
-
-Use for child school projects, show-and-tell, science demos, and safe creative
-activities.
-
-Good fit:
-
-- science fair;
-- show-and-tell;
-- classroom demonstration;
-- child-safe craft or experiment;
-- low-burden parent preparation.
-
-High-quality request:
-
-```text
-/meta meta-kid-project-planner
-
-Help my child prepare a second-grade science fair project about plant growth. We
-have beans, paper cups, cotton, water, and a sunny windowsill.
-
-Keep it safe and simple.
-
-Give me:
-- materials list
-- 3-day plan
-- what the child should observe
-- short presentation script
-- what remains unknown
-```
-
-Expected result: safe, age-appropriate, source-strict output. It should not
-invent weather, school requirements, or child preferences.
 
 ### `meta-paper-write`
 
@@ -266,9 +281,9 @@ Good fit:
 - experiment and figure/table placeholders;
 - LaTeX/PDF path when explicitly requested.
 
-PDF compilation requires `xelatex` and `bibtex` on `PATH`. If those binaries are
-missing, use the LaTeX source output or install TeX Live, MiKTeX, or BasicTeX
-before asking for a compiled PDF.
+PDF compilation requires the paper capability probe to pass. If it does not,
+confirm the managed setup card; on an unsupported platform, install a compatible
+TeX distribution yourself and retry so OpenSquilla can probe it.
 
 High-quality request:
 

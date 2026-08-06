@@ -556,6 +556,9 @@ class CostRollupResult:
     cache_read: int
     cache_write: int
     model_override: str | None
+    # Physical provider paired with ``model_override``.  Kept separate from
+    # the user's explicit ``provider_override`` so routing is not pinned.
+    model_provider: str | None = None
 
 # ---------------------------------------------------------------------------
 # Stage I/O dataclasses
@@ -819,7 +822,7 @@ class TurnFinalizerStage:
                 transcript_appended = bool(append_result)
             if transcript_appended:
                 assistant_message_content = persisted_content
-            if transcript_appended:
+            if transcript_appended and not inp.no_memory_capture:
                 try:
                     await self._turn_memory_capture.capture_turn(
                         agent_id=inp.agent_id,

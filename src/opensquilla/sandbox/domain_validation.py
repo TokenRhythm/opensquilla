@@ -96,6 +96,42 @@ def domain_matches(pattern: str, host: str) -> bool:
     return normalized_host == normalized_pattern
 
 
+def validate_policy_domain_pattern(raw: str) -> DomainDecision:
+    """Validate user allow/deny entries without the legacy wildcard allowlist."""
+    normalized, extraction_error = _extract_validation_host(raw)
+    if not normalized:
+        return DomainDecision("blocked", normalized, "empty_domain")
+    if extraction_error is not None:
+        return DomainDecision("blocked", normalized, extraction_error)
+    if normalized.startswith("*."):
+        suffix = normalized[2:].rstrip(".")
+        if suffix.count(".") < 1:
+            return DomainDecision("blocked", normalized, "broad_wildcard")
+        if not _is_valid_dns_name(suffix):
+            return DomainDecision("blocked", normalized, "invalid_domain")
+        return DomainDecision("allowed", f"*.{suffix}", "wildcard_domain")
+    if "*" in normalized:
+        return DomainDecision("blocked", normalized, "invalid_wildcard")
+    normalized = _normalize_exact_validation_host(normalized)
+    if _is_ip_literal(normalized):
+        return DomainDecision("blocked", normalized, "ip_literal")
+    if "." not in normalized or not _is_valid_dns_name(normalized):
+        return DomainDecision("blocked", normalized, "invalid_domain")
+    return DomainDecision("allowed", normalized, "exact_domain")
+
+
+def policy_domain_matches(pattern: str, host: str) -> bool:
+    decision = validate_policy_domain_pattern(pattern)
+    if decision.status != "allowed":
+        return False
+    host_decision = validate_domain_pattern(host)
+    if host_decision.status != "allowed" or "*" in host_decision.normalized:
+        return False
+    if decision.normalized.startswith("*."):
+        return host_decision.normalized.endswith(f".{decision.normalized[2:]}")
+    return host_decision.normalized == decision.normalized
+
+
 def _extract_validation_host(raw: str) -> tuple[str, str | None]:
     text = str(raw or "").strip().lower()
     if not text:
@@ -185,5 +221,7 @@ __all__ = [
     "DomainDecision",
     "domain_matches",
     "normalize_domain",
+    "policy_domain_matches",
     "validate_domain_pattern",
+    "validate_policy_domain_pattern",
 ]

@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_cron import (
     _build_payload,
@@ -26,6 +28,8 @@ from opensquilla.scheduler.types import (
     ReplyTargetSnapshot,
     SessionTarget,
 )
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.storage import SessionStorage
 
 SESSION_KEY = "agent:main:webchat:abc123"
 CRON_SESSION_KEY = "cron:drink:run:def456"
@@ -52,6 +56,7 @@ class _FakeScheduler:
             delivery=kwargs.get("delivery") or DeliveryConfig(),
             tool_policy=kwargs.get("tool_policy") or {},
             creator_is_owner=bool(kwargs.get("creator_is_owner", False)),
+            creator_host_execute=bool(kwargs.get("creator_host_execute", False)),
         )
 
     async def update_job(self, job_id, **patch) -> CronJob:
@@ -263,6 +268,86 @@ async def test_rpc_create_current_session_job_passes_session_binding_to_schedule
     assert result["sessionTarget"] == "current"
     assert result["targetSessionKey"] == SESSION_KEY
     assert result["originSessionKey"] == SESSION_KEY
+
+
+@pytest.mark.parametrize(
+    (
+        "stored_mode",
+        "capabilities",
+        "is_owner",
+        "expected_mode",
+        "expected_host_execute",
+    ),
+    [
+        pytest.param(
+            "safe", frozenset(), True, "safe", True, id="owner-stored-safe"
+        ),
+        pytest.param(
+            "full",
+            frozenset({"task.read"}),
+            False,
+            "safe",
+            False,
+            id="admin-without-host",
+        ),
+        pytest.param(
+            "full",
+            frozenset({"host.execute"}),
+            False,
+            "full",
+            True,
+            id="named-host-token",
+        ),
+        pytest.param(None, frozenset(), True, "full", True, id="fresh-owner"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rpc_create_background_job_resolves_persisted_mode_for_principal(
+    tmp_path,
+    stored_mode: str | None,
+    capabilities: frozenset[str],
+    is_owner: bool,
+    expected_mode: str,
+    expected_host_execute: bool,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "cron-preference.db"))
+    if stored_mode is not None:
+        await storage.set_runtime_preference("sandbox.run_mode", stored_mode)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    scheduler = _FakeScheduler()
+    principal = Principal(
+        role="operator",
+        scopes=frozenset({"operator.admin"}),
+        is_owner=is_owner,
+        authenticated=True,
+        capabilities=capabilities,
+        auth_state="authenticated",
+        token_public_id=None if is_owner else "named-token",
+    )
+
+    try:
+        await _handle_cron_add(
+            {
+                "name": "Background",
+                "expression": "*/5 * * * *",
+                "payloadKind": AGENT_TURN_KIND,
+                "text": "check status",
+                "agentId": "main",
+            },
+            RpcContext(
+                conn_id="test",
+                cron_scheduler=scheduler,
+                session_manager=manager,
+                config=GatewayConfig(),
+                principal=principal,
+            ),
+        )
+    finally:
+        await storage.close()
+
+    assert scheduler.added["run_mode"] == expected_mode
+    assert scheduler.added["creator_is_owner"] is is_owner
+    assert scheduler.added["creator_host_execute"] is expected_host_execute
 
 
 @pytest.mark.asyncio
@@ -926,6 +1011,7 @@ async def test_owner_current_session_agent_run_uses_owner_tool_boundary() -> Non
         session_key=SESSION_KEY,
         origin_session_key=SESSION_KEY,
         creator_is_owner=True,
+        creator_host_execute=True,
         tool_policy={
             "profile": "minimal",
             "also_allow": ["memory_search", "exec_command"],

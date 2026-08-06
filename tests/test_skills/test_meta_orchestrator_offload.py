@@ -97,9 +97,11 @@ class _ThreadRecordingWriter:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
+        self.begin_kwargs: dict[str, Any] = {}
 
-    def begin_step_sync(self, **_kwargs: Any) -> None:
+    def begin_step_sync(self, **kwargs: Any) -> None:
         self.calls.append(("begin_step_sync", threading.get_ident()))
+        self.begin_kwargs = kwargs
 
     def finish_step_sync(self, **_kwargs: Any) -> None:
         self.calls.append(("finish_step_sync", threading.get_ident()))
@@ -141,3 +143,47 @@ async def test_step_persistence_hooks_offload_writer_calls() -> None:
         "on_step_failover_sync",
     ]
     assert all(thread_id != loop_thread for _, thread_id in writer.calls)
+
+
+async def test_step_persistence_strips_current_run_receipt_proof_only() -> None:
+    async def _unused_runner(_system_prompt: str, _user_message: str) -> Any:
+        raise AssertionError("agent_runner must not be invoked")
+
+    writer = _ThreadRecordingWriter()
+    plan = MetaPlan(
+        name="demo",
+        triggers=("t",),
+        priority=0,
+        steps=(MetaStep(id="audit", skill="audit", kind="skill_exec"),),
+    )
+    orch = MetaOrchestrator(agent_runner=_unused_runner, skill_loader=object())
+    on_begin, _on_finish, _on_failover = orch._step_persistence_hooks(
+        run_id="r1",
+        plan=plan,
+        writer=writer,  # type: ignore[arg-type]
+        usage_scope_prefix="r1",
+    )
+    assert on_begin is not None
+
+    rendered_inputs = {
+        "run_dir": "/synthetic/run",
+        "runtime": {
+            "paid_submission_dispositions": '{"shot1_image":"receipt"}',
+            "paid_submission_receipt_proofs": {
+                "shot1_image": f"sha256:{'a' * 64}",
+            },
+            "fallback_outputs": {"1": ""},
+        },
+        "__opensquilla_paid_submission_receipt_proofs_v1__": "must-not-persist",
+    }
+    await on_begin("audit", "audit", rendered_inputs)
+
+    assert writer.begin_kwargs["rendered_inputs"] == {
+        "run_dir": "/synthetic/run",
+        "runtime": {
+            "paid_submission_dispositions": '{"shot1_image":"receipt"}',
+            "fallback_outputs": {"1": ""},
+        },
+    }
+    # The scheduler/executor-owned input remains intact for this live audit.
+    assert "paid_submission_receipt_proofs" in rendered_inputs["runtime"]

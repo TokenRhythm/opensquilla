@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from opensquilla.engine.hooks.types import CompactionHook
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.provider.types import ProviderRequestCorrelation
+    from opensquilla.session.compaction_deployment import CompactionExecutionPlan
 
 # Internal sentinels mirroring the runtime.py module-level constants. The
 # stage body branches on ``t3_status`` to decide whether to fall through
@@ -92,7 +93,14 @@ class T3UpgradeCompactionPort(Protocol):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        compaction_plan: CompactionExecutionPlan | None = None,
+        history_capacity_tokens: int | None = None,
+        history_capacity_chars: int | None = None,
+        history_has_persisted_user: bool = False,
+        bound_user_message_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        consumer_admission: Any | None = None,
+        consumer_admission_fingerprint: str = "",
     ) -> str: ...
 
 @runtime_checkable
@@ -117,7 +125,14 @@ class PreflightCompactionPort(Protocol):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        compaction_plan: CompactionExecutionPlan | None = None,
+        history_capacity_tokens: int | None = None,
+        history_capacity_chars: int | None = None,
+        history_has_persisted_user: bool = False,
+        bound_user_message_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        consumer_admission: Any | None = None,
+        consumer_admission_fingerprint: str = "",
     ) -> None: ...
 
 @runtime_checkable
@@ -198,11 +213,19 @@ class CompactionAndHistoryStageInput:
     compaction_context_window_tokens: int | None = None
     compaction_provider: Any | None = None
     compaction_model: str | None = None
+    compaction_plan: CompactionExecutionPlan | None = field(
+        default=None,
+        repr=False,
+    )
+    history_capacity_tokens: int | None = None
+    history_capacity_chars: int | None = None
     bound_user_message_id: str | None = None
     provider_request_correlation: ProviderRequestCorrelation | None = field(
         default=None,
         repr=False,
     )
+    consumer_admission: Any | None = field(default=None, repr=False)
+    consumer_admission_fingerprint: str = ""
 
 @dataclass(frozen=True)
 class CompactionAndHistoryStageOutput:
@@ -309,7 +332,14 @@ class CompactionAndHistoryStage:
             context_window_tokens=compaction_context_window_tokens,
             compaction_provider=compaction_provider,
             compaction_model=compaction_model,
+            compaction_plan=inp.compaction_plan,
+            history_capacity_tokens=inp.history_capacity_tokens,
+            history_capacity_chars=inp.history_capacity_chars,
+            history_has_persisted_user=inp.history_has_persisted_user,
+            bound_user_message_id=inp.bound_user_message_id,
             provider_request_correlation=inp.provider_request_correlation,
+            consumer_admission=inp.consumer_admission,
+            consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
         )
         await self._fire_after_compact(t3_state, {"status": t3_status})
 
@@ -330,7 +360,14 @@ class CompactionAndHistoryStage:
                 context_window_tokens=compaction_context_window_tokens,
                 compaction_provider=compaction_provider,
                 compaction_model=compaction_model,
+                compaction_plan=inp.compaction_plan,
+                history_capacity_tokens=inp.history_capacity_tokens,
+                history_capacity_chars=inp.history_capacity_chars,
+                history_has_persisted_user=inp.history_has_persisted_user,
+                bound_user_message_id=inp.bound_user_message_id,
                 provider_request_correlation=inp.provider_request_correlation,
+                consumer_admission=inp.consumer_admission,
+                consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
             )
             await self._fire_after_compact(preflight_state, {"status": "ran"})
 

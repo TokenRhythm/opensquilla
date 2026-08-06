@@ -164,7 +164,7 @@ async def run_agent_once(
     from opensquilla.gateway.routing import build_cli_route_envelope, tool_context_from_envelope
     from opensquilla.paths import media_root_from_config
     from opensquilla.permissions import configured_default_run_mode
-    from opensquilla.sandbox.run_mode import normalize_run_mode
+    from opensquilla.run_mode import normalize_run_mode
     from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
     from opensquilla.tools.types import InteractionMode
 
@@ -177,24 +177,22 @@ async def run_agent_once(
     permissions_override = (
         permissions is not None or os.environ.get("OPENSQUILLA_AGENT_PERMISSIONS") is not None
     )
-    sandbox_settings = getattr(cfg, "sandbox", None)
-    explicit_run_mode = getattr(sandbox_settings, "run_mode", None)
-    run_mode = None
-    if not permissions_override:
-        if explicit_run_mode:
-            run_mode = normalize_run_mode(explicit_run_mode).value
-        elif permissions_profile == "restricted":
-            run_mode = configured_default_run_mode(cfg).value
+    run_mode = configured_default_run_mode(cfg).value
     accepted_run_mode_override = None
-    if explicit_run_mode and run_mode is not None:
+    if permissions_override:
         from opensquilla.gateway.project_workspace_runtime import (
             AcceptedRunModeOverride,
         )
 
+        run_mode = (
+            "full"
+            if permissions_profile in {"bypass", "full"}
+            else "safe"
+        )
         accepted_run_mode_override = AcceptedRunModeOverride(
             run_mode=normalize_run_mode(run_mode),
-            run_mode_source="operator_default",
-            source="config",
+            run_mode_source="user",
+            source="request",
         )
     run_attachments: list[dict[str, Any]] = list(attachments or [])
     if attachment_paths:
@@ -356,6 +354,9 @@ async def run_agent_once(
             workspace_dir=tool_workspace_dir,
             workspace_strict=effective_workspace_strict,
         )
+        from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+        pin_sandbox_policy(tool_ctx, service_cfg)
         tool_ctx.scratch_dir = effective_scratch_dir
         tool_ctx.workspace_lockdown = workspace_lockdown
         tool_ctx.workspace_write_deny_globs = list(effective_workspace_write_deny_globs)

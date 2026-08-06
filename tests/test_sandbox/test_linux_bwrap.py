@@ -161,7 +161,7 @@ def test_default_workspace_profile_binds_host_tmp_writable(tmp_path: Path) -> No
         SecurityLevel.STANDARD,
         "shell.exec",
         tmp_path,
-        SandboxSettings(),
+        SandboxSettings(run_mode="safe"),
     )
 
     argv = build_bwrap_argv(
@@ -173,8 +173,12 @@ def test_default_workspace_profile_binds_host_tmp_writable(tmp_path: Path) -> No
 
     triples = [argv[index : index + 3] for index in range(len(argv) - 2)]
     pairs = [argv[index : index + 2] for index in range(len(argv) - 1)]
-    assert ["--bind", "/tmp", "/tmp"] in triples
-    assert ["--tmpfs", "/tmp"] not in pairs
+    canonical_tmp = str(Path("/tmp").resolve(strict=False))
+    assert ["--bind", canonical_tmp, canonical_tmp] in triples
+    if canonical_tmp == "/tmp":
+        assert ["--tmpfs", "/tmp"] not in pairs
+    else:
+        assert ["--tmpfs", "/tmp"] in pairs
 
 
 def test_compiled_workspace_profile_orders_read_baseline_write_and_protection(
@@ -188,7 +192,7 @@ def test_compiled_workspace_profile_orders_read_baseline_write_and_protection(
         SecurityLevel.STANDARD,
         "shell.exec",
         workspace,
-        SandboxSettings(),
+        SandboxSettings(run_mode="safe"),
     )
 
     argv = build_bwrap_argv(

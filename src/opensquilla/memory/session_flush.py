@@ -35,6 +35,11 @@ from opensquilla.memory.flush import (
     validate_flush_save_arguments,
 )
 from opensquilla.memory.protocols import MemoryProviderCapability, MemoryToolHandler
+from opensquilla.provider.auxiliary_budget import (
+    AuxiliaryRequestTooLargeError,
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.correlation_context import (
     bind_provider_request_correlation,
     current_provider_request_correlation,
@@ -1131,10 +1136,29 @@ async def _provider_complete(
     both provider shapes instead of silently falling back to raw memory on the
     production OpenRouter path.
     """
+    budget = resolve_auxiliary_request_budget(
+        provider,
+        max_output_tokens=max_tokens,
+    )
+    try:
+        ensure_auxiliary_text_fits(
+            messages,
+            max_chars=budget.provider_request_max_chars,
+            max_tokens=budget.max_input_tokens,
+        )
+    except AuxiliaryRequestTooLargeError as exc:
+        raise ProviderCompletionError(
+            str(exc),
+            code="provider_request_too_large",
+        ) from exc
+
     complete = getattr(provider, "complete", None)
     if callable(complete):
         try:
-            resp = await complete(messages=messages, max_tokens=max_tokens)
+            resp = await complete(
+                messages=messages,
+                max_tokens=budget.max_output_tokens,
+            )
         except ProviderCompletionError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -1153,7 +1177,8 @@ async def _provider_complete(
     )
 
     config = ChatConfig(
-        max_tokens=max_tokens,
+        max_tokens=budget.max_output_tokens,
+        provider_request_max_chars=budget.provider_request_max_chars,
         provider_request_correlation=current_provider_request_correlation(),
     )
     scope = current_usage_accounting_scope()

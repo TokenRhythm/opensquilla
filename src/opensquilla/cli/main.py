@@ -733,10 +733,13 @@ def gateway_run(
     )
 
     # The child that owns the gateway retains both the RC4 profile lock and
-    # the legacy gateway lease for its complete write-capable lifetime.
+    # the legacy gateway lease for its complete write-capable lifetime. The
+    # bounded wait lets a predecessor still releasing its lease (an app
+    # restart, a finishing cron tick) resolve on its own instead of failing
+    # startup with OPENSQUILLA_PROFILE_IN_USE immediately.
     try:
         try:
-            with guarded_desktop_profile():
+            with guarded_desktop_profile(lock_timeout=5.0):
                 run_gateway(
                     port=port,
                     bind=bind,

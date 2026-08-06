@@ -11,6 +11,7 @@ from opensquilla.gateway.approval_queue import get_approval_queue, reset_approva
 from opensquilla.sandbox import sensitive_paths
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+from opensquilla.sandbox.policy_models import SandboxPolicy
 from opensquilla.tools.builtin import patch as patch_tool
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import (
@@ -79,6 +80,81 @@ def test_apply_patch_schema_exposes_optional_patch_file_path() -> None:
     assert registered is not None
     assert "path" in registered.spec.parameters
     assert "path" not in registered.spec.required
+
+
+@pytest.mark.asyncio
+async def test_patch_update_approval_backs_up_existing_target_before_apply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.tools.builtin import filesystem
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("before\n", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    patch_text = f"""*** Begin Patch
+*** Update File: {target.as_posix()}
+@@ -1,1 +1,1 @@
+-before
++after
+*** End Patch"""
+    ops = patch_tool._parse_patch(patch_text)
+    monkeypatch.setattr(filesystem, "_sandbox_path_access_enabled", lambda: True)
+    monkeypatch.setattr(patch_tool, "active_file_system_profile", lambda _root: None)
+    token = current_tool_context.set(
+        ToolContext(
+            run_mode="safe",
+            workspace_dir=str(workspace),
+            session_key="session-1",
+            sandbox_policy=SandboxPolicy(),
+            sandbox_gateway_config=SimpleNamespace(state_dir=str(state_dir)),
+        )
+    )
+    try:
+        first, elevated, first_backups = await patch_tool._gate_patch_ops(
+            ops,
+            workspace,
+            None,
+            patch_digest="sha256:patch",
+            sandbox_permissions="require_escalated",
+            justification="Update the exact file requested by the user.",
+        )
+        assert first is not None
+        assert elevated is False
+        assert first_backups == ()
+        approval_id = str(first["approval_id"])
+        action = get_approval_queue().get(approval_id).params["action"]
+        assert action["display"]["kind"] == "modify"
+        assert action["display"]["backup_state"] == "enabled"
+        get_approval_queue().resolve(approval_id, True)
+
+        resumed, elevated, backup_summaries = await patch_tool._gate_patch_ops(
+            ops,
+            workspace,
+            approval_id,
+            patch_digest="sha256:patch",
+            sandbox_permissions="require_escalated",
+            justification="Update the exact file requested by the user.",
+        )
+
+        assert resumed is None
+        assert elevated is True
+        assert len(backup_summaries) == 1
+        assert set(backup_summaries[0]) == {
+            "backupId",
+            "target",
+            "sizeBytes",
+            "createdAt",
+        }
+        assert backup_summaries[0]["target"] == str(target.resolve())
+        receipts = tuple((state_dir / "backup-vault" / "entries").iterdir())
+        assert len(receipts) == 1
+        assert (receipts[0] / "content").read_text(encoding="utf-8") == "before\n"
+        assert target.read_text(encoding="utf-8") == "before\n"
+    finally:
+        current_tool_context.reset(token)
 
 
 def test_patch_request_preserves_absolute_target_outside_workspace(tmp_path: Path) -> None:

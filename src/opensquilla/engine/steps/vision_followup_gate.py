@@ -6,10 +6,15 @@ import asyncio
 import json
 import re
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.steps.squilla_router import _attachments_include_image
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.types import (
     ChatConfig,
     DoneEvent,
@@ -56,6 +61,26 @@ _ZH_PREVIOUS_IMAGE_REFS = (
     "那张图",
     "那张图片",
 )
+_GATE_EXECUTION_TARGET_ATTR = "_opensquilla_vision_gate_execution_target"
+
+
+@dataclass(frozen=True, slots=True)
+class VisionFollowupGateExecutionTarget:
+    """Runtime-only identity of the physical provider used by the gate."""
+
+    provider: Any = field(repr=False, compare=False)
+    provider_id: str
+    model: str
+
+
+def bind_vision_followup_gate_execution_target(
+    chat: Any,
+    target: VisionFollowupGateExecutionTarget,
+) -> Any:
+    """Attach a non-serialized physical target to the dedicated chat closure."""
+
+    setattr(chat, _GATE_EXECUTION_TARGET_ATTR, target)
+    return chat
 
 
 def _router_cfg(ctx: TurnContext) -> Any:
@@ -132,18 +157,30 @@ async def _call_gate_provider(ctx: TurnContext) -> str:
         if provider is None:
             raise RuntimeError("vision follow-up gate has no provider")
         chat = provider.chat
+    execution_target = getattr(chat, _GATE_EXECUTION_TARGET_ATTR, None)
+    budget_provider = (
+        execution_target.provider
+        if isinstance(execution_target, VisionFollowupGateExecutionTarget)
+        else ctx.provider
+    )
+    budget_provider_id = (
+        execution_target.provider_id
+        if isinstance(execution_target, VisionFollowupGateExecutionTarget)
+        else str(ctx.metadata.get("executed_provider", "") or "")
+    )
+    budget_model = (
+        execution_target.model
+        if isinstance(execution_target, VisionFollowupGateExecutionTarget)
+        else str(
+            ctx.metadata.get("router_vision_followup_gate_model", "")
+            or ctx.model
+            or ""
+        )
+    )
     cfg = _router_cfg(ctx)
     timeout = float(getattr(cfg, "vision_followup_gate_timeout_seconds", 3.0) or 3.0)
-    config = ChatConfig(
-        max_tokens=int(getattr(cfg, "vision_followup_gate_max_output_tokens", 120) or 120),
-        temperature=0,
-        timeout=timeout,
-        system=_gate_system_prompt(),
-        provider_request_correlation=derive_provider_request_correlation(
-            ctx.provider_request_correlation,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.vision_gate",
-        ),
+    requested_output_tokens = int(
+        getattr(cfg, "vision_followup_gate_max_output_tokens", 120) or 120
     )
     messages = [
         Message(
@@ -151,6 +188,31 @@ async def _call_gate_provider(ctx: TurnContext) -> str:
             content=json.dumps(_gate_payload(ctx), ensure_ascii=False, separators=(",", ":")),
         )
     ]
+    system_prompt = _gate_system_prompt()
+    budget = resolve_auxiliary_request_budget(
+        budget_provider,
+        max_output_tokens=requested_output_tokens,
+        provider_id=budget_provider_id,
+        model=budget_model,
+    )
+    ensure_auxiliary_text_fits(
+        messages,
+        max_chars=budget.provider_request_max_chars,
+        max_tokens=budget.max_input_tokens,
+        system=system_prompt,
+    )
+    config = ChatConfig(
+        max_tokens=budget.max_output_tokens,
+        temperature=0,
+        timeout=timeout,
+        system=system_prompt,
+        provider_request_max_chars=budget.provider_request_max_chars,
+        provider_request_correlation=derive_provider_request_correlation(
+            ctx.provider_request_correlation,
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.vision_gate",
+        ),
+    )
     chunks: list[str] = []
     reasoning_chunks: list[str] = []
     async for event in chat(messages, tools=[], config=config):

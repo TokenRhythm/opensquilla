@@ -79,6 +79,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         == legacy_runtime_tail
     )
     assert field_names[legacy_tail_start + len(legacy_runtime_tail) :] == [
+        "sandbox_policy",
         "channel_admin_verified",
         "collaboration_mode",
         "collaboration_revision",

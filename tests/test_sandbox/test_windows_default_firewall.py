@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import opensquilla.sandbox.backend.windows_default_firewall as firewall_mod
 from opensquilla.sandbox.backend.windows_default_firewall import (
     LOOPBACK_REMOTE_ADDRESSES,
     NON_LOOPBACK_REMOTE_ADDRESSES,
@@ -130,3 +133,27 @@ def test_powershell_firewall_commands_use_icmp_type_without_remote_port() -> Non
 
 def test_loopback_remote_addresses_use_firewall_accepted_ipv6_range() -> None:
     assert LOOPBACK_REMOTE_ADDRESSES == "127.0.0.0/8,::/127"
+
+
+def test_install_firewall_rules_batches_all_rules_into_one_powershell_call(
+    monkeypatch,
+) -> None:
+    specs = firewall_rule_specs(
+        offline_sid="S-1-5-21-100-200-300-400",
+        allowed_proxy_ports=(43128,),
+        allow_local_binding=False,
+    )
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(firewall_mod.subprocess, "run", fake_run)
+
+    firewall_mod.install_firewall_rules(specs)
+
+    assert len(calls) == 1
+    script = calls[0][0][0][5]
+    assert script.startswith("$ErrorActionPreference = 'Stop'; ")
+    assert all(spec.name in script for spec in specs)

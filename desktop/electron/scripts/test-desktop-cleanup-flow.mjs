@@ -100,6 +100,29 @@ const consolidationBackupMarker = join(
 const cleanupJournal = join(userData, '.opensquilla.profile-cleanup.json')
 let desktopApp
 
+async function seedProfileContext(updatedAt) {
+  await writeFile(join(userData, 'desktop-locale'), 'en', 'utf8')
+  await writeFile(join(userData, 'desktop-profile-context.json'), `${JSON.stringify({
+    schema_version: 1,
+    active_profile_kind: 'primary',
+    active_recovery_id: null,
+    attention_acknowledgement: null,
+    updated_at: updatedAt,
+  }, null, 2)}\n`, 'utf8')
+}
+
+async function waitForRepairPage(app, label) {
+  return waitFor(async () => {
+    for (const candidate of app.windows()) {
+      if (candidate.isClosed()) continue
+      if (await candidate.locator('#recoveryPanel.visible').count().catch(() => 0)) {
+        return candidate
+      }
+    }
+    return null
+  }, label)
+}
+
 try {
   await mkdir(workspace, { recursive: true })
   await mkdir(state, { recursive: true })
@@ -113,60 +136,49 @@ try {
     `workspace_dir = ${JSON.stringify(join(root, 'missing-workspace'))}\n`,
     'utf8',
   )
-  await writeFile(join(userData, 'desktop-locale'), 'en', 'utf8')
   await writeFile(cleanupJournal, 'synthetic interrupted cleanup authority\n', 'utf8')
-  await writeFile(join(userData, 'desktop-profile-context.json'), `${JSON.stringify({
-    schema_version: 1,
-    active_profile_kind: 'primary',
-    active_recovery_id: null,
-    attention_acknowledgement: null,
-    updated_at: '2026-07-13T00:00:00.000Z',
-  }, null, 2)}\n`, 'utf8')
+  await seedProfileContext('2026-07-13T00:00:00.000Z')
 
+  // Phase 1: an interrupted cleanup journal is a warning, not a startup gate.
+  // Startup abandons it automatically — the journal record is archived and
+  // every surviving file is preserved — with no repair page and no dialog.
+  const identityBeforeAbandon = await readFile(join(workspace, 'IDENTITY.md'))
+  const stateBeforeAbandon = await readFile(join(state, 'sessions.db.keep'))
   desktopApp = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${userData}`, packageRoot],
     env: launchEnvironment(isolatedHome),
   })
-  const page = await waitFor(async () => {
-    for (const candidate of desktopApp.windows()) {
-      if (candidate.isClosed()) continue
-      if (await candidate.locator('#recoveryPanel.visible').count().catch(() => 0)) {
-        return candidate
-      }
-    }
-    return null
-  }, 'cleanup test primary repair page')
-
-  // Keep production confirmation intact; cancel the first click and accept the
-  // second so the real primary-repair button proves its busy state is cleared.
-  await desktopApp.evaluate(({ dialog }) => {
-    let cleanupDialogCount = 0
-    dialog.showMessageBox = async () => ({
-      response: cleanupDialogCount++ === 0 ? 0 : 1,
-      checkboxChecked: false,
-    })
-  })
-
-  const identityBeforeAbandon = await readFile(join(workspace, 'IDENTITY.md'))
-  const stateBeforeAbandon = await readFile(join(state, 'sessions.db.keep'))
-  const abandonButton = page.locator('#abandonCleanup')
-  await abandonButton.click()
-  await waitFor(async () => (
-    await abandonButton.isVisible() && await abandonButton.isEnabled()
-  ), 'abandon button to recover after native-dialog cancellation')
-  assert.equal(await exists(cleanupJournal), true, 'cancel must preserve the cleanup journal')
-
-  await abandonButton.click()
-  await waitFor(async () => !await exists(cleanupJournal), 'cleanup journal abandonment')
-  await waitFor(async () => (
-    await page.locator('#recoveryCode').textContent() === 'effective_workspace_missing'
-  ), 'post-abandon primary repair inspection')
-  assert.equal(await page.locator('#cleanupAbandonGroup').isHidden(), true)
+  await waitFor(async () => !await exists(cleanupJournal), 'automatic cleanup journal abandonment')
   assert((await readdir(userData)).some((name) => (
     name.startsWith('.opensquilla.profile-cleanup.abandoned.') && name.endsWith('.json')
   )))
   assert.deepEqual(await readFile(join(workspace, 'IDENTITY.md')), identityBeforeAbandon)
   assert.deepEqual(await readFile(join(state, 'sessions.db.keep')), stateBeforeAbandon)
+  await desktopApp.close()
+  desktopApp = null
+  await delay(200)
+
+  // Phase 2: force the repair page through the remaining hard startup gate
+  // (config authored by a newer build), then run the trusted
+  // delete-current-profile flow from that page.
+  await writeFile(
+    join(primaryHome, 'config.toml'),
+    `workspace_dir = ${JSON.stringify(join(root, 'missing-workspace'))}\nconfig_version = 999\n`,
+    'utf8',
+  )
+  await seedProfileContext('2026-07-13T00:00:01.000Z')
+  desktopApp = await electron.launch({
+    args: ['--use-mock-keychain', `--user-data-dir=${userData}`, packageRoot],
+    env: launchEnvironment(isolatedHome),
+  })
+  const page = await waitForRepairPage(desktopApp, 'cleanup test primary repair page')
+  assert.equal(
+    await page.locator('#recoveryCode').textContent(),
+    'config_schema_too_new',
+  )
+  await desktopApp.evaluate(({ dialog }) => {
+    dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false })
+  })
 
   const preview = await page.evaluate(() => (
     window.opensquillaDesktop.inspectDesktopCleanup({ mode: 'delete-current-profile' })
@@ -203,41 +215,26 @@ try {
     'recorded backup must remain\n',
   )
 
-  // Recreate a synthetic primary profile, then verify delete-all is handed to
-  // the detached offline helper and does not begin until this second Electron
-  // process has actually exited.
+  // Phase 3: recreate a synthetic blocked primary profile, then verify
+  // delete-all is handed to the detached offline helper and does not begin
+  // until this Electron process has actually exited.
   desktopApp = null
   await mkdir(workspace, { recursive: true })
   await mkdir(state, { recursive: true })
   await writeFile(join(workspace, 'IDENTITY.md'), 'synthetic delete-all identity\n', 'utf8')
   await writeFile(
     join(primaryHome, 'config.toml'),
-    `workspace_dir = ${JSON.stringify(join(root, 'still-missing-workspace'))}\n`,
+    `workspace_dir = ${JSON.stringify(join(root, 'still-missing-workspace'))}\nconfig_version = 999\n`,
     'utf8',
   )
-  await writeFile(join(userData, 'desktop-locale'), 'en', 'utf8')
-  await writeFile(join(userData, 'desktop-profile-context.json'), `${JSON.stringify({
-    schema_version: 1,
-    active_profile_kind: 'primary',
-    active_recovery_id: null,
-    attention_acknowledgement: null,
-    updated_at: '2026-07-13T00:00:01.000Z',
-  }, null, 2)}\n`, 'utf8')
+  await seedProfileContext('2026-07-13T00:00:02.000Z')
   await delay(200)
 
   desktopApp = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${userData}`, packageRoot],
     env: launchEnvironment(isolatedHome),
   })
-  const deleteAllPage = await waitFor(async () => {
-    for (const candidate of desktopApp.windows()) {
-      if (candidate.isClosed()) continue
-      if (await candidate.locator('#recoveryPanel.visible').count().catch(() => 0)) {
-        return candidate
-      }
-    }
-    return null
-  }, 'delete-all test primary repair page')
+  const deleteAllPage = await waitForRepairPage(desktopApp, 'delete-all test primary repair page')
   await desktopApp.evaluate(({ dialog }) => {
     dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false })
   })
@@ -275,11 +272,10 @@ try {
   console.log(JSON.stringify({
     ok: true,
     trustedPreviewVerified: true,
-    postStopReinspectionVerified: true,
     currentProfileDeleted: true,
     recordedBackupPreservedByCurrentDelete: true,
     noLogWritebackAfterDelete: true,
-    abandonCleanupVerified: true,
+    automaticCleanupAbandonVerified: true,
     deleteAllStartedAfterExit: true,
     allPrimaryDataAndBackupsDeletedByOfflineHelper: true,
   }))

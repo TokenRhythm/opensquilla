@@ -82,6 +82,20 @@ afterEach(() => {
 })
 
 describe('ClarifyCard Plan questionnaire', () => {
+  it('keeps a complete long generic intro in a focusable scroll region', async () => {
+    const request = planQuestionnaire()
+    delete request.presentation
+    request.intro = `Start\n${'detail '.repeat(400)}\nEnd`
+    const { host } = mountCard(request)
+    await nextTick()
+
+    const intro = host.querySelector<HTMLElement>('[data-testid="clarify-intro"]')
+    expect(intro?.textContent).toContain('Start')
+    expect(intro?.textContent).toContain('End')
+    expect(intro?.classList.contains('clarify-card__intro--long')).toBe(true)
+    expect(intro?.tabIndex).toBe(0)
+  })
+
   it('shows one question at a time and preserves answers while navigating', async () => {
     const { host } = mountCard(planQuestionnaire())
     await nextTick()

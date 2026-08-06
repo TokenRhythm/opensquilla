@@ -21,6 +21,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   the current credential's declared model entitlements, exposes versioned
   `metadata.published` / `metadata.declared` fields, and reports stale catalog
   state without blocking normal model listing or turns.
+- The Sandbox settings module now covers Safe/Full defaults, versioned file,
+  command and network policies, bounded recursive-delete backups, pinned
+  bundled runtime versions, LAN listening/CIDR controls, and named tokens.
+- Safe availability is now decided by cached live process, filesystem worker,
+  deny-write, and authority-deny-read canaries instead of setup state alone.
 
 ### Fixed
 
@@ -37,6 +42,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   optional catalog metadata and maximum-output fields. Existing clients may
   ignore them; external decoders using `additionalProperties: false` must allow
   the new additive fields before upgrading.
+
+### Security
+
+- LAN WebSocket peers are limited to loopback, RFC 1918, or IPv6 ULA ranges
+  and may be narrowed further with `auth.allowed_client_cidrs`; public peers
+  are rejected before authentication.
+- Safe tasks pin one policy version for the entire turn. High-risk commands
+  require exact user approval, and recursive deletion is brokered through an
+  irreversible-action prompt plus a default 3 GiB oldest-first backup vault.
 
 ## [0.5.2] - 2026-07-30
 

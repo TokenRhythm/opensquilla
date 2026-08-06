@@ -19,59 +19,58 @@ const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '../..')
 
+// Every locale exercises the repair page with the schema-too-new fixture, so
+// the expected heading is the update-specific title, not the generic one.
 const LOCALES = {
   en: {
     title: 'Starting OpenSquilla',
     bootAria: 'OpenSquilla startup',
-    repairTitle: 'Your primary profile needs recovery',
-    cleanupTitle: 'A data cleanup stopped partway through',
+    repairTitle: 'Update OpenSquilla to open this profile',
     retry: 'Retry',
   },
   'zh-Hans': {
     title: '正在启动 OpenSquilla',
     bootAria: 'OpenSquilla 启动',
-    repairTitle: '主配置需要恢复',
-    cleanupTitle: '数据清理在中途停止',
+    repairTitle: '请更新 OpenSquilla 以打开此配置',
     retry: '重试',
   },
   ja: {
     title: 'OpenSquilla を起動しています',
     bootAria: 'OpenSquilla の起動',
-    repairTitle: 'プライマリプロファイルの復旧が必要です',
-    cleanupTitle: 'データのクリーンアップが途中で停止しました',
+    repairTitle: 'このプロファイルを開くには OpenSquilla の更新が必要です',
     retry: '再試行',
   },
   fr: {
     title: "Démarrage d'OpenSquilla",
     bootAria: "Démarrage d'OpenSquilla",
-    repairTitle: 'Le profil principal doit être récupéré',
-    cleanupTitle: 'Un nettoyage des données s’est arrêté en cours de route',
+    repairTitle: 'Mettez à jour OpenSquilla pour ouvrir ce profil',
     retry: 'Réessayer',
   },
   de: {
     title: 'OpenSquilla wird gestartet',
     bootAria: 'OpenSquilla-Start',
-    repairTitle: 'Das Hauptprofil muss wiederhergestellt werden',
-    cleanupTitle: 'Eine Datenbereinigung wurde unterbrochen',
+    repairTitle: 'Aktualisieren Sie OpenSquilla, um dieses Profil zu öffnen',
     retry: 'Wiederholen',
   },
   es: {
     title: 'Iniciando OpenSquilla',
     bootAria: 'Inicio de OpenSquilla',
-    repairTitle: 'El perfil principal necesita recuperación',
-    cleanupTitle: 'Una limpieza de datos se detuvo a mitad de camino',
+    repairTitle: 'Actualiza OpenSquilla para abrir este perfil',
     retry: 'Reintentar',
   },
 }
 
-const BLOCKING_CASES = {
-  en: { fixture: 'missing-workspace', stableCode: 'effective_workspace_missing' },
-  'zh-Hans': { fixture: 'corrupt-config', stableCode: 'config_invalid' },
-  ja: { fixture: 'future-config', stableCode: 'config_schema_too_new' },
-  fr: { fixture: 'unfinished-transaction', stableCode: 'transaction_incomplete' },
-  de: { fixture: 'unsafe-database', stableCode: 'state_database_invalid' },
-  es: { fixture: 'cleanup-transaction', stableCode: 'cleanup_transaction_incomplete' },
-}
+// After the recovery-governance downgrade, the only fixture-synthesizable
+// hard startup gate is a config authored by a newer build. Every other
+// historical blocking code now starts with a warning (or is repaired
+// automatically), so each locale exercises the repair page with the same
+// schema-too-new authority.
+const BLOCKING_CASES = Object.fromEntries(
+  Object.keys(LOCALES).map((locale) => [
+    locale,
+    { fixture: 'future-config', stableCode: 'config_schema_too_new' },
+  ]),
+)
 
 const REMOVED_PROFILE_CONTROLS = [
   'recoveryProfiles',
@@ -80,6 +79,7 @@ const REMOVED_PROFILE_CONTROLS = [
   'createRecovery',
   'retryPrimary',
   'returnPrimary',
+  'abandonCleanup',
 ]
 
 async function waitFor(check, label, timeoutMs = 90_000) {
@@ -164,7 +164,6 @@ async function createFixture(locale, blockingCase) {
   const primaryHome = join(userData, 'opensquilla')
   const primaryWorkspace = join(primaryHome, 'workspace')
   const primaryState = join(primaryHome, 'state')
-  const missingWorkspace = join(root, 'missing-external-workspace')
 
   await mkdir(primaryWorkspace, { recursive: true })
   await mkdir(primaryState, { recursive: true })
@@ -179,34 +178,8 @@ async function createFixture(locale, blockingCase) {
   }
   await writeFile(join(primaryState, 'primary-must-not-change.txt'), 'unchanged\n', 'utf8')
 
-  let config = `state_dir = ${JSON.stringify(primaryState)}\n`
-  if (blockingCase.fixture === 'missing-workspace') {
-    config = [
-      `state_dir = ${JSON.stringify(primaryState)}`,
-      `workspace_dir = ${JSON.stringify(missingWorkspace)}`,
-      '',
-    ].join('\n')
-  } else if (blockingCase.fixture === 'corrupt-config') {
-    config = 'workspace_dir = "unterminated\n'
-  } else if (blockingCase.fixture === 'future-config') {
-    config = 'config_version = 999\n'
-  }
-  await writeFile(join(primaryHome, 'config.toml'), config, 'utf8')
-  if (blockingCase.fixture === 'unsafe-database') {
-    await writeFile(join(primaryState, 'sessions.db'), 'not a sqlite database', 'utf8')
-  }
-
-  let journalPath = null
-  let journalBytes = null
-  if (blockingCase.fixture === 'unfinished-transaction') {
-    journalPath = join(userData, '.opensquilla.profile-replace.json')
-    journalBytes = '{"schema_version":1,"phase":"prepared"}\n'
-    await writeFile(journalPath, journalBytes, 'utf8')
-  } else if (blockingCase.fixture === 'cleanup-transaction') {
-    journalPath = join(userData, '.opensquilla.profile-cleanup.json')
-    journalBytes = 'synthetic interrupted cleanup authority\n'
-    await writeFile(journalPath, journalBytes, 'utf8')
-  }
+  assert.equal(blockingCase.fixture, 'future-config')
+  await writeFile(join(primaryHome, 'config.toml'), 'config_version = 999\n', 'utf8')
   await writeFile(join(userData, 'desktop-locale'), locale, 'utf8')
 
   return {
@@ -214,8 +187,6 @@ async function createFixture(locale, blockingCase) {
     userData,
     isolatedHome,
     primaryHome,
-    journalPath,
-    journalBytes,
     primaryBefore: await snapshotTree(primaryHome),
   }
 }
@@ -284,12 +255,7 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     assert.equal(await page.title(), expected.title)
     assert.equal(await page.locator('main.boot').getAttribute('aria-label'), expected.bootAria)
     assert.equal(await page.locator('#recoveryCode').innerText(), blockingCase.stableCode)
-    assert.equal(
-      await page.locator('#recoveryTitle').innerText(),
-      blockingCase.fixture === 'cleanup-transaction'
-        ? expected.cleanupTitle
-        : expected.repairTitle,
-    )
+    assert.equal(await page.locator('#recoveryTitle').innerText(), expected.repairTitle)
     assert.equal(await page.locator('#recoveryPanel').getAttribute('role'), 'region')
     assert.equal(await page.locator('#recoveryPanel').getAttribute('aria-labelledby'), 'recoveryTitle')
     assert.equal(await page.locator('#recoveryStatus').getAttribute('role'), 'status')
@@ -297,6 +263,7 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     assert.equal(await page.evaluate(() => document.activeElement?.id), 'recoveryTitle')
     assert.equal(await page.locator('#recoveryRetry').innerText(), expected.retry)
     assert.equal(await page.locator('#recoveryRetry').isVisible(), true)
+    assert.equal(await page.locator('#recoveryUpdate').isVisible(), true)
 
     for (const removedId of REMOVED_PROFILE_CONTROLS) {
       assert.equal(await page.locator(`#${removedId}`).count(), 0, `${locale}: ${removedId}`)
@@ -306,6 +273,7 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
       chooseWorkspace: typeof window.opensquillaDesktop.chooseRecoveryWorkspace,
       recoverTransaction: typeof window.opensquillaDesktop.recoverProfileTransaction,
       abandonCleanup: typeof window.opensquillaDesktop.abandonCleanupTransaction,
+      openDownload: typeof window.opensquillaDesktop.openLatestDownloadPage,
       retryStartup: typeof window.opensquillaDesktop.retryStartup,
       launchSafeProfile: typeof window.opensquillaDesktop.launchSafeProfile,
       retryPrimaryProfile: typeof window.opensquillaDesktop.retryPrimaryProfile,
@@ -315,7 +283,8 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     assert.equal(bridgeShape.state, 'function')
     assert.equal(bridgeShape.chooseWorkspace, 'function')
     assert.equal(bridgeShape.recoverTransaction, 'function')
-    assert.equal(bridgeShape.abandonCleanup, 'function')
+    assert.equal(bridgeShape.abandonCleanup, 'undefined')
+    assert.equal(bridgeShape.openDownload, 'function')
     assert.equal(bridgeShape.retryStartup, 'function')
     assert.equal(bridgeShape.launchSafeProfile, 'undefined')
     assert.equal(bridgeShape.retryPrimaryProfile, 'undefined')
@@ -335,9 +304,6 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     assert.equal('activeProfile' in recoveryState, false)
     assert.equal('recoveryProfiles' in recoveryState, false)
     assert.deepEqual(await snapshotTree(fixture.primaryHome), fixture.primaryBefore)
-    if (fixture.journalPath) {
-      assert.equal(await readFile(fixture.journalPath, 'utf8'), fixture.journalBytes)
-    }
     if (locale === 'en') await assertReducedMotion(page)
     completedLocales.push(locale)
     completedBlockingCodes.push(blockingCase.stableCode)

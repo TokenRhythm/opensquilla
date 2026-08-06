@@ -22,6 +22,7 @@ from opensquilla.agent_ids import normalize_agent_id
 from opensquilla.recovery.atomic import (
     _copy_windows_mount_point_no_follow,
     _native_io_path,
+    is_path_redirecting_stat,
     native_move_no_replace,
     profile_no_follow_manifest,
 )
@@ -34,6 +35,7 @@ from opensquilla.recovery.locking import (
     acquire_legacy_gateway_locks,
     acquire_profile_locks,
     move_profile_no_replace,
+    resolve_home_link,
 )
 from opensquilla.recovery.session_merge import (
     SessionMergeResult,
@@ -334,7 +336,7 @@ def _blocked(
 
 
 def _is_link_or_reparse(value: os.stat_result) -> bool:
-    return stat.S_ISLNK(value.st_mode) or bool(int(getattr(value, "st_file_attributes", 0)) & 0x400)
+    return is_path_redirecting_stat(value)
 
 
 def _plain_directory(path: Path, *, label: str) -> os.stat_result:
@@ -395,9 +397,11 @@ def _validate_base_paths(
 ) -> None:
     _plain_directory(user_data, label="Electron userData")
     expected = user_data / "opensquilla"
-    if os.path.normcase(os.path.normpath(str(primary_home))) != os.path.normcase(
-        os.path.normpath(str(expected))
-    ):
+    # userData or the home itself may be provisioned as a junction/symlink;
+    # compare by resolved identity rather than spelling.
+    if os.path.normcase(
+        os.path.normpath(os.path.realpath(str(primary_home), strict=False))
+    ) != os.path.normcase(os.path.normpath(os.path.realpath(str(expected), strict=False))):
         raise UnsafePathError("primary home must be the canonical userData/opensquilla path")
     try:
         primary_stat = os.lstat(_native_io_path(primary_home))
@@ -854,13 +858,26 @@ def _validate_directory_chain_binding(binding: object) -> None:
             value = os.lstat(_native_io_path(current))
         except OSError as exc:
             raise UnsafePathError(f"external directory ancestor changed: {current}") from exc
+        observed_attributes = int(getattr(value, "st_file_attributes", 0))
         observed = {
             "path": str(current),
             "device": int(value.st_dev),
             "inode": int(value.st_ino),
             "mode": stat.S_IFMT(value.st_mode),
-            "file_attributes": int(getattr(value, "st_file_attributes", 0)),
+            "file_attributes": observed_attributes,
         }
+        # Cloud-sync attribute bits (hydration, pinning) toggle at will, so
+        # only the stable directory bit participates in the comparison; the
+        # redirect check plus device/inode pin the rest of the identity.
+        expected_attributes = expected.get("file_attributes")
+        if isinstance(expected_attributes, int):
+            expected = {
+                **expected,
+                "file_attributes": expected_attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY,
+            }
+            observed["file_attributes"] = (
+                observed_attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+            )
         if _is_link_or_reparse(value) or not stat.S_ISDIR(value.st_mode) or observed != expected:
             raise UnsafePathError(f"external directory ancestor identity changed: {current}")
     existing_path = Path(str(binding.get("existing_path")))
@@ -4025,7 +4042,7 @@ def consolidate_recovery_profiles(
     """
 
     user_data_path = _absolute(user_data)
-    primary_path = _absolute(primary_home)
+    primary_path = resolve_home_link(_absolute(primary_home))
     journal_path = user_data_path / _JOURNAL_NAME
     try:
         # Most launches have one healthy primary profile and no recovery work.
@@ -4302,7 +4319,7 @@ def acknowledge_profile_credential(
     """Atomically mark one archived credential adoption as terminal."""
 
     user_data_path = _absolute(user_data)
-    primary_path = _absolute(primary_home)
+    primary_path = resolve_home_link(_absolute(primary_home))
     try:
         _validate_base_paths(user_data_path, primary_path)
         validated_transaction_id = _validated_transaction_id(transaction_id)

@@ -27,6 +27,95 @@
   padding: 2rem 0 6rem;
 }
 
+/* Once setup is requested it becomes the primary task. Reclaim the landing
+   greeting's space so the dependency details remain comfortably readable on
+   short and mobile viewports while the composer stays available below. */
+.chat--new-landing.chat--meta-setup {
+  justify-content: flex-start;
+  gap: 0;
+  padding: var(--sp-3) 0;
+}
+
+.chat--new-landing.chat--meta-setup .chat-body {
+  display: none;
+}
+
+.chat--new-landing.chat--meta-setup > .meta-setup-card {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.chat--new-landing.chat--meta-setup .chat-composer-dock {
+  width: 100%;
+}
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 48px;
+  padding: 0 20px;
+  border-bottom: 0;
+  background: var(--bg-surface);
+  flex-shrink: 0;
+  /* The absolutely-positioned topbar right cluster (connection pill + language
+     switcher + theme) floats over this band's right edge at every width and
+     intercepts pointer events. Reserve exactly its measured width so the
+     header actions never slide under the pill. The value is published live by
+     App.vue's ResizeObserver (--topbar-right-reserve), so it tracks the
+     connection state and the locale's language-label width instead of a brittle
+     constant; the fallback only covers the first paint before measurement. */
+  padding-right: var(--topbar-right-reserve, 224px);
+}
+
+.chat-header-left {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.chat-header-right {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+  /* The clearance for the floating topbar cluster lives on .chat-header's
+     padding-right (var(--topbar-right-reserve)); this group just hugs the
+     right edge of that reserved content box. */
+}
+
+/* 769–959px fine-pointer windows keep a docked compact sidebar. In that band
+   collapse secondary action labels to icons and guarantee a readable title
+   allocation instead of letting the fixed right-side groups squeeze it away. */
+.main--sidebar-compact .chat-header {
+  padding-left: 0.75rem;
+}
+
+.main--sidebar-compact .chat-header-left {
+  flex: 1 1 auto;
+  min-width: 5rem;
+}
+
+.main--sidebar-compact .chat-header .chat-label {
+  flex: 1 1 auto;
+  min-width: 3.5rem;
+}
+
+.main--sidebar-compact .chat-header-right {
+  gap: var(--sp-1);
+}
+
+.main--sidebar-compact .chat-header .chat-share-btn__label {
+  display: none;
+}
+
+.main--sidebar-compact .chat-header .chat-share-btn {
+  width: 1.875rem;
+  min-width: 1.875rem;
+  padding-inline: 0;
+}
+
 .chat-share-banner {
   display: flex;
   align-items: center;
@@ -395,124 +484,54 @@
   line-height: 1.5;
 }
 
-/* Compaction maintenance card — blue (--info) marks maintenance, never the
-   task accent. */
-.chat-compact-status {
-  --compact-tone: var(--info);
-  flex-shrink: 0;
-  width: min(560px, calc(100% - var(--sp-8)));
-  margin: var(--sp-2) auto;
-  padding: var(--sp-3) var(--sp-4);
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-}
-
-.chat-compact-status--ok { --compact-tone: var(--ok); }
-.chat-compact-status--warn { --compact-tone: var(--warn); }
-.chat-compact-status--err { --compact-tone: var(--danger); }
-
-.chat-compact-status__head {
+/* A session-level maintenance boundary: deliberately aligned with transcript
+   content and styled below task activity, never as a floating success card. */
+.chat-compaction-event {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
+  gap: 0.625rem;
+  width: var(--chat-col);
+  max-width: calc(100% - 48px);
+  min-height: 1.75rem;
+  margin: 0.125rem auto 0.625rem;
+  padding: 0.25rem 0.125rem;
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+  font-size: var(--fs-xs);
+  line-height: 1.45;
 }
 
-.chat-compact-status__dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--compact-tone);
-  flex-shrink: 0;
+.chat-compaction-event__marker {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex: 0 0 auto;
+  margin: 0 0.1875rem;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-full);
 }
 
-.chat-compact-status__dot--pulsing {
-  animation: compactDotPulse 1.6s ease-in-out infinite;
+.chat-compaction-event--running .chat-compaction-event__marker {
+  border-color: var(--accent);
+  border-right-color: transparent;
+  animation: compactionEventSpin 0.9s linear infinite;
 }
 
-@keyframes compactDotPulse {
-  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--compact-tone) 45%, transparent); }
-  55% { box-shadow: 0 0 0 5px transparent; }
+@keyframes compactionEventSpin {
+  to { transform: rotate(360deg); }
 }
 
-.chat-compact-status__title {
-  font-size: var(--fs-sm);
-  font-weight: 500;
-  color: var(--text);
+.chat-compaction-event--failed {
+  color: var(--danger);
 }
 
-.chat-compact-status--ok .chat-compact-status__title,
-.chat-compact-status--warn .chat-compact-status__title,
-.chat-compact-status--err .chat-compact-status__title {
-  color: var(--compact-tone);
-}
-
-.chat-compact-status__elapsed {
+.chat-compaction-event__detail {
   margin-left: auto;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-}
-
-.chat-compact-status__detail {
-  margin: var(--sp-1) 0 0;
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-}
-
-.chat-compact-status__gauge {
-  height: 8px;
-  margin-top: var(--sp-2);
-  border-radius: var(--radius-full);
-  background: var(--bg-hover);
-  overflow: hidden;
-}
-
-.chat-compact-status__gauge-fill {
-  display: block;
-  height: 100%;
-  /* Indeterminate default: a partial fill so the breathing bar cannot be
-     misread as "context 100% full"; real occupancy overrides via style. */
-  width: 60%;
-  border-radius: var(--radius-full);
-  background: linear-gradient(90deg, color-mix(in srgb, var(--info) 55%, transparent), var(--info));
-  transition: width var(--transition), background var(--transition), opacity var(--transition);
-}
-
-/* Breathing = "working", an opacity oscillation — never a fake progress sweep. */
-.chat-compact-status__gauge-fill--breathing {
-  animation: compactGaugeBreathe 2.2s ease-in-out infinite;
-}
-
-@keyframes compactGaugeBreathe {
-  0%, 100% { opacity: 0.65; }
-  50% { opacity: 1; }
-}
-
-.chat-compact-status__gauge-fill--done {
-  background: var(--ok);
-  opacity: 1;
-}
-
-.chat-compact-status__legend {
-  display: flex;
-  justify-content: space-between;
-  margin-top: var(--sp-1);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
+  color: color-mix(in srgb, var(--text) 46%, transparent);
+  font-size: 0.75rem;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .chat-compact-status__dot--pulsing,
-  .chat-compact-status__gauge-fill--breathing {
+  .chat-compaction-event--running .chat-compaction-event__marker {
     animation: none;
-  }
-
-  .chat-compact-status__gauge-fill {
-    transition: none;
   }
 }
 
@@ -626,10 +645,27 @@
   font-family: var(--font-mono);
   font-weight: 600;
   color: var(--accent);
+  flex-shrink: 0;
   white-space: nowrap;
 }
 
+.chat-slash-status {
+  flex-shrink: 0;
+  padding: 0.125rem 0.375rem;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 9%, transparent);
+  font-size: 0.6875rem;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
 .chat-slash-desc {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-muted);
   flex: 1;
   font-size: 0.8125rem;
@@ -1054,6 +1090,13 @@
   .chat--new-landing {
     padding: clamp(3.25rem, 13vh, 5.5rem) 0.75rem 1.25rem;
     gap: 0.875rem;
+  }
+
+  /* The app topbar floats above new-chat content. Setup mode intentionally
+     replaced the landing padding with a compact desktop inset, so restore a
+     phone-safe top inset here and keep the card title/status fully visible. */
+  .chat--new-landing.chat--meta-setup {
+    padding: calc(3.25rem + env(safe-area-inset-top, 0px)) 0.75rem 0.75rem;
   }
 
   .chat-landing-brand,

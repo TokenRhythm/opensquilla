@@ -22,6 +22,7 @@ from opensquilla.cli.ui import (
     warning_panel,
 )
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config_migration import ConfigParseError
 from opensquilla.onboarding.config_store import load_config, resolve_config_path
 from opensquilla.onboarding.errors import UserCancelledError
 from opensquilla.onboarding.flow import (
@@ -249,7 +250,7 @@ def _exit_config_load_error(exc: Exception, path: str | Path | None = None) -> N
 def _load_config_for_cli(path: str | Path | None = None):
     try:
         return load_config(path)
-    except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
         _exit_config_load_error(exc, path)
 
 
@@ -693,7 +694,7 @@ def onboard_command(
         # EOFError covers Ctrl+D / exhausted piped stdin at a prompt — the
         # same operator intent as Esc/Ctrl+C, so the same productized exit.
         _exit_cancelled(exc)
-    except (tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
         # Corrupt config discovered mid-wizard (e.g. re-loaded after an
         # out-of-band edit): route through the same productized handoff as
         # `--if-needed`/`status` instead of a raw traceback.
@@ -1759,7 +1760,7 @@ def configure_command(
                 # Explicit flags without the section's gate flag: refuse
                 # instead of silently forwarding nothing to the wizard.
                 _exit_incomplete_headless_flags(normalized, given)
-        except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+        except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
             _exit_config_load_error(exc, config_path)
         except (KeyError, TypeError, ValueError) as exc:
             error_console.print(f"[red]Error:[/red] {markup_escape(exc)}")
@@ -1781,7 +1782,7 @@ def configure_command(
         # EOFError covers Ctrl+D / exhausted piped stdin at a prompt — the
         # same operator intent as Esc/Ctrl+C, so the same productized exit.
         _exit_cancelled(exc)
-    except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
         _exit_config_load_error(exc, config_path)
     except (KeyError, TypeError, ValueError) as exc:
         # Mutation-level validation failures reachable from the wizard (e.g.

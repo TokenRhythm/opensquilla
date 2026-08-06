@@ -34,6 +34,10 @@ from opensquilla.memory.dream.ranking import rank_promotion_candidates
 from opensquilla.memory.dream.receipts import write_dream_receipt
 from opensquilla.memory.dream.rehydrate import rehydrate_candidate
 from opensquilla.memory.protocols import MemoryProviderCapability
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import Message
 
@@ -52,9 +56,18 @@ async def _run_complete(
     ``provider.chat(messages)`` and concatenating text deltas (real
     providers like OpenAIProvider).
     """
+    budget = resolve_auxiliary_request_budget(
+        provider,
+        max_output_tokens=max_tokens,
+    )
+    ensure_auxiliary_text_fits(
+        messages,
+        max_chars=budget.provider_request_max_chars,
+        max_tokens=budget.max_input_tokens,
+    )
     complete = getattr(provider, "complete", None)
     if callable(complete):
-        resp = await complete(messages=messages, max_tokens=max_tokens)
+        resp = await complete(messages=messages, max_tokens=budget.max_output_tokens)
         return getattr(resp, "content", None) or getattr(resp, "text", "") or ""
     chat = getattr(provider, "chat", None)
     if not callable(chat):
@@ -63,7 +76,10 @@ async def _run_complete(
         )
     from opensquilla.provider.types import ChatConfig
 
-    config = ChatConfig(max_tokens=max_tokens)
+    config = ChatConfig(
+        max_tokens=budget.max_output_tokens,
+        provider_request_max_chars=budget.provider_request_max_chars,
+    )
     scope = current_usage_accounting_scope()
     close_stream = None
     if scope is None:

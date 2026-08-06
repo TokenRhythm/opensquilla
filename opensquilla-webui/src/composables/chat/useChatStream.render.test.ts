@@ -258,6 +258,29 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('records compaction outcomes with terminal maintenance states', () => {
+    const { api } = makeStream()
+
+    for (const [status, id] of [
+      ['completed', 'cmp-completed'],
+      ['skipped', 'cmp-skipped'],
+      ['stale', 'cmp-stale'],
+      ['cancelled', 'cmp-cancelled'],
+      ['failed', 'cmp-failed'],
+    ] as const) {
+      api.recordCompactionActivity({ status, compaction_id: id, source: 'automatic' })
+    }
+
+    expect(api.foldedTurn.value.statusHistory.map(entry => [entry.id, entry.state])).toEqual([
+      ['cmp-completed', 'completed'],
+      ['cmp-skipped', 'skipped'],
+      ['cmp-stale', 'stale'],
+      ['cmp-cancelled', 'cancelled'],
+      ['cmp-failed', 'failed'],
+    ])
+    api.cleanup()
+  })
+
   it('checkpoints visible output before a same-turn steer without duplicating final text', () => {
     const { api, messages } = makeStream()
 

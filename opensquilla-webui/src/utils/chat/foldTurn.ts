@@ -166,6 +166,7 @@ export function foldTurn(
   const interrupts: FoldedInterrupt[] = []
   const interruptIndex = new Map<string, number>()
   const statusHistory: StatusPart[] = []
+  const maintenanceIndex = new Map<string, number>()
   let rawText = ''
   let finalText: string | null = null
   let thinkingText = ''
@@ -300,9 +301,36 @@ export function foldTurn(
         break
       }
       case 'status': {
-        // Append-only, already in accept order: setStreamActivity emits a frame
-        // only on a real phase change, so each entry is a distinct transition.
-        statusHistory.push({ action: frame.action, label: frame.label, at: frame.at })
+        const entry: StatusPart = {
+          action: frame.action,
+          label: frame.label,
+          at: frame.at,
+          ...(frame.id ? { id: frame.id } : {}),
+          ...(frame.category ? { category: frame.category } : {}),
+          ...(frame.state ? { state: frame.state } : {}),
+          ...(frame.source ? { source: frame.source } : {}),
+          ...(frame.durability ? { durability: frame.durability } : {}),
+          ...(frame.detail ? { detail: frame.detail } : {}),
+        }
+        // Context maintenance emits started/observed/completed lifecycle
+        // frames. Keep its first chronological position and update that row in
+        // place so one compaction never looks like multiple task steps.
+        if (entry.category === 'maintenance' && entry.id) {
+          const index = maintenanceIndex.get(entry.id)
+          if (index === undefined) {
+            maintenanceIndex.set(entry.id, statusHistory.length)
+            statusHistory.push(entry)
+          } else {
+            statusHistory[index] = {
+              ...statusHistory[index],
+              ...entry,
+              at: statusHistory[index]!.at,
+            }
+          }
+        } else {
+          // Phase rows remain append-only and in accepted order.
+          statusHistory.push(entry)
+        }
         break
       }
     }

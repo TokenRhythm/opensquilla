@@ -23,7 +23,7 @@ def test_sandbox_trust_keeps_runtime_sandbox_enabled(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     cfg = load_config(config_path)
-    assert cfg.sandbox.run_mode == "trusted"
+    assert cfg.sandbox.run_mode == "safe"
     assert cfg.sandbox.sandbox is True
     assert cfg.sandbox.security_grading is True
     assert cfg.permissions.default_mode == "off"
@@ -38,10 +38,10 @@ def test_sandbox_bypass_is_full_host_access_with_sandbox_capability(tmp_path: Pa
 
     assert result.exit_code == 0, result.output
     cfg = load_config(config_path)
-    assert cfg.sandbox.run_mode is None
-    assert cfg.sandbox.sandbox is True
-    assert cfg.sandbox.security_grading is True
-    assert cfg.permissions.default_mode == "bypass"
+    assert cfg.sandbox.run_mode == "full"
+    assert cfg.sandbox.sandbox is False
+    assert cfg.sandbox.security_grading is False
+    assert cfg.permissions.default_mode == "full"
 
 
 def test_sandbox_on_restores_trusted_sandbox_default(tmp_path: Path) -> None:
@@ -52,13 +52,13 @@ def test_sandbox_on_restores_trusted_sandbox_default(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     cfg = load_config(config_path)
-    assert cfg.sandbox.run_mode == "trusted"
+    assert cfg.sandbox.run_mode == "safe"
     assert cfg.sandbox.sandbox is True
     assert cfg.sandbox.security_grading is True
     assert cfg.permissions.default_mode == "off"
 
 
-def test_sandbox_reset_restores_bypass_full_host_access_default(tmp_path: Path) -> None:
+def test_sandbox_reset_restores_safe_default(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     assert _invoke(config_path, "full").exit_code == 0
 
@@ -66,10 +66,10 @@ def test_sandbox_reset_restores_bypass_full_host_access_default(tmp_path: Path) 
 
     assert reset.exit_code == 0, reset.output
     cfg = load_config(config_path)
-    assert cfg.sandbox.run_mode is None
+    assert cfg.sandbox.run_mode == "safe"
     assert cfg.sandbox.sandbox is True
     assert cfg.sandbox.security_grading is True
-    assert cfg.permissions.default_mode == "bypass"
+    assert cfg.permissions.default_mode == "off"
 
 
 def test_sandbox_status_reports_run_mode(tmp_path: Path) -> None:
@@ -80,12 +80,12 @@ def test_sandbox_status_reports_run_mode(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["run_mode"] == "trusted"
-    assert payload["run_mode_label"] == "Managed Execution"
+    assert payload["run_mode"] == "safe"
+    assert payload["run_mode_label"] == "Safe"
     assert payload["execution_target"] == "sandbox"
-    assert payload["project_default_run_mode"] == "trusted"
-    assert payload["runtime_capability_run_mode"] == "trusted"
+    assert payload["project_default_run_mode"] == "safe"
+    assert payload["runtime_capability_run_mode"] == "safe"
     assert payload["runtime_sandbox_required"] is True
 
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    assert data["sandbox"]["run_mode"] == "trusted"
+    assert data["sandbox"]["run_mode"] == "safe"

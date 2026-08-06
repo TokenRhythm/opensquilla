@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from opensquilla.provider import ChatConfig, Message, ToolDefinition
@@ -245,6 +249,77 @@ default_cache_break_monitor = CacheBreakMonitor()
 
 _CompactionListener = Callable[[str, dict[str, Any]], None]
 _compaction_listeners: list[_CompactionListener] = []
+_COMPACTION_TERMINAL_STATUSES = frozenset(
+    {
+        "completed",
+        "skipped",
+        "failed",
+        "error",
+        "cancelled",
+        "timed_out",
+        "stale",
+        "emergency_ephemeral",
+    }
+)
+_COMPACTION_TERMINAL_CACHE_SIZE = 2048
+_compaction_sequences: dict[str, int] = {}
+_compaction_terminals: OrderedDict[str, str] = OrderedDict()
+_active_compaction_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+_compaction_heartbeat_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+
+
+def _finalize_compaction_when_owner_stops(
+    session_key: str,
+    compaction_id: str,
+    source: str,
+    phase: str,
+    owner: asyncio.Task[Any],
+) -> None:
+    """Backstop an owner task that exits without publishing a terminal event.
+
+    Known compaction branches still publish their precise terminal status.  This
+    callback covers unexpected exceptions between those branches so a stopped
+    owner cannot leave a heartbeat and busy UI behind.  The terminal claim is
+    idempotent with the normal path.
+    """
+
+    key = (session_key, compaction_id)
+    if _active_compaction_tasks.get(key) is not owner:
+        return
+    if compaction_id in _compaction_terminals:
+        return
+
+    if owner.cancelled():
+        status = "cancelled"
+        reason = "owner_task_cancelled"
+    else:
+        try:
+            owner_error = owner.exception()
+        except asyncio.CancelledError:
+            status = "cancelled"
+            reason = "owner_task_cancelled"
+        else:
+            status = "failed"
+            reason = "owner_task_failed" if owner_error is not None else "terminal_missing"
+
+    # Keep imports local: engine types import the lifecycle helpers while this
+    # module is initialized.
+    from opensquilla.session.compaction_lifecycle import (
+        COMPACTION_TRIGGERED_EVENT,
+        compaction_effect_payload,
+        compaction_lifecycle_payload,
+    )
+
+    notify_compaction(
+        session_key,
+        source=source,
+        phase=phase,
+        status=status,
+        reason=reason,
+        track_current_task=False,
+        **compaction_effect_payload(status=status, reason=reason),
+        **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+    )
 
 
 def add_compaction_listener(listener: _CompactionListener) -> Callable[[], None]:
@@ -292,19 +367,195 @@ def notify_compaction(
     session_key: str,
     *,
     notify_listeners: object = True,
+    track_current_task: object = True,
     **payload: Any,
-) -> None:
+) -> dict[str, Any] | None:
+    """Publish one idempotent lifecycle event and return its normalized payload.
+
+    Terminal delivery is at-least-once at the transport boundary, but this
+    process claims terminal state only once per compaction id.  The additive
+    sequence lets reconnecting clients discard duplicate/out-of-order events.
+    """
+
     event_payload = {
         "status": str(payload.pop("status", "completed") or "completed"),
         "source": str(payload.pop("source", "automatic") or "automatic"),
         **payload,
     }
-    if event_payload["status"].lower() == "completed":
+    # TaskRuntime creates one turn context around the shared runner.  Reuse
+    # that identity here so every compaction lifecycle frame can be correlated
+    # with the live assistant activity without widening every compaction call.
+    from opensquilla.session.turn_context import (
+        append_current_turn_activity_marker,
+        current_turn_context,
+    )
+
+    turn_context = current_turn_context()
+    if turn_context is not None:
+        turn_id = str(turn_context.get("turn_id") or turn_context.get("task_id") or "").strip()
+        task_id = str(turn_context.get("task_id") or turn_id).strip()
+        if turn_id:
+            event_payload.setdefault("turn_id", turn_id)
+        if task_id:
+            event_payload.setdefault("task_id", task_id)
+    status = str(event_payload["status"]).lower()
+    source = str(event_payload["source"]).lower()
+    compaction_id = str(
+        event_payload.get("compaction_id")
+        or event_payload.get("compactionId")
+        or ""
+    ).strip()
+    if compaction_id:
+        if compaction_id in _compaction_terminals:
+            return None
+        sequence = _compaction_sequences.get(compaction_id, 0) + 1
+        _compaction_sequences[compaction_id] = sequence
+        event_payload.setdefault("sequence", sequence)
+
+        key = (session_key, compaction_id)
+        if status == "started":
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            if current is not None and bool(track_current_task):
+                _active_compaction_tasks[key] = current
+                current.add_done_callback(
+                    partial(
+                        _finalize_compaction_when_owner_stops,
+                        session_key,
+                        compaction_id,
+                        str(event_payload.get("source") or "automatic"),
+                        str(event_payload.get("phase") or "compaction"),
+                    )
+                )
+            interval = event_payload.get("heartbeat_interval_seconds")
+            try:
+                heartbeat_interval = float(interval) if interval is not None else 0.0
+            except (TypeError, ValueError):
+                heartbeat_interval = 0.0
+            if (
+                heartbeat_interval > 0
+                and bool(notify_listeners)
+                and current is not None
+            ):
+                existing = _compaction_heartbeat_tasks.get(key)
+                if existing is None or existing.done():
+                    _compaction_heartbeat_tasks[key] = asyncio.create_task(
+                        _compaction_heartbeat_loop(
+                            session_key=session_key,
+                            compaction_id=compaction_id,
+                            source=str(event_payload.get("source") or "automatic"),
+                            phase=str(event_payload.get("phase") or "compaction"),
+                            interval=heartbeat_interval,
+                        )
+                    )
+        if status in _COMPACTION_TERMINAL_STATUSES:
+            _compaction_terminals[compaction_id] = status
+            _compaction_terminals.move_to_end(compaction_id)
+            while len(_compaction_terminals) > _COMPACTION_TERMINAL_CACHE_SIZE:
+                expired_id, _ = _compaction_terminals.popitem(last=False)
+                _compaction_sequences.pop(expired_id, None)
+            _active_compaction_tasks.pop(key, None)
+            heartbeat_task = _compaction_heartbeat_tasks.pop(key, None)
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            if heartbeat_task is not None and heartbeat_task is not current:
+                heartbeat_task.cancel()
+
+    if (
+        compaction_id
+        and source == "automatic"
+        and status == "completed"
+        and event_payload.get("applied") is True
+        and str(event_payload.get("durability") or "").lower() == "durable"
+    ):
+        append_current_turn_activity_marker(
+            {
+                "kind": "context_compaction",
+                "id": compaction_id,
+                "status": "completed",
+                "at": time.time_ns() // 1_000_000,
+            }
+        )
+
+    if status == "completed":
         default_cache_break_monitor.notify_compaction(session_key)
     if not bool(notify_listeners):
-        return
+        return event_payload
     for listener in tuple(_compaction_listeners):
         try:
             listener(session_key, dict(event_payload))
         except Exception:
             pass
+    return event_payload
+
+
+async def _compaction_heartbeat_loop(
+    *,
+    session_key: str,
+    compaction_id: str,
+    source: str,
+    phase: str,
+    interval: float,
+) -> None:
+    started = time.monotonic()
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            accepted = notify_compaction(
+                session_key,
+                source=source,
+                phase=phase,
+                status="observed",
+                compaction_id=compaction_id,
+                heartbeat=True,
+                heartbeat_at=int(time.time() * 1000),
+                elapsed_ms=max(0, int((time.monotonic() - started) * 1000)),
+            )
+            if accepted is None:
+                return
+    except asyncio.CancelledError:
+        return
+
+
+def compaction_terminal_status(compaction_id: str) -> str | None:
+    """Return the terminal state claimed in this process, if any."""
+
+    return _compaction_terminals.get(str(compaction_id or ""))
+
+
+def active_compaction_ids(session_key: str) -> tuple[str, ...]:
+    """Return live operation ids for one session."""
+
+    return tuple(
+        compaction_id
+        for (candidate_key, compaction_id), task in _active_compaction_tasks.items()
+        if candidate_key == session_key and not task.done()
+    )
+
+
+def register_active_compaction(
+    session_key: str,
+    compaction_id: str,
+    task: asyncio.Task[Any],
+) -> None:
+    """Register a background manual operation before it acquires session lock."""
+
+    if task.done():
+        return
+    _active_compaction_tasks[(session_key, compaction_id)] = task
+
+
+def cancel_active_compactions(session_key: str) -> tuple[asyncio.Task[Any], ...]:
+    """Request cancellation for every live compaction in one session."""
+
+    tasks: list[asyncio.Task[Any]] = []
+    for (candidate_key, _), task in tuple(_active_compaction_tasks.items()):
+        if candidate_key != session_key or task.done() or task in tasks:
+            continue
+        task.cancel()
+        tasks.append(task)
+    return tuple(tasks)

@@ -107,6 +107,20 @@ class _LegacyCompactSessionManager(_FakeSessionManager):
         return "[summary]"
 
 
+def _assert_armed_compact_call(
+    manager: _FakeSessionManager,
+    session_key: str,
+    budget: int,
+) -> CompactionConfig:
+    assert len(manager.compact_calls) == 1
+    called_key, called_budget, config = manager.compact_calls[0]
+    assert (called_key, called_budget) == (session_key, budget)
+    assert isinstance(config, CompactionConfig)
+    assert config.operation_id
+    assert config.deadline_at_monotonic is not None
+    return config
+
+
 class _CheckpointingSessionManager(_FakeSessionManager):
     def __init__(self, transcript: list[_FakeEntry]) -> None:
         super().__init__(transcript)
@@ -589,6 +603,77 @@ async def test_auto_summarize_emits_started_and_completed_events(
 
 
 @pytest.mark.asyncio
+async def test_auto_summarize_cancelled_during_post_commit_read_emits_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PostCommitReadManager(_ResultCompactionSessionManager):
+        def __init__(self, transcript: list[_FakeEntry]) -> None:
+            super().__init__(transcript)
+            self.durable_result_returned = asyncio.Event()
+            self.post_commit_read_started = asyncio.Event()
+            self.release_post_commit_read = asyncio.Event()
+
+        async def compact_with_result(
+            self,
+            session_key: str,
+            budget: int,
+            config=None,
+            **kwargs: Any,
+        ) -> Any:
+            result = await super().compact_with_result(
+                session_key,
+                budget,
+                config,
+                **kwargs,
+            )
+            self.durable_result_returned.set()
+            return result
+
+        async def get_transcript(self, session_key: str) -> list[_FakeEntry]:
+            assert self.durable_result_returned.is_set()
+            self.post_commit_read_started.set()
+            await self.release_post_commit_read.wait()
+            return await super().get_transcript(session_key)
+
+    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10)
+    sm = PostCommitReadManager(_history(6, 40))
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        context_overflow,
+        "notify_compaction",
+        lambda session_key, **payload: events.append((session_key, payload)),
+    )
+
+    task = asyncio.create_task(
+        apply_context_overflow_policy(
+            config=cfg,
+            message="m",
+            transcript=sm._transcript,
+            session_key="s-auto-post-commit-cancel",
+            session_manager=sm,
+        )
+    )
+    await asyncio.wait_for(sm.post_commit_read_started.wait(), timeout=1.0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    terminal_events = [
+        payload
+        for _, payload in events
+        if payload["status"]
+        in {"completed", "skipped", "failed", "cancelled", "timed_out"}
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["status"] == "completed"
+    assert terminal_events[0]["reason"] == "cancelled_after_commit"
+    assert terminal_events[0]["cancellation_reconciled"] is True
+    assert terminal_events[0]["applied"] is True
+    assert terminal_events[0]["durability"] == "durable"
+
+
+@pytest.mark.asyncio
 async def test_auto_summarize_reports_durable_effect_when_request_still_over_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -815,7 +900,7 @@ async def test_auto_summarize_compacts_while_protect_flush_runs_in_background() 
     assert outcome.lifecycle is not None
     assert outcome.lifecycle.flush_receipt is outcome.flush_receipt
     assert outcome.lifecycle.refused is False
-    assert sm.compact_calls == [("agent:main:s-flush", 10, None)]
+    _assert_armed_compact_call(sm, "agent:main:s-flush", 10)
     await asyncio.sleep(0)
     flush_service.execute.assert_awaited_once()
 
@@ -845,7 +930,7 @@ async def test_auto_summarize_flush_enabled_without_trigger_skips_flush_service(
     assert outcome.retried is True
     assert outcome.flush_receipt is None
     flush_service.execute.assert_not_called()
-    assert sm.compact_calls == [("agent:main:s-flush-disabled-trigger", 10, None)]
+    _assert_armed_compact_call(sm, "agent:main:s-flush-disabled-trigger", 10)
 
 
 @pytest.mark.asyncio
@@ -872,7 +957,7 @@ async def test_auto_summarize_compacts_when_distill_fails_after_checkpoint() -> 
     assert outcome.refusal is None
     assert outcome.flush_receipt is None
     assert sm.calls == ["checkpoint", "compact"]
-    assert sm.compact_calls == [("agent:main:s-distill-fails", 10, None)]
+    _assert_armed_compact_call(sm, "agent:main:s-distill-fails", 10)
     await asyncio.sleep(0)
     assert flush_service.execute.await_args.kwargs["message_window"] == 0
 
@@ -1054,7 +1139,7 @@ async def test_auto_summarize_protect_flush_receipt_degrades_without_refusal() -
     assert outcome.retried is True
     assert outcome.reason is None
     assert outcome.refusal is None
-    assert sm.compact_calls == [("agent:main:s-protect-flush", 10, None)]
+    _assert_armed_compact_call(sm, "agent:main:s-protect-flush", 10)
     assert sm.compact_kwargs[0]["flush_receipt_status"] == "degraded_forensic"
     assert sm.compact_kwargs[0]["trigger_reason"] == "gateway_auto_summarize"
     await asyncio.sleep(0)
@@ -1106,7 +1191,7 @@ async def test_auto_summarize_compacts_when_flush_service_is_missing() -> None:
     assert outcome.retried is True
     assert outcome.reason is None
     assert outcome.refusal is None
-    assert sm.compact_calls == [("agent:main:s-missing-flush", 10, None)]
+    _assert_armed_compact_call(sm, "agent:main:s-missing-flush", 10)
 
 
 @pytest.mark.asyncio
@@ -1152,7 +1237,7 @@ async def test_auto_summarize_compacts_while_slow_flush_runs_in_background() -> 
     assert outcome.retried is True
     assert outcome.reason is None
     assert outcome.refusal is None
-    assert sm.compact_calls == [("agent:main:s-slow-flush", 10, None)]
+    _assert_armed_compact_call(sm, "agent:main:s-slow-flush", 10)
     assert flush_service.execute.await_args.kwargs["timeout"] == 42.0
 
     flush_release.set()

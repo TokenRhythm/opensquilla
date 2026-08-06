@@ -173,7 +173,7 @@ def test_sessions_delete_is_write_scope_and_allows_remote_operator():
 
     On the default Docker bind (``OPENSQUILLA_LISTEN=0.0.0.0``) the gateway is not a
     loopback bind, so even a ``127.0.0.1`` peer is not the local owner and is granted
-    only :data:`REMOTE_OPERATOR_SCOPES` (read/write/approvals, no admin). While
+    only :data:`REMOTE_OPERATOR_SCOPES` (read/write, no approvals or admin). While
     ``sessions.delete`` was admin-gated, every such delete failed with
     ``UNAUTHORIZED`` and the UI showed "Failed to delete session". It is now
     write-scoped like its sibling destructive ops (reset/truncate), so a remote

@@ -6,6 +6,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from opensquilla.run_mode import RunMode
+from opensquilla.sandbox.legacy_codec import (
+    LegacyModeContext,
+    LegacyModeDecodeError,
+    decode_legacy_run_mode,
+)
 from opensquilla.session.keys import normalize_agent_id
 
 from .delivery import validate_webhook_url
@@ -24,13 +30,6 @@ from .types import (
     ScheduleKind,
     SessionTarget,
 )
-
-_RUN_MODE_ALIASES = {
-    "bypass": "full",
-    "standard-sandbox": "standard",
-    "standard_sandbox": "standard",
-}
-_PERSISTED_RUN_MODES = frozenset({"standard", "trusted", "full"})
 
 
 def _validate_structured_schedule(
@@ -72,18 +71,28 @@ def _coerce_wake_mode(value: CronWakeMode | str) -> CronWakeMode:
     return CronWakeMode(str(value or CronWakeMode.NOW.value).strip().lower())
 
 
-def _persisted_run_mode(value: str, *, creator_is_owner: bool) -> str:
+def _persisted_run_mode(
+    value: str,
+    *,
+    creator_is_owner: bool,
+    creator_host_execute: bool,
+) -> str:
     """Resolve the already-authorized execution mode at the scheduler boundary."""
 
+    host_execution_allowed = creator_is_owner or creator_host_execute
     normalized = str(value or "").strip().lower()
-    normalized = _RUN_MODE_ALIASES.get(normalized, normalized)
     if not normalized:
-        normalized = "full" if creator_is_owner else "trusted"
-    if normalized not in _PERSISTED_RUN_MODES:
-        raise ValueError(f"unsupported cron run_mode: {value!r}")
-    if normalized == "full" and not creator_is_owner:
-        return "trusted"
-    return normalized
+        return RunMode.FULL.value if host_execution_allowed else RunMode.SAFE.value
+    try:
+        mode = decode_legacy_run_mode(
+            normalized,
+            context=LegacyModeContext.EXPLICIT,
+        )
+    except LegacyModeDecodeError as exc:
+        raise ValueError(f"unsupported cron run_mode: {value!r}") from exc
+    if mode is RunMode.FULL and not host_execution_allowed:
+        return RunMode.SAFE.value
+    return mode.value
 
 
 def _delivery_requested(delivery: DeliveryConfig | None) -> bool:
@@ -166,6 +175,7 @@ class SchedulerOps:
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        creator_host_execute: bool = False,
         run_mode: str = "",
         idempotency_key: str = "",
     ) -> CronJob:
@@ -222,9 +232,11 @@ class SchedulerOps:
             delivery=delivery or DeliveryConfig(),
             explicit_delivery=delivery is not None,
         )
+        creator_host_execute = bool(creator_host_execute or creator_is_owner)
         effective_run_mode = _persisted_run_mode(
             run_mode,
             creator_is_owner=creator_is_owner,
+            creator_host_execute=creator_host_execute,
         )
 
         job = CronJob(
@@ -247,6 +259,7 @@ class SchedulerOps:
             creator_session_key=creator_session_key or "",
             creator_sender_id=creator_sender_id or "",
             creator_is_owner=bool(creator_is_owner),
+            creator_host_execute=creator_host_execute,
             run_mode=effective_run_mode,
             elevated="full" if effective_run_mode == "full" else "",
             execution_target="host" if effective_run_mode == "full" else "sandbox",
