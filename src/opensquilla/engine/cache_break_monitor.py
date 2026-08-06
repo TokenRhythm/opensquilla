@@ -14,6 +14,8 @@ from typing import Any
 
 from opensquilla.provider import ChatConfig, Message, ToolDefinition
 
+_MAX_TRACKED_SESSIONS = 512
+
 
 def _jsonable(value: Any) -> Any:
     """Return a stable JSON-ish shape for Pydantic models and dataclasses."""
@@ -152,14 +154,58 @@ class _CacheBaseline:
     cache_read_tokens: int
 
 
-class CacheBreakMonitor:
-    """Track cache-read drops and attribute them to prompt-state changes."""
+@dataclass(slots=True)
+class _SessionCacheState:
+    """Cache-break diagnostics retained for one reusable session key.
 
-    def __init__(self, *, min_drop_tokens: int = 2000, min_drop_ratio: float = 0.05) -> None:
-        self._baselines: dict[str, _CacheBaseline] = {}
-        self._reset_pending: set[str] = set()
+    Baseline and pending reset share one state object so capacity eviction can
+    never leave a pre-compaction baseline behind after dropping the marker that
+    suppresses its expected cache-read decline.
+    """
+
+    baseline: _CacheBaseline | None = None
+    reset_pending: bool = False
+
+
+class CacheBreakMonitor:
+    """Track cache-read drops without retaining unbounded session state.
+
+    Explicit session-identity disposal evicts state through
+    ``SessionManager.evict_session_runtime_state``. The shared LRU is a
+    backstop for reusable or abandoned session keys that do not cross that
+    boundary. Eviction only loses diagnostics: the next response initializes a
+    new baseline and cannot fabricate a cache-break report.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_drop_tokens: int = 2000,
+        min_drop_ratio: float = 0.05,
+        max_sessions: int = _MAX_TRACKED_SESSIONS,
+    ) -> None:
+        self._sessions: OrderedDict[str, _SessionCacheState] = OrderedDict()
         self._min_drop_tokens = max(0, int(min_drop_tokens))
         self._min_drop_ratio = max(0.0, float(min_drop_ratio))
+        self._max_sessions = max(1, int(max_sessions))
+
+    @property
+    def tracked_session_count(self) -> int:
+        """Return the number of session keys currently holding diagnostics."""
+
+        return len(self._sessions)
+
+    def _touch(self, session_key: str) -> _SessionCacheState:
+        state = self._sessions.get(session_key)
+        if state is None:
+            state = _SessionCacheState()
+            self._sessions[session_key] = state
+        self._sessions.move_to_end(session_key)
+        return state
+
+    def _trim_to_max_sessions(self) -> None:
+        while len(self._sessions) > self._max_sessions:
+            self._sessions.popitem(last=False)
 
     def record_prompt_state(
         self,
@@ -198,11 +244,13 @@ class CacheBreakMonitor:
         cache_read_tokens: int,
     ) -> CacheBreakReport:
         current_tokens = max(0, int(cache_read_tokens or 0))
-        previous = self._baselines.get(session_key)
-        reset_pending = session_key in self._reset_pending
-        self._baselines[session_key] = _CacheBaseline(snapshot, current_tokens)
+        state = self._touch(session_key)
+        previous = state.baseline
+        reset_pending = state.reset_pending
+        state.baseline = _CacheBaseline(snapshot, current_tokens)
+        state.reset_pending = False
+        self._trim_to_max_sessions()
         if reset_pending:
-            self._reset_pending.discard(session_key)
             return CacheBreakReport(
                 break_detected=False,
                 reason="baseline_reset_after_compaction",
@@ -238,11 +286,17 @@ class CacheBreakMonitor:
 
     def notify_compaction(self, session_key: str) -> None:
         """Treat the next provider response for this session as a new baseline."""
-        self._reset_pending.add(session_key)
+
+        self._touch(session_key).reset_pending = True
+        self._trim_to_max_sessions()
+
+    def evict(self, session_key: str) -> bool:
+        """Drop cache-break diagnostics for one retired session key."""
+
+        return self._sessions.pop(session_key, None) is not None
 
     def clear(self) -> None:
-        self._baselines.clear()
-        self._reset_pending.clear()
+        self._sessions.clear()
 
 
 default_cache_break_monitor = CacheBreakMonitor()
@@ -361,6 +415,12 @@ def check_response_for_cache_break(
         snapshot,
         cache_read_tokens,
     )
+
+
+def evict_cache_break_state(session_key: str) -> bool:
+    """Drop process-wide cache-break diagnostics for one session key."""
+
+    return default_cache_break_monitor.evict(session_key)
 
 
 def notify_compaction(
