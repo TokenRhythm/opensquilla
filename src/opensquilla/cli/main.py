@@ -141,6 +141,7 @@ from opensquilla.cli.doctor_cmd import doctor_command  # noqa: E402
 from opensquilla.cli.ensemble_cmd import ensemble_app  # noqa: E402
 from opensquilla.cli.init_cmd import init_command  # noqa: E402
 from opensquilla.cli.mcp_server_cmd import app as mcp_server_app  # noqa: E402
+from opensquilla.cli.openai_bridge_cmd import app as openai_bridge_app  # noqa: E402
 from opensquilla.cli.memory_flush_cmd import memory_flush_session_cmd  # noqa: E402
 from opensquilla.cli.migrate_cmd import migrate_app  # noqa: E402
 from opensquilla.cli.models_cmd import app as models_app  # noqa: E402
@@ -192,8 +193,9 @@ app.add_typer(cost_app, name="cost")
 app.add_typer(diagnostics_app, name="diagnostics")
 app.add_typer(cron_app, name="cron")
 app.add_typer(dist_app, name="dist")
-app.add_typer(mcp_server_app, name="mcp-server")
-app.add_typer(migrate_app, name="migrate")
+app.add_typer(mcp_server_app, name="mcp-server")             
+app.add_typer(openai_bridge_app, name="openai-bridge")        
+app.add_typer(migrate_app, name="migrate")                   
 app.add_typer(recovery_app, name="recovery")
 app.add_typer(models_app, name="models")
 app.add_typer(ensemble_app, name="ensemble")
