@@ -5,17 +5,35 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import os
 import re
 import sys
 import wave
-from collections.abc import Iterable
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from opensquilla.skills.bundled._provider_http import (
+    ProviderHTTPError,
+    iter_limited_response_chunks,
+    open_authenticated_request,
+)
+
+SAFE_NO_SUBMIT_EXIT_CODE = 78
+META_CAPABILITY_LEASE_REQUIRED_ENV = "OPENSQUILLA_META_CAPABILITY_LEASE_REQUIRED"
+META_CAPABILITY_PROVIDER_ENV = "OPENSQUILLA_META_CAPABILITY_PROVIDER"
+META_CAPABILITY_API_KEY_ENV = "OPENSQUILLA_META_CAPABILITY_API_KEY"
+META_CAPABILITY_BASE_URL_ENV = "OPENSQUILLA_META_CAPABILITY_BASE_URL"
+META_CAPABILITY_PROXY_ENV = "OPENSQUILLA_META_CAPABILITY_PROXY"
 
 SAMPLE_RATE = 24_000
+MAX_AUDIO_SSE_RESPONSE_BYTES = 96 * 1024 * 1024
+MAX_AUDIO_SSE_LINE_BYTES = 16 * 1024 * 1024
+MAX_AUDIO_SSE_EVENT_BYTES = 16 * 1024 * 1024
+MAX_AUDIO_PCM_BYTES = 64 * 1024 * 1024
 
 
 def _safe_filename(value: str, default: str) -> str:
@@ -106,19 +124,108 @@ def _failure(label: str, filename: str, **extra: object) -> None:
     _print_record(label, payload)
 
 
+def _runtime_connection(args: argparse.Namespace) -> tuple[str, str, str, bool]:
+    """Resolve a MetaSkill lease or the direct-CLI compatibility inputs."""
+
+    lease_required = os.environ.get(META_CAPABILITY_LEASE_REQUIRED_ENV) == "1"
+    if lease_required:
+        provider = os.environ.get(META_CAPABILITY_PROVIDER_ENV, "").strip().lower()
+        if provider != "openrouter":
+            return "", "", "", True
+        return (
+            os.environ.get(META_CAPABILITY_API_KEY_ENV, "").strip(),
+            os.environ.get(META_CAPABILITY_BASE_URL_ENV, "").strip().rstrip("/"),
+            os.environ.get(META_CAPABILITY_PROXY_ENV, "").strip(),
+            True,
+        )
+    api_key_env = args.api_key_env.strip() or "OPENROUTER_API_KEY"
+    return (
+        str(args.api_key.strip() or os.environ.get(api_key_env, "")),
+        args.base_url.strip().rstrip("/"),
+        "",
+        False,
+    )
+
+
+def _open_url(request: Request, *, timeout: float, proxy: str):
+    return open_authenticated_request(
+        request,
+        timeout=timeout,
+        proxy=proxy,
+    )
+
+
 def _failure_reason(exc: BaseException) -> str:
     if isinstance(exc, URLError):
         return exc.reason.__class__.__name__
     return exc.__class__.__name__
 
 
-def _iter_sse_audio_chunks(response: Iterable[bytes]) -> bytes:
-    pcm = bytearray()
-    for raw in response:
-        line = raw.decode("utf-8", "replace").strip()
-        if not line.startswith("data:"):
+def _iter_bounded_sse_lines(response: object) -> Iterator[bytes]:
+    """Split a provider stream into lines without ever asking for a huge line."""
+
+    pending = bytearray()
+    chunks = iter_limited_response_chunks(
+        response,
+        max_bytes=MAX_AUDIO_SSE_RESPONSE_BYTES,
+        error_message="provider audio response exceeds size limit",
+    )
+    for chunk in chunks:
+        cursor = 0
+        while cursor < len(chunk):
+            newline = chunk.find(b"\n", cursor)
+            end = len(chunk) if newline < 0 else newline
+            segment = chunk[cursor:end]
+            if len(pending) + len(segment) > MAX_AUDIO_SSE_LINE_BYTES:
+                raise ProviderHTTPError("provider audio SSE line exceeds size limit")
+            pending.extend(segment)
+            if newline < 0:
+                break
+            line = bytes(pending)
+            pending.clear()
+            yield line[:-1] if line.endswith(b"\r") else line
+            cursor = newline + 1
+    if pending:
+        yield bytes(pending)
+
+
+def _iter_sse_data_events(response: object) -> Iterator[bytes]:
+    """Yield SSE data payloads while bounding every line and complete event."""
+
+    event = bytearray()
+    has_data = False
+    for line in _iter_bounded_sse_lines(response):
+        if not line:
+            if has_data:
+                yield bytes(event)
+            event.clear()
+            has_data = False
             continue
-        payload = line[5:].strip()
+        if line.startswith(b":"):
+            continue
+        if line == b"data":
+            data = b""
+        elif line.startswith(b"data:"):
+            data = line[5:]
+            if data.startswith(b" "):
+                data = data[1:]
+        else:
+            continue
+        added = len(data) + (1 if has_data else 0)
+        if len(event) + added > MAX_AUDIO_SSE_EVENT_BYTES:
+            raise ProviderHTTPError("provider audio SSE event exceeds size limit")
+        if has_data:
+            event.extend(b"\n")
+        event.extend(data)
+        has_data = True
+    if has_data:
+        yield bytes(event)
+
+
+def _iter_sse_audio_chunks(response: object) -> bytes:
+    pcm = bytearray()
+    for raw_event in _iter_sse_data_events(response):
+        payload = raw_event.decode("utf-8", "replace").strip()
         if not payload or payload == "[DONE]":
             continue
         try:
@@ -131,7 +238,13 @@ def _iter_sse_audio_chunks(response: Iterable[bytes]) -> bytes:
             audio = delta.get("audio") or message.get("audio") or {}
             data_b64 = audio.get("data")
             if isinstance(data_b64, str) and data_b64:
-                pcm.extend(base64.b64decode(data_b64))
+                try:
+                    chunk = base64.b64decode(data_b64, validate=True)
+                except (ValueError, binascii.Error):
+                    raise ProviderHTTPError("provider returned invalid audio data") from None
+                if len(pcm) + len(chunk) > MAX_AUDIO_PCM_BYTES:
+                    raise ProviderHTTPError("provider audio exceeds size limit")
+                pcm.extend(chunk)
     return bytes(pcm)
 
 
@@ -149,24 +262,27 @@ def main() -> int:
     filename = _safe_filename(args.filename, "narration.wav")
     messages, script_text = _audio_messages(sys.stdin.read())
 
-    api_key_env = args.api_key_env.strip() or "OPENROUTER_API_KEY"
-    key = str(args.api_key.strip() or os.environ.get(api_key_env, ""))
+    key, base_url, proxy, lease_required = _runtime_connection(args)
     missing = []
     if not key:
-        missing.append(api_key_env)
+        missing.append(
+            "provider_connection:openrouter"
+            if lease_required
+            else (args.api_key_env.strip() or "OPENROUTER_API_KEY")
+        )
+    if not base_url:
+        missing.append("provider_endpoint:openrouter")
     if not args.model:
         missing.append("awesome_webpage.openrouter.models.audio_generation")
     if not args.output_dir:
         missing.append("awesome_webpage.output_dir")
     if missing:
         _failure("AUDIO_CONFIG_NEEDED", filename, missing=missing)
-        return 0
+        return SAFE_NO_SUBMIT_EXIT_CODE if lease_required else 0
 
     output_dir = Path(args.output_dir).expanduser()
     output_path = output_dir / filename
     local_path = f"project/assets/audio/{filename}"
-    base_url = args.base_url.rstrip("/")
-
     body = json.dumps(
         {
             "model": args.model,
@@ -188,12 +304,12 @@ def main() -> int:
     )
 
     try:
-        with urlopen(req, timeout=180) as resp:
+        with _open_url(req, timeout=180, proxy=proxy) as resp:
             pcm = _iter_sse_audio_chunks(resp)
     except HTTPError as exc:
         _failure("AUDIO_GENERATION_FAILED", filename, status=exc.code)
         return 0
-    except (URLError, TimeoutError) as exc:
+    except (URLError, TimeoutError, ProviderHTTPError) as exc:
         _failure("AUDIO_GENERATION_FAILED", filename, reason=_failure_reason(exc))
         return 0
 

@@ -144,6 +144,7 @@ from opensquilla.execution_status import (
     runtime_execution_status,
 )
 from opensquilla.observability.turn_call_log import TurnCallLogger
+from opensquilla.persistence.meta_run_writer import replay_inputs_are_modified
 from opensquilla.provider import (
     ChatConfig,
     ContentBlockText,
@@ -2440,6 +2441,133 @@ def _strip_historical_image_blocks(
         kept.extend(ContentBlockText(text=marker) for marker in omitted)
         sanitized.append(Message(role=msg.role, content=kept))
     return sanitized
+
+
+def _trusted_meta_replay_seed_outputs(
+    *,
+    plan: Any,
+    persisted_steps: Any,
+    failed_step_id: str,
+    replay_failover_aliases: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return only complete outputs that are safe to reuse in a live replay.
+
+    Persistence is deliberately fail-open during a live run, so a historical
+    row can be absent or incomplete even when the in-memory step progressed.
+    Replay must make the opposite choice: ambiguous evidence is not a cache
+    hit and the scheduler reruns that step.
+
+    Failover rows need paired handling.  The primary row records only a
+    ``substitute_step_id``; the actual output lives on the successful
+    substitute row.  Reuse that output under both ids so dependencies on the
+    primary alias and dependencies on the explicit substitute remain
+    satisfied.  If either side of the pair cannot be proven, seed neither.
+    """
+
+    plan_steps = tuple(getattr(plan, "steps", ()) or ())
+    plan_steps_by_id = {
+        step_id: step
+        for step in plan_steps
+        if isinstance((step_id := getattr(step, "id", None)), str) and step_id
+    }
+    substitute_owner_by_id = {
+        substitute_id: step.id
+        for step in plan_steps
+        if isinstance((substitute_id := getattr(step, "on_failure", None)), str)
+        and substitute_id
+        and isinstance(getattr(step, "id", None), str)
+    }
+
+    try:
+        persisted = tuple(persisted_steps or ())
+    except TypeError:
+        persisted = ()
+
+    records_by_id: dict[str, Any] = {}
+    duplicate_ids: set[str] = set()
+    for record in persisted:
+        step_id = getattr(record, "step_id", None)
+        if not isinstance(step_id, str) or step_id not in plan_steps_by_id:
+            continue
+        if step_id in records_by_id:
+            duplicate_ids.add(step_id)
+            continue
+        records_by_id[step_id] = record
+    for step_id in duplicate_ids:
+        records_by_id.pop(step_id, None)
+
+    def complete_ok_output(record: Any) -> str | None:
+        if record is None or getattr(record, "status", None) != "ok":
+            return None
+        truncated_fields = getattr(record, "truncated_fields", None)
+        if not isinstance(truncated_fields, (tuple, list, set, frozenset)):
+            return None
+        if not all(isinstance(field, str) for field in truncated_fields):
+            return None
+        if "output_text" in truncated_fields:
+            return None
+        output_text = getattr(record, "output_text", None)
+        return output_text if isinstance(output_text, str) else None
+
+    seeds: dict[str, str] = {}
+    trusted_pair_ids: set[str] = set()
+
+    # Validate each primary/fallback pair from the immutable plan rather than
+    # accepting an arbitrary pointer from a persistence row.
+    for primary in plan_steps:
+        primary_id = getattr(primary, "id", None)
+        substitute_id = getattr(primary, "on_failure", None)
+        if not isinstance(primary_id, str) or not isinstance(substitute_id, str):
+            continue
+        if not primary_id or not substitute_id:
+            continue
+        if failed_step_id == substitute_id:
+            # "Retry failed step" for a failed fallback must retry that
+            # fallback, not rerun its primary. This is critical when the
+            # primary is a non-idempotent paid submit whose response was lost.
+            primary_record = records_by_id.get(primary_id)
+            if (
+                primary_record is not None
+                and getattr(primary_record, "status", None) == "substituted"
+                and getattr(primary_record, "substitute_step_id", None) == substitute_id
+            ):
+                # The placeholder is scheduler-internal; the forced fallback
+                # overwrites the alias before any dependency on the pair can
+                # complete.
+                seeds[primary_id] = ""
+                trusted_pair_ids.add(primary_id)
+                if replay_failover_aliases is not None:
+                    replay_failover_aliases[substitute_id] = primary_id
+            continue
+        if failed_step_id == primary_id:
+            continue
+        primary_record = records_by_id.get(primary_id)
+        if (
+            primary_record is None
+            or getattr(primary_record, "status", None) != "substituted"
+            or getattr(primary_record, "substitute_step_id", None) != substitute_id
+        ):
+            continue
+        output_text = complete_ok_output(records_by_id.get(substitute_id))
+        if output_text is None:
+            continue
+        seeds[primary_id] = output_text
+        seeds[substitute_id] = output_text
+        trusted_pair_ids.update((primary_id, substitute_id))
+
+    for step_id in plan_steps_by_id:
+        if step_id == failed_step_id or step_id in trusted_pair_ids:
+            continue
+        # A substitute-only row is meaningful only together with its primary
+        # failover record.  Seeding it alone can leak stale output into a run
+        # where the primary is about to execute again.
+        if step_id in substitute_owner_by_id:
+            continue
+        output_text = complete_ok_output(records_by_id.get(step_id))
+        if output_text is not None:
+            seeds[step_id] = output_text
+
+    return seeds
 
 
 @dataclass
@@ -5903,13 +6031,50 @@ class Agent:
             async for ev in self._run_meta_resume(meta_resume):
                 yield ev
             return
+        meta_replay_error = metadata.pop("meta_replay_error", None)
+        if meta_replay_error is not None:
+            async for ev in self._emit_terminal_text(
+                str(meta_replay_error), iterations=0
+            ):
+                yield ev
+            return
+        meta_replay = metadata.get("meta_replay")
+        if isinstance(meta_replay, dict):
+            replay_name = str(meta_replay.get("name") or "")
+            replay_run_id = str(meta_replay.get("run_id") or "")
+            replay_mode = str(meta_replay.get("mode") or "")
+            if replay_name and replay_run_id and replay_mode:
+                async for ev in self._run_meta_launch(
+                    replay_name,
+                    replay_run_id=replay_run_id,
+                    replay_mode=replay_mode,
+                ):
+                    yield ev
+                return
+            metadata.pop("meta_replay", None)
+            async for ev in self._emit_terminal_text(
+                "This replay request is invalid. Choose Retry failed step again.",
+                iterations=0,
+            ):
+                yield ev
+            return
         meta_launch = metadata.get("meta_launch")
         if meta_launch is not None:
             launch_name = (
                 meta_launch.get("name") if isinstance(meta_launch, dict) else None
             )
             if launch_name:
-                async for ev in self._run_meta_launch(launch_name):
+                launch_request = (
+                    meta_launch.get("request")
+                    if isinstance(meta_launch, dict)
+                    else None
+                )
+                launch_events = (
+                    self._run_meta_launch(launch_name, user_request=launch_request)
+                    if isinstance(launch_request, str)
+                    else self._run_meta_launch(launch_name)
+                )
+                async for ev in launch_events:
                     yield ev
                 return
         clarify_outcome = self._read_clarify_outcome(metadata)
@@ -17938,6 +18103,8 @@ class Agent:
         workspace_dir: Any,
         triggered_by: str,
         skill_loader: Any,
+        parent_spec: Any,
+        plan: Any,
     ) -> tuple[Any, Any, Any]:
         """Construct a MetaOrchestrator wired to this agent's provider/tools.
 
@@ -17949,6 +18116,9 @@ class Agent:
             make_agent_runner_from_parent,
             make_llm_chat_from_provider,
             make_tool_invoker_from_handler,
+        )
+        from opensquilla.skills.meta.readiness import (
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
         )
 
         meta_correlation = derive_provider_request_correlation(
@@ -17993,6 +18163,25 @@ class Agent:
             if self._raw_tool_handler is not None
             else None
         )
+        skill_runtime_env: Mapping[str, Mapping[str, str]] = {}
+        runtime_env_provider = (self.config.metadata or {}).get(
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY
+        )
+        if (
+            callable(runtime_env_provider)
+            and parent_spec is not None
+            and plan is not None
+        ):
+            try:
+                resolved_runtime_env = runtime_env_provider(parent_spec, plan)
+            except Exception as exc:  # noqa: BLE001 - credential resolution fails closed
+                logger.warning(
+                    "agent.meta_skill_runtime_env_resolution_failed",
+                    error_type=type(exc).__name__,
+                )
+            else:
+                if isinstance(resolved_runtime_env, Mapping):
+                    skill_runtime_env = resolved_runtime_env
         orch = MetaOrchestrator(
             agent_runner=runner,
             skill_loader=skill_loader,
@@ -18005,8 +18194,40 @@ class Agent:
             turn_id=getattr(self, "_turn_id", None),
             memory_persist_enabled=True,
             usage_tracker=self._usage_tracker,
+            skill_runtime_env=skill_runtime_env,
         )
         return orch, llm_chat, tool_invoker
+
+    @staticmethod
+    def _meta_readiness_context_for_plan(
+        metadata: Mapping[str, Any],
+        *,
+        parent_spec: Any,
+        plan: Any,
+    ) -> Any:
+        """Resolve only parent+plan-scoped, non-secret readiness aliases."""
+
+        from opensquilla.skills.meta.readiness import (
+            META_READINESS_ENV_ALIASES_METADATA_KEY,
+            meta_readiness_context,
+        )
+
+        aliases: object = ()
+        alias_provider = metadata.get(META_READINESS_ENV_ALIASES_METADATA_KEY)
+        if callable(alias_provider):
+            try:
+                aliases = alias_provider(parent_spec, plan)
+            except Exception as exc:  # noqa: BLE001 - readiness fails closed
+                logger.warning(
+                    "agent.meta_readiness_alias_resolution_failed",
+                    error_type=type(exc).__name__,
+                )
+        return meta_readiness_context(
+            env_aliases=aliases,
+            parent_spec=parent_spec,
+            plan=plan,
+            skill_resolver=metadata.get("skill_loader"),
+        )
 
     async def _run_one_streaming(
         self,
@@ -18022,13 +18243,11 @@ class Agent:
             make_meta_inputs,
             meta_input_overrides_from_metadata,
         )
-        from opensquilla.skills.meta.orchestrator import (
-            MetaOrchestrator,
-            make_agent_runner_from_parent,
-            make_llm_chat_from_provider,
-            make_tool_invoker_from_handler,
-        )
         from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
+        from opensquilla.skills.meta.readiness import (
+            assess_meta_skill_readiness,
+            format_meta_setup_error,
+        )
         from opensquilla.skills.meta.types import MetaMatch, MetaResult
         from opensquilla.tools.dispatch import preflight_tool_call
         from opensquilla.tools.types import current_tool_context
@@ -18195,59 +18414,33 @@ class Agent:
                 )
                 return
 
-            meta_correlation = derive_provider_request_correlation(
-                self._provider_request_correlation,
-                execution_id=uuid.uuid4().hex,
-                call_kind="auxiliary.meta",
+            readiness = await asyncio.to_thread(
+                assess_meta_skill_readiness,
+                skill_spec,
+                loader=skill_loader,
+                ctx=self._meta_readiness_context_for_plan(
+                    metadata,
+                    parent_spec=skill_spec,
+                    plan=plan,
+                ),
+                validated_plan=plan,
             )
-            runner = make_agent_runner_from_parent(
-                provider=self.provider,
-                base_config=self.config,
-                tool_definitions=self.tool_definitions,
-                tool_handler=self._raw_tool_handler,
-                agent_factory=type(self),
-                workspace_dir=str(workspace_dir) if workspace_dir else None,
-                usage_tracker=self._usage_tracker,
-                session_key=self._session_key,
-                usage_event_sink=self._usage_event_sink,
-                usage_execution_context=self._usage_execution_context,
-                provider_request_correlation=meta_correlation,
-            )
-            llm_chat = getattr(self, "_test_llm_chat_override", None) or (
-                make_llm_chat_from_provider(
-                    provider=self.provider,
-                    base_config=self.config,
-                    usage_tracker=self._usage_tracker,
-                    session_key=self._session_key,
-                    usage_event_sink=self._usage_event_sink,
-                    usage_execution_context=self._usage_execution_context,
-                    provider_request_correlation=meta_correlation,
+            if not readiness.ready:
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=format_meta_setup_error(name, readiness),
+                    is_error=True,
+                    terminates_turn=False,
                 )
-                if self.provider is not None
-                else None
-            )
-            tool_invoker = (
-                make_tool_invoker_from_handler(
-                    tool_handler=self._raw_tool_handler,
-                    provider_request_correlation=meta_correlation,
-                )
-                if self._raw_tool_handler is not None
-                else None
-            )
+                return
 
-            memory_persist_enabled = True
-            orch = MetaOrchestrator(
-                agent_runner=runner,
-                skill_loader=skill_loader,
-                llm_chat=llm_chat,
-                tool_invoker=tool_invoker,
-                workspace_dir=str(workspace_dir) if workspace_dir else None,
-                run_writer=self._meta_run_writer,
+            orch, llm_chat, tool_invoker = self._build_meta_orchestrator(
+                workspace_dir=workspace_dir,
                 triggered_by="soft_meta_invoke",
-                session_key=getattr(self, "_session_key", None),
-                turn_id=getattr(self, "_turn_id", None),
-                memory_persist_enabled=memory_persist_enabled,
-                usage_tracker=self._usage_tracker,
+                skill_loader=skill_loader,
+                parent_spec=skill_spec,
+                plan=plan,
             )
 
             system_prompt = (
@@ -18400,12 +18593,6 @@ class Agent:
         outer stream pipeline can finalize the turn.
         """
         from opensquilla.engine.types import DoneEvent
-        from opensquilla.skills.meta.orchestrator import (
-            MetaOrchestrator,
-            make_agent_runner_from_parent,
-            make_llm_chat_from_provider,
-            make_tool_invoker_from_handler,
-        )
         from opensquilla.skills.meta.types import MetaResult
         from opensquilla.tools.types import current_tool_context
 
@@ -18431,6 +18618,52 @@ class Agent:
         if isinstance(metadata, dict):
             metadata.pop("meta_resume", None)
 
+        # Capability credentials are re-bound from durable state, never from
+        # the resume marker alone.  Require the claimed snapshot to match its
+        # current run row, then resolve the current parent from the pinned
+        # catalog.  Any missing/mismatched component leaves the orchestrator
+        # with an empty trusted child environment.
+        parent_spec: Any = None
+        resume_plan: Any = None
+        try:
+            claim_run_id = str(getattr(claim, "run_id", "") or "")
+            claim_snapshot = str(
+                getattr(claim, "plan_snapshot_json", "") or ""
+            )
+            resume_record = await asyncio.to_thread(
+                self._meta_run_writer.get_run,
+                claim_run_id,
+            )
+            if (
+                claim_run_id
+                and claim_snapshot
+                and self._session_key
+                and resume_record is not None
+                and str(getattr(resume_record, "run_id", "") or "")
+                == claim_run_id
+                and str(getattr(resume_record, "session_key", "") or "")
+                == self._session_key
+                and str(getattr(resume_record, "plan_snapshot_json", "") or "")
+                == claim_snapshot
+            ):
+                from opensquilla.skills.meta.plan_serde import from_jsonable
+
+                resume_plan = from_jsonable(json.loads(claim_snapshot))
+                candidate_parent = skill_loader.get_by_name(
+                    resume_record.meta_skill_name
+                )
+                if (
+                    candidate_parent is not None
+                    and getattr(resume_plan, "name", None)
+                    == resume_record.meta_skill_name
+                ):
+                    parent_spec = candidate_parent
+        except Exception as exc:  # noqa: BLE001 - capability grant fails closed
+            logger.warning(
+                "agent.meta_resume_capability_binding_failed",
+                error_type=type(exc).__name__,
+            )
+
         effective_ctx = current_tool_context.get() or None
         workspace_dir = (
             (getattr(effective_ctx, "workspace_dir", None) if effective_ctx else None)
@@ -18438,58 +18671,12 @@ class Agent:
             or getattr(self.config, "workspace_dir", None)
         )
 
-        meta_correlation = derive_provider_request_correlation(
-            self._provider_request_correlation,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.meta",
-        )
-        runner = make_agent_runner_from_parent(
-            provider=self.provider,
-            base_config=self.config,
-            tool_definitions=self.tool_definitions,
-            tool_handler=self._raw_tool_handler,
-            agent_factory=type(self),
-            workspace_dir=str(workspace_dir) if workspace_dir else None,
-            usage_tracker=self._usage_tracker,
-            session_key=self._session_key,
-            usage_event_sink=self._usage_event_sink,
-            usage_execution_context=self._usage_execution_context,
-            provider_request_correlation=meta_correlation,
-        )
-        llm_chat = getattr(self, "_test_llm_chat_override", None) or (
-            make_llm_chat_from_provider(
-                provider=self.provider,
-                base_config=self.config,
-                usage_tracker=self._usage_tracker,
-                session_key=self._session_key,
-                usage_event_sink=self._usage_event_sink,
-                usage_execution_context=self._usage_execution_context,
-                provider_request_correlation=meta_correlation,
-            )
-            if self.provider is not None
-            else None
-        )
-        tool_invoker = (
-            make_tool_invoker_from_handler(
-                tool_handler=self._raw_tool_handler,
-                provider_request_correlation=meta_correlation,
-            )
-            if self._raw_tool_handler is not None
-            else None
-        )
-
-        orch = MetaOrchestrator(
-            agent_runner=runner,
-            skill_loader=skill_loader,
-            llm_chat=llm_chat,
-            tool_invoker=tool_invoker,
-            workspace_dir=str(workspace_dir) if workspace_dir else None,
-            run_writer=self._meta_run_writer,
+        orch, _llm_chat, _tool_invoker = self._build_meta_orchestrator(
+            workspace_dir=workspace_dir,
             triggered_by="resume",
-            session_key=getattr(self, "_session_key", None),
-            turn_id=getattr(self, "_turn_id", None),
-            memory_persist_enabled=True,
-            usage_tracker=self._usage_tracker,
+            skill_loader=skill_loader,
+            parent_spec=parent_spec,
+            plan=resume_plan,
         )
 
         result: Any = None
@@ -18553,13 +18740,26 @@ class Agent:
             text_snapshot=final_text,
         )
 
-    async def _run_meta_launch(self, name: str) -> AsyncIterator[Any]:
+    async def _run_meta_launch(
+        self,
+        name: str,
+        *,
+        user_request: str | None = None,
+        replay_run_id: str | None = None,
+        replay_mode: str | None = None,
+    ) -> AsyncIterator[Any]:
         """Run a meta-skill by name from the explicit /meta command.
 
         Models its streaming/finalization on ``_run_meta_resume`` and reuses the
         resolution + guards from ``_run_one_streaming`` (enabled gate,
         awaiting-guard, kind/disable validation). Yields nested AgentEvents plus
-        a terminal DoneEvent so the turn pipeline finalizes normally.
+        a terminal DoneEvent so the turn pipeline finalizes normally. When the
+        command includes ``-- <request>``, ``user_request`` is the original
+        request and is passed to the orchestrator instead of the hidden command
+        envelope.  A trusted replay marker additionally supplies a persisted
+        source run and mode; in that path the original plan snapshot and all
+        successful step outputs are rehydrated and only failed/missing steps
+        are dispatched.
         """
         import opensquilla.skills.creator  # noqa: F401  (registers e2e hooks)
         from opensquilla.engine.types import DoneEvent, TextDeltaEvent
@@ -18576,13 +18776,17 @@ class Agent:
             meta_input_overrides_from_metadata,
         )
         from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
-        from opensquilla.skills.meta.types import MetaMatch, MetaResult
+        from opensquilla.skills.meta.readiness import (
+            assess_meta_skill_readiness,
+            format_meta_setup_error,
+        )
+        from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult
         from opensquilla.tools.types import current_tool_context
 
         metadata = self.config.metadata or {}
         # One-shot: drop the marker so a re-enter through this turn cannot re-run.
         if isinstance(metadata, dict):
-            metadata.pop("meta_launch", None)
+            metadata.pop("meta_replay" if replay_run_id else "meta_launch", None)
 
         if not is_meta_skill_enabled(self.config):
             async for ev in self._emit_terminal_text(
@@ -18599,6 +18803,46 @@ class Agent:
             ):
                 yield ev
             return
+
+        replay_record: Any = None
+        if replay_run_id is not None:
+            if replay_mode not in {"failed-step", "partial-context"}:
+                async for ev in self._emit_terminal_text(
+                    "This replay mode is invalid. Choose Retry failed step again.",
+                    iterations=0,
+                ):
+                    yield ev
+                return
+            replay_record = await asyncio.to_thread(
+                self._meta_run_writer.get_run,
+                replay_run_id,
+            )
+            if (
+                replay_record is None
+                or replay_record.meta_skill_name != name
+                or (
+                    replay_record.session_key
+                    and replay_record.session_key != self._session_key
+                )
+                or replay_record.status != "failed"
+                or not replay_record.failed_step_id
+            ):
+                async for ev in self._emit_terminal_text(
+                    "This replay is no longer available for this session. "
+                    "Choose Retry failed step again.",
+                    iterations=0,
+                ):
+                    yield ev
+                return
+            if replay_inputs_are_modified(replay_record):
+                async for ev in self._emit_terminal_text(
+                    "This run cannot safely retry only the failed step because "
+                    "its saved request was redacted or truncated. Start a new "
+                    "meta-skill run and provide the original request again.",
+                    iterations=0,
+                ):
+                    yield ev
+                return
 
         # Awaiting-guard parity with _run_one_streaming: refuse a new launch
         # while a prior run is waiting for input (avoids the opaque CAS error).
@@ -18629,29 +18873,93 @@ class Agent:
             ):
                 yield ev
             return
-        # Parity with _run_one_streaming and meta.list: skills flagged
-        # disable_model_invocation are neither listed nor runnable via /meta.
-        if getattr(skill_spec, "disable_model_invocation", False):
+        # Fresh launches respect the catalog gate. A trusted failed-run replay
+        # is different: its immutable plan came from the persisted ledger and
+        # may belong to a now-retired compatibility definition. Keeping that
+        # path available lets upgrades finish already-started work without
+        # making the retired skill discoverable or allowing a new run.
+        retired_replay = bool(
+            replay_record is not None
+            and getattr(skill_spec, "disable_model_invocation", False)
+        )
+        if getattr(skill_spec, "disable_model_invocation", False) and not retired_replay:
+            description = str(getattr(skill_spec, "description", "")).strip().lower()
+            unavailable_message = f"{name!r} is not available for invocation."
+            if description.startswith("retired compatibility"):
+                unavailable_message = (
+                    f"{name!r} has been retired and is not available for new runs. "
+                    "Previously saved runs remain available for inspection, resume, or replay."
+                )
             async for ev in self._emit_terminal_text(
-                f"{name!r} is not available for invocation.", iterations=0
+                unavailable_message, iterations=0
             ):
                 yield ev
             return
 
-        try:
-            plan = parse_meta_plan(skill_spec)
-        except MetaPlanError as exc:
-            async for ev in self._emit_terminal_text(
-                f"meta-skill {name!r} plan invalid: {exc}", iterations=0
-            ):
-                yield ev
-            return
+        plan: MetaPlan | None
+        if replay_record is not None:
+            try:
+                from opensquilla.skills.meta.plan_serde import from_jsonable
+
+                plan = from_jsonable(json.loads(replay_record.plan_snapshot_json))
+            except Exception as exc:  # noqa: BLE001 - persisted legacy snapshot
+                async for ev in self._emit_terminal_text(
+                    f"Cannot replay meta-skill {name!r}: its saved plan is invalid ({exc}).",
+                    iterations=0,
+                ):
+                    yield ev
+                return
+        else:
+            try:
+                plan = parse_meta_plan(skill_spec)
+            except MetaPlanError as exc:
+                async for ev in self._emit_terminal_text(
+                    f"meta-skill {name!r} plan invalid: {exc}", iterations=0
+                ):
+                    yield ev
+                return
         if plan is None:
             async for ev in self._emit_terminal_text(
                 f"meta-skill {name!r} parsed to None", iterations=0
             ):
                 yield ev
             return
+
+        # Current-manifest readiness may have changed after the source run was
+        # persisted. Do not let a retired tombstone redefine that immutable
+        # replay; each saved step still enforces its own runtime/tool gates.
+        if not retired_replay:
+            readiness = await asyncio.to_thread(
+                assess_meta_skill_readiness,
+                skill_spec,
+                loader=skill_loader,
+                ctx=self._meta_readiness_context_for_plan(
+                    metadata,
+                    parent_spec=skill_spec,
+                    plan=plan,
+                ),
+                validated_plan=plan,
+            )
+            if not readiness.ready:
+                async for ev in self._emit_terminal_text(
+                    format_meta_setup_error(name, readiness), iterations=0
+                ):
+                    yield ev
+                return
+        if replay_record is not None:
+            from opensquilla.skills.meta.replay_safety import (
+                paid_live_replay_block_reason,
+            )
+
+            paid_block = paid_live_replay_block_reason(
+                plan=plan,
+                persisted_steps=getattr(replay_record, "steps", ()),
+                failed_step_id=str(replay_record.failed_step_id or ""),
+            )
+            if paid_block:
+                async for ev in self._emit_terminal_text(paid_block, iterations=0):
+                    yield ev
+                return
 
         effective_ctx = current_tool_context.get() or None
         workspace_dir = (
@@ -18669,18 +18977,56 @@ class Agent:
             workspace_dir=workspace_dir,
             triggered_by="manual_command",
             skill_loader=skill_loader,
-        )
-        match = MetaMatch(
+            parent_spec=skill_spec,
             plan=plan,
-            inputs=make_meta_inputs(
-                user_message=(
-                    getattr(self, "_current_turn_message", "")
-                    or metadata.get("user_message", "")
-                ),
-                system_prompt=system_prompt,
-                **meta_input_overrides_from_metadata(metadata),
-            ),
         )
+        seed_outputs: dict[str, str] | None = None
+        trusted_replay_meta_run_id: str | None = None
+        if replay_record is not None:
+            try:
+                replay_inputs = json.loads(replay_record.inputs_json or "{}")
+            except json.JSONDecodeError:
+                replay_inputs = {}
+            if not isinstance(replay_inputs, dict):
+                replay_inputs = {}
+            # The artifact directory is a runtime-owned reserved input. Recover
+            # it only from the validated source row; never accept a value from
+            # the new replay turn. Legacy rows predate this field and map their
+            # persisted run id to the same bounded, path-safe namespace.
+            from opensquilla.skills.meta.orchestrator import _preserve_meta_run_id
+
+            trusted_replay_meta_run_id = _preserve_meta_run_id(
+                replay_inputs,
+                fallback_run_id=replay_record.run_id,
+            )
+            replay_inputs["meta_replay_source_run_id"] = replay_record.run_id
+            replay_inputs["meta_replay_mode"] = replay_mode
+            replay_inputs.setdefault("system_prompt", system_prompt)
+            failed_step_id = str(replay_record.failed_step_id or "")
+            replay_failover_aliases: dict[str, str] = {}
+            seed_outputs = _trusted_meta_replay_seed_outputs(
+                plan=plan,
+                persisted_steps=getattr(replay_record, "steps", ()),
+                failed_step_id=failed_step_id,
+                replay_failover_aliases=replay_failover_aliases,
+            )
+            match = MetaMatch(plan=plan, inputs=replay_inputs)
+        else:
+            match = MetaMatch(
+                plan=plan,
+                inputs=make_meta_inputs(
+                    user_message=(
+                        user_request
+                        if user_request is not None
+                        else (
+                            getattr(self, "_current_turn_message", "")
+                            or metadata.get("user_message", "")
+                        )
+                    ),
+                    system_prompt=system_prompt,
+                    **meta_input_overrides_from_metadata(metadata),
+                ),
+            )
 
         # Mirror _run_one_streaming: wrap iter_events in the runtime-e2e / smoke
         # ContextVars so a manually launched meta-skill that spawns sub-agents
@@ -18708,7 +19054,21 @@ class Agent:
         result: Any = None
         final_text_parts: list[str] = []
         try:
-            async for ev in orch.iter_events(match):
+            replay_kwargs: dict[str, Any] = {}
+            if replay_record is not None:
+                replay_kwargs = {
+                    "seed_outputs": seed_outputs,
+                    "trusted_preflight_replay": True,
+                    "trusted_replay_meta_run_id": trusted_replay_meta_run_id,
+                }
+                # Preserve the established replay call contract when there is
+                # no pending fallback alias.  The alias map is meaningful only
+                # for the narrow "retry failed fallback" recovery path.
+                if replay_failover_aliases:
+                    replay_kwargs["replay_failover_aliases"] = (
+                        replay_failover_aliases
+                    )
+            async for ev in orch.iter_events(match, **replay_kwargs):
                 if isinstance(ev, MetaResult):
                     result = ev
                     continue

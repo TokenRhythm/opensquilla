@@ -5,9 +5,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 import yaml
 
 WORKFLOW_DIR = Path(".github/workflows")
@@ -117,6 +119,7 @@ def _expected_classifier_outputs(**overrides: str) -> dict[str, str]:
         "python_changed": "false",
         "platform_sensitive_changed": "false",
         "build_wheel_required": "false",
+        "toolchain_artifact_changed": "false",
         "full_required": "false",
     }
     outputs.update(overrides)
@@ -307,6 +310,148 @@ def test_readme_contract_check_uses_the_pinned_node_version() -> None:
         "node-version-file": "opensquilla-webui/.node-version"
     }
     assert check["run"] == "node scripts/check-readme-locales.mjs"
+
+
+def test_managed_toolchain_artifacts_cover_native_macos_architectures_and_musl() -> None:
+    workflow = _workflow("managed-toolchain-artifacts.yml")
+    assert _trigger_keys(workflow) == {"workflow_call", "workflow_dispatch"}
+    validate = workflow["jobs"]["validate"]
+    matrix = validate["strategy"]["matrix"]["include"]
+
+    assert {entry["runner"] for entry in matrix} == {
+        "ubuntu-24.04",
+        "ubuntu-24.04-arm",
+        "macos-15",
+        "macos-15-intel",
+        "windows-2022",
+    }
+    assert {entry["platform_key"] for entry in matrix} == {
+        "linux-x64",
+        "linux-arm64",
+        "darwin-arm64",
+        "darwin-x64",
+        "windows-x64",
+    }
+    assert all(entry["paper_platform_key"] for entry in matrix)
+    macos = {entry["runner"]: entry for entry in matrix if entry["runner"].startswith("macos-")}
+    assert macos == {
+        "macos-15": {
+            "label": "macOS Apple Silicon real artifacts",
+            "runner": "macos-15",
+            "platform_key": "darwin-arm64",
+            "paper_platform_key": "darwin-universal",
+        },
+        "macos-15-intel": {
+            "label": "macOS Intel real artifacts",
+            "runner": "macos-15-intel",
+            "platform_key": "darwin-x64",
+            "paper_platform_key": "darwin-universal",
+        },
+    }
+
+    assert "OPENSQUILLA_GATEWAY_STATE_DIR" not in validate["env"]
+    assert "OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT" not in validate["env"]
+    assert validate["env"]["OPENSQUILLA_REQUIRE_MANAGED_TOOLCHAIN_E2E"] == "1"
+
+    configure_state = next(
+        step
+        for step in validate["steps"]
+        if step.get("name") == "Configure isolated managed-toolchain state"
+    )
+    assert configure_state["shell"] == "bash"
+    assert "$RUNNER_TEMP" in configure_state["run"]
+    assert "OPENSQUILLA_GATEWAY_STATE_DIR=" in configure_state["run"]
+    assert "OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT=" in configure_state["run"]
+    assert "$GITHUB_ENV" in configure_state["run"]
+
+    paper_smoke = next(
+        step
+        for step in validate["steps"]
+        if step.get("name") == "Validate real pinned paper archive and capability smoke"
+    )["run"]
+    assert "--component paper-tex" in paper_smoke
+    assert "--expect-platform-key ${{ matrix.paper_platform_key }}" in paper_smoke
+    assert (
+        "${{ matrix.platform_key == 'linux-x64' && '--check-runtime-hot-path' || '' }}"
+        in paper_smoke
+    )
+    media_smoke = next(
+        step
+        for step in validate["steps"]
+        if step.get("name") == "Validate real pinned media archives and capability smoke"
+    )["run"]
+    assert "--component media-ffmpeg" in media_smoke
+    assert "--expect-platform-key ${{ matrix.platform_key }}" in media_smoke
+    assert "--check-runtime-hot-path" not in media_smoke
+    paper_compile = next(
+        step
+        for step in validate["steps"]
+        if step.get("name") == "Compile the default four-page paper with the managed toolchain"
+    )["run"]
+    assert "test_meta_default_compact_contract_compiles_real_content_to_four_pages" in paper_compile
+
+    musl = workflow["jobs"]["validate-musl-paper"]
+    assert musl["runs-on"] == "ubuntu-24.04"
+    assert musl["container"]["image"] == "python:3.12-alpine"
+    assert musl["env"]["PYTHONPATH"] == "${{ github.workspace }}/src"
+    assert musl["steps"][0] == {
+        "name": "Prepare Alpine action runtime",
+        "run": "apk add --no-cache fontconfig git nodejs",
+    }
+    smoke = next(
+        step
+        for step in musl["steps"]
+        if step.get("name") == "Validate native musl TinyTeX archive and capability smoke"
+    )
+    command = smoke["run"]
+    assert "validate_managed_toolchain_artifacts_stdlib.py" in command
+    assert "--component paper-tex" in command
+    assert "--expect-platform-key linux-musl-x64" in command
+    assert "media-ffmpeg" not in command
+
+
+def test_musl_toolchain_validator_bootstrap_is_stdlib_only() -> None:
+    script = Path("scripts/validate_managed_toolchain_artifacts_stdlib.py")
+    result = subprocess.run(
+        [sys.executable, "-S", str(script), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--component {paper-tex,media-ffmpeg}" in result.stdout
+    assert "--expect-platform-key" in result.stdout
+
+
+def test_toolchain_validator_platform_assertion_never_overrides_detection(
+    tmp_path: Path,
+) -> None:
+    script = Path("scripts/validate_managed_toolchain_artifacts_stdlib.py")
+    root = tmp_path / "managed-toolchains"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(script),
+            "--component",
+            "paper-tex",
+            "--root",
+            str(root),
+            "--expect-platform-key",
+            "not-the-native-host",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    mismatch = next(event for event in events if event["event"] == "platform_mismatch")
+    assert mismatch["expected_platform_key"] == "not-the-native-host"
+    assert mismatch["actual_platform_key"] != mismatch["expected_platform_key"]
+    assert not (root / "packages").exists()
 
 
 def test_desktop_ci_runs_primary_profile_substrate_unit_tests() -> None:
@@ -627,7 +772,119 @@ def test_ci_change_classifier_tracks_ci_dependency_and_release_changes(tmp_path:
         python_changed="true",
         platform_sensitive_changed="true",
         build_wheel_required="true",
+        toolchain_artifact_changed="true",
         full_required="true",
+    )
+
+
+def test_ci_change_classifier_requires_real_artifacts_for_toolchain_surfaces(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        [
+            "src/opensquilla/skills/toolchains/registry.py",
+            "src/opensquilla/skills/toolchains/manager.py",
+            "src/opensquilla/skills/toolchains/runtime.py",
+            "scripts/validate_managed_toolchain_artifacts.py",
+            "scripts/validate_managed_toolchain_artifacts_stdlib.py",
+        ],
+    )
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        platform_sensitive_changed="true",
+        build_wheel_required="true",
+        toolchain_artifact_changed="true",
+    )
+
+
+def test_ci_change_classifier_requires_real_artifacts_for_paper_contracts(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        [
+            "src/opensquilla/skills/runtime_env.py",
+            "src/opensquilla/skills/bundled/meta-paper-write/SKILL.md",
+            "src/opensquilla/skills/bundled/paper-artifact-runtime/scripts/run.py",
+            "src/opensquilla/skills/bundled/paper-citation-integrity-gate/scripts/audit.py",
+            "src/opensquilla/skills/bundled/paper-delivery-summary/SKILL.md",
+            "src/opensquilla/skills/bundled/paper-latex-sanitizer/scripts/sanitize.py",
+            "src/opensquilla/skills/bundled/paper-length-gate/scripts/audit.py",
+            "src/opensquilla/skills/bundled/paper-quality-gate/scripts/audit.py",
+            "src/opensquilla/skills/bundled/meta-short-drama/SKILL.md",
+            "src/opensquilla/skills/bundled/subtitle-burner/scripts/burn.py",
+            "src/opensquilla/skills/bundled/video-still-animator/scripts/animate.py",
+            "tests/test_skills/test_meta_paper_skills.py",
+            "tests/test_skills/test_managed_toolchains.py",
+        ],
+    )
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        test_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        platform_sensitive_changed="true",
+        build_wheel_required="true",
+        toolchain_artifact_changed="true",
+    )
+
+
+@pytest.mark.parametrize(
+    "paper_surface",
+    [
+        "src/opensquilla/skills/bundled/meta-paper-write/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-artifact-runtime/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-artifact-runtime/scripts/run.py",
+        "src/opensquilla/skills/bundled/paper-citation-integrity-gate/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-citation-integrity-gate/scripts/audit.py",
+        "src/opensquilla/skills/bundled/paper-delivery-summary/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-delivery-summary/scripts/render.py",
+        "src/opensquilla/skills/bundled/paper-latex-sanitizer/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-latex-sanitizer/scripts/sanitize.py",
+        "src/opensquilla/skills/bundled/paper-length-gate/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-length-gate/scripts/audit.py",
+        "src/opensquilla/skills/bundled/paper-quality-gate/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-quality-gate/scripts/audit.py",
+        "src/opensquilla/skills/bundled/paper-refbib-stub/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-refbib-stub/scripts/json_to_bib.py",
+        "src/opensquilla/skills/bundled/paper-source-readiness-gate/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-source-readiness-gate/scripts/audit.py",
+    ],
+)
+def test_each_paper_truthfulness_surface_requires_real_artifacts(
+    tmp_path: Path,
+    paper_surface: str,
+) -> None:
+    outputs = _classify_changed_files(tmp_path, [paper_surface])
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        platform_sensitive_changed="true",
+        build_wheel_required="true",
+        toolchain_artifact_changed="true",
+    )
+
+
+def test_ci_change_classifier_requires_real_artifacts_for_dependency_changes(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(tmp_path, ["uv.lock"])
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        dependency_changed="true",
+        release_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        build_wheel_required="true",
+        toolchain_artifact_changed="true",
     )
 
 
@@ -805,6 +1062,7 @@ def test_ci_change_classifier_runs_full_for_its_own_windows_gate(tmp_path: Path)
         python_changed="true",
         platform_sensitive_changed="true",
         build_wheel_required="true",
+        toolchain_artifact_changed="true",
         full_required="true",
     )
 
@@ -831,6 +1089,7 @@ def test_ci_change_classifier_fails_closed_for_future_ci_surfaces(tmp_path: Path
         python_changed="true",
         platform_sensitive_changed="true",
         build_wheel_required="true",
+        toolchain_artifact_changed="true",
         full_required="true",
     )
 
@@ -963,6 +1222,7 @@ def test_ci_change_classifier_run_all_requires_full_ci(tmp_path: Path) -> None:
         python_changed="true",
         platform_sensitive_changed="true",
         build_wheel_required="true",
+        toolchain_artifact_changed="true",
         full_required="true",
     )
 
@@ -993,6 +1253,11 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "ubuntu-full" in jobs["ci-result"]["needs"]
     assert "macos-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-recovery-e2e" in jobs["ci-result"]["needs"]
+    assert "managed-toolchain-artifacts" in jobs["ci-result"]["needs"]
+    artifact_e2e = jobs["managed-toolchain-artifacts"]
+    assert artifact_e2e["uses"] == "./.github/workflows/managed-toolchain-artifacts.yml"
+    assert "toolchain_artifact_changed == 'true'" in artifact_e2e["if"]
+    assert "full_required == 'true'" in artifact_e2e["if"]
 
 
 def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> None:
@@ -1020,6 +1285,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "macos-recovery",
         "desktop-recovery-e2e",
         "release-packaging",
+        "managed-toolchain-artifacts",
     }
     assert gate_step["run"] == "python .github/scripts/check_ci_results.py"
     assert gate_step["env"]["RESULT_UBUNTU_FULL"] == "${{ needs.ubuntu-full.result }}"
@@ -1028,6 +1294,9 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
     )
     assert gate_step["env"]["RESULT_DESKTOP_RECOVERY_E2E"] == (
         "${{ needs.desktop-recovery-e2e.result }}"
+    )
+    assert gate_step["env"]["RESULT_MANAGED_TOOLCHAIN_ARTIFACTS"] == (
+        "${{ needs.managed-toolchain-artifacts.result }}"
     )
     assert set(key for key in gate_step["env"] if key.startswith("FLAG_")) == {
         "FLAG_DOCS_ONLY",
@@ -1043,6 +1312,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "FLAG_PYTHON_CHANGED",
         "FLAG_PLATFORM_SENSITIVE_CHANGED",
         "FLAG_BUILD_WHEEL_REQUIRED",
+        "FLAG_TOOLCHAIN_ARTIFACT_CHANGED",
         "FLAG_FULL_REQUIRED",
     }
 

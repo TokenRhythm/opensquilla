@@ -22,6 +22,7 @@ BOOLEAN_FLAGS: Final[tuple[str, ...]] = (
     "python_changed",
     "platform_sensitive_changed",
     "build_wheel_required",
+    "toolchain_artifact_changed",
     "full_required",
 )
 
@@ -120,6 +121,11 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
             "RESULT_RELEASE",
             "Release packaging contracts",
             flags["release_changed"] or full,
+        ),
+        (
+            "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS",
+            "Managed Toolchain Artifact E2E",
+            flags["toolchain_artifact_changed"] or full,
         ),
     )
     for variable, label, required in conditional_results:

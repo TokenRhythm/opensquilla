@@ -15,7 +15,7 @@ from typing import Any
 
 from opensquilla.skills.meta.types import MetaPlan, MetaStep, RouteCase
 
-PLAN_SERDE_VERSION: int = 1
+PLAN_SERDE_VERSION: int = 2
 
 
 def to_jsonable(plan: MetaPlan) -> dict[str, Any]:
@@ -52,6 +52,7 @@ def to_jsonable(plan: MetaPlan) -> dict[str, Any]:
                 "tool_args": dict(s.tool_args),
                 "tool_allowlist": list(s.tool_allowlist),
                 "on_failure": s.on_failure,
+                "side_effect": s.side_effect,
                 "clarify_config": clarify_config_to_jsonable(s.clarify_config),
                 "label": s.label,
                 "label_by_language": dict(s.label_by_language),
@@ -167,6 +168,7 @@ def _step_from_jsonable(raw: dict[str, Any], index: int) -> MetaStep:
             str(t) for t in raw.get("tool_allowlist", []) or []
         ),
         on_failure=str(raw.get("on_failure", "") or ""),
+        side_effect=str(raw.get("side_effect", "") or ""),
         clarify_config=clarify_config_from_jsonable(raw.get("clarify_config")),
         label=str(raw.get("label", "") or ""),
         label_by_language={

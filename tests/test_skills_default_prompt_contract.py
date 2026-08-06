@@ -39,7 +39,6 @@ DEFAULTS = {
     "http-fetch",
     "latex-compile",
     "memory",
-    "meta-kid-project-planner",
     "meta-paper-write",
     "meta-short-drama",
     "meta-skill-creator",
@@ -81,11 +80,20 @@ INTERNAL_HELPERS = {
     "openrouter-video-generator",
     # meta-DAG-internal pipeline fragments: reachable via a meta-skill's `skill:`
     # directive, never invoked standalone, so hidden from the model's index.
+    "paper-artifact-runtime",
+    "paper-citation-integrity-gate",
+    "paper-delivery-summary",
+    "paper-latex-sanitizer",
+    "paper-length-gate",
+    "paper-quality-gate",
     "paper-refbib-stub",
     "paper-section-author",
+    "paper-source-readiness-gate",
     "skill-creator-linter",
     "skill-creator-proposals",
     "skill-creator-smoke-test",
+    "short-drama-delivery-audit",
+    "short-drama-review-normalizer",
     "srt-from-script",
     "stack-trace-generic-probe",
     "stack-trace-go-probe",
@@ -93,6 +101,7 @@ INTERNAL_HELPERS = {
     "stack-trace-python-probe",
     "stack-trace-rust-probe",
 }
+COMPATIBILITY_TOMBSTONES = {"meta-kid-project-planner"}
 
 
 def _ctx(
@@ -138,14 +147,14 @@ def _ctx(
     )
 
 
-def test_bundled_directory_only_contains_retained_default_skills() -> None:
+def test_bundled_directory_only_contains_retained_skills_and_tombstones() -> None:
     bundled_names = {
         path.name
         for path in BUNDLED.iterdir()
         if path.is_dir() and (path / "SKILL.md").is_file()
     }
 
-    assert bundled_names == DEFAULTS | INTERNAL_HELPERS
+    assert bundled_names == DEFAULTS | INTERNAL_HELPERS | COMPATIBILITY_TOMBSTONES
 
 
 def test_skill_filter_defaults_are_release_safe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -206,6 +215,8 @@ async def test_default_prompt_only_injects_retained_bundled_skills(
     for name in AUDIO_DEFAULTS:
         assert f"<name>{name}</name>" not in prompt
     for name in INTERNAL_HELPERS:
+        assert f"<name>{name}</name>" not in prompt
+    for name in COMPATIBILITY_TOMBSTONES:
         assert f"<name>{name}</name>" not in prompt
     # Coding-mode skills stay out of the default (coding mode OFF) prompt.
     for name in CODING_MODE_GATED:

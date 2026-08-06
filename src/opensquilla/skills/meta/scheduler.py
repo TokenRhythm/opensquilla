@@ -35,6 +35,19 @@ from opensquilla.engine.usage import usage_scope
 from opensquilla.meta_preflight_protocol import strip_preflight_confirmation_protocol_text
 from opensquilla.skills.meta.events import _FailoverTriggered, _StepDone
 from opensquilla.skills.meta.parser import topological_order
+from opensquilla.skills.meta.replay_safety import (
+    PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY,
+    PAID_SUBMISSION_MAYBE_ACCEPTED,
+    PAID_SUBMISSION_RECEIPT,
+    PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY,
+    PAID_SUBMISSION_SAFE_NO_SUBMIT,
+    encode_paid_submission_dispositions,
+    encode_paid_submission_receipt_proofs,
+    is_external_paid_step,
+    paid_receipt_proof,
+    paid_replay_is_safe,
+    public_step_error,
+)
 from opensquilla.skills.meta.templating import (
     evaluate_when,
     render_with_args,
@@ -71,6 +84,12 @@ _CLARIFY_SKIP_HINT_BY_LANGUAGE = {
 # result. Surfaces can still request more via a follow-up if needed.
 _CLARIFY_SKIP_EXCERPT_CHARS = 600
 _RESCUE_OUTPUT_EXCERPT_CHARS = 600
+_PRIVATE_MACHINE_OUTPUT_KEYS = frozenset(
+    {
+        PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY,
+        PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY,
+    }
+)
 
 
 def _field_has_value(inputs: dict[str, Any], name: str) -> bool:
@@ -262,30 +281,53 @@ def _failure_rescue_payload(
     error: str,
     outputs: dict[str, str],
     has_substitute: bool,
+    plan_has_external_paid_steps: bool = False,
 ) -> dict[str, Any]:
     hint = _failure_hint(error)
-    actions = [
-        {
-            "id": "retry-run",
-            "label": "Retry this run",
-            "description": "Run the same meta-skill again with the original request.",
-        },
-        {
-            "id": "retry-step",
-            "label": "Retry failed step",
-            "description": "Retry only the failed step with successful prior outputs as context.",
-        },
-        {
-            "id": "retry-with-partial-context",
-            "label": "Retry with partial context",
-            "description": "Reuse successful prior step outputs as context for the retry.",
-        },
-        {
-            "id": "switch-meta-skill",
-            "label": "Switch meta-skill",
-            "description": "Use a different meta-skill if this was the wrong workflow.",
-        },
-    ]
+    unsafe_paid_replay = is_external_paid_step(step) and not paid_replay_is_safe(error)
+    if unsafe_paid_replay:
+        actions = [
+            {
+                "id": "review-paid-submit",
+                "label": "Review paid submission",
+                "description": (
+                    "The provider may already have accepted or billed this request. "
+                    "Check provider history before starting another generation."
+                ),
+            },
+            {
+                "id": "switch-meta-skill",
+                "label": "Switch meta-skill",
+                "description": "Use a different meta-skill without repeating this paid submit.",
+            },
+        ]
+    else:
+        actions = [
+            {
+                "id": "retry-run",
+                "label": "Retry this run",
+                "description": "Run the same meta-skill again with the original request.",
+            },
+            {
+                "id": "retry-step",
+                "label": "Retry failed step",
+                "description": (
+                    "Retry only the failed step with successful prior outputs as context."
+                ),
+            },
+            {
+                "id": "retry-with-partial-context",
+                "label": "Retry with partial context",
+                "description": "Reuse successful prior step outputs as context for the retry.",
+            },
+            {
+                "id": "switch-meta-skill",
+                "label": "Switch meta-skill",
+                "description": "Use a different meta-skill if this was the wrong workflow.",
+            },
+        ]
+    if plan_has_external_paid_steps:
+        actions = [action for action in actions if action["id"] != "retry-run"]
     if hint["category"] == "missing_dependency":
         actions.append({
             "id": "install-dependency",
@@ -298,8 +340,13 @@ def _failure_rescue_payload(
             "label": "Continue without artifact",
             "description": "Keep successful text outputs and skip generated-file delivery.",
         })
+    public_outputs = {
+        step_id: text
+        for step_id, text in outputs.items()
+        if step_id not in _PRIVATE_MACHINE_OUTPUT_KEYS
+    }
     prior_outputs: list[dict[str, Any]] = []
-    for step_id, text in sorted(outputs.items()):
+    for step_id, text in sorted(public_outputs.items()):
         excerpt = str(text or "")
         truncated = len(excerpt) > _RESCUE_OUTPUT_EXCERPT_CHARS
         if truncated:
@@ -314,7 +361,7 @@ def _failure_rescue_payload(
         "failed_step_id": step.id,
         "failed_step_label": step.label or step.id,
         "failed_step_kind": step.kind,
-        "partial_output_step_ids": sorted(outputs.keys()),
+        "partial_output_step_ids": sorted(public_outputs),
         "prior_outputs": prior_outputs,
         "has_substitute": has_substitute,
         "hint": hint,
@@ -442,6 +489,8 @@ async def run_dag(
     session_key: str | None = None,
     usage_scope_prefix: str | None = None,
     seed_outputs: dict[str, str] | None = None,
+    replay_failover_aliases: dict[str, str] | None = None,
+    trusted_preflight_replay: bool = False,
 ) -> AsyncIterator[AgentEvent | MetaResult]:
     """Run the plan and stream a flat sequence of events for the UI.
 
@@ -480,6 +529,12 @@ async def run_dag(
     observer bugs must never break the scheduler.
     """
     outputs: dict[str, str] = dict(seed_outputs) if seed_outputs else {}
+    # These slots belong to the scheduler, never to caller-provided replay
+    # seeds. They are refreshed below from parent-observed executor outcomes.
+    # In particular, receipt proofs are current-process-only and must never be
+    # reconstructed from persisted output or workspace sidecars.
+    for private_key in _PRIVATE_MACHINE_OUTPUT_KEYS:
+        outputs.pop(private_key, None)
     try:
         ordered = list(topological_order(match.plan.steps))
     except Exception as exc:  # noqa: BLE001
@@ -490,6 +545,47 @@ async def run_dag(
     if not ordered:
         yield MetaResult(ok=True, final_text="", step_outputs={})
         return
+
+    if any(step.id in _PRIVATE_MACHINE_OUTPUT_KEYS for step in ordered):
+        yield MetaResult(
+            ok=False,
+            error="meta-skill plan uses a reserved runtime step id",
+        )
+        return
+
+    paid_submission_dispositions: dict[str, str] = {
+        step.id: PAID_SUBMISSION_RECEIPT
+        for step in ordered
+        if is_external_paid_step(step) and step.id in outputs
+    }
+    paid_submission_receipt_proofs: dict[str, str] = {}
+
+    def _refresh_paid_submission_runtime_outputs() -> None:
+        outputs[PAID_SUBMISSION_DISPOSITIONS_OUTPUT_KEY] = (
+            encode_paid_submission_dispositions(paid_submission_dispositions)
+        )
+        outputs[PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY] = (
+            encode_paid_submission_receipt_proofs(paid_submission_receipt_proofs)
+        )
+
+    def _record_paid_submission_disposition(step_id: str, disposition: str) -> None:
+        paid_submission_dispositions[step_id] = disposition
+        _refresh_paid_submission_runtime_outputs()
+
+    def _record_paid_submission_receipt_proof(step_id: str, proof: str) -> None:
+        paid_submission_receipt_proofs[step_id] = proof
+        _refresh_paid_submission_runtime_outputs()
+
+    # Keep both channels present even before the first paid step. Trusted
+    # templates therefore receive stable JSON objects, never caller values.
+    _refresh_paid_submission_runtime_outputs()
+
+    def _public_step_outputs() -> dict[str, str]:
+        return {
+            key: value
+            for key, value in outputs.items()
+            if key not in _PRIVATE_MACHINE_OUTPUT_KEYS
+        }
 
     # Announce the static composition so the WebUI can seed its step
     # ribbon before any per-step tool-call event arrives. The orchestrator
@@ -513,7 +609,9 @@ async def run_dag(
         requires_confirmation = _preflight_requires_confirmation(
             match.plan.request_template,
         )
-        can_skip = not (requires_confirmation and missing_fields)
+        can_skip = trusted_preflight_replay or not (
+            requires_confirmation and missing_fields
+        )
         yield MetaPreflightEvent(
             run_id=_run_id,
             meta_skill_name=match.plan.name,
@@ -524,7 +622,10 @@ async def run_dag(
             can_skip=can_skip,
             requires_confirmation=requires_confirmation,
         )
-        preflight_confirmed = _preflight_is_confirmed(match.inputs, _run_id)
+        preflight_confirmed = (
+            trusted_preflight_replay
+            or _preflight_is_confirmed(match.inputs, _run_id)
+        )
         if requires_confirmation and (missing_fields or not preflight_confirmed):
             yield MetaResult(
                 ok=False,
@@ -558,11 +659,30 @@ async def run_dag(
         parent_run_id=None,
     )
 
-    # Terminal-state tracking for the final MetaRunCompletedEvent.
-    _succeeded_step_ids: set[str] = set()
+    # Terminal-state tracking for the final MetaRunCompletedEvent.  Seeded
+    # outputs are real successful work reused from a prior run; mark them as
+    # succeeded immediately so the replay ribbon and completion history never
+    # regress those steps back to pending. A replayed failover primary is the
+    # one exception: its placeholder exists only to suppress a second paid
+    # submit and must remain unresolved until the forced fallback succeeds.
+    plan_step_ids = {step.id for step in ordered}
+    replay_pending_primary_ids = set((replay_failover_aliases or {}).values())
+    _succeeded_step_ids: set[str] = (
+        set(outputs).intersection(plan_step_ids) - replay_pending_primary_ids
+    )
     _failed_step_ids: set[str] = set()
     _recovered_failed_step_ids: set[str] = set()
     _skipped_step_ids: set[str] = set()
+
+    for step in ordered:
+        if step.id not in _succeeded_step_ids:
+            continue
+        yield MetaStepStateEvent(
+            run_id=_run_id,
+            step_id=step.id,
+            state="succeeded",
+            status_text="Reused from the previous run",
+        )
 
     def _yield_completion(
         outcome: Literal["ok", "failed", "cancelled"],
@@ -578,8 +698,9 @@ async def run_dag(
         )
 
     steps_by_id: dict[str, MetaStep] = {s.id: s for s in ordered}
+    reusable_output_ids = set(outputs) - replay_pending_primary_ids
     pending_deps: dict[str, set[str]] = {
-        s.id: set(s.depends_on) - set(outputs.keys()) for s in ordered
+        s.id: set(s.depends_on) - reusable_output_ids for s in ordered
     }
     # Steps that are *only* reachable as another step's ``on_failure``
     # substitute must not run autonomously — they exist on the DAG so
@@ -590,6 +711,21 @@ async def run_dag(
     substitute_only: set[str] = {
         s.on_failure for s in ordered if s.on_failure
     }
+    trusted_replay_aliases = {
+        substitute_id: primary_id
+        for substitute_id, primary_id in (replay_failover_aliases or {}).items()
+        if (
+            substitute_id in steps_by_id
+            and primary_id in outputs
+            and getattr(steps_by_id.get(primary_id), "on_failure", "") == substitute_id
+            and substitute_id not in outputs
+        )
+    }
+    # A failed fallback replay intentionally starts that substitute directly;
+    # mirror normal failover semantics by clearing its declared dependencies.
+    for substitute_id in trusted_replay_aliases:
+        substitute_only.discard(substitute_id)
+        pending_deps[substitute_id] = set()
     unstarted: set[str] = (
         set(steps_by_id.keys()) - substitute_only - set(outputs.keys())
     )
@@ -598,7 +734,7 @@ async def run_dag(
     # id to the original failed step id. On the substitute's ``_StepDone``
     # we mirror its output into the original's slot so downstream
     # ``depends_on`` links see a value as if the original had succeeded.
-    failover_aliases: dict[str, str] = {}
+    failover_aliases: dict[str, str] = dict(trusted_replay_aliases)
     # ``final_text`` is taken from the last non-substitute step in topological
     # order. Substitute-only steps would yield an empty string if they never
     # fire (their primary succeeded), so they cannot serve as the deliverable.
@@ -660,6 +796,11 @@ async def run_dag(
             if not evaluate_when(
                 step.when, inputs=match.inputs, outputs=outputs,
             ):
+                if is_external_paid_step(step):
+                    _record_paid_submission_disposition(
+                        step.id,
+                        PAID_SUBMISSION_SAFE_NO_SUBMIT,
+                    )
                 log.info(
                     "meta_orchestrator.step_skipped",
                     step=step.id,
@@ -766,10 +907,16 @@ async def run_dag(
 
             if on_step_begin is not None:
                 try:
+                    observer_outputs = dict(outputs)
+                    # Receipt proofs are valid only inside this scheduler
+                    # process. Observability hooks may persist their rendered
+                    # inputs, so give them an empty machine channel while the
+                    # actual executor below retains the live proof map.
+                    observer_outputs[PAID_SUBMISSION_RECEIPT_PROOFS_OUTPUT_KEY] = "{}"
                     rendered_inputs = render_with_args(
                         step.with_args,
                         inputs=dict(match.inputs),
-                        outputs=outputs,
+                        outputs=observer_outputs,
                     )
                     await on_step_begin(
                         step.id, effective_skill, rendered_inputs,
@@ -782,16 +929,38 @@ async def run_dag(
                     )
 
             final_text = ""
+            current_receipt_proof: str | None = None
             with usage_scope(f"{scope_prefix}:{step.id}"):
                 async for ev in dispatch_step_stream(
                     step, effective_skill, match.inputs, outputs,
                 ):
                     if isinstance(ev, _StepDone):
-                        final_text = ev.text
+                        current_receipt_proof = paid_receipt_proof(ev.text)
+                        # Strip the private str-subclass carrier immediately;
+                        # templates, persistence and public events receive an
+                        # ordinary string only.
+                        final_text = str(ev.text)
                     else:
                         await event_queue.put((step.id, ev))
 
             outputs[step.id] = final_text
+            if is_external_paid_step(step):
+                # Exit zero alone does not prove that a matching receipt was
+                # produced by this invocation. Only the exact bundled
+                # executor can attach the stdout+sidecar digest carrier.
+                if current_receipt_proof is not None:
+                    _record_paid_submission_receipt_proof(
+                        step.id,
+                        current_receipt_proof,
+                    )
+                _record_paid_submission_disposition(
+                    step.id,
+                    (
+                        PAID_SUBMISSION_RECEIPT
+                        if current_receipt_proof is not None
+                        else PAID_SUBMISSION_MAYBE_ACCEPTED
+                    ),
+                )
             log.info(
                 "meta_orchestrator.step_finished",
                 step=step.id,
@@ -854,10 +1023,27 @@ async def run_dag(
             raise
         except Exception as exc:  # noqa: BLE001
             has_substitute = bool(step.on_failure)
+            current_receipt_proof = paid_receipt_proof(exc)
+            if is_external_paid_step(step) and current_receipt_proof is not None:
+                _record_paid_submission_receipt_proof(
+                    step.id,
+                    current_receipt_proof,
+                )
+            persisted_error = str(exc)
+            if is_external_paid_step(step):
+                _record_paid_submission_disposition(
+                    step.id,
+                    (
+                        PAID_SUBMISSION_SAFE_NO_SUBMIT
+                        if paid_replay_is_safe(persisted_error)
+                        else PAID_SUBMISSION_MAYBE_ACCEPTED
+                    ),
+                )
+            display_error = public_step_error(persisted_error)
             log.warning(
                 "meta_orchestrator.step_failed",
                 step=step.id,
-                error=str(exc),
+                error=display_error,
                 failover=has_substitute,
                 substitute=step.on_failure or None,
             )
@@ -866,9 +1052,12 @@ async def run_dag(
             rescue = _failure_rescue_payload(
                 plan_name=match.plan.name,
                 step=step,
-                error=str(exc),
+                error=persisted_error,
                 outputs=outputs,
                 has_substitute=has_substitute,
+                plan_has_external_paid_steps=any(
+                    is_external_paid_step(candidate) for candidate in match.plan.steps
+                ),
             )
             await event_queue.put(
                 (
@@ -876,7 +1065,7 @@ async def run_dag(
                     ToolResultEvent(
                         tool_use_id=step_use_id,
                         tool_name=step_tool_name,
-                        result=str(exc),
+                        result=display_error,
                         is_error=True,
                         arguments={
                             "step": step.id,
@@ -893,7 +1082,7 @@ async def run_dag(
                     run_id=_run_id,
                     step_id=step.id,
                     state="failed",
-                    error=str(exc),
+                    error=display_error,
                     rescue=rescue,
                 ),
             ))
@@ -907,7 +1096,7 @@ async def run_dag(
                         _FailoverTriggered(
                             failed_step_id=step.id,
                             substitute_step_id=step.on_failure,
-                            error=str(exc),
+                            error=persisted_error,
                         ),
                     ),
                 )
@@ -996,12 +1185,16 @@ async def run_dag(
                 # skipped so those dependents unblock.
                 if step_id not in _recovered_failed_step_ids:
                     completed_step = steps_by_id.get(step_id)
-                    substitute_id = getattr(completed_step, "on_failure", None)
-                    if substitute_id and substitute_id in substitute_only:
-                        substitute_only.discard(substitute_id)
-                        _skipped_step_ids.add(substitute_id)
+                    unfired_substitute_id = getattr(completed_step, "on_failure", None)
+                    if (
+                        isinstance(unfired_substitute_id, str)
+                        and unfired_substitute_id
+                        and unfired_substitute_id in substitute_only
+                    ):
+                        substitute_only.discard(unfired_substitute_id)
+                        _skipped_step_ids.add(unfired_substitute_id)
                         for deps in pending_deps.values():
-                            deps.discard(substitute_id)
+                            deps.discard(unfired_substitute_id)
                 _spawn_ready()
                 continue
             if isinstance(item, _FailoverTriggered):
@@ -1098,7 +1291,7 @@ async def run_dag(
                     ok=False,
                     paused=True,
                     paused_payload=item,
-                    step_outputs=dict(outputs),
+                    step_outputs=_public_step_outputs(),
                 )
                 return
             if isinstance(item, Exception):
@@ -1186,7 +1379,7 @@ async def run_dag(
         yield _yield_completion("failed")
         yield MetaResult(
             ok=False,
-            step_outputs=outputs,
+            step_outputs=_public_step_outputs(),
             error=str(failure),
             failed_step_id=failed_step_id,
         )
@@ -1196,7 +1389,7 @@ async def run_dag(
     yield MetaResult(
         ok=True,
         final_text=outputs.get(last_step_id, ""),
-        step_outputs=outputs,
+        step_outputs=_public_step_outputs(),
     )
 
 

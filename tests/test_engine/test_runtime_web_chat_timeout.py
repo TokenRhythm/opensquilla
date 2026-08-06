@@ -100,6 +100,8 @@ def test_explicit_runtime_timeout_has_priority_over_web_cap() -> None:
         "meta_match",
         "meta_launch",
         "meta_resume",
+        "meta_replay",
+        "meta_replay_error",
     ],
 )
 def test_web_chat_runtime_timeout_exemptions(case: str) -> None:
@@ -127,6 +129,14 @@ def test_web_chat_runtime_timeout_exemptions(case: str) -> None:
         metadata["meta_launch"] = {"name": "meta-test"}
     elif case == "meta_resume":
         metadata["meta_resume"] = ("claim", "parsed")
+    elif case == "meta_replay":
+        metadata["meta_replay"] = {
+            "name": "meta-test",
+            "run_id": "run-test",
+            "mode": "failed-step",
+        }
+    elif case == "meta_replay_error":
+        metadata["meta_replay_error"] = "expired"
 
     assert (
         _override(

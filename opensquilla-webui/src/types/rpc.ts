@@ -452,6 +452,29 @@ export interface ChatSendResponse {
   reason?: string
 }
 
+/** Server-owned recovery record for one unaccepted manual MetaSkill launch. */
+export interface MetaLaunchDraftPayload {
+  sessionKey: string
+  clientRequestId: string
+  name: string
+  launchText: string
+  createdAt: number
+  expiresAt: number
+  sessionExists: boolean
+}
+
+export interface MetaDraftsListResponse {
+  ok: boolean
+  durable: boolean
+  drafts: MetaLaunchDraftPayload[]
+}
+
+export interface MetaDraftDiscardResponse {
+  ok: boolean
+  discarded: boolean
+  accepted?: boolean
+}
+
 export interface SessionSteerV2Params {
   key: string
   message: string

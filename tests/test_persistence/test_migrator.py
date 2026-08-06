@@ -27,6 +27,123 @@ from opensquilla.session.storage import SessionStorage
 _REPO_MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
 
+@pytest.mark.asyncio
+async def test_meta_control_migration_chain_rolls_back_without_ordinary_data_loss(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    storage = await SessionStorage.open(str(db_path))
+    await storage.close()
+
+    tail_ids = (
+        "V030__meta_control_intents",
+        "V031__meta_launch_drafts",
+        "V032__meta_launch_discard_tombstones",
+    )
+    tail_tables = (
+        "meta_control_intents",
+        "meta_launch_drafts",
+        "meta_launch_discard_tombstones",
+    )
+    meta_objects = {
+        *tail_tables,
+        "uq_meta_control_intents_correlation",
+        "idx_meta_control_intents_session_status",
+        "uq_meta_launch_drafts_request",
+        "idx_meta_launch_drafts_session_expiry",
+        "idx_meta_launch_discard_tombstones_expiry",
+    }
+    with sqlite3.connect(db_path) as connection:
+        for table in reversed(tail_tables):
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
+
+    backend = migrator.get_backend(migrator._to_yoyo_url(str(db_path)))
+    try:
+        migrations = migrator.read_migrations(str(_REPO_MIGRATIONS_DIR))
+        by_id = {migration.id: migration for migration in migrations}
+        migration_list_type = type(migrations)
+        base = migration_list_type(
+            [migration for migration in migrations if migration.id < tail_ids[0]],
+            migrations.post_apply,
+        )
+        with backend.lock():
+            backend.apply_migrations(backend.to_apply(base))
+
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "INSERT INTO sessions (session_key, session_id, created_at, updated_at) "
+                "VALUES ('agent:main:webchat:rollback-sentinel', 'session-sentinel', 1, 1)"
+            )
+            connection.execute(
+                "INSERT INTO transcript_entries ("
+                "session_id, session_key, message_id, role, content, created_at"
+                ") VALUES ("
+                "'session-sentinel', 'agent:main:webchat:rollback-sentinel', "
+                "'message-sentinel', 'user', 'ordinary data survives', 1"
+                ")"
+            )
+
+        tail = migration_list_type(
+            [by_id[item] for item in tail_ids],
+            migrations.post_apply,
+        )
+        with backend.lock():
+            backend.apply_migrations(backend.to_apply(tail))
+
+        with sqlite3.connect(db_path) as connection:
+            present = {
+                name
+                for (name,) in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name IN ("
+                    + ",".join("?" for _item in meta_objects)
+                    + ")",
+                    tuple(meta_objects),
+                )
+            }
+        assert present == meta_objects
+
+        with backend.lock():
+            backend.rollback_migrations([by_id[item] for item in reversed(tail_ids)])
+    finally:
+        backend.connection.close()
+
+    with sqlite3.connect(db_path) as connection:
+        ordinary_session = connection.execute(
+            "SELECT session_id FROM sessions WHERE session_key = ?",
+            ("agent:main:webchat:rollback-sentinel",),
+        ).fetchone()
+        ordinary_transcript = connection.execute(
+            "SELECT content FROM transcript_entries WHERE message_id = ?",
+            ("message-sentinel",),
+        ).fetchone()
+        remaining_meta_objects = {
+            name
+            for (name,) in connection.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ("
+                + ",".join("?" for _item in meta_objects)
+                + ")",
+                tuple(meta_objects),
+            )
+        }
+    assert ordinary_session == ("session-sentinel",)
+    assert ordinary_transcript == ("ordinary data survives",)
+    assert remaining_meta_objects == set()
+
+    pre_v025_migrations = tmp_path / "pre-v025-migrations"
+    pre_v025_migrations.mkdir()
+    for migration in base:
+        (pre_v025_migrations / f"{migration.id}.py").write_text(
+            "from yoyo import step\n"
+            "__depends__ = set()\n"
+            "steps = [step('SELECT 1')]\n",
+            encoding="utf-8",
+        )
+    migrator.assert_schema_not_ahead(
+        migrator._to_yoyo_url(str(db_path)),
+        pre_v025_migrations,
+    )
+
+
 def test_apply_pending_registers_python312_datetime_adapter(tmp_path: Path) -> None:
     migrations_dir = tmp_path / "migrations"
     migrations_dir.mkdir()

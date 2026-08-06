@@ -213,6 +213,36 @@ def _collect_diagnostics_flags() -> str:
     return json.dumps(logs_status_snapshot(), indent=2, default=str)
 
 
+def _collect_toolchain_inventory(home_dir: Path) -> str:
+    """Collect sanitized managed-component status without local paths."""
+
+    candidates = (
+        home_dir / "state" / "toolchains" / "v1" / "active",
+        home_dir / "toolchains" / "v1" / "active",
+    )
+    active_dir = next((path for path in candidates if path.is_dir()), candidates[0])
+    inventory: list[dict[str, object]] = []
+    for path in sorted(active_dir.glob("*.json"))[:64]:
+        try:
+            if path.is_symlink() or path.stat().st_size > 64 * 1024:
+                continue
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        component_id = raw.get("component_id")
+        if not isinstance(component_id, str) or not component_id.strip():
+            continue
+        item: dict[str, object] = {"component_id": component_id[:128], "active": True}
+        for key in ("version", "platform_key", "install_backend"):
+            value = raw.get(key)
+            if isinstance(value, str) and value:
+                item[key] = value[:128]
+        inventory.append(item)
+    return json.dumps(inventory, indent=2, default=str)
+
+
 def _configured_state_dir() -> Path | None:
     """Best-effort ``state_dir`` from the config TOML (None when unset/unreadable)."""
     try:
@@ -392,6 +422,14 @@ def collect_bundle(
         _attempt(
             "diagnostics.json",
             lambda: _write_text(archive, "diagnostics.json", _collect_diagnostics_flags()),
+        )
+        _attempt(
+            "toolchains.json",
+            lambda: _write_text(
+                archive,
+                "toolchains.json",
+                _collect_toolchain_inventory(home),
+            ),
         )
         _attempt(
             "errors.jsonl",
