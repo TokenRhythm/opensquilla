@@ -3342,6 +3342,17 @@ class OpenAIProvider:
                 cfg.provider_request_correlation,
             )
         )
+        correlation = cfg.provider_request_correlation
+        if (
+            self._provider_kind == "openrouter"
+            and correlation is not None
+            and correlation.call_kind == "prompt_cache_keepalive"
+            and correlation.session_id
+        ):
+            # Keep cache/routing affinity opt-in: normal OpenRouter requests
+            # must retain their existing headers when keepalive is disabled.
+            # Use the opaque random id, never a canonical session key.
+            headers["X-Session-Id"] = correlation.session_id
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
 

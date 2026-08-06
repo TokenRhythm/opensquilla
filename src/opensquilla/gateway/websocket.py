@@ -798,6 +798,7 @@ async def handle_ws_connection(
     memory_managers: dict[str, Any] | None = None,
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
+    prompt_cache_keepalive_service: Any = None,
 ) -> None:
     """Main WebSocket connection handler."""
     if not websocket_origin_allowed(ws, config):
@@ -1006,6 +1007,7 @@ async def handle_ws_connection(
             memory_stores,
             memory_retrievers,
             provider_stats=provider_stats,
+            prompt_cache_keepalive_service=prompt_cache_keepalive_service,
         )
     except WebSocketDisconnect:
         pass
@@ -1094,6 +1096,7 @@ async def _message_loop(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     provider_stats: Any = None,
+    prompt_cache_keepalive_service: Any = None,
 ) -> None:
     ws = conn.ws
     keepalive_timeout = max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 0.0)))
@@ -1189,6 +1192,7 @@ async def _message_loop(
                 flush_service=flush_service,
                 heartbeat_service=heartbeat_service,
                 heartbeat_loop=heartbeat_loop,
+                prompt_cache_keepalive_service=prompt_cache_keepalive_service,
                 agent_registry=agent_registry,
                 diagnostics_state=diagnostics_state,
                 provider_stats=provider_stats,

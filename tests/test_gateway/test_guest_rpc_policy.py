@@ -112,6 +112,14 @@ async def test_anonymous_node_role_cannot_bypass_guest_allowlist() -> None:
             "chat.clarify_submit",
             {"sessionKey": "agent:main:webchat:owner", "fields": {"answer": "no"}},
         ),
+        ("artifacts.list", {"sessionKey": "agent:main:webchat:owner"}),
+        (
+            "artifacts.get",
+            {
+                "sessionKey": "agent:main:webchat:owner",
+                "artifactId": "art-unowned",
+            },
+        ),
         ("sessions.bootstrap", {"key": "agent:main:webchat:owner"}),
         ("sessions.messages.subscribe", {"key": "agent:main:webchat:owner"}),
         ("sessions.messages.hydrate", {"key": "agent:main:webchat:owner"}),
@@ -205,6 +213,17 @@ def test_guest_can_submit_clarification_only_for_owned_session() -> None:
     params = {"sessionKey": owned, "fields": {"destination": "Tokyo"}}
 
     assert GuestRpcPolicy.authorize("chat.clarify_submit", params, ctx) == params
+
+
+@pytest.mark.parametrize("method", ["artifacts.list", "artifacts.get"])
+def test_guest_can_read_artifacts_only_for_owned_session(method: str) -> None:
+    ctx = _ctx()
+    owned = guest_owned_session_key(ctx.principal.guest_owner_id, "mine")
+    params = {"sessionKey": owned}
+    if method == "artifacts.get":
+        params["artifactId"] = "art-owned"
+
+    assert GuestRpcPolicy.authorize(method, params, ctx) == params
 
 
 @pytest.mark.asyncio

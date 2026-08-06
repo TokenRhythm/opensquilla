@@ -90,6 +90,7 @@ class RpcContext:
     flush_service: Any = None  # SessionFlushService | None (injected at boot)
     heartbeat_service: Any = None  # Task-style heartbeat service (injected at boot)
     heartbeat_loop: Any = None  # Background heartbeat loop (injected at boot)
+    prompt_cache_keepalive_service: Any = None  # Opt-in, in-memory session lease service.
     agent_registry: Any = None  # AgentRegistry instance (injected at boot)
     diagnostics_state: Any = None  # DiagnosticsState instance (injected at boot)
     provider_stats: Any = None  # ProviderStatsStore instance (injected at boot)

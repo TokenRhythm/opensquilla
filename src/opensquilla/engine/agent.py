@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import functools
 import hashlib
 import inspect
@@ -69,6 +70,7 @@ from opensquilla.engine.post_write_convergence import (
     PostWriteConvergenceTracker,
 )
 from opensquilla.engine.progress_watchdog import ProgressObservation, ProgressWatchdog
+from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
 from opensquilla.engine.runtime_diagnostics import RuntimeDiagnosticsObserver
 from opensquilla.engine.runtime_events import append_runtime_event
 from opensquilla.engine.runtime_recovery import (
@@ -2543,6 +2545,11 @@ class Agent:
         self._usage_event_sink = usage_event_sink
         self._usage_execution_context = usage_execution_context
         self._provider_request_correlation = provider_request_correlation
+        # Populated only by a successful real provider stream.  TurnRunner
+        # publishes it after durable finalization, so failed/cancelled turns
+        # can never arm a gateway keepalive probe.
+        self._prompt_cache_keepalive_candidate: PromptCacheKeepaliveCandidate | None = None
+        self._prompt_cache_keepalive_capture_enabled = False
         if self.tool_handler is not None and self._tool_context is not None:
             self.tool_handler = self._bind_tool_handler_context(
                 self.tool_handler,
@@ -5698,6 +5705,16 @@ class Agent:
 
         return list(self._history)
 
+    def prompt_cache_keepalive_candidate(self) -> PromptCacheKeepaliveCandidate | None:
+        """Return the last successful call's stable-prefix candidate, if any."""
+
+        return self._prompt_cache_keepalive_candidate
+
+    def set_prompt_cache_keepalive_capture_enabled(self, enabled: bool) -> None:
+        """Arm stable-prefix copying for an explicitly enabled session only."""
+
+        self._prompt_cache_keepalive_capture_enabled = bool(enabled)
+
     def _usage_context_for_turn(self) -> UsageExecutionContext:
         """Return the injected execution identity or a safe direct-Agent fallback."""
 
@@ -5802,6 +5819,8 @@ class Agent:
             clear_sandbox_approval_denials,
             prune_once_mount_grants,
         )
+
+        self._prompt_cache_keepalive_candidate = None
 
         try:
             if self._session_key:
@@ -5973,6 +5992,18 @@ class Agent:
         # Skills context, multimodal inputs, and the active user request all
         # belong to the protected current turn.
         current_turn_start_index = len(turn_messages)
+        # A one-turn-lag prefix is intentional: every message in this slice was
+        # already provider input before this turn.  The newly generated
+        # assistant response was not, so including it would claim a cache
+        # identity the provider has never seen.
+        keepalive_stable_history = (
+            tuple(
+                message.model_copy(deep=True)
+                for message in turn_messages[:current_turn_start_index]
+            )
+            if self._prompt_cache_keepalive_capture_enabled
+            else ()
+        )
         message_count_request_view: _MessageCountRequestView | None = None
         # Insert this turn's skills context BEFORE the user content so it
         # joins turn_messages permanently (persists into self._history at
@@ -7754,6 +7785,51 @@ class Agent:
                                     continue
                                 provider_done_for_log = raw_ev
                                 _got_done_event = True
+                                if keepalive_stable_history and self._session_key:
+                                    try:
+                                        self._prompt_cache_keepalive_candidate = (
+                                            PromptCacheKeepaliveCandidate(
+                                                session_key=self._session_key,
+                                                provider=self.provider,
+                                                provider_id=str(
+                                                    getattr(
+                                                        self.provider,
+                                                        "active_provider_id",
+                                                        "",
+                                                    )
+                                                    or self.config.provider_id
+                                                    or getattr(
+                                                        self.provider,
+                                                        "provider_id",
+                                                        "",
+                                                    )
+                                                    or getattr(
+                                                        self.provider,
+                                                        "provider_name",
+                                                        "",
+                                                    )
+                                                    or ""
+                                                ),
+                                                model=str(
+                                                    raw_ev.model
+                                                    or self.config.model_id
+                                                    or ""
+                                                ),
+                                                messages=keepalive_stable_history,
+                                                tools=tuple(
+                                                    copy.deepcopy(
+                                                        provider_tools_for_call or []
+                                                    )
+                                                ),
+                                                config=call_chat_cfg.model_copy(
+                                                    deep=True
+                                                ),
+                                            )
+                                        )
+                                    except Exception:
+                                        # Snapshotting is strictly optional and
+                                        # must never change a real user turn.
+                                        self._prompt_cache_keepalive_candidate = None
                                 physical_usage_provider = str(
                                     getattr(
                                         raw_ev,

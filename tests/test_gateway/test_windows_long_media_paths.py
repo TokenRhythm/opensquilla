@@ -132,6 +132,13 @@ def test_long_media_roundtrips_material_artifacts_and_downloads(tmp_path: Path) 
             )
             == artifact
         )
+        assert store.get_ref(
+            session_id="session-parent",
+            artifact_id=artifact.id,
+        ) == artifact
+        listed = store.list_refs(session_id="session-parent", limit=100)
+        assert listed.refs == (artifact,)
+        assert listed.total_count == 1
         assert (
             store.copy_session_artifacts(
                 source_session_id="session-parent",

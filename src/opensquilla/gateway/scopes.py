@@ -129,6 +129,9 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.hydrate": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
+    "sessions.promptCacheKeepalive.status": READ_SCOPE,
+    "artifacts.list": READ_SCOPE,
+    "artifacts.get": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,
     "last-heartbeat": READ_SCOPE,
     "system-presence": READ_SCOPE,
@@ -234,6 +237,7 @@ METHOD_SCOPES: dict[str, str] = {
     # REMOTE_OPERATOR_SCOPES (no admin) — surfacing as "Failed to delete session"
     # (issues #357, #307).
     "sessions.delete": WRITE_SCOPE,
+    "sessions.promptCacheKeepalive.set": WRITE_SCOPE,
     "sandbox.workspace.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.mount.add": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.mount.remove": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.

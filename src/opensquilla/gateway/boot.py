@@ -680,6 +680,7 @@ class ServiceContainer:
     task_runtime: Any = None
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
+    prompt_cache_keepalive_service: Any = None
     daily_usage_telemetry_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     deferred_warmups: list[Callable[[], Any]] = field(default_factory=list)
     deferred_warmup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
@@ -807,6 +808,12 @@ class ServiceContainer:
                 pass
             except Exception:
                 log.debug("gateway.usage_telemetry_close_failed", exc_info=True)
+        if self.prompt_cache_keepalive_service is not None:
+            try:
+                await self.prompt_cache_keepalive_service.close()
+            except Exception:
+                pass
+            self.prompt_cache_keepalive_service = None
         if self.heartbeat_watcher is not None:
             try:
                 await self.heartbeat_watcher.stop()
@@ -3667,6 +3674,8 @@ async def start_gateway_server(
 
     from opensquilla.engine.cache_break_monitor import add_compaction_listener
 
+    prompt_cache_keepalive_service: Any = None
+
     def _emit_runtime_compaction_event(
         session_key: str,
         payload: dict[str, Any],
@@ -3676,6 +3685,11 @@ async def start_gateway_server(
         event_payload = dict(payload or {})
         event_payload.setdefault("status", "completed")
         event_payload.setdefault("source", "automatic")
+        if (
+            event_payload.get("status") == "completed"
+            and prompt_cache_keepalive_service is not None
+        ):
+            prompt_cache_keepalive_service.refresh_required(session_key)
         # Lifecycle claiming and replay append now happen in one synchronous
         # call stack. Network delivery remains asynchronous and at-least-once.
         event_payload = get_session_streams().record(
@@ -3763,6 +3777,26 @@ async def start_gateway_server(
     # Wire task_runtime's short write-lock provider into turn_runner.
     turn_runner.set_session_lock_provider(task_runtime._get_session_lock_for_turn)
     svc.task_runtime = task_runtime
+    from opensquilla.gateway.prompt_cache_keepalive import PromptCacheKeepaliveService
+
+    prompt_cache_keepalive_service = PromptCacheKeepaliveService(
+        task_runtime=task_runtime,
+        session_manager=svc.session_manager,
+        usage_event_sink=usage_event_sink,
+    )
+    set_keepalive_recorder = getattr(
+        turn_runner,
+        "set_prompt_cache_keepalive_recorder",
+        None,
+    )
+    if callable(set_keepalive_recorder):
+        set_keepalive_recorder(
+            prompt_cache_keepalive_service.record_candidate,
+            armed=prompt_cache_keepalive_service.is_enabled,
+        )
+    else:
+        log.warning("gateway.prompt_cache_keepalive_recorder_unavailable")
+    svc.prompt_cache_keepalive_service = prompt_cache_keepalive_service
     # Wire the runtime into SessionManager so kill_session can cascade-cancel.
     attach_runtime = getattr(svc.session_manager, "attach_task_runtime", None)
     if callable(attach_runtime):
@@ -4391,6 +4425,7 @@ async def start_gateway_server(
         flush_service=svc.flush_service,
         heartbeat_service=heartbeat_service,
         heartbeat_loop=heartbeat_loop,
+        prompt_cache_keepalive_service=prompt_cache_keepalive_service,
         agent_registry=svc.agent_registry,
         diagnostics_state=diagnostics_state,
         provider_stats=getattr(svc, "provider_stats", None),

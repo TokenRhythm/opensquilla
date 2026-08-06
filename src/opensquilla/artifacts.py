@@ -392,6 +392,15 @@ class ArtifactRef:
         )
 
 
+@dataclass(frozen=True)
+class ArtifactRefPage:
+    """One backwards-pagination page from a session's on-disk artifact index."""
+
+    refs: tuple[ArtifactRef, ...]
+    has_more: bool
+    total_count: int
+
+
 def artifact_marker(ref: dict[str, Any] | ArtifactRef) -> str:
     payload = ref.to_dict() if isinstance(ref, ArtifactRef) else ref
     name = payload.get("name") if isinstance(payload.get("name"), str) else "artifact"
@@ -435,6 +444,18 @@ def artifact_payload(event_or_ref: Any) -> dict[str, Any]:
 
 def artifact_download_url(artifact_id: str) -> str:
     return f"/api/v1/artifacts/{_validate_artifact_id(artifact_id)}"
+
+
+def artifact_cursor(ref: ArtifactRef) -> str:
+    """Return the stable opaque cursor used by artifact list pagination."""
+
+    return _validate_artifact_id(ref.id)
+
+
+def validate_artifact_cursor(value: Any) -> str:
+    """Validate and normalize a client-provided artifact pagination cursor."""
+
+    return _validate_artifact_id(value)
 
 
 def is_installer_artifact_name(name: str | Path) -> bool:
@@ -1497,6 +1518,113 @@ class ArtifactStore:
                 return ref
         return None
 
+    def get_ref(self, *, session_id: str, artifact_id: str) -> ArtifactRef:
+        """Return session-scoped artifact metadata without reading material bytes."""
+
+        session_id = _validate_non_empty("session_id", session_id)
+        artifact_id = _validate_artifact_id(artifact_id)
+        layout = self._preferred_artifact_layout(
+            session_id,
+            artifact_id,
+        )
+        if layout is None or not layout[2]:
+            raise ArtifactNotFoundError("artifact not found")
+        artifact_dir, _material_name, _safe = layout
+        meta_path = artifact_dir / "meta.json"
+        native_meta_path = native_io_path(meta_path)
+        try:
+            meta_stat = native_meta_path.lstat()
+            if (
+                not stat.S_ISREG(meta_stat.st_mode)
+                or stat.S_ISLNK(meta_stat.st_mode)
+                or _is_reparse_point(meta_path)
+            ):
+                raise ArtifactNotFoundError("artifact not found")
+            raw = json.loads(native_meta_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ArtifactNotFoundError("artifact not found")
+            ref = ArtifactRef.from_dict(raw)
+        except ArtifactNotFoundError:
+            raise
+        except (OSError, ValueError, json.JSONDecodeError):
+            raise ArtifactNotFoundError("artifact not found") from None
+        if ref.id != artifact_id or ref.session_id != session_id:
+            raise ArtifactNotFoundError("artifact not found")
+        material_path, material_exists = self._preferred_material_path_for_ref(ref)
+        if not material_exists or material_path is None:
+            raise ArtifactNotFoundError("artifact not found")
+        return ref
+
+    def list_refs(
+        self,
+        *,
+        session_id: str,
+        limit: int,
+        before: str | None = None,
+    ) -> ArtifactRefPage:
+        """List one backwards page of valid artifact metadata for a session.
+
+        Results inside a page remain oldest-to-newest. Corrupt metadata,
+        cross-session refs, duplicate ids, links/reparse points, and refs whose
+        material is missing are ignored. Listing deliberately checks only material
+        existence; it does not read or hash artifact bytes.
+        """
+
+        session_id = _validate_non_empty("session_id", session_id)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ArtifactError("artifact page limit must be a positive integer")
+        before_id = validate_artifact_cursor(before) if before is not None else None
+
+        refs_by_id: dict[str, ArtifactRef] = {}
+        for meta_path in self._iter_session_meta_paths_for_listing(session_id):
+            try:
+                native_meta_path = native_io_path(meta_path)
+                meta_stat = native_meta_path.lstat()
+                if (
+                    not stat.S_ISREG(meta_stat.st_mode)
+                    or stat.S_ISLNK(meta_stat.st_mode)
+                    or _is_reparse_point(meta_path)
+                ):
+                    continue
+                raw = json.loads(native_meta_path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    continue
+                ref = ArtifactRef.from_dict(raw)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if ref.session_id != session_id:
+                continue
+            # Root-level errors from layout selection are session index failures
+            # and deliberately remain outside the per-metadata recovery block.
+            layout = self._preferred_artifact_layout(session_id, ref.id)
+            if layout is None or not layout[2]:
+                continue
+            artifact_dir, _material_name, _safe = layout
+            selected_meta_path = artifact_dir / "meta.json"
+            if native_io_path(selected_meta_path) != native_meta_path:
+                continue
+            _material_path, material_exists = self._preferred_material_path_for_ref(ref)
+            if ref.id in refs_by_id or not material_exists:
+                continue
+            refs_by_id[ref.id] = ref
+
+        refs = sorted(refs_by_id.values(), key=lambda ref: (ref.created_at, ref.id))
+        total_count = len(refs)
+        if before_id is not None:
+            before_index = next(
+                (index for index, ref in enumerate(refs) if ref.id == before_id),
+                None,
+            )
+            if before_index is None:
+                raise ArtifactError("artifact cursor not found")
+            refs = refs[:before_index]
+        page_refs = refs[-limit:]
+        return ArtifactRefPage(
+            refs=tuple(page_refs),
+            has_more=len(refs) > len(page_refs),
+            total_count=total_count,
+        )
+
     def describe_preview_bundle(
         self,
         artifact_id: str,
@@ -1732,6 +1860,58 @@ class ArtifactStore:
                 seen.add(resolved)
                 yield meta_path
 
+    def _iter_session_meta_paths_for_listing(self, session_id: str) -> Iterator[Path]:
+        """Yield safe metadata paths while preserving directory-level failures."""
+
+        roots = (
+            *self._artifact_session_roots(session_id),
+            self.media_root
+            / ARTIFACT_STORE
+            / _safe_token(_validate_non_empty("session_id", session_id)),
+        )
+        seen: set[Path] = set()
+        for root in roots:
+            native_root = native_io_path(root)
+            try:
+                root_stat = native_root.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or stat.S_ISLNK(root_stat.st_mode)
+                or _is_reparse_point(root)
+            ):
+                continue
+            # Materialize the child list so a directory-level iteration error is
+            # raised before any partial page can be returned.
+            artifact_dirs = sorted(native_root.iterdir(), key=lambda path: path.name)
+            for artifact_dir in artifact_dirs:
+                try:
+                    artifact_dir_stat = artifact_dir.lstat()
+                except OSError:
+                    continue
+                if (
+                    not stat.S_ISDIR(artifact_dir_stat.st_mode)
+                    or stat.S_ISLNK(artifact_dir_stat.st_mode)
+                    or _is_reparse_point(artifact_dir)
+                ):
+                    continue
+                meta_path = artifact_dir / "meta.json"
+                try:
+                    meta_stat = meta_path.lstat()
+                except OSError:
+                    continue
+                if (
+                    not stat.S_ISREG(meta_stat.st_mode)
+                    or stat.S_ISLNK(meta_stat.st_mode)
+                    or _is_reparse_point(meta_path)
+                ):
+                    continue
+                if meta_path in seen:
+                    continue
+                seen.add(meta_path)
+                yield meta_path
+
     def _copy_one_artifact(
         self,
         ref: ArtifactRef,
@@ -1883,6 +2063,133 @@ class ArtifactStore:
             / ARTIFACT_SESSION_BUCKET
             / _session_store_token(session_id, chars=LEGACY_ARTIFACT_STORE_TOKEN_CHARS),
         )
+
+    def _artifact_layout_candidates(
+        self,
+        session_id: str,
+        artifact_id: str,
+    ) -> tuple[tuple[Path, str | None], ...]:
+        """Return layouts in precedence order with their material naming convention."""
+
+        return (
+            (self._artifact_dir(session_id, artifact_id), ARTIFACT_MATERIAL_NAME),
+            (self._legacy_short_artifact_dir(session_id, artifact_id), ARTIFACT_MATERIAL_NAME),
+            (self._legacy_artifact_dir(session_id, artifact_id), None),
+        )
+
+    def _preferred_artifact_layout(
+        self,
+        session_id: str,
+        artifact_id: str,
+    ) -> tuple[Path, str | None, bool] | None:
+        """Select the same first-on-disk metadata layout as downloads.
+
+        The boolean reports whether every traversed layout component and the
+        selected metadata file are ordinary, non-link filesystem objects. An
+        unsafe higher-priority layout blocks legacy fallback, keeping list/get
+        visibility consistent with ``_resolve_meta_path`` without following it.
+        """
+
+        for artifact_dir, material_name in self._artifact_layout_candidates(
+            session_id,
+            artifact_id,
+        ):
+            root = artifact_dir.parent
+            try:
+                root_stat = native_io_path(root).lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or stat.S_ISLNK(root_stat.st_mode)
+                or _is_reparse_point(root)
+            ):
+                return artifact_dir, material_name, False
+            try:
+                artifact_dir_stat = native_io_path(artifact_dir).lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return artifact_dir, material_name, False
+            if (
+                not stat.S_ISDIR(artifact_dir_stat.st_mode)
+                or stat.S_ISLNK(artifact_dir_stat.st_mode)
+                or _is_reparse_point(artifact_dir)
+            ):
+                return artifact_dir, material_name, False
+            meta_path = artifact_dir / "meta.json"
+            try:
+                meta_stat = native_io_path(meta_path).lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return artifact_dir, material_name, False
+            return (
+                artifact_dir,
+                material_name,
+                stat.S_ISREG(meta_stat.st_mode)
+                and not stat.S_ISLNK(meta_stat.st_mode)
+                and not _is_reparse_point(meta_path),
+            )
+        return None
+
+    def _preferred_material_path_for_ref(
+        self,
+        ref: ArtifactRef,
+    ) -> tuple[Path | None, bool]:
+        """Select ``path_for(ref)`` precedence without following filesystem links."""
+
+        _validate_sha256(ref.sha256)
+        candidates = (
+            self._artifact_dir(ref.session_id, ref.id) / ARTIFACT_MATERIAL_NAME,
+            self._legacy_short_artifact_dir(ref.session_id, ref.id)
+            / ARTIFACT_MATERIAL_NAME,
+            self._legacy_artifact_dir(ref.session_id, ref.id) / ref.sha256,
+        )
+        for index, material_path in enumerate(candidates):
+            artifact_dir = material_path.parent
+            root = artifact_dir.parent
+            try:
+                root_stat = native_io_path(root).lstat()
+            except FileNotFoundError:
+                if index < len(candidates) - 1:
+                    continue
+                return material_path, False
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or stat.S_ISLNK(root_stat.st_mode)
+                or _is_reparse_point(root)
+            ):
+                return material_path, False
+            try:
+                artifact_dir_stat = native_io_path(artifact_dir).lstat()
+            except FileNotFoundError:
+                if index < len(candidates) - 1:
+                    continue
+                return material_path, False
+            except OSError:
+                return material_path, False
+            if (
+                not stat.S_ISDIR(artifact_dir_stat.st_mode)
+                or stat.S_ISLNK(artifact_dir_stat.st_mode)
+                or _is_reparse_point(artifact_dir)
+            ):
+                return material_path, False
+            try:
+                material_stat = native_io_path(material_path).lstat()
+            except FileNotFoundError:
+                if index < len(candidates) - 1:
+                    continue
+                return material_path, False
+            except OSError:
+                return material_path, False
+            return (
+                material_path,
+                stat.S_ISREG(material_stat.st_mode)
+                and not stat.S_ISLNK(material_stat.st_mode)
+                and not _is_reparse_point(material_path),
+            )
+        return None, False
 
     def _legacy_artifact_dir(self, session_id: str, artifact_id: str) -> Path:
         return (

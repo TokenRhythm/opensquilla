@@ -193,6 +193,9 @@ export interface SessionsSearchResponse {
 export interface ArtifactPayload {
   id?: string
   key?: string
+  kind?: string
+  sha256?: string
+  session_id?: string
   session_key?: string
   sessionKey?: string
   epoch?: number
@@ -200,9 +203,31 @@ export interface ArtifactPayload {
   name?: string
   mime?: string
   size?: number | string
+  source?: string
+  created_at?: string
+  createdAt?: string
+  store?: string
   download_url?: string
   thumbnail_url?: string
   [key: string]: unknown
+}
+
+export interface ArtifactsListResponse {
+  artifacts?: ArtifactPayload[]
+  has_more?: boolean
+  hasMore?: boolean
+  oldest_cursor?: string | null
+  oldestCursor?: string | null
+  newest_cursor?: string | null
+  newestCursor?: string | null
+  total_count?: number
+  totalCount?: number
+  page_size?: number
+  pageSize?: number
+}
+
+export interface ArtifactsGetResponse {
+  artifact?: ArtifactPayload | null
 }
 
 export interface StreamEventEnvelope {
