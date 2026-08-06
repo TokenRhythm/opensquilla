@@ -4,7 +4,21 @@ from __future__ import annotations
 
 from typing import Any
 
+from opensquilla import __version__
 from opensquilla.mcp_server.bridge import OpenSquillaMCPBridge
+
+
+def _stamp_server_version(mcp: Any, version: str) -> None:
+    """Stamp the product version onto the low-level MCP server.
+
+    FastMCP does not expose a ``version`` constructor argument; the low-level
+    server otherwise reports the MCP SDK version in ``initialize``, which is
+    misleading. Set the attribute directly when it is still unset.
+    """
+
+    low_level = getattr(mcp, "_mcp_server", None)
+    if low_level is not None and getattr(low_level, "version", None) is None:
+        low_level.version = version
 
 
 def create_mcp_server(
@@ -26,6 +40,7 @@ def create_mcp_server(
 
     bridge = bridge or OpenSquillaMCPBridge()
     mcp = fastmcp_cls(name, json_response=True)
+    _stamp_server_version(mcp, __version__)
 
     @mcp.tool(name="conversations_list")
     async def conversations_list(limit: int = 50) -> dict[str, Any]:

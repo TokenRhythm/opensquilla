@@ -60,6 +60,29 @@ def _profile_from_top_level_argv(argv: list[str]) -> str | None:
     return None
 
 
+def _early_version_flag(argv: list[str]) -> bool:
+    """Return True when a top-level ``--version``/``-V`` precedes any command.
+
+    Typer/click do not reliably surface callback-only options on apps with
+    ``no_args_is_help=True`` (click >= 8.2 reports "Missing command"), so the
+    version flag is handled here before Typer parses anything.
+    """
+
+    index = 1
+    while index < len(argv):
+        value = argv[index]
+        if value in ("--version", "-V"):
+            return True
+        if value == "--profile":
+            index += 2
+            continue
+        if value.startswith("-"):
+            index += 1
+            continue
+        return False
+    return False
+
+
 def _is_offline_import_verification(argv: list[str]) -> bool:
     """Recognize the internal receipt verifier before dotenv bootstrap."""
 
@@ -106,6 +129,12 @@ def _load_env_for_active_home() -> None:
     load_env(cwd=cwd, home=home)
     _LOADED_ENV_CONTEXTS.add(context)
 
+
+if _early_version_flag(sys.argv):
+    from opensquilla import __version__
+
+    typer.echo(__version__)
+    raise SystemExit(0)
 
 _preactivate_profile_from_argv(sys.argv)
 
@@ -173,7 +202,22 @@ def _main_callback(
         envvar="OPENSQUILLA_PROFILE",
         help="Use a named OpenSquilla profile home.",
     ),
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        help="Show the installed OpenSquilla version and exit.",
+    ),
 ) -> None:
+    # The --version/-V flag is normally short-circuited by _early_version_flag
+    # before Typer parses (click >= 8.2 mishandles callback-only options with
+    # no_args_is_help=True). Keeping the option here surfaces it in --help and
+    # acts as a fallback for direct app invocation (e.g. CliRunner tests).
+    if version:
+        from opensquilla import __version__
+
+        typer.echo(__version__)
+        raise typer.Exit()
     # Route structlog output on CLI paths to stderr (WARNING+) so command
     # stdout stays clean; the gateway bridge and interactive TUI install
     # their own richer configurations over this default when they run.

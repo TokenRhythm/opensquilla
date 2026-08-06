@@ -694,6 +694,67 @@ settings live in `opensquilla.toml.example`.
 
 ---
 
+## MCP Server
+
+OpenSquilla can run as a Model Context Protocol (MCP) **server**, exposing its
+session workflows to MCP clients such as Claude Desktop, Cursor, Cline, or
+Cherry Studio. This requires the `mcp` extra:
+
+```sh
+pip install "opensquilla[recommended,mcp]"
+```
+
+### Run the server
+
+```sh
+opensquilla mcp-server run --gateway ws://127.0.0.1:18791/ws
+```
+
+The bridge speaks MCP over stdio: the client launches this command as a child
+process and talks to it through stdin/stdout. `--gateway` defaults to
+`ws://localhost:18791/ws`; it must point at the gateway the client can reach,
+so when the gateway binds a non-loopback address (for example
+`opensquilla gateway run --listen 0.0.0.0`), pass that address here as well.
+
+Auth token resolution order: `--token` > `OPENSQUILLA_GATEWAY_TOKEN` >
+`[auth].token` in the OpenSquilla config file.
+
+### Client configuration
+
+Clients that support stdio MCP servers take a command plus arguments. Example
+entry for Claude Desktop / Cursor:
+
+```json
+{
+  "mcpServers": {
+    "opensquilla": {
+      "command": "/absolute/path/to/opensquilla",
+      "args": ["mcp-server", "run", "--gateway", "ws://127.0.0.1:18791/ws"]
+    }
+  }
+}
+```
+
+### Exposed tools and resources
+
+| Kind | Name | Description |
+| --- | --- | --- |
+| tool | `conversations_list` | List sessions visible to the gateway principal |
+| tool | `session_resolve` | Resolve a session key or identifier to metadata |
+| tool | `messages_read` | Read persisted messages for a session |
+| tool | `messages_send` | Send a message to a session (`intent: continue`) |
+| tool | `events_wait` | Wait for live or replayed gateway events |
+| tool | `transcript_export` | Export a full session transcript as JSONL |
+| resource | `opensquilla://sessions` | All sessions |
+| resource (template) | `opensquilla://sessions/{key}` | Session metadata |
+| resource (template) | `opensquilla://sessions/{key}/messages` | Session messages |
+| resource (template) | `opensquilla://sessions/{key}/transcript.jsonl` | Session transcript |
+
+Resources with a `{key}` placeholder are MCP **resource templates**; clients
+enumerate them via `resources/templates/list` rather than `resources/list`.
+
+---
+
 ## What's New in 0.5.0
 
 OpenSquilla 0.5.0 is the first stable release of the 0.5 line, collecting
