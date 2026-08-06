@@ -8,11 +8,13 @@ import time
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from opensquilla.gateway_client import normalize_gateway_url
+from opensquilla.gateway_client import default_gateway_token, normalize_gateway_url
 
 
 class GatewayClientLike(Protocol):
-    async def connect(self, url: str) -> None: ...
+    async def connect(
+        self, url: str, *, auth: dict[str, Any] | None = None
+    ) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -33,6 +35,15 @@ def _default_gateway_client() -> GatewayClientLike:
     return GatewayRPCClient()
 
 
+def _resolve_auth(auth_token: str | None) -> dict[str, Any] | None:
+    """Resolve the gateway auth payload: explicit token -> env/config -> None."""
+
+    token = (auth_token or "").strip()
+    if not token:
+        token = (default_gateway_token() or "").strip()
+    return {"token": token} if token else None
+
+
 class OpenSquillaMCPBridge:
     """Small product bridge from MCP tools/resources to existing gateway RPCs."""
 
@@ -41,6 +52,7 @@ class OpenSquillaMCPBridge:
         *,
         gateway_url: str | None = None,
         gateway_client_factory: Callable[[], GatewayClientLike] = _default_gateway_client,
+        auth_token: str | None = None,
     ) -> None:
         raw_url = (
             gateway_url
@@ -50,6 +62,7 @@ class OpenSquillaMCPBridge:
         self.gateway_url = normalize_gateway_url(raw_url)
         self._gateway_client_factory = gateway_client_factory
         self._client: GatewayClientLike | None = None
+        self._auth = _resolve_auth(auth_token)
 
     async def close(self) -> None:
         if self._client is not None:
@@ -59,7 +72,7 @@ class OpenSquillaMCPBridge:
     async def _ensure_client(self) -> GatewayClientLike:
         if self._client is None:
             client = self._gateway_client_factory()
-            await client.connect(self.gateway_url)
+            await client.connect(self.gateway_url, auth=self._auth)
             self._client = client
         return self._client
 
@@ -84,7 +97,7 @@ class OpenSquillaMCPBridge:
         attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         client = self._gateway_client_factory()
-        await client.connect(self.gateway_url)
+        await client.connect(self.gateway_url, auth=self._auth)
         try:
             subscription = await self._subscribe_messages(client, key, since_stream_seq=None)
             result = await client.call(
@@ -121,7 +134,7 @@ class OpenSquillaMCPBridge:
         terminal_only: bool = False,
     ) -> dict[str, Any]:
         client = self._gateway_client_factory()
-        await client.connect(self.gateway_url)
+        await client.connect(self.gateway_url, auth=self._auth)
         try:
             subscription = await self._subscribe_messages(
                 client, key, since_stream_seq=since_stream_seq

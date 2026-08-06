@@ -17,13 +17,22 @@ def run_mcp_server(
         envvar="OPENSQUILLA_GATEWAY_URL",
         help="OpenSquilla gateway URL to bridge to.",
     ),
+    token: str | None = typer.Option(
+        None,
+        "--token",
+        envvar="OPENSQUILLA_GATEWAY_TOKEN",
+        help="Gateway auth token (defaults to OPENSQUILLA_GATEWAY_TOKEN or config [auth].token).",
+    ),
 ) -> None:
     """Run a stdio MCP server exposing OpenSquilla session workflows."""
 
     from opensquilla.mcp_server.bridge import OpenSquillaMCPBridge
     from opensquilla.mcp_server.server import create_mcp_server
 
-    bridge = OpenSquillaMCPBridge(gateway_url=normalize_gateway_url(gateway_url))
+    bridge = OpenSquillaMCPBridge(
+        gateway_url=normalize_gateway_url(gateway_url),
+        auth_token=token,
+    )
     try:
         mcp = create_mcp_server(bridge)
     except RuntimeError as exc:

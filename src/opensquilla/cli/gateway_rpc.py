@@ -68,41 +68,7 @@ def _target_gateway_url(
     return default_gateway_url()
 
 
-def default_gateway_token(config_path: str | Path | None = None) -> str | None:
-    """Resolve the auth token used to connect to the gateway.
-
-    Resolution order (matches the gateway's own config-loading
-    precedence, so a single ``opensquilla.toml`` works for both ends):
-
-      1. ``OPENSQUILLA_GATEWAY_TOKEN`` env var (explicit override)
-      2. ``GatewayConfig.auth.token`` (from the explicit CLI config path,
-         ``OPENSQUILLA_GATEWAY_CONFIG_PATH`` env var,
-         ``./opensquilla.toml``, or ``~/.opensquilla/config.toml``)
-      3. ``None`` — the connect handshake omits ``auth`` and only
-         works against ``[auth] mode = "none"`` deployments.
-
-    Returns ``None`` instead of raising on any load failure so the
-    CLI still tries to connect (UNAUTHORIZED is more informative than
-    a config-loader crash).
-    """
-    env = os.environ.get("OPENSQUILLA_GATEWAY_TOKEN", "").strip()
-    if env:
-        return env
-    try:
-        from opensquilla.gateway.config import GatewayConfig
-
-        effective_config_path = (
-            str(config_path)
-            if config_path is not None
-            else os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH", "").strip()
-        )
-        cfg = GatewayConfig.load(effective_config_path or None)
-        token = getattr(getattr(cfg, "auth", None), "token", None)
-        if isinstance(token, str) and token.strip():
-            return token.strip()
-    except Exception:  # noqa: BLE001 — config-loader robustness
-        pass
-    return None
+from opensquilla.gateway_client import default_gateway_token  # noqa: F401  # re-exported: moved to opensquilla.gateway_client
 
 
 def rpc_error_exit_code(code: str | None) -> int:
