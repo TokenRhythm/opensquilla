@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 import pytest
@@ -13,7 +14,11 @@ from opensquilla.channels.feishu import FeishuChannel, FeishuChannelConfig, _Tok
 from opensquilla.channels.matrix import MatrixChannel
 from opensquilla.channels.qq import QQChannel
 from opensquilla.channels.slack import SlackChannel
-from opensquilla.channels.telegram import TelegramChannel, TelegramChannelConfig
+from opensquilla.channels.telegram import (
+    TelegramApiError,
+    TelegramChannel,
+    TelegramChannelConfig,
+)
 from opensquilla.channels.types import OutgoingMessage
 from opensquilla.channels.wecom import WeComChannel, WeComChannelConfig
 
@@ -182,3 +187,61 @@ def test_runtime_reply_defaults_to_markdown_format() -> None:
 
     assert reply.format == "markdown"
     assert reply.content == "**bold** answer"
+
+
+@pytest.mark.asyncio
+async def test_qq_markdown_uses_official_markdown_message() -> None:
+    """QQ markdown replies use msg_type=2 + markdown.content."""
+
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from opensquilla.channels.qq import QQChannelConfig
+
+    channel = QQChannel(QQChannelConfig(name="qq", app_id="a", app_secret="s"))
+    channel.api = SimpleNamespace(
+        post_c2c_message=AsyncMock(),
+        post_group_message=AsyncMock(),
+    )
+    await channel.send(
+        OutgoingMessage(
+            content="**bold** list",
+            format="markdown",
+            metadata={"chat_type": "c2c", "openid": "openid-1", "msg_id": "m-1"},
+        )
+    )
+    channel.api.post_c2c_message.assert_awaited_once()
+    kwargs = channel.api.post_c2c_message.await_args.kwargs
+    assert kwargs["msg_type"] == 2
+    assert kwargs["content"] is None
+    assert kwargs["markdown"]["content"] == "**bold** list"
+
+
+@pytest.mark.asyncio
+async def test_telegram_markdown_failure_falls_back_to_plain_text() -> None:
+    """MarkdownV2 rejection falls back to plain text instead of dropping."""
+
+    channel = TelegramChannel(
+        TelegramChannelConfig(token="bot-token", connection_mode="webhook")
+    )
+    sent: list[dict] = []
+
+    async def fake_api(method: str, payload: dict | None = None) -> Any:
+        sent.append(dict(payload or {}))
+        if method == "sendMessage" and payload.get("parse_mode") == "MarkdownV2":
+            raise TelegramApiError("Bad Request: can't parse entities")
+        return {"ok": True, "result": {"message_id": 1}}
+
+    channel._api = fake_api  # type: ignore[method-assign]
+    await channel.send(
+        OutgoingMessage(
+            content="unescaped _underscore_",
+            format="markdown",
+            metadata={"chat_id": "12345"},
+        )
+    )
+
+    assert len(sent) == 2
+    assert sent[0]["parse_mode"] == "MarkdownV2"
+    assert "parse_mode" not in sent[1]
+    assert sent[1]["text"] == "unescaped _underscore_"
