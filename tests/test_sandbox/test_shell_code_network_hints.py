@@ -1003,6 +1003,25 @@ def test_windows_direct_powershell_argv_injects_proxy_defaults() -> None:
     assert ";;" not in command
 
 
+def test_windows_direct_powershell_argv_rewrites_python_c_to_native_process() -> None:
+    """Full Host must not re-tokenize python -c through powershell -Command."""
+    from opensquilla.tools.builtin import shell
+
+    command = (
+        "& 'C:\\Python\\python.exe' -c "
+        "'from pathlib import Path; print(Path(\"README.md\").name)'"
+    )
+    argv = shell._windows_direct_powershell_argv(command)
+    script = argv[-1]
+
+    assert "Invoke-OpenSquillaPythonProcess" in script
+    assert "ConvertTo-OpenSquillaNativeArgumentLine" in script
+    assert "-FilePath 'C:\\Python\\python.exe'" in script
+    assert "from pathlib import Path; print(Path(\"README.md\").name)" in script
+    # The outer PowerShell -Command wrapper must not keep the fragile -c form.
+    assert "python.exe' -c" not in script
+
+
 def test_windows_shell_host_handles_invoke_webrequest_status_via_managed_proxy(
     tmp_path: Path,
 ) -> None:
