@@ -331,7 +331,7 @@ describe('ActivityDisclosure stale state', () => {
       .toBe('Running commands')
   })
 
-  it('shows the working copy with the pulsing dot when live and not stale', async () => {
+  it('shows the ThinkingOrb when live and not stale', async () => {
     const host = mountDisclosure({
       lifecycle: 'working',
       stepCount: 0,
@@ -339,11 +339,13 @@ describe('ActivityDisclosure stale state', () => {
     })
     await nextTick()
 
-    const dot = host.querySelector('.assistant-activity__live-dot')
+    const orb = host.querySelector('.assistant-activity__live-orb')
     expect(host.querySelector('.assistant-activity__live-label')?.textContent?.trim())
       .toBe('Working')
-    expect(dot?.classList.contains('is-active')).toBe(true)
-    expect(dot?.classList.contains('is-stale')).toBe(false)
+    // When not stale, the ThinkingOrb replaces the pulsing dot
+    expect(orb).not.toBeNull()
+    // The stale dot should not be present
+    expect(host.querySelector('.assistant-activity__live-dot')).toBeNull()
   })
 })
 
