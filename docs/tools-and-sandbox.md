@@ -9,6 +9,8 @@ or channel-connected agents.
 
 For a focused permissions guide, see
 [`approvals-and-permissions.md`](approvals-and-permissions.md).
+For the current Safe mode and Full access behavior, including guest isolation
+and upgrade compatibility, see [`sandbox-security.md`](sandbox-security.md).
 
 ## Built-In Tool Areas
 

@@ -20,6 +20,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 
 _d = get_dispatcher()
 
@@ -232,6 +236,7 @@ class _GatewayFusionCompletion:
         model: str,
         agent_id: str,
         max_tokens: int | None = None,
+        provider_request_max_chars: int = 0,
         request_timeout: float | None = None,
     ) -> None:
         self._ctx = ctx
@@ -239,7 +244,16 @@ class _GatewayFusionCompletion:
         self._provider_id = provider_id
         self._model = model
         self._agent_id = agent_id
-        self._max_tokens = max_tokens
+        request_budget = resolve_auxiliary_request_budget(
+            None,
+            provider_id=provider_id,
+            model=model,
+            max_output_tokens=max_tokens or 16_384,
+            provider_request_max_chars=provider_request_max_chars,
+        )
+        self._max_tokens = request_budget.max_output_tokens
+        self._provider_request_max_chars = request_budget.provider_request_max_chars
+        self._provider_request_max_tokens = request_budget.max_input_tokens
         configured_timeout = request_timeout
         if configured_timeout is None:
             configured_timeout = getattr(
@@ -307,11 +321,18 @@ class _GatewayFusionCompletion:
             output_json_schema=getattr(request, "response_schema", None),
             output_json_schema_strict=True,
             candidate_output_mode="inert_artifact",
+            provider_request_max_chars=self._provider_request_max_chars,
             provider_request_correlation=correlation,
         )
         messages = [
             Message(role="user", content=str(getattr(request, "user_prompt", "") or ""))
         ]
+        ensure_auxiliary_text_fits(
+            messages,
+            system=chat_config.system or "",
+            max_chars=self._provider_request_max_chars,
+            max_tokens=self._provider_request_max_tokens,
+        )
         usage_scope = None
         if getattr(self._ctx, "usage_event_sink", None) is not None:
             usage_scope = UsageAccountingScope(
@@ -514,7 +535,17 @@ def _build_profile_import_service(
             )
         )
     )
-    input_budget_tokens = max(1, int(context_window) - max_output_tokens)
+    request_budget = resolve_auxiliary_request_budget(
+        None,
+        provider_id=provider_id,
+        model=model,
+        context_window_tokens=context_window,
+        max_output_tokens=max_output_tokens,
+    )
+    input_budget_tokens = min(
+        max(1, int(context_window) - request_budget.max_output_tokens),
+        request_budget.max_input_tokens,
+    )
     quotas = ProfileImportQuotas(
         max_file_size_kb=int(getattr(memory_config, "max_file_size_kb", 1024) or 0),
         max_total_size_kb=int(getattr(memory_config, "max_total_size_kb", 102400) or 0),
@@ -534,7 +565,8 @@ def _build_profile_import_service(
         provider_id=provider_id,
         model=model,
         agent_id=agent_id,
-        max_tokens=max_output_tokens,
+        max_tokens=request_budget.max_output_tokens,
+        provider_request_max_chars=request_budget.provider_request_max_chars,
     )
     return ProfileImportService(
         paths,

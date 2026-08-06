@@ -43,6 +43,10 @@ from opensquilla.provider.audio import (
     VoiceConversionResult,
     resolve_elevenlabs_api_key_env,
 )
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.correlation_context import (
     bind_provider_request_correlation,
     current_provider_request_correlation,
@@ -402,6 +406,7 @@ def _mime_to_ext(content_type: str) -> str:
 async def _complete_from_stream(provider: Any, messages: list, config: Any = None) -> str:
     """Consume a chat() stream and return the assembled text response."""
     correlation = current_provider_request_correlation()
+    budget = None
     if config is None:
         config = ChatConfig(provider_request_correlation=correlation)
     elif (
@@ -411,6 +416,37 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         config = config.model_copy(
             update={"provider_request_correlation": correlation},
         )
+    if int(getattr(config, "provider_request_max_chars", 0) or 0) <= 0:
+        budget = resolve_auxiliary_request_budget(
+            provider,
+            max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
+        )
+        config = config.model_copy(
+            update={
+                "max_tokens": budget.max_output_tokens,
+                "provider_request_max_chars": budget.provider_request_max_chars,
+            }
+        )
+    if budget is None:
+        budget = resolve_auxiliary_request_budget(
+            provider,
+            max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
+            provider_request_max_chars=int(
+                getattr(config, "provider_request_max_chars", 0) or 0
+            ),
+        )
+    config = config.model_copy(
+        update={
+            "max_tokens": budget.max_output_tokens,
+            "provider_request_max_chars": budget.provider_request_max_chars,
+        }
+    )
+    ensure_auxiliary_text_fits(
+        messages,
+        max_chars=budget.provider_request_max_chars,
+        max_tokens=budget.max_input_tokens,
+        system=str(getattr(config, "system", "") or ""),
+    )
     scope = current_usage_accounting_scope()
     close_stream = None
     if scope is None:

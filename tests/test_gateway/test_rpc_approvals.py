@@ -287,6 +287,31 @@ async def test_plugin_approval_resolve_returns_first_cross_surface_decision(
         queue.close()
 
 
+@pytest.mark.asyncio
+async def test_exec_approval_resolve_commits_user_source_with_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = ApprovalQueue(db_path=":memory:")
+    monkeypatch.setattr(rpc_approvals, "get_approval_queue", lambda: queue)
+    approval_id = queue.request(
+        "exec",
+        {"toolName": "exec_command", "command": "rm x"},
+    )
+    try:
+        result = await rpc_approvals._handle_exec_approval_resolve(
+            {"id": approval_id, "approved": True},
+            RpcContext(conn_id="test"),
+        )
+
+        assert result["resolved"] is True
+        assert result["approved"] is True
+        entry = queue.get(approval_id)
+        assert entry.approved is True
+        assert entry.params["resolutionSource"] == "user_web"
+    finally:
+        queue.close()
+
+
 def test_gateway_rpc_approvals_keeps_payload_logic_out_of_gateway_boundary() -> None:
     source = Path(rpc_approvals.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)

@@ -378,6 +378,11 @@ class _ResolvedCatalog:
     max_tokens: int
     context_window: int
     capabilities: ModelCapabilities | None
+    # Raw positive global ``llm.context_window_tokens`` value, or zero when
+    # unset. This is deliberately distinct from ``context_window`` because a
+    # per-model override may win for the current deployment while the global
+    # value still governs a later selector fallback without its own override.
+    context_window_tokens_global_override: int = 0
     # Provider/model ceiling resolved without the global llm.max_tokens
     # override. Physical fallback uses it only when ``auto_max_tokens_known``
     # is true, so unknown/self-hosted models are never capped by a generic
@@ -416,6 +421,8 @@ class _AgentConfigAuxiliaries:
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"]
     compaction_profile: Literal["conversation", "coding", "research", "support"]
     compaction_protected_recent_messages: int
+    compaction_total_timeout_seconds: float
+    compaction_heartbeat_interval_seconds: float
     # Agent-token-cfg-derived
     tool_result_projection_max_inline_chars: int
     tool_result_fresh_diagnostic_policy_enabled: bool
@@ -959,7 +966,13 @@ class AgentBootstrapStage:
             temperature=catalog.temperature,
             top_p=catalog.top_p,
             context_window_tokens=catalog.context_window,
+            context_window_tokens_global_override=(
+                catalog.context_window_tokens_global_override
+            ),
             provider_request_proof_max_chars=catalog.provider_request_proof_max_chars,
+            provider_request_proof_max_chars_explicit=(
+                catalog.provider_request_proof_max_chars > 0
+            ),
             max_history_turns=_route_max_history_turns(inp.turn.metadata),
             preserve_historical_images=_preserve_historical_images(inp.turn.metadata),
             materialize_historical_attachments=bool(
@@ -977,6 +990,8 @@ class AgentBootstrapStage:
             flush_compaction_safety_mode=aux.flush_compaction_safety_mode,
             compaction_profile=aux.compaction_profile,
             compaction_protected_recent_messages=(aux.compaction_protected_recent_messages),
+            compaction_total_timeout_seconds=aux.compaction_total_timeout_seconds,
+            compaction_heartbeat_interval_seconds=aux.compaction_heartbeat_interval_seconds,
             flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
             thinking=aux.thinking,

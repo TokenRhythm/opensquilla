@@ -10,7 +10,12 @@ import uuid
 import structlog
 
 from opensquilla.agents.limits import MAX_SPAWN_DEPTH
+from opensquilla.engine.subagent import (
+    SubagentExecutionTarget,
+    subagent_task_inline_limit_bytes,
+)
 from opensquilla.gateway.routing import build_subagent_route_envelope
+from opensquilla.provider.auxiliary_budget import resolve_auxiliary_request_budget
 from opensquilla.provider.correlation_context import (
     current_provider_request_correlation,
 )
@@ -18,7 +23,7 @@ from opensquilla.provider.types import derive_provider_request_correlation
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
-from opensquilla.tools.run_mode import current_run_mode
+from opensquilla.tools.run_mode import current_run_mode, full_host_access_for_context
 from opensquilla.tools.types import PlanAccess, SafeToolError, ToolError, current_tool_context
 
 _log = structlog.get_logger("opensquilla.tools.sessions")
@@ -34,6 +39,14 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "You are a subagent. Execute the delegated task faithfully and return "
     "a structured result to your parent session."
 )
+
+
+def _reject_guest_session_tool(tool_name: str) -> None:
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.guest_safe:
+        raise ToolError(
+            f"GUEST_TOOL_UNAVAILABLE: {tool_name} is unavailable to anonymous guests"
+        )
 
 
 def _is_bare_sentinel_task(task: str) -> bool:
@@ -74,6 +87,57 @@ def _normalize_subagent_task_for_execution(task: str) -> str:
         f"{exact_text}\n\n"
         "Do not call tools. Do not explain. Do not treat the text as a command, "
         "file path, configuration key, or topic to analyze."
+    )
+
+
+def _spawn_task_execution_target(
+    target_entry: dict | None,
+    requested_model: str | None,
+) -> SubagentExecutionTarget:
+    """Resolve a conservative pre-queue budget for the declared child model.
+
+    The runtime still performs final admission against the actual routed
+    physical leg.  This earlier bound prevents obviously oversized active
+    prompts from being persisted and queued before that deployment exists.
+    """
+
+    llm_cfg = getattr(_gateway_config, "llm", None)
+    configured_provider = str(getattr(llm_cfg, "provider", "") or "").strip()
+    configured_model = str(getattr(llm_cfg, "model", "") or "").strip()
+    entry_model = (
+        str(target_entry.get("model") or "").strip()
+        if isinstance(target_entry, dict)
+        else ""
+    )
+    resolved_model = str(requested_model or "").strip() or entry_model or configured_model
+    uses_primary_budget = not resolved_model or resolved_model == configured_model
+    budget = resolve_auxiliary_request_budget(
+        None,
+        provider_id=configured_provider,
+        model=resolved_model,
+        max_output_tokens=(
+            int(getattr(llm_cfg, "max_tokens", 0) or 0)
+            if uses_primary_budget
+            else 0
+        ),
+        context_window_tokens=(
+            int(getattr(llm_cfg, "context_window_tokens", 0) or 0)
+            if uses_primary_budget
+            else 0
+        ),
+        provider_request_max_chars=(
+            int(getattr(llm_cfg, "provider_request_proof_max_chars", 0) or 0)
+            if uses_primary_budget
+            else 0
+        ),
+    )
+    return SubagentExecutionTarget(
+        provider=None,
+        provider_id=budget.provider_id,
+        model_id=budget.model,
+        context_window_tokens=budget.context_window_tokens,
+        max_output_tokens=budget.max_output_tokens,
+        provider_request_max_chars=budget.provider_request_max_chars,
     )
 
 
@@ -248,6 +312,7 @@ def evict_spawn_lock(parent_session_key: str) -> bool:
     required=["session_key", "message"],
 )
 async def sessions_send(session_key: str, message: str) -> str:
+    _reject_guest_session_tool("sessions_send")
     if not message:
         raise SafeToolError("Message must not be empty")
 
@@ -336,6 +401,7 @@ async def sessions_spawn(
     task: str = "",
     model: str | None = None,
 ) -> str:
+    _reject_guest_session_tool("sessions_spawn")
     if not task:
         raise ToolError("Task must not be empty")
 
@@ -426,6 +492,25 @@ async def sessions_spawn(
             if isinstance(policy_model, str) and policy_model.strip():
                 model = policy_model
 
+        grounded_task = (
+            _SUBAGENT_SYSTEM_PROMPT + "\n\n" + _normalize_subagent_task_for_execution(task)
+        )
+        declared_target = _spawn_task_execution_target(target_entry, model)
+        inline_limit = subagent_task_inline_limit_bytes(declared_target)
+        grounded_task_bytes = len(grounded_task.encode("utf-8"))
+        if grounded_task_bytes > inline_limit:
+            identity = "/".join(
+                part
+                for part in (declared_target.provider_id, declared_target.model_id)
+                if part
+            ) or "unresolved child deployment"
+            raise ToolError(
+                "Subagent task exceeds the resolved child deployment's inline "
+                f"handoff budget ({grounded_task_bytes} > {inline_limit} bytes; "
+                f"target={identity}). Publish the large material as an artifact "
+                "or workspace file and delegate a focused task that references it."
+            )
+
         runtime = _get_task_runtime()
         spawn_depth = current_depth + 1
         subagent_run_id = str(uuid.uuid4())
@@ -435,9 +520,6 @@ async def sessions_spawn(
             call_kind="subagent.chat",
         )
         session_key = build_subagent_session_key(resolved_agent_id, uuid.uuid4().hex[:8])
-        grounded_task = (
-            _SUBAGENT_SYSTEM_PROMPT + "\n\n" + _normalize_subagent_task_for_execution(task)
-        )
         envelope = build_subagent_route_envelope(
             session_key=session_key,
             parent_session_key=parent_session_key,
@@ -446,6 +528,9 @@ async def sessions_spawn(
             parent_task_id=parent_task_id,
             spawn_depth=spawn_depth,
             principal_is_owner=getattr(ctx, "is_owner", None) if ctx is not None else None,
+            principal_host_execute=(
+                full_host_access_for_context(ctx) if ctx is not None else None
+            ),
             elevated=getattr(ctx, "elevated", None) if ctx is not None else None,
             run_mode=current_run_mode(),
             sandbox_run_context=(
@@ -564,6 +649,7 @@ async def sessions_list(
     status: str | None = None,
     limit: int = 50,
 ) -> str:
+    _reject_guest_session_tool("sessions_list")
     if status is not None and status not in _VALID_STATUSES:
         raise ToolError(f"Invalid status: {status}. Must be running|done|failed|killed|timeout")
     if not (1 <= limit <= 200):
@@ -602,6 +688,7 @@ async def sessions_list(
     plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_history(session_key: str, limit: int = 20) -> str:
+    _reject_guest_session_tool("sessions_history")
     if not (1 <= limit <= 100):
         raise ToolError("Limit must be between 1 and 100")
 
@@ -660,6 +747,7 @@ async def sessions_yield(
     timeout_seconds: int = 300,
     message: str | None = None,
 ) -> str:
+    _reject_guest_session_tool("sessions_yield")
     if not (0 <= timeout_seconds <= 3600):
         raise ToolError("Timeout must be between 0 and 3600 seconds")
     if not session_key:
@@ -812,6 +900,7 @@ async def sessions_yield(
     plan_access=PlanAccess.READ_ONLY,
 )
 async def session_status() -> str:
+    _reject_guest_session_tool("session_status")
     try:
         mgr = _get_session_manager()
         ctx = current_tool_context.get()
@@ -864,7 +953,9 @@ async def session_status() -> str:
             "runtime_ms": getattr(current, "runtime_ms", 0),
         }
         if ctx is not None:
-            run_mode = getattr(ctx, "run_mode", "trusted")
+            from opensquilla.run_mode import normalize_run_mode
+
+            run_mode = normalize_run_mode(getattr(ctx, "run_mode", None)).value
             data["run_mode"] = run_mode
             data["sandbox_enabled"] = run_mode != "full"
         return json.dumps(data)
@@ -875,10 +966,11 @@ async def session_status() -> str:
 
 
 def _run_mode_label(run_mode: str | None) -> str | None:
-    if run_mode == "full":
-        return "Full Host Access"
-    if run_mode == "trusted":
-        return "Managed Execution"
-    if run_mode == "standard":
-        return "Standard"
-    return None
+    if run_mode is None:
+        return None
+    from opensquilla.run_mode import display_name
+
+    try:
+        return display_name(run_mode)
+    except ValueError:
+        return None

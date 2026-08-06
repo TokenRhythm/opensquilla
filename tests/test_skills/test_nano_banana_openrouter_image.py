@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 from pathlib import Path
+
+import pytest
+from PIL import Image
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = (
@@ -209,41 +213,68 @@ def test_target_slots_does_not_synthesize_when_images_are_declined() -> None:
 
 def test_decode_image_auth_stays_on_openrouter_origin(monkeypatch) -> None:
     mod = _module()
-    opened_headers: list[dict[str, str]] = []
+    downloads: list[tuple[str, dict[str, object]]] = []
 
-    class FakeHeaders:
-        def get_content_type(self) -> str:
-            return "image/png"
+    def fake_download(url: str, **kwargs: object) -> bytes:
+        downloads.append((url, kwargs))
+        return b"image-bytes"
 
-    class FakeResponse:
-        headers = FakeHeaders()
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            return None
-
-        def read(self) -> bytes:
-            return b"image-bytes"
-
-    def fake_urlopen(req, timeout: float = 45.0):
-        del timeout
-        opened_headers.append({key.lower(): value for key, value in req.header_items()})
-        return FakeResponse()
-
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(mod, "download_public_https_bytes", fake_download)
 
     assert mod._decode_image(
         "https://storage.example/image.png",
         "sk-or-secret",
         base_url="https://openrouter.ai/api/v1",
     ) == ("image/png", b"image-bytes")
-    assert "authorization" not in opened_headers[-1]
+    assert downloads[-1][1]["authorization"] == "Bearer sk-or-secret"
+    assert downloads[-1][1]["authorization_base_url"] == "https://openrouter.ai/api/v1"
 
     assert mod._decode_image(
         "https://openrouter.ai/api/v1/images/result.png",
         "sk-or-secret",
         base_url="https://openrouter.ai/api/v1",
     ) == ("image/png", b"image-bytes")
-    assert opened_headers[-1]["authorization"] == "Bearer sk-or-secret"
+    assert downloads[-1][1]["authorization"] == "Bearer sk-or-secret"
+    assert downloads[-1][1]["authorization_base_url"] == "https://openrouter.ai/api/v1"
+
+
+def test_validated_image_mime_decodes_complete_raster() -> None:
+    mod = _module()
+    output = io.BytesIO()
+    Image.new("RGB", (64, 64), color=(24, 48, 96)).save(output, format="PNG")
+
+    assert mod._validated_image_mime(output.getvalue()) == "image/png"
+
+
+def test_validated_image_mime_rejects_placeholder_and_pixel_bomb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mod = _module()
+    tiny = io.BytesIO()
+    Image.new("RGB", (1, 1), color=(24, 48, 96)).save(tiny, format="PNG")
+    with pytest.raises(RuntimeError, match="invalid_image_payload"):
+        mod._validated_image_mime(tiny.getvalue())
+
+    monkeypatch.setattr(mod, "MAX_IMAGE_PIXELS", 4_095)
+    compressed = io.BytesIO()
+    Image.new("RGB", (64, 64), color=(0, 0, 0)).save(compressed, format="PNG")
+    with pytest.raises(RuntimeError, match="invalid_image_payload"):
+        mod._validated_image_mime(compressed.getvalue())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b"\x89PNG\r\n\x1a\n" + (b"\x00" * 1016),
+        b"\xff\xd8\xff" + (b"\x00" * 1021),
+        b"GIF89a" + (b"\x00" * 1018),
+        b"RIFF" + (b"\x00" * 4) + b"WEBP" + (b"\x00" * 1012),
+    ),
+)
+def test_validated_image_mime_rejects_magic_bytes_without_decodable_image(
+    payload: bytes,
+) -> None:
+    mod = _module()
+
+    with pytest.raises(RuntimeError, match="invalid_image_payload"):
+        mod._validated_image_mime(payload)

@@ -331,6 +331,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const collapsible = displayRole === 'user' || displayRole === 'assistant'
       const sameGroup = collapsible && displayRole === prevRole && day === prevDay && day !== ''
       if (collapsible) prevRole = displayRole
+      else if (displayRole === 'maintenance') prevRole = ''
 
       const ownerKey = msg.messageId || msg.clientId || `${msg.role}-${i}`
       const planRevisions = (msg.planRevisions ?? []).map(plan => ({
@@ -356,9 +357,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         ts: msg.ts ?? null,
         showHeader: !sameGroup,
         messageId: msg.messageId,
+        restoredFromHistory: msg.restoredFromHistory,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
         inputDisposition: msg.inputDisposition,
         inputDispositionRevision: msg.inputDispositionRevision,
+        maintenance: msg.maintenance,
         turnOutcome: msg.turnOutcome,
         hasAttachments: !!msg.attachments?.length,
         attachments: msg.attachments,

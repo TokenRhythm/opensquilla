@@ -48,7 +48,9 @@ async def test_live_openrouter_session_compaction_succeeds(tmp_path: Path) -> No
 
         result = await manager.compact_with_result(
             session_key,
-            context_window_tokens=2_000,
+            context_window_tokens=int(
+                os.environ.get("LLM_TEST_CONTEXT_WINDOW_TOKENS", "2000")
+            ),
             config=CompactionConfig(
                 model=os.environ.get("LLM_TEST_MODEL", "openai/gpt-4o-mini"),
                 api_key=api_key,

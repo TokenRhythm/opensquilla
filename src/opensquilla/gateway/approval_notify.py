@@ -32,7 +32,10 @@ from opensquilla.channels.approval_prompt import (
     render_approval_prompt,
 )
 from opensquilla.channels.contract import channel_capability_profile
-from opensquilla.channels.system_messages import render_channel_message
+from opensquilla.channels.system_messages import (
+    ChannelSystemMessageKey,
+    render_channel_message,
+)
 from opensquilla.session.keys import derive_chat_type
 
 log = structlog.get_logger(__name__)
@@ -70,6 +73,24 @@ def _approval_summary(params: dict[str, Any], *, config: Any = None) -> tuple[st
                 render_channel_message("approval_label_path", config=config),
                 f"{path} ({access})" if access else path,
             )
+    elif kind == "sandbox_elevation":
+        action = params.get("action")
+        action = action if isinstance(action, dict) else {}
+        display = action.get("display")
+        display = display if isinstance(display, dict) else {}
+        display_kind = str(display.get("kind") or "").strip()
+        target = str(display.get("target") or "").strip()
+        if target:
+            label_key: ChannelSystemMessageKey = "approval_label_path"
+            if display_kind == "network_access":
+                label_key = "approval_label_network_host"
+            elif display_kind == "run_code":
+                label_key = "approval_label_code"
+            elif display_kind == "run_command":
+                label_key = "approval_label_command"
+            return render_channel_message(label_key, config=config), target
+        justification = str(action.get("justification") or params.get("justification") or "")
+        return render_channel_message("approval_label_command", config=config), justification
     command = str(params.get("command") or "")
     if command:
         return render_channel_message("approval_label_command", config=config), command
@@ -77,6 +98,24 @@ def _approval_summary(params: dict[str, Any], *, config: Any = None) -> tuple[st
         render_channel_message("approval_label_command", config=config),
         str(params.get("toolName") or params.get("action_kind") or ""),
     )
+
+
+def _approval_notice(params: dict[str, Any], *, config: Any = None) -> str:
+    action = params.get("action")
+    action = action if isinstance(action, dict) else {}
+    display = action.get("display")
+    display = display if isinstance(display, dict) else {}
+    if str(display.get("kind") or "") != "delete":
+        return ""
+    backup_state = str(display.get("backup_state") or "")
+    key: ChannelSystemMessageKey | None = None
+    if backup_state == "enabled":
+        key = "approval_delete_backup_enabled"
+    elif backup_state == "disabled":
+        key = "approval_delete_backup_disabled"
+    elif backup_state == "unavailable_requires_confirmation":
+        key = "approval_delete_backup_unavailable"
+    return render_channel_message(key, config=config) if key else ""
 
 
 def _offers_always(params: dict[str, Any]) -> bool:
@@ -107,7 +146,16 @@ def _deny_undeliverable(approval_id: str, reason: str, channel_name: str = "") -
         channel=channel_name,
     )
     try:
-        _get_queue().resolve(approval_id, False, elevated_mode=None)
+        queue = _get_queue()
+        queue.resolve(
+            approval_id,
+            False,
+            elevated_mode=None,
+            resolution_metadata={
+                "resolutionSource": "approval_delivery_failure",
+                "resolutionReason": reason,
+            },
+        )
     except Exception:  # noqa: BLE001 - already resolved or expired.
         log.info(
             "approval_notify.fail_closed_deny_skipped",
@@ -188,6 +236,7 @@ async def _deliver_channel_prompt(
         short_code=short_code,
         offer_always=_offers_always(params),
         summary_label=summary_label,
+        notice=_approval_notice(params, config=config),
         origin_channel_id=str(channel_id or ""),
         origin_is_group=origin_is_group,
         origin_chat_type=origin_chat_type if origin_chat_type != "unknown" else "",

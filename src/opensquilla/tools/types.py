@@ -52,6 +52,8 @@ class ToolContext:
     subagent_depth: int = 0
     agent_id: str = "main"
     workspace_dir: str | None = None
+    guest_safe: bool = False
+    environment: dict[str, str] | None = None
     memory_source_dir: str | None = None
     workspace_strict: bool = False
     scratch_dir: str | None = None
@@ -95,7 +97,7 @@ class ToolContext:
     on_bootstrap_source_write: Callable[[str, str], None] | None = None
     on_runtime_event: Callable[[dict[str, Any]], None] | None = None
     # Legacy elevated mode compatibility. New code should treat only "full" as
-    # host execution; standard/trusted run modes stay sandboxed.
+    # host execution; Safe mode stays sandboxed.
     elevated: str | None = None
     # Additive per-call tool surface overrides (surfaced tools are made visible even
     # when exposed_by_default=False). Does NOT relax allowed_tools strict denylist.
@@ -142,6 +144,10 @@ class ToolContext:
     # guidance pointing at <scratch_dir>/verify-mirror/<workspace-relative-path>.
     scratch_verify_mirror_active: bool = False
 
+    # Immutable Safe policy snapshot pinned at the start of this turn. New
+    # runtime fields stay after the legacy positional tail so embedded callers
+    # that still construct ToolContext positionally keep their field mapping.
+    sandbox_policy: Any | None = field(default=None, repr=False)
     # Set only by the authenticated channel ingress boundary. Keeping this
     # separate from ``is_owner`` prevents a generic owner-context leak from
     # promoting a channel caller through the admin-only tool matrix.

@@ -4,6 +4,7 @@ import sys
 _DESKTOP_CA_PROBE_ARG = "--_desktop-ca-probe"
 _DESKTOP_CA_PROBE_OK = "opensquilla-desktop-ca-store-ok"
 _SANDBOX_FILESYSTEM_WORKER_ARG = "--_sandbox-filesystem-worker"
+_INTERNAL_CHILD_ARG = "--internal-child"
 
 
 def _run_desktop_ca_probe() -> int:
@@ -28,10 +29,14 @@ if __name__ == "__main__":
         raise SystemExit(_run_desktop_ca_probe())
 
     if sys.argv[1:] == [_SANDBOX_FILESYSTEM_WORKER_ARG]:
-        from opensquilla.sandbox.filesystem_worker import main as filesystem_worker_main
+        from opensquilla.sandbox.runtime_launcher import dispatch_internal_child
 
-        filesystem_worker_main(["-"])
-        raise SystemExit(0)
+        raise SystemExit(dispatch_internal_child(["filesystem-worker", "-"]))
+
+    if len(sys.argv) >= 3 and sys.argv[1] == _INTERNAL_CHILD_ARG:
+        from opensquilla.sandbox.runtime_launcher import dispatch_internal_child
+
+        raise SystemExit(dispatch_internal_child(sys.argv[2:]))
 
     if len(sys.argv) == 3 and sys.argv[1] == "--elevated-helper":
         from opensquilla.sandbox.backend.windows_default_setup import (

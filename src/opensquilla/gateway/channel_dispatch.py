@@ -1315,7 +1315,11 @@ async def _resolve_channel_approval_decision(
             # Nothing has been claimed yet — surface this as a validation
             # failure, NOT as the caller's already-resolved ValueError race.
             raise _SandboxChoiceError(str(exc)) from exc
-        claim_token = queue.claim_resolution(approval_id)
+        claim_token = queue.claim_resolution(
+            approval_id,
+            resolution_metadata={"resolutionSource": "user_channel"},
+        )
+        pending = queue.get(approval_id)
         try:
             queue.finalize_claimed_resolution(
                 approval_id,
@@ -1347,6 +1351,7 @@ async def _resolve_channel_approval_decision(
             approved,
             elevated_mode=None,
             allow_idempotent=not sandbox_approval,
+            resolution_metadata={"resolutionSource": "user_channel"},
         )
         if sandbox_approval and not approved:
             remember_sandbox_approval_denial(pending.params, approval_id)
@@ -2030,6 +2035,9 @@ async def _run_turn_with_streaming(
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),
     )
+    from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+    pin_sandbox_policy(tool_ctx, config)
     use_streaming = resolve_channel_stream_policy(channel).relay_stream
 
     if use_streaming:

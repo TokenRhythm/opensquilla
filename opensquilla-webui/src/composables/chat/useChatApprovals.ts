@@ -49,6 +49,11 @@ export interface ChatApprovalItem {
   approvalKind: string
   args: Record<string, unknown> | null
   warning: string
+  displayKind?: string
+  displayTarget?: string
+  destructive?: boolean
+  irreversible?: boolean
+  backupState?: string
   agent: string
   sessionKey: string
   deadline: number          // legacy/internal epoch deadline; 0 for human review
@@ -133,6 +138,11 @@ interface ApprovalsSnapshotItem {
   agent?: string
   sessionKey?: string
   deadline?: number
+  displayKind?: string
+  displayTarget?: string
+  destructive?: boolean
+  irreversible?: boolean
+  backupState?: string
 }
 
 interface ApprovalsSnapshotResponse {
@@ -170,6 +180,14 @@ interface ApprovalPushPayload {
   approved?: boolean
   resolution?: string
   deadline?: number
+  display_kind?: string
+  displayKind?: string
+  display_target?: string
+  displayTarget?: string
+  destructive?: boolean
+  irreversible?: boolean
+  backup_state?: string
+  backupState?: string
 }
 
 type ApprovalsRpcClient = {
@@ -203,8 +221,6 @@ export interface UseChatApprovalsOptions {
    *  with the stream (which threads it into the turn log); this composable is its
    *  sole writer. */
   interruptState: Ref<ReadonlyMap<string, InterruptViewState>>
-  /** Deliver a deny note back to the agent through the normal send/queue path. */
-  onDenyFeedback?: (note: string) => void
   /** Mirror the gateway-wide pending count (topbar pill / nav badge). */
   onSnapshotCount?: (count: number) => void
 }
@@ -279,11 +295,50 @@ function pickDisplayArgs(source: Record<string, unknown>, keys: string[]): Recor
   return Object.keys(selected).length ? selected : null
 }
 
-function approvalDisplayName(toolName: unknown, approvalKind: string): string {
-  const explicit = String(toolName || '').trim()
-  if (explicit && !/^unknown(?: tool)?$/i.test(explicit)) return explicit
-  if (approvalKind) return approvalKind.replace(/_/g, ' ')
-  return 'Approval'
+const DISPLAY_KINDS = new Set([
+  'delete',
+  'modify',
+  'create',
+  'run_command',
+  'run_code',
+  'network_access',
+  'path_access',
+  'plugin_permission',
+  'sensitive_operation',
+])
+
+const BACKUP_STATES = new Set([
+  'not_applicable',
+  'enabled',
+  'disabled',
+  'unavailable_requires_confirmation',
+])
+
+function safeDisplayKind(value: unknown, approvalKind: string, command: string): string {
+  const explicit = String(value || '').trim()
+  if (DISPLAY_KINDS.has(explicit)) return explicit
+  if (approvalKind === 'sandbox_network') return 'network_access'
+  if (approvalKind === 'sandbox_path') return 'path_access'
+  if (command) return 'run_command'
+  return 'sensitive_operation'
+}
+
+function safeBackupState(value: unknown): string {
+  const explicit = String(value || '').trim()
+  return BACKUP_STATES.has(explicit) ? explicit : 'not_applicable'
+}
+
+function legacyDisplayTarget(
+  kind: string,
+  explicit: unknown,
+  args: Record<string, unknown> | null,
+): string {
+  const target = String(explicit || '').trim()
+  if (target) return target
+  if (!args) return ''
+  if (kind === 'network_access') return String(args.host || args.bundle_id || '')
+  if (kind === 'path_access') return String(args.path || '')
+  return ''
 }
 
 function snapshotItemToApproval(item: ApprovalsSnapshotItem): ChatApprovalItem | null {
@@ -308,14 +363,20 @@ function snapshotItemToApproval(item: ApprovalsSnapshotItem): ChatApprovalItem |
     legacySnapshotDisplayArgs(approvalKind, rawArgs, params),
   )
   if (!command && rawArgs && typeof rawArgs.command === 'string') command = rawArgs.command
+  const displayKind = safeDisplayKind(item.displayKind, approvalKind, command)
   return {
     id,
     namespace: String(item.namespace || 'exec'),
-    toolName: approvalDisplayName(item.toolName || item.pluginId || item.actionKind, approvalKind),
+    toolName: String(item.toolName || item.pluginId || item.actionKind || ''),
     command,
     approvalKind,
     args,
     warning: String(item.warning || ''),
+    displayKind,
+    displayTarget: legacyDisplayTarget(displayKind, item.displayTarget, args),
+    destructive: item.destructive === true,
+    irreversible: item.irreversible === true,
+    backupState: safeBackupState(item.backupState),
     agent: String(item.agent || ''),
     sessionKey: String(item.sessionKey || ''),
     deadline: Number(item.deadline) || 0,
@@ -334,6 +395,11 @@ function approvalItemToInterruptData(item: ChatApprovalItem): InterruptApprovalD
     approvalKind: item.approvalKind,
     args: item.args,
     warning: item.warning,
+    displayKind: item.displayKind,
+    displayTarget: item.displayTarget,
+    destructive: item.destructive,
+    irreversible: item.irreversible,
+    backupState: item.backupState,
     agent: item.agent,
     sessionKey: item.sessionKey,
     deadline: item.deadline,
@@ -347,14 +413,33 @@ function pushPayloadToInterruptData(payload: ApprovalPushPayload): InterruptAppr
   const approvalId = String(payload.approval_id || payload.approvalId || '').trim()
   if (!approvalId) return null
   const approvalKind = String(payload.approval_kind || payload.approvalKind || '')
+  const command = String(payload.command || '')
+  const args = safeApprovalDisplayArgs(
+    approvalKind,
+    payload.args && typeof payload.args === 'object' ? payload.args : null,
+  )
+  const displayKind = safeDisplayKind(
+    payload.display_kind || payload.displayKind,
+    approvalKind,
+    command,
+  )
   return {
     approvalId,
     namespace: String(payload.namespace || 'exec'),
-    toolName: approvalDisplayName(payload.tool_name || payload.toolName, approvalKind),
-    command: String(payload.command || ''),
+    toolName: String(payload.tool_name || payload.toolName || ''),
+    command,
     approvalKind,
-    args: safeApprovalDisplayArgs(approvalKind, payload.args && typeof payload.args === 'object' ? payload.args : null),
+    args,
     warning: String(payload.warning || ''),
+    displayKind,
+    displayTarget: legacyDisplayTarget(
+      displayKind,
+      payload.display_target || payload.displayTarget,
+      args,
+    ),
+    destructive: payload.destructive === true,
+    irreversible: payload.irreversible === true,
+    backupState: safeBackupState(payload.backup_state || payload.backupState),
     agent: String(payload.agent || ''),
     sessionKey: String(payload.session_key || payload.sessionKey || ''),
     deadline: Number(payload.deadline) || 0,
@@ -636,7 +721,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       fetchApprovalStatus(item.approvalId, item.namespace, generation)))
   }
 
-  async function resolveApproval(entry: ChatApprovalEntry, decision: ChatApprovalDecision, note = '') {
+  async function resolveApproval(entry: ChatApprovalEntry, decision: ChatApprovalDecision) {
     const id = entry.approval.id
     if (approvalBusyIds.value.has(id) || entry.resolution) return
     setApprovalBusy(id, true)
@@ -653,9 +738,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       const resolution = resolutionFromResolveResponse(result)
       if (resolution !== null) entry.resolution = resolution
       else await fetchApprovalStatus(id, entry.approval.namespace)
-      if (resolution === 'denied' && decision === 'deny' && note.trim()) {
-        options.onDenyFeedback?.(note.trim())
-      }
     } catch (err) {
       entry.error = 'Could not resolve — ' + (err instanceof Error ? err.message : String(err))
     } finally {
@@ -667,10 +749,10 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
    * Resolve an inline interrupt part. Reuses the same resolve POST body and the
    * same idempotency guard as resolveApproval (busy or already-resolved is a
    * no-op), driving the optimistic, append-only `interruptState` side-map instead
-   * of a card entry. A deny note rides the normal send/queue path via
-   * onDenyFeedback, exactly as the legacy card does.
+   * of a card entry. A denial is terminal for this turn and never schedules a
+   * follow-up user message.
    */
-  async function resolveInterrupt(id: string, decision: ChatApprovalDecision, note = '') {
+  async function resolveInterrupt(id: string, decision: ChatApprovalDecision) {
     const current = interruptState.value.get(id)
     if (approvalBusyIds.value.has(id) || current?.resolution) return
     setApprovalBusy(id, true)
@@ -687,9 +769,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       const resolution = resolutionFromResolveResponse(result)
       if (resolution) setInterruptState(id, { resolution, busy: false })
       else await fetchApprovalStatus(id, namespaceForInterrupt(id))
-      if (resolution === 'denied' && decision === 'deny' && note.trim()) {
-        options.onDenyFeedback?.(note.trim())
-      }
     } catch (err) {
       setInterruptState(id, {
         busy: false,

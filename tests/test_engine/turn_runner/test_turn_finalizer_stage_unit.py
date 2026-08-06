@@ -796,6 +796,23 @@ async def test_no_session_manager_skips_all_writes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_no_memory_capture_skips_capture_port_entirely() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(text="hi", input_tokens=1, output_tokens=1)
+    inp = _make_input(
+        final_text_parts=["hi"],
+        done_event=done,
+        no_memory_capture=True,
+    )
+
+    outcome = await stage.run(inp)
+
+    assert outcome.output.transcript_appended is True
+    assert outcome.output.memory_captured is False
+    assert recs["turn_memory_capture"].calls == []
+
+
+@pytest.mark.asyncio
 async def test_memory_capture_raises_log_and_continue() -> None:
     stage, recs = _make_stage(
         turn_memory_capture=_RecordingTurnMemoryCapture(raises=RuntimeError),

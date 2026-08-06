@@ -94,6 +94,7 @@ def test_probe_always_uses_one_token_completion_budget(
     observed_max_tokens: list[int | None] = []
     observed_models: list[str] = []
     observed_thinking: list[bool | None] = []
+    observed_request_caps: list[int] = []
 
     class _CapturingProvider:
         provider_name = provider_id
@@ -101,6 +102,7 @@ def test_probe_always_uses_one_token_completion_budget(
         def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
             observed_max_tokens.append(config.max_tokens)
             observed_thinking.append(config.thinking)
+            observed_request_caps.append(config.provider_request_max_chars)
 
             async def _gen() -> Any:
                 yield DoneEvent()
@@ -122,6 +124,7 @@ def test_probe_always_uses_one_token_completion_budget(
     assert observed_max_tokens == [1]
     assert observed_models == [model]
     assert observed_thinking == [False]
+    assert observed_request_caps[0] > 0
 
 
 def test_probe_classifies_bad_key_as_auth_invalid(monkeypatch: Any) -> None:

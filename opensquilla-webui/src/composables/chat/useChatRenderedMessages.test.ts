@@ -53,6 +53,34 @@ function renderedMessagesFor(
   })
 }
 
+describe('useChatRenderedMessages maintenance events', () => {
+  it('preserves the dedicated compaction payload for ChatMessageList', () => {
+    const api = renderedMessagesFor([{
+      role: 'maintenance',
+      text: '',
+      ts: 2_000,
+      messageId: 'maintenance:context-compaction:summary:7',
+      restoredFromHistory: true,
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-7',
+        source: 'manual',
+        state: 'completed',
+        durability: 'durable',
+      },
+    }])
+
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      displayRole: 'maintenance',
+      messageId: 'maintenance:context-compaction:summary:7',
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-7',
+      },
+    })
+  })
+})
+
 describe('useChatRenderedMessages plan revisions', () => {
   it('renders a typed plan part once and derives currentness from the active pointer', () => {
     const currentPlanRevisionId = ref('revision-2')

@@ -127,6 +127,7 @@ def _make_input(
     session_key: str = "agent:main:s1",
     agent_id: str = "agent:main",
     history_has_persisted_user: bool = True,
+    bound_user_message_id: str | None = None,
     context_window_tokens: int = 200_000,
 ) -> CompactionAndHistoryStageInput:
     if agent is None:
@@ -140,6 +141,7 @@ def _make_input(
         session_key=session_key,
         agent_id=agent_id,
         history_has_persisted_user=history_has_persisted_user,
+        bound_user_message_id=bound_user_message_id,
     )
 
 
@@ -264,6 +266,24 @@ async def test_history_loader_called_with_trim_last_user_false() -> None:
     inp = _make_input(history_has_persisted_user=False)
     await stage.run(inp)
     assert history.calls[0]["trim_last_user"] is False
+
+
+@pytest.mark.asyncio
+async def test_active_prompt_binding_is_forwarded_to_both_compaction_ports() -> None:
+    stage, t3, preflight, _, _ = _make_stage(
+        t3=_RecordingT3(return_value="not_applicable"),
+    )
+
+    await stage.run(
+        _make_input(
+            history_has_persisted_user=True,
+            bound_user_message_id="active-user-message",
+        )
+    )
+
+    for call in (t3.calls[0], preflight.calls[0]):
+        assert call["history_has_persisted_user"] is True
+        assert call["bound_user_message_id"] == "active-user-message"
 
 
 @pytest.mark.asyncio

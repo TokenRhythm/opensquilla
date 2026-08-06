@@ -12,6 +12,7 @@ import type {
 } from '@/types/chat'
 import type {
   ArtifactPayload,
+  CompactionPayload,
   ToolDeltaPayload,
   ToolResultPayload,
   ToolUsePayload,
@@ -283,6 +284,37 @@ export function useChatStream(options: UseChatStreamOptions) {
         streamActivityTick.value++
       }, 1000)
     }
+  }
+
+  function recordCompactionActivity(payload: CompactionPayload) {
+    noteStreamSignal()
+    if (!useReducer.value) return
+    const rawStatus = String(payload.status || '').toLowerCase()
+    const state = rawStatus === 'skipped'
+      ? 'skipped'
+      : rawStatus === 'stale'
+        ? 'stale'
+        : rawStatus === 'cancelled'
+          ? 'cancelled'
+          : ['completed', 'emergency_ephemeral'].includes(rawStatus)
+            ? 'completed'
+            : ['failed', 'error', 'timed_out'].includes(rawStatus)
+              ? 'failed'
+              : 'running'
+    const id = String(payload.compaction_id || payload.compactionId || 'current')
+    appendFrame({
+      kind: 'status',
+      action: 'context_compaction',
+      label: '',
+      at: Number(payload.emitted_at || payload.started_at || Date.now()),
+      id,
+      category: 'maintenance',
+      state,
+      source: String(payload.source || 'automatic'),
+      durability: String(payload.durability || ''),
+      detail: String(payload.detail || payload.phase || ''),
+    })
+    scheduleRender()
   }
 
   function toolNarrationLabel(tc: ChatToolCall): string {
@@ -977,6 +1009,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     resetStreamIdleTimer,
     clearStreamIdleTimer,
     setStreamActivity,
+    recordCompactionActivity,
     showThinkingIndicator,
     hideThinkingIndicator,
     isToolGroupOpen,

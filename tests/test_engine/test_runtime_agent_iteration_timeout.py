@@ -256,8 +256,13 @@ async def test_total_deadline_limited_wait_stays_total_timeout_on_early_wake(
             provider_stream(),
             loop=fake_loop,
             total_deadline=10.05,
+            deadline_provider=lambda: 10.10,
         ):
             pass
 
     assert type(exc_info.value) is TimeoutError
+    assert getattr(
+        exc_info.value,
+        "_opensquilla_stream_deadline_at_monotonic",
+    ) == pytest.approx(10.05)
     assert observed_timeouts == [pytest.approx(0.05)]

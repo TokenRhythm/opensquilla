@@ -176,7 +176,7 @@ function verifyGatewayFilesystemWorker(gatewayBinary, env, targetPath) {
     path: targetPath,
     displayPath: targetPath,
   })
-  const result = spawnSync(gatewayBinary, ['--_sandbox-filesystem-worker'], {
+  const result = spawnSync(gatewayBinary, ['--internal-child', 'filesystem-worker', '-'], {
     cwd: dirname(gatewayBinary),
     env,
     input: payload,

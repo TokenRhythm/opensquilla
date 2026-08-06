@@ -18,7 +18,18 @@ import pytest
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.provider import ToolDefinition, ToolInputSchema
+from opensquilla.skills.capability_runtime import (
+    META_CAPABILITY_API_KEY_ENV,
+    META_CAPABILITY_BASE_URL_ENV,
+    META_CAPABILITY_PROVIDER_ENV,
+)
 from opensquilla.skills.loader import SkillLoader
+from opensquilla.skills.meta.parser import parse_meta_plan
+from opensquilla.skills.meta.readiness import (
+    META_OPENROUTER_API_KEY_ENV,
+    META_READINESS_ENV_ALIASES_METADATA_KEY,
+    META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
+)
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import ToolContext
 
@@ -346,6 +357,76 @@ async def test_runtime_pipeline_pins_meta_skill_when_skill_filter_enabled(
 
 def _meta_cfg(auto_trigger: bool) -> SimpleNamespace:
     return SimpleNamespace(meta_skill=SimpleNamespace(enabled=True, auto_trigger=auto_trigger))
+
+
+@pytest.mark.asyncio
+async def test_pipeline_projects_configured_openrouter_key_as_name_only_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def noop_router(ctx: TurnContext) -> TurnContext:
+        return ctx
+
+    noop_router.__name__ = "apply_squilla_router"
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", noop_router)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    secret = "synthetic-openrouter-runtime-key"
+    config = SimpleNamespace(
+        meta_skill=SimpleNamespace(enabled=True, auto_trigger=False),
+        llm=SimpleNamespace(
+            provider="openrouter",
+            api_key=secret,
+            api_key_env="",
+        ),
+    )
+    runner = TurnRunner(provider_selector=None, config=config)
+    trusted_loader = SkillLoader(
+        bundled_dir=(
+            Path(__file__).resolve().parents[2]
+            / "src"
+            / "opensquilla"
+            / "skills"
+            / "bundled"
+        ),
+        snapshot_path=tmp_path / "trusted-snapshot.json",
+    )
+    runner._skill_loader = trusted_loader
+
+    turn, _provider = await runner._run_pipeline(
+        "hello",
+        "agent:main:test-openrouter-readiness-alias",
+        None,
+        None,
+        [ToolDefinition(name="web_search", description="search", input_schema=ToolInputSchema())],
+        "base prompt",
+        [],
+    )
+
+    parent_spec = trusted_loader.get_by_name("meta-short-drama")
+    assert parent_spec is not None
+    plan = parse_meta_plan(parent_spec)
+    assert plan is not None
+
+    readiness_alias_provider = turn.metadata[
+        META_READINESS_ENV_ALIASES_METADATA_KEY
+    ]
+    assert callable(readiness_alias_provider)
+    assert readiness_alias_provider(parent_spec, plan) == ("OPENROUTER_API_KEY",)
+    assert secret not in repr(turn.metadata)
+    runtime_env_provider = turn.metadata[
+        META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY
+    ]
+    assert callable(runtime_env_provider)
+    expected_connection = {
+        META_CAPABILITY_PROVIDER_ENV: "openrouter",
+        META_CAPABILITY_API_KEY_ENV: secret,
+        META_CAPABILITY_BASE_URL_ENV: "https://openrouter.ai/api/v1",
+        META_OPENROUTER_API_KEY_ENV: secret,
+    }
+    assert runtime_env_provider(parent_spec, plan) == {
+        "nano-banana-pro": expected_connection,
+        "seedance-2-prompt": expected_connection,
+    }
 
 
 @pytest.mark.asyncio

@@ -445,7 +445,7 @@ async def test_standalone_dispatch_refreshes_unbound_saved_context(
         await storage.close()
 
     tool_context = captured_contexts[0]
-    assert tool_context.run_mode == "standard"
+    assert tool_context.run_mode == "safe"
     assert tool_context.workspace_dir == str(saved_workspace.resolve())
     assert tool_context.sandbox_run_context.run_mode_source == "user"
     assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [

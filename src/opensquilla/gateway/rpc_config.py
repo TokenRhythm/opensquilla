@@ -795,8 +795,12 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     force_persist_paths.update(tuple(path.split(".")) for path in linked_paths)
 
     # Re-validate full config
-    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.config import (
+        GatewayConfig,
+        validate_compaction_deployment_write,
+    )
 
+    validate_compaction_deployment_write(cfg_dict)
     new_config = GatewayConfig(**cfg_dict)
     routing_changes = reconcile_model_routing_write(
         new_config, explicit_paths, previous=ctx.config
@@ -941,8 +945,12 @@ async def _handle_config_patch(
     explicit_paths.update(linked_paths)
     force_persist_paths.update(tuple(path.split(".")) for path in linked_paths)
 
-    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.config import (
+        GatewayConfig,
+        validate_compaction_deployment_write,
+    )
 
+    validate_compaction_deployment_write(cfg_dict)
     new_config = GatewayConfig(**cfg_dict)
     routing_changes = reconcile_model_routing_write(
         new_config, explicit_paths, previous=ctx.config
@@ -1036,7 +1044,10 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     if not isinstance(params, dict):
         raise ValueError("params.config is required")
 
-    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.config import (
+        GatewayConfig,
+        validate_compaction_deployment_write,
+    )
 
     config_payload = params.get("config")
     if config_payload is None and "config_yaml" in params:
@@ -1068,6 +1079,7 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     config_payload = _strip_public_derived_config_fields(config_payload)
 
     # Validate and persist the full replacement config
+    validate_compaction_deployment_write(config_payload)
     new_config = GatewayConfig(**config_payload)
     _validate_memory_embedding_semantics(new_config)
     inherit_then_clear_explicit(

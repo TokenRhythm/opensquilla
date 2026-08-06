@@ -709,7 +709,7 @@ def build_provider(
     proxy: str = "",
 ) -> LLMProvider:
     """Convenience factory: build a single provider directly."""
-    return _build_provider(
+    return build_provider_from_config(
         ProviderConfig(
             provider=provider,
             model=model,
@@ -719,3 +719,19 @@ def build_provider(
             proxy=proxy,
         )
     )
+
+
+def build_provider_from_config(config: ProviderConfig) -> LLMProvider:
+    """Build one provider while preserving the complete deployment config.
+
+    Callers that already resolved a :class:`ProviderConfig` must not flatten it
+    back into ``build_provider``'s legacy argument list: doing so would discard
+    provider routing and continuity policy.  Copy the only mutable member so an
+    adapter cannot mutate selector-owned configuration through a shared dict.
+    """
+
+    isolated = replace(
+        config,
+        provider_routing=dict(config.provider_routing),
+    )
+    return _build_provider(isolated)

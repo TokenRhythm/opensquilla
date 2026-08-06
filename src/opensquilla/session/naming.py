@@ -31,6 +31,12 @@ import structlog
 
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
+from opensquilla.provider.auxiliary_budget import (
+    AuxiliaryRequestBudget,
+    AuxiliaryRequestTooLargeError,
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.protocol import (
     configured_provider_id,
     provider_connection_config,
@@ -270,6 +276,37 @@ def _should_disable_openrouter_reasoning(url: str, model: str) -> bool:
     return normalized_model in _OPENROUTER_REASONING_DEFAULT_MODELS
 
 
+def _fit_naming_user_content(
+    first_message: str,
+    *,
+    system_prompt: str,
+    budget: AuxiliaryRequestBudget,
+) -> str | None:
+    """Fit a deterministic prefix without sending an over-budget title request."""
+
+    prefix = "Generate a title for this message:\n\n"
+    source = (first_message or "")[:_MAX_INPUT_CHARS]
+    low = 1
+    high = len(source)
+    best: str | None = None
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = prefix + source[:midpoint]
+        try:
+            ensure_auxiliary_text_fits(
+                [{"role": "user", "content": candidate}],
+                system=system_prompt,
+                max_chars=budget.provider_request_max_chars,
+                max_tokens=budget.max_input_tokens,
+            )
+        except AuxiliaryRequestTooLargeError:
+            high = midpoint - 1
+        else:
+            best = candidate
+            low = midpoint + 1
+    return best
+
+
 async def call_naming_llm(
     first_message: str,
     *,
@@ -292,16 +329,36 @@ async def call_naming_llm(
         url += "/v1"
     url += "/chat/completions"
 
-    user_content = (
-        f"Generate a title for this message:\n\n{first_message[:_MAX_INPUT_CHARS]}"
+    system_prompt = _build_system_prompt(language)
+    budget_provider = provider or (
+        "openrouter" if "openrouter.ai" in url.lower() else "openai_compat"
     )
+    request_budget = resolve_auxiliary_request_budget(
+        None,
+        provider_id=budget_provider,
+        model=model,
+        max_output_tokens=_TITLE_MAX_TOKENS,
+    )
+    user_content = _fit_naming_user_content(
+        first_message,
+        system_prompt=system_prompt,
+        budget=request_budget,
+    )
+    if user_content is None:
+        log.warning(
+            "session_naming.request_too_large",
+            provider=budget_provider,
+            model=model,
+            context_window=request_budget.context_window_tokens,
+        )
+        return None
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": _build_system_prompt(language)},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "max_tokens": _TITLE_MAX_TOKENS,
+        "max_tokens": request_budget.max_output_tokens,
         "temperature": 0,
         "stream": False,
     }

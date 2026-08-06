@@ -352,6 +352,11 @@ hard-blocked ranges, fix the DNS or proxy setup instead of bypassing the guard.
 
 ## Gateway Binding
 
+The desktop application always owns a loopback-only child Gateway bound to
+`127.0.0.1`. Desktop settings do not change its listener address or expose it
+to the LAN. The settings below apply to a separately launched standalone
+Gateway.
+
 Foreground:
 
 ```sh
@@ -375,6 +380,57 @@ Bind precedence:
 4. `OPENSQUILLA_GATEWAY_HOST`
 5. config host
 6. `127.0.0.1`
+
+When listening on the LAN, OpenSquilla accepts only loopback, RFC 1918, and
+IPv6 ULA socket peers. `auth.allowed_client_cidrs` can narrow that built-in
+range but cannot add public networks:
+
+```toml
+host = "0.0.0.0"
+
+[auth]
+mode = "token"
+allowed_client_cidrs = ["192.168.50.0/24"]
+```
+
+Missing, malformed, and incorrect tokens receive guest-safe authority only.
+A valid named token with `host.execute` may select Full Access without gaining
+owner-only settings authority.
+
+For a remote Web guest, the server ignores any client-supplied workspace and
+uses the configured default workspace. All file-capable tools follow the same
+non-bypassable policy:
+
+- ordinary host files are readable;
+- the built-in credential paths and OpenSquilla authority/recovery data are
+  not readable;
+- writes are allowed only inside the configured default workspace;
+- workspace creation, selection, and other owner-only lifecycle operations are
+  unavailable.
+
+These restrictions also apply to Shell, Python, Node.js, Git Bash, and their
+child processes. Guests cannot access the global approval queue, and approvals
+cannot elevate a guest past this boundary. The Gateway refuses Guest Safe
+startup when the configured default workspace is inside a protected credential
+or authority path.
+
+## Safe Mode Policy
+
+Settings -> Sandbox persists a versioned policy snapshot for each new task.
+Ordinary host files are readable and writable in Safe mode, except OpenSquilla
+authority/recovery data and the built-in or custom deny-write paths. Mutating a
+deny-write path requires an exact user approval.
+
+Recursive directory deletion always requires a dedicated irreversible-action
+confirmation. Backups are enabled by default with a 3 GiB quota; oldest
+backups are evicted first. A target larger than the quota requires a second,
+explicit confirmation to delete without a backup.
+
+Commands run automatically unless a built-in high-risk rule or a configured
+approval prefix matches. An auto-allow prefix takes precedence over approval
+rules. Network access is public by default through the managed boundary, with
+SSRF and local metadata protections; operators can deny domains, allow
+exceptions, or block all network access.
 
 ## Raw Config Editing
 

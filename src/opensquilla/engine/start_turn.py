@@ -73,6 +73,7 @@ async def reserve_turn_via_runtime(
     stream_event_sink: Callable[[Any], Awaitable[None]] | None = None,
     turn_id: str | None = None,
     overflow_policy: Any = None,
+    bypass_pending_limit: bool = False,
     accepted_run_mode_override: Any | None = None,
 ) -> TaskReservation:
     """Reserve runtime admission while preserving shared ingress metadata."""
@@ -91,6 +92,9 @@ async def reserve_turn_via_runtime(
     )
     if overflow_policy is not None:
         kwargs["overflow_policy"] = overflow_policy
+    if bypass_pending_limit:
+        # Only restart recovery of already-durable accepted work uses this.
+        kwargs["bypass_pending_limit"] = True
     return await runtime.reserve(envelope, message, **kwargs)
 
 

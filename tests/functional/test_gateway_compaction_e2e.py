@@ -33,8 +33,15 @@ def _wait_for_health(port: int, server: subprocess.Popen[str]) -> None:
         if server.poll() is not None:
             stdout = server.stdout.read() if server.stdout else ""
             stderr = server.stderr.read() if server.stderr else ""
+            output_path = getattr(server, "_opensquilla_output_path", None)
+            process_output = (
+                Path(output_path).read_text(encoding="utf-8", errors="replace")
+                if output_path and Path(output_path).exists()
+                else ""
+            )
             raise AssertionError(
-                f"gateway exited early code={server.returncode}\nstdout={stdout}\nstderr={stderr}"
+                f"gateway exited early code={server.returncode}\n"
+                f"stdout={stdout}\nstderr={stderr}\nprocess_output={process_output}"
             )
         try:
             response = httpx.get(url, timeout=1.0)
@@ -43,7 +50,15 @@ def _wait_for_health(port: int, server: subprocess.Popen[str]) -> None:
         except Exception as exc:  # noqa: BLE001 - surfaced on timeout.
             last_error = str(exc)
         time.sleep(0.1)
-    raise AssertionError(f"gateway did not become healthy: {last_error}")
+    output_path = getattr(server, "_opensquilla_output_path", None)
+    process_output = (
+        Path(output_path).read_text(encoding="utf-8", errors="replace")
+        if output_path and Path(output_path).exists()
+        else ""
+    )
+    raise AssertionError(
+        f"gateway did not become healthy: {last_error}\nprocess_output={process_output}"
+    )
 
 
 def _stop_process(server: subprocess.Popen[str]) -> None:
@@ -80,6 +95,7 @@ def _write_slow_compaction_server(
             from opensquilla.gateway.boot import start_gateway_server
             from opensquilla.gateway.config import AuthConfig, GatewayConfig
             from opensquilla.gateway.websocket import SubscriptionManager
+            from opensquilla.session.compaction import CompactionConfig
             from opensquilla.session.manager import SessionManager
             from opensquilla.session.storage import SessionStorage
 
@@ -87,9 +103,28 @@ def _write_slow_compaction_server(
 
 
             class SlowCompactionSessionManager(SessionManager):
-                async def compact_with_result(self, *args, **kwargs):
+                async def compact_with_result(
+                    self,
+                    session_key,
+                    context_window_tokens,
+                    config=None,
+                    custom_instructions=None,
+                    **kwargs,
+                ):
                     await asyncio.sleep(1.2)
-                    return await super().compact_with_result(*args, **kwargs)
+                    # Exercise the real compactor deterministically. Gateway
+                    # target discovery may reflect a developer's configured
+                    # online provider, which would make this local E2E depend
+                    # on credentials and network availability.
+                    kwargs["consumer_admission"] = None
+                    kwargs["context_window_chars"] = None
+                    return await super().compact_with_result(
+                        session_key,
+                        context_window_tokens,
+                        CompactionConfig(),
+                        custom_instructions,
+                        **kwargs,
+                    )
 
 
             async def seed(manager):
@@ -147,7 +182,7 @@ async def _manual_compact_over_websocket(port: int, session_key: str) -> dict[st
         compact_task = asyncio.create_task(
             client.call(
                 "sessions.contextCompact",
-                {"key": session_key, "contextWindowTokens": 1000},
+                {"key": session_key, "contextWindowTokens": 2000},
             )
         )
 
@@ -189,7 +224,7 @@ async def _start_manual_compact_and_wait_for_started(
     compact_task = asyncio.create_task(
         client.call(
             "sessions.contextCompact",
-            {"key": session_key, "contextWindowTokens": 1000},
+            {"key": session_key, "contextWindowTokens": 2000},
         )
     )
 
@@ -204,7 +239,29 @@ async def _start_manual_compact_and_wait_for_started(
 
 
 def _read_compaction_db_state(db_path: Path) -> dict[str, int]:
-    with sqlite3.connect(db_path) as conn:
+    # Windows can keep the abruptly terminated process' WAL/SHM handles alive
+    # for a short time after wait() reports exit. Open normally (so SQLite
+    # replays the WAL) and retry only the transient recovery/locking failures.
+    deadline = time.monotonic() + 10.0
+    while True:
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(db_path, timeout=1.0)
+            conn.execute("select 1 from sessions limit 1").fetchone()
+            break
+        except sqlite3.OperationalError as exc:
+            if conn is not None:
+                conn.close()
+            message = str(exc).lower()
+            if time.monotonic() >= deadline or not any(
+                marker in message
+                for marker in ("disk i/o error", "locked", "busy")
+            ):
+                raise
+            time.sleep(0.1)
+
+    assert conn is not None
+    with conn:
         conn.row_factory = sqlite3.Row
         session = conn.execute(
             "select session_id, compaction_count from sessions limit 1"
@@ -245,16 +302,20 @@ def _start_slow_compaction_gateway(
         db_path=db_path,
         session_key=session_key,
     )
-    return subprocess.Popen(
-        [sys.executable, str(server_script)],
-        cwd=Path.cwd(),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    output_path = tmp_path / "gateway-process.log"
+    with output_path.open("w", encoding="utf-8") as output_stream:
+        server = subprocess.Popen(
+            [sys.executable, str(server_script)],
+            cwd=Path.cwd(),
+            env=env,
+            stdout=output_stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    setattr(server, "_opensquilla_output_path", output_path)
+    return server
 
 
 @pytest.mark.asyncio
@@ -268,7 +329,9 @@ async def test_gateway_websocket_slow_manual_compaction_rewrites_db(
     session_key = "agent:main:webchat:slowcompact"
     state_dir = tmp_path / "state"
     log_dir = tmp_path / "logs"
-    db_path = state_dir / "sessions.db"
+    # The injected SessionManager owns this database. Keep it separate from
+    # the Gateway-owned state/sessions.db that boot migrates before opening.
+    db_path = tmp_path / "injected-sessions.db"
 
     env = os.environ.copy()
     env["OPENSQUILLA_STATE_DIR"] = str(state_dir)
@@ -312,7 +375,9 @@ async def test_gateway_restart_during_slow_manual_compaction_leaves_db_recoverab
     session_key = "agent:main:webchat:slowcompact"
     state_dir = tmp_path / "state"
     log_dir = tmp_path / "logs"
-    db_path = state_dir / "sessions.db"
+    # The injected SessionManager owns this database. Keep it separate from
+    # the Gateway-owned state/sessions.db that boot migrates before opening.
+    db_path = tmp_path / "injected-sessions.db"
     env = os.environ.copy()
     env["OPENSQUILLA_STATE_DIR"] = str(state_dir)
     env["OPENSQUILLA_LOG_DIR"] = str(log_dir)

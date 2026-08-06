@@ -702,7 +702,10 @@ async def _dispatch_gateway_slash_command(
         return True
 
     if parts := _slash_parts(cmd, "/meta"):
-        name = parts[1].strip() if len(parts) > 1 else ""
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+        meta_args = raw_args.split(maxsplit=1)
+        name = meta_args[0] if meta_args else ""
+        request = meta_args[1].strip() if len(meta_args) > 1 else ""
         if not name:
             payload = await client.call("meta.list", {})
             _print_meta_skills_table(payload)
@@ -715,6 +718,8 @@ async def _dispatch_gateway_slash_command(
             console.print(error_panel(error or f"Could not run meta-skill {name!r}."))
             return True
         prompt = f"/meta {name}"
+        if request:
+            prompt = f"{prompt} {request}"
         result = await stream(
             client,
             state.session_key,
@@ -1292,13 +1297,13 @@ async def _handle_elevated_command(
         )
     elif arg == "on":
         console.print(
-            f"[yellow]permissions: on[/yellow] - legacy alias for Managed Execution; "
+            f"[yellow]permissions: on[/yellow] - compatibility alias for Safe mode; "
             f"approvals still apply. "
             f"{cache_suffix}"
         )
     elif arg == "bypass":
         console.print(
-            f"[red]permissions: bypass[/red] - legacy alias for Managed Execution "
+            f"[red]permissions: bypass[/red] - compatibility alias for Safe mode "
             f"with fewer prompts; host access is not granted.{cache_suffix}"
         )
     else:

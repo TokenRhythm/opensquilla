@@ -94,6 +94,7 @@ def test_model_catalog_adapter_defaults_to_200k_without_override() -> None:
     resolved = adapter.lookup("qwen3.6-flash")
 
     assert resolved.context_window == 200_000
+    assert resolved.context_window_tokens_global_override == 0
     assert resolved.max_tokens == 32768
 
 
@@ -111,6 +112,7 @@ def test_model_catalog_adapter_honors_context_window_tokens_override() -> None:
     resolved = adapter.lookup("qwen3.6-flash")
 
     assert resolved.context_window == 1_000_000
+    assert resolved.context_window_tokens_global_override == 1_000_000
     assert resolved.max_tokens == 32768
 
 
@@ -155,8 +157,13 @@ def test_model_catalog_adapter_per_model_override_beats_global_config() -> None:
 
     # The [models.*] per-model window beats the global llm.context_window_tokens
     # override; the global still applies to models without a per-model row.
-    assert adapter.lookup("glm-5.1").context_window == 131_072
-    assert adapter.lookup("some-other-model").context_window == 1_000_000
+    per_model = adapter.lookup("glm-5.1")
+    global_model = adapter.lookup("some-other-model")
+
+    assert per_model.context_window == 131_072
+    assert per_model.context_window_tokens_global_override == 1_000_000
+    assert global_model.context_window == 1_000_000
+    assert global_model.context_window_tokens_global_override == 1_000_000
 
 
 def test_model_catalog_adapter_keeps_fallback_auto_limit_separate() -> None:

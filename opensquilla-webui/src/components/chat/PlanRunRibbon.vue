@@ -351,6 +351,12 @@ function toggleActivation(): void {
 }
 
 function onSummaryKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    onEscape()
+    return
+  }
   if (event.key !== 'Enter' && event.key !== ' ') return
   pointerWithin.value = false
   lastPointerType = ''

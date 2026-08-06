@@ -132,6 +132,13 @@ def test_long_media_roundtrips_material_artifacts_and_downloads(tmp_path: Path) 
             )
             == artifact
         )
+        assert store.get_ref(
+            session_id="session-parent",
+            artifact_id=artifact.id,
+        ) == artifact
+        listed = store.list_refs(session_id="session-parent", limit=100)
+        assert listed.refs == (artifact,)
+        assert listed.total_count == 1
         assert (
             store.copy_session_artifacts(
                 source_session_id="session-parent",
@@ -174,7 +181,10 @@ def test_long_media_roundtrips_material_artifacts_and_downloads(tmp_path: Path) 
             session_id="session-parent",
             logical_path="assets/app.js",
         )
-        assert bundle_resource.path.read_bytes() == b"window.longPathBundle = true"
+        assert (
+            native_io_path(bundle_resource.path).read_bytes()
+            == b"window.longPathBundle = true"
+        )
         assert (
             store.copy_session_artifacts(
                 source_session_id="session-parent",
@@ -188,7 +198,10 @@ def test_long_media_roundtrips_material_artifacts_and_downloads(tmp_path: Path) 
             session_id="session-bundle-child",
             logical_path="assets/app.js",
         )
-        assert child_bundle_resource.path.read_bytes() == b"window.longPathBundle = true"
+        assert (
+            native_io_path(child_bundle_resource.path).read_bytes()
+            == b"window.longPathBundle = true"
+        )
 
         with TestClient(_app(media_root)) as client:
             attachment_response = client.get(

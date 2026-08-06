@@ -38,6 +38,63 @@ def test_approval_queue_request_persists_across_queue_restart(tmp_path) -> None:
     reloaded.close()
 
 
+def test_resolution_metadata_is_committed_with_the_winning_decision(tmp_path) -> None:
+    db_path = tmp_path / "approval_queue.sqlite"
+    first = ApprovalQueue(db_path=str(db_path))
+    second = ApprovalQueue(db_path=str(db_path))
+    approval_id = first.request("exec", {"toolName": "exec_command"})
+    try:
+        first.resolve(
+            approval_id,
+            False,
+            resolution_metadata={
+                "resolutionSource": "approval_delivery_failure",
+                "resolutionReason": "send_failed",
+            },
+        )
+        with pytest.raises(ValueError):
+            second.resolve(
+                approval_id,
+                True,
+                resolution_metadata={"resolutionSource": "user_web"},
+            )
+
+        entry = second.get(approval_id)
+        assert entry.approved is False
+        assert entry.params["resolutionSource"] == "approval_delivery_failure"
+        assert entry.params["resolutionReason"] == "send_failed"
+    finally:
+        first.close()
+        second.close()
+
+
+def test_claim_metadata_cannot_be_overwritten_by_losing_resolver(tmp_path) -> None:
+    db_path = tmp_path / "approval_queue.sqlite"
+    first = ApprovalQueue(db_path=str(db_path))
+    second = ApprovalQueue(db_path=str(db_path))
+    approval_id = first.request("exec", {"toolName": "exec_command"})
+    try:
+        first.claim_resolution(
+            approval_id,
+            resolution_metadata={"resolutionSource": "user_web"},
+        )
+        with pytest.raises(ValueError):
+            second.resolve(
+                approval_id,
+                False,
+                resolution_metadata={
+                    "resolutionSource": "approval_delivery_failure",
+                },
+            )
+
+        entry = second.get(approval_id)
+        assert entry.claim_token is not None
+        assert entry.params["resolutionSource"] == "user_web"
+    finally:
+        first.close()
+        second.close()
+
+
 @pytest.mark.asyncio
 async def test_default_approval_wait_remains_pending_until_human_decides(tmp_path) -> None:
     queue = ApprovalQueue(

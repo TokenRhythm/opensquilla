@@ -7,8 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
+from opensquilla.sandbox import destructive_backup
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+from opensquilla.sandbox.policy_models import FilePolicySettings, SandboxPolicy
 from opensquilla.tools.builtin import code_exec, shell
 from opensquilla.tools.builtin import patch as patch_tool
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
@@ -153,13 +155,16 @@ async def test_apply_patch_approved_absolute_escape_uses_shared_gate(
         actions.append(action)
         return SimpleNamespace(allowed=True)
 
-    monkeypatch.setattr(patch_tool, "gate_elevated_action", allow)
+    monkeypatch.setattr(destructive_backup, "gate_elevated_action", allow)
     token = current_tool_context.set(
         ToolContext(
             is_owner=True,
             caller_kind=CallerKind.CLI,
             workspace_dir=str(workspace),
             session_key="s1",
+            sandbox_policy=SandboxPolicy(
+                files=FilePolicySettings(recursive_delete_backup_enabled=False)
+            ),
         )
     )
     apply_patch = _original_async(patch_tool.apply_patch)

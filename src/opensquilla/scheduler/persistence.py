@@ -92,6 +92,7 @@ _NEW_COLUMNS: list[tuple[str, str]] = [
     ("creator_session_key", "TEXT NOT NULL DEFAULT ''"),
     ("creator_sender_id", "TEXT NOT NULL DEFAULT ''"),
     ("creator_is_owner", "INTEGER NOT NULL DEFAULT 0"),
+    ("creator_host_execute", "INTEGER NOT NULL DEFAULT 0"),
     ("run_mode", "TEXT NOT NULL DEFAULT ''"),
     ("elevated", "TEXT NOT NULL DEFAULT ''"),
     ("execution_target", "TEXT NOT NULL DEFAULT ''"),
@@ -176,6 +177,7 @@ def _row_to_job(row: aiosqlite.Row) -> CronJob:
         creator_session_key=_get("creator_session_key", "") or "",
         creator_sender_id=_get("creator_sender_id", "") or "",
         creator_is_owner=bool(_get("creator_is_owner", 0)),
+        creator_host_execute=bool(_get("creator_host_execute", 0)),
         run_mode=_get("run_mode", "") or "",
         elevated=_get("elevated", "") or "",
         execution_target=_get("execution_target", "") or "",
@@ -520,9 +522,10 @@ class JobStore:
                  reservation_token, reserved_at, reserved_by, reservation_source,
                  scheduled_run_at, tool_policy_json, tz, anchor_at,
                  creator_session_key, creator_sender_id, creator_is_owner,
+                 creator_host_execute,
                  run_mode, elevated, execution_target, idempotency_key)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 cron_expr=excluded.cron_expr,
@@ -560,6 +563,7 @@ class JobStore:
                 creator_session_key=excluded.creator_session_key,
                 creator_sender_id=excluded.creator_sender_id,
                 creator_is_owner=excluded.creator_is_owner,
+                creator_host_execute=excluded.creator_host_execute,
                 run_mode=excluded.run_mode,
                 elevated=excluded.elevated,
                 execution_target=excluded.execution_target,
@@ -604,6 +608,7 @@ class JobStore:
                 job.creator_session_key or "",
                 job.creator_sender_id or "",
                 1 if job.creator_is_owner else 0,
+                1 if job.creator_host_execute else 0,
                 job.run_mode or "",
                 job.elevated or "",
                 job.execution_target or "",

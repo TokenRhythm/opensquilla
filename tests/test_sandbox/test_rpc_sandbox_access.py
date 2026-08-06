@@ -135,7 +135,7 @@ def _request_generated_sandbox_approval(
         session_key=manager.node.session_key,
         workspace_dir=workspace,
         sandbox_run_context=RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=workspace,
             source="saved",
         ),
@@ -255,7 +255,7 @@ async def test_sandbox_context_get_uses_bound_project_not_agent_default(
 
 
 @pytest.mark.asyncio
-async def test_sandbox_context_get_defaults_bound_owner_project_to_full(
+async def test_sandbox_context_get_defaults_fresh_bound_owner_project_to_full(
     project_sandbox_ctx: tuple[RpcContext, SessionNode, ProjectWorkspace],
 ) -> None:
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_get
@@ -407,7 +407,7 @@ async def test_project_run_context_set_reports_workspace_before_setup_readiness(
 
     monkeypatch.setattr(
         rpc_sandbox,
-        "current_sandbox_setup_status",
+        "current_sandbox_capability_report",
         setup_must_not_run,
     )
 
@@ -532,7 +532,7 @@ async def test_rpc_run_context_get_includes_bundles_and_temporary_grants() -> No
         manager,
         manager.node.session_key,
         RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace="/tmp/ws",
             public_network=(PublicNetworkGrant(scope="chat", source="manual"),),
             temporary_grants=(
@@ -576,7 +576,7 @@ async def test_rpc_run_context_get_includes_bundles_and_temporary_grants() -> No
 
 @pytest.mark.asyncio
 async def test_exec_approval_resolve_allows_non_owner_chat_scoped_sandbox_grant() -> None:
-    from opensquilla.gateway.approval_queue import reset_approval_queue
+    from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
     from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
     from opensquilla.sandbox.escalation import build_network_approval_params
     from opensquilla.sandbox.network_guard import NetworkDecision
@@ -608,6 +608,7 @@ async def test_exec_approval_resolve_allows_non_owner_chat_scoped_sandbox_grant(
 
     assert result["resolved"] is True
     assert result["approved"] is True
+    assert get_approval_queue().get(approval_id).params["resolutionSource"] == "user_web"
     context = await get_run_context(
         manager,
         manager.node.session_key,
@@ -1299,7 +1300,7 @@ async def test_rpc_once_rw_mount_preserves_durable_ro_through_expiry(
     workspace.mkdir()
     mounted.mkdir()
     base = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         mounts=(MountGrant(path=str(mounted), access="ro", scope="chat"),),
         run_mode_source="user",
@@ -1427,7 +1428,7 @@ async def test_rpc_mount_remove_updates_resolved_overlay_for_current_tool_mounts
     ctx = _ctx(manager)
 
     remembered = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace="/tmp/ws",
         mounts=(MountGrant(path="/tmp/ws/extras", access="ro", scope="chat"),),
         source="saved",
@@ -1495,7 +1496,7 @@ async def test_rpc_mount_remove_chat_scope_leaves_user_scope_mount_visible() -> 
     upsert_mount_grant({"path": path, "access": "ro", "scope": "workspace"})
     manager.node.origin = {
         "sandbox_run_context": RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace="/tmp/ws",
             mounts=(MountGrant(path=path, access="rw", scope="chat"),),
             source="saved",
@@ -1534,7 +1535,7 @@ async def test_rpc_domain_remove_updates_resolved_overlay_for_current_tool_conte
     manager = _SessionManager()
     ctx = _ctx(manager)
     remembered = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace="/tmp/ws",
         domains=(DomainGrant(domain="example.com", scope="chat"),),
         source="saved",
@@ -1582,7 +1583,7 @@ async def test_rpc_domain_remove_updates_resolved_overlay_for_current_tool_conte
     try:
         merged = current_tool_run_context()
         assert merged is not None
-        assert decide_network_access("example.com", merged).status == "ask"
+        assert decide_network_access("example.com", merged).status == "allow"
     finally:
         current_tool_context.reset(token)
 
@@ -1599,7 +1600,7 @@ async def test_rpc_domain_remove_chat_scope_leaves_user_scope_domain_visible() -
     upsert_domain_grant({"domain": "example.com", "scope": "workspace", "source": "manual"})
     manager.node.origin = {
         "sandbox_run_context": RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace="/tmp/ws",
             domains=(DomainGrant(domain="example.com", scope="chat", source="manual"),),
             source="saved",
@@ -1633,10 +1634,10 @@ async def test_rpc_sandbox_status_reports_backend_managed_network_and_run_mode()
 
     result = await _handle_sandbox_status({}, _ctx(manager))
 
-    assert result["run_mode"] == "standard"
-    assert result["run_mode_label"] == "Standard-Sandbox"
+    assert result["run_mode"] == "safe"
+    assert result["run_mode_label"] == "Safe"
     assert result["execution_target"] == "sandbox"
-    assert result["posture"] == "standard"
+    assert result["posture"] == "safe"
     assert result["backend"] == "noop"
     assert result["managed_network"] == "ready"
     assert result["sandbox"] == {
@@ -1687,7 +1688,7 @@ async def test_rpc_sandbox_status_reports_backend_managed_network_and_run_mode()
         assert expected_domains.issubset(catalog_by_id[bundle_id])
     assert result["permissions"] == {
         "default_mode": "off",
-        "effective_mode": "standard",
+        "effective_mode": "safe",
     }
 
 
@@ -1723,7 +1724,7 @@ async def test_rpc_sandbox_explain_returns_status_messages_and_optional_context(
     await persist_run_context(
         manager,
         manager.node.session_key,
-        RunContext(run_mode=RunMode.TRUSTED, workspace="/tmp/ws", source="saved"),
+        RunContext(run_mode=RunMode.SAFE, workspace="/tmp/ws", source="saved"),
     )
 
     result = await _handle_sandbox_explain(
@@ -1731,10 +1732,10 @@ async def test_rpc_sandbox_explain_returns_status_messages_and_optional_context(
         _ctx(manager),
     )
 
-    assert result["status"]["run_mode"] == "standard"
-    assert result["runContext"]["runMode"] == "trusted"
+    assert result["status"]["run_mode"] == "safe"
+    assert result["runContext"]["runMode"] == "safe"
     assert result["messages"] == [
-        {"kind": "run_mode", "message": "Run mode is standard."},
+        {"kind": "run_mode", "message": "Run mode is safe."},
         {
             "kind": "managed_network",
             "message": "Managed network allowlist is ready.",
@@ -2286,7 +2287,12 @@ async def test_path_list_falls_back_to_home_when_agent_workspace_symlink_loops(
     home = tmp_path / "home"
     home.mkdir()
     looping_workspace = tmp_path / "looping-agent-workspace"
-    looping_workspace.symlink_to(looping_workspace, target_is_directory=True)
+    try:
+        looping_workspace.symlink_to(looping_workspace, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows developer mode or symlink privilege is required")
+        raise
     ctx = _ctx(manager)
     ctx.config.workspace_dir = str(looping_workspace)
     monkeypatch.setattr(
@@ -2309,7 +2315,12 @@ async def test_path_list_explicit_symlink_loop_remains_strict(tmp_path: Path) ->
 
     manager = _SessionManager()
     looping_path = tmp_path / "looping-explicit-path"
-    looping_path.symlink_to(looping_path, target_is_directory=True)
+    try:
+        looping_path.symlink_to(looping_path, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows developer mode or symlink privilege is required")
+        raise
 
     with pytest.raises(RuntimeError, match="Symlink loop"):
         await _handle_sandbox_path_list(
@@ -2762,7 +2773,7 @@ async def test_rpc_sandbox_semantic_validation_does_not_create_missing_session(
     assert manager.created == []
 
 
-def test_non_owner_route_full_hint_coerces_to_trusted() -> None:
+def test_non_owner_route_full_hint_coerces_to_safe() -> None:
     from opensquilla.gateway.routing import build_web_route_envelope, tool_context_from_envelope
     from opensquilla.sandbox.run_context import RunContext
     from opensquilla.sandbox.run_mode import RunMode
@@ -2779,12 +2790,12 @@ def test_non_owner_route_full_hint_coerces_to_trusted() -> None:
 
     ctx = tool_context_from_envelope(envelope, is_owner=False)
 
-    assert ctx.run_mode == "trusted"
+    assert ctx.run_mode == "safe"
     assert ctx.sandbox_run_context is not None
-    assert ctx.sandbox_run_context.run_mode is RunMode.TRUSTED
+    assert ctx.sandbox_run_context.run_mode is RunMode.SAFE
 
 
-def test_non_owner_route_trusted_hint_is_preserved() -> None:
+def test_non_owner_route_legacy_trusted_hint_decodes_to_safe() -> None:
     from opensquilla.gateway.routing import build_web_route_envelope, tool_context_from_envelope
     from opensquilla.sandbox.run_context import RunContext
     from opensquilla.sandbox.run_mode import RunMode
@@ -2795,15 +2806,15 @@ def test_non_owner_route_trusted_hint_is_preserved() -> None:
     )
     envelope.metadata["run_mode"] = "trusted"
     envelope.metadata["sandbox_run_context"] = RunContext(
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         source="route_metadata",
     ).to_origin_payload()
 
     ctx = tool_context_from_envelope(envelope, is_owner=False)
 
-    assert ctx.run_mode == "trusted"
+    assert ctx.run_mode == "safe"
     assert ctx.sandbox_run_context is not None
-    assert ctx.sandbox_run_context.run_mode is RunMode.TRUSTED
+    assert ctx.sandbox_run_context.run_mode is RunMode.SAFE
 
 
 @pytest.mark.asyncio

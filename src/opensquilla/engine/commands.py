@@ -673,19 +673,18 @@ _COMMANDS: tuple[CommandDef, ...] = (
     ),
     CommandDef(
         name="/sandbox",
-        usage="/sandbox <standard|trusted|full>",
+        usage="/sandbox <safe|full>",
         description="Set the channel session sandbox mode.",
         execution={_C: _rpc("sandbox.run_context.set", _sandbox_session_key)},
         argument_choices=(
-            ArgumentChoice("standard", "Use Standard-Sandbox for this channel session."),
-            ArgumentChoice("trusted", "Use Managed Execution for this channel session."),
+            ArgumentChoice("safe", "Use Safe mode for this channel session."),
             ArgumentChoice("full", "Use Full Host Access; channel admin only."),
         ),
     ),
     CommandDef(
         name="/meta",
-        usage="/meta [skill-name]",
-        description="List meta-skills, or run one with /meta <skill-name>.",
+        usage="/meta [skill-name] [request]",
+        description="List meta-skills, or run one with /meta <skill-name> [request].",
         execution={
             _W: _local("meta.menu"),
             _T: _local("meta.menu"),

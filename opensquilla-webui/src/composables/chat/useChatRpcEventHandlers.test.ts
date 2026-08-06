@@ -8,16 +8,27 @@ import type {
   ChatRunStatus,
   ChatRunStatusSource,
 } from '@/types/chat'
+import {
+  FINISHED_STREAM_TASK_ID,
+  PENDING_STREAM_TASK_ID,
+} from '@/utils/chat/streamEvents'
 
 function createHarness(options: {
   messages?: ChatMessage[]
   endStreaming?: (messages: ChatMessage[]) => void
   sessionRunStatus?: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
+  subscribeSession?: () =>
+    | boolean
+    | void
+    | { authoritative: boolean, live: boolean, backgroundOnly: boolean }
+    | Promise<boolean | void | { authoritative: boolean, live: boolean, backgroundOnly: boolean }>
+  onSessionSubscribed?: () => void | Promise<void>
   handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage?: () => void
   refreshRunModePreference?: () => void | Promise<void>
   pendingQueue?: ChatPendingItem[]
   restoreSteerIntoComposer?: (text: string) => void
+  getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -43,6 +54,7 @@ function createHarness(options: {
     resetStreamIdleTimer: vi.fn(),
     clearStreamIdleTimer: vi.fn(),
     setStreamActivity: vi.fn(),
+    recordCompactionActivity: vi.fn(),
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
@@ -51,7 +63,10 @@ function createHarness(options: {
   const markEnsembleHandoff = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
+  const showCompactionToast = vi.fn()
   const showWarningToast = vi.fn()
+  const subscribeSession = vi.fn(options.subscribeSession || (() => undefined))
+  const onSessionSubscribed = vi.fn(options.onSessionSubscribed || (() => undefined))
   const handleSessionConnectionState = vi.fn(
     options.handleSessionConnectionState ?? (() => undefined),
   )
@@ -88,13 +103,17 @@ function createHarness(options: {
     flushPendingRouterDecision: vi.fn(),
     clearPendingRouterDecision: vi.fn(),
     handleRouterControlReplay: vi.fn(),
-    showCompactionToast: vi.fn(),
+    showCompactionToast,
+    getCompactionPlacement: options.getCompactionPlacement,
     showWarningToast,
     scheduleHistorySync,
     schedulePendingDrainAfterTerminal,
     popAllPendingIntoComposer: vi.fn(() => false),
     restoreSteerIntoComposer,
     saveWidgetState: vi.fn(),
+    subscribeSession,
+    onSessionSubscribed,
+    loadHistory: vi.fn(),
     handleSessionConnectionState,
     loadCurrentSessionUsage,
     refreshRunModePreference,
@@ -112,7 +131,10 @@ function createHarness(options: {
     markEnsembleHandoff,
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
+    showCompactionToast,
     showWarningToast,
+    subscribeSession,
+    onSessionSubscribed,
     handleSessionConnectionState,
     loadCurrentSessionUsage,
     refreshRunModePreference,
@@ -198,6 +220,379 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer', 'answer')
       expect(activeStreamTaskId.value).toBe('task-live')
       expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+
+  it('restores an active compaction from the authoritative live snapshot', () => {
+    const {
+      api,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      stream.isStreaming.value = false
+      vi.mocked(stream.startStreaming).mockImplementation(() => {
+        stream.isStreaming.value = true
+      })
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 2400,
+        events: [
+          {
+            event: 'session.event.compaction',
+            payload: {
+              session_key: 'agent:main:test',
+              status: 'started',
+              phase: 'summarizing',
+              compaction_id: 'cmp-live',
+              task_id: 'task-live',
+              sequence: 1,
+              stream_seq: 2399,
+            },
+          },
+        ],
+      })
+
+      expect(showCompactionToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'started',
+          phase: 'summarizing',
+          compaction_id: 'cmp-live',
+          sequence: 1,
+        }),
+        expect.objectContaining({
+          authoritativeLive: true,
+          placement: 'activity',
+          replayed: false,
+        }),
+      )
+      expect(showCompactionToast.mock.calls[0][0]).not.toHaveProperty('stream_seq')
+      expect(stream.startStreaming).toHaveBeenCalledOnce()
+      expect(stream.recordCompactionActivity).toHaveBeenCalledWith(expect.objectContaining({
+        compaction_id: 'cmp-live',
+      }))
+      expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers compaction ownership', () => {
+  it('buffers compaction while task identity is pending and replays only for its owner', () => {
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-owned',
+        stream_seq: 1,
+        status: 'started',
+        source: 'automatic',
+        compaction_id: 'cmp-owned',
+      }, {})
+
+      expect(showCompactionToast).not.toHaveBeenCalled()
+      expect(lastStreamSeq.value).toBe(0)
+
+      api.bindActiveStreamTask('task-owned')
+
+      expect(showCompactionToast).toHaveBeenCalledOnce()
+      expect(stream.recordCompactionActivity).toHaveBeenCalledWith(expect.objectContaining({
+        compaction_id: 'cmp-owned',
+      }))
+      expect(lastStreamSeq.value).toBe(1)
+    } finally {
+      stop()
+    }
+  })
+
+  it('rejects a compaction tagged for another task before consuming its sequence', () => {
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-current'
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-other',
+        stream_seq: 7,
+        status: 'completed',
+        source: 'automatic',
+        compaction_id: 'cmp-other',
+      }, {})
+
+      expect(showCompactionToast).not.toHaveBeenCalled()
+      expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
+      expect(lastStreamSeq.value).toBe(0)
+    } finally {
+      stop()
+    }
+  })
+
+  it('replays done before higher-sequence maintenance without losing the terminal', () => {
+    const getCompactionPlacement = vi.fn((id: string) => (
+      id === 'cmp-late' ? 'activity' as const : undefined
+    ))
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness({ getCompactionPlacement })
+    try {
+      vi.mocked(stream.endStreaming).mockImplementation(() => {
+        stream.isStreaming.value = false
+      })
+      activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-race',
+        stream_seq: 10,
+        text: 'Finished before late maintenance.',
+      })
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-race',
+        stream_seq: 11,
+        status: 'completed',
+        source: 'automatic',
+        compaction_id: 'cmp-late',
+      }, {})
+
+      api.bindActiveStreamTask('task-race')
+
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+      expect(activeStreamTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+      expect(lastStreamSeq.value).toBe(10)
+      expect(showCompactionToast).toHaveBeenCalledOnce()
+      expect(showCompactionToast).toHaveBeenCalledWith(
+        expect.objectContaining({ compaction_id: 'cmp-late' }),
+        expect.objectContaining({ placement: 'activity' }),
+      )
+      expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('lets a terminal own a stream sequence shared with an earlier visible frame', () => {
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-shared-seq',
+        stream_seq: 10,
+        status: 'started',
+        source: 'automatic',
+        compaction_id: 'cmp-shared-seq',
+      }, {})
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-shared-seq',
+        stream_seq: 10,
+        text: 'Done on the shared sequence.',
+      })
+
+      api.bindActiveStreamTask('task-shared-seq')
+
+      expect(showCompactionToast).toHaveBeenCalledOnce()
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+      expect(activeStreamTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+      expect(lastStreamSeq.value).toBe(10)
+    } finally {
+      stop()
+    }
+  })
+
+  it('accepts only tracked terminal compaction after its task has finished', () => {
+    const getCompactionPlacement = vi.fn((id: string) => (
+      id === 'cmp-known' ? 'activity' as const : undefined
+    ))
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness({ getCompactionPlacement })
+    try {
+      activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+      stream.isStreaming.value = false
+
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-finished',
+        stream_seq: 20,
+        status: 'started',
+        source: 'automatic',
+        compaction_id: 'cmp-known',
+      }, {})
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-finished',
+        stream_seq: 21,
+        status: 'failed',
+        source: 'automatic',
+        compaction_id: 'cmp-known',
+      }, {})
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-finished',
+        stream_seq: 22,
+        status: 'failed',
+        source: 'automatic',
+        compaction_id: 'cmp-unknown',
+      }, {})
+
+      expect(showCompactionToast).toHaveBeenCalledOnce()
+      expect(showCompactionToast).toHaveBeenCalledWith(
+        expect.objectContaining({ compaction_id: 'cmp-known', status: 'failed' }),
+        expect.objectContaining({ placement: 'activity' }),
+      )
+      expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
+      expect(stream.startStreaming).not.toHaveBeenCalled()
+      expect(lastStreamSeq.value).toBe(21)
+      expect(getCompactionPlacement).toHaveBeenCalledWith('cmp-known')
+      expect(getCompactionPlacement).toHaveBeenCalledWith('cmp-unknown')
+    } finally {
+      stop()
+    }
+  })
+
+  it.each([
+    ['completed', 'completed'],
+    ['emergency_ephemeral', 'completed'],
+    ['skipped', 'skipped'],
+    ['stale', 'cancelled'],
+    ['cancelled', 'cancelled'],
+    ['failed', 'failed'],
+    ['error', 'failed'],
+    ['timed_out', 'failed'],
+  ] as const)(
+    'settles the latest committed activity marker for a late %s terminal',
+    (status, expectedState) => {
+      const initialMessages: ChatMessage[] = [
+        {
+          role: 'assistant',
+          text: 'Earlier turn',
+          ts: '2026-08-04T00:00:00.000Z',
+          statusHistory: [{
+            action: 'context_compaction',
+            label: '',
+            at: 1_000,
+            id: 'cmp-committed',
+            category: 'maintenance',
+            state: 'running',
+          }],
+        },
+        {
+          role: 'assistant',
+          text: 'Most recent turn',
+          ts: '2026-08-04T00:01:00.000Z',
+          statusHistory: [{
+            action: 'context_compaction',
+            label: '',
+            at: 2_000,
+            id: 'cmp-committed',
+            category: 'maintenance',
+            state: 'running',
+            detail: 'summarizing',
+          }],
+        },
+      ]
+      const {
+        api,
+        activeStreamTaskId,
+        lastStreamSeq,
+        messages,
+        stream,
+        stop,
+      } = createHarness({
+        messages: initialMessages,
+        getCompactionPlacement: id => id === 'cmp-committed' ? 'activity' : undefined,
+      })
+      try {
+        activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+        stream.isStreaming.value = false
+
+        api.handlers.onCompaction({
+          session_key: 'agent:main:test',
+          task_id: 'task-finished',
+          stream_seq: 31,
+          status,
+          source: 'automatic',
+          compaction_id: 'cmp-committed',
+        }, { authoritativeLive: true })
+
+        expect(messages.value).toHaveLength(2)
+        expect(messages.value[0]?.statusHistory?.[0]).toMatchObject({
+          at: 1_000,
+          state: 'running',
+        })
+        expect(messages.value[1]?.statusHistory?.[0]).toMatchObject({
+          at: 2_000,
+          state: expectedState,
+          detail: 'summarizing',
+        })
+        expect(stream.startStreaming).not.toHaveBeenCalled()
+        expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
+        expect(lastStreamSeq.value).toBe(31)
+      } finally {
+        stop()
+      }
+    },
+  )
+
+  it('syncs history after an accepted identified manual completion only', () => {
+    const {
+      api,
+      scheduleHistorySync,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      showCompactionToast
+        .mockReturnValueOnce('standalone')
+        .mockReturnValueOnce(false)
+      const payload = {
+        session_key: 'agent:main:test',
+        status: 'completed',
+        source: 'manual',
+        compaction_id: 'cmp-manual',
+      }
+      api.handlers.onCompaction({ ...payload, stream_seq: 1 }, {})
+      api.handlers.onCompaction({ ...payload, stream_seq: 2 }, {})
+
+      expect(scheduleHistorySync).toHaveBeenCalledOnce()
     } finally {
       stop()
     }
@@ -299,7 +694,7 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
   })
 
   it('toasts warnings for five-second host handling while consuming silent warning sequences', () => {
-    const { api, showWarningToast, messages, stop } = createHarness()
+    const { api, showWarningToast, messages, lastStreamSeq, stop } = createHarness()
     try {
       api.handlers.onWarning({
         session_key: 'agent:main:test',
@@ -315,12 +710,46 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
       api.handlers.onWarning({
         session_key: 'agent:main:test',
         stream_seq: 2,
+        code: 'provider_request_message_limit_recovery_success',
+        message: 'Older history was summarized for this provider request; retrying once.',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        message: 'replayed compaction warning',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        code: 'context_auto_compaction_start',
+        message: 'Provider context limit reached; compacting older context before retrying.',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        message: 'replayed automatic compaction start warning',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 4,
+        code: 'context_auto_compaction_retry',
+        message: 'Stable context compacted; retrying the provider request.',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 4,
+        message: 'replayed automatic compaction warning',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 5,
         message: 'Provider is degraded',
       })
 
       expect(showWarningToast).toHaveBeenCalledOnce()
       expect(showWarningToast).toHaveBeenCalledWith('Provider is degraded')
       expect(messages.value).toHaveLength(0)
+      expect(lastStreamSeq.value).toBe(5)
     } finally {
       stop()
     }
@@ -1044,6 +1473,64 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       vi.mocked(stream.resetStreamIdleTimer).mockClear()
       api.handlers.onConnectionState('connected')
       expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(1)
+    } finally {
+      stop()
+    }
+  })
+
+  it('restores durable setup work only after reconnect subscription succeeds', async () => {
+    let resolveSubscription: ((subscribed: boolean) => void) | undefined
+    const subscription = new Promise<boolean>((resolve) => { resolveSubscription = resolve })
+    const { api, subscribeSession, onSessionSubscribed, stop } = createHarness({
+      subscribeSession: () => subscription,
+    })
+
+    try {
+      api.handlers.onConnectionState('connected')
+      expect(subscribeSession).toHaveBeenCalledOnce()
+      expect(onSessionSubscribed).not.toHaveBeenCalled()
+
+      resolveSubscription?.(true)
+      await subscription
+      await Promise.resolve()
+
+      expect(onSessionSubscribed).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not restore durable setup work when reconnect subscription fails', async () => {
+    const { api, onSessionSubscribed, stop } = createHarness({
+      subscribeSession: async () => false,
+    })
+
+    try {
+      api.handlers.onConnectionState('connected')
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(onSessionSubscribed).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not restore durable setup work from a non-authoritative outcome object', async () => {
+    const { api, onSessionSubscribed, stop } = createHarness({
+      subscribeSession: async () => ({
+        authoritative: false,
+        live: false,
+        backgroundOnly: false,
+      }),
+    })
+
+    try {
+      api.handlers.onConnectionState('connected')
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(onSessionSubscribed).not.toHaveBeenCalled()
     } finally {
       stop()
     }

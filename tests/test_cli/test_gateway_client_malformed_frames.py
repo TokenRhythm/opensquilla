@@ -55,7 +55,7 @@ class _FakeWebSocket:
 def _install_fake_websockets(
     monkeypatch: pytest.MonkeyPatch, ws: _FakeWebSocket
 ) -> None:
-    async def _connect(url: str) -> _FakeWebSocket:
+    async def _connect(url: str, **_kwargs: Any) -> _FakeWebSocket:
         return ws
 
     monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=_connect))

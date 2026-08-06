@@ -85,7 +85,7 @@ current policy.
 - Reuses `opensquilla-webui` and the Python gateway exactly as they run in the
   browser.
 - Starts a bundled `runtime/gateway/opensquilla-gateway` in packaged builds.
-- Falls back to `uv run opensquilla gateway run --bind 127.0.0.1 --port <port>`
+- Falls back to `uv run opensquilla gateway run --listen 127.0.0.1 --port <port>`
   during development when no bundled runtime exists.
 - Uses `contextIsolation: true`, `nodeIntegration: false`, and a minimal preload
   bridge.

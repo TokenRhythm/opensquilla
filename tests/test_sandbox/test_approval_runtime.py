@@ -238,7 +238,7 @@ def test_elevation_gate_does_not_queue_override_with_denied_reads(tmp_path: Path
     ("active_run_mode", "expected_reviewer", "human_actionable"),
     (
         ("standard", "user", True),
-        ("trusted", "auto_review", False),
+        ("trusted", "user", True),
     ),
 )
 def test_active_run_mode_controls_exact_elevation_reviewer(

@@ -23,6 +23,25 @@ export const optionalSessionRpcCallOptions: RpcCallOptions = {
   abortAction: 'reconnect',
 }
 
+// The first setup-status read can queue behind the live Windows capability
+// canary, whose own bounded probe may take up to 30 seconds. Treat this as a
+// slow diagnostic read: give it enough time to finish and never recycle the
+// shared chat socket merely because the read was abandoned.
+export const sandboxSetupRpcCallOptions: RpcCallOptions = {
+  timeoutMs: 45_000,
+  timeoutAction: 'reject',
+  abortAction: 'reject',
+}
+
+// A mode click is an interactive control, so it must never look frozen behind
+// an unrelated slow RPC on the connection. The composable updates the visible
+// selection optimistically; this bound only governs persistence/rollback.
+export const runModeWriteRpcCallOptions: RpcCallOptions = {
+  timeoutMs: 5_000,
+  timeoutAction: 'reject',
+  abortAction: 'reject',
+}
+
 type OptionalSessionRpcClient = {
   waitForConnection: (
     timeoutMs?: number,
