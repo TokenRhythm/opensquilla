@@ -567,3 +567,176 @@ async def test_cancel_active_compactions_is_scoped_to_session(
     finally:
         other_session.cancel()
         await asyncio.gather(other_session, return_exceptions=True)
+
+
+def _record(monitor: CacheBreakMonitor, session_key: str, tokens: int = 5000) -> None:
+    snapshot = monitor.record_prompt_state(
+        messages=[
+            Message(role="user", content=f"old {session_key}"),
+            Message(role="user", content="now"),
+        ],
+        tools=None,
+        config=ChatConfig(system="stable system"),
+        model="model-a",
+    )
+    monitor.check_response_for_cache_break(session_key, snapshot, tokens)
+
+
+def test_evict_drops_all_cache_break_state_for_one_session() -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05)
+    _record(monitor, "agent:main:s1")
+    _record(monitor, "agent:main:s2")
+    monitor.notify_compaction("agent:main:s1")
+
+    assert monitor.evict("agent:main:s1") is True
+    assert monitor.tracked_session_count == 1
+
+    snapshot = monitor.record_prompt_state(
+        messages=[Message(role="user", content="fresh"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="different system"),
+        model="model-b",
+    )
+    report = monitor.check_response_for_cache_break("agent:main:s1", snapshot, 0)
+
+    assert report.break_detected is False
+    assert report.reason == "baseline_initialized"
+
+
+def test_evict_reports_false_for_untracked_session() -> None:
+    assert CacheBreakMonitor().evict("agent:main:never-seen") is False
+
+
+@pytest.mark.asyncio
+async def test_module_level_eviction_targets_only_default_cache_break_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    monitor = CacheBreakMonitor()
+    monkeypatch.setattr(cache_break_monitor, "default_cache_break_monitor", monitor)
+    _record(monitor, "agent:main:s1")
+
+    async def _waiting_owner() -> None:
+        await asyncio.Event().wait()
+
+    owner = asyncio.create_task(_waiting_owner())
+    cache_break_monitor.register_active_compaction(
+        "agent:main:s1",
+        "compaction-still-owned",
+        owner,
+    )
+    try:
+        assert cache_break_monitor.evict_cache_break_state("agent:main:s1") is True
+        assert monitor.tracked_session_count == 0
+        assert cache_break_monitor.active_compaction_ids("agent:main:s1") == (
+            "compaction-still-owned",
+        )
+    finally:
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+
+
+def test_tracked_sessions_stay_bounded_without_explicit_eviction() -> None:
+    monitor = CacheBreakMonitor(max_sessions=4)
+
+    for index in range(50):
+        _record(monitor, f"agent:main:s{index}")
+
+    assert monitor.tracked_session_count == 4
+
+
+def test_lru_eviction_never_reports_a_false_break() -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05, max_sessions=2)
+    _record(monitor, "agent:main:cold", tokens=5000)
+    _record(monitor, "agent:main:hot1")
+    _record(monitor, "agent:main:hot2")
+
+    changed = monitor.record_prompt_state(
+        messages=[Message(role="user", content="changed"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="different system"),
+        model="model-b",
+    )
+    report = monitor.check_response_for_cache_break("agent:main:cold", changed, 0)
+
+    assert report.break_detected is False
+    assert report.reason == "baseline_initialized"
+
+
+def test_most_recently_used_session_survives_the_bound() -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05, max_sessions=2)
+    _record(monitor, "agent:main:keep", tokens=5000)
+    _record(monitor, "agent:main:filler1")
+    _record(monitor, "agent:main:keep", tokens=5000)
+    _record(monitor, "agent:main:filler2")
+
+    changed = monitor.record_prompt_state(
+        messages=[Message(role="user", content="changed"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="different system"),
+        model="model-b",
+    )
+    report = monitor.check_response_for_cache_break("agent:main:keep", changed, 0)
+
+    assert report.break_detected is True
+    assert report.reason == "cache_read_drop"
+
+
+def test_pending_resets_stay_bounded_without_a_paired_baseline() -> None:
+    monitor = CacheBreakMonitor(max_sessions=4)
+
+    for index in range(50):
+        monitor.notify_compaction(f"agent:main:ghost{index}")
+
+    assert monitor.tracked_session_count == 4
+    snapshot = monitor.record_prompt_state(
+        messages=[Message(role="user", content="old"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="stable system"),
+        model="model-a",
+    )
+    report = monitor.check_response_for_cache_break("agent:main:ghost49", snapshot, 0)
+    assert report.reason == "baseline_reset_after_compaction"
+
+
+def test_evict_reports_true_for_a_pending_reset_without_a_baseline() -> None:
+    monitor = CacheBreakMonitor()
+    monitor.notify_compaction("agent:main:pending-only")
+
+    assert monitor.evict("agent:main:pending-only") is True
+    assert monitor.tracked_session_count == 0
+    assert monitor.evict("agent:main:pending-only") is False
+
+
+def test_trimming_never_strands_a_baseline_without_its_reset_marker() -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05, max_sessions=2)
+    _record(monitor, "agent:main:compacted", tokens=5000)
+    monitor.notify_compaction("agent:main:compacted")
+
+    for index in range(10):
+        monitor.notify_compaction(f"agent:main:unrelated{index}")
+
+    after_compaction = monitor.record_prompt_state(
+        messages=[Message(role="user", content="shrunk"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="rewritten by compaction"),
+        model="model-b",
+    )
+    report = monitor.check_response_for_cache_break(
+        "agent:main:compacted",
+        after_compaction,
+        100,
+    )
+
+    assert report.break_detected is False
+    assert report.reason == "baseline_initialized"
+
+
+def test_the_bound_counts_sessions_not_independent_state_maps() -> None:
+    monitor = CacheBreakMonitor(max_sessions=3)
+
+    for index in range(20):
+        _record(monitor, f"agent:main:with-baseline{index}")
+        monitor.notify_compaction(f"agent:main:pending-only{index}")
+
+    assert monitor.tracked_session_count == 3
