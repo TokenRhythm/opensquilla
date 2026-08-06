@@ -292,6 +292,8 @@
       "toolDetailsExpanded": "Ausgeklappt",
       "visualEffectsLabel": "Visuelle Effekte",
       "visualEffectsDesc": "Animiert Modell-Routing-Entscheidungen und Antwortübergänge in Unterhaltungen.",
+      "composerFxLabel": "Schwebende Eingabeleiste",
+      "composerFxDesc": "Eingabe über dem Verlauf schweben lassen und beim Hochscrollen zu einer Zeile einklappen.",
       "bgmLabel": "Hintergrundmusik",
       "bgmDesc": "Zeigt das Hintergrundmusik-Element in der oberen Leiste. Standardmäßig aus; auch über die Befehlspalette umschaltbar.",
       "sidebarWidthLabel": "Seitenleistenbreite",
@@ -3599,9 +3601,7 @@
       "results": "{count} Ergebnisse",
       "countRunning": "{count} laufen",
       "countDone": "{count} fertig",
-      "countFailed": "{count} fehlgeschlagen",
-      "collapseAll": "Alle einklappen",
-      "expandAll": "Alle ausklappen"
+      "countFailed": "{count} fehlgeschlagen"
     },
     "chips": {
       "whatCanYouDo": "Was kannst du?",

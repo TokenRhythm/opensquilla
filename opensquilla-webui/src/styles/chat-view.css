@@ -200,7 +200,7 @@
 .chat-thread {
   flex: 1;
   overflow-y: auto;
-  padding: 0.25rem 0 1.5rem;
+  padding: 0.25rem 0 1.25rem;
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
@@ -209,6 +209,14 @@
      content's left edge) does not shift when the conversation grows a
      scrollbar mid-stream. */
   scrollbar-gutter: stable;
+}
+
+/* Floating composer (existing conversation, toggle on): the dock leaves the
+   document flow and pins to the chat container's bottom edge, so the last
+   messages can scroll underneath the glass panel and the backdrop blur reads
+   through them. The thread gets extra bottom clearance for the panel. */
+.chat.chat--composer-floating .chat-thread {
+  padding: 0.25rem 0 12.5rem;
 }
 
 .chat-thread:focus-visible {
@@ -236,6 +244,12 @@
   overflow: visible;
   padding: 0;
   gap: 0;
+}
+
+/* Retracted composer is a single-line bar, so the thread no longer needs the
+   full panel's bottom clearance. */
+.chat--composer-collapsed .chat-thread {
+  padding-bottom: 5rem;
 }
 
 .chat-landing-brand {
@@ -454,6 +468,18 @@
   flex-shrink: 0;
 }
 
+/* Floating composer (existing conversation, toggle on): the dock leaves the
+   document flow and pins to the chat container's bottom edge, so the last
+   messages can scroll underneath the glass panel and the backdrop blur reads
+   through them. The new-chat landing keeps the centered (relative) layout. */
+.chat.chat--composer-floating .chat-composer-dock {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+}
+
 .chat-composer-dock > .chat-composer {
   position: relative;
   z-index: 2;
@@ -594,9 +620,11 @@
      padding), so the input panel's edges line up with the thread content. */
   width: min(100%, calc(var(--chat-col) + 3rem));
   margin: 0 auto;
-  padding: 0.75rem 1.5rem 1.875rem;
+  /* Floating composer: no bottom-bar band, just breathing room around the
+     glass panel so it reads as a card hovering over the transcript. */
+  padding: 0.5rem 1.5rem 1.25rem;
   border-top: 0;
-  background: var(--bg-surface);
+  background: transparent;
   flex-shrink: 0;
 }
 
@@ -1008,11 +1036,21 @@
   }
 
   .chat-thread {
-    padding: 0.75rem;
+    padding: 0.75rem 0.75rem 1.5rem;
+  }
+
+  .chat.chat--composer-floating .chat-thread {
+    /* Keep the bottom clearance for the floating composer on mobile too;
+       the composer sits at 0.5rem/0.75rem/0.875rem + a 128px panel. */
+    padding: 0.75rem 0.75rem 12.5rem;
+  }
+
+  .chat--composer-collapsed .chat-thread {
+    padding: 0.75rem 0.75rem 4.5rem;
   }
 
   .chat-composer {
-    padding: 0.5rem 0.75rem;
+    padding: 0.5rem 0.75rem 0.875rem;
   }
 
 }

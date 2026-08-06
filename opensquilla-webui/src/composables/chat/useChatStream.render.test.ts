@@ -443,7 +443,7 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
-  it('commits a conflicting terminal snapshot into the tool timeline', () => {
+  it('keeps streamed text around tools when the terminal snapshot conflicts', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('stale preface')
@@ -452,15 +452,17 @@ describe('useChatStream render coalescing', () => {
     api.appendDelta('stale retry')
     api.reconcileFinalText('Canonical answer')
 
-    expect(api.foldedTurn.value.rawText).toBe('Canonical answer')
-    expect(api.foldedTurn.value.timelineItems.map(item => item.type)).toEqual(['tool-group', 'text'])
+    // Streamed content is canonical: the conflicting snapshot is not applied.
+    expect(api.foldedTurn.value.rawText).toBe('stale prefacestale retry')
+    expect(api.foldedTurn.value.timelineItems.map(item => item.type)).toEqual(['text', 'tool-group', 'text'])
 
     api.endStreaming()
 
-    expect(messages.value[0]?.text).toBe('Canonical answer')
+    expect(messages.value[0]?.text).toBe('stale prefacestale retry')
     expect(messages.value[0]?.timeline).toEqual([
+      { type: 'text', raw: 'stale preface' },
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
-      { type: 'text', raw: 'Canonical answer' },
+      { type: 'text', raw: 'stale retry' },
     ])
     expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({
       tool_use_id: 'tool-1',
@@ -469,7 +471,7 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
-  it('clears stale text on an authoritative empty snapshot but keeps tools', () => {
+  it('keeps streamed text when the terminal snapshot is empty (no rewrite)', () => {
     const { api, messages } = makeStream()
 
     api.appendDelta('stale text')
@@ -477,13 +479,14 @@ describe('useChatStream render coalescing', () => {
     api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
     api.reconcileFinalText('')
 
-    expect(api.foldedTurn.value.rawText).toBe('')
-    expect(api.foldedTurn.value.timelineItems.map(item => item.type)).toEqual(['tool-group'])
+    expect(api.foldedTurn.value.rawText).toBe('stale text')
+    expect(api.foldedTurn.value.timelineItems.map(item => item.type)).toEqual(['text', 'tool-group'])
 
     api.endStreaming()
 
-    expect(messages.value[0]?.text).toBe('')
+    expect(messages.value[0]?.text).toBe('stale text')
     expect(messages.value[0]?.timeline).toEqual([
+      { type: 'text', raw: 'stale text' },
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
     ])
     expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({ tool_use_id: 'tool-1' })

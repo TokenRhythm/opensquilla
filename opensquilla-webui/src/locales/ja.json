@@ -292,6 +292,8 @@
       "toolDetailsExpanded": "展開",
       "visualEffectsLabel": "視覚効果",
       "visualEffectsDesc": "会話内のモデルルーティング判断と回答の切り替えをアニメーション表示します。",
+      "composerFxLabel": "フローティング入力欄",
+      "composerFxDesc": "入力欄を会話の上に浮かせ、上にスクロールすると1行に折りたたみます。",
       "bgmLabel": "BGM",
       "bgmDesc": "トップバーにBGMコントロールを表示します。既定ではオフで、コマンドパレットからも切り替えられます。",
       "sidebarWidthLabel": "サイドバーの幅",
@@ -3599,9 +3601,7 @@
       "results": "{count} 件の結果",
       "countRunning": "{count} 件実行中",
       "countDone": "{count} 件完了",
-      "countFailed": "{count} 件失敗",
-      "collapseAll": "すべて折りたたむ",
-      "expandAll": "すべて展開"
+      "countFailed": "{count} 件失敗"
     },
     "chips": {
       "whatCanYouDo": "何ができますか？",

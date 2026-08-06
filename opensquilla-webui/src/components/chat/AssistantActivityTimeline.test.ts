@@ -120,7 +120,10 @@ describe('AssistantActivityTimeline', () => {
     expect(root.querySelector('.tool-row__arg')?.textContent).toBe('2 files')
     // The footprint carries the count; the raw call-count pill would repeat it.
     expect(root.querySelector('.step-count')).toBeNull()
+    // No bulk toolbar exists anymore: the count lives only in the footprint
+    // secondary ("2 files"), never in a separate summary control.
     expect(root.textContent).not.toContain('2 calls')
+    expect(root.textContent).toContain('2 files')
     expect(root.textContent).not.toContain('/private/')
     expect(root.textContent).not.toContain('Private write-secret')
   })

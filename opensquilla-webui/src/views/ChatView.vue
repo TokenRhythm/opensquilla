@@ -5,6 +5,8 @@
       'chat--new-landing': isNewChatLanding,
       'chat--drag-over': threadDragOver,
       'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
+      'chat--composer-floating': composerFxEnabled && !isNewChatLanding,
+      'chat--composer-collapsed': composerCollapsed && composerFxEnabled && !isNewChatLanding,
     }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
@@ -516,6 +518,9 @@
       :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
       :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
       :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
+      :collapsed="composerCollapsed && composerFxEnabled && !isNewChatLanding"
+      :floating="composerFxEnabled && !isNewChatLanding"
+      @expand="composerCollapsed = false"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -703,6 +708,7 @@ import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
 import { useChatSlashCommands } from '@/composables/chat/useChatSlashCommands'
 import { useChatStream } from '@/composables/chat/useChatStream'
+import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
 import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
@@ -898,6 +904,23 @@ const pendingAutoSend = ref('')
 
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
+/* Floating-composer retract: scrolling up off the live edge collapses to a
+   single-line input; any downward browsing (or landing back at the live edge)
+   restores the full panel. Direction + hysteresis keeps slow drags near the
+   edge from flapping the panel. */
+const COMPOSER_RETRACT_GAP = 120
+const COMPOSER_EXPAND_GAP = 60
+const COMPOSER_SCROLL_DEADZONE = 4
+const composerCollapsed = ref(false)
+let lastThreadScrollTop: number | null = null
+
+// Settings → Appearance "Floating composer" toggle. Off: the composer docks in
+// the normal layout and never retracts; on (default): it floats over the
+// transcript and collapses to a single line while scrolling up.
+const { enabled: composerFxEnabled } = useComposerFloatingPreference()
+watch(composerFxEnabled, (on) => {
+  if (!on) composerCollapsed.value = false
+})
 type ChatHeaderActionsHandle = {
   focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
 }
@@ -3310,9 +3333,32 @@ function scrollToBottom() {
 }
 
 function onThreadScroll() {
-  if (!threadRef.value) return
-  const gap = threadRef.value.scrollHeight - threadRef.value.scrollTop - threadRef.value.clientHeight
+  const el = threadRef.value
+  if (!el) return
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
   historyNavigationScrollLock.updateFromScroll(gap)
+  if (isNewChatLanding.value || !composerFxEnabled.value) return
+  if (lastThreadScrollTop === null) {
+    // First scroll of the session: no direction baseline yet, so fall back to
+    // the absolute live-edge gap (also covers programmatic first scrolls).
+    lastThreadScrollTop = el.scrollTop
+    if (composerCollapsed.value) {
+      if (gap < COMPOSER_EXPAND_GAP) composerCollapsed.value = false
+    } else if (gap > COMPOSER_RETRACT_GAP) {
+      composerCollapsed.value = true
+    }
+    return
+  }
+  const delta = el.scrollTop - lastThreadScrollTop
+  lastThreadScrollTop = el.scrollTop
+  if (composerCollapsed.value) {
+    // Any downward browsing — even a short nudge — restores the panel.
+    if (delta > COMPOSER_SCROLL_DEADZONE || gap < COMPOSER_EXPAND_GAP) {
+      composerCollapsed.value = false
+    }
+  } else if (delta < -COMPOSER_SCROLL_DEADZONE && gap > COMPOSER_RETRACT_GAP) {
+    composerCollapsed.value = true
+  }
 }
 
 function onHistoryNavigate() {

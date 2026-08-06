@@ -1,5 +1,9 @@
 <template>
-  <div ref="composerEl" class="chat-composer" :class="{ 'chat-composer--new-landing': isNewLanding }">
+  <div
+    ref="composerEl"
+    class="chat-composer"
+    :class="{ 'chat-composer--new-landing': isNewLanding, 'chat-composer--collapsed': collapsed, 'chat-composer--docked': !floating }"
+  >
     <div class="chat-composer-inner">
       <div v-if="attachments.length > 0" class="chat-attachments">
         <div
@@ -64,6 +68,7 @@
             @keydown="emit('keydown', $event)"
             @compositionstart="emit('compositionChange', true)"
             @compositionend="emit('compositionChange', false)"
+            @focus="emit('expand')"
           />
         </div>
         <div class="chat-input-footer">
@@ -391,12 +396,18 @@ const props = withDefaults(defineProps<{
   promptCacheKeepaliveAvailable?: boolean
   promptCacheKeepaliveSessionReady?: boolean
   promptCacheKeepaliveStatus?: PromptCacheKeepaliveStatus | null
+  /** Collapsed to a single-line input (floating-composer retract). */
+  collapsed?: boolean
+  /** Floating-composer toggle: false docks the panel (solid surface, no
+      glass) even though the composer still renders in the normal layout. */
+  floating?: boolean
 }>(), {
   canChooseProject: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
   inputDisabled: false,
   safeSetupAvailable: false,
+  floating: true,
 })
 
 const emit = defineEmits<{
@@ -422,6 +433,8 @@ const emit = defineEmits<{
   closeProject: []
   openPromptCacheKeepalive: []
   refreshPromptCacheKeepalive: []
+  /** Request the parent to restore the full (expanded) composer. */
+  expand: []
 }>()
 
 const { t } = useI18n()
@@ -648,9 +661,11 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-composer {
-  padding: 0.75rem 1.5rem 1.875rem;
+  /* Floating composer: no bottom-bar band, just breathing room around the
+     glass panel so it reads as a card hovering over the transcript. */
+  padding: 0.5rem 1.5rem 1.25rem;
   border-top: 0;
-  background: var(--bg-surface);
+  background: transparent;
   flex-shrink: 0;
 }
 
@@ -917,8 +932,12 @@ defineExpose<ChatComposerExpose>({
   min-height: 128px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-modal);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-xs);
+  /* Glass card: translucent surface + backdrop blur so the transcript scrolls
+     softly behind the floating composer instead of a solid bottom bar. */
+  background: color-mix(in srgb, var(--bg-surface) 72%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  backdrop-filter: blur(16px) saturate(140%);
+  box-shadow: var(--shadow-lg);
   position: relative;
 }
 
@@ -978,18 +997,143 @@ defineExpose<ChatComposerExpose>({
   box-shadow: var(--shadow-lg);
 }
 
+/* Floating-composer retract: collapse to a single-line input with nothing
+   else. Every region animates (opacity/height/transform) instead of snapping,
+   and the composer's own padding tightens so the bar reads as one slim line. */
+.chat-composer {
+  transition: padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.chat-composer--collapsed {
+  /* !important: the bundler emits a duplicate .chat-composer rule scoped to
+     the parent (ChatView) that lands later in the chunk CSS and would
+     otherwise win the cascade for padding-bottom. */
+  padding-bottom: 0.5rem !important;
+}
+
+/* Floating-composer toggle off (docked layout): the panel is a solid surface
+   — no glass to read the transcript through. !important beats apple-modern's
+   `#app .chat .chat-input-panel:focus-within` id-scoped surface. */
+.chat-composer--docked .chat-input-panel {
+  background: var(--bg-surface) !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+.chat-attachments,
+.chat-replan-draft,
+.chat-composer-send-status,
+.chat-ai-disclaimer {
+  overflow: hidden;
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    max-height var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    margin var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    visibility 0s linear;
+}
+.chat-attachments { max-height: 180px; }
+.chat-replan-draft { max-height: 96px; }
+.chat-composer-send-status { max-height: 64px; }
+.chat-ai-disclaimer { max-height: 64px; }
+
+.chat-composer--collapsed .chat-attachments,
+.chat-composer--collapsed .chat-replan-draft,
+.chat-composer--collapsed .chat-composer-send-status,
+.chat-composer--collapsed .chat-ai-disclaimer {
+  opacity: 0;
+  transform: translateY(6px);
+  max-height: 0 !important;
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    max-height var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    margin var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    visibility 0s linear var(--dur-enter);
+}
+
+/* Toolbar row: animate its height precisely with the grid-rows trick. */
+.chat-input-footer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: 1fr;
+  justify-content: initial;
+  gap: 0.75rem;
+  padding: 0.25rem 0.625rem 0.625rem;
+  transition:
+    grid-template-rows var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    opacity var(--dur-base) var(--ease-out),
+    padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    visibility 0s linear;
+}
+.chat-input-footer > * {
+  min-height: 0;
+  overflow: hidden;
+}
+.chat-composer--collapsed .chat-input-footer {
+  grid-template-rows: 0fr !important;
+  opacity: 0;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    grid-template-rows var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    opacity var(--dur-base) var(--ease-out),
+    padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    visibility 0s linear var(--dur-enter);
+}
+
+.chat-input-panel {
+  /* !important: theme files (apple-modern) declare their own min-height and
+     transition with higher specificity; the retract must win either way. */
+  transition:
+    min-height var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    border-color var(--dur-base) var(--ease-out),
+    box-shadow var(--dur-base) var(--ease-out) !important;
+}
+
+.chat-composer--collapsed .chat-input-panel {
+  min-height: 0 !important;
+}
+
+.chat-textarea {
+  transition:
+    min-height var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    max-height var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.chat-composer--collapsed .chat-textarea {
+  min-height: 0;
+  max-height: 2.5rem;
+  padding: 0.4375rem 1rem;
+  overflow-y: hidden;
+}
+
 .chat-composer--new-landing .chat-input-panel:focus-within {
   border-color: var(--border-focus);
   box-shadow: var(--shadow-xl);
 }
 
-.chat-input-footer,
 .chat-input-actions {
   display: flex;
   align-items: center;
 }
 
 .chat-input-footer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: 1fr;
+  align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
   padding: 0.25rem 0.625rem 0.625rem;

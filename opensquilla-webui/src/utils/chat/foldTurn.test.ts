@@ -98,17 +98,18 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
     expect(f.parts.map(part => part.type)).toEqual(['text', 'interrupt', 'text'])
   })
 
-  it('accumulates streamed text and lets final-text override it', () => {
+  it('accumulates streamed text; a conflicting final-text keeps the stream', () => {
     expect(fold([
       { kind: 'text', seq: 0, text: 'Hello ' },
       { kind: 'text', seq: 1, text: 'world' },
     ]).rawText).toBe('Hello world')
 
+    // Streamed content is canonical: a conflicting snapshot is not applied.
     expect(fold([
       { kind: 'text', seq: 0, text: 'Hello ' },
       { kind: 'text', seq: 1, text: 'world' },
       { kind: 'final-text', seq: 2, text: 'Final answer' },
-    ]).rawText).toBe('Final answer')
+    ]).rawText).toBe('Hello world')
   })
 
   it('preserves semantic text boundaries for live answer streaming', () => {
@@ -126,7 +127,10 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
     ])
   })
 
-  it('replaces stale text around tools with one canonical terminal segment', () => {
+  it('keeps streamed text around tools when the terminal snapshot conflicts', () => {
+    // Product contract: streamed content is the answer. A conflicting
+    // authoritative snapshot is NOT applied to the DOM — streamed text stays
+    // in its original position and order, and tool groups are untouched.
     const f = fold([
       { kind: 'text', seq: 0, text: 'stale preface' },
       { kind: 'tool-start', seq: 1, toolId: 't', name: 'bash', input: '{}', at: 1 },
@@ -135,13 +139,16 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
       { kind: 'final-text', seq: 4, text: 'Canonical answer' },
     ])
 
-    expect(f.rawText).toBe('Canonical answer')
-    expect(f.timelineItems.map(item => item.type)).toEqual(['tool-group', 'text'])
-    expect(f.timelineItems[1]).toMatchObject({ type: 'text', html: 'Canonical answer' })
+    expect(f.rawText).toBe('stale prefacestale retry')
+    expect(f.timelineItems.map(item => item.type)).toEqual(['text', 'tool-group', 'text'])
+    expect(f.timelineItems[0]).toMatchObject({ type: 'text', rawText: 'stale preface' })
+    expect(f.timelineItems[2]).toMatchObject({ type: 'text', rawText: 'stale retry' })
     expect(f.toolCalls[0]).toMatchObject({ toolId: 't', status: 'success', result: 'ok' })
   })
 
-  it('treats an empty terminal snapshot as an authoritative text clear', () => {
+  it('keeps streamed text when the terminal snapshot is empty (no rewrite)', () => {
+    // An empty snapshot previously cleared streamed text; the streamed content
+    // is now canonical, so nothing the user saw is erased.
     const f = fold([
       { kind: 'text', seq: 0, text: 'stale text' },
       { kind: 'tool-start', seq: 1, toolId: 't', name: 'bash', input: '{}', at: 1 },
@@ -149,8 +156,8 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
       { kind: 'final-text', seq: 3, text: '' },
     ])
 
-    expect(f.rawText).toBe('')
-    expect(f.timelineItems.map(item => item.type)).toEqual(['tool-group'])
+    expect(f.rawText).toBe('stale text')
+    expect(f.timelineItems.map(item => item.type)).toEqual(['text', 'tool-group'])
     expect(f.toolCalls[0]).toMatchObject({ toolId: 't', status: 'success' })
   })
 

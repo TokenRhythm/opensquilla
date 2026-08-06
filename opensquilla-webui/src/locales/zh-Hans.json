@@ -292,6 +292,8 @@
       "toolDetailsExpanded": "展开",
       "visualEffectsLabel": "动画效果",
       "visualEffectsDesc": "在对话中显示模型路由决策和回答切换动画。",
+      "composerFxLabel": "悬浮输入栏",
+      "composerFxDesc": "输入栏悬浮于对话之上，向上滚动时收起为单行。",
       "bgmLabel": "背景音乐",
       "bgmDesc": "在顶栏显示背景音乐控件。默认关闭；也可通过命令面板切换。",
       "sidebarWidthLabel": "侧边栏宽度",
@@ -3652,9 +3654,7 @@
       "results": "{count} 条结果",
       "countRunning": "{count} 项运行中",
       "countDone": "{count} 项完成",
-      "countFailed": "{count} 项失败",
-      "collapseAll": "全部折叠",
-      "expandAll": "全部展开"
+      "countFailed": "{count} 项失败"
     },
     "chips": {
       "whatCanYouDo": "你能做什么？",

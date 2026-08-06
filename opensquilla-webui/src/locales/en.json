@@ -292,6 +292,8 @@
       "toolDetailsExpanded": "Expanded",
       "visualEffectsLabel": "Visual effects",
       "visualEffectsDesc": "Animate model-routing decisions and answer transitions in conversations.",
+      "composerFxLabel": "Floating composer",
+      "composerFxDesc": "Float the input over the transcript and collapse it to a single line while scrolling up.",
       "bgmLabel": "Background music",
       "bgmDesc": "Show the background-music control in the top bar. Off by default; also toggleable from the command palette.",
       "sidebarWidthLabel": "Sidebar width",
@@ -3652,9 +3654,7 @@
       "results": "{count} results",
       "countRunning": "{count} running",
       "countDone": "{count} done",
-      "countFailed": "{count} failed",
-      "collapseAll": "Collapse all",
-      "expandAll": "Expand all"
+      "countFailed": "{count} failed"
     },
     "chips": {
       "whatCanYouDo": "What can you do?",
