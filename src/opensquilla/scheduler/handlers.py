@@ -106,12 +106,23 @@ def _required_heartbeat_delivery_error(
     """Return an error when pinned heartbeat delivery was required but failed."""
     if job.delivery.best_effort or delivery_override is None:
         return None
+    mode = (
+        job.delivery.mode
+        if isinstance(job.delivery.mode, DeliveryMode)
+        else DeliveryMode(job.delivery.mode)
+    )
     hb_status = getattr(hb_result, "status", "")
     delivery_status = getattr(hb_result, "delivery_status", "")
     reason = getattr(hb_result, "reason", "")
     if delivery_status in {"delivery_failed", "forward_failed"}:
         return str(reason or delivery_status)
     if hb_status == "skipped":
+        # mode=NONE jobs never require delivery (e.g. silent main-session
+        # injection): their heartbeat run is skipped by design, which must
+        # not be reported as a delivery failure.  An actual delivery attempt
+        # that failed is still reported above.
+        if mode == DeliveryMode.NONE:
+            return None
         return str(reason or delivery_status or "delivery skipped")
     return None
 
