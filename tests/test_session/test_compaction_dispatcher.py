@@ -167,8 +167,18 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
 
 
 @pytest.mark.asyncio
-async def test_new_skips_when_only_cut_would_orphan_tool_result():
-    """If no clean boundary exists, compaction must not split tool state."""
+async def test_new_skips_when_only_cut_would_orphan_tool_result(monkeypatch):
+    """If no clean boundary exists, compaction must not split tool state.
+
+    The branch under test sits in a two-token-wide window band: one token
+    higher and the transcript is within budget, one lower and a cut is found
+    and the quality gate rejects it. Pin token math so the band — and this test
+    — stay deterministic and offline instead of loading an optional tokenizer.
+    """
+    monkeypatch.setattr(
+        "opensquilla.session.compaction._estimate_tokens",
+        lambda text: max(1, len(text) // 4),
+    )
     entries = [
         {
             "role": "assistant",
@@ -188,7 +198,7 @@ async def test_new_skips_when_only_cut_would_orphan_tool_result():
     request = CompactionRequest(
         session_id="boundary-start-test",
         entries=entries,
-        context_window_tokens=26,
+        context_window_tokens=23,
         config=CompactionConfig(safety_margin=1.0),
     )
 
