@@ -148,3 +148,37 @@ def test_telegram_builds_plain_payload_without_parse_mode() -> None:
         )
     )
     assert "parse_mode" not in payload
+
+
+def test_runtime_reply_defaults_to_markdown_format() -> None:
+    """Agent replies are rendered as markdown by default across adapters."""
+
+    from types import SimpleNamespace
+
+    from opensquilla.channels.qq import QQChannel, QQChannelConfig
+    from opensquilla.channels.types import IncomingMessage
+    from opensquilla.gateway.channel_dispatch import _build_runtime_reply_message
+
+    channel = QQChannel(QQChannelConfig(name="qq", app_id="a", app_secret="s"))
+    inbound = IncomingMessage(
+        sender_id="openid-1",
+        channel_id="chat-1",
+        content="hi",
+        metadata={"chat_type": "c2c", "openid": "openid-1", "msg_id": "m-1"},
+    )
+    route_envelope = SimpleNamespace(
+        channel_id="chat-1",
+        thread_id=None,
+        channel_name="qq",
+        metadata={"chat_type": "c2c", "openid": "openid-1"},
+    )
+
+    reply = _build_runtime_reply_message(
+        channel,
+        "**bold** answer",
+        inbound,
+        route_envelope,
+    )
+
+    assert reply.format == "markdown"
+    assert reply.content == "**bold** answer"

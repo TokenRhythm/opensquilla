@@ -701,7 +701,17 @@ class TelegramChannel:
         for chunk in chunks:
             payload = self._build_send_payload(message)
             payload["text"] = chunk
-            result = await self._api("sendMessage", payload)
+            try:
+                result = await self._api("sendMessage", payload)
+            except TelegramApiError:
+                # MarkdownV2 is strict about escaping; an unescaped agent
+                # reply is rejected wholesale. Fall back to plain text so
+                # the answer is still delivered instead of dropped.
+                if payload.get("parse_mode") != "MarkdownV2":
+                    raise
+                plain_payload = dict(payload)
+                plain_payload.pop("parse_mode", None)
+                result = await self._api("sendMessage", plain_payload)
         return result if isinstance(result, dict) else {"result": result}
 
     async def send_typing(self, channel_id: str | None = None) -> ChannelSendResult:

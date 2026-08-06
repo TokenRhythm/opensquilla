@@ -3625,6 +3625,8 @@ def _build_runtime_reply_message(
     if callable(builder):
         reply = builder(content, inbound)
         if isinstance(reply, OutgoingMessage):
+            if reply.format == "text":
+                reply = reply.model_copy(update={"format": "markdown"})
             return _sanitize_outgoing_message(reply)
 
     target = getattr(route_envelope, "reply_target", None)
@@ -3636,7 +3638,12 @@ def _build_runtime_reply_message(
             metadata = {"channel": channel_id} if channel_id else {}
             if thread_id:
                 return _sanitize_outgoing_message(
-                    OutgoingMessage(content=content, reply_to=thread_id, metadata=metadata)
+                    OutgoingMessage(
+                        content=content,
+                        reply_to=thread_id,
+                        metadata=metadata,
+                        format="markdown",
+                    )
                 )
             if channel_id:
                 return _sanitize_outgoing_message(
@@ -3644,10 +3651,15 @@ def _build_runtime_reply_message(
                         content=content,
                         reply_to=None,
                         metadata={**metadata, "thread_ts": None},
+                        format="markdown",
                     )
                 )
         return _sanitize_outgoing_message(
-            OutgoingMessage(content=content, reply_to=thread_id or channel_id)
+            OutgoingMessage(
+                content=content,
+                reply_to=thread_id or channel_id,
+                format="markdown",
+            )
         )
 
     return _build_reply_message(channel, content, inbound)
