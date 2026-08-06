@@ -248,6 +248,7 @@ class DingTalkChannel:
     """
 
     config: DingTalkChannelConfig
+    markdown_capable: bool = True
 
     _queue: asyncio.Queue[IncomingMessage] = field(
         default_factory=asyncio.Queue, init=False, repr=False
@@ -1360,8 +1361,12 @@ class DingTalkChannel:
                 "dingtalk.send: no inbound context yet — robot replies "
                 "require the original ChatbotMessage to resolve sessionWebhook"
             )
-        await asyncio.to_thread(self._handler.reply_text, message.content, target)
-        log.debug("dingtalk.outbound_sent", length=len(message.content))
+        if message.format == "markdown" and hasattr(self._handler, "reply_markdown"):
+            await asyncio.to_thread(self._handler.reply_markdown, message.content, target)
+            log.debug("dingtalk.outbound_markdown_sent", length=len(message.content))
+        else:
+            await asyncio.to_thread(self._handler.reply_text, message.content, target)
+            log.debug("dingtalk.outbound_sent", length=len(message.content))
 
     def _resolve_reply_target(self, message: OutgoingMessage) -> Any:
         """Resolve the ChatbotMessage a reply must be delivered to.

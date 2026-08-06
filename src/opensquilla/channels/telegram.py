@@ -123,6 +123,7 @@ class TelegramChannel:
     config: TelegramChannelConfig
 
     supports_slash_commands: bool = True
+    markdown_capable: bool = True
     policy: ChannelAccessPolicy = field(
         default_factory=lambda: ChannelAccessPolicy(
             dm_allowed=True,
@@ -789,6 +790,8 @@ class TelegramChannel:
             }
         if parse_mode := message.metadata.get("parse_mode"):
             payload["parse_mode"] = str(parse_mode)
+        elif message.format == "markdown":
+            payload["parse_mode"] = "MarkdownV2"
         return payload
 
     async def edit(self, message_id: str, content: str) -> None:

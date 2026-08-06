@@ -910,6 +910,7 @@ class FeishuChannel:
     config: FeishuChannelConfig
     bot_open_id: str | None = None
     supports_slash_commands: bool = True
+    markdown_capable: bool = True
     # See ``ChannelAccessPolicy`` docstring + slack adopter for context.
     # Feishu mirrors slack's defaults today: DMs admit, group requires mention.
     policy: ChannelAccessPolicy = field(
@@ -1752,6 +1753,91 @@ class FeishuChannel:
         self._raise_api_error(data, "reply failed")
         return str(data.get("data", {}).get("message_id", ""))
 
+    async def send_markdown(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        request_uuid: str | None = None,
+    ) -> str:
+        """Send a markdown message as a Feishu ``post`` (rich-text) message.
+
+        Feishu's ``post`` message type renders ``tag: "md"`` elements with the
+        platform's native markdown, so the gateway can ship the same markdown
+        it sends to other rich-text channels (help/status command output,
+        structured notices) without flattening it to plain text first.
+        """
+
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            raise ValueError("feishu.send_markdown: chat target is required")
+        await self._rate_limiter.acquire()
+        headers = await self._auth_headers()
+        client = self._get_client()
+        receive_id_type = _feishu_receive_id_type(chat_id)
+        post_content: dict[str, Any] = {
+            "zh_cn": {
+                "title": "",
+                "content": [
+                    [{"tag": "md", "text": content}]
+                ],
+            }
+        }
+        payload: dict[str, Any] = {
+            "receive_id": chat_id,
+            "msg_type": "post",
+            "content": json.dumps(post_content),
+        }
+        resp = await retry_request(
+            client.post,
+            "/im/v1/messages",
+            params={
+                "receive_id_type": receive_id_type,
+                "uuid": _feishu_delivery_uuid(request_uuid),
+            },
+            json=payload,
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self._raise_api_error(data, "send markdown failed")
+        return str(data.get("data", {}).get("message_id", ""))
+
+    async def reply_markdown(
+        self,
+        message_id: str,
+        content: str,
+        *,
+        request_uuid: str | None = None,
+    ) -> str:
+        """Reply to a Feishu message with a markdown ``post`` message."""
+
+        await self._rate_limiter.acquire()
+        headers = await self._auth_headers()
+        client = self._get_client()
+        post_content: dict[str, Any] = {
+            "zh_cn": {
+                "title": "",
+                "content": [
+                    [{"tag": "md", "text": content}]
+                ],
+            }
+        }
+        resp = await retry_request(
+            client.post,
+            f"/im/v1/messages/{message_id}/reply",
+            params={"uuid": _feishu_delivery_uuid(request_uuid)},
+            json={
+                "msg_type": "post",
+                "content": json.dumps(post_content),
+            },
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self._raise_api_error(data, "reply failed")
+        return str(data.get("data", {}).get("message_id", ""))
+
     async def read_message(self, message_id: str) -> dict[str, Any]:
         """Fetch a Feishu message payload."""
         await self._rate_limiter.acquire()
@@ -1772,11 +1858,18 @@ class FeishuChannel:
         request_uuid = _feishu_delivery_uuid(message.metadata.get("delivery_id"))
         reply_message_id = message.metadata.get("reply_message_id")
         if isinstance(reply_message_id, str) and reply_message_id:
-            await self.reply_text(
-                reply_message_id,
-                message.content,
-                request_uuid=request_uuid,
-            )
+            if message.format == "markdown":
+                await self.reply_markdown(
+                    reply_message_id,
+                    message.content,
+                    request_uuid=request_uuid,
+                )
+            else:
+                await self.reply_text(
+                    reply_message_id,
+                    message.content,
+                    request_uuid=request_uuid,
+                )
             log.debug("feishu.reply", message_id=reply_message_id)
             return
         chat_id = message.reply_to or self.config.default_chat_id
@@ -1810,11 +1903,18 @@ class FeishuChannel:
             data = resp.json()
             self._raise_api_error(data, "send failed")
         else:
-            await self.send_text(
-                chat_id,
-                message.content,
-                request_uuid=request_uuid,
-            )
+            if message.format == "markdown":
+                await self.send_markdown(
+                    chat_id,
+                    message.content,
+                    request_uuid=request_uuid,
+                )
+            else:
+                await self.send_text(
+                    chat_id,
+                    message.content,
+                    request_uuid=request_uuid,
+                )
         log.debug("feishu.send", chat_id=chat_id)
 
     async def send_file(

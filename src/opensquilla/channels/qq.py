@@ -137,6 +137,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
     """
 
     config: QQChannelConfig
+    markdown_capable: bool = True
 
     def __init__(self, config: QQChannelConfig) -> None:
         # Lazy SDK import — keeps the adapter usable even when the
@@ -433,16 +434,34 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
     async def send(self, message: OutgoingMessage) -> None:
         """Route by ``metadata['chat_type']`` to the right SDK call.
 
-        ``c2c``  → ``self.api.post_c2c_message(openid=..., msg_type=0, ...)``
-        ``group`` → ``self.api.post_group_message(group_openid=..., msg_type=0, ...)``
+        ``c2c``  → ``self.api.post_c2c_message(openid=..., msg_type=..., ...)``
+        ``group`` → ``self.api.post_group_message(group_openid=..., msg_type=..., ...)``
 
         ``msg_id`` (when supplied) and a per-inbound-message ``msg_seq`` counter
         satisfy the QQ API's passive-reply dedup rules.
+
+        ``format="markdown"``  → ``msg_type=2`` with ``markdown.content``
+        (official markdown passive message). ``format="text"`` (default) →
+        ``msg_type=0`` plain text.
         """
         meta = message.metadata or {}
         chat_type = meta.get("chat_type", "")
         msg_id = meta.get("msg_id") or meta.get("reply_to_msg_id") or message.reply_to
 
+        markdown_content = (
+            message.content if message.format == "markdown" else None
+        )
+        msg_type = 2 if markdown_content is not None else 0
+        markdown_payload = None
+        if markdown_content is not None:
+            try:
+                from botpy.types.message import MarkdownPayload
+
+                markdown_payload = MarkdownPayload(content=markdown_content)
+            except ImportError:
+                # SDK variant without MarkdownPayload; degrade to plain text.
+                markdown_content = None
+                msg_type = 0
         api = self.api
         if chat_type == "group":
             target = meta.get("group_openid", "")
@@ -451,8 +470,9 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             seq = self._next_msg_seq(f"group:{msg_id or target}")
             await api.post_group_message(
                 group_openid=target,
-                msg_type=0,
-                content=message.content,
+                msg_type=msg_type,
+                content=None if markdown_payload is not None else message.content,
+                markdown=markdown_payload,
                 msg_id=msg_id,
                 msg_seq=seq,
             )
@@ -463,8 +483,9 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             seq = self._next_msg_seq(f"c2c:{msg_id or target}")
             await api.post_c2c_message(
                 openid=target,
-                msg_type=0,
-                content=message.content,
+                msg_type=msg_type,
+                content=None if markdown_payload is not None else message.content,
+                markdown=markdown_payload,
                 msg_id=msg_id,
                 msg_seq=seq,
             )
