@@ -258,6 +258,11 @@ class OpenAICompatPolicy:
     # Reasoning format assumed when no model capabilities are available.
     default_reasoning_format: str = ""
 
+    # Whether the reasoning dialect's payload (e.g. a vendor-specific
+    # ``thinking`` object) is only valid on this provider's official_host;
+    # off-host requests omit it instead of sending an unrecognized field.
+    reasoning_dialect_requires_official_host: bool = False
+
     # Models that need an explicit thinking enable/disable payload even when
     # no capability profile is available (exact ids, lowercase).
     thinking_toggle_model_ids: frozenset[str] = frozenset()
@@ -477,7 +482,11 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "mimo": OpenAICompatPolicy(display_name="MiMo"),
     "mistral": OpenAICompatPolicy(display_name="Mistral"),
     "groq": OpenAICompatPolicy(display_name="Groq"),
-    "zhipu": OpenAICompatPolicy(display_name="Zhipu"),
+    "zhipu": OpenAICompatPolicy(
+        display_name="Zhipu",
+        official_host="open.bigmodel.cn",
+        reasoning_dialect_requires_official_host=True,
+    ),
     "qianfan": OpenAICompatPolicy(display_name="Qianfan"),
     "siliconflow": OpenAICompatPolicy(display_name="SiliconFlow"),
     "aihubmix": OpenAICompatPolicy(display_name="AiHubMix"),
