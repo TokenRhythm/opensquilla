@@ -679,9 +679,9 @@ class DingTalkChannel:
         if message.attachments:
             names = ", ".join(str(a.name or "attachment") for a in message.attachments)
             suffix = (
-                f"\n\n[附件未支持: {names}]"
+                f"\n\n[attachment unsupported: {names}]"
                 if message.content.strip()
-                else f"[附件未支持: {names}]"
+                else f"[attachment unsupported: {names}]"
             )
             message = message.model_copy(update={"content": message.content + suffix})
         if self._handler is None:
