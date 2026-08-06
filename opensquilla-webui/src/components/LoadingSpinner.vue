@@ -74,7 +74,7 @@ onErrorCaptured(() => {
 
 @media (prefers-reduced-motion: reduce) {
   .loading-spinner {
-    animation-duration: 1.6s;
+    animation-duration: var(--dur-pulse);
   }
 }
 </style>
