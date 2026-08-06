@@ -84,6 +84,39 @@ describe('arrangeSidebarSections cancel stop labels', () => {
   })
 })
 
+describe('arrangeSidebarSections task attention', () => {
+  it('folds queued and running rows into one running indicator state', () => {
+    const sections = arrangeSidebarSections([
+      session({
+        key: 'agent:main:webchat:queued',
+        title: 'Queued',
+        updatedAt: 300,
+        runStatus: 'queued',
+        active_task: { status: 'queued' },
+      }),
+      session({
+        key: 'agent:main:webchat:running',
+        title: 'Running',
+        updatedAt: 200,
+        runStatus: 'running',
+        active_task: { status: 'running' },
+      }),
+      session({
+        key: 'agent:main:webchat:idle',
+        title: 'Idle',
+        updatedAt: 100,
+        runStatus: 'idle',
+      }),
+    ])
+
+    expect(sectionFor(sections, 'chats').rows.map(row => row.taskAttention)).toEqual([
+      'running',
+      'running',
+      'none',
+    ])
+  })
+})
+
 describe('arrangeSidebarSections — subagent nesting', () => {
   it('nests a subagent under its parent chat at depth 1', () => {
     const parentKey = 'agent:main:webchat:parent'
@@ -119,6 +152,25 @@ describe('arrangeSidebarSections — subagent nesting', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0].title).toBe('Orphan task')
     expect(rows[0].depth).toBe(1)
+  })
+
+  it('keeps a forked chat flat even when its parent is visible', () => {
+    const parentKey = 'agent:main:webchat:parent'
+    const sections = arrangeSidebarSections([
+      session({ key: parentKey, title: 'Parent chat', updatedAt: 100 }),
+      session({
+        key: 'agent:main:webchat:fork',
+        title: 'Forked chat',
+        updatedAt: 200,
+        forked_from_parent: true,
+        parent: { key: parentKey, title: 'Parent chat' },
+      }),
+    ])
+
+    expect(sectionFor(sections, 'chats').rows.map(row => ({ title: row.title, depth: row.depth }))).toEqual([
+      { title: 'Forked chat', depth: 0 },
+      { title: 'Parent chat', depth: 0 },
+    ])
   })
 })
 
@@ -235,6 +287,55 @@ describe('arrangeSidebarSections — recency ordering', () => {
     expect(rows.map(r => ({ title: r.title, runStatus: r.runStatus }))).toEqual([
       { title: 'Running', runStatus: 'running' },
       { title: 'Finished', runStatus: 'idle' },
+    ])
+  })
+})
+
+describe('arrangeSidebarSections — manual session ordering', () => {
+  it('applies a saved order while keeping newly-created sessions above it', () => {
+    const sections = arrangeSidebarSections([
+      session({ key: 'agent:main:webchat:new', title: 'New', updatedAt: 300 }),
+      session({ key: 'agent:main:webchat:a', title: 'A', updatedAt: 200 }),
+      session({ key: 'agent:main:webchat:b', title: 'B', updatedAt: 100 }),
+    ], undefined, [
+      'agent:main:webchat:b',
+      'agent:main:webchat:a',
+    ])
+
+    expect(sectionFor(sections, 'chats').rows.map(row => row.title)).toEqual(['New', 'B', 'A'])
+  })
+
+  it('places pinned sessions above newer unpinned sessions', () => {
+    const sections = arrangeSidebarSections([
+      session({ key: 'agent:main:webchat:new', title: 'New', updatedAt: 300 }),
+      session({ key: 'agent:main:webchat:pinned', title: 'Pinned', updatedAt: 100 }),
+      session({ key: 'agent:main:webchat:old', title: 'Old', updatedAt: 50 }),
+    ], undefined, [], ['agent:main:webchat:pinned'])
+
+    expect(sectionFor(sections, 'chats').rows.map(row => ({ title: row.title, pinned: row.pinned }))).toEqual([
+      { title: 'Pinned', pinned: true },
+      { title: 'New', pinned: false },
+      { title: 'Old', pinned: false },
+    ])
+  })
+
+  it('keeps a subagent attached to its parent after the parent is reordered', () => {
+    const parentKey = 'agent:main:webchat:parent'
+    const sections = arrangeSidebarSections([
+      session({ key: 'agent:main:webchat:other', title: 'Other', updatedAt: 300 }),
+      session({ key: parentKey, title: 'Parent', updatedAt: 200 }),
+      session({
+        key: 'agent:main:subagent:child',
+        title: 'Child',
+        updatedAt: 100,
+        parent: { key: parentKey, spawnDepth: 1 },
+      }),
+    ], undefined, [parentKey, 'agent:main:webchat:other'])
+
+    expect(sectionFor(sections, 'chats').rows.map(row => ({ title: row.title, depth: row.depth }))).toEqual([
+      { title: 'Parent', depth: 0 },
+      { title: 'Child', depth: 1 },
+      { title: 'Other', depth: 0 },
     ])
   })
 })

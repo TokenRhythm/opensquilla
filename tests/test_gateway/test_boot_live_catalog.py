@@ -16,13 +16,23 @@ import pytest
 from opensquilla.gateway.boot import build_services
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider.model_catalog import set_shared_catalog
+from opensquilla.provider.tokenrhythm_catalog import (
+    parse_tokenrhythm_declared,
+    parse_tokenrhythm_published,
+)
 from opensquilla.sandbox.integration import reset_runtime
 
 
 @pytest.fixture(autouse=True)
 def _clear_shared_catalog():
+    from opensquilla.gateway.model_catalog_refresh import (
+        install_tokenrhythm_catalog_coordinator,
+    )
+
+    install_tokenrhythm_catalog_coordinator(None)
     set_shared_catalog(None)
     yield
+    install_tokenrhythm_catalog_coordinator(None)
     set_shared_catalog(None)
 
 
@@ -59,10 +69,12 @@ async def test_keyless_boot_never_fetches_live_catalog(
         fetches.append(args)
         return {}
 
-    # warm_live_provider_catalogs resolves the fetch through its module
-    # global, so this interception observes any attempted listing fetch.
     monkeypatch.setattr(
-        "opensquilla.provider.live_catalog.fetch_live_catalog_entries",
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_published",
+        recording_fetch,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_declared",
         recording_fetch,
     )
 
@@ -97,20 +109,45 @@ async def test_configured_boot_ingests_live_qwen_limit(
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
     _deny_background_sandbox_setup(monkeypatch)
 
-    fetches: list[tuple[Any, ...]] = []
+    fetches: list[str] = []
 
-    async def fake_fetch(*args: Any, **kwargs: Any) -> dict:
-        fetches.append(args)
-        return {
-            "qwen3.7-max": {
-                "context_window": 1_000_000,
-                "max_output_tokens": 131_072,
+    async def fake_public(**kwargs: Any) -> dict:
+        fetches.append("published")
+        return parse_tokenrhythm_published(
+            {
+                "data": [
+                    {
+                        "id": "qwen3.7-max",
+                        "type": "chat",
+                        "status": "online",
+                        "contextWindow": 1_000_000,
+                        "maxOutputTokens": 131_072,
+                    }
+                ]
             }
-        }
+        )
+
+    async def fake_declared(*args: Any, **kwargs: Any) -> dict:
+        fetches.append("declared")
+        return parse_tokenrhythm_declared(
+            {
+                "data": [
+                    {
+                        "id": "qwen3.7-max",
+                        "context_length": 1_000_000,
+                        "max_completion_tokens": 131_072,
+                    }
+                ]
+            }
+        )
 
     monkeypatch.setattr(
-        "opensquilla.provider.live_catalog.fetch_live_catalog_entries",
-        fake_fetch,
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_published",
+        fake_public,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_declared",
+        fake_declared,
     )
     config = GatewayConfig(
         llm={
@@ -126,7 +163,7 @@ async def test_configured_boot_ingests_live_qwen_limit(
         config=config, session_db_path=":memory:", seed_agent_workspaces=False
     )
     try:
-        assert len(fetches) == 1
+        assert fetches == ["published", "declared"]
         assert services.model_catalog is not None
         entry = services.model_catalog.resolve_entry("qwen3.7-max", provider="tokenrhythm")
         assert entry.source == "live"
@@ -145,15 +182,44 @@ async def test_desktop_deferred_warm_uses_key_saved_after_build(
     monkeypatch.setenv("OPENSQUILLA_DESKTOP_FAST_START", "1")
     _deny_background_sandbox_setup(monkeypatch)
 
-    fetches: list[tuple[Any, ...]] = []
+    fetches: list[str] = []
 
-    async def fake_fetch(*args: Any, **kwargs: Any) -> dict:
-        fetches.append(args)
-        return {"qwen3.7-max": {"max_output_tokens": 131_072}}
+    async def fake_public(**kwargs: Any) -> dict:
+        fetches.append("published")
+        return parse_tokenrhythm_published(
+            {
+                "data": [
+                    {
+                        "id": "qwen3.7-max",
+                        "type": "chat",
+                        "status": "online",
+                        "contextWindow": 1_000_000,
+                        "maxOutputTokens": 131_072,
+                    }
+                ]
+            }
+        )
+
+    async def fake_declared(*args: Any, **kwargs: Any) -> dict:
+        fetches.append("declared")
+        return parse_tokenrhythm_declared(
+            {
+                "data": [
+                    {
+                        "id": "qwen3.7-max",
+                        "max_completion_tokens": 131_072,
+                    }
+                ]
+            }
+        )
 
     monkeypatch.setattr(
-        "opensquilla.provider.live_catalog.fetch_live_catalog_entries",
-        fake_fetch,
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_published",
+        fake_public,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_declared",
+        fake_declared,
     )
     config = GatewayConfig(
         llm={"provider": "tokenrhythm", "model": "qwen3.7-max"},
@@ -181,7 +247,7 @@ async def test_desktop_deferred_warm_uses_key_saved_after_build(
         )
         await warmup()
 
-        assert len(fetches) == 1
+        assert fetches == ["published", "declared"]
         assert services.model_catalog.resolve_entry(
             "qwen3.7-max", provider="tokenrhythm"
         ).source == "live"

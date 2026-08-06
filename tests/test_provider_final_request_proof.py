@@ -80,7 +80,7 @@ def test_openai_final_request_proof_blocks_oversized_send(monkeypatch: Any) -> N
     assert events[0].code == "provider_request_budget_exhausted"
     proof = json.loads(events[0].message)
     assert proof["fits"] is False
-    assert proof["retry_count"] == 2
+    assert proof["retry_count"] == 4
     assert proof["top_contributors"][0]["chars"] == 5000
 
 
@@ -166,7 +166,7 @@ def test_openai_final_request_proof_allows_native_image_payload(
             event
             async for event in provider.chat(
                 messages,
-                config=ChatConfig(provider_request_max_chars=1000),
+                config=ChatConfig(provider_request_max_chars=10_000),
             )
         ]
 
@@ -212,7 +212,7 @@ def test_anthropic_final_request_proof_blocks_oversized_send(monkeypatch: Any) -
     assert events[0].code == "provider_request_budget_exhausted"
     proof = json.loads(events[0].message)
     assert proof["fits"] is False
-    assert proof["retry_count"] == 2
+    assert proof["retry_count"] == 4
 
 
 def test_anthropic_env_request_proof_blocks_as_controlled_error(monkeypatch: Any) -> None:
@@ -307,7 +307,7 @@ def test_anthropic_final_request_proof_allows_native_image_payload(
             event
             async for event in provider.chat(
                 messages,
-                config=ChatConfig(provider_request_max_chars=1000),
+                config=ChatConfig(provider_request_max_chars=10_000),
             )
         ]
 
@@ -339,9 +339,54 @@ def _large_schema_tool() -> ToolDefinition:
     )
 
 
+def test_openai_request_proof_serialization_failure_is_controlled(
+    monkeypatch: Any,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
+    provider = OpenAIProvider(api_key="test", model="gpt-test")
+
+    async def run() -> list[Any]:
+        return [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="hello")],
+                tools=[_large_schema_tool()],
+                config=ChatConfig(
+                    provider_request_max_chars=10_000,
+                    tool_choice={"not-json-serializable"},
+                ),
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    assert requests == []
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "provider_internal"
+    assert events[0].message == "Provider request could not be serialized."
+
+
 def test_openai_final_request_proof_compacts_adapter_payload_with_tools(
     monkeypatch: Any,
 ) -> None:
+    # Exercise the documented one-version rollback path for installations
+    # that still permit request-only rewriting of recent/unresolved results.
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS", "0")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS", "0")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS", "0")
     requests: list[httpx.Request] = []
     payloads: list[dict[str, Any]] = []
     proofs: list[dict[str, Any]] = []
@@ -427,6 +472,11 @@ def test_openai_final_request_proof_compacts_adapter_payload_with_tools(
 def test_anthropic_final_request_proof_compacts_adapter_payload_with_tools(
     monkeypatch: Any,
 ) -> None:
+    # Exercise the documented one-version rollback path for installations
+    # that still permit request-only rewriting of recent/unresolved results.
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS", "0")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS", "0")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS", "0")
     requests: list[httpx.Request] = []
     payloads: list[dict[str, Any]] = []
     proofs: list[dict[str, Any]] = []

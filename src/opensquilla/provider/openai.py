@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -27,9 +28,11 @@ from .app_attribution import is_provider_app_host, provider_app_headers
 from .candidate_artifact import (
     CandidateArtifactBuilder,
     CandidateArtifactLimitError,
+    InertCandidateTextNormalizer,
     strip_candidate_tool_identity,
 )
 from .compat_policy import (
+    TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
     TEXT_TOOL_DIALECT_MINIMAX_XML,
     TEXT_TOOL_DIALECT_PLAIN_JSON,
     TEXT_TOOL_DIALECT_QWEN_TAG,
@@ -44,6 +47,8 @@ from .error_redaction import (
 )
 from .failures import retry_after_from_headers
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
+from .model_catalog import shared_catalog
+from .model_identity import model_basename
 from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .reasoning_dialects import (
     ReasoningDisableArgs,
@@ -53,6 +58,8 @@ from .reasoning_dialects import (
 )
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    project_final_request_payload,
+    protected_tool_result_indexes,
     prove_provider_payload_from_env,
 )
 from .stream_assembly import (
@@ -61,13 +68,26 @@ from .stream_assembly import (
     ToolStreamProtocolError,
 )
 from .text_tool_normalizer import (
+    InertDsmlSegment,
     LiteralTextSegment,
+    RejectedTextToolSegment,
     TextToolSegment,
     TextToolStreamNormalizer,
     classify_text_tool_segments,
     warn_for_unauthorized_plain_candidate,
 )
-from .tokenrhythm_correlation import tokenrhythm_correlation_headers
+from .tokenrhythm_catalog import (
+    is_official_tokenrhythm_endpoint,
+    merge_tokenrhythm_catalog,
+    parse_tokenrhythm_declared,
+    tokenrhythm_published_catalog_entries,
+)
+from .tokenrhythm_correlation import (
+    TOKENRHYTHM_INSTALL_ID_HEADER,
+    redact_tokenrhythm_install_ids,
+    tokenrhythm_correlation_headers,
+    tokenrhythm_install_id_headers,
+)
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -77,6 +97,7 @@ from .types import (
     ModelCapabilities,
     ModelInfo,
     ProviderBillingReceipt,
+    ProviderFinalRequestProjection,
     ProviderHeartbeatEvent,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
@@ -101,33 +122,13 @@ _MARKDOWN_JSON_FENCE_RE = re.compile(
 )
 
 
-class _InertCandidateTextPassthrough:
-    """Keep textual tool syntax literal for non-executable proposer output."""
-
-    native_lifecycle_deferred = False
-    held_chars = 0
-    held_event_count = 0
-
-    def push(self, text: str) -> list[str]:
-        return [text] if text else []
-
-    def observe_native_tool_start(self, _tool_name: str) -> list[TextToolSegment]:
-        return []
-
-    def abandon_native_lifecycle_defer(self) -> list[TextToolSegment]:
-        return []
-
-    def finish(
-        self,
-        *,
-        successful_text_tool_terminal: bool,
-        native_calls: list[tuple[str, dict[str, Any]]] | None = None,
-    ) -> list[TextToolSegment]:
-        del successful_text_tool_terminal, native_calls
-        return []
-
-
 _MAX_CANDIDATE_WIRE_ID_CHARS = 4096
+
+
+def _has_native_tool_payload(value: object) -> bool:
+    """Distinguish absent/null/empty arrays from explicit malformed wrappers."""
+
+    return value is not None and (not isinstance(value, list) or bool(value))
 
 
 def _candidate_wire_digest(value: str) -> bytes | None:
@@ -376,6 +377,33 @@ def _provider_display_name(provider_kind: str) -> str:
     }.get(provider_kind, "Provider")
 
 
+def _positive_model_listing_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, float):
+        if not value.is_integer() or not math.isfinite(value):
+            return 0
+        value = int(value)
+    elif isinstance(value, str):
+        try:
+            value = int(value.strip())
+        except ValueError:
+            return 0
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _model_listing_max_output(row: Mapping[str, Any]) -> int:
+    """Preserve the generic OpenAI-compatible nested-field contract.
+
+    TokenRhythm is parsed through its typed declaration parser above, where
+    the provider-specific top-level-before-nested precedence is explicit.
+    Other compatible providers retain the historical ``top_provider`` rule.
+    """
+    raw_top_provider = row.get("top_provider")
+    top_provider = raw_top_provider if isinstance(raw_top_provider, Mapping) else {}
+    return _positive_model_listing_int(top_provider.get("max_completion_tokens"))
+
+
 def _dashscope_endpoint_family(base_url: str) -> str:
     url = base_url.strip().lower()
     if "coding-intl.dashscope.aliyuncs.com" in url:
@@ -603,10 +631,6 @@ def _strip_think_tags(text: str) -> str:
     return result.strip()
 
 
-def _model_basename(model: str) -> str:
-    return model.rsplit("/", 1)[-1].strip().lower()
-
-
 def _on_official_host(policy: OpenAICompatPolicy, base_url: str) -> bool:
     return bool(policy.official_host) and policy.official_host in base_url.lower()
 
@@ -620,7 +644,7 @@ def _uses_max_completion_tokens(
         return False
     if not _on_official_host(policy, base_url):
         return False
-    return _model_basename(model).startswith(policy.max_completion_tokens_model_prefixes)
+    return model_basename(model).startswith(policy.max_completion_tokens_model_prefixes)
 
 
 def _should_use_max_completion_tokens(
@@ -681,7 +705,7 @@ def _should_send_temperature(
 ) -> bool:
     if cfg.temperature is None:
         return False
-    model_name = _model_basename(model)
+    model_name = model_basename(model)
     if (
         policy.fixed_sampling_model_prefixes
         and model_name.startswith(policy.fixed_sampling_model_prefixes)
@@ -709,7 +733,7 @@ def _apply_compat_request_constraints(
 ) -> None:
     """Apply declarative endpoint constraints after generic payload assembly."""
 
-    model_name = _model_basename(model)
+    model_name = model_basename(model)
     force_thinking = model_name in policy.force_thinking_model_ids
     if force_thinking:
         payload["enable_thinking"] = True
@@ -1781,18 +1805,24 @@ def _segment_text_tool_events(
             if segment.text:
                 events.append(TextDeltaEvent(text=segment.text))
             continue
+        if isinstance(segment, RejectedTextToolSegment):
+            continue
+        if isinstance(segment, InertDsmlSegment):
+            raise AssertionError("inert DSML reached executable event conversion")
         for call in segment.calls:
             id_prefix = {
                 TEXT_TOOL_DIALECT_QWEN_TAG: "qwen_text",
                 TEXT_TOOL_DIALECT_MINIMAX_XML: "minimax_compat",
                 TEXT_TOOL_DIALECT_PLAIN_JSON: "text_compat",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: "deepseek_dsml",
             }[call.dialect]
             tool_use_id = f"{id_prefix}_{uuid4().hex[:12]}"
-            event_name = (
-                "provider.qwen_text_tool_call_parsed"
-                if call.dialect == TEXT_TOOL_DIALECT_QWEN_TAG
-                else "provider.text_tool_call_parsed"
-            )
+            event_name = {
+                TEXT_TOOL_DIALECT_QWEN_TAG: "provider.qwen_text_tool_call_parsed",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: (
+                    "provider.deepseek_dsml_tool_call_parsed"
+                ),
+            }.get(call.dialect, "provider.text_tool_call_parsed")
             log.warning(
                 event_name,
                 provider=provider_kind,
@@ -1818,6 +1848,65 @@ def _segment_text_tool_events(
                 )
             )
     return events
+
+
+def _text_tool_rejection_details(
+    segments: list[TextToolSegment],
+) -> tuple[tuple[str, ...], int] | None:
+    """Return bounded rejection metadata without retaining provider payloads."""
+
+    rejected = [
+        segment
+        for segment in segments
+        if isinstance(segment, RejectedTextToolSegment)
+    ]
+    if not rejected:
+        return None
+    reasons = tuple(sorted({segment.reason for segment in rejected}))
+    call_count = sum(max(0, segment.call_count) for segment in rejected)
+    return reasons, call_count
+
+
+def _text_tool_rejection_error(
+    segments: list[TextToolSegment],
+    *,
+    display_name: str,
+    provider_kind: str,
+    model: str,
+    phase: str,
+    cache_shape: Mapping[str, Any],
+    trace: LLMTraceRecorder,
+) -> ErrorEvent | None:
+    """Convert one rejected DSML response into a payload-free terminal error."""
+
+    details = _text_tool_rejection_details(segments)
+    if details is None:
+        return None
+    reasons, call_count = details
+    log.warning(
+        "provider.deepseek_dsml_tool_call_rejected",
+        provider=provider_kind,
+        model=model,
+        reasons=reasons,
+        call_count=call_count,
+    )
+    trace.record_error(
+        code="incomplete_tool_call",
+        message="Provider returned rejected DeepSeek DSML tool-call text",
+        metadata={
+            "phase": phase,
+            "cache_shape": cache_shape,
+            "reasons": reasons,
+            "call_count": call_count,
+        },
+    )
+    return ErrorEvent(
+        message=(
+            f"{display_name} returned an invalid DeepSeek DSML tool call; "
+            "no text-encoded tools were executed"
+        ),
+        code="incomplete_tool_call",
+    )
 
 
 def _synthesize_text_tool_events(
@@ -2445,8 +2534,8 @@ def _requires_assistant_reasoning_content(
     *,
     thinking: bool = False,
 ) -> bool:
-    model_name = _model_basename(model)
-    return model.strip().lower() in policy.require_reasoning_content_model_ids or (
+    model_name = model_basename(model)
+    return model_name in policy.require_reasoning_content_model_ids or (
         thinking
         and model_name
         in policy.require_reasoning_content_when_thinking_model_ids
@@ -2459,7 +2548,7 @@ def _effective_policy_thinking(
     *,
     thinking: bool,
 ) -> bool:
-    return thinking or _model_basename(model) in policy.force_thinking_model_ids
+    return thinking or model_basename(model) in policy.force_thinking_model_ids
 
 
 def _requires_tool_call_reasoning_content(
@@ -2470,7 +2559,7 @@ def _requires_tool_call_reasoning_content(
 ) -> bool:
     return (
         thinking
-        and _model_basename(model)
+        and model_basename(model)
         in policy.require_tool_call_reasoning_content_when_thinking_model_ids
     )
 
@@ -2482,7 +2571,7 @@ def _should_replay_reasoning_content(
     caps: ModelCapabilities | None,
     thinking: bool = False,
 ) -> bool:
-    model_name = _model_basename(model)
+    model_name = model_basename(model)
     effective_thinking = _effective_policy_thinking(
         policy, model, thinking=thinking
     )
@@ -2636,6 +2725,7 @@ def _build_openai_wire_messages(
     model: str,
     replay_provider_state: bool,
     reasoning_echo_turns: int | None,
+    logical_index_map: dict[int, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the exact OpenAI-compatible wire-message array, without I/O."""
     openai_messages: list[dict[str, Any]] = []
@@ -2673,6 +2763,8 @@ def _build_openai_wire_messages(
         else None
     )
     for message_index, message in enumerate(messages):
+        if logical_index_map is not None:
+            logical_index_map[message_index] = len(openai_messages)
         effective_thinking = _effective_policy_thinking(
             policy, model, thinking=cfg.thinking
         )
@@ -2752,6 +2844,7 @@ def _prompt_json_schema_config(
 class OpenAIProvider:
     """Streams from OpenAI-compatible Chat Completions API (SSE)."""
 
+    final_request_admission_guaranteed = True
     provider_name = "openai"
 
     def __init__(
@@ -2861,9 +2954,10 @@ class OpenAIProvider:
         ):
             raise ValueError("additional_messages must be a non-negative integer")
         cfg = config or ChatConfig()
+        wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         wire_messages = _build_openai_wire_messages(
             messages,
-            cfg,
+            wire_cfg,
             policy=self._compat,
             provider_kind=self._provider_kind,
             model=self._model,
@@ -2885,21 +2979,12 @@ class OpenAIProvider:
             base_host=_base_url_hostname(self._base_url),
         )
 
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[ToolDefinition] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        cfg = config or ChatConfig()
-        return self._stream(messages, tools, cfg)
-
-    async def _stream(
+    def _build_payload(
         self,
         messages: list[Message],
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> tuple[dict[str, Any], int | None, str | None]:
         wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         caps = cfg.model_capabilities
         include_reasoning_content = _should_replay_reasoning_content(
@@ -2908,6 +2993,7 @@ class OpenAIProvider:
             caps=caps,
             thinking=cfg.thinking,
         )
+        logical_index_map: dict[int, int] = {}
         openai_messages = _build_openai_wire_messages(
             messages,
             wire_cfg,
@@ -2916,8 +3002,13 @@ class OpenAIProvider:
             model=self._model,
             replay_provider_state=self._replay_provider_state,
             reasoning_echo_turns=self._reasoning_echo_turns,
+            logical_index_map=logical_index_map,
         )
-
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": openai_messages,
@@ -2936,9 +3027,15 @@ class OpenAIProvider:
                     "schema": cfg.output_json_schema,
                 },
             }
+        elif (
+            cfg.output_json_schema is not None
+            and self._compat.supports_json_object_output
+            and cfg.output_json_schema.get("type") == "object"
+        ):
+            payload["response_format"] = {"type": "json_object"}
         if (
             include_reasoning_content
-            and _model_basename(self._model)
+            and model_basename(self._model)
             in self._compat.preserve_thinking_model_ids
         ) or (
             self._provider_kind == "dashscope" and include_reasoning_content
@@ -2958,8 +3055,6 @@ class OpenAIProvider:
         if self._compat.sends_usage_include:
             payload["usage"] = {"include": True}
         if self._compat.sends_disable_fallbacks:
-            # Gateway proxies must not silently substitute another model:
-            # SquillaRouter is the single routing authority.
             payload["disable_fallbacks"] = True
         if (
             self._compat.anthropic_top_level_cache
@@ -2982,24 +3077,11 @@ class OpenAIProvider:
         if tools:
             payload["tools"] = [
                 _build_openai_tool(
-                    t,
+                    tool,
                     unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
                 )
-                for t in tools
+                for tool in tools
             ]
-            tool_names = [tool.get("function", {}).get("name", "") for tool in payload["tools"]]
-            tool_schema_hash = hashlib.sha256(
-                json.dumps(payload["tools"], ensure_ascii=False, sort_keys=True).encode("utf-8")
-            ).hexdigest()[:16]
-            log.info(
-                "provider.request_tool_surface",
-                provider=self._provider_kind,
-                model=self._model,
-                provider_visible_tool_names=tool_names,
-                tool_schema_hash=tool_schema_hash,
-                temperature=payload.get("temperature"),
-                top_p=payload.get("top_p"),
-            )
             if _should_send_tool_choice(self._provider_kind, cfg, caps):
                 payload["tool_choice"] = cfg.tool_choice
         if self._compat.supports_provider_routing_pin:
@@ -3016,9 +3098,6 @@ class OpenAIProvider:
                         "allow_fallbacks": True,
                     }
 
-        # Reasoning injection (gated on thinking being enabled). Gating —
-        # which model/capability profile triggers a payload at all — lives
-        # here; how each dialect spells it lives in reasoning_dialects.
         thinking_toggle_model = (
             self._model.strip().lower() in self._compat.thinking_toggle_model_ids
         )
@@ -3043,16 +3122,13 @@ class OpenAIProvider:
                 ),
             )
             if reasoning_format == "dashscope":
-                # DashScope thinking budget: the local env override wins;
-                # without an explicit per-call budget the field is omitted
-                # entirely so the endpoint applies its own default.
                 env_thinking_budget = _thinking_budget_tokens_from_env()
                 if env_thinking_budget is not None:
                     payload["thinking_budget"] = env_thinking_budget
                 elif not cfg.thinking_budget_explicit:
                     payload.pop("thinking_budget", None)
         elif (
-            _model_basename(self._model) in self._compat.force_thinking_model_ids
+            model_basename(self._model) in self._compat.force_thinking_model_ids
             or (
                 self._compat.thinking_required_model_prefixes
                 and self._model.strip().lower().startswith(
@@ -3060,13 +3136,8 @@ class OpenAIProvider:
                 )
             )
         ):
-            # Forced-thinking endpoints reject enable_thinking=False; omit the
-            # off-payload so the request still succeeds. The model will still
-            # think — that is the only mode the endpoint supports.
             pass
         elif thinking_toggle_model:
-            # Toggle models need an explicit off payload even without a
-            # capability profile (policy gating, independent of dialect).
             payload["thinking"] = {"type": "disabled"}
         elif caps and caps.supports_reasoning:
             apply_reasoning_disable(
@@ -3087,7 +3158,108 @@ class OpenAIProvider:
             cfg=cfg,
             has_tools=bool(tools),
         )
+        fallback_reason = (
+            "native_is_error_unavailable"
+            if any(message.get("role") == "tool" for message in openai_messages)
+            else None
+        )
+        return payload, wire_active_user_index, fallback_reason
 
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Chat Completions payload without I/O or shaping."""
+
+        cfg = config or ChatConfig()
+        payload, wire_active_user_index, fallback_reason = self._build_payload(
+            messages,
+            tools,
+            cfg,
+        )
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        return project_final_request_payload(
+            payload,
+            projection_adapter=self._provider_kind,
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="content_envelope",
+            fallback_reason=fallback_reason,
+            active_user_message_index=wire_active_user_index,
+            message_limit=message_limit,
+            protected_tool_result_indexes=protected_result_indexes,
+        )
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        cfg = config or ChatConfig()
+        return self._stream_with_detached_cancellation(messages, tools, cfg)
+
+    async def _stream_with_detached_cancellation(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> AsyncIterator[StreamEvent]:
+        """Preserve cancellation without retaining the physical request frame."""
+
+        cancelled = False
+        event: StreamEvent | None = None
+        try:
+            async for event in self._stream(messages, tools, cfg):
+                yield event
+        except asyncio.CancelledError:
+            # The inner stream owns request headers and HTTPX response state.
+            # Drop its cancellation traceback and any last echoed event before
+            # propagating a fresh cancellation from this metadata-only frame.
+            event = None
+            cancelled = True
+
+        if cancelled:
+            raise asyncio.CancelledError from None
+
+    async def _stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> AsyncIterator[StreamEvent]:
+        payload, wire_active_user_index, fallback_reason = self._build_payload(
+            messages,
+            tools,
+            cfg,
+        )
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        openai_messages = cast(list[dict[str, Any]], payload["messages"])
+        if tools:
+            provider_tools = cast(list[dict[str, Any]], payload.get("tools", []))
+            tool_names = [
+                tool.get("function", {}).get("name", "")
+                for tool in provider_tools
+            ]
+            tool_schema_hash = hashlib.sha256(
+                json.dumps(
+                    provider_tools,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            log.info(
+                "provider.request_tool_surface",
+                provider=self._provider_kind,
+                model=self._model,
+                provider_visible_tool_names=tool_names,
+                tool_schema_hash=tool_schema_hash,
+                temperature=payload.get("temperature"),
+                top_p=payload.get("top_p"),
+            )
         if self._provider_kind == "dashscope":
             log.info(
                 "provider.qwen_provider_profile",
@@ -3103,11 +3275,6 @@ class OpenAIProvider:
                 stream_fallback="non_stream_once",
             )
 
-        fallback_reason = (
-            "native_is_error_unavailable"
-            if any(message.get("role") == "tool" for message in openai_messages)
-            else None
-        )
         from opensquilla.engine.context_budget import coordinate_provider_context_budget
 
         budget_decision = coordinate_provider_context_budget(
@@ -3116,6 +3283,8 @@ class OpenAIProvider:
             proof_budget=cfg.provider_request_max_chars,
             status_projection_mode="content_envelope",
             fallback_reason=fallback_reason,
+            active_user_message_index=wire_active_user_index,
+            protected_tool_result_indexes=protected_result_indexes,
         )
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
@@ -3123,6 +3292,13 @@ class OpenAIProvider:
             yield ErrorEvent(
                 message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
                 code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
             )
             return
         payload = budget_decision.payload or payload
@@ -3134,6 +3310,8 @@ class OpenAIProvider:
                 projection_adapter=self._provider_kind,
                 status_projection_mode="content_envelope",
                 fallback_reason=fallback_reason,
+                active_user_message_index=wire_active_user_index,
+                protected_tool_result_indexes=protected_result_indexes,
             )
         except ProviderRequestBudgetExceededError as exc:
             log.warning("provider.request_budget_exhausted", **exc.proof)
@@ -3151,12 +3329,30 @@ class OpenAIProvider:
             headers["Authorization"] = f"Bearer {self._api_key}"
         headers.update(provider_app_headers(self._base_url))
         headers.update(
+            tokenrhythm_install_id_headers(
+                self._provider_kind,
+                self._base_url,
+                proxy=self._proxy,
+            )
+        )
+        headers.update(
             tokenrhythm_correlation_headers(
                 self._provider_kind,
                 self._base_url,
                 cfg.provider_request_correlation,
             )
         )
+        correlation = cfg.provider_request_correlation
+        if (
+            self._provider_kind == "openrouter"
+            and correlation is not None
+            and correlation.call_kind == "prompt_cache_keepalive"
+            and correlation.session_id
+        ):
+            # Keep cache/routing affinity opt-in: normal OpenRouter requests
+            # must retain their existing headers when keepalive is disabled.
+            # Use the opaque random id, never a canonical session key.
+            headers["X-Session-Id"] = correlation.session_id
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
 
@@ -3175,11 +3371,13 @@ class OpenAIProvider:
         reasoning = ReasoningAccumulator()
         tools_by_name = _tool_by_name(tools)
         text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
-        text_tool_normalizer: (
-            TextToolStreamNormalizer | _InertCandidateTextPassthrough
-        )
+        text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
-            text_tool_normalizer = _InertCandidateTextPassthrough()
+            assert candidate_artifact is not None
+            text_tool_normalizer = InertCandidateTextNormalizer(
+                artifact=candidate_artifact,
+                dialects=text_tool_dialects,
+            )
         else:
             text_tool_normalizer = TextToolStreamNormalizer(
                 tools=tools,
@@ -3306,13 +3504,24 @@ class OpenAIProvider:
             async with httpx.AsyncClient(
                 timeout=(
                     _stream_timeout(cfg.timeout)
-                    if self._compat.stream_timeout_fallback
+                    if (
+                        self._compat.stream_timeout_fallback
+                        and cfg.physical_attempt_limit != 1
+                    )
                     else cfg.timeout
                 ),
                 trust_env=_trust_env(),
                 proxy=self._proxy,
                 follow_redirects=False,
             ) as client:
+                headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+                headers.update(
+                    tokenrhythm_install_id_headers(
+                        self._provider_kind,
+                        self._base_url,
+                        proxy=self._proxy,
+                    )
+                )
                 async with client.stream(
                     "POST",
                     endpoint,
@@ -3812,7 +4021,27 @@ class OpenAIProvider:
                                 streamed_thought_signature = ts_delta
 
                             # Tool calls (may stream over multiple chunks)
-                            raw_tool_calls = delta.get("tool_calls") or []
+                            raw_tool_calls_value = delta.get("tool_calls")
+                            if _has_native_tool_payload(raw_tool_calls_value):
+                                pending_segments = (
+                                    text_tool_normalizer.observe_native_tool_start("")
+                                )
+                                for pending_event in _segment_text_tool_events(
+                                    pending_segments,
+                                    provider_kind=self._provider_kind,
+                                    model=self._model,
+                                ):
+                                    if isinstance(pending_event, TextDeltaEvent):
+                                        visible_assistant_text_parts.append(
+                                            pending_event.text
+                                        )
+                                        emitted_stream_event = True
+                                        yield pending_event
+                            raw_tool_calls = (
+                                []
+                                if raw_tool_calls_value is None
+                                else raw_tool_calls_value
+                            )
                             if not isinstance(raw_tool_calls, list):
                                 if inert_candidate_output:
                                     assert candidate_artifact is not None
@@ -3822,6 +4051,7 @@ class OpenAIProvider:
                                             raw_tool_calls
                                         ),
                                     )
+                                    text_tool_normalizer.observe_native_tool_start("")
                                     emitted_stream_event = True
                                 else:
                                     invalid_native_structure += 1
@@ -3840,6 +4070,7 @@ class OpenAIProvider:
                                             ("invalid_tool_call", candidate_artifact.call_count),
                                             arguments=strip_candidate_tool_identity(tc),
                                         )
+                                        text_tool_normalizer.observe_native_tool_start("")
                                         emitted_stream_event = True
                                     else:
                                         invalid_native_structure += 1
@@ -3934,6 +4165,7 @@ class OpenAIProvider:
                                         name_fragment=name_fragment,
                                         arguments_fragment=arguments_fragment,
                                     )
+                                    text_tool_normalizer.observe_native_tool_start("")
                                     candidate_artifact_open_keys.add(artifact_key)
                                     emitted_stream_event = True
                                     continue
@@ -4212,6 +4444,7 @@ class OpenAIProvider:
                     if not has_terminal_evidence:
                         if (
                             self._compat.empty_stream_fallback
+                            and cfg.physical_attempt_limit != 1
                             and not active_choice_seen
                             and not emitted_stream_event
                             and not assistant_text_parts
@@ -4418,6 +4651,18 @@ class OpenAIProvider:
                         successful_text_tool_terminal=successful_text_tool_terminal,
                         native_calls=native_calls,
                     )
+                    rejection_error = _text_tool_rejection_error(
+                        normalized_segments,
+                        display_name=self._compat.display_name,
+                        provider_kind=self._provider_kind,
+                        model=self._model,
+                        phase="stream",
+                        cache_shape=cache_shape,
+                        trace=trace,
+                    )
+                    if rejection_error is not None:
+                        yield rejection_error
+                        return
                     for event in _segment_text_tool_events(
                         normalized_segments,
                         provider_kind=self._provider_kind,
@@ -4447,7 +4692,7 @@ class OpenAIProvider:
                     deferred_post_native_events.clear()
 
                     candidate_artifact_text = ""
-                    if candidate_artifact is not None and candidate_artifact.has_calls:
+                    if candidate_artifact is not None and candidate_artifact.has_content:
                         if successful_text_tool_terminal:
                             for artifact_key in candidate_artifact_open_keys:
                                 candidate_artifact.finish(artifact_key)
@@ -4491,6 +4736,7 @@ class OpenAIProvider:
 
                     if (
                         self._compat.empty_stream_fallback
+                        and cfg.physical_attempt_limit != 1
                         and not emitted_stream_event
                         and not assistant_text_parts
                         and not tools_acc.has_calls
@@ -4579,7 +4825,11 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
-            if self._compat.stream_timeout_fallback and not emitted_stream_event:
+            if (
+                self._compat.stream_timeout_fallback
+                and cfg.physical_attempt_limit != 1
+                and not emitted_stream_event
+            ):
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"
                     if self._provider_kind == "openrouter"
@@ -4810,6 +5060,14 @@ class OpenAIProvider:
         cache_shape = _payload_cache_shape(fallback_payload, tools=tools)
         fallback_headers = dict(headers)
         fallback_headers["Accept"] = "application/json"
+        fallback_headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+        fallback_headers.update(
+            tokenrhythm_install_id_headers(
+                self._provider_kind,
+                self._base_url,
+                proxy=self._proxy,
+            )
+        )
         endpoint = self._api_url("/v1/chat/completions")
         trace = LLMTraceRecorder(
             provider=self._provider_kind,
@@ -4841,6 +5099,17 @@ class OpenAIProvider:
                 proxy=self._proxy,
                 follow_redirects=False,
             ) as client:
+                # ``AsyncClient.__aenter__`` is an await boundary. Refresh at
+                # the final send point so a privacy toggle that lands while
+                # the fallback client is opening cannot forward a stale id.
+                fallback_headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+                fallback_headers.update(
+                    tokenrhythm_install_id_headers(
+                        self._provider_kind,
+                        self._base_url,
+                        proxy=self._proxy,
+                    )
+                )
                 response = await client.post(
                     endpoint,
                     headers=fallback_headers,
@@ -5054,11 +5323,13 @@ class OpenAIProvider:
         tools_by_name = _tool_by_name(tools)
         finish_reasons: list[str] = []
         text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
-        text_tool_normalizer: (
-            TextToolStreamNormalizer | _InertCandidateTextPassthrough
-        )
+        text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
-            text_tool_normalizer = _InertCandidateTextPassthrough()
+            assert candidate_artifact is not None
+            text_tool_normalizer = InertCandidateTextNormalizer(
+                artifact=candidate_artifact,
+                dialects=text_tool_dialects,
+            )
         else:
             text_tool_normalizer = TextToolStreamNormalizer(
                 tools=tools,
@@ -5098,7 +5369,19 @@ class OpenAIProvider:
                     if reasoning_event is not None:
                         yield reasoning_event
 
-            raw_tool_calls = message.get("tool_calls") or []
+            raw_tool_calls_value = message.get("tool_calls")
+            if _has_native_tool_payload(raw_tool_calls_value):
+                for pending_event in _segment_text_tool_events(
+                    text_tool_normalizer.observe_native_tool_start(""),
+                    provider_kind=self._provider_kind,
+                    model=self._model,
+                ):
+                    if isinstance(pending_event, TextDeltaEvent):
+                        visible_assistant_text_parts.append(pending_event.text)
+                        yield pending_event
+            raw_tool_calls = (
+                [] if raw_tool_calls_value is None else raw_tool_calls_value
+            )
             if not isinstance(raw_tool_calls, list):
                 if inert_candidate_output:
                     assert candidate_artifact is not None
@@ -5106,6 +5389,7 @@ class OpenAIProvider:
                         ("invalid_tool_calls", candidate_artifact.call_count),
                         arguments=strip_candidate_tool_identity(raw_tool_calls),
                     )
+                    text_tool_normalizer.observe_native_tool_start("")
                 else:
                     invalid_native_arguments += 1
                     log.warning(
@@ -5123,6 +5407,7 @@ class OpenAIProvider:
                             ("invalid_tool_call", call_position),
                             arguments=strip_candidate_tool_identity(tc),
                         )
+                        text_tool_normalizer.observe_native_tool_start("")
                     else:
                         invalid_native_arguments += 1
                         log.warning(
@@ -5157,6 +5442,7 @@ class OpenAIProvider:
                         name_text=raw_name,
                         arguments=raw_arguments,
                     )
+                    text_tool_normalizer.observe_native_tool_start("")
                     continue
                 raw_function = tc.get("function") or {}
                 if not isinstance(raw_function, Mapping):
@@ -5364,6 +5650,18 @@ class OpenAIProvider:
             successful_text_tool_terminal=successful_text_tool_terminal,
             native_calls=native_calls,
         )
+        rejection_error = _text_tool_rejection_error(
+            normalized_segments,
+            display_name=self._compat.display_name,
+            provider_kind=self._provider_kind,
+            model=self._model,
+            phase="non_stream",
+            cache_shape=cache_shape,
+            trace=trace,
+        )
+        if rejection_error is not None:
+            yield rejection_error
+            return
         for event in _segment_text_tool_events(
             normalized_segments,
             provider_kind=self._provider_kind,
@@ -5386,7 +5684,7 @@ class OpenAIProvider:
             yield deferred_event
 
         candidate_artifact_text = ""
-        if candidate_artifact is not None and candidate_artifact.has_calls:
+        if candidate_artifact is not None and candidate_artifact.has_content:
             candidate_artifact_text = candidate_artifact.render_text()
             if candidate_artifact_text:
                 visible_assistant_text_parts.append(candidate_artifact_text)
@@ -5464,16 +5762,43 @@ class OpenAIProvider:
             else {}
         )
         headers.update(provider_app_headers(self._base_url))
+        safe_request_error: Exception | None = None
+        cancelled_request_error: asyncio.CancelledError | None = None
+        client: Any = None
+        resp: Any = None
+        data: Any = None
+        rows: Any = None
+        excluded_model_ids: Any = None
+        models: list[ModelInfo] | None = None
+        raw_message = ""
+        raw_state = ""
         try:
             async with httpx.AsyncClient(
                 timeout=10.0,
                 trust_env=_trust_env(),
                 proxy=self._proxy,
+                follow_redirects=False,
             ) as client:
+                headers.update(
+                    tokenrhythm_install_id_headers(
+                        self._provider_kind,
+                        self._base_url,
+                        proxy=self._proxy,
+                    )
+                )
                 resp = await client.get(self._api_url("/v1/models"), headers=headers)
                 resp.raise_for_status()
-                data = resp.json()
-                rows = data.get("data", [])
+                data = (
+                    resp.json(parse_float=Decimal)
+                    if self._provider_kind == "tokenrhythm"
+                    else resp.json()
+                )
+                raw_rows = data.get("data", [])
+                rows = (
+                    [row for row in raw_rows if isinstance(row, Mapping)]
+                    if isinstance(raw_rows, list)
+                    else []
+                )
                 if self._compat.model_listing_excluded_ids:
                     excluded_model_ids = {
                         model_id.lower()
@@ -5484,22 +5809,201 @@ class OpenAIProvider:
                         for row in rows
                         if str(row.get("id", "")).lower() not in excluded_model_ids
                     ]
-                return [
-                    ModelInfo(
-                        provider=self._provider_kind,
-                        model_id=m["id"],
-                        display_name=m.get("name", m.get("id", "")),
-                        context_window=m.get("context_length", 0),
-                        max_output_tokens=(m.get("top_provider") or {}).get("max_completion_tokens")
-                        or 0,
+                if self._provider_kind == "tokenrhythm":
+                    declared = parse_tokenrhythm_declared(
+                        {"data": rows},
+                        known_secret=self._api_key,
                     )
-                    for m in rows
-                ]
+                    catalog = shared_catalog()
+                    official_endpoint = is_official_tokenrhythm_endpoint(
+                        self._base_url
+                    )
+                    published = (
+                        catalog.tokenrhythm_published_snapshot()
+                        if official_endpoint
+                        else {}
+                    )
+                    merged = merge_tokenrhythm_catalog(published, declared)
+                    published_entries = tokenrhythm_published_catalog_entries(
+                        published
+                    )
+                    published_fields = {
+                        model_id.lower(): fields
+                        for model_id, fields in published_entries.items()
+                    }
+                    result: list[ModelInfo] = []
+                    for model in merged.values():
+                        limits = (
+                            catalog.resolve_deployment_limits(
+                                model.model_id,
+                                provider="tokenrhythm",
+                                api_key=self._api_key,
+                                base_url=self._base_url,
+                                proxy=self._proxy or "",
+                            )
+                            if official_endpoint
+                            else None
+                        )
+                        capabilities = (
+                            catalog.resolve_deployment_capabilities(
+                                model.model_id,
+                                provider="tokenrhythm",
+                                api_key=self._api_key,
+                                base_url=self._base_url,
+                            )
+                            if official_endpoint
+                            else ModelCapabilities()
+                        )
+                        price_fields = published_fields.get(
+                            model.model_id.lower(), {}
+                        )
+                        declared_metadata = model.metadata.declared
+                        if declared_metadata is None:  # merge contract, defensive only
+                            continue
+                        declared_capabilities = declared_metadata.capabilities
+                        published_capabilities = (
+                            model.metadata.published.capabilities
+                            if model.metadata.published is not None
+                            else None
+                        )
+                        streaming = declared_capabilities.streaming
+                        if streaming is None and published_capabilities is not None:
+                            streaming = published_capabilities.streaming
+                        tools = declared_capabilities.tools
+                        if tools is None and published_capabilities is not None:
+                            tools = published_capabilities.tools
+                        vision = declared_capabilities.vision
+                        if vision is None and published_capabilities is not None:
+                            vision = published_capabilities.vision
+                        reasoning = declared_capabilities.reasoning
+                        if reasoning is None and published_capabilities is not None:
+                            reasoning = published_capabilities.reasoning
+                        result.append(
+                            ModelInfo(
+                                provider=self._provider_kind,
+                                model_id=model.model_id,
+                                display_name=model.display_name,
+                                context_window=(
+                                    model.context_window
+                                    or (
+                                        limits.context_window
+                                        if limits is not None
+                                        else 0
+                                    )
+                                ),
+                                max_output_tokens=(
+                                    model.max_output_tokens
+                                    or (
+                                        limits.max_output_tokens
+                                        if limits is not None
+                                        else 0
+                                    )
+                                ),
+                                supports_reasoning=(
+                                    False
+                                    if reasoning is False
+                                    else capabilities.supports_reasoning
+                                ),
+                                supports_tools=(
+                                    tools
+                                    if tools is not None
+                                    else capabilities.supports_tools
+                                ),
+                                supports_streaming=(
+                                    streaming
+                                    if streaming is not None
+                                    else capabilities.supports_streaming
+                                ),
+                                supports_vision=(
+                                    vision
+                                    if vision is not None
+                                    else capabilities.supports_vision
+                                ),
+                                input_cost_per_1k=(
+                                    float(
+                                        price_fields.get("input_cost_per_mtok")
+                                        or 0.0
+                                    )
+                                    / 1000.0
+                                ),
+                                output_cost_per_1k=(
+                                    float(
+                                        price_fields.get("output_cost_per_mtok")
+                                        or 0.0
+                                    )
+                                    / 1000.0
+                                ),
+                                metadata=model.metadata.to_wire(),
+                            )
+                        )
+                    models = result
+                else:
+                    models = [
+                        ModelInfo(
+                            provider=self._provider_kind,
+                            model_id=m["id"],
+                            display_name=m.get("name", m.get("id", "")),
+                            context_window=m.get("context_length", 0),
+                            max_output_tokens=_model_listing_max_output(m),
+                        )
+                        for m in rows
+                        if m.get("id")
+                    ]
+        except asyncio.CancelledError:
+            cancelled_request_error = asyncio.CancelledError()
         except httpx.HTTPError as exc:
             if raise_on_error:
-                raise redacted_httpx_error(exc, api_key=self._api_key) from None
-            return []
-        except Exception:
+                safe_request_error = redacted_httpx_error(
+                    exc,
+                    api_key=self._api_key,
+                )
+        except Exception as exc:
             if raise_on_error:
-                raise
-            return []
+                if isinstance(exc, json.JSONDecodeError):
+                    safe_document = redact_tokenrhythm_install_ids(exc.doc)
+                    if safe_document != exc.doc:
+                        safe_request_error = RuntimeError(
+                            "Provider model catalog returned invalid JSON"
+                        )
+                if safe_request_error is None:
+                    raw_message = str(exc)
+                    safe_message = redact_tokenrhythm_install_ids(raw_message)
+                    raw_state = repr(getattr(exc, "__dict__", {}))
+                    if (
+                        safe_message != raw_message
+                        or redact_tokenrhythm_install_ids(raw_state) != raw_state
+                    ):
+                        safe_request_error = RuntimeError(
+                            safe_message
+                            if safe_message != raw_message
+                            else "Provider model catalog parsing failed"
+                        )
+                    else:
+                        exc.__cause__ = None
+                        exc.__context__ = None
+                        exc.__traceback__ = None
+                        safe_request_error = exc
+
+        if cancelled_request_error is not None:
+            headers.clear()
+            client = None
+            resp = None
+            data = None
+            rows = None
+            excluded_model_ids = None
+            models = None
+            raw_message = ""
+            raw_state = ""
+            raise cancelled_request_error
+        if safe_request_error is not None:
+            headers.clear()
+            client = None
+            resp = None
+            data = None
+            rows = None
+            excluded_model_ids = None
+            models = None
+            raw_message = ""
+            raw_state = ""
+            raise safe_request_error
+        return models or []

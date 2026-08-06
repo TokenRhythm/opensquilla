@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
-from opensquilla.recovery.atomic import native_move_no_replace
+from opensquilla.recovery.atomic import native_move_no_replace, reparse_tag_redirects
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.engine import profile_replacement_transaction_unfinished
 from opensquilla.recovery.errors import (
@@ -180,7 +180,9 @@ def cleanup_scope_fingerprint(
 
 
 def _is_reparse(value: os.stat_result) -> bool:
-    return bool(int(getattr(value, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE)
+    if not int(getattr(value, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE:
+        return False
+    return reparse_tag_redirects(int(getattr(value, "st_reparse_tag", 0)))
 
 
 def _absolute(path: str | Path) -> Path:

@@ -97,7 +97,7 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value[0]?.steerClientMessageId).toBeUndefined()
   })
 
-  it('requests canonical messages without compaction summaries', async () => {
+  it('requests canonical messages with durable compaction summaries', async () => {
     const { api, rpc } = makeHistory()
 
     expect(api.historyState.value.initialLoadStatus).toBe('pending')
@@ -105,11 +105,189 @@ describe('useChatHistory canonical pagination', () => {
 
     expect(rpc.call).toHaveBeenCalledWith('chat.history', expect.objectContaining({
       includeCanonical: true,
-      includeSummaries: false,
+      includeSummaries: true,
     }), expect.objectContaining({ timeoutAction: 'reject' }))
     expect(api.historyState.value).toMatchObject({
       initialLoadStatus: 'ready',
     })
+  })
+
+  it('restores manual compaction summaries in stable transcript chronology', async () => {
+    const baseTime = 1_720_000_000_000
+    const response: ChatHistoryResponse = {
+      messages: [
+        {
+          id: 'user-1',
+          message_id: 'user-1',
+          role: 'user',
+          text: 'Earlier request',
+          timestamp: baseTime,
+        },
+        {
+          id: 'assistant-1',
+          message_id: 'assistant-1',
+          role: 'assistant',
+          text: 'Earlier answer',
+          timestamp: baseTime + 1_000,
+        },
+        {
+          id: 'user-2',
+          message_id: 'user-2',
+          role: 'user',
+          text: 'Continue',
+          timestamp: baseTime + 3_000,
+        },
+      ],
+      compaction_summaries: [
+        {
+          id: 9,
+          compaction_id: 'cmp-9',
+          compaction_index: 2,
+          trigger_reason: 'manual',
+          removed_count: 8,
+          kept_count: 2,
+          created_at: 1_720_000_001,
+        },
+        {
+          id: 7,
+          compaction_id: 'cmp-7',
+          compaction_index: 1,
+          trigger_reason: 'manual',
+          removed_count: 5,
+          kept_count: 1,
+          created_at: 1_720_000_001,
+        },
+        {
+          id: 8,
+          compaction_id: 'cmp-auto',
+          trigger_reason: 'auto_threshold',
+          created_at: 1_720_000_002,
+        },
+      ],
+      has_more: false,
+    }
+    const { api, messages } = makeHistory(false, {
+      response,
+      messages: [{
+        role: 'maintenance',
+        text: '',
+        ts: baseTime + 500,
+        messageId: 'maintenance:optimistic:cmp-7',
+        maintenance: {
+          kind: 'context_compaction',
+          compactionId: 'cmp-7',
+          source: 'manual',
+          state: 'completed',
+          durability: 'durable',
+        },
+      }],
+    })
+
+    await api.loadHistory()
+
+    const expectedIds = [
+      'user-1',
+      'assistant-1',
+      'maintenance:context-compaction:summary:7',
+      'maintenance:context-compaction:summary:9',
+      'user-2',
+    ]
+    expect(messages.value.map(message => message.messageId)).toEqual(expectedIds)
+    expect(messages.value[2]).toMatchObject({
+      role: 'maintenance',
+      text: '',
+      ts: baseTime + 1_000,
+      restoredFromHistory: true,
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-7',
+        source: 'manual',
+        state: 'completed',
+        durability: 'durable',
+        removedCount: 5,
+        keptCount: 1,
+      },
+    })
+    expect(messages.value.filter(message =>
+      message.maintenance?.compactionId === 'cmp-7',
+    )).toHaveLength(1)
+
+    // A background refresh receives the same metadata. Stable ids and the
+    // timestamp tie-breaker keep both membership and order unchanged.
+    await api.loadHistory()
+    expect(messages.value.map(message => message.messageId)).toEqual(expectedIds)
+  })
+
+  it('inserts maintenance without reordering promoted canonical rows', async () => {
+    const baseTime = 1_720_000_000_000
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [
+          {
+            id: 'user-old',
+            message_id: 'user-old',
+            role: 'user',
+            text: 'Original request',
+            timestamp: baseTime,
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'steer-1',
+            message_id: 'steer-1',
+            role: 'user',
+            text: 'Use the new constraint',
+            timestamp: baseTime + 1_000,
+            turn_context: {
+              turn_id: 'turn-new',
+              promoted_from_turn_id: 'turn-old',
+              disposition: 'promoted',
+              revision: 2,
+            },
+          },
+          {
+            id: 'assistant-old',
+            message_id: 'assistant-old',
+            role: 'assistant',
+            text: 'Completed old turn',
+            timestamp: baseTime + 2_000,
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'assistant-new',
+            message_id: 'assistant-new',
+            role: 'assistant',
+            text: 'Completed promoted turn',
+            timestamp: baseTime + 3_000,
+            turn_context: { turn_id: 'turn-new' },
+          },
+        ],
+        compaction_summaries: [{
+          id: 11,
+          compaction_id: 'cmp-promoted',
+          trigger_reason: 'manual',
+          created_at: baseTime + 1_500,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value
+      .filter(message => message.role !== 'maintenance')
+      .map(message => message.messageId)).toEqual([
+      'user-old',
+      'assistant-old',
+      'steer-1',
+      'assistant-new',
+    ])
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'user-old',
+      'maintenance:context-compaction:summary:11',
+      'assistant-old',
+      'steer-1',
+      'assistant-new',
+    ])
   })
 
   it('applies the shared bootstrap deadline without recycling on history timeout', async () => {
@@ -348,6 +526,54 @@ describe('useChatHistory canonical pagination', () => {
     await api.loadHistory()
 
     expect(messages.value[0]?.turnId).toBe('turn-1')
+  })
+
+  it('restores durable compaction activity from canonical history', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-1',
+          message_id: 'assistant-1',
+          role: 'assistant',
+          text: 'answer after compaction',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-1',
+            activity_markers: [{
+              kind: 'context_compaction',
+              id: 'cmp-history',
+              status: 'completed',
+              at: 1_720_000_000_000,
+            }],
+          },
+        }],
+        compaction_summaries: [{
+          id: 12,
+          compaction_id: 'cmp-history',
+          trigger_reason: 'manual',
+          created_at: 1_720_000_000_000,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      restoredFromHistory: true,
+      statusHistory: [{
+        action: 'context_compaction',
+        label: '',
+        at: 1_720_000_000_000,
+        id: 'cmp-history',
+        category: 'maintenance',
+        state: 'completed',
+        source: 'automatic',
+        durability: 'durable',
+      }],
+    })
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value.some(message => message.role === 'maintenance')).toBe(false)
   })
 
   it('interleaves cold same-turn output when the steer crosses a page boundary', async () => {
@@ -594,6 +820,18 @@ describe('useChatHistory canonical pagination', () => {
   it('prepends one page per cursor and preserves the reader scroll anchor', async () => {
     const thread = document.createElement('div')
     let height = 400
+    const earlySummary = {
+      id: 21,
+      compaction_id: 'cmp-early',
+      trigger_reason: 'manual',
+      created_at: Date.parse('2026-07-06T00:00:01.500Z'),
+    }
+    const lateSummary = {
+      id: 22,
+      compaction_id: 'cmp-late',
+      trigger_reason: 'manual',
+      created_at: Date.parse('2026-07-06T00:00:03.500Z'),
+    }
     Object.defineProperties(thread, {
       scrollHeight: { configurable: true, get: () => height },
       scrollTop: { configurable: true, value: 120, writable: true },
@@ -603,6 +841,7 @@ describe('useChatHistory canonical pagination', () => {
       threadRef,
       response: {
         messages: [historyMessage('m3'), historyMessage('m4')],
+        compaction_summaries: [lateSummary],
         has_more: true,
         oldest_cursor: 'cursor-3',
         newest_cursor: 'cursor-4',
@@ -615,11 +854,13 @@ describe('useChatHistory canonical pagination', () => {
     document.body.append(thread)
     thread.getBoundingClientRect = () => ({ top: 0, bottom: 500 } as DOMRect)
     anchor.getBoundingClientRect = () => {
-      const top = messages.value.length > 2 ? 300 : 100
+      const canonicalCount = messages.value.filter(message => message.role !== 'maintenance').length
+      const top = canonicalCount > 2 ? 300 : 100
       return { top, bottom: top + 60 } as DOMRect
     }
     rpc.call.mockImplementationOnce(async () => ({
       messages: [historyMessage('m3'), historyMessage('m4')],
+      compaction_summaries: [lateSummary],
       has_more: true,
       oldest_cursor: 'cursor-3',
       newest_cursor: 'cursor-4',
@@ -630,6 +871,7 @@ describe('useChatHistory canonical pagination', () => {
       height = 900
       return {
         messages: [historyMessage('m1'), historyMessage('m2')],
+        compaction_summaries: [earlySummary, lateSummary],
         has_more: false,
         oldest_cursor: 'cursor-1',
         newest_cursor: 'cursor-2',
@@ -642,7 +884,17 @@ describe('useChatHistory canonical pagination', () => {
     await nextTick()
     await api.loadEarlierHistory()
 
-    expect(messages.value.map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'm1',
+      'maintenance:context-compaction:summary:21',
+      'm2',
+      'm3',
+      'maintenance:context-compaction:summary:22',
+      'm4',
+    ])
+    expect(messages.value
+      .filter(message => message.role !== 'maintenance')
+      .map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
     expect(thread.scrollTop).toBe(320)
     expect(rpc.call).toHaveBeenCalledTimes(2)
     expect(api.historyState.value.canonicalComplete).toBe(true)

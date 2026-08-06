@@ -5,14 +5,17 @@ import io
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from PIL import Image
 
 from opensquilla.provider.image_generation import (
     ImageGenerationRequest,
     ImageGenerationResult,
+    OpenAIImageGenerationProvider,
     OpenRouterImageGenerationProvider,
     QwenTokenPlanImageGenerationProvider,
+    TokenRhythmImageGenerationProvider,
     get_image_generation_provider,
 )
 from opensquilla.provider.qwen_token_plan import (
@@ -26,6 +29,176 @@ def _test_png_bytes() -> bytes:
     with Image.new("RGBA", (2, 1), (30, 120, 210, 128)) as image:
         image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def test_image_generation_reuses_and_pins_a_profile_key_pool(monkeypatch) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.llm_runtime import reset_profile_credential_pools
+    from opensquilla.provider.image_generation_credentials import (
+        resolve_image_generation_credential,
+    )
+
+    monkeypatch.setenv("TOKENRHYTHM_POOL_A", "synthetic-pool-key-a")
+    monkeypatch.setenv("TOKENRHYTHM_POOL_B", "synthetic-pool-key-b")
+    reset_profile_credential_pools()
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "model": "deepseek-v4-flash",
+                "api_key_env_pool": ["TOKENRHYTHM_POOL_A", "TOKENRHYTHM_POOL_B"],
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+    )
+
+    def resolve(session_key: str):
+        return resolve_image_generation_credential(
+            provider_id="tokenrhythm",
+            provider_config=config.image_generation.providers.tokenrhythm,
+            default_env_key="TOKENRHYTHM_API_KEY",
+            default_base_url="https://tokenrhythm.studio/v1",
+            effective_base_url="https://tokenrhythm.studio/v1/images",
+            gateway_config=config,
+            runtime=True,
+            session_key=session_key,
+        )
+
+    first = resolve("session-a")
+    pinned = resolve("session-a")
+    rotated = resolve("session-b")
+    reset_profile_credential_pools()
+
+    assert first.available is True
+    assert first.owner == "profile"
+    assert first.kind == "pool"
+    assert pinned.api_key == first.api_key
+    assert rotated.api_key != first.api_key
+    assert "synthetic-pool-key" not in repr(first)
+
+
+def test_image_generation_reports_an_exhausted_profile_key_pool(monkeypatch) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.llm_runtime import (
+        profile_credential_pools,
+        reset_profile_credential_pools,
+    )
+    from opensquilla.provider.failures import ProviderFailureKind
+    from opensquilla.provider.image_generation_credentials import (
+        resolve_image_generation_credential,
+    )
+
+    monkeypatch.setenv("TOKENRHYTHM_POOL_ONLY", "synthetic-pool-key")
+    reset_profile_credential_pools()
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "model": "deepseek-v4-flash",
+                "api_key_env_pool": ["TOKENRHYTHM_POOL_ONLY"],
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+    )
+
+    first = resolve_image_generation_credential(
+        provider_id="tokenrhythm",
+        provider_config=config.image_generation.providers.tokenrhythm,
+        default_env_key="TOKENRHYTHM_API_KEY",
+        default_base_url="https://tokenrhythm.studio/v1",
+        effective_base_url="https://tokenrhythm.studio/v1",
+        gateway_config=config,
+        runtime=True,
+        session_key="session-exhausted",
+    )
+    assert first.available is True
+    profile_credential_pools().report_failure(
+        "tokenrhythm",
+        "session-exhausted",
+        ProviderFailureKind.AUTH_INVALID,
+    )
+
+    exhausted = resolve_image_generation_credential(
+        provider_id="tokenrhythm",
+        provider_config=config.image_generation.providers.tokenrhythm,
+        default_env_key="TOKENRHYTHM_API_KEY",
+        default_base_url="https://tokenrhythm.studio/v1",
+        effective_base_url="https://tokenrhythm.studio/v1",
+        gateway_config=config,
+        runtime=True,
+        session_key="session-exhausted",
+    )
+    reset_profile_credential_pools()
+
+    assert exhausted.available is False
+    assert exhausted.owner == "profile"
+    assert exhausted.kind == "pool"
+    assert exhausted.reason == "credential_pool_unavailable"
+
+
+def test_image_generation_reports_pool_failure_through_gateway_capability(
+    monkeypatch,
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.llm_runtime import reset_profile_credential_pools
+    from opensquilla.provider.image_generation_credentials import (
+        report_image_generation_pool_failure,
+        resolve_image_generation_credential,
+    )
+
+    monkeypatch.setenv("TOKENRHYTHM_POOL_A", "synthetic-pool-key-a")
+    monkeypatch.setenv("TOKENRHYTHM_POOL_B", "synthetic-pool-key-b")
+    reset_profile_credential_pools()
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "model": "deepseek-v4-flash",
+                "api_key_env_pool": ["TOKENRHYTHM_POOL_A", "TOKENRHYTHM_POOL_B"],
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+    )
+
+    def resolve():
+        return resolve_image_generation_credential(
+            provider_id="tokenrhythm",
+            provider_config=config.image_generation.providers.tokenrhythm,
+            default_env_key="TOKENRHYTHM_API_KEY",
+            default_base_url="https://tokenrhythm.studio/v1",
+            effective_base_url="https://tokenrhythm.studio/v1/images",
+            gateway_config=config,
+            runtime=True,
+            session_key="session-failure",
+        )
+
+    first = resolve()
+    request = httpx.Request("POST", "https://tokenrhythm.studio/v1/images")
+    response = httpx.Response(401, request=request)
+    report_image_generation_pool_failure(
+        first,
+        httpx.HTTPStatusError("invalid credential", request=request, response=response),
+    )
+    rotated = resolve()
+    reset_profile_credential_pools()
+
+    assert first.kind == "pool"
+    assert first.api_key != rotated.api_key
 
 
 def _clear_vision_provider_env(monkeypatch) -> None:
@@ -43,6 +216,64 @@ def _clear_vision_provider_env(monkeypatch) -> None:
         "ANTHROPIC_BASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_openai_image_provider_keeps_output_format_in_images_payload(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "data": [
+                    {
+                        "b64_json": base64.b64encode(_test_png_bytes()).decode(
+                            "ascii"
+                        )
+                    }
+                ]
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            captured.update(url=url, json=json)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: FakeClient(),
+    )
+
+    await OpenAIImageGenerationProvider(api_key="synthetic-openai-key").generate(
+        ImageGenerationRequest(
+            prompt="draw a squid",
+            model="gpt-image-1",
+            size="1024x1024",
+            output_format="webp",
+        )
+    )
+
+    assert captured["url"] == "https://api.openai.com/v1/images/generations"
+    assert captured["json"] == {
+        "model": "gpt-image-1",
+        "prompt": "draw a squid",
+        "size": "1024x1024",
+        "output_format": "webp",
+        "n": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -706,6 +937,70 @@ async def test_invalid_provider_image_triggers_fallback_and_requested_format_con
         assert image.format == "WEBP"
 
 
+@pytest.mark.asyncio
+async def test_image_generation_fallback_redacts_install_id_from_attempts_and_error(
+    monkeypatch,
+) -> None:
+    from opensquilla.provider import image_generation
+
+    install_id = "i7"
+
+    class FakeProvider:
+        provider_id = "synthetic_redaction"
+        default_model = "image-model"
+        auth_env_vars: tuple[str, ...] = ()
+
+        async def generate(
+            self,
+            request: ImageGenerationRequest,
+        ) -> ImageGenerationResult:
+            if request.model == "working":
+                return ImageGenerationResult(
+                    image_bytes=_test_png_bytes(),
+                    mime_type="image/png",
+                    model=request.model,
+                    provider=self.provider_id,
+                )
+            raise RuntimeError(f"upstream echoed {install_id}")
+
+    monkeypatch.setattr(
+        image_generation,
+        "redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+    image_generation.register_image_generation_provider(FakeProvider())
+    request = ImageGenerationRequest(
+        prompt="draw a squid",
+        model="synthetic_redaction/broken",
+        size="1024x1024",
+    )
+    try:
+        result = await image_generation.generate_with_fallbacks(
+            request=request,
+            candidates=[
+                "synthetic_redaction/broken",
+                "synthetic_redaction/working",
+            ],
+        )
+        with pytest.raises(RuntimeError) as raised:
+            await image_generation.generate_with_fallbacks(
+                request=request,
+                candidates=[
+                    "synthetic_redaction/broken-a",
+                    "synthetic_redaction/broken-b",
+                ],
+            )
+    finally:
+        image_generation.reset_image_generation_providers()
+
+    assert len(result.attempts) == 1
+    assert result.attempts[0].error == "upstream echoed ***"
+    assert install_id not in repr(result.attempts)
+    assert install_id not in str(raised.value)
+    assert install_id not in repr(raised.value)
+    assert "upstream echoed ***" in str(raised.value)
+
+
 @pytest.mark.parametrize(
     "call_kind",
     [
@@ -961,6 +1256,137 @@ def test_image_generation_reuses_llm_key_only_after_capability_is_enabled(monkey
 
     image_config.enabled = True
     assert image_generation_available()
+
+
+def test_image_generation_reuses_same_origin_llm_env_reference(monkeypatch) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("CUSTOM_OPENROUTER_KEY", "sk-or-from-custom-env")
+
+    from opensquilla.gateway.config import ImageGenerationConfig, LlmProviderConfig
+    from opensquilla.tools.builtin.media import configure_image_generation
+
+    image_config = ImageGenerationConfig(
+        enabled=True,
+        primary="openrouter/google/gemini-3.1-flash-image-preview",
+    )
+    llm_config = LlmProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.1",
+        api_key_env="CUSTOM_OPENROUTER_KEY",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    configure_image_generation(image_config, llm_config=llm_config)
+    try:
+        provider = get_image_generation_provider("openrouter")
+        assert provider is not None
+        assert provider._resolve_api_key() == "sk-or-from-custom-env"
+    finally:
+        configure_image_generation(None)
+
+
+def test_image_generation_keeps_using_tokenrhythm_after_primary_switch(monkeypatch) -> None:
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.tools.builtin import media
+
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "model": "deepseek-v4-flash",
+                "api_key": "synthetic-demoted-tokenrhythm-key",
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+        image_generation={
+            "enabled": True,
+            "binding": "custom",
+            "primary": "tokenrhythm/qwen-image-2.0",
+        },
+    )
+
+    media.configure_image_generation(
+        config.image_generation,
+        gateway_config=config,
+        llm_config=config.llm,
+    )
+    try:
+        provider = get_image_generation_provider("tokenrhythm")
+        assert provider is not None
+        assert provider._resolve_api_key() == "synthetic-demoted-tokenrhythm-key"
+        assert media.image_generation_available() is True
+    finally:
+        media.configure_image_generation(None)
+
+
+@pytest.mark.asyncio
+async def test_follow_llm_image_generation_is_dormant_for_another_active_provider(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    from opensquilla.gateway.config import ImageGenerationConfig, LlmProviderConfig
+    from opensquilla.tools.builtin import media
+    from opensquilla.tools.types import ToolError
+
+    image_config = ImageGenerationConfig(
+        enabled=True,
+        binding="follow_llm",
+        primary="openrouter/google/gemini-3.1-flash-image-preview",
+    )
+    image_config.providers.openrouter.api_key = "synthetic-image-key"
+    llm_config = LlmProviderConfig(
+        provider="deepseek",
+        model="deepseek-chat",
+        api_key="synthetic-llm-key",
+    )
+
+    media.configure_image_generation(image_config, llm_config=llm_config)
+    try:
+        assert media.image_generation_available() is False
+        with pytest.raises(ToolError, match="bound LLM provider is not active"):
+            await media.image_generate(prompt="draw a squid")
+    finally:
+        media.configure_image_generation(None)
+
+
+@pytest.mark.asyncio
+async def test_follow_llm_image_generation_is_dormant_for_custom_same_provider_endpoint(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    from opensquilla.gateway.config import ImageGenerationConfig, LlmProviderConfig
+    from opensquilla.tools.builtin import media
+    from opensquilla.tools.types import ToolError
+
+    image_config = ImageGenerationConfig(
+        enabled=True,
+        binding="follow_llm",
+        primary="openrouter/google/gemini-3.1-flash-image-preview",
+    )
+    image_config.providers.openrouter.api_key = "synthetic-image-key"
+    llm_config = LlmProviderConfig(
+        provider="openrouter",
+        model="compatible-model",
+        api_key="synthetic-llm-key",
+        base_url="https://compatible.example.test/v1",
+    )
+
+    media.configure_image_generation(image_config, llm_config=llm_config)
+    try:
+        assert media.image_generation_available() is False
+        with pytest.raises(ToolError, match="bound LLM provider is not active"):
+            await media.image_generate(prompt="draw a squid")
+    finally:
+        media.configure_image_generation(None)
 
 
 def test_image_generation_llm_key_does_not_cross_endpoint_origin(monkeypatch) -> None:
@@ -1592,3 +2018,388 @@ def test_image_generation_capability_does_not_expose_agent_tool_when_disabled(
     names = {tool.name for tool in tool_defs}
 
     assert "image_generate" not in names
+
+
+def _tokenrhythm_image_request() -> ImageGenerationRequest:
+    from opensquilla.provider.types import ProviderRequestCorrelation
+
+    return ImageGenerationRequest(
+        prompt="draw a friendly squid",
+        model="qwen-image-2.0",
+        size="1024x1024",
+        output_format="png",
+        timeout_seconds=12.0,
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="image-execution-1",
+            call_kind="auxiliary.image_generation",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_tokenrhythm_image_provider_uses_images_api_and_b64_response(
+    monkeypatch,
+) -> None:
+    from opensquilla.provider.tokenrhythm_correlation import (
+        TOKENRHYTHM_CALL_KIND_HEADER,
+        TOKENRHYTHM_EXECUTION_ID_HEADER,
+        TOKENRHYTHM_SESSION_ID_HEADER,
+        TOKENRHYTHM_TURN_ID_HEADER,
+    )
+
+    captured: dict[str, object] = {}
+    image_bytes = _test_png_bytes()
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "data": [
+                    {
+                        "b64_json": base64.b64encode(image_bytes).decode("ascii"),
+                        "revised_prompt": "a friendly squid",
+                    }
+                ]
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            captured.update(url=url, headers=headers, json=json)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: FakeClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
+
+    result = await TokenRhythmImageGenerationProvider(
+        api_key="synthetic-tokenrhythm-key"
+    ).generate(_tokenrhythm_image_request())
+
+    assert captured["url"] == "https://tokenrhythm.studio/v1/images/generations"
+    assert captured["json"] == {
+        "model": "qwen-image-2.0",
+        "prompt": "draw a friendly squid",
+        "size": "1024x1024",
+        "n": 1,
+    }
+    headers = captured["headers"]
+    assert isinstance(headers, dict)
+    assert headers["Authorization"] == "Bearer synthetic-tokenrhythm-key"
+    assert headers["HTTP-Referer"] == "https://opensquilla.ai"
+    assert headers["X-Title"] == "OpenSquilla"
+    assert headers[TOKENRHYTHM_SESSION_ID_HEADER] == "session-1"
+    assert headers[TOKENRHYTHM_TURN_ID_HEADER] == "turn-1"
+    assert headers[TOKENRHYTHM_EXECUTION_ID_HEADER] == "image-execution-1"
+    assert headers[TOKENRHYTHM_CALL_KIND_HEADER] == "auxiliary.image_generation"
+    assert headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
+    assert "synthetic-install-id" not in str(captured["json"])
+    assert result.provider == "tokenrhythm"
+    assert result.model == "qwen-image-2.0"
+    assert result.image_bytes == image_bytes
+    assert result.mime_type == "image/png"
+    assert result.revised_prompt == "a friendly squid"
+
+
+@pytest.mark.asyncio
+async def test_direct_image_provider_redacts_only_errors_that_echo_install_id(
+    monkeypatch,
+) -> None:
+    install_id = "i7"
+    leaking_error = ValueError(f"upstream echoed {install_id}")
+    ordinary_error = ValueError("ordinary upstream failure")
+    errors = iter((leaking_error, ordinary_error))
+
+    class FailingClient:
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            raise self.error
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: FailingClient(next(errors)),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+    provider = TokenRhythmImageGenerationProvider(
+        api_key="synthetic-tokenrhythm-key"
+    )
+
+    with pytest.raises(RuntimeError) as redacted:
+        await provider.generate(_tokenrhythm_image_request())
+    with pytest.raises(ValueError) as unchanged:
+        await provider.generate(_tokenrhythm_image_request())
+
+    assert str(redacted.value) == "upstream echoed ***"
+    assert install_id not in repr(redacted.value)
+    assert unchanged.value is ordinary_error
+
+
+@pytest.mark.asyncio
+async def test_tokenrhythm_image_http_error_drops_retained_install_id(
+    monkeypatch,
+) -> None:
+    install_id = "i7"
+    original_errors: list[httpx.HTTPStatusError] = []
+
+    class FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            request = httpx.Request("POST", url, headers=headers, json=json)
+            response = httpx.Response(
+                502,
+                request=request,
+                headers={"X-Upstream-Echo": install_id},
+                json={"error": f"upstream echoed {install_id}"},
+            )
+            error = httpx.HTTPStatusError(
+                "upstream rejected the request",
+                request=request,
+                response=response,
+            )
+            original_errors.append(error)
+            raise error
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: FailingClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.tokenrhythm_install_id_headers",
+        lambda *_args, **_kwargs: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+
+    provider = TokenRhythmImageGenerationProvider(
+        api_key="synthetic-tokenrhythm-key"
+    )
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        await provider.generate(_tokenrhythm_image_request())
+
+    assert raised.value.__context__ is None
+    assert raised.value.request.headers["X-OpenSquilla-Install-Id"] == "[PRESENT]"
+    assert raised.value.response.request is raised.value.request
+    retained = " ".join(
+        (
+            str(raised.value),
+            repr(raised.value),
+            repr(raised.value.request.headers),
+            raised.value.response.text,
+            repr(original_errors[0].__dict__),
+        )
+    )
+    assert install_id not in retained
+
+
+@pytest.mark.asyncio
+async def test_tokenrhythm_image_invalid_json_drops_retained_install_id(
+    monkeypatch,
+) -> None:
+    from opensquilla.provider import image_generation
+
+    install_id = "i7"
+
+    class InvalidJsonClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, headers, json):
+            request = httpx.Request("POST", url, headers=headers, json=json)
+            return httpx.Response(
+                200,
+                request=request,
+                text=f'{{"echo":"{install_id}"',
+            )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: InvalidJsonClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.tokenrhythm_install_id_headers",
+        lambda *_args, **_kwargs: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+    image_generation.register_image_generation_provider(
+        TokenRhythmImageGenerationProvider(api_key="synthetic-tokenrhythm-key")
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await image_generation.generate_with_fallbacks(
+                request=_tokenrhythm_image_request(),
+                candidates=["tokenrhythm/qwen-image-2.0"],
+            )
+    finally:
+        image_generation.reset_image_generation_providers()
+
+    assert str(raised.value) == "Image generation provider returned invalid JSON"
+    assert raised.value.__context__ is None
+    assert not hasattr(raised.value, "doc")
+    assert install_id not in repr(raised.value.__dict__)
+
+
+@pytest.mark.asyncio
+async def test_tokenrhythm_image_provider_downloads_url_through_secure_helper(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    image_url = "https://generated.example.test/image.png?signature=redacted"
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": [{"url": image_url}]}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, _url, *, headers, json):
+            return FakeResponse()
+
+    async def fake_download(url: str, *, timeout_seconds: float):
+        captured.update(url=url, timeout=timeout_seconds)
+        return "image/png", _test_png_bytes()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: FakeClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation._download_tokenrhythm_image",
+        fake_download,
+    )
+
+    result = await TokenRhythmImageGenerationProvider(
+        api_key="synthetic-tokenrhythm-key"
+    ).generate(_tokenrhythm_image_request())
+
+    assert captured == {"url": image_url, "timeout": 12.0}
+    assert result.image_bytes == _test_png_bytes()
+
+
+@pytest.mark.asyncio
+async def test_tokenrhythm_image_provider_omits_metadata_on_custom_host(
+    monkeypatch,
+) -> None:
+    captured_headers: dict[str, str] = {}
+
+    class FakeResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "data": [
+                    {
+                        "b64_json": base64.b64encode(_test_png_bytes()).decode(
+                            "ascii"
+                        )
+                    }
+                ]
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, _url, *, headers, json):
+            captured_headers.update(headers)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.image_generation.httpx.AsyncClient",
+        lambda **_kwargs: FakeClient(),
+    )
+
+    await TokenRhythmImageGenerationProvider(
+        api_key="synthetic-tokenrhythm-key",
+        base_url="https://compatible.example/v1",
+    ).generate(_tokenrhythm_image_request())
+
+    assert captured_headers == {
+        "Authorization": "Bearer synthetic-tokenrhythm-key",
+        "Content-Type": "application/json",
+    }
+
+
+def test_tokenrhythm_image_provider_registers_with_configured_identity(monkeypatch) -> None:
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+
+    from opensquilla.gateway.config import ImageGenerationConfig, LlmProviderConfig
+    from opensquilla.tools.builtin.media import configure_image_generation
+
+    llm = LlmProviderConfig(
+        provider="tokenrhythm",
+        model="deepseek-v4",
+        api_key="synthetic-llm-key",
+        base_url="https://tokenrhythm.studio/v1",
+    )
+    configure_image_generation(ImageGenerationConfig(enabled=True), llm_config=llm)
+    try:
+        provider = get_image_generation_provider("tokenrhythm")
+        assert isinstance(provider, TokenRhythmImageGenerationProvider)
+        assert provider.default_model == "qwen-image-2.0"
+        assert provider.auth_env_vars == ("TOKENRHYTHM_API_KEY",)
+        assert provider._base_url == "https://tokenrhythm.studio/v1"
+        assert provider._resolve_api_key() == "synthetic-llm-key"
+    finally:
+        configure_image_generation(None)

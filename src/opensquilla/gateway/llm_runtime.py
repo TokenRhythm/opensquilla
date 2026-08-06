@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import secrets
 import threading
 import time
 from collections.abc import Callable
@@ -379,14 +380,24 @@ def masked_key_id(secret: str) -> str:
 class PooledCredential:
     """A pool-resolved profile credential.
 
-    ``env_name`` (the credential id) and ``key_id`` are safe to log;
-    ``api_key`` is the live secret and is excluded from ``repr``.
+    ``env_name`` (the credential id) and ``key_id`` are safe to log.
+    ``api_key`` is the live secret; ``lease_token`` is the opaque authority
+    to report its failure. Both stay parent-process-only and out of ``repr``.
     """
 
     provider_id: str
     env_name: str
     key_id: str
     api_key: str = field(default="", repr=False)
+    lease_token: str = field(default="", repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class _CredentialPin:
+    """One session's exact, parent-process-only credential lease."""
+
+    cred_id: str
+    lease_token: str = field(repr=False, compare=False)
 
 
 class ProfileCredentialPools:
@@ -422,7 +433,7 @@ class ProfileCredentialPools:
         self._pool_fingerprints: dict[str, tuple[str, ...]] = {}
         self._creds_by_id: dict[str, dict[str, Credential]] = {}
         self._key_ids: dict[str, dict[str, str]] = {}
-        self._pins: dict[str, dict[str, str]] = {}
+        self._pins: dict[str, dict[str, _CredentialPin]] = {}
 
     def acquire_for_session(
         self,
@@ -447,9 +458,9 @@ class ProfileCredentialPools:
                 return None
 
             pins = self._pins.setdefault(provider_id, {})
-            pinned_id = pins.get(session_key)
-            if pinned_id is not None and pool.available(pinned_id):
-                cred = self._creds_by_id[provider_id][pinned_id]
+            pin = pins.get(session_key)
+            if pin is not None and pool.available(pin.cred_id):
+                cred = self._creds_by_id[provider_id][pin.cred_id]
                 log.debug(
                     "credential_pool.pin_reused",
                     provider=provider_id,
@@ -457,10 +468,18 @@ class ProfileCredentialPools:
                     env_name=cred.cred_id,
                     key_id=self._key_ids[provider_id][cred.cred_id],
                 )
-                return self._pooled_locked(provider_id, cred)
+                return self._pooled_locked(
+                    provider_id,
+                    cred,
+                    lease_token=pin.lease_token,
+                )
 
             cred = pool.acquire()  # may raise NoCredentialsAvailable
-            pins[session_key] = cred.cred_id
+            pin = _CredentialPin(
+                cred_id=cred.cred_id,
+                lease_token=secrets.token_urlsafe(32),
+            )
+            pins[session_key] = pin
             log.info(
                 "credential_pool.rotation",
                 provider=provider_id,
@@ -469,7 +488,11 @@ class ProfileCredentialPools:
                 key_id=self._key_ids[provider_id][cred.cred_id],
                 pool_size=len(pool),
             )
-            return self._pooled_locked(provider_id, cred)
+            return self._pooled_locked(
+                provider_id,
+                cred,
+                lease_token=pin.lease_token,
+            )
 
     def report_failure(
         self,
@@ -492,34 +515,100 @@ class ProfileCredentialPools:
         with self._lock:
             pool = self._pools.get(provider_id)
             pins = self._pins.get(provider_id, {})
-            cred_id = pins.pop(session_key, None)
-            if pool is None or cred_id is None:
+            pin = pins.pop(session_key, None)
+            if pool is None or pin is None:
                 return
-            if kind is ProviderFailureKind.AUTH_INVALID:
-                cooldown = float("inf")
-            elif kind is ProviderFailureKind.INSUFFICIENT_CREDITS:
-                cooldown = INSUFFICIENT_CREDITS_COOLDOWN_SECONDS
-            else:
-                cooldown = (
-                    retry_after_seconds
-                    if retry_after_seconds is not None and retry_after_seconds >= 0
-                    else RATE_LIMITED_COOLDOWN_SECONDS
-                )
-            pool.report_429(cred_id, cooldown_seconds=cooldown)
-            # Drop every other session pinned to the now-parked key so they
-            # rotate on their next turn instead of failing the same way.
-            for other_session in [s for s, c in pins.items() if c == cred_id]:
-                pins.pop(other_session, None)
-            log.warning(
-                "credential_pool.cooldown",
-                provider=provider_id,
-                session_key=session_key,
-                env_name=cred_id,
-                key_id=self._key_ids.get(provider_id, {}).get(cred_id, ""),
-                failure_kind=str(kind),
-                cooldown_seconds=cooldown,
-                permanent=cooldown == float("inf"),
+            self._park_credential_locked(
+                provider_id,
+                session_key,
+                pin.cred_id,
+                kind,
+                retry_after_seconds=retry_after_seconds,
             )
+
+    def report_failure_for_lease(
+        self,
+        provider_id: str,
+        session_key: str,
+        lease_token: str,
+        kind: ProviderFailureKind,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> bool:
+        """Park only the credential represented by the exact active lease.
+
+        A late result from a previous request must never park a credential
+        that the same session acquired later.  The opaque token is generated
+        per session pin, never derived from key material, and compared while
+        holding the pool lock. Empty, stale, or fabricated tokens are a
+        fail-closed no-op. Generic provider paths retain ``report_failure``
+        for compatibility; paid media must use this exact API.
+        """
+
+        if kind not in _REPORTABLE_FAILURE_KINDS or not lease_token:
+            return False
+        provider_id = (provider_id or "").strip().lower()
+        with self._lock:
+            pool = self._pools.get(provider_id)
+            pins = self._pins.get(provider_id, {})
+            pin = pins.get(session_key)
+            if (
+                pool is None
+                or pin is None
+                or not secrets.compare_digest(pin.lease_token, lease_token)
+            ):
+                return False
+            pins.pop(session_key, None)
+            self._park_credential_locked(
+                provider_id,
+                session_key,
+                pin.cred_id,
+                kind,
+                retry_after_seconds=retry_after_seconds,
+            )
+            return True
+
+    def _park_credential_locked(
+        self,
+        provider_id: str,
+        session_key: str,
+        cred_id: str,
+        kind: ProviderFailureKind,
+        *,
+        retry_after_seconds: float | None,
+    ) -> None:
+        """Park ``cred_id`` and invalidate every lease that named it."""
+
+        pool = self._pools[provider_id]
+        pins = self._pins.get(provider_id, {})
+        if kind is ProviderFailureKind.AUTH_INVALID:
+            cooldown = float("inf")
+        elif kind is ProviderFailureKind.INSUFFICIENT_CREDITS:
+            cooldown = INSUFFICIENT_CREDITS_COOLDOWN_SECONDS
+        else:
+            cooldown = (
+                retry_after_seconds
+                if retry_after_seconds is not None and retry_after_seconds >= 0
+                else RATE_LIMITED_COOLDOWN_SECONDS
+            )
+        pool.report_429(cred_id, cooldown_seconds=cooldown)
+        # Drop every other session pinned to the now-parked key so they
+        # rotate on their next turn instead of failing the same way. This
+        # also invalidates their lease tokens before they can report late.
+        for other_session in [
+            session for session, other_pin in pins.items() if other_pin.cred_id == cred_id
+        ]:
+            pins.pop(other_session, None)
+        log.warning(
+            "credential_pool.cooldown",
+            provider=provider_id,
+            session_key=session_key,
+            env_name=cred_id,
+            key_id=self._key_ids.get(provider_id, {}).get(cred_id, ""),
+            failure_kind=str(kind),
+            cooldown_seconds=cooldown,
+            permanent=cooldown == float("inf"),
+        )
 
     def peek_available(
         self,
@@ -575,12 +664,19 @@ class ProfileCredentialPools:
             self._key_ids.pop(provider, None)
             self._pins.pop(provider, None)
 
-    def _pooled_locked(self, provider_id: str, cred: Credential) -> PooledCredential:
+    def _pooled_locked(
+        self,
+        provider_id: str,
+        cred: Credential,
+        *,
+        lease_token: str = "",
+    ) -> PooledCredential:
         return PooledCredential(
             provider_id=provider_id,
             env_name=cred.cred_id,
             key_id=self._key_ids[provider_id][cred.cred_id],
             api_key=cred.secret,
+            lease_token=lease_token,
         )
 
     def _ensure_pool_locked(

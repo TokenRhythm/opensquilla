@@ -15,6 +15,8 @@ It covers:
   the MIT license; see the dedicated section below.
 - The built-in tokenjuice tool-result projection backend and bundled
   reduction rules under `src/opensquilla/plugins/tokenjuice/`.
+- Optional managed toolchains downloaded after explicit user confirmation;
+  these binaries are not embedded in the OpenSquilla wheel or source tree.
 - The cron prompt-injection scanner was reviewed against Hermes Agent
   reference material; the MIT notice is reproduced below for conservative
   attribution.
@@ -277,6 +279,27 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## Optional managed toolchains downloaded at runtime
+
+OpenSquilla does not embed the following toolchains in its source distribution
+or wheel. The Web setup flow presents their source, version, license, and known
+download size, asks for explicit consent, and then stores verified artifacts in
+the user's OpenSquilla state directory. Each downloaded component remains under
+its upstream terms.
+
+| Runtime component | Catalog source | Catalog license / provenance note |
+|---|---|---|
+| TinyTeX 2026.05 / TeX Live packages | https://github.com/rstudio/tinytex-releases | TinyTeX release repository: GPL-2.0. The self-contained verified archive is not updated from the floating TeX Live network. Its included packages remain governed by their own TeX Live catalog metadata, and upstream license files remain in the downloaded tree. |
+| FFmpeg / FFprobe macOS 8.1.2 ZIPs | https://ffmpeg.martin-riedl.de/ | GPL-3.0-or-later builds selected separately for Apple Silicon and Intel, with the build source pinned to commit [`bb1d6db29cee948f9685bcd69e6caf17d960662b`](https://git.martin-riedl.de/ffmpeg/build-script/commit/bb1d6db29cee948f9685bcd69e6caf17d960662b). Each original ZIP is verified by fixed byte size and SHA-256 before extraction. Because the embedded binary signatures are invalid, OpenSquilla then removes them, applies a local ad-hoc signature, and requires strict `codesign` verification before activation. This local signature is not a Developer ID signature or Apple notarization. The matching pinned GPL license assets are installed beside the binaries. These builds require macOS 12 or later. |
+| FFmpeg Linux static GPL builds | https://github.com/BtbN/FFmpeg-Builds | GPL-3.0-or-later catalog build. |
+| FFmpeg Windows essentials build | https://github.com/GyanD/codexffmpeg | GPL build; upstream license files remain in the downloaded archive. |
+| Noto Sans CJK 2.004 regular font | https://github.com/notofonts/noto-cjk/tree/Sans2.004 | SIL Open Font License 1.1. The pinned license file is downloaded and checksum-verified beside the font; the OFL text is also reproduced earlier in this notice. |
+
+The built-in catalog records fixed URLs, byte sizes, and SHA-256 values for
+every executable archive, license file, and font download. OpenSquilla neither
+republishes these toolchains as part of its releases nor claims ownership of
+them.
+
 ## npm and Python dependency packaging strategy
 
 OpenSquilla uses npm lockfiles for the Web UI and Electron shell and `uv.lock`
@@ -374,14 +397,21 @@ are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 - `nano-pdf`
 - `openrouter-video-generator`
 - `paper-abstract-author`
+- `paper-artifact-runtime`
+- `paper-citation-integrity-gate`
 - `paper-citation-planner`
+- `paper-delivery-summary`
 - `paper-experiment-stub`
+- `paper-latex-sanitizer`
+- `paper-length-gate`
 - `paper-outline-author`
 - `paper-plot-stub`
 - `paper-preference-planner`
+- `paper-quality-gate`
 - `paper-refbib-stub`
 - `paper-revision-author`
 - `paper-section-author`
+- `paper-source-readiness-gate`
 - `paper-source-curator`
 - `pdf-toolkit`
 - `pptx`
@@ -389,6 +419,8 @@ are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 - `skill-creator-linter`
 - `skill-creator-proposals`
 - `skill-creator-smoke-test`
+- `short-drama-delivery-audit`
+- `short-drama-review-normalizer`
 - `stack-trace-generic-probe`
 - `stack-trace-go-probe`
 - `stack-trace-js-probe`

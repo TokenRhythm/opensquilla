@@ -406,10 +406,17 @@ class CompactionEvent:
 
     kind: Literal["compaction"] = field(default="compaction", init=False)
     compaction_id: str | None = None
+    compaction_deadline_at_monotonic: float | None = None
+    compaction_timeout_seconds: float | None = None
     summary: str = ""
     kept_entries: list[dict] = field(default_factory=list)
     kept_count: int = 0
     removed_count: int = 0
+    summary_payload: dict[str, Any] | None = None
+    summary_format: str = "text"
+    coverage_status: str = "unknown"
+    missing_obligations: list[str] | None = None
+    critical_carry_forward: list[str] | None = None
 
 
 @dataclass
@@ -419,12 +426,30 @@ class CompactionOutcome:
     messages: list = field(default_factory=list)
     compacted: bool = False
     summary: str = ""
+    summary_payload: dict[str, Any] | None = None
+    summary_format: str = "text"
+    coverage_status: str = "unknown"
+    missing_obligations: list[str] | None = None
+    critical_carry_forward: list[str] | None = None
     kept_entries: list[dict] = field(default_factory=list)
     removed_count: int = 0
     compaction_id: str | None = None
+    compaction_deadline_at_monotonic: float | None = None
+    compaction_timeout_seconds: float | None = None
     request_context_insert_index: int | None = None
     runtime_context_insert_index: int | None = None
     protected_turn_start_index: int | None = None
+    # Request-scoped projection only. The canonical turn transcript remains
+    # raw and no CompactionEvent may be persisted for this outcome.
+    ephemeral_only: bool = False
+    # Runtime-only owner for a multi-stage overflow recovery. Durable and
+    # request-scoped projections share its absolute deadline and physical LLM
+    # call counter; it must never enter persistence, logs, or event reprs.
+    runtime_compaction_config: Any | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 AgentEvent = (
@@ -510,6 +535,11 @@ class AgentConfig:
     provider_id: str = ""
     stop_sequences: list[str] = field(default_factory=list)
     context_window_tokens: int = 200000
+    # Positive only when the gateway operator explicitly configured the global
+    # ``llm.context_window_tokens`` value. Keep it separate from the resolved
+    # active-model window so selector fallback can apply the same precedence to
+    # its own physical deployment. Zero preserves catalog-derived rebinding.
+    context_window_tokens_global_override: int = 0
     context_overflow_threshold: float = 0.85  # trigger at 85%
     max_overflow_retries: int = 2
     max_history_turns: int = 0  # 0 = unlimited; compaction handles oversized history
@@ -546,6 +576,22 @@ class AgentConfig:
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"] = "protect"
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     compaction_protected_recent_messages: int = 0
+    compaction_total_timeout_seconds: float = 120.0
+    compaction_heartbeat_interval_seconds: float = 15.0
+    # Frozen runtime-only single-deployment chain for auxiliary compaction.
+    # Kept opaque here to avoid coupling engine types to session internals.
+    compaction_execution_plan: Any | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    # Re-resolve the selector's current physical leg at the start of each
+    # compaction operation, then freeze the returned plan for that operation.
+    compaction_execution_plan_factory: Callable[[], Any | None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     repair_enabled: bool = True
     repair_interval_seconds: float = 60.0
     repair_max_items_per_tick: int = 5
@@ -578,6 +624,10 @@ class AgentConfig:
     tool_result_dispatch_turn_max_chars: int = 0
     tool_result_provider_request_max_chars: int = 0
     provider_request_proof_max_chars: int = 0
+    # ``None`` means infer an explicit operator limit from a positive value.
+    # Internal callers that bind a cap derived for a concrete child deployment
+    # set this to ``False`` so selector fallback can re-plan independently.
+    provider_request_proof_max_chars_explicit: bool | None = None
     tool_use_argument_provider_request_max_chars: int = 0
     tool_use_argument_projection_enabled: bool = False
     tool_result_external_keep_recent: int = 2
@@ -787,10 +837,18 @@ class AgentConfig:
 
     def __post_init__(self) -> None:
         self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))
+        if self.provider_request_proof_max_chars_explicit is None:
+            self.provider_request_proof_max_chars_explicit = (
+                int(self.provider_request_proof_max_chars or 0) > 0
+            )
         self.compaction_protected_recent_messages = max(
             0,
             int(self.compaction_protected_recent_messages or 0),
         )
+        if float(self.compaction_total_timeout_seconds or 0) <= 0:
+            self.compaction_total_timeout_seconds = 120.0
+        if float(self.compaction_heartbeat_interval_seconds or 0) <= 0:
+            self.compaction_heartbeat_interval_seconds = 15.0
 
     def resolve_thinking(self, prompt: str | None = None) -> tuple[bool, int]:
         """Return (enabled, budget_tokens) based on the thinking field.

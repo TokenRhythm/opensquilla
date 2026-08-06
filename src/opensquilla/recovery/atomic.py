@@ -37,6 +37,7 @@ _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
 _IO_REPARSE_TAG_SYMLINK = 0xA000000C
 _ALLOWED_LINK_REPARSE_TAGS = frozenset({_IO_REPARSE_TAG_MOUNT_POINT, _IO_REPARSE_TAG_SYMLINK})
+_REPARSE_NAME_SURROGATE_BIT = 0x20000000
 _WINDOWS_DELETE_ACCESS = 0x00010000
 _WINDOWS_FILE_ADD_SUBDIRECTORY = 0x00000004
 _WINDOWS_FILE_TRAVERSE = 0x00000020
@@ -153,6 +154,11 @@ class PathIdentity:
         link_target: str | None = None,
     ) -> PathIdentity:
         observed_tag = int(getattr(value, "st_reparse_tag", 0)) or None
+        if observed_tag is not None and not reparse_tag_redirects(observed_tag):
+            # Data-only reparse tags (cloud placeholders, WOF compression) are
+            # hydration state, not filesystem identity: fstat cannot observe
+            # them and sync clients toggle them at will.
+            observed_tag = None
         return cls(
             device=int(value.st_dev),
             inode=int(value.st_ino),
@@ -184,8 +190,32 @@ def _is_reparse_point(value: os.stat_result) -> bool:
     return bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
+def reparse_tag_redirects(tag: int) -> bool:
+    """Return True when a Windows reparse tag redirects path resolution.
+
+    Name surrogates (symlinks, junctions) substitute another path during
+    lookups and stay rejected everywhere. Data-only reparse points - OneDrive
+    Files On-Demand placeholders, WOF-compressed files - keep resolution
+    intact and behave as plain entries. An unobservable tag fails closed.
+    """
+
+    if tag == 0:
+        return True
+    return bool(tag & _REPARSE_NAME_SURROGATE_BIT)
+
+
+def is_path_redirecting_stat(value: os.stat_result) -> bool:
+    """Symlink, or a Windows reparse point that redirects path resolution."""
+
+    if stat.S_ISLNK(value.st_mode):
+        return True
+    if not _is_reparse_point(value):
+        return False
+    return reparse_tag_redirects(int(getattr(value, "st_reparse_tag", 0)))
+
+
 def _is_link_or_reparse(value: os.stat_result) -> bool:
-    return stat.S_ISLNK(value.st_mode) or _is_reparse_point(value)
+    return is_path_redirecting_stat(value)
 
 
 def path_identity(path: str | Path, *, follow_symlinks: bool = False) -> PathIdentity:
@@ -250,7 +280,9 @@ def no_follow_manifest(
     receipts must never persist hashes of user-authored Markdown or transcripts.
     Links are rejected by default. When a real directory is explicitly named in
     ``link_leaf_directories``, links below (but never in place of) that directory
-    are recorded by their no-follow identity and are not traversed.
+    are recorded by their no-follow identity and are not traversed. Data-only
+    Windows reparse points (cloud sync placeholders, WOF compression) do not
+    redirect path resolution and are manifested as the plain entries they are.
     """
 
     root_path = Path(root)
@@ -900,7 +932,7 @@ def _copy_windows_mount_point_no_follow(
         observed_tag = int(attributes.reparse_tag)
         is_reparse = bool(attributes.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
         if expected_tag is None:
-            if is_reparse or observed_tag:
+            if (is_reparse or observed_tag) and reparse_tag_redirects(observed_tag):
                 raise UnsafePathError(f"{label} became a reparse point")
         elif not is_reparse or observed_tag != expected_tag:
             raise UnsafePathError(f"{label} reparse tag changed")
@@ -1345,7 +1377,9 @@ def _windows_move_no_replace(
             if error_number in unsupported_errors:
                 raise NoReplaceUnavailableError("Windows handle attribute query is unavailable")
             raise UnsafePathError(f"cannot verify {label} handle (Windows error {error_number})")
-        if attributes.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        if attributes.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT and reparse_tag_redirects(
+            int(attributes.reparse_tag)
+        ):
             raise UnsafePathError(f"{label} became a reparse point before native move")
         if require_directory and not attributes.file_attributes & _FILE_ATTRIBUTE_DIRECTORY:
             raise UnsafePathError(f"{label} is not a directory")

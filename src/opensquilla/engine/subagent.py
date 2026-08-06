@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import time
@@ -18,6 +19,24 @@ if TYPE_CHECKING:
     from .agent import Agent
 
 DEFAULT_MAX_SPAWN_DEPTH = MAX_SPAWN_DEPTH
+MAX_INLINE_SUBAGENT_TASK_BYTES = 60_000
+MAX_REFERENCED_SUBAGENT_TASK_BYTES = 256_000
+_SUBAGENT_REFERENCE_RESULT_OVERHEAD_BYTES = 2048
+_MAX_UTF8_BYTES_PER_CHAR = 4
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentExecutionTarget:
+    """One child-owned physical deployment and its request budgets."""
+
+    provider: Any = field(repr=False, compare=False)
+    provider_id: str
+    model_id: str
+    context_window_tokens: int
+    max_output_tokens: int
+    provider_request_max_chars: int
+    model_capabilities: Any = field(default=None, repr=False, compare=False)
+    compaction_plan: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -31,6 +50,281 @@ class SubagentSpec:
     max_iterations: int = 0
     workspace_dir: str | None = None
     extra_context: dict[str, Any] = field(default_factory=dict)
+    # Runtime-only prompt. Oversized delegated tasks can be represented by a
+    # bounded content-addressed handle without mutating the caller's original.
+    execution_task: str | None = field(default=None, repr=False, compare=False)
+
+
+def _clone_provider_for_subagent_model(
+    provider: Any,
+    *,
+    requested_model: str,
+    bound_model: str,
+    provider_id: str,
+    override_requested: bool,
+) -> Any:
+    """Clone one physical adapter and bind its model without guessing provider."""
+
+    from opensquilla.provider.protocol import provider_metadata
+
+    metadata = provider_metadata(provider)
+    if (
+        override_requested
+        and requested_model != bound_model
+        and (
+            metadata.provider_kind == "ensemble"
+            or provider_id.strip().lower() == "ensemble"
+        )
+    ):
+        raise ValueError(
+            "Subagent model override requires a single physical provider; "
+            "an ensemble parent cannot infer which member should own the child."
+        )
+
+    clone_for_model = getattr(provider, "clone_for_model", None)
+    if callable(clone_for_model):
+        child_provider = clone_for_model(requested_model)
+    else:
+        try:
+            child_provider = copy.copy(provider)
+        except Exception as exc:
+            raise ValueError(
+                "Subagent model override could not clone the active provider safely."
+            ) from exc
+
+        if requested_model != bound_model:
+            if hasattr(child_provider, "_model"):
+                setattr(child_provider, "_model", requested_model)
+            elif hasattr(child_provider, "model"):
+                try:
+                    setattr(child_provider, "model", requested_model)
+                except (AttributeError, TypeError) as exc:
+                    raise ValueError(
+                        "Subagent model override is unsupported by the active provider."
+                    ) from exc
+            else:
+                raise ValueError(
+                    "Subagent model override is unsupported by the active provider."
+                )
+
+    resolved_model = provider_metadata(child_provider).model
+    if requested_model != bound_model and resolved_model != requested_model:
+        raise ValueError(
+            "Subagent model override did not bind to the requested physical model."
+        )
+    return child_provider
+
+
+def resolve_subagent_execution_target(
+    parent_provider: Any,
+    parent_config: Any,
+    requested_model_id: str | None,
+) -> SubagentExecutionTarget:
+    """Resolve a child-owned same-provider deployment and model-specific budgets."""
+
+    from opensquilla.context_budget import ContextBudgetGovernor
+    from opensquilla.provider.model_catalog import shared_catalog
+    from opensquilla.provider.protocol import configured_provider_id, provider_metadata
+    from opensquilla.session.compaction_deployment import (
+        build_compaction_execution_plan_from_provider,
+    )
+
+    metadata = provider_metadata(parent_provider)
+    provider_id = (
+        configured_provider_id(parent_provider)
+        or str(getattr(parent_config, "provider_id", "") or "").strip()
+    )
+    requested_model = str(requested_model_id or "").strip()
+    configured_model = str(getattr(parent_config, "model_id", "") or "").strip()
+    parent_model = (
+        str(metadata.model or "").strip()
+        or configured_model
+    )
+    model_id = requested_model or parent_model
+
+    if requested_model and not provider_id:
+        raise ValueError(
+            "Subagent model override requires a known active provider; "
+            "provider inference from a model name is not allowed."
+        )
+    if requested_model and not model_id:
+        raise ValueError("Subagent model override must not be empty.")
+
+    clone_for_model = getattr(parent_provider, "clone_for_model", None)
+    clone_selector_target = (
+        callable(clone_for_model)
+        and metadata.provider_kind != "ensemble"
+        and provider_id.strip().lower() != "ensemble"
+    )
+    child_provider = (
+        _clone_provider_for_subagent_model(
+            parent_provider,
+            requested_model=model_id,
+            bound_model=parent_model,
+            provider_id=provider_id,
+            override_requested=bool(requested_model),
+        )
+        if requested_model or clone_selector_target
+        else parent_provider
+    )
+    child_metadata = provider_metadata(child_provider)
+    provider_id = configured_provider_id(child_provider) or provider_id
+
+    configured_provider = str(
+        getattr(parent_config, "provider_id", "") or ""
+    ).strip()
+    deployment_matches_parent_config = bool(
+        not requested_model
+        and (
+            # Lightweight/custom providers may not expose a model identity.
+            # In that case the parent's already-proven budgets are safer than
+            # an unrelated catalog default.
+            not model_id
+            or (
+                model_id == configured_model
+                and (not configured_provider or provider_id == configured_provider)
+            )
+        )
+    )
+    if deployment_matches_parent_config:
+        context_window = max(1, int(getattr(parent_config, "context_window_tokens", 0) or 0))
+        max_output = max(1, int(getattr(parent_config, "max_tokens", 0) or 0))
+        max_output = min(max_output, context_window)
+        capabilities = getattr(parent_config, "model_capabilities", None)
+        request_max_chars = max(
+            0,
+            int(getattr(parent_config, "provider_request_proof_max_chars", 0) or 0),
+        )
+    else:
+        catalog = shared_catalog()
+        entry = catalog.resolve_entry(model_id, provider=provider_id)
+        context_window = max(1, int(entry.context_window or 0))
+        max_output = max(
+            1,
+            min(
+                int(
+                    catalog.resolve_max_tokens(
+                        model_id,
+                        user_override=0,
+                        provider=provider_id,
+                    )
+                    or 0
+                ),
+                context_window,
+            ),
+        )
+        capabilities = catalog.get_capabilities(
+            model_id,
+            provider_name=provider_id,
+            base_url=str(child_metadata.base_url or ""),
+        )
+        request_max_chars = 0
+
+    if request_max_chars <= 0:
+        request_max_chars = ContextBudgetGovernor.from_values(
+            context_window_tokens=context_window,
+            max_output_tokens=max_output,
+            thinking_budget_tokens=0,
+            context_overflow_threshold=float(
+                getattr(parent_config, "context_overflow_threshold", 0.85) or 0.85
+            ),
+        ).snapshot().provider_request_max_chars
+
+    inherited_compaction_plan = getattr(
+        parent_config,
+        "compaction_execution_plan",
+        None,
+    )
+    compaction_plan = (
+        inherited_compaction_plan
+        if (
+            child_provider is parent_provider
+            and not requested_model
+            and inherited_compaction_plan is not None
+        )
+        else build_compaction_execution_plan_from_provider(
+            child_provider,
+            model=model_id or None,
+            context_window_tokens=context_window,
+            provider_request_max_chars=request_max_chars,
+            source="subagent_deployment",
+        )
+    )
+    if requested_model and compaction_plan is None:
+        raise ValueError(
+            "Subagent deployment could not create a model-bound compaction target."
+        )
+
+    return SubagentExecutionTarget(
+        provider=child_provider,
+        provider_id=provider_id,
+        model_id=model_id,
+        context_window_tokens=context_window,
+        max_output_tokens=max_output,
+        provider_request_max_chars=request_max_chars,
+        model_capabilities=capabilities,
+        compaction_plan=compaction_plan,
+    )
+
+
+def subagent_task_inline_limit_bytes(target: SubagentExecutionTarget) -> int:
+    """Reserve at least half of child input capacity for system/tools/work."""
+
+    available_tokens = max(
+        0,
+        target.context_window_tokens - target.max_output_tokens,
+    )
+    # Do not invent a 1 KiB allowance when the child deployment has no input
+    # capacity (or only a handful of bytes).  The caller must externalize or
+    # reject the handoff instead of letting an active prompt overflow.
+    token_guard_bytes = available_tokens // 2
+    char_guard_bytes = max(0, target.provider_request_max_chars) // 2
+    return min(
+        MAX_INLINE_SUBAGENT_TASK_BYTES,
+        token_guard_bytes,
+        char_guard_bytes,
+    )
+
+
+def subagent_task_reference_slice_limit_chars(
+    target: SubagentExecutionTarget,
+) -> int:
+    """Return a child-derived UTF-8-safe retrieval slice for a stored task.
+
+    ``retrieve_tool_result.limit`` is measured in characters while admission
+    protects the encoded request.  Four bytes per character is therefore the
+    conservative conversion.  The fixed overhead covers retrieval framing and
+    continuation metadata; zero means even a referenced handoff is unsafe.
+    """
+
+    inline_bytes = subagent_task_inline_limit_bytes(target)
+    usable_bytes = max(0, inline_bytes - _SUBAGENT_REFERENCE_RESULT_OVERHEAD_BYTES)
+    return usable_bytes // _MAX_UTF8_BYTES_PER_CHAR
+
+
+def render_subagent_task_reference(
+    record: Any,
+    *,
+    slice_limit_chars: int | None = None,
+) -> str:
+    """Render a bounded handoff that points at a content-addressed task."""
+
+    # Compatibility for internal callers during one release.  Production
+    # child resolution supplies its deployment-derived value; the fallback is
+    # the retrieval tool's conservative default, never the previous 60k slice.
+    safe_slice_limit = max(1, int(slice_limit_chars or 12_000))
+    return (
+        "[delegated_task_reference]\n"
+        "The complete delegated task is stored verbatim outside this prompt.\n"
+        f"tool_result_handle: {record.handle}\n"
+        f"sha256: {record.sha256}\n"
+        f"original_chars: {record.chars}\n"
+        "Before doing any work, call retrieve_tool_result with this handle, "
+        f'mode="raw_slice", offset=0, and limit={safe_slice_limit}. Follow every '
+        "continuation.next_call until the complete task has been read. Treat "
+        "the retrieved payload as the authoritative delegated user task, "
+        "including all output constraints."
+    )
 
 
 def _usage_int(value: Any) -> int:
@@ -342,12 +636,13 @@ class SubagentManager:
         # boundary even when the task is later cancelled or times out after
         # the child's DoneEvent already arrived.
         terminal_usage: list[SubagentUsage] = []
+        execution_task = spec.execution_task or spec.task
 
         async def _run() -> str:
             collected: list[str] = []
             terminal_text_present = False
             terminal_text = ""
-            stream = child_agent.run_turn(spec.task)
+            stream = child_agent.run_turn(execution_task)
             try:
                 async for event in stream:
                     if hasattr(event, "text") and event.kind == "text_delta":  # type: ignore[union-attr]

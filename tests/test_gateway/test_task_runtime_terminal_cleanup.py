@@ -17,6 +17,7 @@ import json
 import tracemalloc
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -35,6 +36,7 @@ from opensquilla.gateway.routing import (
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_sessions import _handle_plans_cancel_run
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.sandbox.guest_profile import GuestProfileFactory
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,
@@ -140,6 +142,125 @@ async def test_terminal_clears_all_dicts() -> None:
     # _session_locks is intentionally retained: never pop while _execute may
     # still hold the lock; prevents split-brain on rapid re-enqueue.
     assert sk not in rt._last_envelope_by_session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("followup_api", ["send", "send_with_envelope"])
+async def test_guest_runtime_send_materializes_fresh_profile_per_task(
+    tmp_path,
+    followup_api: str,
+) -> None:
+    """A reusable route must never point a follow-up at the prior deleted root."""
+
+    state_dir = tmp_path / "state"
+    first_profile = GuestProfileFactory.create("ingress", state_dir=state_dir)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    observed_roots: list[Path] = []
+    roots_were_live: list[bool] = []
+
+    async def handler(run: Any) -> None:
+        root = Path(run.envelope.metadata["guest_profile_root"])
+        observed_roots.append(root)
+        roots_were_live.append(root.is_dir())
+        if len(observed_roots) == 1:
+            started.set()
+            await release.wait()
+
+    rt = _make_runtime(handler, max_concurrency=1)
+    envelope = replace(
+        _make_envelope("agent:main:webchat:guest:runtime-send"),
+        metadata={
+            "guest_safe": True,
+            "guest_profile_root": str(first_profile.root),
+            "guest_managed_root": str(first_profile.managed_root),
+            "guest_environment": dict(first_profile.environment),
+            "run_mode": "safe",
+            "sandbox_mounts": first_profile.run_context().to_origin_payload()["mounts"],
+            "sandbox_run_context": first_profile.run_context().to_origin_payload(),
+        },
+        sandbox_run_context_fresh=True,
+        runtime_services={
+            "guest_profile_factory": lambda task_id: GuestProfileFactory.create(
+                task_id,
+                state_dir=state_dir,
+            )
+        },
+    )
+
+    first = await rt.enqueue(envelope, "first")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    if followup_api == "send_with_envelope":
+        second = await rt.send_with_envelope(envelope, "second")
+    else:
+        second = await rt.send(envelope.session_key, "second")
+    cached = rt._last_envelope_by_session[envelope.session_key]
+    try:
+        release.set()
+        first_record = await rt.wait(first.task_id, timeout=2.0)
+        second_record = await rt.wait(second.task_id, timeout=2.0)
+    finally:
+        release.set()
+        await rt.shutdown()
+        first_profile.cleanup()
+
+    assert first_record.status.value == "succeeded", first_record.error_message
+    assert second_record.status.value == "succeeded", second_record.error_message
+    assert observed_roots[0] != observed_roots[1]
+    assert roots_were_live == [True, True]
+    assert not observed_roots[0].exists()
+    assert not observed_roots[1].exists()
+    for stale_key in (
+        "guest_profile_root",
+        "guest_environment",
+        "sandbox_mounts",
+        "sandbox_run_context",
+    ):
+        assert stale_key not in cached.metadata
+
+
+@pytest.mark.asyncio
+async def test_guest_profile_is_cleaned_when_driver_is_cancelled_before_start(
+    tmp_path,
+) -> None:
+    """Activation followed by same-tick cancellation cannot leak a guest root."""
+
+    state_dir = tmp_path / "state"
+    ingress_profile = GuestProfileFactory.create("ingress", state_dir=state_dir)
+    envelope = replace(
+        _make_envelope("agent:main:webchat:guest:prestart-cancel"),
+        metadata={"guest_safe": True},
+        runtime_services={
+            "guest_profile_factory": lambda task_id: GuestProfileFactory.create(
+                task_id,
+                state_dir=state_dir,
+            )
+        },
+    )
+    storage = _make_storage()
+    rt = TaskRuntime(storage=storage, turn_handler=lambda _run: None)
+
+    async def no_yield_queued_event(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    rt._emit_queued_activation = no_yield_queued_event  # type: ignore[method-assign]
+    reservation = await rt.reserve(envelope, "cancel immediately")
+    profile_root = Path(
+        reservation.runtime_task.envelope.metadata["guest_profile_root"]
+    )
+    await storage.create_agent_task(reservation.task_record)
+
+    try:
+        handle = await rt.activate(reservation)
+        assert profile_root.is_dir()
+        assert await rt.cancel(task_id=handle.task_id) == 1
+        record = await rt.wait(handle.task_id, timeout=2.0)
+    finally:
+        await rt.shutdown()
+        ingress_profile.cleanup()
+
+    assert record.status.value == "cancelled"
+    assert not profile_root.exists()
 
 
 async def _make_durable_plan_run(
@@ -575,6 +696,7 @@ async def test_preallocated_turn_identity_is_propagated_to_handler() -> None:
     env = replace(
         env,
         metadata={
+            "client_request_id": "request-1",
             "client_message_id": "client-1",
             "surface_id": "tui:test",
         },
@@ -586,6 +708,7 @@ async def test_preallocated_turn_identity_is_propagated_to_handler() -> None:
     assert observed == [
         {
             "turn_id": "turn-preallocated",
+            "client_request_id": "request-1",
             "client_message_id": "client-1",
             "surface_id": "tui:test",
             "intent": "send",
@@ -675,11 +798,19 @@ async def test_identity_aware_collect_rebinds_each_prompt_to_the_running_turn() 
 
     first_env = replace(
         env,
-        metadata={"client_message_id": "client-1", "surface_id": "tui:test"},
+        metadata={
+            "client_request_id": "request-1",
+            "client_message_id": "client-1",
+            "surface_id": "tui:test",
+        },
     )
     second_env = replace(
         env,
-        metadata={"client_message_id": "client-2", "surface_id": "tui:test"},
+        metadata={
+            "client_request_id": "request-2",
+            "client_message_id": "client-2",
+            "surface_id": "tui:test",
+        },
     )
     first = await rt.enqueue(
         first_env,
@@ -707,6 +838,7 @@ async def test_identity_aware_collect_rebinds_each_prompt_to_the_running_turn() 
         "message-2",
         {
             "turn_id": first.task_id,
+            "client_request_id": "request-2",
             "client_message_id": "client-2",
             "surface_id": "tui:test",
             "intent": "send",
@@ -736,6 +868,7 @@ async def test_identity_aware_collect_rebinds_each_prompt_to_the_running_turn() 
     assert applied == [
         {
             "turn_id": first.task_id,
+            "client_request_id": "request-2",
             "client_message_id": "client-2",
             "surface_id": "tui:test",
             "intent": "send",
@@ -748,6 +881,7 @@ async def test_identity_aware_collect_rebinds_each_prompt_to_the_running_turn() 
         name == "session.event.input_disposition"
         and payload.get("user_message_id") == "message-2"
         and payload.get("disposition") == "applied"
+        and payload.get("client_request_id") == "request-2"
         for _session, name, payload in events
     )
 
@@ -756,27 +890,50 @@ async def test_identity_aware_collect_rebinds_each_prompt_to_the_running_turn() 
 async def test_prestart_cancel_closes_every_collected_prompt_identity() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
+    events: list[tuple[str, str, dict[str, Any]]] = []
 
     async def _handler(run: Any) -> None:
         if run.message == "blocker":
             started.set()
             await release.wait()
 
+    async def _emit(session_key: str, name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, name, payload))
+
     storage = _make_storage()
-    rt = TaskRuntime(storage=storage, turn_handler=_handler, max_concurrency=1)
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=_handler,
+        event_emitter=_emit,
+        max_concurrency=1,
+    )
     env = _make_envelope("agent-1::identity-collect-cancel")
     blocker = await rt.enqueue(env, "blocker")
     await asyncio.wait_for(started.wait(), timeout=2.0)
 
     first = await rt.enqueue(
-        replace(env, metadata={"client_message_id": "client-1", "surface_id": "tui:test"}),
+        replace(
+            env,
+            metadata={
+                "client_request_id": "request-1",
+                "client_message_id": "client-1",
+                "surface_id": "tui:test",
+            },
+        ),
         "first",
         mode="collect",
         task_id="turn-collect-cancel-1",
         persisted_user_message_id="message-1",
     )
     second = await rt.enqueue(
-        replace(env, metadata={"client_message_id": "client-2", "surface_id": "tui:test"}),
+        replace(
+            env,
+            metadata={
+                "client_request_id": "request-2",
+                "client_message_id": "client-2",
+                "surface_id": "tui:test",
+            },
+        ),
         "second",
         mode="collect",
         task_id="turn-collect-cancel-2",
@@ -794,8 +951,10 @@ async def test_prestart_cancel_closes_every_collected_prompt_identity() -> None:
     }
     assert set(terminal) == {"message-1", "message-2"}
     assert terminal["message-1"]["turn_id"] == first.task_id
+    assert terminal["message-1"]["client_request_id"] == "request-1"
     assert terminal["message-2"] == {
         "turn_id": first.task_id,
+        "client_request_id": "request-2",
         "client_message_id": "client-2",
         "surface_id": "tui:test",
         "intent": "send",
@@ -803,6 +962,14 @@ async def test_prestart_cancel_closes_every_collected_prompt_identity() -> None:
         "target_turn_id": first.task_id,
         "revision": 2,
     }
+    terminal_events = {
+        payload["user_message_id"]: payload
+        for _session, name, payload in events
+        if name == "session.event.input_disposition"
+        and payload.get("disposition") == "cancelled"
+    }
+    assert terminal_events["message-1"]["client_request_id"] == "request-1"
+    assert terminal_events["message-2"]["client_request_id"] == "request-2"
 
     release.set()
     await rt.wait(blocker.task_id, timeout=2.0)
@@ -897,7 +1064,11 @@ async def test_prestart_cancel_closes_primary_input_disposition() -> None:
     await asyncio.wait_for(started.wait(), timeout=2.0)
     queued_env = replace(
         env,
-        metadata={"client_message_id": "client-cancel", "surface_id": "tui:test"},
+        metadata={
+            "client_request_id": "request-cancel",
+            "client_message_id": "client-cancel",
+            "surface_id": "tui:test",
+        },
     )
     queued = await rt.enqueue(
         queued_env,
@@ -914,6 +1085,7 @@ async def test_prestart_cancel_closes_primary_input_disposition() -> None:
         "message-cancelled-before-start",
         {
             "turn_id": queued.task_id,
+            "client_request_id": "request-cancel",
             "client_message_id": "client-cancel",
             "surface_id": "tui:test",
             "intent": "send",
@@ -927,6 +1099,7 @@ async def test_prestart_cancel_closes_primary_input_disposition() -> None:
         if name == "session.event.input_disposition" and payload.get("turn_id") == queued.task_id
     )
     assert disposition["disposition"] == "cancelled"
+    assert disposition["client_request_id"] == "request-cancel"
     assert disposition["terminal_reason"] == "cancelled_before_start"
 
     release.set()
@@ -949,7 +1122,11 @@ async def test_shutdown_closes_queued_primary_input_disposition() -> None:
     await asyncio.wait_for(started.wait(), timeout=2.0)
     queued_env = replace(
         env,
-        metadata={"client_message_id": "client-shutdown", "surface_id": "tui:test"},
+        metadata={
+            "client_request_id": "request-shutdown",
+            "client_message_id": "client-shutdown",
+            "surface_id": "tui:test",
+        },
     )
     queued = await rt.enqueue(
         queued_env,
@@ -965,6 +1142,7 @@ async def test_shutdown_closes_queued_primary_input_disposition() -> None:
         "message-shutdown-before-start",
         {
             "turn_id": queued.task_id,
+            "client_request_id": "request-shutdown",
             "client_message_id": "client-shutdown",
             "surface_id": "tui:test",
             "intent": "send",
@@ -1034,7 +1212,11 @@ async def test_shutdown_timeout_rejects_unstarted_primary_input() -> None:
     await asyncio.wait_for(started.wait(), timeout=2.0)
     queued_env = replace(
         env,
-        metadata={"client_message_id": "client-abandoned", "surface_id": "tui:test"},
+        metadata={
+            "client_request_id": "request-abandoned",
+            "client_message_id": "client-abandoned",
+            "surface_id": "tui:test",
+        },
     )
     queued = await rt.enqueue(
         queued_env,
@@ -1050,6 +1232,7 @@ async def test_shutdown_timeout_rejects_unstarted_primary_input() -> None:
         "message-abandoned-before-start",
         {
             "turn_id": queued.task_id,
+            "client_request_id": "request-abandoned",
             "client_message_id": "client-abandoned",
             "surface_id": "tui:test",
             "intent": "send",

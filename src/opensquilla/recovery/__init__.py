@@ -17,6 +17,7 @@ from opensquilla.recovery.cleanup import (
     cleanup_apply,
     cleanup_inspect,
 )
+from opensquilla.recovery.config_recovery import recover_config
 from opensquilla.recovery.consolidate import (
     ConsolidationResult,
     acknowledge_profile_credential,
@@ -117,6 +118,7 @@ __all__ = [
     "profile_lock_key",
     "profile_lock_path",
     "reconcile_profile",
+    "recover_config",
     "recover_desktop_settings",
     "recover_profile_transaction",
     "settings_transaction_exists",

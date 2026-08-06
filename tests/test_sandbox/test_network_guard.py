@@ -38,7 +38,7 @@ class _SessionManager:
 
 def _context(
     *,
-    run_mode: RunMode = RunMode.STANDARD,
+    run_mode: RunMode = RunMode.SAFE,
     domains: tuple[DomainGrant, ...] = (),
     bundles: tuple[PackageBundleGrant, ...] = (),
     public_network: tuple[PublicNetworkGrant, ...] = (),
@@ -77,53 +77,53 @@ def test_decide_network_access_allows_wildcard_domain_grant() -> None:
     )
 
 
-def test_decide_network_access_asks_for_unknown_valid_domain() -> None:
+def test_decide_network_access_allows_unknown_valid_public_domain() -> None:
     decision = decide_network_access("example.com", _context())
 
     assert decision == NetworkDecision(
-        status="ask",
+        status="allow",
         normalized_host="example.com",
-        reason="unknown_domain",
-        source=None,
+        reason="public_default",
+        source="policy:default_open",
     )
 
 
-def test_standard_sandbox_unknown_public_host_still_asks() -> None:
+def test_safe_sandbox_unknown_public_host_is_open_by_default() -> None:
     decision = decide_network_access(
         "https://new-public-example.invalid",
-        _context(run_mode=RunMode.STANDARD),
+        _context(run_mode=RunMode.SAFE),
     )
 
     assert decision == NetworkDecision(
-        status="ask",
+        status="allow",
         normalized_host="new-public-example.invalid",
-        reason="unknown_domain",
-        source=None,
+        reason="public_default",
+        source="policy:default_open",
     )
 
 
-def test_trusted_sandbox_auto_trusts_unknown_public_host_for_this_chat() -> None:
-    decision = decide_network_access("docs.example.com", _context(run_mode=RunMode.TRUSTED))
+def test_safe_sandbox_uses_public_default_for_unknown_domain() -> None:
+    decision = decide_network_access("docs.example.com", _context(run_mode=RunMode.SAFE))
 
     assert decision == NetworkDecision(
         status="allow",
         normalized_host="docs.example.com",
-        reason="auto_trusted",
-        source="auto_trusted:chat",
+        reason="public_default",
+        source="policy:default_open",
     )
 
 
-def test_trusted_sandbox_unknown_public_host_auto_trusts_for_chat() -> None:
+def test_safe_sandbox_url_uses_public_default() -> None:
     decision = decide_network_access(
         "https://new-public-example.invalid",
-        _context(run_mode=RunMode.TRUSTED),
+        _context(run_mode=RunMode.SAFE),
     )
 
     assert decision == NetworkDecision(
         status="allow",
         normalized_host="new-public-example.invalid",
-        reason="auto_trusted",
-        source="auto_trusted:chat",
+        reason="public_default",
+        source="policy:default_open",
     )
 
 
@@ -190,7 +190,7 @@ def test_standard_public_network_grant_does_not_override_validation_block() -> N
         assert decision == expected
 
 
-def test_unknown_domain_builds_structured_network_escalation_choices() -> None:
+def test_default_open_domain_does_not_build_network_escalation() -> None:
     from opensquilla.sandbox.escalation import build_network_approval_params
 
     decision = decide_network_access("example.com", _context())
@@ -202,21 +202,7 @@ def test_unknown_domain_builds_structured_network_escalation_choices() -> None:
         fingerprint="fp123",
     )
 
-    assert proposal is not None
-    assert proposal["approvalKind"] == "sandbox_network"
-    assert proposal["host"] == "example.com"
-    assert proposal["sessionKey"] == "agent:main:webchat:abc"
-    assert proposal["workspace"] == "/tmp/ws"
-    assert [choice["id"] for choice in proposal["choices"]] == [
-        "allow_once",
-        "allow_same_type",
-        "deny",
-    ]
-    assert [choice["label"] for choice in proposal["choices"]] == [
-        "Allow once",
-        "Allow same type",
-        "Deny",
-    ]
+    assert proposal is None
 
 
 def test_blocked_network_decision_has_no_escalation_choices() -> None:
@@ -343,18 +329,15 @@ def test_full_host_access_bypasses_sandbox_domain_controls() -> None:
     )
 
 
-def test_trusted_sandbox_auto_trusts_low_risk_recognized_hosts_for_this_chat() -> None:
-    context = _context(run_mode=RunMode.TRUSTED)
+def test_safe_sandbox_keeps_sources_for_recognized_hosts() -> None:
+    context = _context(run_mode=RunMode.SAFE)
 
     for host in ("api.github.com", "registry.npmjs.org"):
         decision = decide_network_access(host, context)
 
-        assert decision == NetworkDecision(
-            status="allow",
-            normalized_host=host,
-            reason="auto_trusted",
-            source="auto_trusted:chat",
-        )
+        assert decision.status == "allow"
+        assert decision.normalized_host == host
+        assert decision.reason in {"default_allowlist", "package_bundle"}
 
 
 @pytest.mark.asyncio
@@ -495,7 +478,7 @@ async def test_trusted_sandbox_auto_trust_does_not_persist_unsafe_hosts() -> Non
 
 
 def test_trusted_sandbox_does_not_auto_trust_unsafe_hosts() -> None:
-    context = _context(run_mode=RunMode.TRUSTED)
+    context = _context(run_mode=RunMode.SAFE)
 
     for host in (
         "127.0.0.1",
@@ -517,7 +500,7 @@ def test_decide_network_access_blocks_unsafe_ip_literal() -> None:
     assert decision == NetworkDecision(
         status="block",
         normalized_host="169.254.169.254",
-        reason="ip_literal",
+        reason="metadata_blocked",
         source="validation",
     )
 
@@ -557,7 +540,7 @@ def test_decide_network_access_allows_default_bundle_domain_without_explicit_gra
     )
 
 
-def test_decide_network_access_honors_disabled_default_bundle_override() -> None:
+def test_disabled_default_bundle_falls_back_to_public_default() -> None:
     context = _context(
         bundles=(
             PackageBundleGrant(
@@ -570,10 +553,10 @@ def test_decide_network_access_honors_disabled_default_bundle_override() -> None
     decision = decide_network_access("registry.npmjs.org", context)
 
     assert decision == NetworkDecision(
-        status="ask",
+        status="allow",
         normalized_host="registry.npmjs.org",
-        reason="unknown_domain",
-        source=None,
+        reason="public_default",
+        source="policy:default_open",
     )
 
 
@@ -652,7 +635,7 @@ def test_default_github_bundle_allows_workflow_host() -> None:
     )
 
 
-def test_disabled_default_github_bundle_blocks_workflow_host() -> None:
+def test_disabled_default_github_bundle_falls_back_to_public_default() -> None:
     context = _context(
         bundles=(PackageBundleGrant(bundle_id="github-default", source="disabled"),),
     )
@@ -660,8 +643,8 @@ def test_disabled_default_github_bundle_blocks_workflow_host() -> None:
     decision = decide_network_access("actions.githubusercontent.com", context)
 
     assert decision == NetworkDecision(
-        status="ask",
+        status="allow",
         normalized_host="actions.githubusercontent.com",
-        reason="unknown_domain",
-        source=None,
+        reason="public_default",
+        source="policy:default_open",
     )

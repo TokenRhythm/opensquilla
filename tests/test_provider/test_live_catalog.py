@@ -8,9 +8,11 @@ payloads are synthetic mirrors of the platform shape.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from opensquilla.provider.live_catalog import (
@@ -19,7 +21,7 @@ from opensquilla.provider.live_catalog import (
     parse_tokenrhythm_models,
     warm_live_provider_catalogs,
 )
-from opensquilla.provider.model_catalog import ModelCatalog
+from opensquilla.provider.model_catalog import DEFAULT_MAX_TOKENS, ModelCatalog
 
 
 def _tokenrhythm_row(**overrides: Any) -> dict[str, Any]:
@@ -220,10 +222,10 @@ def test_parse_tokenrhythm_qwen_max_output_is_exact_128_kib_tokens() -> None:
     assert catalog.resolve_max_tokens("qwen3.7-max", provider="tokenrhythm") == 131_072
 
 
-def test_parse_tokenrhythm_models_halves_near_window_output_caps() -> None:
-    # A published output cap at/near the whole window (input and output
-    # share it) would trip resolve_max_tokens' request-safety clamp down to
-    # 8192; the parser halves it to the engine's output-reserve ceiling.
+def test_parse_tokenrhythm_models_preserves_near_window_output_caps_raw() -> None:
+    # Published metadata remains byte-for-byte meaningful for discovery.
+    # The provider-scoped runtime resolver, not the parser, derives the
+    # engine's half-window execution ceiling.
     entries = parse_tokenrhythm_models(
         {
             "code": 0,
@@ -236,13 +238,12 @@ def test_parse_tokenrhythm_models_halves_near_window_output_caps() -> None:
         }
     )
 
-    assert entries["minimax-m2.5"]["max_output_tokens"] == 100_000
-    assert entries["minimax-m2.7"]["max_output_tokens"] == 100_000
+    assert entries["minimax-m2.5"]["max_output_tokens"] == 200_000
+    assert entries["minimax-m2.7"]["max_output_tokens"] == 192_000
 
     catalog = ModelCatalog()
     catalog.set_live_provider_entries("tokenrhythm", entries)
-    # The resolved value survives resolve_max_tokens un-clamped — the whole
-    # point of halving at ingest time.
+    # Runtime keeps real input room without falsifying the website field.
     assert catalog.resolve_max_tokens("minimax-m2.5", provider="tokenrhythm") == 100_000
 
 
@@ -258,6 +259,22 @@ def test_refreshed_corrections_rows_do_not_trip_the_near_window_clamp() -> None:
         ("mimo-v2.5-pro", 128_000),
     ):
         assert catalog.resolve_max_tokens(model, provider="tokenrhythm") == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [("minimax-m2.7", 131_072), ("mimo-v2.5-pro", DEFAULT_MAX_TOKENS)],
+)
+def test_tokenrhythm_raw_policy_inputs_never_leak_to_generic_budget_fallback(
+    model: str,
+    expected: int,
+) -> None:
+    catalog = ModelCatalog()
+
+    # Those exact ids have no provider-agnostic runtime budget. In particular,
+    # the TokenRhythm website's raw 192K/256K values must not flow through and
+    # trigger another provider's legacy near-window 8K reduction.
+    assert catalog.resolve_max_tokens(model, provider="unrelated-cloud") == expected
 
 
 def test_tokenrhythm_offline_corrections_use_effective_prices() -> None:
@@ -372,7 +389,13 @@ async def test_fetch_live_catalog_entries_uses_url_verbatim_without_auth() -> No
     mock_response.raise_for_status = MagicMock()
     mock_response.json.return_value = {"code": 0, "data": [_tokenrhythm_row()]}
 
-    with patch("opensquilla.provider.live_catalog.httpx.AsyncClient") as mock_client_cls:
+    with (
+        patch("opensquilla.provider.live_catalog.httpx.AsyncClient") as mock_client_cls,
+        patch(
+            "opensquilla.provider.live_catalog.tokenrhythm_install_id_headers",
+            return_value={"X-OpenSquilla-Install-Id": "synthetic-install-id"},
+        ),
+    ):
         mock_client = AsyncMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
@@ -395,9 +418,145 @@ async def test_fetch_live_catalog_entries_uses_url_verbatim_without_auth() -> No
     assert headers == {
         "HTTP-Referer": "https://opensquilla.ai",
         "X-Title": "OpenSquilla",
+        "X-OpenSquilla-Install-Id": "synthetic-install-id",
     }
     assert "Authorization" not in headers
+    mock_response.json.assert_called_once_with(parse_float=Decimal)
     assert entries["deepseek-v4-pro"]["context_window"] == 900_000
+
+
+async def test_fetch_live_catalog_omits_install_id_with_explicit_proxy() -> None:
+    captured: dict[str, Any] = {}
+    helper_proxies: list[str | None] = []
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = {"code": 0, "data": []}
+
+    def install_headers(
+        _provider_kind: str,
+        _base_url: str,
+        *,
+        proxy: str | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, str]:
+        helper_proxies.append(proxy)
+        return {} if proxy else {"X-OpenSquilla-Install-Id": "must-not-send"}
+
+    with (
+        patch("opensquilla.provider.live_catalog.httpx.AsyncClient") as mock_client_cls,
+        patch(
+            "opensquilla.provider.live_catalog.tokenrhythm_install_id_headers",
+            side_effect=install_headers,
+        ),
+    ):
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def capture_get(url: str, **kwargs: Any) -> Any:
+            captured["url"] = url
+            captured["headers"] = kwargs["headers"]
+            return mock_response
+
+        mock_client.get = AsyncMock(side_effect=capture_get)
+        mock_client_cls.return_value = mock_client
+
+        await fetch_live_catalog_entries(
+            "https://tokenrhythm.studio/api/models",
+            "tokenrhythm",
+            proxy="http://company-proxy.example:8080",
+        )
+
+    assert helper_proxies == ["http://company-proxy.example:8080"]
+    assert "X-OpenSquilla-Install-Id" not in captured["headers"]
+    assert mock_client_cls.call_args.kwargs["proxy"] == "http://company-proxy.example:8080"
+
+
+async def test_fetch_live_catalog_redacts_install_id_from_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_id = "i7"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            502,
+            request=request,
+            headers={f"X-Echo-{install_id}": install_id},
+            text=f"upstream echoed {install_id}",
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+    monkeypatch.setattr(
+        "opensquilla.provider.live_catalog.tokenrhythm_install_id_headers",
+        lambda *_args, **_kwargs: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        await fetch_live_catalog_entries(
+            "https://tokenrhythm.studio/api/models",
+            "tokenrhythm",
+        )
+
+    assert raised.value.__context__ is None
+    assert raised.value.request.headers["X-OpenSquilla-Install-Id"] == "[PRESENT]"
+    retained = " ".join(
+        (
+            repr(raised.value.request.headers),
+            repr(raised.value.response.headers),
+            raised.value.response.text,
+        )
+    )
+    assert install_id not in retained
+
+
+async def test_fetch_live_catalog_invalid_json_drops_retained_install_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_id = "i7"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            text=f'{{"echo":"{install_id}"',
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+    monkeypatch.setattr(
+        "opensquilla.provider.live_catalog.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await fetch_live_catalog_entries(
+            "https://tokenrhythm.studio/api/models",
+            "tokenrhythm",
+        )
+
+    assert str(raised.value) == "Live provider catalog returned invalid JSON"
+    assert raised.value.__context__ is None
+    assert not hasattr(raised.value, "doc")
+    assert install_id not in repr(raised.value.__dict__)
 
 
 async def test_fetch_live_catalog_entries_rejects_unknown_shape() -> None:
@@ -446,15 +605,28 @@ async def test_warm_ingests_only_providers_with_live_catalog_metadata(
 async def test_warm_degrades_per_provider_on_fetch_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    install_id = "i7"
+
     async def failing_fetch(*args: Any, **kwargs: Any) -> dict:
-        raise OSError("network unreachable")
+        raise OSError(f"network unreachable {install_id}")
 
     monkeypatch.setattr(
         "opensquilla.provider.live_catalog.fetch_live_catalog_entries", failing_fetch
     )
+    monkeypatch.setattr(
+        "opensquilla.provider.live_catalog.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+    captured_log = MagicMock()
+    monkeypatch.setattr("opensquilla.provider.live_catalog.log", captured_log)
     catalog = _RecordingCatalog()
 
     counts = await warm_live_provider_catalogs(catalog, ["tokenrhythm"])
 
     assert counts == {}
     assert catalog.calls == []
+    captured_log.warning.assert_called_once_with(
+        "live_catalog.failed",
+        provider="tokenrhythm",
+        error="network unreachable ***",
+    )

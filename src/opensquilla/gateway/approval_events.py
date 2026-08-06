@@ -16,6 +16,7 @@ from typing import Any, cast
 
 from opensquilla.gateway.scopes import APPROVALS_SCOPE
 from opensquilla.safety.secret_redaction import redact_secret_value
+from opensquilla.sandbox.elevation import ApprovalDisplay
 
 _EVENT_SUFFIXES = frozenset({"requested", "updated", "resolved"})
 _REDACTED = "[REDACTED]"
@@ -160,6 +161,31 @@ def approval_display_fields(params: Mapping[str, Any] | None) -> dict[str, Any]:
     source: Mapping[str, Any] = params if isinstance(params, Mapping) else {}
     approval_kind = _non_empty_text(source.get("approvalKind") or source.get("approval_kind"))
 
+    display = ApprovalDisplay(kind="sensitive_operation")
+    if approval_kind == "sandbox_elevation":
+        raw_action = source.get("action")
+        raw_display = raw_action.get("display") if isinstance(raw_action, Mapping) else None
+        if isinstance(raw_display, Mapping):
+            try:
+                display = ApprovalDisplay.from_canonical_payload(raw_display)
+            except ValueError:
+                pass
+    elif approval_kind == "sandbox_path":
+        display = ApprovalDisplay(
+            kind="path_access",
+            target=_non_empty_text(source.get("path")),
+        )
+    elif approval_kind == "sandbox_network":
+        display = ApprovalDisplay(
+            kind="network_access",
+            target=_non_empty_text(source.get("host")),
+        )
+    elif "permissions" in source:
+        display = ApprovalDisplay(
+            kind="plugin_permission",
+            target=_non_empty_text(source.get("pluginId")),
+        )
+
     args: dict[str, Any] | None
     if approval_kind == "sandbox_path":
         args = _selected_scalar_fields(source, ("path", "access", "workspace")) or None
@@ -190,12 +216,12 @@ def approval_display_fields(params: Mapping[str, Any] | None) -> dict[str, Any]:
         # complete header rather than three individually harmless strings.
         command = _non_empty_text(" ".join(str(part) for part in argv))
 
-    tool_name = _non_empty_text(
-        source.get("toolName")
-        or source.get("pluginId")
-        or source.get("action_kind")
-        or approval_kind
-    )
+    if display.kind == "sensitive_operation" and command:
+        display = ApprovalDisplay(kind="run_command", target=command)
+
+    tool_name = ""
+    if not approval_kind.startswith("sandbox_"):
+        tool_name = _non_empty_text(source.get("toolName") or source.get("pluginId"))
     return {
         "tool_name": tool_name,
         "session_key": _non_empty_text(
@@ -206,8 +232,17 @@ def approval_display_fields(params: Mapping[str, Any] | None) -> dict[str, Any]:
         "command": command,
         "warning": _non_empty_text(source.get("warning") or source.get("reason")),
         "approval_kind": approval_kind,
-        "action_kind": _non_empty_text(source.get("action_kind")),
+        "action_kind": (
+            ""
+            if approval_kind.startswith("sandbox_")
+            else _non_empty_text(source.get("action_kind"))
+        ),
         "mode": _non_empty_text(source.get("mode")),
+        "display_kind": display.kind,
+        "display_target": _non_empty_text(display.target),
+        "destructive": display.destructive,
+        "irreversible": display.irreversible,
+        "backup_state": display.backup_state,
     }
 
 
@@ -225,7 +260,7 @@ def build_approval_snapshot_item(
         "namespace": str(info.get("namespace") or "exec"),
         "created_at": info.get("created_at"),
         "deadline": info.get("deadline"),
-        "toolName": display["tool_name"] or "Unknown",
+        "toolName": display["tool_name"],
         "sessionKey": display["session_key"],
         "agent": display["agent"],
         "args": display["args"],
@@ -234,6 +269,11 @@ def build_approval_snapshot_item(
         "approvalKind": display["approval_kind"],
         "actionKind": display["action_kind"],
         "mode": display["mode"] or default_mode,
+        "displayKind": display["display_kind"],
+        "displayTarget": display["display_target"],
+        "destructive": display["destructive"],
+        "irreversible": display["irreversible"],
+        "backupState": display["backup_state"],
     }
 
 
@@ -270,6 +310,11 @@ def build_approval_event_payload(info: dict[str, Any]) -> dict[str, Any]:
         # push from the lean pre-contract shape that requires HTTP hydration.
         "args": display["args"],
         "warning": display["warning"],
+        "display_kind": display["display_kind"],
+        "display_target": display["display_target"],
+        "destructive": display["destructive"],
+        "irreversible": display["irreversible"],
+        "backup_state": display["backup_state"],
         "created_at": info.get("created_at"),
         "deadline": info.get("deadline"),
     }

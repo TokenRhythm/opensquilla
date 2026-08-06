@@ -394,7 +394,7 @@ def test_untyped_or_tampered_journal_has_no_automatic_recovery_action(
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "transaction_incomplete"
     assert "recover-transaction" not in report.allowed_actions
 
@@ -449,7 +449,7 @@ def test_almost_typed_import_journal_is_read_only_and_not_recoverable(
 
     report = inspect_profile(home, profile_kind="desktop-primary")
 
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "transaction_incomplete"
     assert "recover-transaction" not in report.allowed_actions
     assert journal.read_bytes() == journal_before

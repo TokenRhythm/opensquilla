@@ -153,6 +153,8 @@ def test_meta_orchestrator_wiring_uses_raw_handler_and_one_explicit_correlation(
         workspace_dir=None,
         triggered_by="test",
         skill_loader=object(),
+        parent_spec=None,
+        plan=None,
     )
 
     assert captured["runner"]["tool_handler"] is _raw_tool_handler

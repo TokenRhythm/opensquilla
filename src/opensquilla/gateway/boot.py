@@ -117,6 +117,22 @@ def _start_background_install_telemetry(config: GatewayConfig) -> None:
         log.debug("gateway.install_telemetry_skipped", exc_info=True)
 
 
+def _prewarm_tokenrhythm_install_id(config: GatewayConfig) -> None:
+    """Prime the optional TokenRhythm install header without delaying boot."""
+
+    try:
+        from opensquilla.provider.tokenrhythm_correlation import (
+            prewarm_tokenrhythm_install_id,
+        )
+
+        prewarm_tokenrhythm_install_id(config=config)
+    except Exception:
+        # Install identity is best-effort request metadata.  A resolver or
+        # thread-start failure must never make the gateway/standalone runtime
+        # unavailable.
+        log.debug("gateway.tokenrhythm_install_id_prewarm_skipped", exc_info=True)
+
+
 def _auto_propose_usage_execution_context(
     agent_id: str,
     usage_event_sink: Any | None,
@@ -642,6 +658,7 @@ class ServiceContainer:
     )
     cron_scheduler: SchedulerEngine | None = None
     model_catalog: ModelCatalog | None = None
+    model_catalog_refresh_coordinator: Any = None
     agent_registry: Any = None
     memory_managers: dict[str, MemoryManager] = field(default_factory=dict)
     # Legacy per-tier dicts. These are derived views over
@@ -663,8 +680,10 @@ class ServiceContainer:
     task_runtime: Any = None
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
+    prompt_cache_keepalive_service: Any = None
     daily_usage_telemetry_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     deferred_warmups: list[Callable[[], Any]] = field(default_factory=list)
+    deferred_warmup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     _compaction_listener_remove: Callable[[], None] | None = None
     _approval_listener_remove: Callable[[], None] | None = None
     _approval_channel_notifier_remove: Callable[[], None] | None = None
@@ -682,6 +701,37 @@ class ServiceContainer:
         an in-flight cron job or heartbeat tick can drive TurnRunner ->
         TurnCaptureService.capture_turn against an already-closed store.
         """
+        # Desktop warmups may enter the catalog refresh boundary after first
+        # paint. Stop that producer before closing the coordinator so a task
+        # which has not started yet cannot recreate a fresh global coordinator
+        # during shutdown.
+        deferred_warmup_task = self.deferred_warmup_task
+        self.deferred_warmup_task = None
+        if deferred_warmup_task is not None:
+            deferred_warmup_task.cancel()
+            try:
+                await deferred_warmup_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.debug("gateway.deferred_warmup_close_failed", exc_info=True)
+
+        model_catalog_refresh_coordinator = self.model_catalog_refresh_coordinator
+        self.model_catalog_refresh_coordinator = None
+        if model_catalog_refresh_coordinator is not None:
+            try:
+                await model_catalog_refresh_coordinator.close()
+            except Exception:
+                log.debug("gateway.model_catalog_refresh_close_failed", exc_info=True)
+            try:
+                from opensquilla.gateway.model_catalog_refresh import (
+                    install_tokenrhythm_catalog_coordinator,
+                )
+
+                install_tokenrhythm_catalog_coordinator(None)
+            except Exception:
+                pass
+
         profile_import_maintenance_task = self.profile_import_maintenance_task
         self.profile_import_maintenance_task = None
         if profile_import_maintenance_task is not None:
@@ -758,6 +808,12 @@ class ServiceContainer:
                 pass
             except Exception:
                 log.debug("gateway.usage_telemetry_close_failed", exc_info=True)
+        if self.prompt_cache_keepalive_service is not None:
+            try:
+                await self.prompt_cache_keepalive_service.close()
+            except Exception:
+                pass
+            self.prompt_cache_keepalive_service = None
         if self.heartbeat_watcher is not None:
             try:
                 await self.heartbeat_watcher.stop()
@@ -1081,29 +1137,52 @@ def _desktop_ownership_profile_home(config: GatewayConfig) -> Path:
 
 
 async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
-    """Run automatic sandbox setup when enabled."""
+    """Inspect sandbox readiness without elevating during gateway startup."""
 
     if not config.sandbox.auto_setup:
         log.info("boot.sandbox_setup_auto_disabled")
         return None
 
-    from opensquilla.sandbox.setup_runtime import ensure_sandbox_setup_auto
+    from opensquilla.sandbox.setup_runtime import (
+        current_sandbox_capability_report,
+        current_sandbox_setup_runtime_status,
+    )
 
-    result = await ensure_sandbox_setup_auto(config)
+    result = await current_sandbox_setup_runtime_status(config)
     log.info(
-        "boot.sandbox_setup_auto_completed",
+        "boot.sandbox_setup_status_completed",
         state=result.state.value,
         platform=result.platform,
         requires_admin=result.requires_admin,
         detail=result.detail,
     )
+    if result.state.value == "ready":
+        try:
+            capability = await current_sandbox_capability_report(config)
+            log.info(
+                "boot.sandbox_capability_prewarm_completed",
+                available=getattr(capability, "available", False),
+                backend=getattr(capability, "backend", ""),
+                code=getattr(capability, "code", ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - startup prewarm is best-effort.
+            log.warning(
+                "boot.sandbox_capability_prewarm_failed",
+                error=str(exc),
+            )
+    else:
+        log.info(
+            "boot.sandbox_setup_deferred",
+            state=result.state.value,
+            platform=result.platform,
+        )
     return result
 
 
 def _sandbox_settings_for_runtime(config: GatewayConfig) -> Any:
     """Return sandbox settings normalized to the config-level run mode."""
 
-    from opensquilla.sandbox.run_mode import (
+    from opensquilla.run_mode import (
         RunMode,
         config_run_mode,
         run_mode_config_patch,
@@ -1111,7 +1190,7 @@ def _sandbox_settings_for_runtime(config: GatewayConfig) -> Any:
     )
 
     configured = config_run_mode(config)
-    if configured in {RunMode.STANDARD, RunMode.TRUSTED}:
+    if configured in {RunMode.SAFE, RunMode.SAFE}:
         return config.sandbox
 
     patch = run_mode_config_patch(sandbox_runtime_capability_mode(config))
@@ -1151,6 +1230,23 @@ def _task_runtime_envelope_owner(envelope: Any) -> bool:
     if isinstance(principal_is_owner, bool):
         return principal_is_owner
     return getattr(envelope, "source_kind", None) == SourceKind.CLI
+
+
+def _task_runtime_envelope_host_execute(envelope: Any) -> bool:
+    """Resolve host-execution authority without widening owner privileges."""
+    from opensquilla.gateway.routing import (
+        PRINCIPAL_HOST_EXECUTE_METADATA_KEY,
+        SourceKind,
+    )
+
+    if getattr(envelope, "source_kind", None) == SourceKind.CHANNEL:
+        return _task_runtime_envelope_owner(envelope)
+    principal_host_execute = getattr(envelope, "metadata", {}).get(
+        PRINCIPAL_HOST_EXECUTE_METADATA_KEY
+    )
+    if isinstance(principal_host_execute, bool):
+        return principal_host_execute
+    return _task_runtime_envelope_owner(envelope)
 
 
 async def dispatch_task_runtime_turn(
@@ -1230,10 +1326,14 @@ async def dispatch_task_runtime_turn(
     tool_context = tool_context_from_envelope(
         run.envelope,
         is_owner=is_owner,
+        host_execute_allowed=_task_runtime_envelope_host_execute(run.envelope),
         workspace_dir=(str(workspace_dir) if workspace_dir is not None else None),
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),
     )
+    from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+    pin_sandbox_policy(tool_context, config)
     tool_context.task_id = run.task_id
     if (
         session is None
@@ -2405,6 +2505,7 @@ async def build_services(
         config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
         if config.config_path:
             log.info("build_services.config_loaded", path=config.config_path)
+    _prewarm_tokenrhythm_install_id(config)
     deferred_warmups: list[Callable[[], Any]] = []
     sandbox_setup_task: asyncio.Task[Any] | None = None
     _warn_workspace_state_mismatch(config)
@@ -2435,13 +2536,29 @@ async def build_services(
 
     configure_trusted_fake_ip_cidrs(config.tools.trusted_fake_ip_cidrs)
 
+    # Canonicalize released sandbox state before opening any persistent store.
+    # A failed prepared journal is intentionally left for explicit recovery;
+    # startup never guesses or rolls the profile back automatically.
+    config_path = Path(str(getattr(config, "config_path", "") or ""))
+    if config_path.is_file():
+        from opensquilla.sandbox.upgrade_migration import (
+            ensure_sandbox_upgrade_migrated,
+        )
+
+        upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+        if not upgrade_report.ok:
+            raise RuntimeError(
+                "migration_failed_manual_recovery_required: "
+                f"{upgrade_report.error or upgrade_report.status}"
+            )
+
     # ── Sandbox runtime ─────────────────────────────────────────────
     # validate_combination emits structured warnings; configure_runtime
     # assembles the backend + gate + ledger so tool handlers can call
     # through the ``@sandboxed`` decorator.
     try:
+        from opensquilla.run_mode import config_run_mode
         from opensquilla.sandbox.integration import configure_runtime
-        from opensquilla.sandbox.run_mode import config_run_mode
 
         sandbox_settings = _sandbox_settings_for_runtime(config)
         effective = configure_runtime(
@@ -2623,6 +2740,18 @@ async def build_services(
     # instance exists, so resolve_model_price/get_capabilities honor them
     # from the first turn onward.
     apply_model_catalog_overrides(model_catalog, config)
+
+    from opensquilla.gateway.model_catalog_refresh import (
+        TokenRhythmCatalogCoordinator,
+        install_tokenrhythm_catalog_coordinator,
+    )
+
+    model_catalog_refresh_coordinator = TokenRhythmCatalogCoordinator(model_catalog)
+    install_tokenrhythm_catalog_coordinator(model_catalog_refresh_coordinator)
+    # Hydration is disk-only. It exposes a matching last-good entitlement
+    # before warmup while preserving the keyless/custom-endpoint zero-network
+    # boot contract.
+    await model_catalog_refresh_coordinator.hydrate(config)
 
     async def _warm_model_catalog_and_pricing() -> None:
         # Registry-driven live listing first. The shared refresh boundary
@@ -2838,12 +2967,11 @@ async def build_services(
                 ),
             },
         )
-        await cron_scheduler.start()
         # Inject into admin tool so `cron` tool can dispatch to the scheduler
         from opensquilla.tools.builtin.admin import set_scheduler
 
         set_scheduler(cron_scheduler)
-        log.info("build_services.cron_scheduler_started")
+        log.info("build_services.cron_scheduler_initialized")
     except Exception as e:
         log.warning("build_services.cron_scheduler_failed", error=str(e))
 
@@ -3144,6 +3272,7 @@ async def build_services(
         usage_event_sink=usage_event_sink,
         cron_scheduler=cron_scheduler,
         model_catalog=model_catalog,
+        model_catalog_refresh_coordinator=model_catalog_refresh_coordinator,
         agent_registry=agent_registry,
         memory_managers=memory_managers,
         memory_stores=memory_stores,
@@ -3545,17 +3674,34 @@ async def start_gateway_server(
 
     from opensquilla.engine.cache_break_monitor import add_compaction_listener
 
+    prompt_cache_keepalive_service: Any = None
+
     def _emit_runtime_compaction_event(
         session_key: str,
         payload: dict[str, Any],
     ) -> None:
+        from opensquilla.gateway.session_streams import get_session_streams
+
         event_payload = dict(payload or {})
         event_payload.setdefault("status", "completed")
         event_payload.setdefault("source", "automatic")
+        if (
+            event_payload.get("status") == "completed"
+            and prompt_cache_keepalive_service is not None
+        ):
+            prompt_cache_keepalive_service.refresh_required(session_key)
+        # Lifecycle claiming and replay append now happen in one synchronous
+        # call stack. Network delivery remains asynchronous and at-least-once.
+        event_payload = get_session_streams().record(
+            session_key,
+            "session.event.compaction",
+            event_payload,
+        )
         emit_coro = runtime_event_bridge.emit(
             session_key,
             "session.event.compaction",
             event_payload,
+            replay_recorded=True,
         )
         try:
             create_background_task(emit_coro)
@@ -3631,6 +3777,26 @@ async def start_gateway_server(
     # Wire task_runtime's short write-lock provider into turn_runner.
     turn_runner.set_session_lock_provider(task_runtime._get_session_lock_for_turn)
     svc.task_runtime = task_runtime
+    from opensquilla.gateway.prompt_cache_keepalive import PromptCacheKeepaliveService
+
+    prompt_cache_keepalive_service = PromptCacheKeepaliveService(
+        task_runtime=task_runtime,
+        session_manager=svc.session_manager,
+        usage_event_sink=usage_event_sink,
+    )
+    set_keepalive_recorder = getattr(
+        turn_runner,
+        "set_prompt_cache_keepalive_recorder",
+        None,
+    )
+    if callable(set_keepalive_recorder):
+        set_keepalive_recorder(
+            prompt_cache_keepalive_service.record_candidate,
+            armed=prompt_cache_keepalive_service.is_enabled,
+        )
+    else:
+        log.warning("gateway.prompt_cache_keepalive_recorder_unavailable")
+    svc.prompt_cache_keepalive_service = prompt_cache_keepalive_service
     # Wire the runtime into SessionManager so kill_session can cascade-cancel.
     attach_runtime = getattr(svc.session_manager, "attach_task_runtime", None)
     if callable(attach_runtime):
@@ -3638,6 +3804,12 @@ async def start_gateway_server(
     from opensquilla.tools.builtin.sessions import set_task_runtime
 
     set_task_runtime(task_runtime)
+    recovered_meta_controls = await task_runtime.recover_durable_meta_controls()
+    if recovered_meta_controls:
+        log.info(
+            "task_runtime.meta_controls_recovered",
+            count=recovered_meta_controls,
+        )
     recover_stranded_steers = getattr(task_runtime, "recover_stranded_steers", None)
     if callable(recover_stranded_steers):
         steer_recovery = await recover_stranded_steers()
@@ -3805,9 +3977,19 @@ async def start_gateway_server(
         # FailureDestination at runtime. Without this wire the dispatch
         # plumbing is dead in production even though unit tests cover the
         # hook directly.
-        from opensquilla.scheduler.jobs import set_failure_dispatcher
+        from opensquilla.scheduler.jobs import set_failure_dispatcher, set_terminal_notifier
 
         set_failure_dispatcher(delivery_chain.dispatch_failure_alert)
+        set_terminal_notifier(
+            lambda job, execution: delivery_chain.notify_finished(
+                job,
+                success=execution.success,
+                summary=execution.summary,
+                session_key=execution.session_key,
+                run_id=execution.id,
+                error=execution.error,
+            )
+        )
 
         def _cron_workspace_resolver(agent_id: str) -> tuple[str | None, bool]:
             workspace_dir = resolve_agent_workspace_dir(agent_id, config)
@@ -4141,6 +4323,11 @@ async def start_gateway_server(
         else:
             await _pause_auto_propose_runtime_crons()
 
+        # Startup catch-up can execute overdue jobs immediately. Start only
+        # after delivery, terminal notifications, and every handler are ready.
+        await svc.cron_scheduler.start()
+        log.info("build_services.cron_scheduler_started")
+
     # Build channel adapters (don't start yet -- app doesn't exist)
     webhook_routes: list = []
     if channel_manager is None and config.channels.channels:
@@ -4244,6 +4431,7 @@ async def start_gateway_server(
         flush_service=svc.flush_service,
         heartbeat_service=heartbeat_service,
         heartbeat_loop=heartbeat_loop,
+        prompt_cache_keepalive_service=prompt_cache_keepalive_service,
         agent_registry=svc.agent_registry,
         diagnostics_state=diagnostics_state,
         provider_stats=getattr(svc, "provider_stats", None),
@@ -4436,7 +4624,7 @@ async def start_gateway_server(
             )
         log.info("gateway.started", host=config.host, port=config.port)
         if _desktop_fast_start_enabled():
-            create_background_task(_run_deferred_warmups(svc))
+            svc.deferred_warmup_task = create_background_task(_run_deferred_warmups(svc))
 
     # Start channels (after app is ready to receive webhooks)
     if channel_manager is not None:

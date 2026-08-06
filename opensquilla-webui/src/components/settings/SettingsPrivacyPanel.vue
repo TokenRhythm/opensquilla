@@ -7,6 +7,8 @@ const { t } = useI18n()
 interface PrivacyPanelContract {
   disableNetworkObservability: boolean
   disableNetworkObservabilityDirty: boolean
+  memoryAutoCapture: boolean
+  memoryAutoCaptureDirty: boolean
   statusText: string
 }
 
@@ -16,6 +18,7 @@ defineProps<{
 
 const emit = defineEmits<{
   updateDisableNetworkObservability: [enabled: boolean]
+  updateMemoryAutoCapture: [enabled: boolean]
 }>()
 </script>
 
@@ -25,6 +28,21 @@ const emit = defineEmits<{
       <h3 class="control-section__title">{{ t('setup.privacy.title') }}</h3>
       <p class="control-section__desc">{{ panel.statusText }}</p>
     </div>
+
+    <label class="control-row">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('setup.privacy.memoryAutoCaptureLabel') }}</span>
+        <span class="control-row__desc">{{ t('setup.privacy.memoryAutoCaptureDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <ControlSwitch
+          :checked="panel.memoryAutoCapture"
+          name="setup_memory_auto_capture"
+          :aria-label="t('setup.privacy.memoryAutoCaptureLabel')"
+          @change="(value) => emit('updateMemoryAutoCapture', value)"
+        />
+      </div>
+    </label>
 
     <label class="control-row">
       <div class="control-row__label-block">

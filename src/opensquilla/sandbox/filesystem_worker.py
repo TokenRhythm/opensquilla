@@ -6,7 +6,9 @@ import errno
 import fnmatch
 import hashlib
 import json
+import os
 import re
+import secrets
 import stat
 import sys
 from collections.abc import Sequence
@@ -30,25 +32,38 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError("filesystem worker expects one payload source")
         payload = _load_payload(args[0])
         result = _run(payload)
-        print(json.dumps(result, ensure_ascii=False))
+        _write_json(sys.stdout, result)
     except Exception as exc:
-        print(
-            json.dumps(
-                {
-                    "error": str(exc),
-                    "type": type(exc).__name__,
-                },
-                ensure_ascii=False,
-            ),
-            file=sys.stderr,
+        _write_json(
+            sys.stderr,
+            {
+                "error": str(exc),
+                "type": type(exc).__name__,
+            },
         )
         raise SystemExit(1) from None
 
 
+def _write_json(stream: Any, payload: object) -> None:
+    encoded = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    binary_stream = getattr(stream, "buffer", None)
+    if binary_stream is not None:
+        binary_stream.write(encoded)
+        binary_stream.flush()
+        return
+    stream.write(encoded.decode("utf-8"))
+    stream.flush()
+
+
 def _load_payload(source: str | Path) -> dict[str, Any]:
-    raw_payload = (
-        sys.stdin.read() if str(source) == "-" else Path(source).read_text(encoding="utf-8")
-    )
+    if str(source) == "-":
+        binary_stream = getattr(sys.stdin, "buffer", None)
+        if binary_stream is not None:
+            raw_payload = binary_stream.read().decode("utf-8")
+        else:
+            raw_payload = sys.stdin.read()
+    else:
+        raw_payload = Path(source).read_text(encoding="utf-8")
     try:
         payload = json.loads(raw_payload)
     except json.JSONDecodeError as exc:
@@ -533,7 +548,7 @@ def _write_text(payload: dict[str, Any]) -> dict[str, object]:
     content = _required_string(payload, "content")
     created = not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    _write_utf8_safely(path, content, create=created)
     return {
         "message": f"Written {len(content)} bytes to {path}",
         "created": created,
@@ -553,11 +568,49 @@ def _edit_text(payload: dict[str, Any]) -> dict[str, object]:
     count = original.count(old_text)
     if count > 1:
         raise ValueError(f"old_text matches {count} locations in {path}; be more specific")
-    path.write_text(original.replace(old_text, new_text, 1), encoding="utf-8")
+    _write_utf8_safely(path, original.replace(old_text, new_text, 1), create=False)
     return {
         "message": f"Edited {path}: replaced {len(old_text)} chars with {len(new_text)} chars",
         "created": False,
     }
+
+
+def _write_utf8_safely(path: Path, content: str, *, create: bool) -> None:
+    encoded = content.encode("utf-8")
+    original_mode = None if create else stat.S_IMODE(path.stat().st_mode)
+    descriptor = -1
+    temporary: Path | None = None
+    try:
+        for _attempt in range(100):
+            candidate = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                    0o666,
+                )
+                temporary = candidate
+                break
+            except FileExistsError:
+                continue
+        if temporary is None:
+            raise FileExistsError(f"could not allocate temporary file beside {path}")
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(encoded)
+            handle.flush()
+        if original_mode is not None:
+            os.chmod(temporary, original_mode)
+        os.replace(temporary, path)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def _authorized_source_target(payload: dict[str, Any]) -> Path:
@@ -591,16 +644,17 @@ def _source_fingerprint(data: bytes | None) -> dict[str, object]:
 def _create_source(payload: dict[str, Any]) -> dict[str, object]:
     path = _authorized_source_target(payload)
     content = _required_string(payload, "content")
+    encoded = content.encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as handle:
-        handle.write(content)
+    with path.open("xb") as handle:
+        handle.write(encoded)
     return {
         "message": f"Created source file {path}",
         "created": True,
         "status": "created",
-        "afterRevision": _source_revision(content.encode("utf-8")),
+        "afterRevision": _source_revision(encoded),
         "beforeFingerprint": _source_fingerprint(None),
-        "afterFingerprint": _source_fingerprint(content.encode("utf-8")),
+        "afterFingerprint": _source_fingerprint(encoded),
     }
 
 

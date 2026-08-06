@@ -24,6 +24,7 @@ function projectRow(overrides: Partial<SidebarSectionRow> = {}): SidebarSectionR
     depth: 0,
     runStatus: 'idle',
     runLabel: '',
+    taskAttention: 'none',
     updatedAt: 0,
     hasContractGaps: false,
     workspace: 'D:\\repos\\project-a',
@@ -48,6 +49,7 @@ function taskRow(overrides: Partial<SidebarSectionRow> = {}): SidebarSectionRow 
     depth: 1,
     runStatus: 'idle',
     runLabel: 'Idle',
+    taskAttention: 'none',
     updatedAt: 1,
     hasContractGaps: false,
     workspaceId: 'project-a',
@@ -71,6 +73,8 @@ function i18n() {
             refresh: 'Refresh',
             enterSelectionMode: 'Select tasks',
             rowActions: 'Actions for {title}',
+            pinTask: 'Pin task',
+            unpinTask: 'Unpin task',
             statusLabel: '{status}',
             rename: 'Rename',
             delete: 'Delete',
@@ -115,6 +119,8 @@ async function mountSidebar(
     projectEdit: vi.fn(),
     projectDeleteHistory: vi.fn(),
     projectRemove: vi.fn(),
+    reorder: vi.fn(),
+    sessionPin: vi.fn(),
   }
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -134,6 +140,8 @@ async function mountSidebar(
     onProjectEdit: events.projectEdit,
     onProjectDeleteHistory: events.projectDeleteHistory,
     onProjectRemove: events.projectRemove,
+    onReorder: events.reorder,
+    onSessionPin: events.sessionPin,
   }))
   const app = createApp(Root)
   app.use(i18n())
@@ -186,6 +194,94 @@ describe('SidebarConversations project workspaces', () => {
     const ordinary = host.querySelector('[data-session-key="agent:main:webchat:ordinary"]')
     expect(ordinary?.getAttribute('data-sidebar-zone')).toBe('recents')
     expect(ordinary?.getAttribute('data-zone-label')).toBe('Recents')
+  })
+
+  it('emits a reorder when one recent chat is dragged onto another', async () => {
+    const first = taskRow({
+      key: 'agent:main:webchat:first',
+      title: 'First',
+      depth: 0,
+      workspaceId: undefined,
+    })
+    const second = taskRow({
+      key: 'agent:main:webchat:second',
+      title: 'Second',
+      depth: 0,
+      workspaceId: undefined,
+    })
+    const { host, events } = await mountSidebar([first, second])
+    const source = host.querySelector<HTMLElement>(`[data-session-key="${first.key}"]`)
+    const target = host.querySelector<HTMLElement>(`[data-session-key="${second.key}"]`)
+
+    expect(source?.classList.contains('is-reorderable')).toBe(true)
+    vi.spyOn(document, 'elementFromPoint').mockReturnValue(target || null)
+    source?.dispatchEvent(new MouseEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientX: 10,
+      clientY: 10,
+    }))
+    document.dispatchEvent(new MouseEvent('pointermove', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 20,
+      clientY: 20,
+    }))
+    document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }))
+    await nextTick()
+
+    expect(events.reorder).toHaveBeenCalledWith({
+      draggedKey: first.key,
+      targetKey: second.key,
+      position: 'after',
+    })
+  })
+
+  it('pins and unpins a task from its row menu', async () => {
+    const row = taskRow({ depth: 0, workspaceId: undefined })
+    const { host, events } = await mountSidebar([row])
+    const actions = host.querySelector<HTMLButtonElement>(`[aria-label="Actions for ${row.title}"]`)
+    actions?.click()
+    await nextTick()
+    const pin = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+      .find(button => button.textContent?.trim() === 'Pin task')
+    pin?.click()
+    await nextTick()
+
+    expect(events.sessionPin).toHaveBeenCalledWith({ key: row.key, pinned: true })
+  })
+
+  it('does not reorder a project task into the recents group', async () => {
+    const projectTask = taskRow()
+    const recentTask = taskRow({
+      key: 'agent:main:webchat:recent',
+      title: 'Recent',
+      depth: 0,
+      workspaceId: undefined,
+    })
+    const { host, events } = await mountSidebar([projectRow(), projectTask, recentTask])
+    const source = host.querySelector<HTMLElement>(`[data-session-key="${projectTask.key}"]`)
+    const target = host.querySelector<HTMLElement>(`[data-session-key="${recentTask.key}"]`)
+
+    vi.spyOn(document, 'elementFromPoint').mockReturnValue(target || null)
+    source?.dispatchEvent(new MouseEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientX: 10,
+      clientY: 10,
+    }))
+    document.dispatchEvent(new MouseEvent('pointermove', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 20,
+      clientY: 20,
+    }))
+    document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }))
+    await nextTick()
+
+    expect(events.reorder).not.toHaveBeenCalled()
   })
 
   it('keeps an empty project compact and gives recents its own empty state', async () => {

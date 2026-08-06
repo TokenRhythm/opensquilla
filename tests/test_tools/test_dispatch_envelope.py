@@ -1271,7 +1271,7 @@ async def test_dispatch_channel_approval_payload_is_pending_status() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_unattended_subagent_preserves_automatic_rule_review() -> None:
+async def test_dispatch_legacy_trusted_alias_keeps_safe_approval_boundary() -> None:
     reset_approval_queue()
     handler = build_tool_handler(_build_registry())
     token = current_tool_context.set(
@@ -1297,8 +1297,8 @@ async def test_dispatch_unattended_subagent_preserves_automatic_rule_review() ->
         reset_approval_queue()
 
     payload = json.loads(result.content)
-    assert payload["status"] == "approval_required"
-    assert payload.get("error_class") != "UnsupportedSurface"
+    assert payload["status"] == "error"
+    assert payload["error_class"] == "UnsupportedSurface"
 
 
 @pytest.mark.asyncio

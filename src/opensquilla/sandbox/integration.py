@@ -30,6 +30,7 @@ host.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -46,6 +47,7 @@ from opensquilla.sandbox.backend import Backend, NoopBackend, UnavailableBackend
 from opensquilla.sandbox.capability_profile import capability_profile_for_command
 from opensquilla.sandbox.config import EffectiveMode, SandboxSettings
 from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
     ApprovalReviewerName,
     ElevationAction,
     ElevationGateResult,
@@ -82,8 +84,9 @@ from opensquilla.sandbox.path_validation import (
     normalize_mount_access,
     normalize_path,
 )
-from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
 from opensquilla.sandbox.policy import LevelHints, build_policy, select_level
+from opensquilla.sandbox.policy_models import SandboxPolicy as StoredSandboxPolicy
 from opensquilla.sandbox.run_context import DomainGrant, PackageBundleGrant, RunContext
 from opensquilla.sandbox.run_context_service import auto_add_trusted_domain_grant
 from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
@@ -110,8 +113,18 @@ _MANAGED_NETWORK_PROXY_URL: contextvars.ContextVar[str | None] = contextvars.Con
     "opensquilla_managed_network_proxy_url",
     default=None,
 )
+_ACTIVE_SANDBOX_POLICY: contextvars.ContextVar[StoredSandboxPolicy | None] = (
+    contextvars.ContextVar(
+        "opensquilla_active_sandbox_policy",
+        default=None,
+    )
+)
 _MANAGED_PROXY_ENV_NAMES_UPPER = managed_proxy_env_names_upper(
     include_windows_git=True,
+)
+GUEST_WINDOWS_PROCESS_UNAVAILABLE = (
+    "GUEST_WINDOWS_PROCESS_UNAVAILABLE: unauthenticated Windows guests cannot "
+    "launch processes; use managed-workspace file tools instead"
 )
 
 _IN_PROCESS_NETWORK_TAGS: frozenset[str] = frozenset(
@@ -125,6 +138,29 @@ _SEARCH_PROVIDER_SYSTEM_DOMAINS: dict[str, tuple[str, ...]] = {
     "iqs": ("cloud-iqs.aliyuncs.com",),
     "tavily": ("api.tavily.com",),
 }
+
+
+def active_sandbox_policy() -> StoredSandboxPolicy:
+    """Return the immutable policy snapshot for the current Safe run."""
+    policy = _ACTIVE_SANDBOX_POLICY.get()
+    if policy is None:
+        from opensquilla.tools.types import current_tool_context
+
+        context = current_tool_context.get()
+        candidate = getattr(context, "sandbox_policy", None) if context is not None else None
+        if isinstance(candidate, StoredSandboxPolicy):
+            policy = candidate
+    return policy.model_copy(deep=True) if policy is not None else StoredSandboxPolicy()
+
+
+@contextlib.contextmanager
+def sandbox_policy_scope(policy: StoredSandboxPolicy):
+    """Bind one policy version for an entire task/run boundary."""
+    token = _ACTIVE_SANDBOX_POLICY.set(policy.model_copy(deep=True))
+    try:
+        yield
+    finally:
+        _ACTIVE_SANDBOX_POLICY.reset(token)
 
 
 # ─── Approval queue / context protocols ──────────────────────────────────
@@ -217,7 +253,7 @@ def configure_runtime(
             backend = UnavailableBackend(str(exc))
             log.warning(
                 "sandbox.backend_unavailable: backend=auto reason=%s; "
-                "Managed Execution will request an exact reviewed host retry; "
+                "Safe mode will request an exact reviewed host retry; "
                 "Standard mode remains fail closed",
                 exc,
             )
@@ -319,9 +355,68 @@ def active_file_system_profile(
     if isinstance(override, FileSystemPermissionProfile):
         return override
 
+    stored_policy = (
+        getattr(tool_context, "sandbox_policy", None)
+        if tool_context is not None
+        else None
+    )
+    safe_profile: FileSystemPermissionProfile | None = None
+    if tool_context is not None and isinstance(stored_policy, StoredSandboxPolicy):
+        from opensquilla.sandbox.file_policy import (
+            authority_roots_for_state,
+            compile_safe_file_profile,
+            compile_web_guest_file_profile,
+        )
+
+        config = getattr(tool_context, "sandbox_gateway_config", None)
+        state_dir = str(getattr(config, "state_dir", "") or "").strip()
+        authority_roots = authority_roots_for_state(state_dir) if state_dir else ()
+        effective_workspace = (
+            workspace.expanduser().resolve(strict=False)
+            if workspace is not None
+            else (
+                Path(str(tool_context.workspace_dir)).expanduser().resolve(strict=False)
+                if getattr(tool_context, "workspace_dir", None)
+                else None
+            )
+        )
+        guest_safe = bool(getattr(tool_context, "guest_safe", False))
+        if guest_safe:
+            if effective_workspace is None:
+                raise ValueError(
+                    "GUEST_DEFAULT_WORKSPACE_UNSAFE: guest workspace is unavailable"
+                )
+            guest_mounts = _session_mounts_for_policy(effective_workspace)
+            return compile_web_guest_file_profile(
+                stored_policy,
+                workspace=effective_workspace,
+                writable_roots=tuple(
+                    mount.host_path for mount in guest_mounts if mount.mode == "rw"
+                ),
+                runtime_roots=tuple(
+                    mount.host_path for mount in guest_mounts if mount.mode == "ro"
+                ),
+                authority_roots=authority_roots,
+            )
+        writable_roots: tuple[Path, ...] = ()
+        if effective_workspace is not None:
+            writable_roots = (
+                effective_workspace,
+                *(
+                    mount.host_path
+                    for mount in _session_mounts_for_policy(effective_workspace)
+                    if mount.mode == "rw"
+                ),
+            )
+        safe_profile = compile_safe_file_profile(
+            stored_policy,
+            authority_roots=authority_roots,
+            writable_roots=writable_roots,
+        )
+
     runtime = get_runtime()
     if runtime is None or not runtime.effective.sandbox_enabled:
-        return None
+        return safe_profile
     effective_workspace = (
         workspace.expanduser().resolve(strict=False)
         if workspace is not None
@@ -334,7 +429,32 @@ def active_file_system_profile(
         runtime.settings,
         session_mounts=_session_mounts_for_policy(effective_workspace),
     )
-    return policy.file_system
+    base_profile = policy.file_system
+    if safe_profile is None:
+        return base_profile
+    if base_profile is None:
+        return safe_profile.as_read_only()
+    return FileSystemPermissionProfile(
+        # The stored Safe policy describes host-level write carve-outs and may
+        # contain broad baseline grants (POSIX ``/`` or the Windows user
+        # profile).  A live runtime sandbox is the outer boundary: retain only
+        # the stored policy's READ/DENY restrictions so it can narrow, never
+        # widen, the runtime's writable roots.
+        entries=(
+            *base_profile.entries,
+            *(
+                entry
+                for entry in safe_profile.entries
+                if entry.access is not FileSystemAccess.WRITE
+            ),
+        ),
+        denied_read_globs=tuple(
+            dict.fromkeys(
+                (*base_profile.denied_read_globs, *safe_profile.denied_read_globs)
+            )
+        ),
+        default_access=base_profile.default_access,
+    )
 
 
 def reset_runtime() -> None:
@@ -533,6 +653,54 @@ def _backend_name(runtime: SandboxRuntime | object | None) -> str:
     backend = getattr(runtime, "backend", None) if runtime is not None else None
     name = getattr(backend, "name", "")
     return str(name or "")
+
+
+def reject_windows_guest_process(
+    runtime: SandboxRuntime | object | None = None,
+    *,
+    action_kind: str | None = None,
+) -> None:
+    """Fail closed for a guest process using trusted request authority.
+
+    ``ToolContext.guest_safe`` is set by authenticated gateway routing and is
+    not part of the caller-controlled child environment.  The environment
+    marker remains useful to downstream policy compilation, but it is never
+    the authority for this denial.
+    """
+
+    if action_kind is not None and not action_kind.startswith(
+        ("shell.", "code.", "git.", "sandbox.command", "capability.probe")
+    ):
+        return
+    rt = runtime or get_runtime()
+    if not _backend_name(rt).lower().startswith("windows_"):
+        return
+    try:
+        from opensquilla.tools.types import current_tool_context
+
+        context = current_tool_context.get()
+    except Exception:  # pragma: no cover - defensive against import cycles
+        context = None
+    if context is not None and bool(getattr(context, "guest_safe", False)):
+        raise SandboxBackendError(GUEST_WINDOWS_PROCESS_UNAVAILABLE)
+
+
+def _reserve_guest_environment_marker(
+    env: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Prevent tool arguments from overriding the routed guest marker."""
+
+    try:
+        from opensquilla.tools.types import current_tool_context
+
+        context = current_tool_context.get()
+    except Exception:  # pragma: no cover - defensive against import cycles
+        context = None
+    if context is None or not bool(getattr(context, "guest_safe", False)):
+        return env
+    reserved = dict(env or {})
+    reserved["OPENSQUILLA_GUEST_SAFE"] = "1"
+    return reserved
 
 
 def _windows_proxy_allowlist_enforced(
@@ -815,6 +983,9 @@ async def gate_action(
         )
         return denial, policy, req
 
+    reject_windows_guest_process(rt, action_kind=action_kind)
+    env = _reserve_guest_environment_marker(env)
+
     workspace = _resolve_workspace(rt, str(cwd) if cwd else None)
     level = (
         select_level(action_kind, hints)
@@ -839,17 +1010,21 @@ async def gate_action(
     except Exception:  # pragma: no cover - defensive against tool-context cycles
         active_mode = None
     managed_execution = bool(
-        active_mode == RunMode.TRUSTED.value
-        or (run_context is not None and run_context.run_mode == RunMode.TRUSTED)
+        active_mode == RunMode.SAFE.value
+        or (run_context is not None and run_context.run_mode == RunMode.SAFE)
         or (
             active_mode is None
             and run_context is None
             and configured_mode is not None
-            and normalize_run_mode(configured_mode) == RunMode.TRUSTED
+            and normalize_run_mode(configured_mode) == RunMode.SAFE
         )
     )
+    if managed_execution:
+        safe_profile = active_file_system_profile(workspace)
+        if safe_profile is not None:
+            policy = dataclasses.replace(policy, file_system=safe_profile)
     if managed_execution and policy.require_approval:
-        # Managed Execution reviews only an exact host escape. Waiting on the
+        # Safe mode reviews only an exact host escape. Waiting on the
         # legacy policy approval gate here can block a sandboxed tool for five
         # minutes before it ever reaches the deterministic elevation rules.
         policy = dataclasses.replace(policy, require_approval=False)
@@ -888,6 +1063,7 @@ async def run_under_backend(
         raise SandboxBackendError(
             "Sandbox runtime is not configured; refusing to run backend request"
         )
+    reject_windows_guest_process(rt)
     if (
         request.policy.network == NetworkMode.PROXY_ALLOWLIST
         and request.policy.network_proxy is None
@@ -990,7 +1166,7 @@ def _auto_trusted_persistence_callback(
     *,
     context: RunContext,
 ) -> Callable[[NetworkDecision], Awaitable[None]] | None:
-    if context.run_mode != RunMode.TRUSTED:
+    if context.run_mode != RunMode.SAFE:
         return None
     session_manager, config = _current_sandbox_persistence_handles()
     if session_manager is None or config is None:
@@ -1062,14 +1238,13 @@ async def prepare_subprocess_managed_network_proxy(
     returns a request with ``network_proxy`` populated and an async cleanup
     callback that must run after the subprocess exits or spawn fails.
     """
-    if (
-        request.policy.network != NetworkMode.PROXY_ALLOWLIST
-    ):
+    rt = runtime or get_runtime()
+    reject_windows_guest_process(rt)
+    if request.policy.network != NetworkMode.PROXY_ALLOWLIST:
         return ManagedNetworkSubprocess(
             request=request,
             cleanup=_noop_managed_network_cleanup,
         )
-    rt = runtime or get_runtime()
     backend_name = _backend_name(rt)
     if request.policy.network_proxy is not None:
         return ManagedNetworkSubprocess(
@@ -1100,6 +1275,7 @@ async def prepare_subprocess_managed_network_proxy(
         context=context,
         request=request,
         runtime=rt,
+        policy=active_sandbox_policy(),
         session_key_override=_resolve_session_id(rt, None),
         workspace_override=grant_workspace,
     )
@@ -1501,7 +1677,7 @@ async def _preflight_cached_network_artifact_access(
     fingerprint: str,
 ) -> DenialResult | dict[str, object] | None:
     for host in _cached_network_artifact_hosts(request):
-        decision = decide_network_access(host, context)
+        decision = decide_network_access(host, context, active_sandbox_policy())
         if decision.status == "allow":
             continue
         if decision.status == "ask":
@@ -1555,7 +1731,7 @@ async def _preflight_request_package_bundle(
     bundle_id = _package_bundle_id_for_request(request)
     if bundle_id is None:
         return None
-    if context.run_mode == RunMode.TRUSTED:
+    if context.run_mode == RunMode.SAFE:
         return None
 
     fingerprint = action_fingerprint(request)
@@ -1588,7 +1764,7 @@ def _context_with_request_package_bundle(
     bundle_id = _package_bundle_id_for_request(request)
     if bundle_id is None or _context_has_enabled_package_bundle(context, bundle_id):
         return context
-    if context.run_mode != RunMode.TRUSTED:
+    if context.run_mode != RunMode.SAFE:
         return context
     grant = PackageBundleGrant(bundle_id=bundle_id, scope="chat", source="auto_trusted")
     return dataclasses.replace(context, bundles=context.bundles + (grant,))
@@ -1643,6 +1819,7 @@ async def _run_in_process_with_managed_network(
         context=context,
         request=request,
         runtime=runtime,
+        policy=active_sandbox_policy(),
         session_key_override=_resolve_session_id(runtime, None),
         workspace_override=_network_grant_workspace(request, runtime),
     )
@@ -1908,6 +2085,10 @@ async def escalate_backend_denial(
         sandbox_permissions="require_escalated",
         justification="command failed; retry without sandbox?",
         risk_markers=tuple(result.backend_notes),
+        display=ApprovalDisplay(
+            kind="run_command",
+            target=" ".join(request.argv),
+        ),
     )
     return gate_elevated_action(
         action,
@@ -1934,38 +2115,14 @@ async def escalate_unavailable_backend_in_managed_mode(
     runtime: SandboxRuntime | None = None,
     review_action: ElevationAction | None = None,
 ) -> DenialResult | ElevationGateResult | None:
-    """Turn a missing sandbox backend into one exact Managed host retry."""
+    """Never replay a started Safe action with host permissions.
 
-    context = current_tool_run_context()
-    try:
-        mode = (
-            context.run_mode
-            if context is not None
-            else normalize_run_mode(request.run_mode, default=RunMode.STANDARD)
-        )
-    except ValueError:
-        return None
-    if mode != RunMode.TRUSTED:
-        return None
-    rt = runtime or get_runtime()
-    if rt is None or not isinstance(rt.backend, UnavailableBackend):
-        return None
-    reason = str(error) or "sandbox backend unavailable"
-    return await escalate_backend_denial(
-        SandboxResult(
-            returncode=-1,
-            stdout="",
-            stderr=reason,
-            wall_time_s=0.0,
-            timed_out=False,
-            backend_used=rt.backend.name,
-            backend_notes=("backend_unavailable", reason),
-        ),
-        request,
-        policy,
-        runtime=rt,
-        review_action=review_action,
-    )
+    Capability fallback is decided before task execution by ``ModeResolver``.
+    Reaching this path means Safe execution already started, so replaying the
+    action could duplicate partial side effects.
+    """
+
+    return None
 
 
 def consume_backend_denial_retry(
@@ -2050,11 +2207,18 @@ def _runtime_is_full_host_access(runtime: SandboxRuntime) -> bool:
     context = current_tool_run_context()
     if context is not None:
         return context.run_mode == RunMode.FULL
-    return runtime.default_run_mode == RunMode.FULL
+    configured = getattr(runtime, "default_run_mode", None)
+    if configured is None:
+        configured = getattr(getattr(runtime, "settings", None), "run_mode", None)
+    try:
+        return normalize_run_mode(configured) == RunMode.FULL
+    except ValueError:
+        return False
 
 
 __all__ = [
     "SandboxRuntime",
+    "active_sandbox_policy",
     "active_file_system_profile",
     "action_fingerprint",
     "build_request",
@@ -2077,4 +2241,5 @@ __all__ = [
     "run_in_process_network_action",
     "run_under_backend",
     "sandboxed",
+    "sandbox_policy_scope",
 ]

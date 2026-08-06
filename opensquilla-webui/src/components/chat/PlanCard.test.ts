@@ -167,6 +167,23 @@ describe('PlanCard', () => {
     expect(planCardSource).toContain('width: 44px')
   })
 
+  it('keeps two-digit structured step numbers inside the card at narrow widths', async () => {
+    const host = mountPlanCard(plan({
+      steps: Array.from({ length: 10 }, (_, index) => ({
+        stepId: `step-${index + 1}`,
+        title: `Step ${index + 1}`,
+        details: 'A long detail that must wrap inside the available column.',
+      })),
+    }))
+    await nextTick()
+
+    expect(host.querySelectorAll('.plan-card__step-copy')).toHaveLength(10)
+    expect(planCardSource).toContain('counter-reset: plan-step')
+    expect(planCardSource).toContain('counter-increment: plan-step')
+    expect(planCardSource).toContain('grid-template-columns: minmax(2rem, auto) minmax(0, 1fr)')
+    expect(planCardSource).not.toContain('.plan-card__step::marker')
+  })
+
   it('emits stable plan identifiers for each current-plan action', async () => {
     const implementCurrent = vi.fn()
     const implementNew = vi.fn()
@@ -180,6 +197,7 @@ describe('PlanCard', () => {
 
     const buttons = host.querySelectorAll<HTMLButtonElement>('.plan-card__actions button')
     expect(buttons).toHaveLength(3)
+    expect(buttons[0]?.classList.contains('btn--primary')).toBe(true)
     buttons[0]?.click()
     buttons[1]?.click()
     buttons[2]?.click()

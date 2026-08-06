@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="OpenSquilla 沙箱系统：背景、技术选型、架构实现与深度技术追问">
+  <title>OpenSquilla 沙箱系统｜技术复盘</title>
+  <style>
+    :root{--bg:#081117;--panel:#0e1c24;--panel2:#12242e;--line:#233842;--text:#edf5f3;--muted:#a2b5b7;--soft:#71878d;--mint:#60dfc1;--gold:#efb96e;--red:#ff9c9c;--blue:#87bfff;--r:15px}
+    *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:74px}body{margin:0;background:radial-gradient(circle at 84% 0,rgba(96,223,193,.08),transparent 28rem),var(--bg);color:var(--text);font:15px/1.72 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}a{color:var(--mint);text-decoration:none}a:hover{text-decoration:underline}code{padding:.1em .35em;border:1px solid rgba(135,191,255,.18);border-radius:5px;background:rgba(135,191,255,.07);color:#cfe5ff;font: .9em "Cascadia Code",Consolas,monospace;overflow-wrap:anywhere}strong{color:var(--text)}
+    .top{position:sticky;top:0;z-index:20;border-bottom:1px solid var(--line);background:rgba(8,17,23,.92);backdrop-filter:blur(14px)}.top-inner{max-width:1120px;margin:auto;padding:12px 22px;display:flex;align-items:center;gap:18px}.brand{margin-right:auto;font-weight:800}.brand span{color:var(--mint)}nav{display:flex;gap:4px;overflow:auto;white-space:nowrap}nav a{padding:6px 9px;border-radius:7px;color:var(--muted);font-size:12px}nav a:hover,nav a.active{background:rgba(96,223,193,.1);color:var(--text);text-decoration:none}
+    main{max-width:1120px;margin:auto;padding:72px 22px 90px}.hero{padding:26px 0 62px;border-bottom:1px solid var(--line)}.eyebrow{color:var(--mint);font:800 11px/1.4 "Cascadia Code",monospace;letter-spacing:.16em;text-transform:uppercase}h1{max-width:850px;margin:18px 0 20px;font-size:clamp(40px,7vw,74px);line-height:1.02;letter-spacing:-.05em}.lead{max-width:820px;margin:0;color:var(--muted);font-size:18px}.one-line{margin-top:28px;padding:18px 20px;border-left:3px solid var(--mint);border-radius:0 10px 10px 0;background:rgba(96,223,193,.08)}.one-line b{color:var(--mint)}
+    section{padding:72px 0 0}.kicker{color:var(--gold);font:800 10px/1.4 "Cascadia Code",monospace;letter-spacing:.16em;text-transform:uppercase}h2{margin:8px 0 14px;font-size:clamp(28px,4vw,43px);line-height:1.12;letter-spacing:-.035em}h3{margin:0 0 7px;font-size:18px;line-height:1.35}.intro{max-width:800px;margin:0 0 24px;color:var(--muted)}
+    .grid2,.grid3{display:grid;gap:12px}.grid2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid3{grid-template-columns:repeat(3,minmax(0,1fr))}.card{padding:20px;border:1px solid var(--line);border-radius:var(--r);background:linear-gradient(145deg,var(--panel),rgba(14,28,36,.72))}.card p,.card li{margin-top:7px;color:var(--muted);font-size:13px}.card ul{margin:9px 0 0;padding-left:18px}.tag{display:inline-block;margin-bottom:12px;color:var(--gold);font:700 10px "Cascadia Code",monospace;letter-spacing:.1em}.verdict{color:var(--mint);font-weight:800}.tradeoff{color:var(--gold);font-weight:700}
+    .compare{width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--panel);font-size:13px}.compare th,.compare td{padding:13px 14px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.compare th{color:var(--soft);background:rgba(255,255,255,.018);font-size:10px;letter-spacing:.08em;text-transform:uppercase}.compare td:first-child{width:18%;color:var(--text);font-weight:700}.compare td{color:var(--muted)}.compare tr:last-child td{border-bottom:0}
+    .mode{position:relative;padding-top:48px}.mode::before{position:absolute;top:18px;left:20px;color:var(--mint);font:800 11px "Cascadia Code",monospace}.mode.standard::before{content:"STANDARD"}.mode.managed::before{content:"MANAGED"}.mode.full::before{content:"FULL HOST"}.mode.managed{border-color:rgba(96,223,193,.35)}.mode.full{border-color:rgba(239,185,110,.3)}
+    .flow{display:grid;grid-template-columns:repeat(6,1fr);gap:22px;padding:20px;border:1px solid var(--line);border-radius:var(--r);background:var(--panel)}.node{position:relative;padding:13px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}.node:not(:last-child)::after{content:"→";position:absolute;right:-18px;top:50%;transform:translateY(-50%);color:var(--mint)}.node b{display:block;font-size:12px}.node span{color:var(--soft);font-size:10px}
+    .layers{display:grid;gap:8px;margin-top:12px}.layer{display:grid;grid-template-columns:130px minmax(0,1fr) 290px;gap:15px;align-items:start;padding:14px 16px;border:1px solid var(--line);border-radius:11px;background:rgba(14,28,36,.72)}.layer b{color:var(--mint);font-size:13px}.layer p{margin:0;color:var(--muted);font-size:13px}.layer .files{color:var(--soft);font:11px/1.6 "Cascadia Code",monospace}
+    .case{display:grid;grid-template-columns:36px minmax(0,1fr);gap:13px;padding:17px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}.num{width:32px;height:32px;display:grid;place-items:center;border-radius:9px;background:rgba(239,185,110,.1);color:var(--gold);font:700 11px "Cascadia Code",monospace}.case p{margin:4px 0;color:var(--muted);font-size:13px}.case em{color:#d9e5e4;font-style:normal;font-weight:700}
+    .toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:20px 0 10px}.toolbar span{color:var(--soft);font-size:12px}button{cursor:pointer;padding:7px 11px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--muted);font:inherit;font-size:12px}button:hover{border-color:rgba(96,223,193,.4);color:var(--text)}.qa{display:grid;gap:8px}details{border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow:hidden}summary{position:relative;cursor:pointer;padding:15px 46px 15px 17px;list-style:none;font-weight:750}summary::-webkit-details-marker{display:none}summary::after{content:"+";position:absolute;right:17px;top:10px;color:var(--mint);font-size:22px;font-weight:400}details[open] summary{border-bottom:1px solid var(--line);background:rgba(96,223,193,.04)}details[open] summary::after{content:"−"}.answer{padding:15px 17px 18px;color:var(--muted);font-size:13px}.answer p{margin:0 0 9px}.answer p:last-child{margin:0}.logic{display:grid;grid-template-columns:68px minmax(0,1fr);gap:5px 10px}.logic b{color:var(--gold);font-size:11px}.probe{margin-top:10px!important;padding:9px 11px;border-radius:8px;background:rgba(239,185,110,.08);color:#e7cda9}.risk{color:var(--red)!important}
+    .evidence{display:flex;flex-wrap:wrap;gap:8px}.evidence a{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:12px}.note{margin-top:18px;padding:14px 16px;border-radius:10px;background:rgba(135,191,255,.07);color:var(--muted);font-size:12px}footer{margin-top:70px;padding-top:22px;border-top:1px solid var(--line);color:var(--soft);font-size:11px}
+    @media(max-width:900px){.top-inner{align-items:flex-start}.brand{display:none}.flow{grid-template-columns:repeat(3,1fr)}.node:not(:last-child)::after{display:none}.layer{grid-template-columns:110px 1fr}.layer .files{grid-column:2}.grid3{grid-template-columns:1fr}.grid2{grid-template-columns:1fr 1fr}}
+    @media(max-width:640px){body{font-size:14px}.top-inner{padding:9px 14px}main{padding:50px 16px 70px}.hero{padding-bottom:45px}.grid2{grid-template-columns:1fr}.flow{grid-template-columns:1fr 1fr;padding:14px}.layer{grid-template-columns:1fr;gap:5px}.layer .files{grid-column:1}.compare{display:block;overflow-x:auto;white-space:normal}.toolbar{align-items:flex-start;flex-direction:column}.logic{grid-template-columns:58px 1fr}}
+    @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}@media print{.top,.toolbar{display:none}body{background:white;color:#16252c}.card,.flow,.layer,.case,details,.compare{box-shadow:none;break-inside:avoid}main{max-width:none;padding:10mm}details .answer,details:not([open]) .answer{display:block!important}summary::after{display:none}}
+  </style>
+</head>
+<body>
+  <header class="top"><div class="top-inner"><div class="brand"><span>OpenSquilla</span> Sandbox</div><nav aria-label="页面目录"><a href="#brief">概要</a><a href="#why-native">选型</a><a href="#model">模式</a><a href="#architecture">架构</a><a href="#hard-parts">难点</a><a href="#questions">追问</a><a href="#evidence">证据</a></nav></div></header>
+  <main>
+    <section class="hero" id="brief">
+      <div class="eyebrow">Sandbox system · technical deep dive</div>
+      <h1>不是“套一层容器”，<br>而是统一执行边界</h1>
+      <p class="lead">OpenSquilla 的难点是让 shell、文件、代码执行、网络、后台进程、子代理和 Coding Task 在 Windows、Linux、macOS 上遵守同一套权限语义，同时又能完成真实的本地任务。</p>
+      <div class="one-line"><b>30 秒回答：</b>我把原来分散的 sandbox 开关、approval bypass、敏感路径和 workspace 规则收敛成三态运行模式；用 RunContext 统一携带路径与网络授权，用确定性 OperationProfile 和 action fingerprint 做精确决策，再由 Bubblewrap、Seatbelt、Windows restricted token/ACL/firewall 等原生能力执行。后端不可用时失败闭合，Full Host 也不会抹掉独立的工具 deny 与注入防护。</div>
+    </section>
+
+    <section>
+      <div class="kicker">01 · The real problem</div><h2>一开始要解决的，不是隔离本身</h2>
+      <p class="intro">旧系统已经有沙箱，但用户看到的开关和真实边界不一致：Web UI 的“绕过审批”看似放开权限，实际仍被 workspace、敏感路径和 mount 拒绝；同一动作在 shell、filesystem、后台任务和子代理中又可能走不同逻辑。</p>
+      <div class="grid3">
+        <article class="card"><span class="tag">SEMANTICS</span><h3>语义分裂</h3><p><code>sandbox</code>、<code>security_grading</code>、approval mode 多个布尔值组合，无法回答“到底在宿主还是隔离内执行”。</p></article>
+        <article class="card"><span class="tag">CONSISTENCY</span><h3>工具不一致</h3><p>文件工具会检查路径，shell 的 workdir、重定向、后台进程或网络子进程却可能绕过同一边界。</p></article>
+        <article class="card"><span class="tag">USABILITY</span><h3>安全与可用性冲突</h3><p>全拒绝会让安装、搜索、读取外部项目无法完成；全放开又会让一次批准扩散成会话级权限。</p></article>
+      </div>
+    </section>
+
+    <section id="why-native">
+      <div class="kicker">02 · Technology choice</div><h2>为什么不用 Docker，而用系统原生限制？</h2>
+      <p class="intro"><span class="verdict">结论：</span>不是认为 Docker 不安全，而是它与“本地桌面代理、按命令临时隔离、需要受控访问宿主资源”的主要场景不匹配。Docker 更适合稳定服务、CI 和多租户任务；OpenSquilla 需要的是策略控制面加平台原生执行后端。</p>
+      <table class="compare">
+        <thead><tr><th>维度</th><th>Docker</th><th>系统原生后端</th><th>本项目判断</th></tr></thead>
+        <tbody>
+          <tr><td>部署成本</td><td>依赖 daemon、镜像、网络与 volume；macOS/Windows 通常还经过 VM。</td><td>复用 OS 已有原语，按命令创建短生命周期边界。</td><td>桌面首次使用和跨平台分发更轻。</td></tr>
+          <tr><td>宿主任务</td><td>容器内的 package manager、注册表、服务、GUI、进程视图不是宿主本身；想操作宿主通常要额外挂载或高权限桥接。</td><td>可在 policy 批准后针对精确 host effect 执行。</td><td>安装/卸载/探测是真实需求，不能假装在容器里完成。</td></tr>
+          <tr><td>文件语义</td><td>需要预先设计 volume；动态外部路径、单次 ro/rw grant 会转化为容器重建与挂载管理。</td><td>RunContext 直接把 workspace、ro/rw mount 映射给后端。</td><td>更适合会话中动态批准一个路径。</td></tr>
+          <tr><td>策略问题</td><td>能隔离进程，但不会自动解决“谁批准、批准哪个路径/域名、是否传播给子代理”。</td><td>这些由统一策略层解决，后端只兑现 policy。</td><td>真正复杂的是控制面，不是启动容器。</td></tr>
+          <tr><td>隔离强度</td><td>Linux 上本质也基于 namespace/cgroup/seccomp，工具链成熟；配置合理时隔离稳定。</td><td>各平台强度不同，需要能力探测、显式降级和失败闭合。</td><td><span class="tradeoff">原生方案更贴合，但必须承认平台差异。</span></td></tr>
+        </tbody>
+      </table>
+      <div class="grid2" style="margin-top:12px">
+        <div class="card"><span class="tag">NATIVE BACKENDS</span><h3>具体怎么落地</h3><ul><li>Linux：Bubblewrap + namespace + bind mount + seccomp/limits</li><li>macOS：Seatbelt profile</li><li>Windows：restricted token/identity + ACL + firewall/WFP</li><li>共享：受管代理、进程内网络守卫、路径与授权策略</li></ul></div>
+        <div class="card"><span class="tag">WHEN DOCKER WINS</span><h3>什么时候反而应该选 Docker</h3><p>服务端多租户、可预构建固定镜像、任务不需要影响宿主、要求可复现依赖环境时，Docker 是更自然的后端。合理演进方向是把它作为另一种 Backend，而不是替代上层 RunMode/RunContext。</p></div>
+      </div>
+    </section>
+
+    <section id="model">
+      <div class="kicker">03 · Security model</div><h2>为什么是三种模式，而不是开/关？</h2>
+      <div class="grid3">
+        <article class="card mode standard"><h3>Standard-Sandbox</h3><p>始终以 sandbox 为执行目标；跨 workspace、额外网络或敏感动作必须形成明确批准。后端不可用时直接失败。</p></article>
+        <article class="card mode managed"><h3>Managed Execution</h3><p>仍默认在 sandbox 内执行；普通公网、非敏感临时路径和可识别 host effect 可由确定性规则处理，越界只对精确动作授权。</p></article>
+        <article class="card mode full"><h3>Full Host Access</h3><p>执行目标改为 host，仅对允许主体开放；绕过沙箱批准门，但显式工具 deny、注入来源拒绝和外传防护仍独立存在。</p></article>
+      </div>
+      <div class="note"><strong>关键区分：</strong>Managed 是“在隔离模型内减少不必要阻塞”，Full 是“改变执行目标”。auto-approve 只能处理当前模式中的批准，不能把 Standard 升级成 Managed 或 Full。</div>
+    </section>
+
+    <section id="architecture">
+      <div class="kicker">04 · Architecture</div><h2>从一次调用到真正执行</h2>
+      <div class="flow" aria-label="执行链路">
+        <div class="node"><b>RunMode</b><span>先锁定执行目标</span></div><div class="node"><b>Principal</b><span>校验主体可选模式</span></div><div class="node"><b>RunContext</b><span>workspace + grants</span></div><div class="node"><b>OperationProfile</b><span>路径/网络/host effect</span></div><div class="node"><b>Policy & Approval</b><span>规则 + 精确指纹</span></div><div class="node"><b>Backend</b><span>隔离执行或精确 host retry</span></div>
+      </div>
+      <div class="layers">
+        <div class="layer"><b>上下文层</b><p>会话中统一保存 workspace、ro/rw mount、domain、public network、package bundle 和 temporary grant，并定义子代理继承规则。</p><div class="files">run_context.py<br>run_context_service.py</div></div>
+        <div class="layer"><b>描述层</b><p>把 shell、文件、网络、后台进程等变成统一操作描述；分类器合并 requested paths、write paths、domains、destructive intent 与 host effect。</p><div class="files">operation_runtime.py<br>operation_profile.py</div></div>
+        <div class="layer"><b>授权层</b><p>对越界动作生成 action fingerprint；批准返回 continuation，重试时重新计算并单次消费，防止“批准 A、执行 B”。</p><div class="files">elevation.py<br>escalation.py</div></div>
+        <div class="layer"><b>网络层</b><p>子进程走受管代理，Gateway 内 HTTP 调用走进程内守卫；连接时验证最终 IP，拒绝私网、数字 IP 与 DNS 重绑定。</p><div class="files">network_guard.py<br>network_proxy.py</div></div>
+        <div class="layer"><b>平台层</b><p>Backend 只兑现 policy；必须声明 available/capability，初始化失败抛出明确错误，不能静默回落到宿主。</p><div class="files">linux_bwrap.py<br>seatbelt.py<br>windows_default.py</div></div>
+      </div>
+    </section>
+
+    <section id="hard-parts">
+      <div class="kicker">05 · Hard parts</div><h2>最有技术含量的坑</h2>
+      <p class="intro">这些问题都不是“少写一个 if”，而是边界对象、访问级别或执行位置发生漂移。</p>
+      <div class="grid2">
+        <article class="case"><div class="num">01</div><div><h3>workspace 被敏感根误伤</h3><p><em>问题：</em><code>/root/.opensquilla/workspace</code> 先命中 `/root` 敏感规则。</p><p><em>解法：</em>规范化后先识别精确 workspace，再应用宽泛敏感根；测试固定规则顺序。</p></div></article>
+        <article class="case"><div class="num">02</div><div><h3>写请求拿到只读 grant</h3><p><em>问题：</em>审批显示成功，重试仍报 <code>mount_requires_write_access</code>。</p><p><em>解法：</em>approval choice 从真实 access 生成；rw 请求不能用 ro 选择完成。</p></div></article>
+        <article class="case"><div class="num">03</div><div><h3>网络分类吞掉输出路径</h3><p><em>问题：</em><code>curl -o /mnt/out URL</code> 只获得域名授权，没有写挂载。</p><p><em>解法：</em>分类器合并网络、读写路径和 host effect，禁止 early return 覆盖已有证据。</p></div></article>
+        <article class="case"><div class="num">04</div><div><h3>外部 cwd 变成可写 workspace</h3><p><em>问题：</em>只批准 ro workdir，后端却按 workspace 以 rw 挂载。</p><p><em>解法：</em>区分会话 workspace 与执行 cwd；后者按 grant 独立挂载。</p></div></article>
+        <article class="case"><div class="num">05</div><div><h3>混合 shell 整段被提升</h3><p><em>问题：</em><code>where winget; Set-Content ...</code> 因第一段 host probe 让后续写入也走 host。</p><p><em>解法：</em>host routing 不能跳过路径门；必要时拆分命令，授权绑定精确目标。</p></div></article>
+        <article class="case"><div class="num">06</div><div><h3>Windows 子进程收不到 EOF</h3><p><em>问题：</em>Proactor 下关闭 stdin 未等待 <code>wait_closed()</code>，CI 重复超时。</p><p><em>解法：</em>前后台 host exec 都等待关闭完成，并做连续多轮回归。</p></div></article>
+        <article class="case"><div class="num">07</div><div><h3>Full Host 在子链路丢失</h3><p><em>问题：</em>子代理/Coding Task 重建 context 时使用默认值，悄悄重新启用 sandbox。</p><p><em>解法：</em>run mode、workspace、mount、principal 显式序列化；临时 grant 按继承规则处理。</p></div></article>
+        <article class="case"><div class="num">08</div><div><h3>Windows 首次初始化冻结事件循环</h3><p><em>问题：</em>async task 内同步 <code>WaitForSingleObject(INFINITE)</code>，Desktop 45 秒先超时。</p><p><em>方向：</em>移入线程/工作进程，并把 setup 状态暴露给 Desktop。</p></div></article>
+      </div>
+    </section>
+
+    <section id="questions">
+      <div class="kicker">06 · Technical questions</div><h2>可能继续追问什么</h2>
+      <p class="intro">回答模板固定为：先给结论，再解释约束与机制，最后主动承认取舍。这样既避免背诵感，也不会把安全问题答成产品口号。</p>
+      <div class="toolbar"><span>20 个问题 · 点击展开</span><div><button id="open-all" type="button">全部展开</button> <button id="close-all" type="button">全部收起</button></div></div>
+      <div class="qa" id="qa">
+        <details open><summary>1. 为什么不用 Docker？</summary><div class="answer"><div class="logic"><b>结论</b><span>Docker 不是不安全，而是不匹配本地桌面代理的主要执行模型。</span><b>原因</b><span>它引入 daemon/镜像/volume/VM 成本；容器内无法自然完成宿主安装、注册表、服务和进程管理；动态单次路径授权也会变成挂载生命周期问题。</span><b>取舍</b><span>原生后端部署轻、能精确处理 host effect，但平台隔离强度不完全一致，所以必须能力探测和失败闭合。</span></div><p class="probe"><strong>继续追问：</strong>Docker 何时更合适？答：服务端多租户、固定镜像、CI、完全不需要影响宿主时；可以作为未来 Backend，但替代不了 RunContext 与审批控制面。</p></div></details>
+        <details><summary>2. Docker 本身不也是系统原生隔离吗？</summary><div class="answer"><p><strong>是。</strong>Linux Docker 底层同样依赖 namespace、cgroup、capability、seccomp。这里的区别不是“原生 vs 非原生的安全原语”，而是是否引入容器运行时、镜像文件系统与 volume 模型。OpenSquilla 直接调用底层能力，更适合 per-command ephemeral sandbox 和动态宿主授权。</p><p class="risk"><strong>不要回答：</strong>“Docker 太重所以不安全”。重是运维取舍，不是安全结论。</p></div></details>
+        <details><summary>3. 系统原生方案会不会比 Docker 更不安全？</summary><div class="answer"><p>不能一概而论。Linux Bubblewrap 可提供强 namespace/mount/seccomp 边界；macOS Seatbelt 与 Windows 组合机制能力不同。设计上不宣称三平台等强，而是通过 Backend capability、明确 unavailable 和失败闭合避免“假隔离”。高风险多租户仍应优先更强的 VM/container 边界。</p></div></details>
+        <details><summary>4. 为什么三种模式，两种模式不够？</summary><div class="answer"><p>开/关只能表达执行位置，无法表达“仍隔离，但对普通操作减少重复确认”。Managed 解决可用性，Full 改变执行目标；二者不能合并，否则自动规则很容易演化成隐式 host access。</p></div></details>
+        <details><summary>5. Managed Execution 到底自动允许什么？</summary><div class="answer"><p>不是一张无限白名单，而是按 OperationProfile 判断：正常公网、已知包网络束、非敏感临时路径、明确的安装/探测 host effect 等。敏感路径、关键删除、系统破坏、高置信外传和未知动作仍拒绝或要求精确批准。</p></div></details>
+        <details><summary>6. 为什么不用模型判断一个动作是否安全？</summary><div class="answer"><p>安全裁决需要可重复、低延迟、离线可用、能做回归。模型输出受版本、上下文和采样影响，同一动作可能得到不同结论。确定性规则的代价是维护成本，但输入、输出和覆盖范围可证明；未知行为按保守默认处理。</p></div></details>
+        <details><summary>7. action fingerprint 包含什么？</summary><div class="answer"><p>至少覆盖 tool、action kind、规范化 argv、cwd、目标读写路径、会话/主体和关键 policy 参数。批准返回 continuation；执行前重新计算并匹配，只消费一次，防止参数或路径变化后复用旧批准。</p></div></details>
+        <details><summary>8. 怎样处理 TOCTOU 和符号链接？</summary><div class="answer"><p>策略阶段做 symlink-aware canonicalization 只是第一层；强保证要靠后端 mount view、no-follow/openat 类访问、父目录验证和创建/重命名前复查。仅用 <code>Path.resolve()</code> 无法消除检查到系统调用之间的竞态。</p></div></details>
+        <details><summary>9. 不存在的目标路径怎么规范化？</summary><div class="answer"><p>不能直接 resolve 叶子。做法是找到最近存在祖先，规范化祖先后按平台词法规则拼回剩余片段，再校验 denied root/glob；Windows 还要处理盘符、UNC、大小写折叠、junction 与设备路径。</p></div></details>
+        <details><summary>10. 为什么网络既要代理，又要进程内守卫？</summary><div class="answer"><p>shell/代码子进程可通过 proxy env 和平台网络边界约束；Gateway 内的 httpx、provider、search 调用不一定创建子进程，也可能不读取环境变量。两层共享同一个 NetworkDecision，覆盖不同执行形态。</p></div></details>
+        <details><summary>11. 域名 allowlist 为什么还不够？</summary><div class="answer"><p>允许域名可能解析到 loopback、RFC1918、链路本地或云元数据地址，攻击者还可做 DNS 重绑定。代理必须在真正连接时验证最终 IP，并处理 Host、absolute URL、CONNECT authority 不一致，拒绝直接数字 IP 绕过。</p></div></details>
+        <details><summary>12. Backend 不可用时为什么不能自动跑宿主？</summary><div class="answer"><p>基础设施失败不等于用户授予宿主权限。Standard 直接失败；Managed 只能返回结构化 denial，在用户或规则对同一个 fingerprint 形成批准后做精确 host retry。否则就是静默安全降级。</p></div></details>
+        <details><summary>13. auto-approve 为什么不能触发 host routing？</summary><div class="answer"><p>approval behavior 回答“如何处理批准”，RunMode 回答“在哪执行”。二者顺序必须固定：先锁定执行边界，再解析批准。否则 Standard + auto-approve 会被错误升级成 Managed/Full。</p></div></details>
+        <details><summary>14. 混合 shell 命令怎么防止权限扩大？</summary><div class="answer"><p>不能因为脚本中出现一个 host probe 就把整段放到宿主。分类器要保留每个读写目标，host routing 仍必须经过 path/write policy；高风险场景拆分子命令，fingerprint 绑定精确 argv 与目标。</p></div></details>
+        <details><summary>15. Full Host Access 是否等于所有安全检查关闭？</summary><div class="answer"><p>不是。它关闭 sandbox enforcement 与相关 approval gates，但显式 denied tools、提示注入来源拒绝、敏感数据外传保护和 mutation telemetry 是独立边界。分层设计避免“一个开关删除所有控制”。</p></div></details>
+        <details><summary>16. 子代理为什么不能直接继承所有 grant？</summary><div class="answer"><p>run mode、workspace 和明确长期 grant 可以按契约继承；一次性 grant 具有 action/session 所有权，盲目复制会把一次批准扩散到多个执行者。派生 RunContext 必须显式定义哪些能力继承、哪些重新批准。</p></div></details>
+        <details><summary>17. Windows 和 Linux 如何保证接口一致？</summary><div class="answer"><p>一致的是 policy 输入、result/error 契约和 capability 描述，不是假装底层实现相同。Linux 映射到 namespace/mount/seccomp；Windows 映射到 restricted identity、ACL、firewall/WFP。无法兑现的 operation domain 必须报告 unsupported。</p></div></details>
+        <details><summary>18. 如何设计测试矩阵？</summary><div class="answer"><p>按 <code>mode × principal × tool domain × platform × boundary × approval outcome × execution shape</code> 组合，而不是追求测试数量。优先覆盖交叉不变量：Standard+auto-approve+host effect、Managed+external rw+background network、Full+subagent+explicit deny。</p></div></details>
+        <details><summary>19. 这个方案最大的缺点是什么？</summary><div class="answer"><p>跨平台实现和规则维护成本高，隔离强度也不完全一致；OperationProfile 对 shell wrapper、未来路径和新 package manager 需要持续扩展。缓解手段是能力显式化、保守默认、属性/模糊测试，以及未来增加 Docker/VM Backend 处理更强隔离场景。</p></div></details>
+        <details><summary>20. 如果继续优化，优先做什么？</summary><div class="answer"><p>第一，修复 Windows 首次 setup 阻塞事件循环并暴露 configuring 状态；第二，用 property/fuzz 测试覆盖路径、shell token 与代理协议解析；第三，建立 Backend conformance suite，明确三平台能力差距；第四，为高风险/多租户场景增加容器或 VM 后端。</p></div></details>
+      </div>
+    </section>
+
+    <section id="evidence">
+      <div class="kicker">07 · Evidence</div><h2>公开证据链</h2>
+      <p class="intro">只保留与沙箱直接相关的起点、主线合入、定向修正和当前遗留问题。</p>
+      <div class="evidence">
+        <a href="https://github.com/opensquilla/opensquilla/issues/106" target="_blank" rel="noopener noreferrer">#106 语义错位起点</a><a href="https://github.com/opensquilla/opensquilla/issues/107" target="_blank" rel="noopener noreferrer">#107 完整问题定义</a><a href="https://github.com/opensquilla/opensquilla/pull/189" target="_blank" rel="noopener noreferrer">#189 第一版体系</a><a href="https://github.com/opensquilla/opensquilla/pull/230" target="_blank" rel="noopener noreferrer">#230 跨平台重构</a><a href="https://github.com/opensquilla/opensquilla/pull/412" target="_blank" rel="noopener noreferrer">#412 合入 main</a><a href="https://github.com/opensquilla/opensquilla/pull/450" target="_blank" rel="noopener noreferrer">#450 host routing</a><a href="https://github.com/opensquilla/opensquilla/pull/526" target="_blank" rel="noopener noreferrer">#526 文件授权</a><a href="https://github.com/opensquilla/opensquilla/pull/544" target="_blank" rel="noopener noreferrer">#544 权限模型收口</a><a href="https://github.com/opensquilla/opensquilla/pull/669" target="_blank" rel="noopener noreferrer">#669 Coding Task 传播</a><a href="https://github.com/opensquilla/opensquilla/issues/705" target="_blank" rel="noopener noreferrer">#705 初始化遗留问题</a>
+      </div>
+    </section>
+    <footer>OpenSquilla sandbox technical deep dive · based on public repository evidence · 2026-07-22</footer>
+  </main>
+  <script>
+    (()=>{const items=[...document.querySelectorAll('#qa details')];document.querySelector('#open-all').addEventListener('click',()=>items.forEach(x=>x.open=true));document.querySelector('#close-all').addEventListener('click',()=>items.forEach(x=>x.open=false));const links=[...document.querySelectorAll('nav a')];const sections=links.map(a=>document.querySelector(a.getAttribute('href'))).filter(Boolean);if('IntersectionObserver'in window){const io=new IntersectionObserver(es=>{const e=es.filter(x=>x.isIntersecting).sort((a,b)=>b.intersectionRatio-a.intersectionRatio)[0];if(e)links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')===`#${e.target.id}`))},{rootMargin:'-18% 0px -68% 0px',threshold:[0,.2,.5]});sections.forEach(s=>io.observe(s))}})();
+  </script>
+</body>
+</html>

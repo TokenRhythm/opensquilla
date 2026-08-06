@@ -1101,7 +1101,7 @@ async def test_standalone_repl_uses_exact_slash_tokens(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_standalone_slash_compact_passes_provider_config(monkeypatch) -> None:
+async def test_standalone_slash_compact_uses_selected_physical_deployment(monkeypatch) -> None:
     services = _FakeServices()
     services.provider_selector = _FakeProviderSelector()
     services.config = SimpleNamespace(
@@ -1139,7 +1139,7 @@ async def test_standalone_slash_compact_passes_provider_config(monkeypatch) -> N
     assert context_window == 1234
     assert isinstance(config, CompactionConfig)
     assert config.api_key == "cli-provider-key"
-    assert config.model == "openrouter/test"
+    assert config.model == "provider/model"
     assert config.base_url == "https://openrouter.ai/api/v1"
     assert config.timeout_seconds == 12.5
 

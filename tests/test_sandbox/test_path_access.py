@@ -25,8 +25,9 @@ from opensquilla.sandbox.permissions import (
     FileSystemPermissionProfile,
 )
 from opensquilla.sandbox.platform_permissions import FileSystemPlatformContext
+from opensquilla.sandbox.policy_models import FilePolicySettings, SandboxPolicy
 from opensquilla.sandbox.run_context import MountGrant, RunContext
-from opensquilla.sandbox.run_mode import RunMode
+from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
 from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest
 from opensquilla.tools.builtin import filesystem as fs
 from opensquilla.tools.builtin import patch as patch_tool
@@ -159,7 +160,7 @@ def _install_source_filesystem_worker_backend() -> _SourceFilesystemWorkerBacken
 def tool_context(
     workspace: Path,
     *,
-    run_mode: str | None = "standard",
+    run_mode: str | None = "safe",
     sandbox_mounts: list[dict[str, object]] | None = None,
     workspace_strict: bool = False,
 ) -> Iterator[ToolContext]:
@@ -180,7 +181,7 @@ def tool_context(
         session_key="s1",
         sandbox_mounts=sandbox_mounts or [],
         sandbox_run_context=RunContext(
-            run_mode=RunMode(run_mode or "standard"),
+            run_mode=normalize_run_mode(run_mode),
             workspace=str(workspace),
             mounts=mounts,
             source="saved",
@@ -1042,118 +1043,23 @@ async def test_shell_reads_dot_credential_names_inside_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_denied_sandbox_path_request_does_not_create_repeated_prompt(
+async def test_authenticated_safe_reads_outside_workspace_without_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _disable_global_root_readonly()
-    from types import SimpleNamespace
-
-    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
 
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     outside = tmp_path / "outside"
     outside.mkdir()
+    (outside / "notes.txt").write_text("readable\n", encoding="utf-8")
     monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: _InlineExecutorLoop())
 
     with tool_context(workspace):
-        first = json.loads(await fs.list_dir(str(outside)))
+        result = await fs.list_dir(str(outside))
 
-    assert first["status"] == "approval_required"
-    assert first["approvalKind"] == "sandbox_path"
-    approval_id = first["approval_id"]
-    assert len(get_approval_queue().list_pending("exec")) == 1
-
-    await _handle_exec_approval_resolve(
-        {"id": approval_id, "approved": False, "choice": "deny"},
-        SimpleNamespace(session_manager=None, config=None),
-    )
-
-    with tool_context(workspace):
-        second = json.loads(await fs.list_dir(str(outside)))
-
-    assert second["status"] == "approval_denied"
-    assert second["approval_id"] == approval_id
-    assert "user denied" in second["message"].lower()
-    assert "do not ask" in second["message"].lower()
-    assert "Add the requested path" not in second["message"]
-    assert get_approval_queue().list_pending("exec") == []
-
-
-@pytest.mark.asyncio
-async def test_denied_sandbox_path_request_can_be_requested_again_next_turn(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _disable_global_root_readonly()
-    from types import SimpleNamespace
-
-    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
-    from opensquilla.sandbox.escalation import clear_sandbox_approval_denials
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(exist_ok=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: _InlineExecutorLoop())
-
-    with tool_context(workspace):
-        first = json.loads(await fs.list_dir(str(outside)))
-
-    assert first["status"] == "approval_required"
-    approval_id = first["approval_id"]
-
-    await _handle_exec_approval_resolve(
-        {"id": approval_id, "approved": False, "choice": "deny"},
-        SimpleNamespace(session_manager=None, config=None),
-    )
-
-    with tool_context(workspace):
-        same_turn = json.loads(await fs.list_dir(str(outside)))
-
-    assert same_turn["status"] == "approval_denied"
-    assert same_turn["approval_id"] == approval_id
-
-    clear_sandbox_approval_denials("s1")
-
-    with tool_context(workspace):
-        next_turn = json.loads(await fs.list_dir(str(outside)))
-
-    assert next_turn["status"] == "approval_required"
-    assert next_turn["approval_id"] != approval_id
-
-
-@pytest.mark.asyncio
-async def test_denied_sandbox_path_request_clears_duplicate_pending_prompts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _disable_global_root_readonly()
-    from types import SimpleNamespace
-
-    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(exist_ok=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: _InlineExecutorLoop())
-
-    with tool_context(workspace):
-        first = json.loads(await fs.list_dir(str(outside)))
-        second = json.loads(await fs.list_dir(str(outside)))
-
-    assert first["status"] == "approval_required"
-    assert second["status"] == "approval_pending"
-    assert second["approval_id"] == first["approval_id"]
-    assert len(get_approval_queue().list_pending("exec")) == 1
-
-    await _handle_exec_approval_resolve(
-        {"id": first["approval_id"], "approved": False, "choice": "deny"},
-        SimpleNamespace(session_manager=None, config=None),
-    )
-
+    assert "notes.txt" in result
     assert get_approval_queue().list_pending("exec") == []
 
 
@@ -1172,6 +1078,63 @@ async def test_filesystem_write_outside_workspace_requires_explicit_elevation(
     assert payload["path"] == str(outside.resolve(strict=False))
     assert get_approval_queue().list_pending("exec") == []
     assert not outside.exists()
+
+
+@pytest.mark.asyncio
+async def test_safe_custom_deny_write_path_forces_exact_user_approval(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    protected = workspace / "protected"
+    protected.mkdir(parents=True)
+    target = protected / "credentials.json"
+    state_dir = tmp_path / "state"
+    policy = SandboxPolicy(
+        files=FilePolicySettings(
+            custom_deny_write_paths=[str(protected / "**")],
+        )
+    )
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_policy = policy
+        ctx.sandbox_gateway_config = SimpleNamespace(state_dir=str(state_dir))
+        requested = json.loads(await fs.write_file(str(target), "approved\n"))
+        assert requested["status"] == "approval_required"
+        approval_id = requested["approval_id"]
+        pending = get_approval_queue().get(approval_id)
+
+        assert pending.params["reviewer"] == "user"
+        assert pending.params["action"]["target_paths"] == [[str(target), "write"]]
+        assert not target.exists()
+
+        get_approval_queue().resolve(approval_id, True)
+        result = await fs.write_file(
+            str(target),
+            "approved\n",
+            approval_id=approval_id,
+        )
+
+    assert "Written 9 bytes" in result
+    assert target.read_text(encoding="utf-8") == "approved\n"
+    assert get_approval_queue().get(approval_id).consumed is True
+
+
+@pytest.mark.asyncio
+async def test_safe_authority_path_mutation_cannot_be_approved(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    state_dir = tmp_path / "state"
+    target = state_dir / "sessions.db"
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_policy = SandboxPolicy()
+        ctx.sandbox_gateway_config = SimpleNamespace(state_dir=str(state_dir))
+        payload = json.loads(await fs.write_file(str(target), "blocked\n"))
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "sandbox_authority_read_denied"
+    assert get_approval_queue().list_pending("exec") == []
+    assert not target.exists()
 
 
 @pytest.mark.asyncio
@@ -2005,7 +1968,7 @@ async def test_managed_shell_nested_sh_workspace_write_reaches_backend(
         ctx.sandbox_file_system_profile = profile
         result = await shell.exec_command(
             "sh -lc 'printf shell-workspace-ok > sandbox_probe_shell.txt "
-            "&& cat sandbox_probe_shell.txt && rm sandbox_probe_shell.txt'"
+            "&& cat sandbox_probe_shell.txt'"
         )
 
     assert result == "exit_code=0\nshell-workspace-ok\n"
@@ -2294,16 +2257,39 @@ async def test_apply_patch_exact_elevation_uses_digest_and_bypasses_worker(
         assert "-old" not in json.dumps(pending.params)
         get_approval_queue().resolve(approval_id, True)
 
+        backup_warning = json.loads(
+            await patch_tool.apply_patch(
+                patch=patch_text,
+                sandbox_permissions="require_escalated",
+                justification="Apply the exact one-file patch requested by the user.",
+                approval_id=approval_id,
+            )
+        )
+        assert backup_warning["status"] == "approval_required"
+        second_approval_id = backup_warning["approval_id"]
+        assert second_approval_id != approval_id
+        second_pending = get_approval_queue().get(second_approval_id)
+        assert second_pending.params["action"]["action_kind"] == (
+            "patch.apply_without_backup"
+        )
+        assert second_pending.params["action"]["display"]["backup_state"] == (
+            "unavailable_requires_confirmation"
+        )
+        assert second_pending.params["action"]["content_digest"]
+        assert "-old" not in json.dumps(second_pending.params)
+        get_approval_queue().resolve(second_approval_id, True)
+
         result = await patch_tool.apply_patch(
             patch=patch_text,
             sandbox_permissions="require_escalated",
             justification="Apply the exact one-file patch requested by the user.",
-            approval_id=approval_id,
+            approval_id=second_approval_id,
         )
 
     assert "1 file(s) modified" in result
     assert outside.read_text(encoding="utf-8") == "new\n"
     assert get_approval_queue().get(approval_id).consumed is True
+    assert get_approval_queue().get(second_approval_id).consumed is True
 
 
 @pytest.mark.asyncio
@@ -2331,13 +2317,27 @@ async def test_edit_file_exact_elevation_edits_one_outside_file(
         )
         approval_id = requested["approval_id"]
         get_approval_queue().resolve(approval_id, True)
+        backup_warning = json.loads(
+            await fs.edit_file(
+                str(outside),
+                "old value",
+                "new value",
+                sandbox_permissions="require_escalated",
+                justification="Edit the exact outside file requested by the user.",
+                approval_id=approval_id,
+            )
+        )
+        second_approval_id = backup_warning["approval_id"]
+        assert backup_warning["backup_state"] == "unavailable_requires_confirmation"
+        assert second_approval_id != approval_id
+        get_approval_queue().resolve(second_approval_id, True)
         result = await fs.edit_file(
             str(outside),
             "old value",
             "new value",
             sandbox_permissions="require_escalated",
             justification="Edit the exact outside file requested by the user.",
-            approval_id=approval_id,
+            approval_id=second_approval_id,
         )
 
     assert "Edited" in result
@@ -2371,7 +2371,7 @@ async def test_edit_source_exact_elevation_preserves_revision_contract(
         )
         approval_id = requested["approval_id"]
         get_approval_queue().resolve(approval_id, True)
-        result = json.loads(
+        backup_warning = json.loads(
             await fs.edit_source(
                 str(outside),
                 revision,
@@ -2379,6 +2379,20 @@ async def test_edit_source_exact_elevation_preserves_revision_contract(
                 sandbox_permissions="require_escalated",
                 justification="Apply the exact revision-gated edit requested by the user.",
                 approval_id=approval_id,
+            )
+        )
+        second_approval_id = backup_warning["approval_id"]
+        assert backup_warning["backup_state"] == "unavailable_requires_confirmation"
+        assert second_approval_id != approval_id
+        get_approval_queue().resolve(second_approval_id, True)
+        result = json.loads(
+            await fs.edit_source(
+                str(outside),
+                revision,
+                edits,
+                sandbox_permissions="require_escalated",
+                justification="Apply the exact revision-gated edit requested by the user.",
+                approval_id=second_approval_id,
             )
         )
 
@@ -2756,7 +2770,7 @@ async def test_trusted_run_context_read_path_outside_workspace_needs_no_mount(
 
     with tool_context(workspace, run_mode=None) as ctx:
         ctx.sandbox_run_context = RunContext(
-            run_mode=RunMode.TRUSTED,
+            run_mode=RunMode.SAFE,
             workspace=str(workspace),
         )
         result = await fs.read_file(str(target))
@@ -2832,7 +2846,7 @@ async def test_trusted_shell_powershell_read_path_outside_workspace_needs_no_mou
 
 
 @pytest.mark.asyncio
-async def test_trusted_shell_delete_existing_file_requires_elevation(
+async def test_trusted_shell_delete_existing_file_requires_destructive_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2857,10 +2871,12 @@ async def test_trusted_shell_delete_existing_file_requires_elevation(
     with tool_context(workspace, run_mode="trusted") as ctx:
         payload = json.loads(await shell.exec_command(f'del "{outside}"'))
 
-    assert payload["status"] == "elevation_required"
+    assert payload["status"] == "approval_required"
     assert payload["target"] == str(outside.resolve(strict=False))
+    assert payload["backup_state"] == "enabled"
+    assert payload["irreversible"] is False
     assert backend_calls == []
-    assert get_approval_queue().list_pending("exec") == []
+    assert len(get_approval_queue().list_pending("exec")) == 1
     assert ctx.sandbox_mounts == []
 
 
@@ -2958,7 +2974,7 @@ async def test_full_host_access_shell_write_to_protected_metadata_uses_host(
 
 
 @pytest.mark.asyncio
-async def test_trusted_shell_delete_existing_file_under_rw_mount_uses_existing_mount(
+async def test_trusted_shell_delete_under_rw_mount_still_requires_destructive_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2976,6 +2992,11 @@ async def test_trusted_shell_delete_existing_file_under_rw_mount_uses_existing_m
 
     monkeypatch.setattr(shell, "run_under_backend", fake_backend)
     monkeypatch.setattr(shell, "_windows_sandbox_backend_active", lambda runtime=None: True)
+    # This test simulates the Windows backend on a POSIX host while keeping
+    # the target as a real host fixture.  Do not remap Linux ``/tmp`` into the
+    # synthetic Windows session temp root before destructive-action parsing.
+    monkeypatch.setattr(shell, "_windows_translate_posix_tmp_references", lambda command: command)
+    monkeypatch.setattr(shell, "_windows_translate_posix_tmp_path", lambda path: path)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -2987,16 +3008,16 @@ async def test_trusted_shell_delete_existing_file_under_rw_mount_uses_existing_m
         run_mode="trusted",
         sandbox_mounts=[{"path": str(mounted.resolve(strict=False)), "access": "rw"}],
     ) as ctx:
-        result = await shell.exec_command(f'del "{outside}"')
+        payload = json.loads(await shell.exec_command(f'del "{outside}"'))
 
-    assert "exit_code=0" in result
-    assert backend_calls
-    assert get_approval_queue().list_pending("exec") == []
+    assert payload["status"] == "approval_required"
+    assert payload["target"] == str(outside.resolve(strict=False))
+    assert payload["backup_state"] == "enabled"
+    assert backend_calls == []
+    assert len(get_approval_queue().list_pending("exec")) == 1
     assert ctx.sandbox_mounts == [
         {"path": str(mounted.resolve(strict=False)), "access": "rw"},
     ]
-    request = backend_calls[0]
-    assert any(mount.host_path == mounted for mount in request.policy.mounts)
 
 
 def test_windows_shell_policy_ignores_deleted_active_file_mount(

@@ -2536,7 +2536,7 @@ async def test_direct_channel_unbound_turn_refreshes_durable_context(
         await storage.close()
 
     tool_context = runner.calls[0]["tool_context"]
-    assert tool_context.run_mode == "standard"
+    assert tool_context.run_mode == "safe"
     assert tool_context.workspace_dir == str(current_workspace.resolve())
     assert tool_context.sandbox_run_context.run_mode_source == "operator_default"
     assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [

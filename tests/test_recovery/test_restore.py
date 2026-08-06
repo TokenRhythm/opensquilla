@@ -497,7 +497,7 @@ def test_restore_post_move_unknown_state_preserves_journal_and_observed_paths(
             encoding="utf-8"
         ) == "current\n"
     report = inspect_profile(target, profile_kind="desktop-primary")
-    assert report.outcome == "recovery_required"
+    assert report.outcome == "attention"
     assert report.stable_code == "transaction_incomplete"
 
 

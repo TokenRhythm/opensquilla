@@ -54,15 +54,13 @@ def _profile(home: Path) -> None:
     )
 
 
-def test_unknown_desktop_layout_blocks_agent_before_profile_seed(
+def test_future_desktop_config_blocks_agent_before_profile_seed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "profile"
-    unknown = home / "unknown-layout"
-    unknown.mkdir(parents=True)
-    identity = unknown / "USER.md"
-    identity.write_text("synthetic preserved identity\n", encoding="utf-8")
+    home.mkdir(parents=True)
+    (home / "config.toml").write_text("config_version = 999\n", encoding="utf-8")
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
     monkeypatch.setenv("OPENSQUILLA_TEST_PROFILE_LOCK_ROOT", "1")
@@ -86,11 +84,47 @@ def test_unknown_desktop_layout_blocks_agent_before_profile_seed(
 
     assert result.exit_code == 1
     assert isinstance(result.exception, RecoveryRequiredError)
-    assert result.exception.report.stable_code == "unknown_layout"
+    assert result.exception.report.stable_code == "config_schema_too_new"
     assert agent_calls == []
-    assert identity.read_text(encoding="utf-8") == "synthetic preserved identity\n"
     assert not (home / "workspace").exists()
     assert not (home / "state").exists()
+
+
+def test_unknown_desktop_layout_warns_without_seeding_or_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """unknown_layout is a warning now: the agent starts and nothing is seeded."""
+
+    home = tmp_path / "profile"
+    unknown = home / "unknown-layout"
+    unknown.mkdir(parents=True)
+    identity = unknown / "USER.md"
+    identity.write_text("synthetic preserved identity\n", encoding="utf-8")
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    monkeypatch.setenv("OPENSQUILLA_TEST_PROFILE_LOCK_ROOT", "1")
+    monkeypatch.setenv("OPENSQUILLA_PROFILE_KIND", "desktop-primary")
+    monkeypatch.setenv("OPENSQUILLA_DESKTOP", "1")
+
+    from opensquilla.cli import main as cli_main
+
+    agent_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli_main,
+        "run_agent_command",
+        lambda **kwargs: agent_calls.append(dict(kwargs)),
+    )
+
+    result = CliRunner().invoke(
+        cli_main.app,
+        ["agent", "--message", "reaches the runtime", "--json"],
+    )
+
+    assert result.exit_code == 0
+    assert len(agent_calls) == 1
+    assert identity.read_text(encoding="utf-8") == "synthetic preserved identity\n"
+    assert not (home / "workspace").exists()
 
 
 @pytest.mark.parametrize(

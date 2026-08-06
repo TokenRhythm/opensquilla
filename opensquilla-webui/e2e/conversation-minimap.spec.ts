@@ -143,6 +143,78 @@ test.describe('Long conversation history rail', () => {
     expect(arrivalPaint.maxTransitionDuration).toBeLessThanOrEqual(0.00001)
   })
 
+  test('keeps idle markers compact until pointer hover or keyboard focus', async ({ page }) => {
+    await page.addInitScript(() => localStorage.removeItem('opensquilla.sidebar.width.v1'))
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await seedLongHistory(page)
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+
+    const thread = page.locator('.chat-thread')
+    const markers = page.getByTestId('conversation-minimap-marker')
+    await expect(markers).toHaveCount(12, { timeout: 10000 })
+
+    await thread.evaluate((element) => {
+      element.scrollTop = 0
+      element.dispatchEvent(new Event('scroll'))
+    })
+
+    const markerStyles = () => markers.evaluateAll(elements => elements.map(element => ({
+      active: element.getAttribute('aria-current') === 'location',
+      opacity: element.style.getPropertyValue('--conversation-minimap-line-opacity'),
+      scaleX: element.style.getPropertyValue('--conversation-minimap-line-scale-x'),
+      scaleY: element.style.getPropertyValue('--conversation-minimap-line-scale-y'),
+    })))
+
+    await expect.poll(markerStyles).toEqual([
+      { active: true, opacity: '1.0000', scaleX: '0.2667', scaleY: '1.0000' },
+      ...Array.from({ length: 11 }, () => ({
+        active: false,
+        opacity: '0.4500',
+        scaleX: '0.2667',
+        scaleY: '0.5000',
+      })),
+    ])
+
+    await thread.evaluate((element) => {
+      element.scrollTop = 1000
+      element.dispatchEvent(new Event('scroll'))
+    })
+    await expect.poll(async () => (
+      await markerStyles()
+    ).findIndex(marker => marker.active)).toBeGreaterThan(0)
+    expect((await markerStyles()).every(marker => marker.scaleX === '0.2667')).toBe(true)
+    const activeAfterScroll = (await markerStyles()).findIndex(marker => marker.active)
+
+    await markers.nth(5).hover()
+    await expect.poll(async () => (await markerStyles())[5]?.scaleX).toBe('1.0000')
+    const hoveredStyles = await markerStyles()
+    expect(Number(hoveredStyles[4]?.scaleX)).toBeGreaterThan(0.2667)
+    expect(hoveredStyles[activeAfterScroll]).toMatchObject({
+      active: true,
+      opacity: '1.0000',
+      scaleY: '1.0000',
+    })
+    expect(hoveredStyles[5]).toMatchObject({ active: false, opacity: '0.4500', scaleY: '0.5000' })
+
+    await page.mouse.move(700, 450)
+    await expect.poll(async () => (await markerStyles()).every(
+      marker => marker.scaleX === '0.2667',
+    )).toBe(true)
+
+    await markers.nth(6).focus()
+    await expect(markers.nth(6)).toBeFocused()
+    await expect.poll(async () => (await markerStyles())[6]?.scaleX).toBe('1.0000')
+    const focusedStyles = await markerStyles()
+    expect(Number(focusedStyles[5]?.scaleX)).toBeGreaterThan(0.2667)
+    expect(focusedStyles[activeAfterScroll]).toMatchObject({
+      active: true,
+      opacity: '1.0000',
+      scaleY: '1.0000',
+    })
+    expect(focusedStyles[6]).toMatchObject({ active: false, opacity: '0.4500', scaleY: '0.5000' })
+  })
+
   test('keeps the maximum lens clear of the centered conversation column', async ({ page }) => {
     await page.addInitScript(() => localStorage.removeItem('opensquilla.sidebar.width.v1'))
     await page.setViewportSize({ width: 1440, height: 900 })

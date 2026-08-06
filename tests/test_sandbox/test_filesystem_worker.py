@@ -4,7 +4,7 @@ import errno
 import json
 import os
 import stat
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +12,25 @@ import pytest
 
 from opensquilla.sandbox import directory_listing, filesystem_worker
 from opensquilla.sandbox.permissions import FileSystemAccess
+
+
+class _LocaleTextStream:
+    """Expose locale-dependent text I/O over inspectable raw bytes."""
+
+    def __init__(self, data: bytes = b"", *, encoding: str) -> None:
+        self.buffer = BytesIO(data)
+        self.encoding = encoding
+
+    def read(self) -> str:
+        return self.buffer.read().decode(self.encoding)
+
+    def write(self, value: str) -> int:
+        encoded = value.encode(self.encoding)
+        self.buffer.write(encoded)
+        return len(value)
+
+    def flush(self) -> None:
+        return None
 
 
 def _make_symlink(link: Path, target: Path) -> None:
@@ -63,6 +82,42 @@ def test_load_payload_retains_path_compatibility(tmp_path: Path) -> None:
     payload_path.write_text(json.dumps(expected), encoding="utf-8")
 
     assert filesystem_worker._load_payload(payload_path) == expected
+
+
+def test_load_payload_decodes_binary_stdin_as_utf8_under_gbk_locale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        "kind": "write_text",
+        "path": "C:/workspace/赛车.html",
+        "content": "完成 🏁",
+    }
+    raw = json.dumps(expected, ensure_ascii=False).encode("utf-8")
+    monkeypatch.setattr(
+        filesystem_worker.sys,
+        "stdin",
+        _LocaleTextStream(raw, encoding="gbk"),
+    )
+
+    assert filesystem_worker._load_payload("-") == expected
+
+
+def test_main_emits_utf8_json_under_gbk_locale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdin = _LocaleTextStream(b'{"kind":"probe"}', encoding="gbk")
+    stdout = _LocaleTextStream(encoding="gbk")
+    monkeypatch.setattr(filesystem_worker.sys, "stdin", stdin)
+    monkeypatch.setattr(filesystem_worker.sys, "stdout", stdout)
+    monkeypatch.setattr(
+        filesystem_worker,
+        "_run",
+        lambda _payload: {"message": "读取完成 🏁"},
+    )
+
+    filesystem_worker.main(["-"])
+
+    assert json.loads(stdout.buffer.getvalue().decode("utf-8")) == {"message": "读取完成 🏁"}
 
 
 def test_filesystem_profile_parses_optional_logical_path(tmp_path: Path) -> None:
@@ -558,6 +613,62 @@ def test_write_text_rejects_redirected_current_attachment_root(
 
     with pytest.raises(PermissionError, match="must not be a redirected path"):
         filesystem_worker._write_text(payload)
+
+    assert not target.exists()
+
+
+def test_write_text_preserves_existing_file_when_utf8_encoding_fails(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "existing.txt"
+    target.write_text("original", encoding="utf-8")
+
+    with pytest.raises(UnicodeEncodeError):
+        filesystem_worker._write_text({"path": str(target), "content": "invalid \udc80"})
+
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+def test_edit_text_preserves_existing_file_when_utf8_encoding_fails(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "existing.txt"
+    target.write_text("before", encoding="utf-8")
+
+    with pytest.raises(UnicodeEncodeError):
+        filesystem_worker._edit_text(
+            {
+                "path": str(target),
+                "oldText": "before",
+                "newText": "invalid \udc80",
+            }
+        )
+
+    assert target.read_text(encoding="utf-8") == "before"
+
+
+def test_write_text_writes_chinese_and_emoji_as_exact_utf8_bytes(tmp_path: Path) -> None:
+    target = tmp_path / "赛车.html"
+    content = "OpenSquilla 体素竞速 🏁"
+
+    filesystem_worker._write_text({"path": str(target), "content": content})
+
+    assert target.read_bytes() == content.encode("utf-8")
+
+
+def test_create_source_does_not_leave_empty_file_when_utf8_encoding_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "new.py"
+    monkeypatch.setattr(
+        filesystem_worker,
+        "_authorized_source_target",
+        lambda _payload: target,
+    )
+
+    with pytest.raises(UnicodeEncodeError):
+        filesystem_worker._create_source({"content": "invalid \udc80"})
 
     assert not target.exists()
 

@@ -7,6 +7,7 @@ import pytest
 
 from opensquilla.application.approval_queue import ApprovalQueue
 from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
     ElevationAction,
     consume_approved_elevation,
     gate_elevated_action,
@@ -45,6 +46,13 @@ def test_elevation_action_fingerprint_binds_side_effect_fields() -> None:
 def test_elevation_action_round_trips_canonical_payload() -> None:
     action = replace(
         _shell_action("touch /mnt/desktop/probe"),
+        display=ApprovalDisplay(
+            kind="delete",
+            target="/mnt/desktop/probe",
+            destructive=True,
+            irreversible=True,
+            backup_state="disabled",
+        ),
         network_targets=("example.com",),
         content_digest="sha256:abc",
         tty=True,
@@ -55,6 +63,37 @@ def test_elevation_action_round_trips_canonical_payload() -> None:
 
     assert restored == action
     assert restored.fingerprint() == action.fingerprint()
+
+
+def test_approval_display_rejects_unknown_user_facing_semantics() -> None:
+    with pytest.raises(ValueError, match="invalid_approval_display_kind"):
+        ApprovalDisplay.from_canonical_payload(
+            {
+                "kind": "sandbox_elevation",
+                "target": "/mnt/desktop/probe",
+                "destructive": True,
+                "irreversible": True,
+                "backup_state": "disabled",
+            }
+        )
+
+
+def test_elevation_fingerprint_binds_user_facing_approval_semantics() -> None:
+    action = replace(
+        _shell_action("rm /mnt/desktop/probe"),
+        display=ApprovalDisplay(
+            kind="delete",
+            target="/mnt/desktop/probe",
+            destructive=True,
+            irreversible=True,
+            backup_state="enabled",
+        ),
+    )
+
+    assert replace(
+        action,
+        display=replace(action.display, backup_state="disabled"),
+    ).fingerprint() != action.fingerprint()
 
 
 def test_request_elevation_is_non_human_actionable_for_auto_review(tmp_path: Path) -> None:

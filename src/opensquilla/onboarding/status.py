@@ -24,13 +24,16 @@ from opensquilla.onboarding.config_store import default_config_path
 from opensquilla.onboarding.image_generation_specs import (
     get_image_generation_provider_setup_spec,
 )
+from opensquilla.onboarding.image_generation_state import (
+    resolve_image_generation_state,
+)
 from opensquilla.onboarding.provider_specs import get_provider_setup_spec
 from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
 from opensquilla.onboarding.section_status import (
     FIRST_RUN_REQUIRED_SECTIONS,
     SectionStatus,
     _configured_image_generation_provider_ids,
-    _image_generation_effective_env_key,
+    _image_generation_effective_endpoint,
     _image_generation_endpoint_conflict_provider,
     _image_generation_endpoint_is_valid,
     _image_generation_has_invalid_model_reference,
@@ -49,6 +52,9 @@ from opensquilla.onboarding.section_status import (
     needs_onboarding as _needs_onboarding,
 )
 from opensquilla.provider.environment import environment_value
+from opensquilla.provider.image_generation_credentials import (
+    resolve_image_generation_credential,
+)
 from opensquilla.provider.preset_registry import get_preset
 
 
@@ -87,6 +93,9 @@ class OnboardingStatus:
     sections: dict[str, SectionStatus] = field(default_factory=dict)
     section_details: dict[str, dict[str, object]] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    # Additive read-side metadata stays optional so integrations that construct
+    # this public dataclass with the pre-feature positional shape keep working.
+    image_generation_state: dict[str, object] = field(default_factory=dict)
 
 
 _SECTION_LABELS: dict[str, str] = {
@@ -826,26 +835,31 @@ def _image_generation_provider_source(
         return "", ""
 
     provider_cfg = _image_generation_provider_config(cfg, provider_id)
-    explicit_key = getattr(provider_cfg, "api_key", "") if provider_cfg else ""
-    if explicit_key:
-        return "explicit", spec.env_key
-
-    env_key, env_is_explicit = _image_generation_effective_env_key(
-        cfg,
-        provider_id,
-        spec,
+    endpoint = _image_generation_effective_endpoint(cfg, provider_id)
+    if endpoint is None:
+        return "", ""
+    resolution = resolve_image_generation_credential(
+        provider_id=provider_id,
+        provider_config=provider_cfg,
+        default_env_key=spec.env_key,
+        default_base_url=endpoint[0],
+        effective_base_url=(
+            spec.default_base_url
+            if str(getattr(cfg.image_generation, "binding", "custom") or "custom")
+            == "follow_llm"
+            else endpoint[1]
+        ),
+        gateway_config=cfg,
+        model=str(getattr(cfg.image_generation, "primary", "") or "image-generation"),
+        include_image_credentials=(
+            str(getattr(cfg.image_generation, "binding", "custom") or "custom")
+            != "follow_llm"
+        ),
     )
-    if env_key and os.environ.get(env_key):
-        return "env", env_key
-    if env_key and env_is_explicit:
-        return (
-            "missing_env",
-            env_key,
-        )
-
-    if _image_generation_llm_key_reusable(cfg, provider_id) is True:
-        return "llm_fallback", spec.env_key
-    return "", env_key or str(getattr(spec, "env_key", "") or "").strip()
+    return (
+        resolution.source if resolution.source != "none" else "",
+        resolution.env_key or spec.env_key,
+    )
 
 
 def _image_generation_annotations(
@@ -1094,6 +1108,13 @@ def get_onboarding_status(
         )
 
     llm_profile_status = _llm_profile_status(config, probe_history=probe_history)
+    image_generation_state = resolve_image_generation_state(
+        config,
+        configured=image_status is SectionStatus.OK,
+        resolved_provider_id=image_provider,
+        credential_source=image_source,
+        section_status=image_status.value,
+    )
     return OnboardingStatus(
         config_path=str(path),
         has_config=has_config,
@@ -1110,6 +1131,7 @@ def get_onboarding_status(
         image_generation_provider=image_provider,
         image_generation_primary=image_primary,
         image_generation_env_key=image_env_key,
+        image_generation_state=image_generation_state,
         audio_configured=audio_status is SectionStatus.OK,
         audio_enabled=bool(getattr(config.audio, "enabled", False)),
         audio_source=audio_source,

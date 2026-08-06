@@ -34,7 +34,7 @@ class SkillRequires:
 class SkillInstallSpec:
     """How to install a skill's dependencies."""
 
-    kind: str = ""  # brew | node | go | uv | download
+    kind: str = ""  # brew | node | go | uv | download | toolchain
     id: str = ""
     label: str = ""
     bins: list[str] = field(default_factory=list)

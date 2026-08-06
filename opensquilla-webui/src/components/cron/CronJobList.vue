@@ -49,10 +49,17 @@
             {{ job.enabled ? nextRunText(job, now) : t('cronSkills.list.paused') }}
           </span>
         </div>
+        <div class="cron-card__workspace" :class="{ 'is-unavailable': workspaceUnavailable(job) }">
+          <Icon name="folder" :size="14" />
+          <span>{{ workspaceLabel(job) }}</span>
+          <button v-if="workspaceUnavailable(job)" class="cron-workspace-rebind" type="button" @click="emit('edit', job)">
+            {{ t('cronSkills.list.rebindWorkspace') }}
+          </button>
+        </div>
         <footer class="cron-card__actions">
-          <button class="cron-iconbtn cron-iconbtn--accent" :aria-label="t('cronSkills.list.runNow')" :title="t('cronSkills.list.runNow')" :disabled="runningJobIds.has(job.id)" @click="emit('run', job.id)">
+          <button class="cron-iconbtn cron-iconbtn--accent" :aria-label="runActionLabel(job)" :title="runActionLabel(job)" :disabled="runningJobIds.has(job.id) || workspaceUnavailable(job)" @click="emit('run', job.id)">
             <span v-if="runningJobIds.has(job.id)" class="cron-spinner" aria-hidden="true"></span>
-            <Icon v-else name="send" :size="15" />
+            <Icon v-else :name="isJobFailed(job) ? 'refresh' : 'send'" :size="15" />
 
           </button>
           <button class="cron-iconbtn" :aria-label="t('cronSkills.list.edit')" :title="t('cronSkills.list.edit')" @click="emit('edit', job)">
@@ -84,9 +91,14 @@
             <td v-if="bulkMode" class="cron-table__check"><input class="cron-bulk-check" type="checkbox" :checked="selectedJobIds.has(job.id)" :aria-label="t('cronSkills.list.selectJob', { name: displayJobName(job) })" @change="emit('toggle-selection', job.id)"></td>
             <td class="cron-table__task"><div class="cron-table__task-content"><span class="cron-card__dot" :class="dotClass(job)" /><button class="cron-link" @click="emit('select', job.id)">{{ displayJobName(job) }}</button></div></td>
             <td class="cron-table__schedule"><div class="cron-table__schedule-content"><Icon name="clock" :size="14" /><span>{{ explainCron(job.expression || '') || job.expression || job.schedule || '—' }}</span></div></td>
+            <td class="cron-table__workspace" :class="{ 'is-unavailable': workspaceUnavailable(job) }">
+              <Icon name="folder" :size="14" />
+              <span>{{ workspaceLabel(job) }}</span>
+              <button v-if="workspaceUnavailable(job)" class="cron-workspace-rebind" type="button" @click="emit('edit', job)">{{ t('cronSkills.list.rebindWorkspace') }}</button>
+            </td>
             <td class="cron-table__time cron-table__next">{{ job.enabled ? nextRunText(job, now) : t('cronSkills.list.paused') }}</td>
             <td class="cron-table__actions"><div class="cron-table__actions-content">
-              <button class="cron-iconbtn cron-iconbtn--sm cron-iconbtn--accent" :aria-label="runningJobIds.has(job.id) ? t('cronSkills.list.running') : t('cronSkills.list.runNow')" :title="runningJobIds.has(job.id) ? t('cronSkills.list.running') : t('cronSkills.list.runNow')" :disabled="runningJobIds.has(job.id)" @click="emit('run', job.id)"><span v-if="runningJobIds.has(job.id)" class="cron-spinner" aria-hidden="true"></span><Icon v-else name="send" :size="14" /></button>
+              <button class="cron-iconbtn cron-iconbtn--sm cron-iconbtn--accent" :aria-label="runActionLabel(job)" :title="runActionLabel(job)" :disabled="runningJobIds.has(job.id) || workspaceUnavailable(job)" @click="emit('run', job.id)"><span v-if="runningJobIds.has(job.id)" class="cron-spinner" aria-hidden="true"></span><Icon v-else :name="isJobFailed(job) ? 'refresh' : 'send'" :size="14" /></button>
               <button class="cron-iconbtn cron-iconbtn--sm" :aria-label="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" :title="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" @click="emit('toggle', job)"><Icon :name="job.enabled ? 'pause' : 'play'" :size="14" /></button>
               <button class="cron-iconbtn cron-iconbtn--sm" :aria-label="t('cronSkills.list.edit')" :title="t('cronSkills.list.edit')" @click="emit('edit', job)"><Icon name="edit" :size="14" /></button>
               <button class="cron-iconbtn cron-iconbtn--sm cron-iconbtn--danger" :aria-label="t('cronSkills.list.delete')" :title="t('cronSkills.list.delete')" @click="emit('delete', job)"><Icon name="trash" :size="14" /></button>
@@ -104,13 +116,14 @@ import { useI18n } from 'vue-i18n'
 import { localizedCronJobName } from '@/utils/cron/templateNames'
 import Icon from '@/components/Icon.vue'
 import type { CronJob, CronPanelTemplate } from '@/types/cron'
+import type { ProjectWorkspaceItem } from '@/composables/useProjectWorkspaces'
 import { explainCron } from '@/utils/cron/schedule'
-import { dotClass, isImminent, nextRunText } from '@/composables/cron/useCronJobs'
+import { dotClass, isImminent, isJobFailed, nextRunText } from '@/composables/cron/useCronJobs'
 
 const { t } = useI18n()
 const displayJobName = (job: CronJob) => localizedCronJobName(job.name, job.id, t)
 
-defineProps<{
+const props = defineProps<{
   jobs: CronJob[]
   totalJobs: number
   searchText: string
@@ -122,6 +135,8 @@ defineProps<{
   runningJobIds: Set<string>
   bulkMode: boolean
   selectedJobIds: Set<string>
+  projectWorkspaces: ProjectWorkspaceItem[]
+  projectWorkspacesLoaded: boolean
 }>()
 
 const emit = defineEmits<{
@@ -140,9 +155,29 @@ const emit = defineEmits<{
 const tableCols = computed(() => [
   { key: 'name', label: t('cronSkills.list.colName') },
   { key: 'expression', label: t('cronSkills.list.colSchedule') },
+  { key: 'workspace', label: t('cronSkills.list.colWorkspace') },
   { key: 'next_run', label: t('cronSkills.list.colNextRun') },
   { key: '_actions', label: '' },
 ])
 const sortableCols = ['name', 'expression']
+
+function workspaceUnavailable(job: CronJob): boolean {
+  if (!job.workspaceId || !props.projectWorkspacesLoaded) return false
+  const workspace = props.projectWorkspaces.find(item => item.id === job.workspaceId)
+  return !workspace || !workspace.available
+}
+
+function workspaceLabel(job: CronJob): string {
+  const name = job.workspaceName || t('cronSkills.list.noWorkspace')
+  return workspaceUnavailable(job)
+    ? t('cronSkills.list.workspaceUnavailable', { name })
+    : name
+}
+
+function runActionLabel(job: CronJob): string {
+  if (workspaceUnavailable(job)) return t('cronSkills.list.rebindBeforeRun')
+  if (props.runningJobIds.has(job.id)) return t('cronSkills.list.running')
+  return isJobFailed(job) ? t('cronSkills.list.retry') : t('cronSkills.list.runNow')
+}
 
 </script>

@@ -300,6 +300,28 @@ class _FakeTranscriptSessionManager(_FakeSessionManager):
         return self._transcript
 
 
+class _FakeIndexedSessionManager(_FakeSessionManager):
+    def __init__(self, sessions):
+        super().__init__(sessions)
+        self.list_calls = 0
+        self.get_calls = []
+
+    async def list_sessions(self):
+        self.list_calls += 1
+        return await super().list_sessions()
+
+    async def get_session(self, session_key):
+        self.get_calls.append(session_key)
+        return next(
+            (
+                session
+                for session in self._sessions
+                if getattr(session, "session_key", None) == session_key
+            ),
+            None,
+        )
+
+
 def test_usage_status_session_manager_path_reads_cache_fields() -> None:
     """When session_manager has records, getattr on cache_read/cache_write must flow through."""
     session = SimpleNamespace(
@@ -327,6 +349,61 @@ def test_usage_status_session_manager_path_reads_cache_fields() -> None:
     assert row["billedCostUsd"] == 0.0
     assert row["costSource"] == "opensquilla_estimate"
     assert row["costEphemeral"] is False
+
+
+def test_usage_status_requested_session_uses_indexed_lookup_without_scanning_all_sessions() -> None:
+    requested_key = "agent:webchat:requested"
+    sessions = [
+        SimpleNamespace(
+            session_key=requested_key,
+            status="running",
+            input_tokens=500,
+            output_tokens=20,
+            context_tokens=100,
+            model="claude-opus-4-7",
+        ),
+        *[
+            SimpleNamespace(
+                session_key=f"agent:webchat:historical-{index}",
+                status="finished",
+                input_tokens=index,
+                output_tokens=1,
+                context_tokens=10,
+                model="claude-opus-4-7",
+            )
+            for index in range(250)
+        ],
+    ]
+    manager = _FakeIndexedSessionManager(sessions)
+    tracker = UsageTracker()
+    tracker.add(
+        requested_key,
+        input_tokens=500,
+        output_tokens=20,
+        model_id="claude-opus-4-7",
+    )
+    tracker.add(
+        "agent:webchat:historical-249",
+        input_tokens=249,
+        output_tokens=1,
+        model_id="claude-opus-4-7",
+    )
+
+    payload = asyncio.run(
+        _handle_usage_status(
+            {"sessionKey": requested_key},
+            _ctx(
+                session_manager=manager,
+                usage_tracker=tracker,
+            ),
+        )
+    )
+
+    assert manager.get_calls == [requested_key]
+    assert manager.list_calls == 0
+    assert payload["totalSessions"] == 1
+    assert payload["activeSessions"] == 1
+    assert [row["session"] for row in payload["sessions"]] == [requested_key]
 
 
 def test_usage_status_reports_context_pressure_from_session_context_not_lifetime_usage() -> None:

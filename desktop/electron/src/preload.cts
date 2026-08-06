@@ -17,6 +17,9 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   resetDesktopSettings: () => ipcRenderer.invoke('desktop:settings:reset'),
   getDesktopPreferences: () => ipcRenderer.invoke('desktop:preferences:get'),
   saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
+  reportSandboxUnavailable: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:sandbox:unavailable', payload)
+  ),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   chooseProjectDirectory: (payload: unknown) => (
@@ -64,7 +67,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   recoverProfileTransaction: () => ipcRenderer.invoke('desktop:recovery:recover-transaction'),
   revealRecoveryPath: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:reveal-path', payload),
   copyRecoveryDiagnostics: () => ipcRenderer.invoke('desktop:recovery:copy-diagnostics'),
-  abandonCleanupTransaction: () => ipcRenderer.invoke('desktop:recovery:abandon-cleanup'),
+  openLatestDownloadPage: () => ipcRenderer.invoke('desktop:recovery:open-download'),
   inspectDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:inspect', payload),
   discardDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:discard', payload),
   applyDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:apply', payload),

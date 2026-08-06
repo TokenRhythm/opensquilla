@@ -3138,7 +3138,7 @@ def test_post_move_unknown_state_preserves_journal_and_all_observed_paths(
         target,
         profile_kind="desktop-primary",
     )
-    assert inspected.outcome == "recovery_required"
+    assert inspected.outcome == "attention"
     assert inspected.stable_code == "transaction_incomplete"
 
 
@@ -3238,7 +3238,7 @@ def test_windows_lock_reacquire_failure_preserves_profile_transaction(
         target,
         profile_kind="desktop-primary",
     )
-    assert inspected.outcome == "recovery_required"
+    assert inspected.outcome == "attention"
     assert inspected.stable_code == "transaction_incomplete"
 
 
@@ -3668,7 +3668,7 @@ def test_committed_journal_cannot_bypass_missing_history(
 
     inspected = recovery_module.inspect_profile(target, profile_kind="desktop-primary")
 
-    assert inspected.outcome == "recovery_required"
+    assert inspected.outcome == "attention"
     assert inspected.stable_code == "transaction_incomplete"
 
 

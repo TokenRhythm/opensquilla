@@ -147,6 +147,30 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.notifyMessagePending).toHaveBeenCalledOnce()
   })
 
+  it('blocks edit while streaming with visible feedback instead of a silent no-op', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+    options.isStreaming.value = true
+    const notifyEditBlocked = vi.fn()
+    options.notifyEditBlocked = notifyEditBlocked
+
+    api.editMessage(renderedMessage({
+      role: 'user',
+      displayRole: 'user',
+      sourceIndex: 0,
+      messageId: 'msg-A',
+      text: 'A',
+    }))
+
+    expect(options.messages.value.map(message => message.text)).toEqual(['A'])
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.focusComposer).not.toHaveBeenCalled()
+    expect(notifyEditBlocked).toHaveBeenCalledOnce()
+  })
+
   it('does not regenerate as a parent send when the durable fork id is missing', async () => {
     const messages: ChatMessage[] = [
       { role: 'user', text: 'still saving', ts: null, clientId: 'client-only' },
@@ -309,6 +333,57 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
 
     expect(copyTextWithFallback).toHaveBeenCalledWith(
       'Implementation complete.\n\nAI generated',
+    )
+  })
+
+  it('copies only the terminal answer from an ordinary tool transcript', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Checking.\n\nPreparing.\n\n---\n\n## Final answer',
+      timelineItems: [
+        { type: 'text', key: 'work', html: 'Checking.', rawText: 'Checking.' },
+        {
+          type: 'tool-group',
+          key: 'request',
+          group: {
+            groupId: 'request',
+            operationKey: 'web.read',
+            label: 'Read',
+            iconName: 'search',
+            calls: [{
+              toolId: 'request',
+              renderKey: 'request',
+              name: 'http_request',
+              displayName: 'Request',
+              inputRaw: '{}',
+              inputPreview: '',
+              isRunning: false,
+              status: 'success',
+              isError: false,
+              result: 'ok',
+              resultPreview: 'ok',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: false,
+            status: 'success',
+          },
+        },
+        {
+          type: 'text',
+          key: 'terminal',
+          html: 'Preparing.<hr><h2>Final answer</h2>',
+          rawText: 'Preparing.\n\n---\n\n## Final answer',
+        },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith(
+      '## Final answer\n\nAI generated',
     )
   })
 })

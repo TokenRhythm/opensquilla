@@ -9,7 +9,7 @@ from pathlib import Path
 from opensquilla.bootstrap_types import BootstrapFileReport
 from opensquilla.paths import native_io_path, state_dir
 from opensquilla.safety.injection_guard import InjectionFinding, scan_for_injection
-from opensquilla.session.keys import is_subagent_key
+from opensquilla.session.keys import is_guest_webchat_key, is_subagent_key
 
 # Matches YYYY-MM-DD.md or YYYY-MM-DD-<slug>.md (basename).
 _DATED_BASENAME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:-[a-z0-9][a-z0-9-]*)?\.md")
@@ -63,6 +63,8 @@ def _bootstrap_allowlist_for_session(session_key: str | None) -> frozenset[str] 
         return None
 
     key = session_key.lower()
+    if is_guest_webchat_key(key):
+        return frozenset()
     if is_subagent_key(key):
         return _SUBAGENT_BOOTSTRAP_ALLOWLIST
     if key.startswith("cron:"):

@@ -6,11 +6,17 @@ from dataclasses import dataclass
 from typing import Literal
 
 from opensquilla.sandbox.default_allowlist import default_allowlist_source
-from opensquilla.sandbox.domain_validation import domain_matches, validate_domain_pattern
+from opensquilla.sandbox.domain_validation import (
+    domain_matches,
+    policy_domain_matches,
+    validate_domain_pattern,
+    validate_policy_domain_pattern,
+)
 from opensquilla.sandbox.package_bundles import (
     DEFAULT_PACKAGE_BUNDLE_IDS,
     expand_package_bundle,
 )
+from opensquilla.sandbox.policy_models import SandboxPolicy
 from opensquilla.sandbox.run_context import PublicNetworkGrant, RunContext
 from opensquilla.sandbox.run_mode import RunMode
 
@@ -24,26 +30,99 @@ class NetworkDecision:
     reason: str
     source: str | None
 
+    @property
+    def allowed(self) -> bool:
+        return self.status == "allow"
 
-def decide_network_access(host: str, context: RunContext) -> NetworkDecision:
+    @property
+    def code(self) -> str:
+        return self.reason
+
+
+def _metadata_or_validation_reason(normalized: str, reason: str) -> str:
+    metadata_hosts = {
+        "169.254.169.254",
+        "metadata.google.internal",
+        "metadata.azure.internal",
+    }
+    return "metadata_blocked" if normalized in metadata_hosts else reason
+
+
+def _rule_specificity(pattern: str) -> tuple[int, int, int]:
+    decision = validate_policy_domain_pattern(pattern)
+    if decision.status != "allowed":
+        return (-1, -1, -1)
+    normalized = decision.normalized
+    exact = int(not normalized.startswith("*."))
+    suffix = normalized[2:] if not exact else normalized
+    return (exact, suffix.count(".") + 1, len(suffix))
+
+
+def _best_policy_rule(host: str, rules: list[str]) -> tuple[str, tuple[int, int, int]] | None:
+    matches = [
+        (rule, _rule_specificity(rule))
+        for rule in rules
+        if policy_domain_matches(rule, host)
+    ]
+    return max(matches, key=lambda item: item[1], default=None)
+
+
+def _policy_network_decision(
+    host: str,
+    policy: SandboxPolicy,
+) -> NetworkDecision | None:
+    allow = _best_policy_rule(host, policy.network.allow_domains)
+    deny = _best_policy_rule(host, policy.network.deny_domains)
+    if allow is not None or deny is not None:
+        if deny is not None and (allow is None or deny[1] >= allow[1]):
+            return NetworkDecision(
+                status="block",
+                normalized_host=host,
+                reason="policy_domain_denied",
+                source=f"deny:{deny[0]}",
+            )
+        if allow is not None:
+            return NetworkDecision(
+                status="allow",
+                normalized_host=host,
+                reason="policy_domain_allowed",
+                source=f"allow:{allow[0]}",
+            )
+    if policy.network.block_all_network:
+        return NetworkDecision(
+            status="block",
+            normalized_host=host,
+            reason="policy_block_all",
+            source="policy:block_all",
+        )
+    return None
+
+
+def decide_network_access(
+    host: str,
+    context: RunContext,
+    policy: SandboxPolicy | None = None,
+) -> NetworkDecision:
+    if context.run_mode == RunMode.FULL:
+        return NetworkDecision(
+            status="allow",
+            normalized_host=str(host),
+            reason="full_host_access",
+            source="run_mode:full",
+        )
     validation = validate_domain_pattern(host)
     if validation.status == "blocked":
         return NetworkDecision(
             status="block",
             normalized_host=validation.normalized,
-            reason=validation.reason,
+            reason=_metadata_or_validation_reason(
+                validation.normalized,
+                validation.reason,
+            ),
             source="validation",
         )
 
     normalized_host = validation.normalized
-    if context.run_mode == RunMode.FULL:
-        return NetworkDecision(
-            status="allow",
-            normalized_host=normalized_host,
-            reason="full_host_access",
-            source="run_mode:full",
-        )
-
     if "*" in normalized_host:
         return NetworkDecision(
             status="block",
@@ -51,6 +130,11 @@ def decide_network_access(host: str, context: RunContext) -> NetworkDecision:
             reason="invalid_domain",
             source="validation",
         )
+
+    stored_policy = policy or SandboxPolicy()
+    policy_decision = _policy_network_decision(normalized_host, stored_policy)
+    if policy_decision is not None:
+        return policy_decision
 
     disabled_bundle_ids = {
         grant.bundle_id for grant in context.bundles if grant.source == "disabled"
@@ -83,17 +167,6 @@ def decide_network_access(host: str, context: RunContext) -> NetworkDecision:
                     source=f"bundle:{bundle_grant.bundle_id}",
                 )
 
-    if context.run_mode == RunMode.TRUSTED and _is_recognized_default_host(
-        normalized_host,
-        disabled_bundle_ids=disabled_bundle_ids,
-    ):
-        return NetworkDecision(
-            status="allow",
-            normalized_host=normalized_host,
-            reason="auto_trusted",
-            source="auto_trusted:chat",
-        )
-
     default_source = default_allowlist_source(normalized_host)
     if default_source is not None:
         return NetworkDecision(
@@ -125,12 +198,12 @@ def decide_network_access(host: str, context: RunContext) -> NetworkDecision:
             source=f"public_network:{scope}",
         )
 
-    if context.run_mode == RunMode.TRUSTED:
+    if context.run_mode == RunMode.SAFE:
         return NetworkDecision(
             status="allow",
             normalized_host=normalized_host,
-            reason="auto_trusted",
-            source="auto_trusted:chat",
+            reason="public_default",
+            source="policy:default_open",
         )
 
     return NetworkDecision(

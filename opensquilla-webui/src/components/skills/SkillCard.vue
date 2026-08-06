@@ -14,6 +14,13 @@
       <span v-else-if="isMetaSkill(skill)" class="sk-card__kind-badge" title="meta">META</span>
     </div>
     <p class="sk-card__desc" :title="skill.description || ''">{{ skill.description || '' }}</p>
+    <span
+      v-if="skillProviderCheckAtLaunch(skill)"
+      class="sk-card__provider-status"
+      :title="skillStatusChipText(skill)"
+    >
+      {{ skillStatusChipText(skill) }}
+    </span>
     <div class="sk-card__deps" :aria-label="t('cronSkills.skillCard.dependencies')">
       <span class="sk-card__dep" :title="t('cronSkills.skillCard.pythonCount', { count: dependencyCounts.python })">
         <span aria-hidden="true">PY</span> {{ dependencyCounts.python }}
@@ -54,6 +61,8 @@ import type { Skill } from '@/types/skills'
 import {
   isMetaSkill,
   skillDependencyCounts,
+  skillProviderCheckAtLaunch,
+  skillStatusChipText,
   skillStatusDotClass,
   skillStatusDotTitle,
 } from '@/composables/skills/useSkillsCatalog'

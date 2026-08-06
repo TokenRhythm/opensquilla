@@ -30,7 +30,9 @@ from opensquilla.profile_import_io import (
     BoundProfileReadError,
     capture_bound_profile_directory,
     capture_bound_profile_file,
+    is_path_redirecting_stat,
     native_io_path,
+    reparse_tag_redirects,
 )
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -93,10 +95,7 @@ class _WindowsSecurityAttributes(ctypes.Structure):
 
 
 def _is_link_or_reparse(value: os.stat_result) -> bool:
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    return stat.S_ISLNK(value.st_mode) or bool(
-        attributes & _FILE_ATTRIBUTE_REPARSE_POINT
-    )
+    return is_path_redirecting_stat(value)
 
 
 def _private_windows_sddl(user_sid: str, *, directory: bool) -> str:
@@ -274,7 +273,10 @@ class _CtypesWindowsPrivateAcl:
                 int.from_bytes(bytes(file_id.file_id.identifier), "little"),
             )
             if (
-                file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+                (
+                    file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+                    and reparse_tag_redirects(int(attributes.reparse_tag))
+                )
                 or is_directory != directory
                 or (
                     expected_inode

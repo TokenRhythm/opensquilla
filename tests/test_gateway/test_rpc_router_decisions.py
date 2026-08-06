@@ -533,7 +533,7 @@ def test_feedback_handler_is_dormant_static() -> None:
     the routing engines themselves, and the self-learning mutation surfaces
     (training, promotion pointer writes, sample writes).
     """
-    source = Path("src/opensquilla/gateway/rpc_router.py").read_text()
+    source = Path("src/opensquilla/gateway/rpc_router.py").read_text(encoding="utf-8")
     assert "RoutingHistoryStore" not in source
     import_lines = [
         line.strip()

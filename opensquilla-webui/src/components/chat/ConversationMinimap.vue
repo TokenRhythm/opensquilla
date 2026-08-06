@@ -90,9 +90,10 @@ const EXIT_SCROLL_RANGE_RATIO = 1
 // not mount/unmount the rail on every sub-pixel wobble around one boundary.
 // A fresh rail must reach the enter threshold; once visible it is allowed to
 // remain until the conversation pane crosses the lower exit threshold.
-// The rail's 30px lens starts 14px from the shell edge; its focus ring reaches
-// another 4px. At the 1104px floor, the shared 980px conversation column still
-// leaves a stable gap after accounting for the thread's scrollbar gutter.
+// The rail's 30px interactive lens starts 14px from the shell edge; its focus
+// ring reaches another 4px. At the 1104px floor, the shared 980px conversation
+// column still leaves a stable gap after accounting for the thread's scrollbar
+// gutter.
 // Enter a little later than that floor so live sidebar resizing cannot flicker
 // the rail at the exact collision boundary.
 const ENTER_INLINE_SIZE = 1120
@@ -135,7 +136,6 @@ const listRef = ref<HTMLElement | null>(null)
 const tooltipRef = ref<HTMLElement | null>(null)
 const markerRefs = ref<HTMLButtonElement[]>([])
 const activeIndex = ref(0)
-const activeProgress = ref(0)
 const hoveredIndex = ref<number | null>(null)
 const focusedIndex = ref<number | null>(null)
 const pointerLensIndex = ref<number | null>(null)
@@ -199,11 +199,10 @@ const previewTurn = computed(() => {
   const index = previewIndex.value
   return index === null ? null : turns.value[index] || null
 })
-const visualFocusIndex = computed(() => (
+const visualFocusIndex = computed<number | null>(() => (
   pointerLensIndex.value
   ?? focusedIndex.value
   ?? hoveredIndex.value
-  ?? activeProgress.value
 ))
 
 function truncatePreview(text: string): string {
@@ -216,15 +215,19 @@ function setMarkerRef(el: Element | ComponentPublicInstance | null, index: numbe
 }
 
 function markerStyle(index: number): Record<string, string> {
-  const distance = Math.abs(index - visualFocusIndex.value)
-  const influence = Math.exp(-(distance * distance) / (2 * LENS_SIGMA * LENS_SIGMA))
-  const scaleX = MIN_LINE_SCALE_X + (1 - MIN_LINE_SCALE_X) * influence
-  const scaleY = MIN_LINE_SCALE_Y + (1 - MIN_LINE_SCALE_Y) * influence
-  const opacity = MIN_LINE_OPACITY + (1 - MIN_LINE_OPACITY) * influence
+  const isActive = index === activeIndex.value
+  const focusIndex = visualFocusIndex.value
+  let scaleX = MIN_LINE_SCALE_X
+  if (focusIndex !== null) {
+    const distance = Math.abs(index - focusIndex)
+    const influence = Math.exp(-(distance * distance) / (2 * LENS_SIGMA * LENS_SIGMA))
+    scaleX += (1 - MIN_LINE_SCALE_X) * influence
+  }
+
   return {
     '--conversation-minimap-line-scale-x': scaleX.toFixed(4),
-    '--conversation-minimap-line-scale-y': scaleY.toFixed(4),
-    '--conversation-minimap-line-opacity': opacity.toFixed(4),
+    '--conversation-minimap-line-scale-y': (isActive ? 1 : MIN_LINE_SCALE_Y).toFixed(4),
+    '--conversation-minimap-line-opacity': (isActive ? 1 : MIN_LINE_OPACITY).toFixed(4),
   }
 }
 
@@ -283,16 +286,13 @@ function updateActiveTurn() {
   const offsets = anchorOffsets.value
   if (!container || offsets.length === 0) {
     activeIndex.value = 0
-    activeProgress.value = 0
     return
   }
 
   const bottomGap = container.scrollHeight - container.scrollTop - container.clientHeight
   let nextIndex = 0
-  let nextProgress = 0
   if (bottomGap <= 2) {
     nextIndex = offsets.length - 1
-    nextProgress = nextIndex
   } else {
     const readingLine = container.scrollTop + Math.min(180, container.clientHeight * 0.3)
     let low = 0
@@ -306,16 +306,8 @@ function updateActiveTurn() {
         high = mid - 1
       }
     }
-    nextProgress = nextIndex
-    const nextOffset = offsets[nextIndex + 1]
-    const currentOffset = offsets[nextIndex]
-    if (Number.isFinite(currentOffset) && Number.isFinite(nextOffset) && nextOffset > currentOffset) {
-      const segmentProgress = Math.min(1, Math.max(0, (readingLine - currentOffset) / (nextOffset - currentOffset)))
-      nextProgress += segmentProgress
-    }
   }
 
-  activeProgress.value = nextProgress
   if (nextIndex !== activeIndex.value) {
     activeIndex.value = nextIndex
     void nextTick(keepActiveMarkerVisible)
@@ -597,7 +589,6 @@ function navigateTo(index: number, focusTarget = false) {
   }
   emit('navigate', index)
   activeIndex.value = index
-  activeProgress.value = index
   if (focusTarget) anchor.focus({ preventScroll: true })
   if (distance <= ARRIVAL_TOLERANCE_PX) {
     showArrivalHighlight(anchor)
@@ -642,7 +633,7 @@ function onListPointerMove(event: PointerEvent) {
       if (Math.abs(pitch) >= 1) {
         nextLensIndex = (pendingPointerClientY - firstCenter) / pitch
       } else {
-        nextLensIndex = hoveredIndex.value ?? activeProgress.value
+        nextLensIndex = hoveredIndex.value ?? focusedIndex.value ?? activeIndex.value
       }
     }
     pointerLensIndex.value = Math.min(turns.value.length - 1, Math.max(0, nextLensIndex))
@@ -704,7 +695,6 @@ watch(() => props.sessionKey, () => {
   clearArrivalHighlight()
   hasLongHistory.value = false
   activeIndex.value = 0
-  activeProgress.value = 0
   hoveredIndex.value = null
   focusedIndex.value = null
   pointerLensIndex.value = null
@@ -723,7 +713,6 @@ watch(turns, (nextTurns, previousTurns) => {
   hoveredIndex.value = remap(hoveredIndex.value)
   focusedIndex.value = remap(focusedIndex.value)
   activeIndex.value = remap(activeIndex.value) ?? 0
-  activeProgress.value = activeIndex.value
   pointerLensIndex.value = null
   markerRefs.value = []
   void nextTick(() => {

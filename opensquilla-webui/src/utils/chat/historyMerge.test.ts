@@ -89,6 +89,50 @@ describe('mergeLiveOnlyFields', () => {
     ])
   })
 
+  it('keeps live task phases when history only adds a durable compaction marker', () => {
+    const merged = mergeLiveOnlyFields(
+      msg({
+        statusHistory: [
+          { action: 'inspect', label: 'Inspecting', at: 1_000 },
+          {
+            action: 'context_compaction',
+            label: 'Organizing context',
+            category: 'maintenance',
+            id: 'compact-1',
+            state: 'running',
+            at: 1_500,
+          },
+          { action: 'write', label: 'Writing', at: 2_000 },
+        ],
+      }),
+      msg({
+        statusHistory: [{
+          action: 'context_compaction',
+          label: 'Context organized',
+          category: 'maintenance',
+          id: 'compact-1',
+          state: 'completed',
+          durability: 'durable',
+          at: 1_800,
+        }],
+      }),
+    )
+
+    expect(merged.statusHistory).toEqual([
+      { action: 'inspect', label: 'Inspecting', at: 1_000 },
+      {
+        action: 'context_compaction',
+        label: 'Context organized',
+        category: 'maintenance',
+        id: 'compact-1',
+        state: 'completed',
+        durability: 'durable',
+        at: 1_500,
+      },
+      { action: 'write', label: 'Writing', at: 2_000 },
+    ])
+  })
+
   it('keeps routerSettled sticky once it has settled', () => {
     expect(mergeLiveOnlyFields(msg({ routerSettled: true }), msg({ routerSettled: undefined })).routerSettled).toBe(true)
   })

@@ -387,9 +387,9 @@ full reference.
 
 ## Installation Privacy
 
-OpenSquilla uses anonymous installation telemetry to estimate install counts,
-version adoption, and runtime compatibility. Data is sent on first gateway
-startup and once per OpenSquilla version. It also records content-free daily
+OpenSquilla uses pseudonymous installation telemetry to estimate install
+counts, version adoption, and runtime compatibility. Data is sent on first
+gateway startup and once per OpenSquilla version. It also records content-free daily
 aggregates of completed top-level conversations and token usage by UTC date,
 and attempts to upload pending cumulative UTC-day snapshots to the telemetry
 service at startup and once per hour. OpenSquilla may also make
@@ -418,6 +418,15 @@ The `install_id` is a local one-way SHA-256 digest derived from usable MAC
 addresses, then local IP addresses when no MAC is available, with a random
 persisted fallback. Raw MAC/IP values are not uploaded.
 
+By default, requests sent directly to the official TokenRhythm HTTPS API may
+also carry the same pseudonymous, cross-session installation identifier in the
+optional `X-OpenSquilla-Install-Id` header. Only the exact official
+`tokenrhythm.studio` and `api.tokenrhythm.studio` HTTPS hosts on port 443 are
+eligible; custom proxies, OpenRouter, other providers, browser pages,
+redirected nonofficial targets, and returned image/CDN downloads are excluded.
+The raw MAC/IP values are never sent. The header is omitted if its background
+resolution is not ready or fails, so requests continue normally.
+
 What is not sent: usernames, hostnames, paths, API keys, provider config,
 chat/session/memory/agent content, file names, or file contents. Source IP may
 be visible to HTTP servers at the transport layer, but is not part of the
@@ -437,12 +446,14 @@ disable_network_observability = true
 ```
 
 That unified switch covers automatic install telemetry, daily aggregate usage
-telemetry, passive update checks,
-and automatic desktop update checks at startup and during long-running app
-sessions. Explicit update-availability checks remain disabled while the unified
-or legacy opt-out is active. Other user-initiated actions may still contact
-network services after user intent, including release downloads and configured
-providers, search, or channels.
+telemetry, passive update checks, and automatic desktop update checks at
+startup and during long-running app sessions, as well as the TokenRhythm
+installation header. Explicit update-availability checks remain disabled while
+the unified or legacy opt-out is active. CI and test environments also
+suppress the installation header and installation telemetry automatically.
+Other user-initiated actions may still
+contact network services after user intent, including release downloads and
+configured providers, search, or channels.
 
 Legacy opt-out environment variables remain honored:
 
@@ -450,6 +461,13 @@ Legacy opt-out environment variables remain honored:
 OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
+
+The legacy telemetry opt-out suppresses the TokenRhythm installation header;
+the update-check opt-out by itself does not. TokenRhythm must treat the header
+as optional and untrusted, and must not use it for authentication,
+authorization, billing, rate limiting, or anti-abuse decisions. See
+[`PRIVACY.md`](PRIVACY.md#tokenrhythm-installation-identifier) for the complete
+target and data-handling rules.
 
 Advanced deployments can use their own installation telemetry endpoint:
 

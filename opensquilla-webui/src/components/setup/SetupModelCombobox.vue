@@ -69,7 +69,9 @@ const fieldTooltipId = computed(() => `${fieldId.value}-info-tooltip`)
 
 const query = computed(() => String(props.value || '').trim().toLowerCase())
 const catalogAvailable = computed(() => (
-  !props.disabled && props.modelSource === 'live' && props.models.length > 0
+  !props.disabled
+  && (props.modelSource === 'live' || props.modelSource === 'catalog')
+  && props.models.length > 0
 ))
 const describedBy = computed(() => {
   const ids: string[] = []
@@ -118,12 +120,14 @@ const activeOptionId = computed(() => {
   return showFreeTextRow.value ? freeTextOptionId.value : undefined
 })
 
-// Muted provenance footer (progressive disclosure): where the list and the
-// per-model metadata came from, once, instead of per-row badges. Empty (and
-// hidden) unless the list really is live and at least one row names a source —
-// the copy asserts "live list from the provider".
+// Muted provenance footer (progressive disclosure): explain metadata sourcing
+// once instead of repeating it in every row. Metadata-aware gateways get the
+// published/catalog copy; older gateways keep the capability-source fallback.
 const provenance = computed(() => {
   if (props.modelSource !== 'live') return ''
+  if (props.models.some(model => model.metadata?.schemaVersion === 1)) {
+    return t('setup.provider.modelMetadataProvenance')
+  }
   const sources = Array.from(new Set(props.models.map(model => model.capabilitySource).filter(Boolean)))
   if (!sources.length) return ''
   return t('setup.provider.modelProvenance', { sources: sources.join(', ') })
@@ -139,16 +143,63 @@ function compactTokens(count: number | null): string {
   return String(count)
 }
 
-function rowMeta(model: DiscoveredModel): string {
-  const parts: string[] = []
-  const ctx = compactTokens(model.contextWindow)
-  if (ctx) parts.push(ctx)
-  const maxOutput = compactTokens(model.maxOutputTokens)
-  if (maxOutput) {
-    parts.push(t('setup.provider.modelMaxOutput', { tokens: maxOutput }))
+interface ModelRowMetric {
+  kind: 'context' | 'output'
+  tokens: string
+  shortLabel: string
+  accessibleLabel: string
+}
+
+const NORMAL_MODEL_STATUSES = new Set(['active', 'available', 'online', 'ready'])
+
+function rowMetrics(model: DiscoveredModel): ModelRowMetric[] {
+  const metrics: ModelRowMetric[] = []
+  const published = model.metadata?.schemaVersion === 1 ? model.metadata.published : null
+  const publishedContext = compactTokens(published?.contextWindow ?? null)
+  const ctx = publishedContext || compactTokens(model.contextWindow)
+  if (ctx) {
+    metrics.push({
+      kind: 'context',
+      tokens: ctx,
+      shortLabel: t('setup.provider.modelContextShort'),
+      accessibleLabel: t(
+        publishedContext
+          ? 'setup.provider.modelPublishedContext'
+          : 'setup.provider.modelCatalogContext',
+        { tokens: ctx },
+      ),
+    })
   }
-  parts.push(...model.capabilities.filter(cap => cap !== 'chat').slice(0, 3))
-  return parts.join(' · ')
+  const publishedMaxOutput = compactTokens(published?.maxOutputTokens ?? null)
+  const maxOutput = publishedMaxOutput || compactTokens(model.maxOutputTokens)
+  if (maxOutput) {
+    metrics.push({
+      kind: 'output',
+      tokens: maxOutput,
+      shortLabel: t('setup.provider.modelOutputShort'),
+      accessibleLabel: t(
+        publishedMaxOutput
+          ? 'setup.provider.modelPublishedMaxOutput'
+          : 'setup.provider.modelCatalogMaxOutput',
+        { tokens: maxOutput },
+      ),
+    })
+  }
+  return metrics
+}
+
+function rowStatus(model: DiscoveredModel): string {
+  const metadata = model.metadata?.schemaVersion === 1 ? model.metadata : null
+  const status = String(metadata?.published?.status || metadata?.declared?.status || '').trim()
+  const normalized = status.toLowerCase()
+  if (!normalized || NORMAL_MODEL_STATUSES.has(normalized)) return ''
+  if (normalized === 'testing') return t('setup.provider.modelStatusTesting')
+  if (normalized === 'offline') return t('setup.provider.modelStatusOffline')
+  return status
+}
+
+function usesCatalogOnlyMetadata(model: DiscoveredModel): boolean {
+  return model.metadata?.schemaVersion === 1 && model.metadata.published === null
 }
 
 function modelOptionId(index: number): string {
@@ -344,7 +395,14 @@ function onKeydown(event: KeyboardEvent) {
         :aria-activedescendant="catalogAvailable ? activeOptionId : undefined"
         :aria-describedby="describedBy"
         :aria-label="cell ? field.label : undefined"
-        autocomplete="off"
+        autocomplete="one-time-code"
+        autocapitalize="off"
+        data-1p-ignore
+        data-bwignore
+        data-form-type="other"
+        data-lpignore="true"
+        data-protonpass-ignore="true"
+        spellcheck="false"
         :disabled="disabled"
         :value="value"
         :placeholder="field.placeholder || t('setup.provider.modelSearchOrCustom')"
@@ -411,19 +469,54 @@ function onKeydown(event: KeyboardEvent) {
             >
               <span class="setup-model-combobox__identity">
                 <span class="setup-model-combobox__id" :title="model.id">{{ model.id }}</span>
-                <span
-                  v-if="model.name && model.name !== model.id"
-                  class="setup-model-combobox__name"
-                  :title="model.name"
-                >
-                  {{ model.name }}
+                <span class="setup-model-combobox__subline">
+                  <span
+                    v-if="model.name && model.name !== model.id"
+                    class="setup-model-combobox__name"
+                    :title="model.name"
+                  >
+                    {{ model.name }}
+                  </span>
+                  <span
+                    v-if="rowStatus(model)"
+                    class="setup-model-combobox__badge setup-model-combobox__badge--status"
+                  >
+                    {{ rowStatus(model) }}
+                  </span>
+                  <span
+                    v-if="usesCatalogOnlyMetadata(model)"
+                    class="setup-model-combobox__badge setup-model-combobox__badge--catalog"
+                  >
+                    {{ t('setup.provider.modelCatalogValue') }}
+                  </span>
                 </span>
               </span>
               <span class="setup-model-combobox__aside">
-                <span v-if="rowMeta(model)" class="setup-model-combobox__meta">{{ rowMeta(model) }}</span>
+                <span v-if="rowMetrics(model).length" class="setup-model-combobox__meta">
+                  <template v-for="(metric, metricIndex) in rowMetrics(model)" :key="metric.kind">
+                    <span
+                      v-if="metricIndex > 0"
+                      class="setup-model-combobox__metric-separator"
+                      aria-hidden="true"
+                    >·</span>
+                    <span class="setup-model-combobox__metric" :title="metric.accessibleLabel">
+                      <span class="setup-model-combobox__sr-only">
+                        {{ metric.accessibleLabel }}
+                      </span>
+                      <span class="setup-model-combobox__metric-label" aria-hidden="true">
+                        {{ metric.shortLabel }}
+                      </span>
+                      <span class="setup-model-combobox__metric-value" aria-hidden="true">
+                        {{ metric.tokens }}
+                      </span>
+                    </span>
+                  </template>
+                </span>
                 <span v-if="model.id === selectedId" class="setup-model-combobox__selected">
-                  <Icon name="check" :size="12" />
-                  {{ t('setup.provider.modelSelected') }}
+                  <Icon name="check" :size="12" aria-hidden="true" />
+                  <span class="setup-model-combobox__sr-only">
+                    {{ t('setup.provider.modelSelected') }}
+                  </span>
                 </span>
               </span>
             </button>
@@ -689,25 +782,40 @@ function onKeydown(event: KeyboardEvent) {
   min-width: 0;
 }
 
+.setup-model-combobox__subline {
+  align-items: center;
+  display: flex;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.setup-model-combobox__subline:empty {
+  display: none;
+}
+
 .setup-model-combobox__name {
   color: var(--text-dim);
   display: block;
+  flex: 0 1 auto;
   font-size: var(--fs-xs);
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .setup-model-combobox__meta {
+  align-items: center;
   color: var(--text-dim);
+  display: inline-flex;
   font-size: var(--fs-xs);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  gap: var(--sp-1);
+  min-width: 0;
 }
 
 .setup-model-combobox__aside,
-.setup-model-combobox__selected {
+.setup-model-combobox__selected,
+.setup-model-combobox__metric {
   align-items: center;
   display: inline-flex;
   gap: var(--sp-1);
@@ -715,14 +823,44 @@ function onKeydown(event: KeyboardEvent) {
 
 .setup-model-combobox__aside {
   justify-self: end;
-  max-width: 230px;
   min-width: 0;
 }
 
 .setup-model-combobox__selected {
   color: var(--accent);
+  flex: 0 0 auto;
   font-size: var(--fs-xs);
+}
+
+.setup-model-combobox__metric,
+.setup-model-combobox__metric-value {
   white-space: nowrap;
+}
+
+.setup-model-combobox__metric-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.setup-model-combobox__metric-separator {
+  color: var(--border-strong);
+}
+
+.setup-model-combobox__badge {
+  border-radius: var(--radius-pill);
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  padding: 1px var(--sp-1);
+  white-space: nowrap;
+}
+
+.setup-model-combobox__badge--status {
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn);
+}
+
+.setup-model-combobox__badge--catalog {
+  background: var(--bg-hover);
+  color: var(--text-dim);
 }
 
 .setup-model-combobox__footer {
@@ -731,6 +869,12 @@ function onKeydown(event: KeyboardEvent) {
   font-size: var(--fs-xs);
   padding: var(--sp-1) var(--sp-3);
   flex-shrink: 0;
+}
+
+@media (max-width: 520px) {
+  .setup-model-combobox__metric-label {
+    display: none;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

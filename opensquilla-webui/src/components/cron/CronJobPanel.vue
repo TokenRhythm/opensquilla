@@ -52,6 +52,32 @@
               <select id="cp-payload-kind-simple" v-model="form.payloadKind" class="cron-field__input" @change="emit('payloadKindChange')"><option value="reminder">{{ t('cronSkills.panel.modeReminder') }}</option><option value="agent_turn">{{ t('cronSkills.panel.modeAgentTurn') }}</option><option value="system_event">{{ t('cronSkills.panel.modeSystemEvent') }}</option></select>
               <div class="cron-field__hint">{{ jobModeHint }}</div>
             </div>
+            <div v-if="form.payloadKind === 'agent_turn'" class="cron-field">
+              <label class="cron-field__label" for="cp-workspace">
+                {{ t('cronSkills.panel.projectWorkspace') }}
+                <span v-if="form.workspaceRequired" aria-hidden="true">*</span>
+              </label>
+              <select
+                id="cp-workspace"
+                v-model="form.workspaceId"
+                class="cron-field__input"
+                :required="form.workspaceRequired"
+                :disabled="projectWorkspacesLoading"
+              >
+                <option value="" :disabled="form.workspaceRequired">{{ t('cronSkills.panel.noWorkspace') }}</option>
+                <option
+                  v-for="workspace in projectWorkspaces"
+                  :key="workspace.id"
+                  :value="workspace.id"
+                  :disabled="!workspace.available"
+                >
+                  {{ workspace.name }}{{ workspace.available ? '' : ` · ${t('cronSkills.panel.workspaceUnavailable')}` }}
+                </option>
+              </select>
+              <div class="cron-field__hint">
+                {{ form.workspaceRequired ? t('cronSkills.panel.workspaceRequiredHint') : t('cronSkills.panel.workspaceOptionalHint') }}
+              </div>
+            </div>
             <div class="cron-field"><label class="cron-field__label" for="cp-message">{{ messageLabel }}</label><textarea id="cp-message" v-model="form.message" class="cron-field__input cron-field__input--textarea" rows="4" :placeholder="t('cronSkills.panel.friendlyMessagePlaceholder')" /></div>
             <details ref="runtimeSettingsRef" class="cron-advanced cron-advanced--runtime">
               <summary class="cron-advanced__summary">{{ t('cronSkills.panel.moreRuntimeSettings') }}</summary>
@@ -171,6 +197,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import type { CronJob, CronJobFormModel } from '@/types/cron'
+import type { ProjectWorkspaceItem } from '@/types/rpc'
 import {
   atScheduleValueFromLocalInput,
   localDateTimeInputValue,
@@ -192,6 +219,8 @@ const props = defineProps<{
   targetSessionLabel: string
   targetSessionHint: string
   messageLabel: string
+  projectWorkspaces: ProjectWorkspaceItem[]
+  projectWorkspacesLoading: boolean
 }>()
 
 const form = defineModel<CronJobFormModel>('form', { required: true })

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { computed, ref } from 'vue'
 import {
   buildImagePayload,
+  buildSearchPayload,
   imageModelForDisplay,
   imageModelRefForPayload,
   parseImageFallbacks,
@@ -26,8 +27,8 @@ const imageProviders = [
 ]
 
 const baseValues = {
-  providerId: 'openrouter',
   enabled: true,
+  providerId: 'openrouter',
   primary: 'google/gemini-3.1-flash-image-preview',
   apiKey: '',
   apiKeyEnv: '',
@@ -154,6 +155,11 @@ describe('buildImagePayload', () => {
     expect(payload.credentialMode).toBe('direct')
   })
 
+  it('sends the explicit enabled state', () => {
+    expect(buildImagePayload(baseValues).enabled).toBe(true)
+    expect(buildImagePayload({ ...baseValues, enabled: false }).enabled).toBe(false)
+  })
+
   it('adds a credential mode only when a credential field was edited', () => {
     const untouched = buildImagePayload({
       ...baseValues,
@@ -175,7 +181,208 @@ describe('buildImagePayload', () => {
   })
 })
 
+describe('buildSearchPayload', () => {
+  it('preserves hidden advanced values but never sends inline and env keys together', () => {
+    const payload = buildSearchPayload({
+      providerId: 'brave',
+      apiKey: 'test-inline-key',
+      apiKeyEnv: 'BRAVE_SEARCH_API_KEY',
+      maxResults: 17,
+      proxy: 'http://127.0.0.1:7890',
+      useEnvProxy: true,
+      fallbackPolicy: 'network',
+      diagnostics: true,
+    })
+
+    expect(payload).toMatchObject({
+      providerId: 'brave',
+      apiKey: 'test-inline-key',
+      maxResults: 17,
+      proxy: 'http://127.0.0.1:7890',
+      useEnvProxy: true,
+      fallbackPolicy: 'network',
+      diagnostics: true,
+    })
+    expect(payload).not.toHaveProperty('apiKeyEnv')
+  })
+})
+
+describe('useSetupCapabilitiesForm search provider switching', () => {
+  const searchProviders = [
+    { providerId: 'duckduckgo', requiresApiKey: false },
+    { providerId: 'brave', requiresApiKey: true, envKey: 'BRAVE_SEARCH_API_KEY' },
+    { providerId: 'tavily', requiresApiKey: true, envKey: 'TAVILY_API_KEY' },
+  ]
+
+  it('preserves a saved env reference until the provider is changed', () => {
+    const form = useSetupCapabilitiesForm()
+    form.initSearchFromConfig({
+      search_provider: 'brave',
+      search_api_key_env: 'CUSTOM_BRAVE_KEY',
+    }, searchProviders)
+
+    expect(form.searchPayload().apiKeyEnv).toBe('CUSTOM_BRAVE_KEY')
+
+    form.updateField('search', 'provider', 'tavily')
+    form.onSearchProviderChange(searchProviders[2])
+
+    expect(form.searchPayload()).not.toHaveProperty('apiKeyEnv')
+    expect(form.searchPayload()).not.toHaveProperty('apiKey')
+  })
+
+  it('does not silently configure a hidden env reference for a new keyed provider', () => {
+    const form = useSetupCapabilitiesForm()
+    form.initSearchFromConfig({}, searchProviders)
+
+    form.updateField('search', 'provider', 'brave')
+    form.onSearchProviderChange(searchProviders[1])
+
+    expect(form.searchPayload()).not.toHaveProperty('apiKeyEnv')
+  })
+})
+
 describe('useSetupCapabilitiesForm image hydration', () => {
+  it('enables the server recommendation and reuses a profile credential without a key field', () => {
+    const form = useSetupCapabilitiesForm()
+    const tokenRhythm = {
+      providerId: 'tokenrhythm',
+      envKey: 'TOKENRHYTHM_API_KEY',
+      requiresApiKey: true,
+      defaultBaseUrl: 'https://tokenrhythm.studio/v1',
+      defaultModel: 'qwen-image-2.0',
+    }
+
+    form.initImageFromConfig({}, {
+      imageGenerationEnabled: false,
+      imageGenerationState: {
+        mode: 'unconfigured',
+        recommendation: { providerId: 'tokenrhythm' },
+        credentialOptions: [{
+          providerId: 'tokenrhythm',
+          available: true,
+          source: 'llm_fallback',
+          owner: 'profile',
+          kind: 'direct',
+        }],
+      },
+    }, [...imageProviders, tokenRhythm])
+
+    form.updateField('image', 'enabled', true)
+
+    expect(form.selectedImageProvider.value).toBe('tokenrhythm')
+    expect(form.imageCredentialSourceValue.value).toBe('llm_fallback')
+    expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imagePayload()).toMatchObject({
+      enabled: true,
+      providerId: 'tokenrhythm',
+      primary: 'tokenrhythm/qwen-image-2.0',
+    })
+    expect(form.imagePayload()).not.toHaveProperty('credentialMode')
+    expect(form.imagePayload()).not.toHaveProperty('apiKey')
+    expect(form.imagePayload()).not.toHaveProperty('apiKeyEnv')
+  })
+
+  it('disables image generation without discarding its provider draft', () => {
+    const form = useSetupCapabilitiesForm()
+    form.initImageFromConfig({}, {
+      imageGenerationEnabled: true,
+      imageGenerationState: {
+        mode: 'custom',
+        effective: {
+          providerId: 'openrouter',
+          primary: 'openrouter/google/gemini-3.1-flash-image-preview',
+        },
+      },
+    }, imageProviders)
+
+    form.updateField('image', 'enabled', false)
+
+    expect(form.imagePayload()).toMatchObject({
+      enabled: false,
+      providerId: 'openrouter',
+      primary: 'openrouter/google/gemini-3.1-flash-image-preview',
+    })
+  })
+
+  it('keeps a server-declared unconfigured capability unselected and pristine', () => {
+    const form = useSetupCapabilitiesForm()
+
+    form.initImageFromConfig({}, {
+      // Legacy fields can contain schema defaults. The additive state is
+      // authoritative and prevents that default from becoming a fake choice.
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+      imageGenerationState: {
+        mode: 'unconfigured',
+        effective: {
+          providerId: '',
+          primary: '',
+        },
+      },
+    }, imageProviders)
+
+    expect(form.selectedImageProvider.value).toBe('')
+    expect(form.imagePrimaryValue.value).toBe('')
+    expect(form.imageDirty.value).toBe(false)
+  })
+
+  it('uses additive persisted state before stale legacy credential status', () => {
+    const form = useSetupCapabilitiesForm()
+
+    form.initImageFromConfig({}, {
+      imageGenerationProvider: 'openai',
+      imageGenerationPrimary: 'openai/gpt-image-1',
+      imageGenerationState: {
+        mode: 'custom',
+        effective: {
+          providerId: 'openrouter',
+          primary: 'openrouter/google/gemini-3.1-flash-image-preview',
+        },
+      },
+    }, imageProviders)
+
+    expect(form.selectedImageProvider.value).toBe('openrouter')
+    expect(form.imagePrimaryValue.value).toBe('google/gemini-3.1-flash-image-preview')
+  })
+
+  it('creates a dirty provider draft only after a recommendation is accepted', () => {
+    const form = useSetupCapabilitiesForm()
+    const tokenRhythm = {
+      providerId: 'tokenrhythm',
+      envKey: 'TOKENRHYTHM_API_KEY',
+      requiresApiKey: true,
+      defaultBaseUrl: 'https://tokenrhythm.studio/api/v1',
+      defaultModel: 'tokenrhythm/qwen-image-2.0',
+    }
+
+    form.initImageFromConfig({
+      image_generation: {
+        // config.get materializes this schema default even when the variable
+        // is absent. It must not masquerade as a working saved credential.
+        providers: {
+          tokenrhythm: { api_key_env: 'TOKENRHYTHM_API_KEY' },
+        },
+      },
+    }, {
+      imageGenerationState: { mode: 'unconfigured' },
+    }, [...imageProviders, tokenRhythm])
+    expect(form.imageDirty.value).toBe(false)
+
+    form.onImageProviderChange(tokenRhythm)
+
+    expect(form.selectedImageProvider.value).toBe('tokenrhythm')
+    expect(form.imageIsEnabled.value).toBe(true)
+    expect(form.imagePrimaryValue.value).toBe('qwen-image-2.0')
+    expect(form.imageCredentialSourceValue.value).toBe('none')
+    expect(form.imageDirty.value).toBe(true)
+    expect(form.imagePayload()).toMatchObject({
+      providerId: 'tokenrhythm',
+      primary: 'tokenrhythm/qwen-image-2.0',
+    })
+    expect(form.imagePayload()).not.toHaveProperty('apiKey')
+    expect(form.imagePayload()).not.toHaveProperty('apiKeyEnv')
+  })
+
   it('uses the primary provider over a stale credential-provider status', () => {
     const form = useSetupCapabilitiesForm()
 
@@ -208,6 +415,7 @@ describe('useSetupCapabilitiesForm image hydration', () => {
     }, imageProviders)
 
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('explicit')
     expect(form.imageApiKeyValue.value).toBe('')
     expect(form.imageApiKeyEnvValue.value).toBe('')
     expect(form.imagePayload()).not.toHaveProperty('apiKey')
@@ -224,12 +432,21 @@ function stubPanelContext() {
   const flag = computed(() => false)
   const list = computed(() => [] as string[])
   const providers = computed(() => [] as Array<{ providerId: string; label: string }>)
+  const imageModels = computed(() => [])
   return {
     searchProviders: providers,
     memoryProviders: providers,
     imageProviders: providers,
     imageSpec: computed(() => null),
+    imageRecommendation: computed(() => null),
+    imageCredentialOptions: computed(() => []),
+    imageModels,
+    imageModelSource: computed(() => 'none'),
     searchRequiresKey: flag,
+    searchKeyPlaceholder: text,
+    searchDraftDirty: flag,
+    searchDraftMissingKey: flag,
+    searchDraftStatusText: text,
     searchEnvPlaceholder: text,
     searchAdvancedOpen: flag,
     searchNeeds: list,
@@ -246,13 +463,15 @@ function stubPanelContext() {
     memoryEnvPlaceholder: text,
     memoryNeeds: list,
     memoryStatusText: text,
+    memoryModeTitle: text,
+    memoryModeDescription: text,
+    memoryExpandable: flag,
     memoryEnvCommand: text,
     imageNeeds: list,
     imageStatusText: text,
     imageEnvCommand: text,
     capabilityBadgeTone: () => '',
     capabilityBadgeLabel: () => '',
-    capabilitySaveButtonClass: () => '',
     memoryAutoCapture: ref(false),
     audioEnabled: ref(false),
     audioApiKey: ref(''),
@@ -265,6 +484,8 @@ function stubPanelContext() {
     audioBadgeTone: text,
     audioBadgeLabel: text,
     audioKeyPlaceholder: text,
+    resettable: () => false,
+    resetPending: ref<'search' | 'memory_embedding' | 'image_generation' | 'audio' | ''>(''),
   }
 }
 
@@ -281,12 +502,15 @@ describe('useSetupCapabilitiesForm image key state', () => {
       imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
     }, imageProviders)
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('explicit')
 
     form.onImageProviderChange(imageProviders[0])
     expect(form.imageKeyConfiguredValue.value).toBe(false)
+    expect(form.imageCredentialSourceValue.value).toBe('none')
 
     form.onImageProviderChange(imageProviders[1])
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('explicit')
   })
 
   it('exposes the stored-key state on the panel without ever exposing the key', () => {
@@ -303,10 +527,12 @@ describe('useSetupCapabilitiesForm image key state', () => {
     const panel = form.createPanel(stubPanelContext())
 
     expect(panel.value.form.imageKeyConfigured).toBe(true)
+    expect(panel.value.form.imageCredentialSource).toBe('explicit')
     expect(panel.value.form.imageApiKey).toBe('')
 
     form.onImageProviderChange(imageProviders[0])
     expect(panel.value.form.imageKeyConfigured).toBe(false)
+    expect(panel.value.form.imageCredentialSource).toBe('none')
     expect(panel.value.form.imageApiKey).toBe('')
   })
 
@@ -323,6 +549,7 @@ describe('useSetupCapabilitiesForm image key state', () => {
     }, imageProviders)
 
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('env')
     // The env reference stays editable; only the direct key is write-only.
     expect(form.imageApiKeyEnvValue.value).toBe('CUSTOM_OPENROUTER_ENV')
   })
@@ -338,11 +565,37 @@ describe('useSetupCapabilitiesForm image key state', () => {
       imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
     }, imageProviders)
     expect(form.imageKeyConfiguredValue.value).toBe(true)
+    expect(form.imageCredentialSourceValue.value).toBe('configured')
 
     // The status describes the active provider; another provider without any
     // stored credential is honestly not configured.
     form.onImageProviderChange(imageProviders[0])
     expect(form.imageKeyConfiguredValue.value).toBe(false)
+    expect(form.imageCredentialSourceValue.value).toBe('none')
+  })
+
+  it('exposes backend credential-source detail for reusable and broken credentials', () => {
+    const reusable = useSetupCapabilitiesForm()
+    reusable.initImageFromConfig({}, {
+      imageGenerationConfigured: true,
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+      imageGenerationSource: 'llm_fallback',
+    }, imageProviders)
+
+    expect(reusable.imageKeyConfiguredValue.value).toBe(true)
+    expect(reusable.imageCredentialSourceValue.value).toBe('llm_fallback')
+
+    const broken = useSetupCapabilitiesForm()
+    broken.initImageFromConfig({}, {
+      imageGenerationConfigured: false,
+      imageGenerationProvider: 'openrouter',
+      imageGenerationPrimary: 'openrouter/google/gemini-3.1-flash-image-preview',
+      imageGenerationSource: 'missing_env',
+    }, imageProviders)
+
+    expect(broken.imageKeyConfiguredValue.value).toBe(false)
+    expect(broken.imageCredentialSourceValue.value).toBe('missing_env')
   })
 })
 

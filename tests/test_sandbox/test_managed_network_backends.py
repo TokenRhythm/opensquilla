@@ -848,7 +848,7 @@ async def test_run_under_backend_populates_proxy_from_current_run_context(
     runtime = SimpleNamespace(backend=FakeBackend())
     policy = _policy(tmp_path, network_proxy=None)
     run_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         domains=(DomainGrant(domain="allowed.test"),),
     )
     envelope = build_cli_route_envelope(
@@ -1044,7 +1044,7 @@ async def test_windows_proxy_allowlist_starts_proxy_on_allowed_marker_port(
     )
 
     policy = _policy(tmp_path, network_proxy=None)
-    run_context = RunContext(run_mode=RunMode.TRUSTED)
+    run_context = RunContext(run_mode=RunMode.SAFE)
     envelope = build_cli_route_envelope(
         session_key="agent:main:webchat:abc",
         run_mode="trusted",

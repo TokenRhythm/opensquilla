@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
@@ -529,16 +530,64 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
 
     console.print(f"[{ACCENT}]compacting context...[/]")
     config = slash_services.config
-    context_window = (
+    configured_context_cap = (
         getattr(config, "context_budget_tokens", 100_000) if config is not None else 100_000
     )
-    compaction_config = build_compaction_config_from_provider(
-        _resolve_compaction_provider(
+    session = None
+    if slash_services.get_session is not None:
+        try:
+            session = await _maybe_await(
+                slash_services.get_session(context.session_key)
+            )
+        except Exception:  # noqa: BLE001 - target fallback remains isolated
+            session = None
+    if session is None:
+        session = SimpleNamespace(
+            session_key=context.session_key,
+            model=context.model,
+            model_override=None,
+            model_provider=None,
+            provider_override=None,
+        )
+    from opensquilla.gateway.compaction_target import (
+        build_gateway_consumer_admission,
+        limit_gateway_consumer_budget,
+        resolve_gateway_compaction_target,
+        resolve_gateway_consumer_budget,
+    )
+
+    gateway_context = SimpleNamespace(
+        config=config,
+        provider_selector=slash_services.provider_selector,
+    )
+    consumer_budget = resolve_gateway_consumer_budget(
+        gateway_context,
+        session,
+    )
+    consumer_budget = limit_gateway_consumer_budget(
+        consumer_budget,
+        max(1, int(configured_context_cap or 1)),
+    )
+    context_window = consumer_budget.context_window_tokens
+    consumer_admission, consumer_admission_fingerprint = (
+        build_gateway_consumer_admission(consumer_budget)
+    )
+    target = resolve_gateway_compaction_target(
+        gateway_context,
+        session,
+    )
+    compaction_provider = target.provider
+    if compaction_provider is None and not target.blocked_reason:
+        compaction_provider = _resolve_compaction_provider(
             slash_services.provider_selector,
             context.model,
-        ),
-        model_override=context.model,
+        )
+    compaction_config = build_compaction_config_from_provider(
+        compaction_provider,
+        model_override=target.model or context.model,
         compaction_config=getattr(config, "compaction", None),
+        compaction_plan=target.plan,
+        context_window_tokens=context_window,
     )
     try:
         if compact_with_result is not None:
@@ -570,6 +619,28 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
                 for parameter in parameters
             ):
                 compact_kwargs["trigger_reason"] = "manual"
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "context_window_chars"
+                for parameter in parameters
+            ):
+                compact_kwargs["context_window_chars"] = (
+                    consumer_budget.provider_request_max_chars
+                )
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "consumer_admission"
+                for parameter in parameters
+            ):
+                compact_kwargs["consumer_admission"] = consumer_admission
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "consumer_admission_fingerprint"
+                for parameter in parameters
+            ):
+                compact_kwargs["consumer_admission_fingerprint"] = (
+                    consumer_admission_fingerprint
+                )
             result = await compact_with_result(
                 context.session_key,
                 context_window,

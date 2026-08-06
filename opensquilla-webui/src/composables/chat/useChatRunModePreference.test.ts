@@ -22,12 +22,14 @@ function runInScope(
   policy: ReturnType<typeof ref<RunModePolicy | null>>,
   rpc = createRpc(),
   hydrateCallOptions?: RpcCallOptions,
+  writeCallOptions?: RpcCallOptions,
 ) {
   const scope = effectScope()
   const api = scope.run(() => useChatRunModePreference({
     runModePolicy: () => policy.value,
     rpc,
     hydrateCallOptions,
+    writeCallOptions,
   }))!
   return { api, scope, rpc }
 }
@@ -38,10 +40,20 @@ afterEach(() => {
 })
 
 describe('useChatRunModePreference', () => {
+  it('starts in Full Access before the principal policy arrives', () => {
+    const policy = ref<RunModePolicy | null>(null)
+
+    const { api, scope } = runInScope(policy)
+
+    expect(api.runMode.value).toBe('full')
+    expect(api.runModeUserSelected.value).toBe(false)
+    scope.stop()
+  })
+
   it('uses policy default on a fresh browser with no saved user preference', () => {
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
 
     const { api, scope } = runInScope(policy)
@@ -55,12 +67,13 @@ describe('useChatRunModePreference', () => {
     localStorage.setItem(RUN_MODE_STORAGE_KEY, 'trusted')
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
 
     const { api, scope } = runInScope(policy)
 
-    expect(api.runMode.value).toBe('trusted')
+    expect(api.runMode.value).toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     expect(api.runModeUserSelected.value).toBe(true)
     scope.stop()
   })
@@ -69,7 +82,7 @@ describe('useChatRunModePreference', () => {
     localStorage.setItem(RUN_MODE_STORAGE_KEY, 'standard')
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
     const rpc = createRpc()
     const hydrateCallOptions: RpcCallOptions = {
@@ -95,41 +108,82 @@ describe('useChatRunModePreference', () => {
         abortAction: 'reconnect',
       },
     )
-    expect(api.runMode.value).toBe('trusted')
-    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('trusted')
+    expect(api.runMode.value).toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
   })
 
   it('persists manual selections through the backend before updating cache', async () => {
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
     const rpc = createRpc()
-    rpc.call.mockResolvedValueOnce({ runMode: 'standard', source: 'preference' })
+    rpc.call.mockResolvedValueOnce({ runMode: 'safe', source: 'preference' })
     const { api, scope } = runInScope(policy, rpc)
 
-    const selected = await api.setGlobalRunMode('standard')
+    const selected = await api.setGlobalRunMode('safe')
 
-    expect(selected).toBe('standard')
+    expect(selected).toBe('safe')
     expect(rpc.call).toHaveBeenCalledWith('sandbox.run_mode.preference.set', {
-      runMode: 'standard',
+      runMode: 'safe',
     })
-    expect(api.runMode.value).toBe('standard')
-    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('standard')
+    expect(api.runMode.value).toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
+    scope.stop()
+  })
+
+  it('updates the visible selection immediately while persistence is pending', async () => {
+    const policy = ref<RunModePolicy | null>({
+      defaultRunMode: 'full',
+      allowedRunModes: ['safe', 'full'],
+    })
+    const rpc = createRpc()
+    let resolveWrite!: (payload: unknown) => void
+    rpc.call.mockReturnValueOnce(new Promise(resolve => {
+      resolveWrite = resolve
+    }))
+    const writeCallOptions: RpcCallOptions = {
+      timeoutMs: 5_000,
+      timeoutAction: 'reject',
+      abortAction: 'reject',
+    }
+    const { api, scope } = runInScope(policy, rpc, undefined, writeCallOptions)
+
+    const pending = api.setGlobalRunMode('safe')
+
+    expect(api.runMode.value).toBe('safe')
+    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+      5_000,
+      undefined,
+      {
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      },
+    )
+    await Promise.resolve()
+    expect(rpc.call).toHaveBeenCalledWith(
+      'sandbox.run_mode.preference.set',
+      { runMode: 'safe' },
+      writeCallOptions,
+    )
+
+    resolveWrite({ runMode: 'trusted', source: 'preference' })
+    await expect(pending).resolves.toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
   })
 
   it('keeps the confirmed preference when a backend write fails', async () => {
     const policy = ref<RunModePolicy | null>({
       defaultRunMode: 'full',
-      allowedRunModes: ['standard', 'trusted', 'full'],
+      allowedRunModes: ['safe', 'full'],
     })
     const rpc = createRpc()
     rpc.call.mockRejectedValueOnce(new Error('write failed'))
     const { api, scope } = runInScope(policy, rpc)
 
-    await expect(api.setGlobalRunMode('standard')).rejects.toThrow('write failed')
+    await expect(api.setGlobalRunMode('safe')).rejects.toThrow('write failed')
 
     expect(api.runMode.value).toBe('full')
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBeNull()
@@ -145,8 +199,8 @@ describe('useChatRunModePreference', () => {
 
     api.applyRunModePreferenceChanged({ runMode: 'full' })
 
-    expect(api.runMode.value).toBe('trusted')
-    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('trusted')
+    expect(api.runMode.value).toBe('safe')
+    expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBe('safe')
     scope.stop()
   })
 
@@ -159,7 +213,7 @@ describe('useChatRunModePreference', () => {
 
     const { api, scope } = runInScope(policy)
 
-    expect(api.runMode.value).toBe('trusted')
+    expect(api.runMode.value).toBe('safe')
     expect(api.runModeUserSelected.value).toBe(false)
     expect(localStorage.getItem(RUN_MODE_STORAGE_KEY)).toBeNull()
     scope.stop()
@@ -177,13 +231,13 @@ describe('persistMaterializedSessionRunMode', () => {
       rpc,
       sessionKey: 'agent:main:webchat:one',
       isDraft: false,
-      runMode: 'standard',
+      runMode: 'safe',
     })
 
     expect(rpc.waitForConnection).toHaveBeenCalledOnce()
     expect(rpc.call).toHaveBeenCalledWith('sandbox.run_context.set', {
       sessionKey: 'agent:main:webchat:one',
-      runMode: 'standard',
+      runMode: 'safe',
     })
   })
 

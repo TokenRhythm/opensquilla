@@ -36,6 +36,60 @@ def test_profile_upsert_redacts_secret_and_keeps_credential_sources() -> None:
     assert result.restart_required is False
 
 
+def test_inactive_openrouter_profile_upsert_does_not_enable_image_generation() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "gpt-test",
+            "api_key": "synthetic-openai-key",
+        }
+    )
+
+    result = upsert_llm_profile(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+    )
+
+    assert result.config.image_generation.enabled is False
+    assert result.config.image_generation.binding == "custom"
+
+
+def test_openrouter_profile_activation_can_enable_default_image_generation() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "gpt-test",
+            "api_key": "synthetic-openai-key",
+        },
+        llm_profiles={
+            "openrouter": {
+                "model": "openai/gpt-test",
+                "api_key": "synthetic-openrouter-key",
+                "base_url": "https://openrouter.ai/api/v1",
+            }
+        },
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+
+    result = activate_llm_profile(
+        cfg,
+        provider_id="openrouter",
+        image_generation_intent="enable_provider_default",
+    )
+
+    assert result.config.image_generation.enabled is True
+    assert result.config.image_generation.binding == "follow_llm"
+    assert (
+        result.config.image_generation.primary
+        == "openrouter/google/gemini-3.1-flash-image-preview"
+    )
+    assert result.public_payload["capabilityChanges"]["imageGeneration"][
+        "applied"
+    ] is True
+
+
 def test_profile_keep_current_secret_is_same_origin_only() -> None:
     cfg = GatewayConfig(
         llm_profiles={
@@ -244,6 +298,66 @@ def test_profile_remove_unused_entry() -> None:
     assert result.public_payload == {"provider": "openai", "removed": True}
 
 
+def _profile_backed_tokenrhythm_image_config() -> GatewayConfig:
+    return GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "model": "deepseek-v4-flash",
+                "api_key": "synthetic-profile-key",
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+        image_generation={
+            "enabled": True,
+            "binding": "custom",
+            "primary": "tokenrhythm/qwen-image-2.0",
+        },
+    )
+
+
+def test_profile_remove_keeps_image_route_but_loses_profile_credential(monkeypatch) -> None:
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = _profile_backed_tokenrhythm_image_config()
+    before = get_onboarding_status(cfg)
+
+    result = remove_llm_profile(cfg, provider_id="tokenrhythm")
+    after = get_onboarding_status(result.config)
+
+    assert before.image_generation_source == "llm_fallback"
+    assert before.image_generation_state["effective"]["credentialOwner"] == "profile"
+    assert result.config.image_generation.enabled is True
+    assert result.config.image_generation.primary == "tokenrhythm/qwen-image-2.0"
+    assert after.image_generation_configured is False
+    assert after.image_generation_source == "none"
+    assert after.image_generation_state["effective"]["providerId"] == "tokenrhythm"
+    assert after.image_generation_state["effective"]["available"] is False
+
+
+def test_profile_remove_keeps_image_available_through_default_env(monkeypatch) -> None:
+    monkeypatch.setenv("TOKENRHYTHM_API_KEY", "synthetic-environment-key")
+    cfg = _profile_backed_tokenrhythm_image_config()
+    before = get_onboarding_status(cfg)
+
+    result = remove_llm_profile(cfg, provider_id="tokenrhythm")
+    after = get_onboarding_status(result.config)
+
+    assert before.image_generation_source == "llm_fallback"
+    assert before.image_generation_state["effective"]["credentialOwner"] == "profile"
+    assert result.config.image_generation.enabled is True
+    assert result.config.image_generation.primary == "tokenrhythm/qwen-image-2.0"
+    assert after.image_generation_configured is True
+    assert after.image_generation_source == "env"
+    assert after.image_generation_state["effective"]["providerId"] == "tokenrhythm"
+    assert after.image_generation_state["effective"]["available"] is True
+    assert after.image_generation_state["effective"]["credentialOwner"] == "image"
+
+
 def test_profile_remove_accepts_historical_case_variant() -> None:
     cfg = GatewayConfig(llm_profiles={"OpenAI": {"api_key_env": "OPENAI_PROFILE_KEY"}})
 
@@ -296,6 +410,39 @@ def test_active_profile_remove_atomically_promotes_replacement_and_removes_prima
     }
     assert "synthetic-old-primary-secret" not in repr(result.public_payload)
     assert "synthetic-new-primary-secret" not in repr(result.public_payload)
+
+
+def test_active_profile_remove_can_enable_openrouter_image_default_with_replacement() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "model": "gpt-test",
+            "api_key": "synthetic-old-primary-secret",
+            "base_url": "https://api.openai.com/v1",
+        },
+        llm_profiles={
+            "openrouter": {
+                "model": "openai/gpt-test",
+                "api_key": "synthetic-new-primary-secret",
+                "base_url": "https://openrouter.ai/api/v1",
+            }
+        },
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+
+    result = remove_active_llm_profile(
+        cfg,
+        provider_id="openai",
+        replacement_provider_id="openrouter",
+        image_generation_intent="enable_provider_default",
+    )
+
+    assert result.config.llm.provider == "openrouter"
+    assert result.config.image_generation.enabled is True
+    assert result.config.image_generation.binding == "follow_llm"
+    assert result.public_payload["capabilityChanges"]["imageGeneration"][
+        "applied"
+    ] is True
 
 
 def test_active_profile_remove_is_all_or_nothing_when_disabled_ensemble_references_primary(

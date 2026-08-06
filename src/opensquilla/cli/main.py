@@ -237,8 +237,13 @@ def _build_cli_dream(agent: str, *, force: bool = False, need_provider: bool = T
 
     from opensquilla.gateway.config import GatewayConfig
     from opensquilla.memory.dream_factory import build_dream_factory
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
 
     gw = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
+    if need_provider:
+        prewarm_tokenrhythm_install_id(config=gw)
 
     dream = build_dream_factory(
         config=gw,
@@ -728,10 +733,13 @@ def gateway_run(
     )
 
     # The child that owns the gateway retains both the RC4 profile lock and
-    # the legacy gateway lease for its complete write-capable lifetime.
+    # the legacy gateway lease for its complete write-capable lifetime. The
+    # bounded wait lets a predecessor still releasing its lease (an app
+    # restart, a finishing cron tick) resolve on its own instead of failing
+    # startup with OPENSQUILLA_PROFILE_IN_USE immediately.
     try:
         try:
-            with guarded_desktop_profile():
+            with guarded_desktop_profile(lock_timeout=5.0):
                 run_gateway(
                     port=port,
                     bind=bind,

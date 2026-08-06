@@ -12,13 +12,34 @@ let primedRelease: (() => void) | null = null
  */
 export const optionalSessionRpcAllowed = computed(() => activeHolds.value === 0)
 
+export const OPTIONAL_SESSION_RPC_TIMEOUT_MS = 10_000
+
 export const optionalSessionRpcCallOptions: RpcCallOptions = {
-  timeoutMs: 2_000,
-  // These methods still use the Gateway's serial dispatcher. Retire the
-  // connection when one is abandoned so a stuck handler cannot keep later
-  // navigation and control requests trapped behind it.
+  timeoutMs: OPTIONAL_SESSION_RPC_TIMEOUT_MS,
+  // Give ordinary metadata latency enough room to avoid interrupting an
+  // active stream. If a request is genuinely stuck, the Gateway's serialized
+  // dispatcher cannot serve later frames, so reconnect as a last resort.
   timeoutAction: 'reconnect',
   abortAction: 'reconnect',
+}
+
+// The first setup-status read can queue behind the live Windows capability
+// canary, whose own bounded probe may take up to 30 seconds. Treat this as a
+// slow diagnostic read: give it enough time to finish and never recycle the
+// shared chat socket merely because the read was abandoned.
+export const sandboxSetupRpcCallOptions: RpcCallOptions = {
+  timeoutMs: 45_000,
+  timeoutAction: 'reject',
+  abortAction: 'reject',
+}
+
+// A mode click is an interactive control, so it must never look frozen behind
+// an unrelated slow RPC on the connection. The composable updates the visible
+// selection optimistically; this bound only governs persistence/rollback.
+export const runModeWriteRpcCallOptions: RpcCallOptions = {
+  timeoutMs: 5_000,
+  timeoutAction: 'reject',
+  abortAction: 'reject',
 }
 
 type OptionalSessionRpcClient = {

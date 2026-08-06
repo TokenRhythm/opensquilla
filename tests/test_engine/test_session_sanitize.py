@@ -2852,14 +2852,19 @@ async def test_agent_preserves_reasoning_content_for_deepseek_text_replay() -> N
 
 
 @pytest.mark.asyncio
-async def test_agent_preserves_direct_deepseek_v4_reasoning_without_capabilities() -> None:
+@pytest.mark.parametrize(
+    "model_id", ["deepseek-v4-flash", "deepseek-v4-flash-0731"]
+)
+async def test_agent_preserves_direct_deepseek_v4_reasoning_without_capabilities(
+    model_id: str,
+) -> None:
     provider = CapturingProvider()
     agent = Agent(
         provider=provider,
         config=AgentConfig(
             max_iterations=1,
             thinking=ThinkingLevel.HIGH,
-            model_id="deepseek-v4-flash",
+            model_id=model_id,
             model_capabilities=None,
         ),
     )

@@ -324,7 +324,7 @@ async def test_shell_exact_elevation_grant_runs_host_once(
         assert requested["status"] == "approval_required"
         approval_id = requested["approval_id"]
         pending = get_approval_queue().get(approval_id)
-        assert pending.params["humanActionable"] is False
+        assert pending.params["humanActionable"] is True
         assert host_calls == []
 
         get_approval_queue().resolve(approval_id, True)
@@ -355,7 +355,7 @@ async def test_shell_exact_elevation_grant_runs_host_once(
 
 
 @pytest.mark.asyncio
-async def test_shell_create_then_delete_uses_two_one_shot_elevation_audits(
+async def test_shell_compound_delete_requires_separate_exact_actions_after_create(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -433,24 +433,6 @@ async def test_shell_create_then_delete_uses_two_one_shot_elevation_audits(
                 **kwargs,
             )
         )
-        delete_id = str(delete_pending["approval_id"])
-        get_approval_queue().resolve(delete_id, True)
-        delete_result = await shell.exec_command(
-            delete,
-            sandbox_permissions="require_escalated",
-            justification="Delete the exact probe and its empty directory.",
-            approval_id=delete_id,
-            **kwargs,
-        )
-        delete_replay = json.loads(
-            await shell.exec_command(
-                delete,
-                sandbox_permissions="require_escalated",
-                justification="Delete the exact probe and its empty directory.",
-                approval_id=delete_id,
-                **kwargs,
-            )
-        )
     finally:
         current_tool_context.reset(token)
         target.unlink(missing_ok=True)
@@ -458,21 +440,17 @@ async def test_shell_create_then_delete_uses_two_one_shot_elevation_audits(
             outside.rmdir()
 
     create_entry = get_approval_queue().get(create_id)
-    delete_entry = get_approval_queue().get(delete_id)
     assert create_preflight["status"] == "elevation_required"
-    assert delete_preflight["status"] == "elevation_required"
+    assert delete_preflight["status"] == "blocked"
+    assert delete_preflight["reason"] == "recursive_delete_target_not_static"
     assert create_pending["status"] == "approval_required"
-    assert delete_pending["status"] == "approval_required"
-    assert create_id != delete_id
-    assert create_entry.params["fingerprint"] != delete_entry.params["fingerprint"]
+    assert delete_pending["status"] == "blocked"
+    assert delete_pending["reason"] == "recursive_delete_target_not_static"
+    assert "仅包含一个字面量路径" in delete_pending["message"]
     assert create_entry.consumed is True
-    assert delete_entry.consumed is True
     assert create_result == "exit_code=0\ncreated\n"
-    assert delete_result == "exit_code=0\ndeleted\n"
-    assert host_calls == [create, delete]
+    assert host_calls == [create]
     assert create_replay["status"] == "approval_invalid"
-    assert delete_replay["status"] == "approval_invalid"
-    assert not target.exists()
     assert not outside.exists()
 
 
@@ -672,7 +650,7 @@ async def test_shell_backend_request_preserves_resolved_run_mode(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -686,7 +664,7 @@ async def test_shell_backend_request_preserves_resolved_run_mode(
 
     assert "ok" in result
     assert backend_calls
-    assert backend_calls[0].run_mode == "trusted"
+    assert backend_calls[0].run_mode == "safe"
 
 
 @pytest.mark.asyncio
@@ -762,7 +740,7 @@ async def test_trusted_windows_shell_receives_managed_proxy_without_network_hint
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -842,7 +820,7 @@ async def test_trusted_linux_shell_receives_managed_proxy_without_network_hint(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -942,7 +920,7 @@ async def test_trusted_windows_code_exec_receives_managed_proxy_without_network_
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -995,7 +973,7 @@ def test_trusted_windows_tools_collapse_host_network_to_managed_proxy(
             workspace_dir=str(tmp_path),
             session_key="s1",
             run_mode="trusted",
-            sandbox_run_context=RunContext(run_mode=RunMode.TRUSTED),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -1359,7 +1337,7 @@ async def test_code_exec_backend_request_preserves_resolved_run_mode(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -1373,7 +1351,7 @@ async def test_code_exec_backend_request_preserves_resolved_run_mode(
 
     assert result["stdout"] == "ok\n"
     assert backend_calls
-    assert backend_calls[0].run_mode == "trusted"
+    assert backend_calls[0].run_mode == "safe"
 
 
 @pytest.mark.asyncio
@@ -1608,7 +1586,7 @@ async def test_shell_unknown_explicit_url_runs_with_managed_proxy(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -1830,7 +1808,7 @@ async def test_windows_proxy_allowlist_preflight_does_not_repair_during_command(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -1904,7 +1882,7 @@ async def test_windows_ready_proxy_allowlist_preflight_continues_to_proxy_runtim
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )
@@ -1921,16 +1899,16 @@ async def test_windows_ready_proxy_allowlist_preflight_continues_to_proxy_runtim
 
 
 @pytest.mark.asyncio
-async def test_shell_package_install_queues_bundle_approval_before_proxy_run(
+async def test_shell_package_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.tools.builtin import shell
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -1944,38 +1922,32 @@ async def test_shell_package_install_queues_bundle_approval_before_proxy_run(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "pip install requests",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "pip install requests",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "python-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "python-package-install"
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio
-async def test_uv_pip_install_queues_bundle_approval_before_proxy_run(
+async def test_uv_pip_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.tools.builtin import shell
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("uv pip package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -1989,29 +1961,23 @@ async def test_uv_pip_install_queues_bundle_approval_before_proxy_run(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "uv pip install --no-cache-dir httpx[http2] pendulum",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "uv pip install --no-cache-dir httpx[http2] pendulum",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "python-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "python-package-install"
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio
-async def test_poetry_install_queues_python_bundle_before_proxy_run(
+async def test_poetry_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2020,8 +1986,8 @@ async def test_poetry_install_queues_python_bundle_before_proxy_run(
 
     profile_calls: list[tuple[str, ...]] = []
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("poetry package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
     def _fake_capability_profile_for_command(argv):
         profile_calls.append(tuple(argv))
@@ -2032,7 +1998,7 @@ async def test_poetry_install_queues_python_bundle_before_proxy_run(
         "capability_profile_for_command",
         _fake_capability_profile_for_command,
     )
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -2046,30 +2012,27 @@ async def test_poetry_install_queues_python_bundle_before_proxy_run(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "poetry install",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "poetry install",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert profile_calls == [("sh", "-lc", "poetry install")]
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "python-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "python-package-install"
+    assert profile_calls == [
+        ("sh", "-lc", "poetry install"),
+        ("sh", "-lc", "poetry install"),
+    ]
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio
-async def test_composer_install_queues_php_bundle_before_proxy_run(
+async def test_composer_install_uses_default_open_proxy_without_approval(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2078,8 +2041,8 @@ async def test_composer_install_queues_php_bundle_before_proxy_run(
 
     profile_calls: list[tuple[str, ...]] = []
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("composer package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
     def _fake_capability_profile_for_command(argv):
         profile_calls.append(tuple(argv))
@@ -2090,7 +2053,7 @@ async def test_composer_install_queues_php_bundle_before_proxy_run(
         "capability_profile_for_command",
         _fake_capability_profile_for_command,
     )
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -2104,26 +2067,23 @@ async def test_composer_install_queues_php_bundle_before_proxy_run(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "composer install",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "composer install",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert profile_calls == [("sh", "-lc", "composer install")]
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "php-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "php-package-install"
+    assert profile_calls == [
+        ("sh", "-lc", "composer install"),
+        ("sh", "-lc", "composer install"),
+    ]
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio
@@ -2177,7 +2137,7 @@ async def test_trusted_uv_pip_install_receives_managed_proxy_without_prompt(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2245,7 +2205,7 @@ async def test_trusted_python_explicit_url_uses_managed_proxy_before_execution(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2306,7 +2266,7 @@ async def test_trusted_python_caught_network_error_still_uses_proxy_before_execu
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2370,7 +2330,7 @@ async def test_trusted_npm_view_uses_managed_proxy_before_execution(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2452,7 +2412,7 @@ async def test_trusted_unknown_install_uses_managed_proxy_without_redundant_retr
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2501,7 +2461,7 @@ async def test_standard_network_failure_does_not_return_package_bundle_recovery_
             workspace_dir=str(standard_runtime_no_preflight),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -2551,7 +2511,7 @@ async def test_standard_network_failure_does_not_retry_explicit_url(
             workspace_dir=str(standard_runtime_no_preflight),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
@@ -2630,7 +2590,7 @@ async def test_standard_network_failure_does_not_retry_with_approved_bundle(
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 workspace=str(standard_runtime_no_preflight),
                 bundles=(PackageBundleGrant(bundle_id="python-package-install"),),
             ),
@@ -2756,7 +2716,7 @@ async def test_standard_network_failure_does_not_consume_allow_once_grant(
         fingerprint=integration_mod.action_fingerprint(approval_request),
     )
     run_context = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(standard_runtime_no_preflight),
         temporary_grants=(grant,),
     )
@@ -2825,7 +2785,7 @@ async def test_trusted_hostless_private_network_failure_does_not_retry(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2885,7 +2845,7 @@ async def test_trusted_metadata_target_is_not_auto_retried(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -2978,7 +2938,7 @@ async def test_trusted_network_failure_does_not_retry_after_managed_proxy_execut
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3034,7 +2994,7 @@ async def test_trusted_normal_user_path_denial_requests_broader_retry_review(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3089,7 +3049,7 @@ async def test_trusted_read_path_denial_requests_broader_retry_review(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3144,7 +3104,7 @@ async def test_trusted_execve_path_denial_requests_broader_retry_review(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3224,7 +3184,7 @@ async def test_trusted_managed_network_denial_requests_broader_retry_review(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3294,7 +3254,7 @@ async def test_trusted_sensitive_path_denial_does_not_auto_retry(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3342,7 +3302,7 @@ async def test_trusted_successful_network_failure_text_does_not_retry(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3357,16 +3317,16 @@ async def test_trusted_successful_network_failure_text_does_not_retry(
 
 
 @pytest.mark.asyncio
-async def test_timeout_wrapped_node_install_queues_bundle_approval_before_proxy_run(
+async def test_timeout_wrapped_node_install_uses_default_open_proxy(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.tools.builtin import shell
 
-    async def _fail_run_under_backend(request, *, runtime=None):
-        pytest.fail("node package bundle approval should run before proxy execution")
+    async def _run_under_backend(request, *, runtime=None):
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="", backend_notes=())
 
-    monkeypatch.setattr(shell, "run_under_backend", _fail_run_under_backend)
+    monkeypatch.setattr(shell, "run_under_backend", _run_under_backend)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -3380,25 +3340,19 @@ async def test_timeout_wrapped_node_install_queues_bundle_approval_before_proxy_
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:
-        payload = json.loads(
-            await shell.exec_command(
-                "timeout 30 npm install lodash",
-                workdir=str(managed_runtime),
-            )
+        result = await shell.exec_command(
+            "timeout 30 npm install lodash",
+            workdir=str(managed_runtime),
         )
     finally:
         current_tool_context.reset(token)
 
-    assert payload["status"] == "approval_required"
-    assert payload["approvalKind"] == "sandbox_network"
-    assert payload["bundle_id"] == "node-package-install"
-    pending = get_approval_queue().list_pending("exec")
-    assert len(pending) == 1
-    assert pending[0]["params"]["bundle_id"] == "node-package-install"
+    assert result == "exit_code=0\nok\n"
+    assert get_approval_queue().list_pending("exec") == []
 
 
 @pytest.mark.asyncio
@@ -3442,7 +3396,7 @@ async def test_subprocess_network_approval_uses_session_workspace_for_external_c
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3503,7 +3457,7 @@ async def test_subprocess_network_once_grant_consumes_from_session_workspace(
         session_key="s1",
         run_mode="standard",
         sandbox_run_context=RunContext(
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             workspace=str(managed_runtime),
             temporary_grants=(grant,),
         ),
@@ -3581,7 +3535,7 @@ async def test_background_shell_network_spawn_receives_managed_proxy(
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 domains=(DomainGrant(domain="example.com"),),
             ),
         )
@@ -3662,7 +3616,7 @@ async def test_code_network_subprocess_receives_managed_proxy_env(
             session_key="s1",
             run_mode="standard",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.STANDARD,
+                run_mode=RunMode.SAFE,
                 domains=(DomainGrant(domain="example.com"),),
             ),
         )
@@ -3763,7 +3717,7 @@ async def test_code_exec_prepares_managed_proxy_before_backend_run(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 domains=(DomainGrant(domain="example.com"),),
             ),
         )
@@ -3838,7 +3792,7 @@ async def test_trusted_code_exec_path_denial_escalates_without_retry(
             session_key="s1",
             run_mode="trusted",
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(managed_runtime),
             ),
         )
@@ -3905,7 +3859,7 @@ async def test_code_unknown_explicit_url_runs_with_managed_proxy(
             workspace_dir=str(managed_runtime),
             session_key="s1",
             run_mode="standard",
-            sandbox_run_context=RunContext(run_mode=RunMode.STANDARD),
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
         )
     )
     try:

@@ -7,6 +7,7 @@ import json
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import typer
@@ -238,6 +239,25 @@ async def _run_probes(targets: list[_ProbeTarget], timeout: float) -> list[dict[
     return [await _probe_one(target, timeout) for target in targets]
 
 
+def _prewarm_draft_probe_install_id() -> None:
+    """Register the active privacy context before an unsaved live probe."""
+
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
+
+    config: Any
+    try:
+        config = load_config(None)
+    except Exception:
+        # A malformed local config must not break the desktop bridge, but it
+        # also must not fall back to an implicitly enabled privacy context.
+        config = SimpleNamespace(
+            privacy=SimpleNamespace(disable_network_observability=True)
+        )
+    prewarm_tokenrhythm_install_id(config=config)
+
+
 @app.command("probe-draft", hidden=True)
 def models_probe_draft() -> None:
     """Probe one unsaved provider draft supplied as JSON on stdin.
@@ -273,6 +293,7 @@ def models_probe_draft() -> None:
         )
         raise typer.Exit(code=2)
 
+    _prewarm_draft_probe_install_id()
     target = _ProbeTarget(
         provider_id=provider_id,
         model=model,
@@ -310,6 +331,11 @@ def models_probe(
     probe fails, 2 on invalid selection.
     """
     cfg = load_config(config_path)
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
+
+    prewarm_tokenrhythm_install_id(config=cfg)
     targets = _probe_targets(cfg)
     if provider:
         wanted = provider.strip().lower()

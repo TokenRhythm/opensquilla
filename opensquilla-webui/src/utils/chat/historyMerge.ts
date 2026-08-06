@@ -1,4 +1,5 @@
 import type { ChatMessage } from '@/types/chat'
+import type { StatusPart } from '@/types/parts'
 
 const TERMINAL_STEER_DISPOSITIONS = new Set([
   'applied',
@@ -73,8 +74,39 @@ export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): Cha
   // The fold's phase snapshot supplies an exact same-session activity start.
   // History does not persist it, so retain the local snapshot across the first
   // authoritative refresh; a cold reload still correctly falls back to counts.
-  if (!(server.statusHistory?.length) && (prev.statusHistory?.length ?? 0) > 0) {
-    merged.statusHistory = prev.statusHistory
+  if ((prev.statusHistory?.length ?? 0) > 0 || (server.statusHistory?.length ?? 0) > 0) {
+    const serverRows = server.statusHistory ?? []
+    const previousRows = prev.statusHistory ?? []
+    const serverHasTaskPhases = serverRows.some(entry => entry.category !== 'maintenance')
+    // A persisted task-phase snapshot is authoritative when one exists. A
+    // server response containing only durable maintenance markers is not a
+    // task-phase snapshot, though: keep the richer live phase history and
+    // merge those markers into it instead of collapsing Activity to a single
+    // "Context organized" row after the first history refresh.
+    const rows: StatusPart[] = serverHasTaskPhases
+      ? serverRows.filter(entry => entry.category !== 'maintenance')
+      : previousRows.filter(entry => entry.category !== 'maintenance')
+    const maintenanceById = new Map<string, number>()
+    for (const entry of previousRows) {
+      if (entry.category !== 'maintenance' || !entry.id) continue
+      maintenanceById.set(entry.id, rows.length)
+      rows.push(entry)
+    }
+    // Durable server markers win lifecycle fields while retaining the first
+    // observed timestamp, which keeps the event anchored at the point where
+    // compaction actually appeared in the live Activity timeline.
+    for (const entry of serverRows) {
+      if (entry.category !== 'maintenance') continue
+      const id = entry.id
+      const index = id ? maintenanceById.get(id) : undefined
+      if (index === undefined) {
+        if (id) maintenanceById.set(id, rows.length)
+        rows.push(entry)
+      } else {
+        rows[index] = { ...rows[index], ...entry, at: rows[index]!.at }
+      }
+    }
+    merged.statusHistory = rows.sort((a, b) => a.at - b.at)
   }
 
   // routerSettled is sticky: once a strip has settled it stays settled.

@@ -53,6 +53,34 @@ function renderedMessagesFor(
   })
 }
 
+describe('useChatRenderedMessages maintenance events', () => {
+  it('preserves the dedicated compaction payload for ChatMessageList', () => {
+    const api = renderedMessagesFor([{
+      role: 'maintenance',
+      text: '',
+      ts: 2_000,
+      messageId: 'maintenance:context-compaction:summary:7',
+      restoredFromHistory: true,
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-7',
+        source: 'manual',
+        state: 'completed',
+        durability: 'durable',
+      },
+    }])
+
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      displayRole: 'maintenance',
+      messageId: 'maintenance:context-compaction:summary:7',
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-7',
+      },
+    })
+  })
+})
+
 describe('useChatRenderedMessages plan revisions', () => {
   it('renders a typed plan part once and derives currentness from the active pointer', () => {
     const currentPlanRevisionId = ref('revision-2')
@@ -1150,6 +1178,103 @@ describe('useChatRenderedMessages clarify history recovery', () => {
       runId: 'plan-run-2',
       step: 'choose_target',
     })
+  })
+
+  it('restores and settles a terminal request from its preserved request payload', () => {
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: '',
+        ts: 0,
+        messageId: 'm-terminal-request-user-input',
+        tool_calls: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'request-input-terminal',
+            name: 'request_user_input',
+            user_input_request: {
+              status: 'input_required',
+              kind: 'user_input',
+              paused: true,
+              request_id: 'request-terminal-1',
+              run_id: 'plan-run-2',
+              step: 'choose_target',
+              clarify_schema: {
+                mode: 'form',
+                presentation: 'plan_questionnaire_v1',
+                fields: [{
+                  name: 'target',
+                  type: 'enum',
+                  required: true,
+                  choices: ['current', 'new'],
+                }],
+              },
+            },
+            result: JSON.stringify({
+              status: 'answered',
+              kind: 'user_input',
+              paused: false,
+              request_id: 'request-terminal-1',
+              answers: { target: 'current' },
+            }),
+          },
+        ],
+      },
+    ])
+
+    const [message] = api.renderedMessages.value
+    const clarify = message.parts?.find((part): part is ChatPart & {
+      type: 'interrupt'
+      interruptKind: 'clarify'
+    } => part.type === 'interrupt' && part.interruptKind === 'clarify')
+
+    expect(clarify?.key).toBe(
+      'm-terminal-request-user-input:interrupt:request-terminal-1',
+    )
+    expect(clarify?.resolution).toBe('replied')
+    expect(clarify?.clarify?.presentation).toBe('plan_questionnaire_v1')
+  })
+
+  it('keeps consecutive requests distinct by requestId', () => {
+    const request = (requestId: string) => ({
+      status: 'input_required',
+      kind: 'user_input',
+      paused: true,
+      request_id: requestId,
+      run_id: 'same-run',
+      step: 'same-step',
+      clarify_schema: {
+        fields: [{ name: 'scope', type: 'string' }],
+      },
+    })
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: '',
+        ts: 0,
+        messageId: 'm-consecutive-requests',
+        tool_calls: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'request-input-1',
+            result: request('request-1'),
+          },
+          {
+            type: 'tool_result',
+            tool_use_id: 'request-input-2',
+            result: request('request-2'),
+          },
+        ],
+      },
+    ])
+
+    const keys = api.renderedMessages.value[0].parts
+      ?.filter(part => part.type === 'interrupt')
+      .map(part => part.key)
+    expect(keys).toEqual([
+      'm-consecutive-requests:interrupt:request-1',
+      'm-consecutive-requests:interrupt:request-2',
+    ])
   })
 
   it('applies clarify submit state to recovered historical interrupt cards', () => {

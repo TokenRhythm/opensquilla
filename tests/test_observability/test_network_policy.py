@@ -3,6 +3,7 @@ from __future__ import annotations
 from opensquilla.gateway.config import GatewayConfig, PrivacyConfig
 from opensquilla.observability.network_policy import (
     network_observability_disabled,
+    provider_install_id_disabled,
     provider_request_correlation_disabled,
 )
 
@@ -79,6 +80,43 @@ def test_provider_correlation_honors_config_without_base_settings() -> None:
         privacy = _Privacy()
 
     assert provider_request_correlation_disabled(config=_Config(), env={}) is True
+
+
+def test_provider_install_id_defaults_to_enabled() -> None:
+    assert provider_install_id_disabled(env={}) is False
+
+
+def test_provider_install_id_honors_config_and_unified_env() -> None:
+    config = GatewayConfig(
+        privacy=PrivacyConfig(disable_network_observability=True),
+    )
+
+    assert provider_install_id_disabled(config=config, env={}) is True
+    assert provider_install_id_disabled(env={GLOBAL_DISABLE_ENV: "on"}) is True
+
+
+def test_provider_install_id_honors_legacy_telemetry_disable_only() -> None:
+    assert provider_install_id_disabled(env={TELEMETRY_DISABLED_ENV: "yes"}) is True
+    assert provider_install_id_disabled(env={UPDATE_CHECK_DISABLED_ENV: "yes"}) is False
+
+
+def test_provider_install_id_is_suppressed_in_automated_environments() -> None:
+    assert provider_install_id_disabled(env={"GITHUB_ACTIONS": "true"}) is True
+    assert provider_install_id_disabled(env={"OPENSQUILLA_TESTING": "1"}) is True
+    assert provider_install_id_disabled(env={"PYTEST_CURRENT_TEST": "test_name"}) is True
+
+
+def test_provider_install_id_ignores_false_automated_environment_values() -> None:
+    assert (
+        provider_install_id_disabled(
+            env={
+                "GITHUB_ACTIONS": "false",
+                "OPENSQUILLA_TESTING": "off",
+                "PYTEST_CURRENT_TEST": "",
+            }
+        )
+        is False
+    )
 
 
 def test_false_env_does_not_override_config_disable() -> None:

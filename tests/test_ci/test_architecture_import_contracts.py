@@ -112,6 +112,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # orchestrator (offline retrain; default-off, fail-open).
     ("gateway", "squilla_router"),
     ("gateway", "tools"),
+    # The reusable Python Gateway client shares the bounded WebSocket receive
+    # contract with the CLI client; contracts remains implementation-free.
+    ("gateway_client.py", "contracts"),
     ("identity", "safety"),
     ("identity", "session"),
     ("mcp", "tools"),
@@ -155,6 +158,10 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("persistence", "observability"),
     ("persistence", "skills"),
     ("provider", "engine"),
+    # Official TokenRhythm transports reuse the passive install identity and
+    # its shared privacy policy; observability remains a leaf and never imports
+    # provider back.
+    ("provider", "observability"),
     ("provider", "safety"),
     # Provider argument repair reuses the tool alias/schema helpers (lazy import).
     ("provider", "tools"),
@@ -166,6 +173,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("router_control.py", "engine"),
     ("sandbox", "application"),
     ("sandbox", "gateway"),
+    # Direct-update migration reuses the profile lock implementation owned by
+    # recovery. Recovery no longer imports sandbox back, so this stays one-way.
+    ("sandbox", "recovery"),
     ("sandbox", "safety"),
     ("sandbox", "tools"),
     ("scheduler", "agents"),
@@ -173,6 +183,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("scheduler", "compat"),
     ("scheduler", "engine"),
     ("scheduler", "gateway"),
+    # Persisted cron jobs decode legacy run-mode names through the sandbox
+    # compatibility codec; the package-neutral vocabulary avoids wider edges.
+    ("scheduler", "sandbox"),
     ("scheduler", "session"),
     ("scheduler", "skills"),
     ("scheduler", "tools"),

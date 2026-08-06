@@ -409,3 +409,55 @@ class TurnIngressReceipt(SQLModel, table=True):
     task_id: str | None = Field(default=None, index=True)
     accepted_at: int = Field(default_factory=_now_ms)
     schema_version: int = 1
+
+
+class MetaControlIntent(SQLModel, table=True):
+    """Durable authorization for one hidden MetaSkill control turn.
+
+    ``correlation_id`` is namespaced (``request:<client id>`` for a manual
+    launch and ``nonce:<nonce>`` for a failed-step replay), so it contains no
+    prompt or provider credential material.  Acceptance coordinates are bound
+    in the same transaction as the turn-ingress receipt.
+    """
+
+    __tablename__ = "meta_control_intents"
+
+    intent_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    session_key: str = Field(index=True, max_length=512)
+    control_kind: str = Field(max_length=16)
+    correlation_id: str = Field(max_length=272)
+    meta_skill_name: str = Field(max_length=256)
+    replay_run_id: str | None = None
+    replay_mode: str | None = Field(default=None, max_length=32)
+    status: str = Field(default="staged", max_length=16)
+    accepted_source_scope: str | None = Field(default=None, max_length=256)
+    accepted_request_session_key: str | None = Field(default=None, max_length=512)
+    accepted_client_request_id: str | None = Field(default=None, max_length=256)
+    accepted_request_fingerprint: str | None = Field(default=None, max_length=128)
+    accepted_message_id: str | None = None
+    accepted_task_id: str | None = Field(default=None, index=True)
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+    schema_version: int = 1
+
+
+class MetaLaunchDraft(SQLModel, table=True):
+    """Unaccepted manual MetaSkill request retained for crash recovery.
+
+    The launch text is user-authored content and receives the same local
+    session-database treatment as a transcript message.  It is never copied to
+    logs or provider metadata.  ``client_request_id`` is the stable identity
+    used by ``meta.run`` and the eventual hidden ``chat.send``.
+    """
+
+    __tablename__ = "meta_launch_drafts"
+
+    draft_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    session_key: str = Field(index=True, max_length=512)
+    client_request_id: str = Field(max_length=256)
+    meta_skill_name: str = Field(max_length=256)
+    launch_text: str = Field(max_length=128_000)
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+    expires_at: int
+    schema_version: int = 1

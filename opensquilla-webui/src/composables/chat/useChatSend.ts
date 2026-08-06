@@ -5,6 +5,7 @@ import type { RpcClientError } from '@/lib/rpc'
 import type {
   Attachment,
   ChatMessage,
+  HiddenControlDispatchResult,
   ChatPendingItem,
   ChatSteerCapability,
 } from '@/types/chat'
@@ -36,6 +37,18 @@ import { localizedChatErrorMessage } from '@/utils/chat/errors'
 import { rehomePromotedSteerRows } from '@/utils/chat/historyMerge'
 import { isControlInput } from '@/utils/chat/inputSemantics'
 import { createClientMessageId, createClientRequestId } from '@/utils/chat/messageIdentity'
+import {
+  type HiddenControlStorage,
+  listHiddenControls,
+  persistHiddenControlResult,
+  removeHiddenControl,
+} from '@/utils/chat/hiddenControlOutbox'
+import {
+  listPendingMetaDiscards,
+  type MetaDiscardStorage,
+  persistPendingMetaDiscard,
+  removePendingMetaDiscard,
+} from '@/utils/chat/metaDiscardOutbox'
 import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
@@ -336,6 +349,7 @@ export interface UseChatSendOptions {
       text: string
       displayText: string
       clientRequestId?: string
+      sessionKey?: string
       clientMessageId?: string
       visibleCommitted?: boolean
     },
@@ -350,6 +364,8 @@ export interface UseChatSendOptions {
   }) => boolean
   restoreSteerIntoComposer?: (text: string) => void
   popAllPendingIntoComposer: () => boolean
+  hiddenControlStorage?: HiddenControlStorage | null
+  metaDiscardStorage?: MetaDiscardStorage | null
   executeSlashCommand: (text: string) => Promise<boolean>
   closeSlashMenu: () => void
   autoResizeTextarea: () => void
@@ -362,6 +378,13 @@ export function useChatSend(options: UseChatSendOptions) {
   let activeResponseHandoff: ResponseHandoffGate | null = null
   let activeProjectPreflightToken: symbol | null = null
   let recoveredAttempt: SendAttempt | null = null
+  const hiddenDispatchInFlight = new Map<string, Promise<HiddenControlDispatchResult>>()
+  const renderedHiddenControls = new Set<string>()
+
+  function metaDiscardStorage(): MetaDiscardStorage | null | undefined {
+    return options.metaDiscardStorage
+  }
+
   const recoveredQueuedAttempts = new WeakMap<ChatPendingItem, SendAttempt>()
   const recoveredQueuedSteers = new WeakMap<ChatPendingItem, SteerAttempt>()
 
@@ -1863,36 +1886,127 @@ export function useChatSend(options: UseChatSendOptions) {
    * compaction is in flight, it is queued (carrying provider + display text and
    * a hiddenControl flag) so the drain restores both.
    */
-  async function dispatchHiddenSend(
+  function hiddenDispatchResult(
+    status: HiddenControlDispatchResult['status'],
+    reason: HiddenControlDispatchResult['reason'],
+    clientRequestId: string,
+    sessionKey: string,
+  ): HiddenControlDispatchResult {
+    return { status, reason, clientRequestId, sessionKey }
+  }
+
+  function dispatchHiddenSend(
     providerText: string,
     displayText: string,
-    expectedSessionKey?: string,
-    queuedItem?: ChatPendingItem,
-  ): Promise<ChatSendOutcome> {
-    const requestSessionKey = options.sessionKey.value
-    if (!requestSessionKey || !providerText) return 'not_sent'
-    if (expectedSessionKey && requestSessionKey !== expectedSessionKey) return 'not_sent'
-    const deferOrQueue = (): ChatSendOutcome => {
-      if (queuedItem) return 'deferred'
-      const queued = options.enqueueHiddenControl?.(
-        { text: providerText, displayText },
-        pendingQueueOwner(),
-      )
-      return queued ? 'accepted' : 'deferred'
+    clientRequestId?: string,
+    targetSessionKey?: string,
+  ): Promise<HiddenControlDispatchResult> {
+    const requestSessionKey = String(targetSessionKey || options.sessionKey.value).trim()
+    const stableClientRequestId = String(clientRequestId || '').trim() || createClientRequestId()
+    if (!requestSessionKey || !providerText) {
+      return Promise.resolve(hiddenDispatchResult(
+        'rejected',
+        'invalid_request',
+        stableClientRequestId,
+        requestSessionKey,
+      ))
     }
-    if (options.sendBlockedReason?.value) return deferOrQueue()
-    if (options.validateActiveProjectBeforeSend) {
-      if (await refreshedActiveProjectBlocksSend()) return deferOrQueue()
+
+    const hiddenDispatchKey = `${requestSessionKey}\u0000${stableClientRequestId}`
+    const existing = hiddenDispatchInFlight.get(hiddenDispatchKey)
+    if (existing) return existing
+
+    // Persist before either local queueing or RPC. The payload contains only
+    // the already-visible control turn (never provider credentials), while its
+    // stable request id lets Gateway ingress collapse response-loss retries.
+    const persistResult = persistHiddenControlResult({
+      sessionKey: requestSessionKey,
+      clientRequestId: stableClientRequestId,
+      providerText,
+      displayText,
+    }, options.hiddenControlStorage)
+    if (persistResult === 'conflict' || persistResult === 'failed' || persistResult === 'invalid') {
+      return Promise.resolve(hiddenDispatchResult(
+        'rejected',
+        persistResult === 'conflict' ? 'outbox_conflict' : 'outbox_persist_failed',
+        stableClientRequestId,
+        requestSessionKey,
+      ))
     }
-    if (
-      options.sessionKey.value !== requestSessionKey
-      || (expectedSessionKey && options.sessionKey.value !== expectedSessionKey)
-    ) return 'not_sent'
-    if (options.sendBlockedReason?.value) return deferOrQueue()
+    if (requestSessionKey !== options.sessionKey.value) {
+      // A delayed meta.run response belongs to its originating chat. Persist
+      // the exact staged control, but never mutate/send through whichever chat
+      // is currently rendered. Returning to the origin calls
+      // restoreHiddenControls and resumes with the same idempotency key.
+      if (persistResult !== 'persisted' && persistResult !== 'matched') {
+        return Promise.resolve(hiddenDispatchResult(
+          'rejected',
+          'outbox_persist_failed',
+          stableClientRequestId,
+          requestSessionKey,
+        ))
+      }
+      return Promise.resolve(hiddenDispatchResult(
+        'queued',
+        'queued',
+        stableClientRequestId,
+        requestSessionKey,
+      ))
+    }
+
+    const operation = performHiddenSend(
+      providerText,
+      displayText,
+      stableClientRequestId,
+      requestSessionKey,
+    )
+    hiddenDispatchInFlight.set(hiddenDispatchKey, operation)
+    void operation.then(() => {
+      if (hiddenDispatchInFlight.get(hiddenDispatchKey) === operation) {
+        hiddenDispatchInFlight.delete(hiddenDispatchKey)
+      }
+    }, () => {
+      if (hiddenDispatchInFlight.get(hiddenDispatchKey) === operation) {
+        hiddenDispatchInFlight.delete(hiddenDispatchKey)
+      }
+    })
+    return operation
+  }
+
+  async function performHiddenSend(
+    providerText: string,
+    displayText: string,
+    stableClientRequestId: string,
+    requestSessionKey: string,
+  ): Promise<HiddenControlDispatchResult> {
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     const handoffInFlight = responseHandoffBlocksCurrentSession()
-    if (options.stream.isStreaming.value || compactInFlight || handoffInFlight) {
-      return deferOrQueue()
+    const projectBlocked = options.validateActiveProjectBeforeSend
+      ? await refreshedActiveProjectBlocksSend()
+      : false
+    if (
+      projectBlocked
+      || options.sendBlockedReason?.value
+      || options.stream.isStreaming.value
+      || compactInFlight
+      || handoffInFlight
+    ) {
+      const queuedItem = {
+        text: providerText,
+        displayText,
+        clientRequestId: stableClientRequestId,
+        sessionKey: requestSessionKey,
+      }
+      const owner = pendingQueueOwner()
+      const queued = owner
+        ? options.enqueueHiddenControl?.(queuedItem, owner)
+        : options.enqueueHiddenControl?.(queuedItem)
+      return hiddenDispatchResult(
+        queued ? 'queued' : 'rejected',
+        queued ? 'queued' : 'queue_full',
+        stableClientRequestId,
+        requestSessionKey,
+      )
     }
 
     options.aborted.value = false
@@ -1902,13 +2016,10 @@ export function useChatSend(options: UseChatSendOptions) {
     })
     // Show the visible confirmation as a user bubble (NOT the marker text).
     const now = new Date().toISOString()
-    const clientMessageId = queuedItem?.hiddenClientMessageId || createClientMessageId()
-    const clientRequestId = queuedItem?.hiddenClientRequestId || createClientRequestId()
-    if (queuedItem) {
-      queuedItem.hiddenClientMessageId = clientMessageId
-      queuedItem.hiddenClientRequestId = clientRequestId
-    }
-    if (displayText && queuedItem?.hiddenVisibleCommitted !== true) {
+    const clientMessageId = `hidden-control:${stableClientRequestId}`
+    const renderedKey = `${requestSessionKey}\u0000${stableClientRequestId}`
+    if (displayText && !renderedHiddenControls.has(renderedKey)) {
+      renderedHiddenControls.add(renderedKey)
       options.messages.value.push({
         role: 'user',
         text: displayText,
@@ -1917,15 +2028,18 @@ export function useChatSend(options: UseChatSendOptions) {
       })
       options.autoScroll.value = true
       options.scrollToBottom()
-      if (queuedItem) queuedItem.hiddenVisibleCommitted = true
     }
 
     const params: ChatSendParams = {
-      clientRequestId,
+      clientRequestId: stableClientRequestId,
       clientMessageId,
       message: providerText,
       sessionKey: requestSessionKey,
     }
+    const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
+      ? options.pendingSessionIntent.value
+      : null
+    if (hiddenSessionIntent) params.intent = hiddenSessionIntent
     if (displayText && displayText !== providerText) params.displayText = displayText
     params._source = chatSourceMetadata(options)
 
@@ -1937,6 +2051,21 @@ export function useChatSend(options: UseChatSendOptions) {
 
     try {
       const res = await options.rpc.call<ChatSendResponse>('chat.send', params)
+      if (
+        hiddenSessionIntent
+        && requestSessionKey === options.sessionKey.value
+        && options.pendingSessionIntent.value === hiddenSessionIntent
+      ) {
+        options.pendingSessionIntent.value = null
+      }
+      // A resolved chat.send response proves durable ingress acceptance. Clear
+      // the browser outbox before any local session handoff work, which can
+      // fail independently without making an exact-id resend necessary.
+      removeHiddenControl(
+        requestSessionKey,
+        stableClientRequestId,
+        options.hiddenControlStorage,
+      )
       const taskId = acceptedTaskId(res)
       const terminalStatus = terminalResponseStatus(res)
       const stoppedByUser = freshSendToken?.stoppedByUser === true
@@ -1962,7 +2091,12 @@ export function useChatSend(options: UseChatSendOptions) {
           responseHandoff.terminalResponse = Boolean(terminalStatus)
           await handoffResponseSession(acceptedSessionKey, responseHandoff)
         }
-        return 'accepted'
+        return hiddenDispatchResult(
+          'accepted',
+          'accepted',
+          stableClientRequestId,
+          requestSessionKey,
+        )
       }
       if ((res?.sessionKey || requestSessionKey) === requestSessionKey) {
         bindAcceptedUserMessage(clientMessageId, res)
@@ -2010,8 +2144,30 @@ export function useChatSend(options: UseChatSendOptions) {
         handleTerminalResponse(res, freshSendToken, { finishFreshStream: !wasStreaming })
         // See dispatchSend: a terminal response has no future lifecycle event.
       }
+      return hiddenDispatchResult(
+        'accepted',
+        'accepted',
+        stableClientRequestId,
+        requestSessionKey,
+      )
     } catch (err: unknown) {
+      const rpcError = err as RpcClientError | null | undefined
       const acceptedError = acceptedErrorInfo(err)
+      const accepted = rpcError?.accepted
+      if (accepted === true) {
+        if (
+          hiddenSessionIntent
+          && requestSessionKey === options.sessionKey.value
+          && options.pendingSessionIntent.value === hiddenSessionIntent
+        ) {
+          options.pendingSessionIntent.value = null
+        }
+        removeHiddenControl(
+          requestSessionKey,
+          stableClientRequestId,
+          options.hiddenControlStorage,
+        )
+      }
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
       const stoppedByUser = freshSendToken?.stoppedByUser === true
       if (
@@ -2051,11 +2207,37 @@ export function useChatSend(options: UseChatSendOptions) {
           errorCode: errorCode(err),
           ts: new Date().toISOString(),
         })
-        return 'accepted'
+        return hiddenDispatchResult(
+          'accepted',
+          'accepted',
+          stableClientRequestId,
+          requestSessionKey,
+        )
       }
       if (acceptedError && options.sessionKey.value === requestSessionKey) {
         bindUserMessageId(clientMessageId, acceptedError.messageId)
         options.scheduleHistorySync()
+        return hiddenDispatchResult(
+          'accepted',
+          'accepted',
+          stableClientRequestId,
+          requestSessionKey,
+        )
+      }
+      if (acceptedError) {
+        return hiddenDispatchResult(
+          'accepted',
+          'accepted',
+          stableClientRequestId,
+          requestSessionKey,
+        )
+      }
+      if (accepted === false && rpcError?.retryable === false) {
+        removeHiddenControl(
+          requestSessionKey,
+          stableClientRequestId,
+          options.hiddenControlStorage,
+        )
       }
       if (options.sessionKey.value !== requestSessionKey) {
         recordSessionNavigationDiag('hiddenSend.error.stale', {
@@ -2063,10 +2245,20 @@ export function useChatSend(options: UseChatSendOptions) {
           current: options.sessionKey.value,
           reason: errorMessage(err),
         })
-        return acceptedError ? 'accepted' : 'retryable_failure'
+        return hiddenDispatchResult(
+          accepted === false ? 'rejected' : 'unknown',
+          accepted === false ? 'send_rejected' : 'response_unknown',
+          stableClientRequestId,
+          requestSessionKey,
+        )
       }
       if (!wasStreaming && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)) {
-        return acceptedError ? 'accepted' : 'retryable_failure'
+        return hiddenDispatchResult(
+          accepted === false ? 'rejected' : 'unknown',
+          accepted === false ? 'send_rejected' : 'response_unknown',
+          stableClientRequestId,
+          requestSessionKey,
+        )
       }
       if (!wasStreaming) {
         if (activeFreshSendToken === freshSendToken) {
@@ -2076,37 +2268,121 @@ export function useChatSend(options: UseChatSendOptions) {
         options.activeStreamSessionKey.value = ''
         options.stream.endStreaming()
       }
-      if (
-        !acceptedError
-        && !queuedItem
-        && options.sessionKey.value === requestSessionKey
-      ) {
-        const queued = options.enqueueHiddenControl?.(
-          {
-            text: providerText,
-            displayText,
-            clientRequestId,
-            clientMessageId,
-            visibleCommitted: Boolean(displayText),
-          },
-          pendingQueueOwner(),
-        )
-        if (queued) {
-          options.schedulePendingDrainAfterTerminal()
-          return 'accepted'
-        }
-      }
       options.messages.value.push({
         role: 'error',
         text: sendFailureMessage(err),
         errorCode: errorCode(err),
         ts: new Date().toISOString(),
       })
-      return acceptedError ? 'accepted' : 'retryable_failure'
+      return hiddenDispatchResult(
+        accepted === false ? 'rejected' : 'unknown',
+        accepted === false ? 'send_rejected' : 'response_unknown',
+        stableClientRequestId,
+        requestSessionKey,
+      )
     } finally {
       finishResponseHandoff(responseHandoff)
     }
-    return 'accepted'
+    return hiddenDispatchResult('accepted', 'accepted', stableClientRequestId, requestSessionKey)
+  }
+
+  async function dispatchQueuedHiddenSend(
+    item: ChatPendingItem,
+    ownerSessionKey: string,
+  ): Promise<ChatSendOutcome> {
+    const stableClientRequestId = item.clientRequestId
+      || item.hiddenClientRequestId
+      || createClientRequestId()
+    item.clientRequestId = stableClientRequestId
+    item.hiddenClientRequestId = stableClientRequestId
+    item.hiddenClientMessageId ||= `hidden-control:${stableClientRequestId}`
+    const result = await dispatchHiddenSend(
+      item.text,
+      item.displayTextOverride || '',
+      stableClientRequestId,
+      ownerSessionKey,
+    )
+    if (item.displayTextOverride) item.hiddenVisibleCommitted = true
+    if (result.status === 'accepted') return 'accepted'
+    if (result.status === 'queued') return 'deferred'
+    if (result.status === 'unknown') return 'retryable_failure'
+    return 'not_sent'
+  }
+
+  async function restoreHiddenControls(
+    targetSessionKey = options.sessionKey.value,
+    skipClientRequestIds: readonly string[] = [],
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    if (!targetSessionKey || !isCurrent() || options.sessionKey.value !== targetSessionKey) return
+    const skipped = new Set(skipClientRequestIds)
+    for (const item of listHiddenControls(targetSessionKey, options.hiddenControlStorage)) {
+      if (!isCurrent() || options.sessionKey.value !== targetSessionKey) return
+      if (skipped.has(item.clientRequestId)) continue
+      const result = await dispatchHiddenSend(
+        item.providerText,
+        item.displayText,
+        item.clientRequestId,
+      )
+      if (!isCurrent()) return
+      // One queued item owns the next drain slot. Continuing would only fill a
+      // bounded in-memory queue during a long active turn; the remaining
+      // durable outbox entries will be retried on the next restore/reconnect.
+      if (result.status === 'queued') return
+    }
+  }
+
+  async function retryPendingMetaDiscard(
+    sessionKey: string,
+    clientRequestId: string,
+  ): Promise<boolean> {
+    try {
+      const result = await options.rpc.call<{ discarded?: boolean; accepted?: boolean }>('meta.drafts.discard', {
+        sessionKey,
+        clientRequestId,
+      })
+      if (result?.discarded !== true && result?.accepted !== true) return false
+      removePendingMetaDiscard(sessionKey, clientRequestId, metaDiscardStorage())
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  function discardHiddenControl(sessionKey: string, clientRequestId: string): boolean {
+    // Persist the user's cancellation before removing the sendable browser
+    // copy. If the RPC or its response is lost, reload retries only this
+    // discard and never treats the server draft as launchable work.
+    if (!persistPendingMetaDiscard({ sessionKey, clientRequestId }, metaDiscardStorage())) {
+      return false
+    }
+    forgetHiddenControl(sessionKey, clientRequestId)
+    void retryPendingMetaDiscard(sessionKey, clientRequestId)
+    return true
+  }
+
+  function forgetHiddenControl(sessionKey: string, clientRequestId: string): void {
+    removeHiddenControl(sessionKey, clientRequestId, options.hiddenControlStorage)
+  }
+
+  async function flushPendingMetaDiscards(
+    sessionKey?: string,
+    skipClientRequestIds: readonly string[] = [],
+  ): Promise<string[]> {
+    const remaining: string[] = []
+    const skipped = new Set(skipClientRequestIds)
+    for (const pending of listPendingMetaDiscards(sessionKey, metaDiscardStorage())) {
+      if (skipped.has(pending.clientRequestId)) {
+        remaining.push(pending.clientRequestId)
+        continue
+      }
+      const discarded = await retryPendingMetaDiscard(
+        pending.sessionKey,
+        pending.clientRequestId,
+      )
+      if (!discarded) remaining.push(pending.clientRequestId)
+    }
+    return remaining
   }
 
   /**
@@ -2137,6 +2413,11 @@ export function useChatSend(options: UseChatSendOptions) {
     supportsSameTurnSteer,
     dispatchComposerPrompt,
     dispatchHiddenSend,
+    dispatchQueuedHiddenSend,
+    discardHiddenControl,
+    forgetHiddenControl,
+    flushPendingMetaDiscards,
+    restoreHiddenControls,
     sendHiddenMetaPreflightConfirmation,
   }
 }

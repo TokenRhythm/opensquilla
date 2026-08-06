@@ -90,7 +90,10 @@ def _unsafe_desktop_profile(home: Path, *, port: int = 0) -> None:
     lifecycle = state / "gateway"
     lifecycle.mkdir(parents=True)
     missing_workspace = home.parent / "missing-workspace"
+    # config_version = 999 is the remaining hard startup gate: a config
+    # authored by a newer build must never be reinterpreted by this one.
     (home / "config.toml").write_text(
+        "config_version = 999\n"
         f"state_dir = {json.dumps(str(state))}\n"
         f"workspace_dir = {json.dumps(str(missing_workspace))}\n",
         encoding="utf-8",
@@ -184,6 +187,25 @@ def test_gateway_run_turns_missing_onboarding_env_into_recovery_hint(
     assert normalized.index("opensquillaonboardstatus--config") < normalized.index(
         expected_config
     )
+    assert "Traceback" not in output
+
+
+def test_gateway_run_reports_invalid_config_without_traceback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "custom.toml"
+    target.write_text("workspace_dir = [\n", encoding="utf-8")
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
+
+    result = runner.invoke(app, ["gateway", "run", "--config", str(target)])
+
+    assert result.exit_code == 1
+    output = result.stdout + (result.stderr or "")
+    compact = "".join(output.split())
+    assert "Invalid gateway config" in output
+    assert "custom.toml" in compact
+    assert "recoveryrecover-config" in compact
     assert "Traceback" not in output
 
 
@@ -299,7 +321,7 @@ def test_unsafe_desktop_gateway_lifecycle_blocks_before_spawn_or_write(
     assert result.ok is False
     assert result.state == "recovery_required"
     assert result.code == "DESKTOP_PROFILE_RECOVERY_REQUIRED"
-    assert result.details["stableCode"] == "effective_workspace_missing"
+    assert result.details["stableCode"] == "config_schema_too_new"
     assert _profile_tree_snapshot(home) == before
     assert not user_state.exists()
 
@@ -373,7 +395,7 @@ def test_gateway_run_emits_stable_profile_in_use_error_without_sensitive_path(
     lock_error = getattr(recovery, lock_error_name)
 
     @contextlib.contextmanager
-    def busy_profile_guard():
+    def busy_profile_guard(**_kwargs):
         raise lock_error(
             f"profile is in use by another writer: {sensitive_profile}"
         )

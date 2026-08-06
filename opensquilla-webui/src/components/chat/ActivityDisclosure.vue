@@ -166,9 +166,7 @@ watch(() => [props.stateKey, props.continuityKey] as const, ([key, continuityKey
 watch(
   () => props.defaultOpen,
   (defaultOpen, previousDefaultOpen) => {
-    if (defaultOpen && !previousDefaultOpen) {
-      open.value = true
-    }
+    if (defaultOpen !== previousDefaultOpen) open.value = defaultOpen
   },
 )
 
@@ -202,6 +200,10 @@ const resolvedSummaryLabel = computed(() => {
   min-width: 0;
   margin: 0 0 0.625rem;
   color: var(--text-muted);
+}
+
+.assistant-activity--settled {
+  margin-bottom: 0.25rem;
 }
 
 .assistant-activity--live {
@@ -384,7 +386,6 @@ const resolvedSummaryLabel = computed(() => {
   margin: 0.125rem 0 0.25rem;
   padding: 0 0 0 0.75rem;
   border: 0;
-  border-left: 1px solid var(--border);
   background: transparent;
 }
 
@@ -418,13 +419,6 @@ const resolvedSummaryLabel = computed(() => {
 .assistant-activity__body.is-open :deep(.assistant-activity-status__row:nth-child(n + 3)),
 .assistant-activity__body.is-open :deep(.tool-row:nth-child(n + 3)) {
   animation-delay: 120ms;
-}
-
-.assistant-activity--settled[data-share-expanded="true"]::after {
-  content: "";
-  display: block;
-  height: 1px;
-  background: var(--border);
 }
 
 @keyframes assistant-activity-pulse {

@@ -12,6 +12,7 @@ runtime wrapper.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -95,6 +96,7 @@ class _RecordingAgentRun:
 class _RecordingCompactionPersist:
     calls: list[dict[str, Any]] = field(default_factory=list)
     raises: type[BaseException] | None = None
+    result: bool | None = None
 
     async def persist_and_notify(
         self,
@@ -102,18 +104,45 @@ class _RecordingCompactionPersist:
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
-    ) -> None:
+        compaction_deadline_at_monotonic: float | None = None,
+        compaction_timeout_seconds: float | None = None,
+        removed_count: int = 0,
+        source_entries: tuple[Any, ...] | None = None,
+        source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_boundary_message_id: str | None = None,
+        source_boundary_entry_id: int | None = None,
+    ) -> bool | None:
         self.calls.append(
             {
                 "session_key": session_key,
                 "summary": summary,
                 "kept_entries": kept_entries,
+                "summary_payload": summary_payload,
+                "summary_format": summary_format,
+                "coverage_status": coverage_status,
+                "missing_obligations": missing_obligations,
+                "critical_carry_forward": critical_carry_forward,
                 "compaction_id": compaction_id,
+                "compaction_deadline_at_monotonic": (
+                    compaction_deadline_at_monotonic
+                ),
+                "compaction_timeout_seconds": compaction_timeout_seconds,
+                "removed_count": removed_count,
+                "source_entries": source_entries,
+                "source_preimage": source_preimage,
+                "source_boundary_message_id": source_boundary_message_id,
+                "source_boundary_entry_id": source_boundary_entry_id,
             }
         )
         if self.raises is not None:
             raise self.raises("recording persist boom")
+        return self.result
 
 
 @dataclass
@@ -209,6 +238,10 @@ def _make_input(
     input_provenance: dict[str, Any] | None = None,
     pending_input_provider: Any | None = None,
     tool_context: Any | None = None,
+    compaction_source_entries: tuple[Any, ...] | None = None,
+    compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+    compaction_source_boundary_message_id: str | None = None,
+    compaction_source_boundary_entry_id: int | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
         agent=SimpleNamespace(),
@@ -231,6 +264,12 @@ def _make_input(
         state=state if state is not None else _make_state(),
         pending_input_provider=pending_input_provider,
         tool_context=tool_context,
+        compaction_source_entries=compaction_source_entries,
+        compaction_source_preimage=compaction_source_preimage,
+        compaction_source_boundary_message_id=(
+            compaction_source_boundary_message_id
+        ),
+        compaction_source_boundary_entry_id=compaction_source_boundary_entry_id,
     )
 
 
@@ -951,6 +990,68 @@ def test_tool_result_handler_replaces_intermediate_approval_result() -> None:
     assert state.turn_segments[0]["input"]["approval_id"] == "approval-1"
 
 
+def test_tool_result_handler_preserves_initial_user_input_request() -> None:
+    state = _make_state()
+    handler = _ToolResultHandler()
+    request = {
+        "status": "input_required",
+        "kind": "user_input",
+        "paused": True,
+        "request_id": "request-1",
+        "run_id": "run-1",
+        "step": "plan",
+        "clarify_schema": {
+            "mode": "form",
+            "presentation": "plan_questionnaire_v1",
+            "fields": [{"name": "scope", "required": True}],
+        },
+    }
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="call-input",
+            tool_name="request_user_input",
+            result=json.dumps(request),
+        ),
+        state,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="call-input",
+            tool_name="request_user_input",
+            result=json.dumps(
+                {
+                    "status": "answered",
+                    "kind": "user_input",
+                    "paused": False,
+                    "request_id": "request-1",
+                    "answers": {"scope": "focused"},
+                }
+            ),
+        ),
+        state,
+    )
+
+    assert state.turn_segments == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-input",
+            "name": "request_user_input",
+            "result": json.dumps(
+                {
+                    "status": "answered",
+                    "kind": "user_input",
+                    "paused": False,
+                    "request_id": "request-1",
+                    "answers": {"scope": "focused"},
+                }
+            ),
+            "is_error": False,
+            "user_input_request": request,
+        }
+    ]
+
+
 def test_artifact_handler_appends_payload() -> None:
     state = _make_state()
     handler = _ArtifactHandler()
@@ -1212,17 +1313,58 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
         memory_snapshot=snapshot,
         system_prompt=prompt,
     )
-    inp = _make_input()
+    source_entries = (SimpleNamespace(message_id="source-boundary", id=7),)
+    source_preimage = ((7, "source-boundary"),)
+    inp = _make_input(
+        compaction_source_entries=source_entries,
+        compaction_source_preimage=source_preimage,
+        compaction_source_boundary_message_id="source-boundary",
+        compaction_source_boundary_entry_id=7,
+    )
     await handler.handle(
-        CompactionEvent(compaction_id="cmp_inline_1", summary="s", kept_entries=[1, 2]),
+        CompactionEvent(
+            compaction_id="cmp_inline_1",
+            summary="s",
+            kept_entries=[1, 2],
+            removed_count=4,
+        ),
         inp,
     )
     assert len(persist.calls) == 1
     assert persist.calls[0]["summary"] == "s"
     assert persist.calls[0]["kept_entries"] == [1, 2]
     assert persist.calls[0]["compaction_id"] == "cmp_inline_1"
+    assert persist.calls[0]["removed_count"] == 4
+    assert persist.calls[0]["source_entries"] is source_entries
+    assert persist.calls[0]["source_preimage"] is source_preimage
+    assert persist.calls[0]["source_boundary_message_id"] == "source-boundary"
+    assert persist.calls[0]["source_boundary_entry_id"] == 7
     assert len(snapshot.calls) == 1
     assert len(prompt.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_handler_does_not_refresh_after_stale_source() -> None:
+    persist = _RecordingCompactionPersist(result=False)
+    snapshot = _RecordingMemorySnapshotRefresh()
+    prompt = _RecordingSystemPromptRefresh()
+    handler = _CompactionHandler(
+        persist=persist,
+        memory_snapshot=snapshot,
+        system_prompt=prompt,
+    )
+
+    await handler.handle(
+        CompactionEvent(summary="stale", kept_entries=[], removed_count=1),
+        _make_input(
+            compaction_source_entries=(),
+            compaction_source_preimage=(),
+        ),
+    )
+
+    assert len(persist.calls) == 1
+    assert snapshot.calls == []
+    assert prompt.calls == []
 
 
 @pytest.mark.asyncio

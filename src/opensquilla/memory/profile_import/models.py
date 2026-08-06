@@ -12,7 +12,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "profile-fusion-v2"
+PROMPT_VERSION = "profile-fusion-v3"
 EXPORT_PROMPT_VERSION = "profile-export-v1"
 MAX_RAW_BYTES = 256 * 1024
 PREVIEW_TTL_SECONDS = 24 * 60 * 60

@@ -17,6 +17,7 @@ desktop_changed=false
 python_changed=false
 platform_sensitive_changed=false
 build_wheel_required=false
+toolchain_artifact_changed=false
 full_required=false
 seen_file=false
 
@@ -82,6 +83,11 @@ mark_platform_sensitive_changed() {
   windows_full_required=true
 }
 
+mark_toolchain_artifact_changed() {
+  mark_non_docs_changed
+  toolchain_artifact_changed=true
+}
+
 mark_full_required() {
   docs_only=false
   runtime_changed=true
@@ -96,6 +102,7 @@ mark_full_required() {
   python_changed=true
   platform_sensitive_changed=true
   build_wheel_required=true
+  toolchain_artifact_changed=true
   full_required=true
 }
 
@@ -110,6 +117,7 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       ;;
     pyproject.toml | uv.lock)
       mark_dependency_changed
+      mark_toolchain_artifact_changed
       ;;
     opensquilla-webui/*)
       mark_frontend_changed
@@ -140,6 +148,26 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       ;;
     .github/scripts/*)
       mark_full_required
+      ;;
+    scripts/validate_managed_toolchain_artifacts.py | scripts/validate_managed_toolchain_artifacts_stdlib.py)
+      mark_runtime_changed
+      mark_platform_sensitive_changed
+      mark_toolchain_artifact_changed
+      ;;
+    src/opensquilla/skills/toolchains/*)
+      mark_runtime_changed
+      mark_platform_sensitive_changed
+      mark_toolchain_artifact_changed
+      ;;
+    src/opensquilla/skills/runtime_env.py | src/opensquilla/skills/bundled/meta-paper-write/* | src/opensquilla/skills/bundled/paper-*/* | src/opensquilla/skills/bundled/meta-short-drama/* | src/opensquilla/skills/bundled/subtitle-burner/* | src/opensquilla/skills/bundled/video-still-animator/*)
+      mark_runtime_changed
+      mark_platform_sensitive_changed
+      mark_toolchain_artifact_changed
+      ;;
+    tests/test_skills/test_managed_toolchains.py | tests/test_skills/test_toolchain_runtime_integration.py | tests/test_skills/test_toolchain_state_scope.py | tests/test_skills/test_meta_paper* | tests/test_skills/test_paper_*)
+      mark_test_changed
+      mark_platform_sensitive_changed
+      mark_toolchain_artifact_changed
       ;;
     tests/test_scripts/test_build_wheelhouse_zip.py | tests/test_install_scripts.py | tests/test_root_start_scripts.py | tests/test_release_consistency.py | tests/test_public_release_hygiene.py)
       mark_test_changed
@@ -227,5 +255,6 @@ fi
   printf 'python_changed=%s\n' "${python_changed}"
   printf 'platform_sensitive_changed=%s\n' "${platform_sensitive_changed}"
   printf 'build_wheel_required=%s\n' "${build_wheel_required}"
+  printf 'toolchain_artifact_changed=%s\n' "${toolchain_artifact_changed}"
   printf 'full_required=%s\n' "${full_required}"
 } >> "${output_file}"

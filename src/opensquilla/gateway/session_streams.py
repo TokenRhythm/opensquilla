@@ -49,17 +49,26 @@ class SessionStreamRegistry:
         self._live_task_by_session: dict[str, str | None] = {}
 
     @staticmethod
-    def _is_replay_lossy(event_name: str) -> bool:
-        return event_name in {
+    def _is_replay_lossy(
+        event_name: str,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if event_name in {
             "session.event.text_delta",
             "session.event.run_heartbeat",
             "session.event.tool_use_delta",
-        }
+        }:
+            return True
+        return bool(
+            event_name == "session.event.compaction"
+            and isinstance(payload, dict)
+            and payload.get("heartbeat") is True
+        )
 
     def _trim_session_events(self, events: deque[BufferedSessionEvent]) -> None:
         while len(events) > self._max_events_per_session:
             for index, event in enumerate(events):
-                if self._is_replay_lossy(event.event_name):
+                if self._is_replay_lossy(event.event_name, event.payload):
                     del events[index]
                     break
             else:

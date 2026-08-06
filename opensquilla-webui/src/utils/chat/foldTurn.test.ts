@@ -111,6 +111,21 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
     ]).rawText).toBe('Final answer')
   })
 
+  it('preserves semantic text boundaries for live answer streaming', () => {
+    const f = fold([
+      { kind: 'tool-start', seq: 0, toolId: 't', name: 'bash', input: '{}', at: 1 },
+      { kind: 'tool-result', seq: 1, toolId: 't', name: 'bash', result: 'ok', isError: false, input: '{}', at: 2 },
+      { kind: 'text', seq: 2, text: 'Checking.', presentation: 'intermediate' },
+      { kind: 'text', seq: 3, text: 'Answer', presentation: 'answer' },
+    ])
+
+    expect(f.timelineItems).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+      expect.objectContaining({ type: 'text', rawText: 'Checking.', presentation: 'intermediate' }),
+      expect.objectContaining({ type: 'text', rawText: 'Answer', presentation: 'answer' }),
+    ])
+  })
+
   it('replaces stale text around tools with one canonical terminal segment', () => {
     const f = fold([
       { kind: 'text', seq: 0, text: 'stale preface' },
@@ -169,6 +184,48 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
     ])
     expect(f.statusHistory.map(s => s.action)).toEqual(['plan', 'run'])
     expect(f.statusHistory[0].at).toBeLessThanOrEqual(f.statusHistory[1].at)
+  })
+
+  it('merges maintenance completion into its original compaction row', () => {
+    const f = fold([
+      {
+        kind: 'status',
+        seq: 0,
+        action: 'context_compaction',
+        label: '',
+        at: 1000,
+        id: 'cmp-1',
+        category: 'maintenance',
+        state: 'running',
+        source: 'automatic',
+        durability: 'durable',
+      },
+      {
+        kind: 'status',
+        seq: 1,
+        action: 'context_compaction',
+        label: '',
+        at: 2000,
+        id: 'cmp-1',
+        category: 'maintenance',
+        state: 'completed',
+        source: 'automatic',
+        durability: 'durable',
+        detail: 'Stable context compacted',
+      },
+    ])
+
+    expect(f.statusHistory).toEqual([{
+      action: 'context_compaction',
+      label: '',
+      at: 1000,
+      id: 'cmp-1',
+      category: 'maintenance',
+      state: 'completed',
+      source: 'automatic',
+      durability: 'durable',
+      detail: 'Stable context compacted',
+    }])
   })
 
   it('preserves artifact arrival order', () => {

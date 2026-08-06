@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from opensquilla.session import manager as session_manager_module
 from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.context_view import (
+    build_compaction_context_records,
+    format_compaction_summary_context,
+)
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     PlanRunRecord,
@@ -1663,6 +1668,95 @@ async def test_storage_migrates_legacy_summary_metadata_columns(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_legacy_summary_database_compacts_and_replays_after_restart(tmp_path):
+    """A pre-metadata summary survives upgrade, replacement, and a cold restart."""
+    db_path = tmp_path / "legacy-summary-upgrade.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE session_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                compaction_index INTEGER NOT NULL DEFAULT 0,
+                summary_text TEXT NOT NULL,
+                covered_through_id INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO session_summaries (
+                session_id, session_key, compaction_index, summary_text,
+                covered_through_id, created_at, schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-session-placeholder",
+                "agent:main:legacy-upgrade",
+                0,
+                "legacy checkpoint before metadata columns",
+                0,
+                123,
+                1,
+            ),
+        )
+
+    storage = SessionStorage(str(db_path))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    node = await manager.create("agent:main:legacy-upgrade")
+    await storage.conn.execute(
+        "UPDATE session_summaries SET session_id = ? WHERE session_key = ?",
+        (node.session_id, node.session_key),
+    )
+    await storage.conn.commit()
+    for index in range(20):
+        await manager.append_message(
+            node.session_key,
+            "user",
+            f"legacy-upgrade message {index} " + ("x" * 500),
+            token_count=200,
+        )
+
+    result = await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=1000,
+        compaction_id="cmp-legacy-upgrade-replacement",
+    )
+    assert result.removed_count > 0
+    assert result.summary_payload is not None
+    assert result.summary_payload["source_coverage"]["replaces_prior_context"] is True
+    replacement_compaction_id = "cmp-legacy-upgrade-replacement"
+    await storage.close()
+
+    reopened = SessionStorage(str(db_path))
+    await reopened.connect()
+    try:
+        restarted = SessionManager(reopened, inject_time_prefix=False)
+        summaries = await restarted.get_summaries(node.session_key)
+        states = await restarted.get_context_states(node.session_key)
+
+        assert len(summaries) == 2
+        assert summaries[0].summary_format == "text"
+        assert summaries[0].summary_payload is None
+        assert summaries[1].summary_payload is not None
+        assert summaries[1].summary_payload["source_coverage"]["replaces_prior_context"] is True
+
+        active_records = build_compaction_context_records(
+            context_states=states,
+            summaries=summaries,
+        )
+        assert len(active_records) == 1
+        assert active_records[0].compaction_id == replacement_compaction_id
+        assert active_records[0].covered_through_id == summaries[1].covered_through_id
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_storage_adds_compaction_lookup_index_to_existing_database(tmp_path):
     db_path = tmp_path / "existing-compaction-index.db"
     initial = SessionStorage(str(db_path))
@@ -1769,6 +1863,14 @@ async def test_compact_no_op_small_context(manager):
     assert summary == ""
 
 
+def test_durable_summary_replay_matches_runtime_formatter() -> None:
+    summary = "portable checkpoint"
+    rendered = format_compaction_summary_context([summary])
+
+    assert rendered is not None
+    assert session_manager_module._durable_summary_replay(summary) == f"{rendered}\n\n"
+
+
 @pytest.mark.asyncio
 async def test_compact_reduces_transcript(manager):
     await manager.create("agent:main:main")
@@ -1825,6 +1927,178 @@ async def test_compact_with_result_returns_source_and_persists(manager):
     ]
     assert canonical_contents == original_contents
     assert [entry.content for entry in transcript] == original_contents[-len(transcript) :]
+
+
+def test_compaction_singleflight_target_fingerprint_is_credential_aware():
+    first = CompactionConfig(provider="provider-a", model="model-a", api_key="secret-a")
+    same_deployment_and_credentials = CompactionConfig(
+        provider="provider-a",
+        model="model-a",
+        api_key="secret-a",
+    )
+    other_credentials = CompactionConfig(
+        provider="provider-a",
+        model="model-a",
+        api_key="secret-b",
+    )
+    other_model = CompactionConfig(provider="provider-a", model="model-b", api_key="secret-a")
+
+    first_fingerprint = session_manager_module._compaction_target_fingerprint(first)
+
+    assert (
+        session_manager_module._compaction_target_fingerprint(same_deployment_and_credentials)
+        == first_fingerprint
+    )
+    assert (
+        session_manager_module._compaction_target_fingerprint(other_credentials)
+        != first_fingerprint
+    )
+    assert (
+        session_manager_module._compaction_target_fingerprint(other_model)
+        != first_fingerprint
+    )
+    assert "secret-a" not in first_fingerprint
+    assert "secret-b" not in session_manager_module._compaction_target_fingerprint(
+        other_credentials
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_with_result_singleflight_shares_generation_and_commit(
+    manager,
+    monkeypatch,
+):
+    await manager.create("agent:main:main")
+    for i in range(20):
+        await manager.append_message(
+            "agent:main:main",
+            "user",
+            f"singleflight msg {i} " + ("x" * 500),
+            token_count=200,
+        )
+
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+    waiter_joined = asyncio.Event()
+    generation_calls = 0
+    original_compact_context = session_manager_module.compact_context
+    original_acquire = session_manager_module._acquire_compaction_singleflight
+
+    async def slow_compact_context(request):
+        nonlocal generation_calls
+        generation_calls += 1
+        generation_started.set()
+        await release_generation.wait()
+        return await original_compact_context(request)
+
+    def track_acquire(*args, **kwargs):
+        flight, is_owner = original_acquire(*args, **kwargs)
+        if not is_owner:
+            waiter_joined.set()
+        return flight, is_owner
+
+    monkeypatch.setattr(session_manager_module, "compact_context", slow_compact_context)
+    monkeypatch.setattr(
+        session_manager_module,
+        "_acquire_compaction_singleflight",
+        track_acquire,
+    )
+    shared_config = CompactionConfig()
+
+    owner = asyncio.create_task(
+        manager.compact_with_result(
+            "agent:main:main",
+            context_window_tokens=1000,
+            config=shared_config,
+        )
+    )
+    await asyncio.wait_for(generation_started.wait(), timeout=1)
+    waiter = asyncio.create_task(
+        manager.compact_with_result(
+            "agent:main:main",
+            context_window_tokens=1000,
+            config=shared_config,
+        )
+    )
+    await asyncio.wait_for(waiter_joined.wait(), timeout=1)
+    release_generation.set()
+
+    owner_result, waiter_result = await asyncio.gather(owner, waiter)
+
+    assert owner_result is waiter_result
+    assert generation_calls == 1
+    assert shared_config.operation_id is None
+    assert shared_config.deadline_at_monotonic is None
+    node = await manager.get_session("agent:main:main")
+    assert node is not None
+    assert node.compaction_count == 1
+    assert len(await manager.get_summaries("agent:main:main")) == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_with_result_singleflight_waiter_cancel_does_not_cancel_owner(
+    manager,
+    monkeypatch,
+):
+    await manager.create("agent:main:main")
+    for i in range(20):
+        await manager.append_message(
+            "agent:main:main",
+            "user",
+            f"cancel waiter msg {i} " + ("x" * 500),
+            token_count=200,
+        )
+
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+    waiter_joined = asyncio.Event()
+    generation_calls = 0
+    original_compact_context = session_manager_module.compact_context
+    original_acquire = session_manager_module._acquire_compaction_singleflight
+
+    async def slow_compact_context(request):
+        nonlocal generation_calls
+        generation_calls += 1
+        generation_started.set()
+        await release_generation.wait()
+        return await original_compact_context(request)
+
+    def track_acquire(*args, **kwargs):
+        flight, is_owner = original_acquire(*args, **kwargs)
+        if not is_owner:
+            waiter_joined.set()
+        return flight, is_owner
+
+    monkeypatch.setattr(session_manager_module, "compact_context", slow_compact_context)
+    monkeypatch.setattr(
+        session_manager_module,
+        "_acquire_compaction_singleflight",
+        track_acquire,
+    )
+
+    owner = asyncio.create_task(
+        manager.compact_with_result("agent:main:main", context_window_tokens=1000)
+    )
+    await asyncio.wait_for(generation_started.wait(), timeout=1)
+    waiter = asyncio.create_task(
+        manager.compact_with_result("agent:main:main", context_window_tokens=1000)
+    )
+    await asyncio.wait_for(waiter_joined.wait(), timeout=1)
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert not owner.done()
+
+    release_generation.set()
+    result = await owner
+
+    assert result.summary
+    assert generation_calls == 1
+    node = await manager.get_session("agent:main:main")
+    assert node is not None
+    assert node.compaction_count == 1
+    assert len(await manager.get_summaries("agent:main:main")) == 1
 
 
 @pytest.mark.asyncio
@@ -2001,7 +2275,7 @@ async def test_archive_only_memory_flush_compaction_status_does_not_enter_repair
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_reports_and_backfills_missing_obligations(manager):
+async def test_compact_with_result_reports_obligations_and_keeps_protected_tool_tail(manager):
     await manager.create("agent:main:main")
     await manager.append_message(
         "agent:main:main",
@@ -2011,7 +2285,19 @@ async def test_compact_with_result_reports_and_backfills_missing_obligations(man
             "Constraint: do not enable coverage blocking by default.\n"
             "Keep src/opensquilla/session/models.py and docs/Long Task Report.md."
         ),
-        token_count=250,
+        token_count=500,
+    )
+    await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "I will preserve those constraints and continue the continuity work.",
+        token_count=500,
+    )
+    await manager.append_message(
+        "agent:main:main",
+        "user",
+        "Run the focused session test now.",
+        token_count=20,
     )
     await manager.append_message(
         "agent:main:main",
@@ -2041,8 +2327,8 @@ async def test_compact_with_result_reports_and_backfills_missing_obligations(man
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=500,
-        config=CompactionConfig(safety_margin=1.0),
+        context_window_tokens=1_200,
+        config=CompactionConfig(safety_margin=1.2),
     )
 
     assert result.removed_count > 0
@@ -2051,16 +2337,20 @@ async def test_compact_with_result_reports_and_backfills_missing_obligations(man
     assert summary.summary_text == result.summary
     assert summary.summary_format == "structured_v1"
     assert summary.summary_payload is not None
-    assert summary.coverage_status == "pass_with_backfill"
-    assert summary.missing_obligations
-    assert summary.critical_carry_forward
+    assert summary.coverage_status == "pass"
+    assert summary.missing_obligations == []
+    assert summary.critical_carry_forward == []
     assert "src/opensquilla/session/models.py" in str(summary.summary_payload)
-    assert any("call_exec_1" in item for item in summary.critical_carry_forward)
-    assert await manager.get_transcript("agent:main:main")
+    transcript = await manager.get_transcript("agent:main:main")
+    assert any(entry.tool_call_id == "call_exec_1" for entry in transcript)
+    assert any(
+        entry.tool_calls and entry.tool_calls[0]["id"] == "call_exec_1"
+        for entry in transcript
+    )
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_strict_coverage_blocks_destructive_rewrite(manager):
+async def test_compact_with_result_strict_coverage_installs_verified_backfill(manager):
     node = await manager.create("agent:main:main")
     late_critical_path = "src/opensquilla/session/critical_continuity.py"
     await manager.append_message(
@@ -2084,17 +2374,22 @@ async def test_compact_with_result_strict_coverage_blocks_destructive_rewrite(ma
         config=CompactionConfig(safety_margin=1.0, coverage_blocking=True),
     )
 
-    assert result.removed_count == 0
-    assert result.skip_reason == "coverage_blocked"
-    assert result.coverage_status == "fail_blocked"
-    assert any(late_critical_path in item for item in result.missing_obligations or [])
-    assert await manager.get_transcript("agent:main:main") == original_transcript
-    assert await manager.get_summaries("agent:main:main") == []
-    assert await manager.get_context_states("agent:main:main") == []
+    assert result.removed_count > 0
+    assert result.skip_reason is None
+    assert result.coverage_status == "pass"
+    assert result.missing_obligations == []
+    assert late_critical_path in str(result.summary_payload)
+    assert len(await manager.get_transcript("agent:main:main")) < len(
+        original_transcript
+    )
+    summaries = await manager.get_summaries("agent:main:main")
+    assert len(summaries) == 1
+    assert late_critical_path in str(summaries[0].summary_payload)
+    assert await manager.get_context_states("agent:main:main")
     current_node = await manager._storage.get_session("agent:main:main")
     assert current_node is not None
     assert current_node.session_id == node.session_id
-    assert current_node.compaction_count == 0
+    assert current_node.compaction_count == 1
 
 
 @pytest.mark.asyncio
@@ -2143,7 +2438,24 @@ async def test_compact_with_result_writes_portable_context_state(manager):
 @pytest.mark.asyncio
 async def test_compact_with_result_preserves_tool_metadata_for_boundary_cut(manager):
     await manager.create("agent:main:main")
-    await manager.append_message("agent:main:main", "user", "old context", token_count=300)
+    await manager.append_message(
+        "agent:main:main",
+        "user",
+        "ancient request",
+        token_count=500,
+    )
+    await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "ancient answer",
+        token_count=500,
+    )
+    await manager.append_message(
+        "agent:main:main",
+        "user",
+        "tool request",
+        token_count=3,
+    )
     await manager.append_message(
         "agent:main:main",
         "assistant",
@@ -2163,18 +2475,22 @@ async def test_compact_with_result_preserves_tool_metadata_for_boundary_cut(mana
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=100,
+        context_window_tokens=500,
         config=CompactionConfig(safety_margin=1.0),
     )
 
-    assert result.removed_count == 1
-    assert result.kept_entries[0]["role"] == "assistant"
-    assert result.kept_entries[0]["tool_calls"] == [{"id": "call_1", "type": "function"}]
+    assert result.removed_count == 2
+    assert result.kept_entries[0]["role"] == "user"
+    assert result.kept_entries[0]["content"] == "tool request"
+    assert result.kept_entries[1]["role"] == "assistant"
+    assert result.kept_entries[1]["tool_calls"] == [{"id": "call_1", "type": "function"}]
     transcript = await manager.get_transcript("agent:main:main")
-    assert transcript[0].role == "assistant"
-    assert transcript[0].tool_calls == [{"id": "call_1", "type": "function"}]
-    assert transcript[1].role == "tool"
-    assert transcript[1].tool_call_id == "call_1"
+    assert transcript[0].role == "user"
+    assert transcript[0].content == "tool request"
+    assert transcript[1].role == "assistant"
+    assert transcript[1].tool_calls == [{"id": "call_1", "type": "function"}]
+    assert transcript[2].role == "tool"
+    assert transcript[2].tool_call_id == "call_1"
 
 
 @pytest.mark.asyncio
@@ -2198,8 +2514,13 @@ async def test_compact_counts_tool_calls_when_token_count_is_underreported(manag
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=50,
-        config=CompactionConfig(safety_margin=1.0),
+        context_window_tokens=300,
+        config=CompactionConfig(
+            safety_margin=1.0,
+            # This test isolates the wire-token estimator. Default production
+            # policy correctly retains the unresolved tool call as raw state.
+            protect_semantic_tail=False,
+        ),
     )
 
     assert result.removed_count == 1
@@ -2227,6 +2548,24 @@ def _fail_next_transcript_insert(monkeypatch: pytest.MonkeyPatch, storage: Sessi
     monkeypatch.setattr(storage.conn, "execute", execute)
 
 
+def _fail_next_summary_insert(monkeypatch: pytest.MonkeyPatch, storage: SessionStorage) -> None:
+    original_execute = storage.conn.execute
+    failed = False
+
+    def execute(sql: str, params: Any = ()):
+        nonlocal failed
+        if (
+            not failed
+            and isinstance(sql, str)
+            and sql.lstrip().upper().startswith("INSERT INTO SESSION_SUMMARIES")
+        ):
+            failed = True
+            raise RuntimeError("rewrite insert failed")
+        return original_execute(sql, params)
+
+    monkeypatch.setattr(storage.conn, "execute", execute)
+
+
 @pytest.mark.asyncio
 async def test_compact_rewrite_failure_keeps_session_state_atomic(
     manager,
@@ -2240,7 +2579,7 @@ async def test_compact_rewrite_failure_keeps_session_state_atomic(
     original_summaries = await manager.get_summaries("agent:main:main")
     original_node = await manager._storage.get_session("agent:main:main")
 
-    _fail_next_transcript_insert(monkeypatch, manager._storage)
+    _fail_next_summary_insert(monkeypatch, manager._storage)
 
     with pytest.raises(RuntimeError, match="rewrite insert failed"):
         await manager.compact("agent:main:main", context_window_tokens=1000)
@@ -2496,6 +2835,251 @@ async def test_persist_compaction_result_stores_summary_out_of_band(manager):
     assert states[0].state_kind == "structured_summary_v1"
     assert states[0].payload is not None
     assert states[0].payload["compaction_id"] == "cmp_inline_1"
+
+
+@pytest.mark.asyncio
+async def test_persist_compaction_result_preserves_structured_tail_metadata(manager):
+    node = await manager.create("agent:main:structured-tail")
+    await manager.append_message(node.session_key, "user", "old question")
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    await manager.append_message(
+        node.session_key,
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": "tool-live",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"x"}'},
+            }
+        ],
+        reasoning_content="signed reasoning",
+    )
+    await manager.append_message(
+        node.session_key,
+        "tool",
+        "result",
+        tool_call_id="tool-live",
+    )
+
+    await manager.persist_compaction_result(
+        node.session_key,
+        "older context",
+        [
+            {"role": "assistant", "content": "[flattened tool request]"},
+            {"role": "tool", "content": "[flattened tool result]"},
+        ],
+        compaction_id="cmp-structured-tail",
+    )
+
+    transcript = await manager.get_transcript(node.session_key)
+    assert len(transcript) == 2
+    assert transcript[0].tool_calls is not None
+    assert transcript[0].tool_calls[0]["id"] == "tool-live"
+    assert transcript[0].reasoning_content == "signed reasoning"
+    assert transcript[1].tool_call_id == "tool-live"
+    assert transcript[1].content == "result"
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_preserves_queued_append_only_suffix(manager):
+    node = await manager.create("agent:main:inline-queued-suffix")
+    old_user = await manager.append_message(node.session_key, "user", "old question")
+    old_assistant = await manager.append_message(
+        node.session_key,
+        "assistant",
+        "old answer",
+    )
+    active_user = await manager.append_message(
+        node.session_key,
+        "user",
+        "active request",
+    )
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+    )
+    queued_user = await manager.append_message(
+        node.session_key,
+        "user",
+        "queued request",
+    )
+    entries_before = {
+        entry.message_id: entry
+        for entry in await manager.get_transcript(node.session_key)
+    }
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        "summary of the old exchange",
+        [
+            {"role": "user", "content": "[Available skills for this turn]"},
+            {"role": "user", "content": "active request"},
+        ],
+        compaction_id="cmp-inline-queued",
+        removed_count=2,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+
+    assert installed is True
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.message_id for entry in transcript] == [
+        active_user.message_id,
+        queued_user.message_id,
+    ]
+    assert [entry.id for entry in transcript] == [
+        entries_before[active_user.message_id].id,
+        entries_before[queued_user.message_id].id,
+    ]
+    assert transcript[0].content == "active request"
+    assert transcript[1].content == "queued request"
+    queued_before = entries_before[queued_user.message_id]
+    assert queued_before.id is not None
+    page_before_queued, _ = await manager._storage.get_canonical_transcript_page(
+        node.session_id,
+        limit=1,
+        before=(queued_before.created_at, queued_before.id),
+    )
+    assert [entry.message_id for entry in page_before_queued] == [
+        active_user.message_id,
+    ]
+    async with manager._storage.conn.execute(
+        "SELECT message_id FROM compacted_transcript_entries "
+        "WHERE session_id = ? ORDER BY original_entry_id",
+        (node.session_id,),
+    ) as cur:
+        archived = await cur.fetchall()
+    assert [row[0] for row in archived] == [
+        old_user.message_id,
+        old_assistant.message_id,
+    ]
+    summaries = await manager._storage.get_all_summaries(node.session_id)
+    assert len(summaries) == 1
+    assert summaries[0].removed_count == 2
+    assert summaries[0].kept_count == 1
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_preserves_metadata_from_concurrent_suffix_append(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:inline-concurrent-metadata")
+    old_user = await manager.append_message(node.session_key, "user", "old question")
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    active_user = await manager.append_message(node.session_key, "user", "active request")
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+    )
+    before = await manager._storage.get_session(node.session_key)
+    assert before is not None
+    before.total_tokens = 100
+    before.total_tokens_fresh = True
+    await manager._storage.upsert_session(before)
+
+    original_rewrite = manager._storage.rewrite_compacted_session
+    append_metadata: dict[str, Any] = {}
+
+    async def rewrite_after_concurrent_append(**kwargs):
+        appended = await manager.append_message(
+            node.session_key,
+            "user",
+            "queued after compaction snapshot",
+            token_count=17,
+        )
+        concurrent = await manager._storage.get_session(node.session_key)
+        assert concurrent is not None
+        append_metadata["updated_at"] = concurrent.updated_at
+        append_metadata["message_id"] = appended.message_id
+        return await original_rewrite(**kwargs)
+
+    monkeypatch.setattr(
+        manager._storage,
+        "rewrite_compacted_session",
+        rewrite_after_concurrent_append,
+    )
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        "summary of the old exchange",
+        [{"role": "user", "content": "active request"}],
+        compaction_id="cmp-inline-concurrent-metadata",
+        removed_count=2,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+
+    assert installed is True
+    current = await manager._storage.get_session(node.session_key)
+    assert current is not None
+    assert current.total_tokens == 117
+    assert current.total_tokens_fresh is False
+    assert current.updated_at >= append_metadata["updated_at"]
+    assert current.compaction_count == 1
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.message_id for entry in transcript] == [
+        active_user.message_id,
+        append_metadata["message_id"],
+    ]
+    assert old_user.message_id not in {entry.message_id for entry in transcript}
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_rejects_stale_source_without_partial_install(manager):
+    node = await manager.create("agent:main:inline-stale-source")
+    old_user = await manager.append_message(node.session_key, "user", "old question")
+    active_user = await manager.append_message(
+        node.session_key,
+        "user",
+        "active request",
+    )
+    source = await manager.capture_compaction_source(
+        node.session_key,
+        boundary_message_id=active_user.message_id,
+    )
+    assert await manager.update_message_turn_context(
+        node.session_key,
+        old_user.message_id,
+        {"status": "changed-after-source-capture"},
+    )
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        "stale summary",
+        [{"role": "user", "content": "active request"}],
+        compaction_id="cmp-inline-stale",
+        removed_count=1,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+
+    assert installed is False
+    transcript = await manager.get_transcript(node.session_key)
+    assert [entry.message_id for entry in transcript] == [
+        old_user.message_id,
+        active_user.message_id,
+    ]
+    assert transcript[0].turn_context == {
+        "status": "changed-after-source-capture",
+    }
+    assert await manager._storage.get_all_summaries(node.session_id) == []
+    assert await manager.get_context_states(node.session_key) == []
+    current_node = await manager.get_session(node.session_key)
+    assert current_node is not None
+    assert current_node.compaction_count == 0
+    async with manager._storage.conn.execute(
+        "SELECT COUNT(*) FROM compacted_transcript_entries WHERE session_id = ?",
+        (node.session_id,),
+    ) as cur:
+        assert (await cur.fetchone())[0] == 0
 
 
 @pytest.mark.asyncio

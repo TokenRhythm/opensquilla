@@ -174,23 +174,25 @@ def _local_user_authorized_list(sid: str) -> str:
 
 
 def install_firewall_rules(specs: tuple[FirewallRuleSpec, ...]) -> None:
-    for command in powershell_firewall_commands(specs):
-        completed = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip()
-            raise SandboxBackendError(f"firewall_rule_install_failed: {detail}")
+    script = "$ErrorActionPreference = 'Stop'; " + "; ".join(
+        powershell_firewall_commands(specs)
+    )
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise SandboxBackendError(f"firewall_rule_install_failed: {detail}")
 
 
 __all__ = [

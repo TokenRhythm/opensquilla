@@ -139,7 +139,7 @@ async def test_new_avoids_mid_turn_cut():
 async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     """Turn-boundary cut must match the Agent's flattened tool-use entries."""
     entries = [
-        {"role": "user", "content": "old context", "token_count": 100},
+        {"role": "user", "content": "old context", "token_count": 1_000},
         {"role": "user", "content": "q1", "token_count": 100},
         {"role": "assistant", "content": "[Used tool: read_file]", "token_count": 5},
         {
@@ -153,7 +153,7 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     request = CompactionRequest(
         session_id="agent-flattened-boundary-test",
         entries=entries,
-        context_window_tokens=100,
+        context_window_tokens=500,
         config=CompactionConfig(safety_margin=1.0),
     )
     result = await compact_context_new(request)
@@ -162,7 +162,8 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     removed = entries[: len(entries) - len(result.kept_entries)]
     kept = result.kept_entries
     assert removed[-1]["content"] != "[Used tool: read_file]"
-    assert kept[0]["content"] == "[Used tool: read_file]"
+    assert kept[0]["content"] == "q1"
+    assert kept[1]["content"] == "[Used tool: read_file]"
 
 
 @pytest.mark.asyncio
@@ -200,8 +201,8 @@ async def test_new_skips_when_only_cut_would_orphan_tool_result():
 
 
 @pytest.mark.asyncio
-async def test_new_prev_summary_prefix_injected():
-    """When custom_instructions carries __prev_summary__: the merged summary is prefixed."""
+async def test_new_prev_summary_marker_remains_backward_compatible():
+    """The legacy marker is consumed as rolling context, not as instructions."""
     entries = [
         {"role": "user", "content": "a " * 500, "token_count": 500},
         {"role": "assistant", "content": "b " * 500, "token_count": 500},
@@ -215,8 +216,8 @@ async def test_new_prev_summary_prefix_injected():
     )
     result = await compact_context_new(request)
     if result.removed_count > 0:
-        assert "[Previous context]" in result.summary
         assert "prior context here" in result.summary
+        assert "__prev_summary__:" not in result.summary
 
 
 @pytest.mark.asyncio

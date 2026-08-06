@@ -8,6 +8,7 @@ import type { RpcCallOptions } from '@/lib/rpc'
 import type { RawSessionItem, RawSessionListEntry, SessionsListResponse } from '@/types/rpc'
 import type { ProjectWorkspaceItem } from '@/types/rpc'
 import { normalizeTurnOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
+import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 
 export const SESSION_LIST_VIEW = 'session-list-v1'
 
@@ -346,10 +347,15 @@ function parentField(item: SessionItem): Record<string, unknown> | null {
   return parent && typeof parent === 'object' ? parent as Record<string, unknown> : null
 }
 
-/** Parent session key for subagent rows, when the contract carries one. */
+/** Parent session key carried by the session contract. */
 export function sessionParentKey(item: SessionItem): string {
   const key = parentField(item)?.key
   return typeof key === 'string' ? key.trim() : ''
+}
+
+/** Only spawned subagent tasks form a visual hierarchy in the sidebar. */
+function isSubagentSession(item: SessionItem): boolean {
+  return item.sessionKind === 'task' || item.surface === 'subagent'
 }
 
 /** Spawn depth from the session contract; 0 when the row is not a subagent. */
@@ -383,7 +389,7 @@ export function arrangeSessionLedger(items: SessionItem[]): SessionLedgerEntry[]
   const roots: SessionItem[] = []
   for (const item of items) {
     const parentKey = sessionParentKey(item)
-    if (parentKey && parentKey !== item.key && byKey.has(parentKey)) {
+    if (isSubagentSession(item) && parentKey && parentKey !== item.key && byKey.has(parentKey)) {
       const list = children.get(parentKey) || []
       list.push(item)
       children.set(parentKey, list)
@@ -402,7 +408,7 @@ export function arrangeSessionLedger(items: SessionItem[]): SessionLedgerEntry[]
     // An orphan subagent (parent not in the visible list) still indents when
     // the contract marks it spawned; its lineage label falls back to the
     // parent title carried on the contract.
-    const orphanDepth = sessionSpawnDepth(root) > 0 ? 1 : 0
+    const orphanDepth = isSubagentSession(root) && sessionSpawnDepth(root) > 0 ? 1 : 0
     visit(root, orphanDepth, orphanDepth > 0 ? sessionParentTitle(root) : '')
   }
   return entries
@@ -424,6 +430,7 @@ export interface SidebarSectionRow {
   depth: number
   runStatus: string
   runLabel: string
+  taskAttention: SessionTaskAttention
   updatedAt: number
   hasContractGaps: boolean
   workspace?: string
@@ -434,6 +441,8 @@ export interface SidebarSectionRow {
   workspacePinned?: boolean
   workspaceAvailable?: boolean
   provisional?: boolean
+  /** Local sidebar preference; never changes the underlying session contract. */
+  pinned?: boolean
 }
 
 /** One collapsible family section with its recency-ordered rows. */
@@ -481,6 +490,8 @@ const SIDEBAR_SECTION_ORDER: SidebarSectionFamily[] = ['chats', 'channels', 'aut
 export function arrangeSidebarSections(
   items: SessionItem[],
   projects?: readonly ProjectWorkspaceItem[],
+  sessionOrder: readonly string[] = [],
+  pinnedSessionKeys: readonly string[] = [],
 ): SidebarSection[] {
   const buckets: Record<SidebarSectionFamily, SessionItem[]> = {
     chats: [],
@@ -495,6 +506,19 @@ export function arrangeSidebarSections(
   }
 
   const byRecency = (a: SessionItem, b: SessionItem) => (b.updatedAt || 0) - (a.updatedAt || 0)
+  const orderIndex = new Map(sessionOrder.map((key, index) => [key, index]))
+  const pinnedKeys = new Set(pinnedSessionKeys)
+  const bySidebarOrder = (a: SessionItem, b: SessionItem) => {
+    const pinnedDifference = Number(pinnedKeys.has(b.key)) - Number(pinnedKeys.has(a.key))
+    if (pinnedDifference !== 0) return pinnedDifference
+    const aIndex = orderIndex.get(a.key)
+    const bIndex = orderIndex.get(b.key)
+    if (aIndex !== undefined && bIndex !== undefined) return aIndex - bIndex
+    // Sessions created after the last manual reorder remain at the top.
+    if (aIndex !== undefined) return 1
+    if (bIndex !== undefined) return -1
+    return byRecency(a, b)
+  }
   const toRow = (item: SessionItem, depth: number): SidebarSectionRow => ({
     rowKind: 'session',
     key: item.key,
@@ -505,6 +529,7 @@ export function arrangeSidebarSections(
     depth,
     runStatus: item.runStatus,
     runLabel: item.runLabel,
+    taskAttention: ['queued', 'running'].includes(item.runStatus) ? 'running' : 'none',
     updatedAt: item.updatedAt || 0,
     hasContractGaps: item.contractGaps.length > 0,
     workspace: item.workspace,
@@ -512,6 +537,7 @@ export function arrangeSidebarSections(
     workspaceLabel: item.workspaceLabel,
     workspaceDisplayPath: item.workspaceDisplayPath,
     provisional: item.provisional,
+    pinned: pinnedKeys.has(item.key),
   })
 
   type WorkspaceBucket = {
@@ -552,13 +578,10 @@ export function arrangeSidebarSections(
       bucket.updatedAt = Math.max(bucket.updatedAt, row.updatedAt || 0)
     }
 
-    const topLevelUpdatedAt = (entry: WorkspaceTopLevel): number => {
-      if (entry.kind === 'row') return entry.row.updatedAt || 0
-      return buckets.get(entry.workspace)?.updatedAt || 0
-    }
-
     return [...topLevel]
-      .sort((a, b) => topLevelUpdatedAt(b) - topLevelUpdatedAt(a) || a.index - b.index)
+      // The ledger is already recency- or manually ordered. Preserve its first
+      // occurrence for both ordinary rows and workspace groups.
+      .sort((a, b) => a.index - b.index)
       .flatMap(entry => {
         if (entry.kind === 'row') return [entry.row]
         const bucket = buckets.get(entry.workspace)
@@ -573,6 +596,7 @@ export function arrangeSidebarSections(
           depth: 0,
           runStatus: 'idle',
           runLabel: '',
+          taskAttention: 'none',
           updatedAt: bucket.updatedAt,
           hasContractGaps: false,
           workspace: entry.workspace,
@@ -603,6 +627,7 @@ export function arrangeSidebarSections(
         depth: 0,
         runStatus: 'idle',
         runLabel: '',
+        taskAttention: 'none',
         updatedAt: 0,
         hasContractGaps: false,
         workspace: project.path,
@@ -625,6 +650,7 @@ export function arrangeSidebarSections(
           depth: 1,
           runStatus: 'idle',
           runLabel: '',
+          taskAttention: 'none',
           updatedAt: 0,
           hasContractGaps: false,
           workspace: project.path,
@@ -655,7 +681,7 @@ export function arrangeSidebarSections(
     if (family === 'chats') {
       // Recency-sort first so the ledger's root ordering follows recency, then
       // flatten parent → child so subagents indent directly beneath their chat.
-      const ledger = arrangeSessionLedger([...bucket].sort(byRecency))
+      const ledger = arrangeSessionLedger([...bucket].sort(bySidebarOrder))
       rows = projects === undefined
         ? arrangeWorkspaceRows(ledger)
         : arrangePersistedProjectRows(ledger, projects)

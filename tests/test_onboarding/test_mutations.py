@@ -41,6 +41,127 @@ def test_upsert_provider_persists_fields():
     assert res.changed is True
 
 
+def test_upsert_openrouter_can_atomically_enable_provider_default_image_generation():
+    cfg = GatewayConfig()
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+        image_generation_intent="enable_provider_default",
+    )
+
+    image = res.config.image_generation
+    assert image.enabled is True
+    assert image.binding == "follow_llm"
+    assert image.primary == "openrouter/google/gemini-3.1-flash-image-preview"
+    assert image.fallbacks == []
+    assert {
+        "image_generation.enabled",
+        "image_generation.binding",
+        "image_generation.primary",
+    } <= res.config.force_persist_paths()
+    assert res.public_payload["capabilityChanges"]["imageGeneration"] == {
+        "applied": True,
+        "reason": "enabled_provider_default",
+        "binding": "follow_llm",
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+    }
+
+
+def test_upsert_openrouter_legacy_save_preserves_unconfigured_image_generation():
+    cfg = GatewayConfig()
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+    )
+
+    assert res.config.image_generation.enabled is False
+    assert res.config.image_generation.binding == "custom"
+    assert "capabilityChanges" not in res.public_payload
+
+
+@pytest.mark.parametrize(
+    "image_generation",
+    [
+        {"enabled": False},
+        {
+            "enabled": True,
+            "primary": "openai/gpt-image-1",
+            "providers": {"openai": {"api_key": "synthetic-image-key"}},
+        },
+    ],
+)
+def test_upsert_openrouter_does_not_override_operator_owned_image_generation(
+    image_generation,
+):
+    cfg = GatewayConfig(image_generation=image_generation)
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+        image_generation_intent="enable_provider_default",
+    )
+
+    assert res.config.image_generation.model_dump() == cfg.image_generation.model_dump()
+    change = res.public_payload["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is False
+    assert change["reason"] == "operator_configuration_preserved"
+
+
+def test_upsert_openrouter_default_image_generation_rejects_custom_endpoint():
+    cfg = GatewayConfig()
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+        base_url="https://openrouter-compatible.example/v1",
+        image_generation_intent="enable_provider_default",
+    )
+
+    assert res.config.image_generation.enabled is False
+    change = res.public_payload["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is False
+    assert change["reason"] == "custom_endpoint_preserved"
+
+
+def test_upsert_openrouter_default_image_generation_rejects_wrong_official_path():
+    cfg = GatewayConfig()
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+        base_url="https://openrouter.ai/compatible/v1",
+        image_generation_intent="enable_provider_default",
+    )
+
+    assert res.config.image_generation.enabled is False
+    change = res.public_payload["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is False
+    assert change["reason"] == "custom_endpoint_preserved"
+
+
+def test_upsert_provider_rejects_unknown_image_generation_intent():
+    with pytest.raises(ValueError, match="image_generation_intent"):
+        upsert_llm_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            model="openai/gpt-test",
+            api_key="synthetic-openrouter-key",
+            image_generation_intent="silently_enable_everything",
+        )
+
+
 def test_upsert_provider_strips_trailing_paste_punctuation_from_api_key():
     cfg = GatewayConfig()
     res = upsert_llm_provider(
@@ -1914,6 +2035,31 @@ def test_upsert_image_generation_provider_can_use_matching_llm_key(monkeypatch):
     assert res.public_payload["api_key_source"] == "llm_fallback"
 
 
+def test_upsert_image_generation_reuses_profile_without_copying_its_key(monkeypatch):
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "model": "deepseek-v4-flash",
+                "api_key": "synthetic-profile-key",
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+    )
+
+    result = upsert_image_generation_provider(cfg, provider_id="tokenrhythm")
+
+    assert result.public_payload["api_key_source"] == "llm_fallback"
+    assert result.config.image_generation.providers.tokenrhythm.api_key == ""
+    assert result.config.image_generation.providers.tokenrhythm.api_key_env == ""
+
+
 def test_upsert_image_generation_provider_llm_fallback_requires_same_origin(monkeypatch):
     # The matching-LLM-key fallback binds the primary LLM secret to the image
     # endpoint; a save pointing the image provider at a different origin must
@@ -2107,14 +2253,17 @@ def test_upsert_image_generation_does_not_restore_default_env_after_origin_chang
     ) in reauthorized.config.force_persist_path_segments()
 
 
-def test_upsert_image_generation_fresh_default_origin_uses_default_env_key(monkeypatch):
+def test_upsert_image_generation_uses_default_env_without_persisting_schema_default(
+    monkeypatch,
+):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-shared-image-env")
     res = upsert_image_generation_provider(GatewayConfig(), provider_id="openai")
-    assert res.config.image_generation.providers.openai.api_key_env == "OPENAI_API_KEY"
+    assert res.config.image_generation.providers.openai.api_key_env == ""
+    assert res.public_payload["api_key_source"] == "env"
     assert res.public_payload["api_key_source"] == "env"
 
 
-def test_upsert_image_generation_same_origin_path_change_keeps_default_env_key(monkeypatch):
+def test_upsert_image_generation_same_origin_path_keeps_implicit_default_env(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-shared-image-env")
     first = upsert_image_generation_provider(GatewayConfig(), provider_id="openai")
 
@@ -2124,7 +2273,8 @@ def test_upsert_image_generation_same_origin_path_change_keeps_default_env_key(m
         base_url="https://api.openai.com/v2",
     )
 
-    assert same.config.image_generation.providers.openai.api_key_env == "OPENAI_API_KEY"
+    assert same.config.image_generation.providers.openai.api_key_env == ""
+    assert same.public_payload["api_key_source"] == "env"
     assert same.public_payload["api_key_source"] == "env"
 
 
@@ -2851,6 +3001,26 @@ def test_image_generation_explicit_enabled_decision_is_force_persisted(tmp_path)
 
     data = _tomllib.loads(target.read_text())
     assert data["image_generation"]["enabled"] is False
+
+
+def test_audio_explicit_enabled_decision_is_force_persisted(tmp_path):
+    """An old client may still explicitly disable audio while saving a key."""
+    import tomllib as _tomllib
+
+    from opensquilla.onboarding.config_store import load_config, persist_config
+
+    target = tmp_path / "config.toml"
+    cfg = load_config(target)
+    res = upsert_audio_provider(
+        cfg,
+        provider_id="elevenlabs",
+        api_key="synthetic-audio-key",
+        enabled=False,
+    )
+    persist_config(res.config, path=target)
+
+    data = _tomllib.loads(target.read_text())
+    assert data["audio"]["enabled"] is False
 
 
 def test_upsert_channel_blank_secret_keeps_stored_value():

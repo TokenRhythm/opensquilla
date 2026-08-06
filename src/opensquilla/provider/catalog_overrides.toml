@@ -678,14 +678,14 @@ reasoning_format = "qwen_token_plan"
 # the fallback beneath the boot-time live ingest of the platform's public
 # listing (https://tokenrhythm.studio/api/models, keyless; see
 # provider/live_catalog.py). Windows, output limits, and prices below are
-# that listing's published values (refreshed 2026-07; CNY per Mtok
+# that listing's published values (refreshed 2026-08; CNY per Mtok
 # converted at ~6.975 CNY/USD) so offline boots budget close to the
 # platform. Every served model streams DeepSeek-style reasoning_content
 # unconditionally, but the endpoint rejects thinking-toggle payloads
 # (UNKNOWN_FIELD 400), so reasoning_format stays "none": display-side
 # parsing needs no format, and "none" keeps the request builder from
-# injecting a deepseek thinking object. Vision is live-verified on the
-# kimi rows only.
+# injecting a deepseek thinking object. Vision is published for the kimi
+# rows and qwen3.8-max; explicit API declarations remain authoritative.
 
 [tokenrhythm."deepseek-v4-flash"]
 context_window = 1000000
@@ -743,13 +743,11 @@ output_cost_per_mtok = 4.014336917562724
 cache_read_cost_per_mtok = 0.2867383512544803
 
 # minimax/mimo publish near-window output caps (input + output share the
-# window). Passing those through as max_tokens would trip
-# resolve_max_tokens' request-safety clamp down to 8192, so these rows —
-# like the live ingest (live_catalog.py) — halve them to the engine's own
-# output-reserve ceiling (window/2).
+# window). These rows preserve those public values exactly; ModelCatalog's
+# TokenRhythm-scoped runtime policy derives the half-window execution budget.
 [tokenrhythm."minimax-m2.5"]
 context_window = 200000
-max_output_tokens = 100000
+max_output_tokens = 200000
 supports_reasoning = true
 supports_tools = true
 supports_vision = false
@@ -759,7 +757,7 @@ output_cost_per_mtok = 1.2043010752688172
 
 [tokenrhythm."minimax-m2.7"]
 context_window = 200000
-max_output_tokens = 100000
+max_output_tokens = 192000
 supports_reasoning = true
 supports_tools = true
 supports_vision = false
@@ -802,7 +800,7 @@ cache_read_cost_per_mtok = 0.1863799283154122
 
 [tokenrhythm."mimo-v2.5-pro"]
 context_window = 256000
-max_output_tokens = 128000
+max_output_tokens = 256000
 supports_reasoning = true
 supports_tools = true
 supports_vision = false
@@ -820,6 +818,18 @@ reasoning_format = "none"
 input_cost_per_mtok = 0.8602150537634409
 output_cost_per_mtok = 2.5806451612903225
 cache_read_cost_per_mtok = 0.17204301075268819
+
+[tokenrhythm."qwen3.8-max"]
+context_window = 1000000
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+status = "testing"
+input_cost_per_mtok = 1.7204301075268817
+output_cost_per_mtok = 5.161290322580645
+cache_read_cost_per_mtok = 0.21505376344086022
 
 # Catch-all for models TokenRhythm adds later: everything on this relay
 # so far streams reasoning and takes tools; vision stays off until

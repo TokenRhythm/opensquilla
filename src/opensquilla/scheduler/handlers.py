@@ -122,6 +122,7 @@ def _build_cron_tool_context(
     *,
     session_key: str | None = None,
     workspace_resolver: WorkspaceResolver | None = None,
+    workspace_dir_override: str | None = None,
     default_elevated: str | DefaultElevatedResolver | None = None,
 ) -> ToolContext:
     from opensquilla.scheduler.routing import build_cron_route_envelope, tool_context_from_envelope
@@ -141,13 +142,17 @@ def _build_cron_tool_context(
         session_key=resolved_session_key,
         agent_id=agent_id,
     )
-    workspace_dir = None
-    workspace_strict = False
-    if workspace_resolver is not None:
+    workspace_dir = workspace_dir_override
+    workspace_strict = workspace_dir_override is not None
+    if workspace_dir is None and workspace_resolver is not None:
         workspace_dir, workspace_strict = workspace_resolver(agent_id)
     return tool_context_from_envelope(
         envelope,
-        is_owner=bool(getattr(job, "creator_is_owner", False)),
+        is_owner=(
+            bool(getattr(job, "creator_is_owner", False))
+            and bool(getattr(job, "creator_host_execute", False))
+        ),
+        host_execute_allowed=bool(getattr(job, "creator_host_execute", False)),
         workspace_dir=workspace_dir,
         workspace_strict=workspace_strict,
         default_elevated=_resolve_default_elevated(default_elevated),
@@ -235,6 +240,10 @@ def make_agent_run_handler(
             return HandlerResult()
 
         # Session setup
+        bound_workspace_dir: str | None = None
+        workspace_id = job.payload.get("_workspace_id")
+        if isinstance(workspace_id, str) and workspace_id and sm is None:
+            raise RuntimeError("project workspace storage is unavailable")
         if sm is not None:
             try:
                 await sm.get_or_create(
@@ -242,6 +251,21 @@ def make_agent_run_handler(
                     agent_id=agent_id,
                     display_name=f"Cron: {job.name[:50]}",
                 )
+                if isinstance(workspace_id, str) and workspace_id:
+                    storage = getattr(sm, "_storage", None)
+                    if storage is None or not hasattr(storage, "bind_session_workspace"):
+                        raise RuntimeError("project workspace storage is unavailable")
+                    if hasattr(storage, "get_project_workspace"):
+                        from opensquilla.project_workspaces import (
+                            resolve_validated_project_workspace,
+                        )
+
+                        validated = await resolve_validated_project_workspace(
+                            storage,
+                            workspace_id,
+                        )
+                        bound_workspace_dir = str(validated.canonical_path)
+                    await storage.bind_session_workspace(session_key, workspace_id)
                 _persisted = await sm.append_message(session_key, role="user", content=task)
                 if _persisted is not None and isinstance(_persisted.content, str):
                     task = _persisted.content
@@ -252,6 +276,8 @@ def make_agent_run_handler(
                     session_key=session_key,
                     exc_info=True,
                 )
+                if isinstance(workspace_id, str) and workspace_id:
+                    raise
 
         # Emit cron.run.start (pre-execution notification, best-effort)
         await delivery_chain.notify_start(job, task)
@@ -328,6 +354,7 @@ def make_agent_run_handler(
                     job,
                     session_key=session_key,
                     workspace_resolver=workspace_resolver,
+                    workspace_dir_override=bound_workspace_dir,
                     default_elevated=default_elevated,
                 )
                 async for event in wrap_stream(

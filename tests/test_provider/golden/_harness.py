@@ -26,6 +26,7 @@ import pytest
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.provider.compat_policy import known_policy_kinds
 from opensquilla.provider.model_catalog import ModelCatalog
+from opensquilla.provider.protocol import project_provider_final_request
 from opensquilla.provider.registry import get_provider_spec, list_provider_specs
 from opensquilla.provider.selector import ProviderConfig, _build_provider
 from opensquilla.provider.types import (
@@ -37,6 +38,7 @@ from opensquilla.provider.types import (
     ErrorEvent,
     Message,
     ModelCapabilities,
+    ProviderFinalRequestProjection,
     ToolDefinition,
     ToolInputSchema,
 )
@@ -562,6 +564,22 @@ def _provider_for_case(case: GoldenCase) -> Any:
             base_url=case.base_url,
         )
     )
+
+
+def project_case_request(case: GoldenCase) -> ProviderFinalRequestProjection:
+    """Project the same exact request envelope used by ``capture_case_record``."""
+
+    provider = _provider_for_case(case)
+    messages = _tool_history_messages() if case.tool_history else _plain_messages()
+    tools = [_golden_tool()] if case.with_tools else None
+    projection = project_provider_final_request(
+        provider,
+        messages,
+        tools,
+        _chat_config(case),
+    )
+    assert projection is not None, f"{case.case_id}: final request projection unavailable"
+    return projection
 
 
 def _auth_style(request: httpx.Request) -> str:

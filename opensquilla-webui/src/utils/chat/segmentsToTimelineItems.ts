@@ -33,6 +33,7 @@ export function segmentsToTimelineItems(
         key: `text-${idx}`,
         html: seg.html || '',
         rawText: seg.raw || '',
+        presentation: seg.presentation,
       }]
     }
     if (seg.type === 'interrupt') {

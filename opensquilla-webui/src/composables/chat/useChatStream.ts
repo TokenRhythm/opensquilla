@@ -12,6 +12,7 @@ import type {
 } from '@/types/chat'
 import type {
   ArtifactPayload,
+  CompactionPayload,
   ToolDeltaPayload,
   ToolResultPayload,
   ToolUsePayload,
@@ -285,6 +286,37 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
+  function recordCompactionActivity(payload: CompactionPayload) {
+    noteStreamSignal()
+    if (!useReducer.value) return
+    const rawStatus = String(payload.status || '').toLowerCase()
+    const state = rawStatus === 'skipped'
+      ? 'skipped'
+      : rawStatus === 'stale'
+        ? 'stale'
+        : rawStatus === 'cancelled'
+          ? 'cancelled'
+          : ['completed', 'emergency_ephemeral'].includes(rawStatus)
+            ? 'completed'
+            : ['failed', 'error', 'timed_out'].includes(rawStatus)
+              ? 'failed'
+              : 'running'
+    const id = String(payload.compaction_id || payload.compactionId || 'current')
+    appendFrame({
+      kind: 'status',
+      action: 'context_compaction',
+      label: '',
+      at: Number(payload.emitted_at || payload.started_at || Date.now()),
+      id,
+      category: 'maintenance',
+      state,
+      source: String(payload.source || 'automatic'),
+      durability: String(payload.durability || ''),
+      detail: String(payload.detail || payload.phase || ''),
+    })
+    scheduleRender()
+  }
+
   function toolNarrationLabel(tc: ChatToolCall): string {
     const verb = TOOL_PROGRESS_VERBS[toolOperationKey(tc.name)]
       || `Running ${tc.name.replace(/[_-]+/g, ' ')}`
@@ -479,7 +511,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     return raw
   }
 
-  function appendDelta(text: string) {
+  function appendDelta(
+    text: string,
+    presentation: 'intermediate' | 'answer' = 'answer',
+  ) {
     if (options.aborted.value) return
     const deltaText = normalizeIncomingTextDelta(text)
     if (!deltaText) return
@@ -488,14 +523,24 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamRaw.value += deltaText
 
     const lastSegment = streamSegments.value[streamSegments.value.length - 1]
-    if (!lastSegment || lastSegment.type !== 'text') {
-      streamSegments.value.push({ type: 'text', raw: deltaText, html: '', dirty: true })
+    if (
+      !lastSegment
+      || lastSegment.type !== 'text'
+      || lastSegment.presentation !== presentation
+    ) {
+      streamSegments.value.push({
+        type: 'text',
+        raw: deltaText,
+        html: '',
+        dirty: true,
+        presentation,
+      })
     } else {
       lastSegment.raw = (lastSegment.raw || '') + deltaText
       lastSegment.dirty = true
     }
 
-    if (useReducer.value) appendFrame({ kind: 'text', text: deltaText })
+    if (useReducer.value) appendFrame({ kind: 'text', text: deltaText, presentation })
     scheduleRender()
   }
 
@@ -964,6 +1009,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     resetStreamIdleTimer,
     clearStreamIdleTimer,
     setStreamActivity,
+    recordCompactionActivity,
     showThinkingIndicator,
     hideThinkingIndicator,
     isToolGroupOpen,

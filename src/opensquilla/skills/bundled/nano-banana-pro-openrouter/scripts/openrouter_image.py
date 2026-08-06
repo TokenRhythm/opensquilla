@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import concurrent.futures
+import io
 import json
 import os
 import re
@@ -15,6 +17,25 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from opensquilla.skills.bundled._provider_http import (
+    download_public_https_bytes,
+    open_authenticated_request,
+    read_limited_response,
+    same_http_origin,
+)
+
+SAFE_NO_SUBMIT_EXIT_CODE = 78
+META_CAPABILITY_LEASE_REQUIRED_ENV = "OPENSQUILLA_META_CAPABILITY_LEASE_REQUIRED"
+META_CAPABILITY_PROVIDER_ENV = "OPENSQUILLA_META_CAPABILITY_PROVIDER"
+META_CAPABILITY_API_KEY_ENV = "OPENSQUILLA_META_CAPABILITY_API_KEY"
+META_CAPABILITY_BASE_URL_ENV = "OPENSQUILLA_META_CAPABILITY_BASE_URL"
+META_CAPABILITY_PROXY_ENV = "OPENSQUILLA_META_CAPABILITY_PROXY"
+MAX_PROVIDER_JSON_RESPONSE_BYTES = 48 * 1024 * 1024
+MAX_IMAGE_DOWNLOAD_BYTES = 32 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 16_384
+MAX_IMAGE_PIXELS = 25_000_000
+MIN_IMAGE_DIMENSION = 64
 
 
 def _emit(label: str, payload: dict[str, Any]) -> None:
@@ -359,9 +380,38 @@ def _resolve_url(url: str, *, base_url: str) -> str:
 
 
 def _same_origin(url: str, *, base_url: str) -> bool:
-    parsed = urllib.parse.urlparse(url)
-    base = urllib.parse.urlparse(base_url)
-    return parsed.scheme == base.scheme and parsed.netloc == base.netloc
+    return same_http_origin(url, base_url)
+
+
+def _runtime_connection(args: argparse.Namespace) -> tuple[str, str, str, bool]:
+    """Resolve a MetaSkill lease or the direct-CLI compatibility inputs."""
+
+    lease_required = os.environ.get(META_CAPABILITY_LEASE_REQUIRED_ENV) == "1"
+    if lease_required:
+        provider = os.environ.get(META_CAPABILITY_PROVIDER_ENV, "").strip().lower()
+        if provider != "openrouter":
+            return "", "", "", True
+        return (
+            os.environ.get(META_CAPABILITY_API_KEY_ENV, "").strip(),
+            os.environ.get(META_CAPABILITY_BASE_URL_ENV, "").strip().rstrip("/"),
+            os.environ.get(META_CAPABILITY_PROXY_ENV, "").strip(),
+            True,
+        )
+    api_key_env = args.api_key_env.strip() or "OPENROUTER_API_KEY"
+    return (
+        args.api_key.strip() or os.environ.get(api_key_env, ""),
+        args.base_url.strip().rstrip("/"),
+        "",
+        False,
+    )
+
+
+def _open_url(request: urllib.request.Request, *, timeout: float, proxy: str):
+    return open_authenticated_request(
+        request,
+        timeout=timeout,
+        proxy=proxy,
+    )
 
 
 def _extract_image_url(data: dict[str, Any]) -> str | None:
@@ -384,25 +434,40 @@ def _extract_image_url(data: dict[str, Any]) -> str | None:
     return None
 
 
-def _decode_image(url: str, api_key: str, *, base_url: str) -> tuple[str, bytes]:
+def _decode_image(
+    url: str,
+    api_key: str,
+    *,
+    base_url: str,
+    proxy: str = "",
+) -> tuple[str, bytes]:
     if url.startswith("data:"):
         prefix, sep, encoded = url.partition(",")
         if not sep or ";base64" not in prefix:
             raise RuntimeError("unsupported_data_url")
         mime = prefix.removeprefix("data:").split(";", 1)[0] or "image/png"
-        return mime, base64.b64decode(encoded)
+        if len(encoded) > (MAX_IMAGE_DOWNLOAD_BYTES * 4 // 3) + 4:
+            raise RuntimeError("image_payload_too_large")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise RuntimeError("invalid_data_url") from None
+        if len(decoded) > MAX_IMAGE_DOWNLOAD_BYTES:
+            raise RuntimeError("image_payload_too_large")
+        return mime, decoded
     resolved_url = _resolve_url(url, base_url=base_url)
-    if resolved_url.startswith(("http://", "https://")):
-        headers = (
-            {"Authorization": "Bearer " + api_key}
-            if _same_origin(resolved_url, base_url=base_url)
-            else {}
-        )
-        req = urllib.request.Request(resolved_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            mime = resp.headers.get_content_type() or "image/png"
-            return mime, resp.read()
-    raise RuntimeError("unsupported_image_url")
+    body = download_public_https_bytes(
+        resolved_url,
+        timeout=45,
+        max_bytes=MAX_IMAGE_DOWNLOAD_BYTES,
+        proxy=proxy,
+        authorization="Bearer " + api_key if api_key else "",
+        authorization_base_url=base_url,
+    )
+    # Remote response headers are deliberately not trusted to choose a parser
+    # or extension.  Existing payload validation below verifies image bytes;
+    # PNG remains the compatibility default for URL-based responses.
+    return "image/png", body
 
 
 def _extension_for_mime(mime: str) -> str:
@@ -413,6 +478,62 @@ def _extension_for_mime(mime: str) -> str:
     if mime == "image/gif":
         return ".gif"
     return ".png"
+
+
+def _detected_image_mime(payload: bytes) -> str | None:
+    """Recognize the bounded raster formats this adapter can safely publish."""
+
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if payload.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _validated_image_mime(payload: bytes) -> str:
+    """Return the decoded raster MIME only after a complete local decode."""
+
+    detected_mime = _detected_image_mime(payload)
+    if detected_mime is None:
+        raise RuntimeError("invalid_image_payload")
+    expected_format = {
+        "image/png": "PNG",
+        "image/jpeg": "JPEG",
+        "image/gif": "GIF",
+        "image/webp": "WEBP",
+    }[detected_mime]
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        raise RuntimeError("local_image_validation_unavailable") from None
+    try:
+        with Image.open(io.BytesIO(payload)) as probe:
+            actual_format = str(probe.format or "").upper()
+            width, height = probe.size
+            frame_count = int(getattr(probe, "n_frames", 1) or 1)
+            if actual_format != expected_format:
+                raise RuntimeError("invalid_image_payload")
+            if (
+                width < MIN_IMAGE_DIMENSION
+                or height < MIN_IMAGE_DIMENSION
+                or width > MAX_IMAGE_DIMENSION
+                or height > MAX_IMAGE_DIMENSION
+                or width * height > MAX_IMAGE_PIXELS
+                or frame_count != 1
+            ):
+                raise RuntimeError("invalid_image_payload")
+            probe.verify()
+        with Image.open(io.BytesIO(payload)) as decoded:
+            decoded.load()
+    except RuntimeError:
+        raise
+    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
+        raise RuntimeError("invalid_image_payload") from None
+    return detected_mime
 
 
 def _scrub_error(exc: object, api_key: str) -> str:
@@ -452,6 +573,7 @@ def _generate_one(
     output_dir: Path,
     local_path_prefix: str,
     resolution: str,
+    proxy: str,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -472,14 +594,23 @@ def _generate_one(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        with _open_url(req, timeout=90, proxy=proxy) as resp:
+            raw = read_limited_response(
+                resp,
+                max_bytes=MAX_PROVIDER_JSON_RESPONSE_BYTES,
+                error_message="provider JSON response exceeds size limit",
+            )
+            data = json.loads(raw.decode("utf-8"))
         image_url = _extract_image_url(data)
         if not image_url:
             raise RuntimeError("provider_returned_no_image")
-        mime, image_bytes = _decode_image(image_url, api_key, base_url=base_url)
-        if not mime.startswith("image/") or len(image_bytes) < 1024:
-            raise RuntimeError("invalid_image_payload")
+        mime, image_bytes = _decode_image(
+            image_url,
+            api_key,
+            base_url=base_url,
+            proxy=proxy,
+        )
+        mime = _validated_image_mime(image_bytes)
         ext = _extension_for_mime(mime)
         filename = _clean_slot(slot_id) + ext
         out_path = (output_dir / filename).resolve()
@@ -494,15 +625,13 @@ def _generate_one(
             "prompt_preview": prompt[:80],
         }
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read(400).decode("utf-8", errors="replace")
-        except Exception:
-            detail = ""
+        # Provider error bodies are untrusted and can reflect prompts, signed
+        # URLs, request metadata, or other user content. Persist only the
+        # status code in the MetaSkill result/transcript.
         return {
             "ok": False,
             "slot_id": _clean_slot(slot_id),
-            "reason": f"http_{exc.code}: {_scrub_error(detail or exc, api_key)}",
+            "reason": f"http_{exc.code}",
         }
     except Exception as exc:
         return {"ok": False, "slot_id": _clean_slot(slot_id), "reason": _scrub_error(exc, api_key)}
@@ -554,8 +683,7 @@ def main() -> int:
     parser.add_argument("--local-path-prefix", default="project/assets/images")
     args = parser.parse_args()
 
-    api_key_env = args.api_key_env.strip() or "OPENROUTER_API_KEY"
-    api_key = args.api_key.strip() or os.environ.get(api_key_env, "")
+    api_key, base_url, proxy, lease_required = _runtime_connection(args)
     replacement_slot = (
         f"{args.local_path_prefix.rstrip('/')}/replace-with-generated-image.png"
     )
@@ -568,17 +696,31 @@ def main() -> int:
                 "replacement_slot": replacement_slot,
             },
         )
-        return 0
+        return SAFE_NO_SUBMIT_EXIT_CODE if lease_required else 0
     if not api_key:
         _emit(
             "IMAGE_CONFIG_NEEDED",
             {
-                "missing": [api_key_env],
+                "missing": [
+                    "provider_connection:openrouter"
+                    if lease_required
+                    else (args.api_key_env.strip() or "OPENROUTER_API_KEY")
+                ],
                 "reason": "missing_api_key",
                 "replacement_slot": replacement_slot,
             },
         )
-        return 0
+        return SAFE_NO_SUBMIT_EXIT_CODE if lease_required else 0
+    if not base_url:
+        _emit(
+            "IMAGE_CONFIG_NEEDED",
+            {
+                "missing": ["provider_endpoint:openrouter"],
+                "reason": "missing_provider_endpoint",
+                "replacement_slot": replacement_slot,
+            },
+        )
+        return SAFE_NO_SUBMIT_EXIT_CODE if lease_required else 0
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -626,11 +768,12 @@ def main() -> int:
                     slot_id=job["slot_id"],
                     prompt=job["prompt"],
                     model=args.model.strip(),
-                    base_url=args.base_url.rstrip("/"),
+                    base_url=base_url,
                     api_key=api_key,
                     output_dir=output_dir,
                     local_path_prefix=args.local_path_prefix,
                     resolution=args.resolution,
+                    proxy=proxy,
                 ),
                 jobs,
             )

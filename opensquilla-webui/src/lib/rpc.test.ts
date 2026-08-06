@@ -55,6 +55,7 @@ function establishConnection(socket: MockWebSocket): void {
 describe('RpcClient', () => {
   beforeEach(() => {
     MockWebSocket.instances = []
+    localStorage.clear()
     vi.stubGlobal('WebSocket', MockWebSocket)
     vi.useFakeTimers()
   })
@@ -63,6 +64,69 @@ describe('RpcClient', () => {
     vi.clearAllTimers()
     vi.useRealTimers()
     vi.unstubAllGlobals()
+  })
+
+  it('persists one random guest session key and sends it in every handshake', () => {
+    const first = new RpcClient()
+    first.connect('ws://rpc.test')
+    const firstSocket = MockWebSocket.instances[0]
+    firstSocket.receive({ type: 'event', event: 'connect.challenge' })
+
+    const firstFrame = JSON.parse(firstSocket.sent[0]) as {
+      params: { auth: { guestSessionKey: string } }
+    }
+    const guestSessionKey = firstFrame.params.auth.guestSessionKey
+    expect(guestSessionKey).toMatch(/^osqg_[A-Za-z0-9_-]{43}$/)
+    expect(localStorage.getItem('opensquilla.guestSessionKey')).toBe(guestSessionKey)
+
+    const second = new RpcClient()
+    second.connect('ws://rpc.test')
+    const secondSocket = MockWebSocket.instances[1]
+    secondSocket.receive({ type: 'event', event: 'connect.challenge' })
+    const secondFrame = JSON.parse(secondSocket.sent[0]) as {
+      params: { auth: { guestSessionKey: string } }
+    }
+    expect(secondFrame.params.auth.guestSessionKey).toBe(guestSessionKey)
+
+    first.disconnect()
+    second.disconnect()
+  })
+
+  it('persists a server-generated compatibility guest key from hello', () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+    const serverKey = 'osqg_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'
+
+    socket.receive({
+      protocol: 3,
+      policy: { tick_interval_ms: 30_000 },
+      auth: { guestSessionKey: serverKey },
+    })
+
+    expect(localStorage.getItem('opensquilla.guestSessionKey')).toBe(serverKey)
+    client.disconnect()
+  })
+
+  it('sends the guest session key alongside a named token', () => {
+    localStorage.setItem(
+      'opensquilla.guestSessionKey',
+      'osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    )
+    const client = new RpcClient()
+    client.connect('ws://rpc.test', 'osq_named_token')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+
+    const frame = JSON.parse(socket.sent[0]) as {
+      params: { auth: { token: string; guestSessionKey: string } }
+    }
+    expect(frame.params.auth).toEqual({
+      token: 'osq_named_token',
+      guestSessionKey: 'osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    })
+    client.disconnect()
   })
 
   it('preserves structured retry and acceptance metadata on the rejected error', async () => {

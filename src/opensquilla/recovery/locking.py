@@ -20,6 +20,8 @@ from opensquilla.recovery.atomic import (
     _chmod_open_file,
     _native_io_path,
     _windows_extended_path,
+    is_path_redirecting_stat,
+    reparse_tag_redirects,
 )
 from opensquilla.recovery.errors import (
     AtomicStateUnknownError,
@@ -120,7 +122,7 @@ class _HeldLegacyLock:
     compat_owner_thread: int | None
     gateway_owner_thread: int | None
     path: Path
-    state_identity: tuple[int, int, int]
+    state_identity: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,30 @@ def profile_lock_key(home: str | Path) -> str:
     return hashlib.sha256(_normalized_path(home).encode("utf-8", "surrogatepass")).hexdigest()
 
 
+def resolve_home_link(home: Path) -> Path:
+    """Follow a user-provisioned link at the profile home itself.
+
+    Relocating the profile to another disk and leaving a symlink or junction
+    at the configured location is explicit user intent, so the home resolves
+    once before locks and inspection; alias and target already share one lock
+    because ``profile_lock_key`` normalizes with ``resolve``. Every check
+    inside the home stays no-follow, and the resolved target must still pass
+    the plain-directory home checks. When resolution fails the original path
+    is kept and rejected by those checks.
+    """
+
+    try:
+        value = os.lstat(_native_io_path(home))
+    except OSError:
+        return home
+    if not is_path_redirecting_stat(value):
+        return home
+    try:
+        return Path(_logical_path_spelling(os.path.realpath(_native_io_path(home), strict=True)))
+    except (OSError, RuntimeError):
+        return home
+
+
 def user_state_dir() -> Path:
     """Return the OS user-state root without consulting profile dotenv files."""
     test_override = os.environ.get("OPENSQUILLA_USER_STATE_DIR", "").strip()
@@ -233,8 +259,7 @@ def _assert_real_lock_directory(path: Path) -> tuple[int, int]:
         value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"profile lock directory is unavailable: {path}") from exc
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    if stat.S_ISLNK(value.st_mode) or attributes & 0x400 or not stat.S_ISDIR(value.st_mode):
+    if is_path_redirecting_stat(value) or not stat.S_ISDIR(value.st_mode):
         raise UnsafePathError(f"profile lock directory must not be a link: {path}")
     return int(value.st_dev), int(value.st_ino)
 
@@ -292,6 +317,17 @@ def _prepare_posix_lock_file(path: Path, root: Path) -> int:
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+        except FileNotFoundError:
+            # Darwin can report ENOENT to one of two simultaneous openat
+            # callers racing to create the same O_NOFOLLOW leaf. Retrying the
+            # same no-follow operation preserves the safety check and opens
+            # the regular file created by the winning caller.
+            try:
+                fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+            except OSError as exc:
+                raise UnsafePathError(
+                    f"cannot open profile lock without following links: {path}"
+                ) from exc
         except OSError as exc:
             raise UnsafePathError(
                 f"cannot open profile lock without following links: {path}"
@@ -411,7 +447,7 @@ def _windows_assert_lock_handle(
     ):
         error_number = getattr(ctypes, "get_last_error")()
         raise UnsafePathError(f"cannot inspect {label} handle (Windows error {error_number})")
-    if attributes.file_attributes & 0x400:
+    if attributes.file_attributes & 0x400 and reparse_tag_redirects(int(attributes.reparse_tag)):
         raise UnsafePathError(f"{label} must not be a reparse point")
     is_directory = bool(attributes.file_attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY)
     if require_directory != is_directory:
@@ -583,10 +619,8 @@ def _windows_open_profile_lock_file(path: Path, root: Path) -> int:
             path_value = os.lstat(_native_io_path(path))
         except OSError as exc:
             raise UnsafePathError(f"profile lock path disappeared while opening: {path}") from exc
-        attributes = int(getattr(path_value, "st_file_attributes", 0))
         if (
-            stat.S_ISLNK(path_value.st_mode)
-            or attributes & 0x400
+            is_path_redirecting_stat(path_value)
             or not stat.S_ISREG(path_value.st_mode)
             or path_value.st_nlink != 1
         ):
@@ -649,15 +683,16 @@ def _prepare_lock_file(path: Path) -> int:
     return _prepare_posix_lock_file(path, root)
 
 
-def _state_directory_identity(path: Path) -> tuple[int, int, int]:
+def _state_directory_identity(path: Path) -> tuple[int, int]:
     try:
         value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"cannot inspect legacy state directory safely: {path}") from exc
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    if stat.S_ISLNK(value.st_mode) or attributes & 0x400 or not stat.S_ISDIR(value.st_mode):
+    if is_path_redirecting_stat(value) or not stat.S_ISDIR(value.st_mode):
         raise UnsafePathError(f"legacy state directory must not be a link: {path}")
-    return int(value.st_dev), int(value.st_ino), attributes
+    # Cloud-sync placeholder attribute bits toggle with hydration state, so
+    # the identity is device/inode only.
+    return int(value.st_dev), int(value.st_ino)
 
 
 def _lockable_state_path(path: Path, *, allow_state_symlink: bool) -> Path:
@@ -667,8 +702,7 @@ def _lockable_state_path(path: Path, *, allow_state_symlink: bool) -> Path:
         value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"cannot inspect legacy state directory safely: {path}") from exc
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    if not (stat.S_ISLNK(value.st_mode) or attributes & 0x400):
+    if not is_path_redirecting_stat(value):
         return path
     if not allow_state_symlink:
         raise UnsafePathError(f"legacy state directory must not be a link: {path}")
@@ -768,14 +802,11 @@ def _prepare_legacy_lock_file(state_path: Path, *, create_if_missing: bool) -> i
             ) from exc
     try:
         value = os.fstat(fd)
-        attributes = int(getattr(value, "st_file_attributes", 0))
-        if attributes & 0x400 or not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
+        if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
             raise UnsafePathError(f"legacy gateway lock is not a regular file: {path}")
         current_path = os.lstat(_native_io_path(path))
-        current_attributes = int(getattr(current_path, "st_file_attributes", 0))
         if (
-            stat.S_ISLNK(current_path.st_mode)
-            or current_attributes & 0x400
+            is_path_redirecting_stat(current_path)
             or not stat.S_ISREG(current_path.st_mode)
             or current_path.st_nlink != 1
             or (int(current_path.st_dev), int(current_path.st_ino))
@@ -832,10 +863,8 @@ def rebind_legacy_gateway_lock(
         path_value = os.lstat(_native_io_path(destination_path))
     except OSError as exc:
         raise UnsafePathError("moved legacy gateway lock is missing at destination") from exc
-    path_attributes = int(getattr(path_value, "st_file_attributes", 0))
     if (
-        stat.S_ISLNK(path_value.st_mode)
-        or path_attributes & 0x400
+        is_path_redirecting_stat(path_value)
         or not stat.S_ISREG(path_value.st_mode)
         or path_value.st_nlink != 1
     ):
@@ -859,10 +888,8 @@ def rebind_legacy_gateway_lock(
             held_value = os.fstat(held.fd)
         except OSError as exc:
             raise UnsafePathError("cannot verify moved legacy gateway lock handle") from exc
-        held_attributes = int(getattr(held_value, "st_file_attributes", 0))
         if (
-            held_attributes & 0x400
-            or not stat.S_ISREG(held_value.st_mode)
+            not stat.S_ISREG(held_value.st_mode)
             or held_value.st_nlink != 1
             or (int(held_value.st_dev), int(held_value.st_ino))
             != (int(path_value.st_dev), int(path_value.st_ino))
@@ -936,10 +963,8 @@ def _legacy_lock_file_identity(path: Path) -> tuple[int, int]:
         value = os.lstat(_native_io_path(path))
     except OSError as exc:
         raise UnsafePathError(f"legacy gateway lock is unavailable: {path}") from exc
-    attributes = int(getattr(value, "st_file_attributes", 0))
     if (
-        stat.S_ISLNK(value.st_mode)
-        or attributes & 0x400
+        is_path_redirecting_stat(value)
         or not stat.S_ISREG(value.st_mode)
         or value.st_nlink != 1
     ):

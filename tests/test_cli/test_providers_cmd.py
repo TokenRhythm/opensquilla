@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -44,6 +45,12 @@ def test_providers_configure_writes_config(tmp_path, monkeypatch):
     assert "openrouter" in text
     assert "deepseek/deepseek-v4-flash" in text
     assert "sk-test" not in result.stdout
+    config = tomllib.loads(text)
+    assert config["image_generation"] == {
+        "enabled": True,
+        "binding": "follow_llm",
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+    }
 
 
 def test_providers_configure_unsupported_fails(tmp_path, monkeypatch):

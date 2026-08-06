@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { createApp, h, nextTick, type App } from 'vue'
+import { createApp, h, nextTick, reactive, type App } from 'vue'
 import { createPinia } from 'pinia'
 
 import i18n from '@/i18n'
@@ -144,6 +144,21 @@ function approvalTimelineItem(
   }
 }
 
+function planPart(): Extract<ChatPart, { type: 'plan' }> {
+  return {
+    type: 'plan',
+    key: 'assistant-1:plan:revision-1',
+    plan: {
+      revisionId: 'revision-1',
+      planId: 'plan-1',
+      title: 'A restrained plan',
+      markdown: 'Keep the final plan easy to scan.',
+      steps: [{ stepId: 'step-1', title: 'Verify the layout' }],
+      current: true,
+    },
+  }
+}
+
 function baseMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
   return {
     id: 'assistant-1',
@@ -277,6 +292,74 @@ describe('AssistantMessage activity disclosure', () => {
     expect(summary?.textContent).not.toContain('Activity ·')
     expect(el.querySelector('.assistant-activity')?.getAttribute('data-share-expanded')).toBe('false')
     expect(el.querySelector('.tool-row')).not.toBeNull()
+    expect(el.querySelector('.assistant-answer--separated')).not.toBeNull()
+  })
+
+  it('does not add an answer divider when the message has no activity', async () => {
+    const el = mountMessage(baseMessage({
+      text: 'Direct answer',
+      timelineItems: [],
+      toolCalls: [],
+      parts: [],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    expect(el.querySelector('.assistant-answer')).not.toBeNull()
+    expect(el.querySelector('.assistant-answer--separated')).toBeNull()
+  })
+
+  it('places a single planning-process disclosure before the Plan card', async () => {
+    const reasoning: Extract<ChatPart, { type: 'reasoning' }> = {
+      type: 'reasoning',
+      key: 'assistant-1:reasoning',
+      text: 'Checked constraints and compatibility.',
+      seconds: 7,
+    }
+    const el = mountMessage(baseMessage({
+      text: 'The plan is ready.',
+      timelineItems: successfulTimeline(),
+      parts: [reasoning, planPart()],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    const main = el.querySelector<HTMLElement>('.msg-ai-main')
+    const intro = main?.querySelector<HTMLElement>('.plan-message-intro')
+    const activity = main?.querySelector<HTMLElement>('.assistant-activity')
+    const card = main?.querySelector<HTMLElement>('.plan-card')
+    const children = Array.from(main?.children ?? [])
+
+    expect(intro?.textContent).toContain('The plan is ready.')
+    expect(children.indexOf(intro as HTMLElement))
+      .toBeLessThan(children.indexOf(activity as HTMLElement))
+    expect(children.indexOf(activity as HTMLElement))
+      .toBeLessThan(children.indexOf(card as HTMLElement))
+    expect(activity?.querySelector('.assistant-activity__label')?.textContent)
+      .toBe('Planning process · 7s')
+    expect(activity?.querySelector('.assistant-activity__detail')).toBeNull()
+    expect(activity?.querySelector('.thinking-fold')).toBeNull()
+    expect(activity?.querySelector('.thinking-block__header')).toBeNull()
+    expect(activity?.querySelector('.thinking-block__body')?.textContent)
+      .toBe('Checked constraints and compatibility.')
+  })
+
+  it('does not add a generic completed receipt below a Plan card', async () => {
+    const el = mountMessage(baseMessage({
+      text: '',
+      timelineItems: [],
+      parts: [planPart()],
+      statusHistory: [],
+      turnOutcome: {
+        turnId: 'turn-plan',
+        status: 'succeeded',
+        kind: 'completed',
+      },
+    }), true)
+    await nextTick()
+
+    expect(el.querySelector('.plan-card')).not.toBeNull()
+    expect(el.querySelector('[data-testid="turn-outcome-completed"]')).toBeNull()
   })
 
   it('keeps intermediate candidate narration inside activity and the final answer outside once', async () => {
@@ -310,6 +393,47 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity?.textContent).not.toContain('Final verified answer.')
     expect(answer?.textContent).toBe('Final verified answer.')
     expect((el.textContent?.match(/Final verified answer\./g) ?? [])).toHaveLength(1)
+  })
+
+  it('keeps aggregated narration around one tool inside the collapsed activity', async () => {
+    const el = mountMessage(baseMessage({
+      text: 'Inspecting first.\nChecking the result.\nFinal answer.',
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'opening',
+          html: '<p>Inspecting first.</p>',
+          rawText: 'Inspecting first.\n',
+        },
+        {
+          type: 'text',
+          key: 'middle',
+          html: '<p>Checking the result.</p>',
+          rawText: 'Checking the result.\n',
+        },
+        timelineGroup(successfulCall('verify', 'http_request')),
+        {
+          type: 'text',
+          key: 'answer',
+          html: '<p>Final answer.</p>',
+          rawText: 'Final answer.',
+        },
+      ],
+      parts: [],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    const answer = [...el.querySelectorAll<HTMLElement>('.msg-ai-text')]
+      .find(node => !activity?.contains(node))
+
+    expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('false')
+    expect(activity?.textContent).toContain('Inspecting first.')
+    expect(activity?.textContent).toContain('Checking the result.')
+    expect(activity?.textContent).not.toContain('Final answer.')
+    expect(answer?.textContent).toBe('Final answer.')
   })
 
   it('collapses PlanRun narration and leaves only the terminal delivery outside', async () => {
@@ -568,19 +692,26 @@ describe('AssistantMessage activity disclosure', () => {
       .toContain('Worked for 21s')
   })
 
-  it('keeps streaming work collapsed until the user expands it', async () => {
-    const el = mountMessage(baseMessage({
+  it('expands streaming work and automatically folds it when settled', async () => {
+    const message = reactive(baseMessage({
       isStreaming: true,
       timelineItems: successfulTimeline(),
     }))
+    const el = mountMessage(message)
     await nextTick()
 
-    const summary = el.querySelector<HTMLButtonElement>('.assistant-activity__live-head')
-    const body = el.querySelector<HTMLElement>('.assistant-activity__body')
-    expect(summary?.getAttribute('aria-expanded')).toBe('false')
-    expect(summary?.textContent).toContain('Working')
-    expect(body?.getAttribute('aria-hidden')).toBe('true')
-    expect(body?.classList.contains('is-open')).toBe(false)
+    expect(el.querySelector('.assistant-activity__live-head')?.getAttribute('aria-expanded'))
+      .toBe('true')
+    expect(el.querySelector('.assistant-activity__body')?.getAttribute('aria-hidden'))
+      .toBe('false')
+
+    message.isStreaming = false
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('false')
+    expect(el.querySelector('.assistant-activity__body')?.getAttribute('aria-hidden'))
+      .toBe('true')
   })
 
   it('does not let the tool-detail preference force the outer activity open', async () => {

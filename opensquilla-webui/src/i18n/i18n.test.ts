@@ -291,6 +291,45 @@ describe('catalog parity', () => {
     expect(leaked).toEqual([])
   })
 
+  it('uses model fusion consistently in zh-Hans ensemble copy', () => {
+    const zhFlat = flatten(zhHans as Record<string, unknown>)
+    const ensemblePrefixes = [
+      'setup.modelStrategy.',
+      'setup.router.',
+      'setup.ensemble.',
+      'chat.routerFx.',
+      'chat.msgMeta.',
+      'chat.routeFeedback.',
+    ]
+    const ensembleKeys = new Set([
+      'settings.rail.ensemble',
+      'setup.provider.activateEnsembleOnPreserved',
+      'setup.provider.routingDesc',
+      'setup.toast.ensembleSaved',
+      'chat.aiModelEnsembleRouter',
+      'chat.composer.modelRoutingEnsemble',
+      'chat.stream.synthesizingCandidates',
+    ])
+    const deprecated = Object.entries(zhFlat).filter(([key, value]) =>
+      typeof value === 'string'
+      && value.includes('聚合')
+      && (ensembleKeys.has(key) || ensemblePrefixes.some(prefix => key.startsWith(prefix))),
+    )
+
+    expect(deprecated).toEqual([])
+    expect({
+      rail: zhHans.settings.rail.ensemble,
+      setup: zhHans.setup.router.summaryEnsemble,
+      composer: zhHans.chat.composer.modelRoutingEnsemble,
+      runtime: zhHans.chat.routerFx.ensembleSelecting,
+    }).toEqual({
+      rail: '模型融合',
+      setup: 'AI 智能融合路由',
+      composer: 'AI 智能融合路由',
+      runtime: 'AI 智能融合路由 · 正在选择候选',
+    })
+  })
+
   it('ships the approved Model Service labels in every locale', () => {
     expect({
       en: en.settings.rail.provider,
@@ -390,5 +429,18 @@ describe('catalog parity', () => {
       expect(copy.stepSelectAndPaste).toBeTruthy()
       expect(copy.stepReplaceAndPaste).toBeTruthy()
     }
+  })
+
+  it('ships English and Simplified Chinese image-onboarding copy', () => {
+    expect(en.setup.provider.imageGenerationOptInLabel)
+      .toBe('Also enable image generation (recommended)')
+    expect(zhHans.setup.provider.imageGenerationOptInLabel)
+      .toBe('同时启用图像生成（推荐）')
+    expect(en.setup.capabilities.imageRecommendationUse).toBe('Use {provider}')
+    expect(zhHans.setup.capabilities.imageRecommendationUse).toBe('使用 {provider}')
+    expect(en.setup.capabilities.imageRecommendationRegisterExternal)
+      .toContain('opens in a new tab')
+    expect(zhHans.setup.capabilities.imageRecommendationRegisterExternal)
+      .toContain('在新标签页中打开')
   })
 })

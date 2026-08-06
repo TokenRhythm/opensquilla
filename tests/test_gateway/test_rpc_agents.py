@@ -208,6 +208,50 @@ async def test_models_rpc_list_filters_rows_but_keeps_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_models_rpc_non_tokenrhythm_enrichment_ignores_warm_shared_catalog() -> None:
+    from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
+    from opensquilla.provider.selector import ModelListResult
+    from opensquilla.provider.types import ModelInfo
+
+    model_id = "synthetic-non-tokenrhythm-cold-boundary"
+    shared = ModelCatalog()
+    shared.set_user_overrides(
+        {
+            f"synthetic-provider/{model_id}": {
+                "supports_reasoning": True,
+                "reasoning_format": "deepseek",
+            }
+        }
+    )
+
+    class _Selector:
+        async def list_models_detailed(self):
+            return ModelListResult(
+                models=[
+                    ModelInfo(
+                        provider="synthetic-provider",
+                        model_id=model_id,
+                    ).model_dump()
+                ]
+            )
+
+    set_shared_catalog(shared)
+    try:
+        result = await get_dispatcher().dispatch(
+            "r1",
+            "models.list",
+            {},
+            RpcContext(conn_id="test", provider_selector=_Selector()),
+        )
+    finally:
+        set_shared_catalog(None)
+
+    assert result.error is None, result.error
+    assert result.payload["models"][0]["source"] == "synthesized"
+    assert result.payload["models"][0]["reasoningFormat"] == "none"
+
+
+@pytest.mark.asyncio
 async def test_agents_rpc_create_accepts_explicit_id() -> None:
     cfg = GatewayConfig()
     registry = AgentRegistry(cfg, persist_changes=False)

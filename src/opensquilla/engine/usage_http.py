@@ -202,16 +202,37 @@ class DirectUsageReservation:
         payload: Any,
         *,
         raw_json: str = "",
+        allow_billing_only: bool = False,
     ) -> bool:
-        """Finalize a valid receipt; mark malformed/missing receipts unknown."""
+        """Finalize a valid receipt; mark malformed/missing receipts unknown.
+
+        Image APIs may bill per generated asset and legitimately omit token
+        counters. ``allow_billing_only`` accepts that shape only when the
+        trusted provider-native billing parser yields a receipt; otherwise the
+        call remains unknown rather than inventing a zero-cost result.
+        """
 
         if self.terminal or self.scope is None or self.call is None:
             return self.scope is None
         try:
             if not isinstance(payload, Mapping):
                 raise ValueError("provider response must be an object")
+            billing_only = allow_billing_only and not isinstance(
+                payload.get("usage"),
+                Mapping,
+            )
+            normalized_payload: Mapping[str, Any] = payload
+            if billing_only:
+                normalized_payload = {
+                    **payload,
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                }
             done = openai_compatible_done_event(
-                payload,
+                normalized_payload,
                 default_model=self.call.model,
                 provider_kind=self.call.provider,
                 base_url=self.base_url,
@@ -221,6 +242,8 @@ class DirectUsageReservation:
                     raw_json,
                 ),
             )
+            if billing_only and getattr(done, "billing_receipt", None) is None:
+                raise ValueError("provider response has no trusted billing receipt")
         except (TypeError, ValueError):
             await self.mark_unknown("missing_or_invalid_usage_receipt")
             return False

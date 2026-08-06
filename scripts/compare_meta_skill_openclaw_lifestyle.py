@@ -1,9 +1,9 @@
-"""Lifestyle meta-skill benchmark against the OpenClaw t3 baseline.
+"""Archived kid-planner compatibility benchmark against the OpenClaw baseline.
 
-This catalog is intentionally narrower than ``compare_meta_skill_openclaw``:
-it covers retained practical work/life meta-skills and frames each case so the
-OpenSquilla meta-skill orchestration path can be judged against OpenClaw's
-t3 Opus 4.8 baseline.
+``meta-kid-project-planner`` is retired and cannot start new runs.  This module
+retains its synthetic cases and report readers only for historical comparison
+and tombstone compatibility tests; live execution is intentionally disabled.
+Active MetaSkill benchmarks live in ``compare_meta_skill_openclaw``.
 """
 
 from __future__ import annotations
@@ -64,6 +64,7 @@ LIFESTYLE_JUDGE_SUBSCORE_RANGES: dict[str, tuple[int, int]] = {
     "risk_boundary_safety": (0, 10),
     "meta_skill_fit": (0, 5),
 }
+ARCHIVED_COMPATIBILITY_BENCHMARK = True
 
 
 KID_PROJECT_RUBRIC: tuple[RubricCriterion, ...] = (
@@ -875,8 +876,10 @@ def main() -> None:
         asyncio.run(judge_existing(args))
         return
     if args.run_live:
-        asyncio.run(run_live(args))
-        return
+        raise SystemExit(
+            "Live execution is disabled because meta-kid-project-planner is retired. "
+            "Use scripts/compare_meta_skill_openclaw.py for active MetaSkills."
+        )
     rows = build_lifestyle_rows(args.prompt_language)
     if args.write_dry_run:
         write_lifestyle_reports(rows)
