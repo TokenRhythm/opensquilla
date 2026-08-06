@@ -71,7 +71,10 @@
             @focus="emit('expand')"
           />
         </div>
-        <div class="chat-input-footer">
+        <div
+          class="chat-input-footer"
+          :class="{ 'chat-input-footer--popover-open': anyPopoverOpen }"
+        >
           <div class="chat-input-actions chat-input-actions--left">
             <div ref="addMenuAnchorEl" class="chat-settings-anchor">
               <button
@@ -548,6 +551,20 @@ function toggleRunMode() {
 
 watch(() => props.runModeLocked, (locked) => {
   if (locked) runModeOpen.value = false
+})
+
+function closeAllPopovers() {
+  addMenuOpen.value = false
+  modelRoutingOpen.value = false
+  runModeOpen.value = false
+  moreActionsOpen.value = false
+}
+
+// The retract animation collapses the footer with overflow clipping; any open
+// menu would be clipped/vanished mid-flight, so close menus the moment the
+// composer starts collapsing.
+watch(() => props.collapsed, (collapsed) => {
+  if (collapsed) closeAllPopovers()
 })
 
 function toggleMoreActions() {
@@ -1077,6 +1094,18 @@ defineExpose<ChatComposerExpose>({
 .chat-input-footer > * {
   min-height: 0;
   overflow: hidden;
+}
+
+/* While a composer menu is open, the footer must not clip it: the menus are
+   absolutely positioned above their anchor (bottom: calc(100% + 8px)) and the
+   overflow: hidden above exists only for the retract animation. Collapsing
+   closes menus (see closeAllPopovers) and re-applies the clip below. */
+.chat-input-footer--popover-open > * {
+  overflow: visible;
+}
+
+.chat-composer--collapsed .chat-input-footer > * {
+  overflow: hidden !important;
 }
 .chat-composer--collapsed .chat-input-footer {
   grid-template-rows: 0fr !important;
