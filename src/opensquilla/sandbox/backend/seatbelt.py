@@ -46,6 +46,7 @@ from opensquilla.sandbox.permissions import (
     logical_absolute_path,
 )
 from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import (
     NetworkMode,
     NetworkProxySpec,
@@ -59,8 +60,6 @@ log = logging.getLogger(__name__)
 
 _SANDBOX_EXEC_NAME = "sandbox-exec"
 _SANDBOX_EXEC_SYSTEM_PATH = Path("/usr/bin/sandbox-exec")
-_FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
-_FROZEN_FILESYSTEM_WORKER_ARG = "--_sandbox-filesystem-worker"
 _FILESYSTEM_PATH_OPERATION_KINDS = frozenset(
     {
         "read_file",
@@ -957,6 +956,15 @@ def _runtime_readonly_roots() -> tuple[Path, ...]:
         if not link_target.is_absolute():
             link_target = executable.parent / link_target
         symlink_roots = (link_target.parent, link_target.parent.parent)
+    base_executable = Path(
+        getattr(sys, "_base_executable", "") or executable
+    ).expanduser()
+    base_runtime_root = base_executable.parent.parent.absolute()
+    base_runtime_alias_roots = (
+        (base_runtime_root,)
+        if base_runtime_root != base_runtime_root.resolve(strict=False)
+        else ()
+    )
     prefix = Path(sys.prefix).expanduser().resolve(strict=False)
     base_prefix = Path(sys.base_prefix).expanduser().resolve(strict=False)
     configured = sysconfig.get_paths()
@@ -966,6 +974,7 @@ def _runtime_readonly_roots() -> tuple[Path, ...]:
         executable.resolve(strict=False).parent,
         executable.resolve(strict=False).parent.parent,
         *((prefix,) if prefix != base_prefix else ()),
+        *base_runtime_alias_roots,
         *(
             Path(configured[name])
             for name in ("stdlib", "platstdlib", "purelib", "platlib")
@@ -1011,15 +1020,7 @@ def _python_executable() -> Path:
 
 
 def _filesystem_worker_argv() -> tuple[str, ...]:
-    if bool(getattr(sys, "frozen", False)):
-        return (str(_python_executable()), _FROZEN_FILESYSTEM_WORKER_ARG)
-    return (
-        str(_python_executable()),
-        "-B",
-        "-m",
-        _FILESYSTEM_WORKER_MODULE,
-        "-",
-    )
+    return internal_child_argv(ChildRole.FILESYSTEM_WORKER, args=("-",))
 
 
 def _filesystem_worker_env() -> dict[str, str]:

@@ -150,6 +150,7 @@
           :fork-busy="forkInFlight"
           :plan-action-pending="planCardPendingAction"
           :plan-actions-disabled="planActionsDisabled"
+          :is-streaming="isStreaming"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
           @regenerate-message="regenerateMessage"
@@ -172,6 +173,33 @@
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
         </ChatMessageList>
+
+        <!-- Manual or turn-boundary compaction has no assistant turn to own
+             it. Keep one quiet transcript maintenance row instead of a
+             floating success card or a second task-like animation. -->
+        <div
+          v-if="compactStatus.visible && !compactStatus.compactionId"
+          class="chat-compaction-event"
+          :class="{
+            'chat-compaction-event--running': compactStatus.isBusy,
+            'chat-compaction-event--failed': compactStatus.tone === 'err',
+          }"
+          data-testid="compaction-event"
+          :data-compaction-id="compactStatus.compactionId"
+          :data-status="compactStatus.status"
+          :data-source="compactStatus.source"
+          :data-durability="compactStatus.durability"
+          data-placement="turn-boundary"
+          :role="compactStatus.tone === 'err' ? 'alert' : 'status'"
+          :aria-live="compactStatus.tone === 'err' ? 'assertive' : 'polite'"
+          aria-atomic="true"
+        >
+          <span class="chat-compaction-event__marker" aria-hidden="true" />
+          <span class="chat-compaction-event__title">{{ compactStatus.message }}</span>
+          <span v-if="compactStatus.detail" class="chat-compaction-event__detail">
+            {{ compactStatus.detail }}
+          </span>
+        </div>
 
         <PlanCard
           v-if="currentPlan && !currentPlanInHistory"
@@ -346,7 +374,7 @@
             :error="entry.error"
             @allow-once="resolveApproval(entry, 'allow-once')"
             @allow-always="resolveApproval(entry, 'allow-always')"
-            @deny="note => resolveApproval(entry, 'deny', note)"
+            @deny="resolveApproval(entry, 'deny')"
             @extend="extendInterrupt(entry.approval.id)"
           />
 
@@ -374,40 +402,6 @@
         />
       </div>
     </div>
-
-    <!-- Compaction maintenance card -->
-    <div v-if="compactStatus.visible" class="chat-compact-status" :class="`chat-compact-status--${compactStatus.tone}`" role="status" aria-live="polite">
-      <div class="chat-compact-status__head">
-        <span class="chat-compact-status__dot" :class="{ 'chat-compact-status__dot--pulsing': compactStatus.isBusy }" aria-hidden="true" />
-        <span class="chat-compact-status__title">{{ compactStatus.message }}</span>
-        <span v-if="compactElapsed" class="chat-compact-status__elapsed">{{ compactElapsed }}</span>
-      </div>
-      <p v-if="compactStatus.detail" class="chat-compact-status__detail">{{ compactStatus.detail }}</p>
-      <div v-if="compactGaugeVisible" class="chat-compact-status__gauge" aria-hidden="true">
-        <span
-          class="chat-compact-status__gauge-fill"
-          :class="{
-            'chat-compact-status__gauge-fill--breathing': compactStatus.isBusy,
-            'chat-compact-status__gauge-fill--done': compactStatus.status === 'completed',
-          }"
-          :style="compactStatus.occupancyPercent !== null ? { width: `${compactStatus.occupancyPercent}%` } : undefined"
-        />
-      </div>
-      <div v-if="compactGaugeVisible && compactStatus.occupancyPercent !== null" class="chat-compact-status__legend">
-        <span>context {{ compactStatus.occupancyPercent }}%</span>
-        <span v-if="compactStatus.contextWindowLabel">{{ compactStatus.contextWindowLabel }}</span>
-      </div>
-    </div>
-
-    <SandboxSetupBanner
-      v-if="sandboxSetupVisible"
-      :status="sandboxSetupStatus"
-      :can-setup="sandboxSetupCanSetup"
-      :ensuring="sandboxSetupEnsuring"
-      :error="sandboxSetupError"
-      @setup="ensureSandboxSetup"
-      @dismiss="dismissSandboxSetup"
-    />
 
     <!-- Composer dock: positioning context so the slash menu anchors directly
          above the composer in any layout. The new-chat landing centers the
@@ -498,7 +492,8 @@
       :send-blocked-message="composerSendBlockedMessage"
       :input-disabled="Boolean(dockedPlanQuestionnaire)"
       :run-mode="runMode"
-      :allowed-run-modes="allowedRunModes"
+      :allowed-run-modes="composerAllowedRunModes"
+      :safe-setup-available="composerSafeSetupAvailable"
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
@@ -519,6 +514,9 @@
       :plan-mode-disabled="planActionPending !== null"
       :plan-mode-applies-next-turn="planModeAppliesNextTurn"
       :replan-active="replanActive"
+      :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
+      :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
+      :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -539,6 +537,16 @@
       @stop="onComposerStop"
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
+      @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
+      @refresh-prompt-cache-keepalive="void refreshPromptCacheKeepaliveStatus()"
+    />
+    <SandboxSetupDialog
+      :open="composerSandboxSetupOpen"
+      :pending="sandboxSetupPending"
+      :outcome="sandboxSetupOutcome"
+      @cancel="cancelComposerSandboxSetup"
+      @background="runComposerSandboxSetupInBackground"
+      @confirm="void confirmComposerSandboxSetup()"
     />
     <ProjectWorkspacePickerDialog
       v-if="rpc.canChooseProject"
@@ -581,6 +589,14 @@
       @set-theme="onShareSetTheme"
     />
 
+    <PromptCacheKeepaliveDialog
+      v-if="promptCacheKeepaliveAvailable"
+      :open="promptCacheKeepaliveOpen"
+      :session-key="sessionKey"
+      @close="promptCacheKeepaliveOpen = false"
+      @saved="onPromptCacheKeepaliveSaved"
+    />
+
     <!-- Persistent completion announcer: the live block's role="status" phase
          label unmounts with the block when streaming ends, so on its own the
          settle would never reach a screen reader. This region stays mounted
@@ -594,9 +610,11 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
+import { storeToRefs } from 'pinia'
 import { useRpcStore } from '@/stores/rpc'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
+import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
@@ -604,6 +622,7 @@ import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import ChatHeaderActions from '@/components/chat/ChatHeaderActions.vue'
+import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
@@ -622,8 +641,8 @@ import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
 import RouterFxStrip from '@/components/chat/RouterFxStrip.vue'
-import SandboxSetupBanner from '@/components/chat/SandboxSetupBanner.vue'
 import SharePreviewModal from '@/components/chat/SharePreviewModal.vue'
+import SandboxSetupDialog from '@/components/sandbox/SandboxSetupDialog.vue'
 import ToolResultModal from '@/components/chat/ToolResultModal.vue'
 import Icon from '@/components/Icon.vue'
 import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
@@ -654,13 +673,20 @@ import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
+import {
+  composerRunModeSelectionAction,
+  effectiveComposerRunMode,
+} from '@/composables/chat/composerRunMode'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
-import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
+import {
+  shouldCanonicalizeInitialDraftRoute,
+  useChatSessionRoute,
+} from '@/composables/chat/useChatSessionRoute'
 import {
   useChatRunModePreference,
   type RunModePolicy,
@@ -671,6 +697,8 @@ import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
   optionalSessionRpcCallOptions,
+  runModeWriteRpcCallOptions,
+  sandboxSetupRpcCallOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
@@ -678,6 +706,7 @@ import { useChatSlashCommands } from '@/composables/chat/useChatSlashCommands'
 import { useChatStream } from '@/composables/chat/useChatStream'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
+import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
@@ -695,6 +724,7 @@ import {
 import { useFreshTaskDraft } from '@/composables/useFreshTaskDraft'
 import type {
   Attachment,
+  ChatMaintenanceEvent,
   ChatMessage,
   ChatPendingItem,
   ChatRenderedMessage,
@@ -712,8 +742,16 @@ import type {
   SessionMessagesSnapshotResponse,
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
-import { isSandboxRunMode, type SandboxRunMode } from '@/types/sandbox'
+import {
+  isRecognizedSandboxRunMode,
+  normalizeSandboxRunMode,
+  type SandboxRunMode,
+} from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
+import type {
+  PromptCacheKeepaliveStatus,
+  PromptCacheKeepaliveStatusUpdate,
+} from '@/types/promptCacheKeepalive'
 import type {
   CollaborationMode,
   PlanCardAction,
@@ -809,6 +847,11 @@ const toolResultModal = ref<{
 /* ── Stores / Router ───────────────────────────────────────────────── */
 
 const rpc = useRpcStore()
+const sandboxSetupStore = useSandboxSetupStore()
+const {
+  ensuring: sandboxSetupPending,
+  outcome: sandboxSetupOutcome,
+} = storeToRefs(sandboxSetupStore)
 // Setup runs before this view's/ancestor children's mounted hooks. Holding the
 // admission gate here prevents global onboarding/workspace metadata calls from
 // entering the serialized Gateway queue ahead of session recovery.
@@ -864,6 +907,12 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const promptCacheKeepaliveOpen = ref(false)
+const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
+const promptCacheKeepaliveAvailable = computed(() => (
+  rpc.supportsMethod('sessions.promptCacheKeepalive.status')
+  && rpc.supportsMethod('sessions.promptCacheKeepalive.set')
+))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const inputText = ref('')
 const composerRevision = ref(0)
@@ -912,6 +961,7 @@ const {
 } = useChatRunModePreference({
   rpc,
   hydrateCallOptions: optionalSessionRpcCallOptions,
+  writeCallOptions: runModeWriteRpcCallOptions,
   runModePolicy: () => {
     const auth = rpc.auth as RpcAuthPayload | null
     return auth?.runModePolicy
@@ -928,28 +978,50 @@ async function refreshRunModePreference() {
   }
 }
 const activeRunModeLock = ref<SandboxRunMode | null>(null)
-const runMode = computed<SandboxRunMode>(
+const requestedRunMode = computed<SandboxRunMode>(
   () => activeRunModeLock.value ?? globalRunMode.value,
 )
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
   rpc: {
     call: (method, params) =>
-      rpc.call(method, params, optionalSessionRpcCallOptions),
+      rpc.call(method, params, sandboxSetupRpcCallOptions),
+    waitForConnection: () => rpc.waitForConnection(10_000),
   },
   connectionState: computed(() => rpc.state),
-  runMode,
+  runMode: requestedRunMode,
   autoRefresh: false,
+  onUnavailable: async (status) => {
+    await platform.settings.reportSandboxUnavailable?.({
+      state: status.state,
+      ...(status.message ? { message: status.message } : {}),
+    })
+  },
 })
 const {
   status: sandboxSetupStatus,
-  ensuring: sandboxSetupEnsuring,
-  error: sandboxSetupError,
-  visible: sandboxSetupVisible,
-  canSetup: sandboxSetupCanSetup,
-  ensureSetup: ensureSandboxSetup,
-  dismiss: dismissSandboxSetup,
 } = sandboxSetupRecovery
+const runMode = computed<SandboxRunMode>(() => effectiveComposerRunMode(
+  globalRunMode.value,
+  sandboxSetupStatus.value,
+  activeRunModeLock.value,
+  sandboxSetupRecovery.resolved.value,
+))
+const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
+  if (!sandboxSetupRecovery.resolved.value) {
+    return allowedRunModes.value.filter((mode) => mode !== 'safe')
+  }
+  const status = sandboxSetupStatus.value
+  if (
+    status !== null
+    && status.state !== 'ready'
+  ) {
+    return allowedRunModes.value.filter((mode) => mode !== 'safe')
+  }
+  return allowedRunModes.value
+})
+const composerSafeSetupAvailable = computed(() => sandboxSetupRecovery.canSetup.value)
+const composerSandboxSetupOpen = ref(false)
 
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()
@@ -976,6 +1048,35 @@ let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
+const promptCacheKeepaliveSessionReady = computed(() => pendingSessionIntent.value === null)
+
+async function refreshPromptCacheKeepaliveStatus() {
+  const key = sessionKey.value
+  if (
+    !key
+    || !promptCacheKeepaliveAvailable.value
+    || !promptCacheKeepaliveSessionReady.value
+  ) return
+  try {
+    const next = await rpc.call<PromptCacheKeepaliveStatus>(
+      'sessions.promptCacheKeepalive.status',
+      { key },
+    )
+    if (sessionKey.value === key) promptCacheKeepaliveStatus.value = next
+  } catch {
+    // The settings dialog owns actionable RPC errors. Menu refresh is best effort.
+  }
+}
+
+function onPromptCacheKeepaliveSaved(update: PromptCacheKeepaliveStatusUpdate) {
+  if (update.sessionKey === sessionKey.value) {
+    promptCacheKeepaliveStatus.value = update.status
+  }
+}
+
+watch(sessionKey, () => {
+  promptCacheKeepaliveStatus.value = null
+})
 
 function activeSnapshot(workspace: ProjectWorkspaceItem): ActiveProjectWorkspaceSnapshot {
   return {
@@ -1152,7 +1253,7 @@ const chatCompaction = useChatCompaction({
 })
 const {
   compactStatus,
-  compactElapsed,
+  getCompactionPlacement,
   setCompactInFlight,
   hideCompactStatus,
   showCompactStatus,
@@ -1161,10 +1262,47 @@ const {
 } = chatCompaction
 isCompactInFlightForCurrentSession = chatCompaction.isCompactInFlightForCurrentSession
 
-// The context gauge stays up while compaction runs and settles on completed;
-// skipped/failed/cancelled keep the card head only.
-const compactGaugeVisible = computed(() =>
-  compactStatus.value.isBusy || compactStatus.value.status === 'completed')
+function transcriptCompactionState(status: string): ChatMaintenanceEvent['state'] {
+  if (status === 'skipped') return 'skipped'
+  if (status === 'stale') return 'stale'
+  if (status === 'cancelled') return 'cancelled'
+  if (['failed', 'error', 'timed_out'].includes(status)) return 'failed'
+  if (['completed', 'emergency_ephemeral'].includes(status)) return 'completed'
+  return 'running'
+}
+
+// Standalone compaction has no assistant turn to own it. Anchor its lifecycle
+// in the transcript at first observation and update that same row by id, so a
+// later user turn cannot make the maintenance boundary drift down the page.
+watch(compactStatus, (status) => {
+  const compactionId = String(status.compactionId || '').trim()
+  if (!status.visible || !compactionId) return
+  const maintenance: ChatMaintenanceEvent = {
+    kind: 'context_compaction',
+    compactionId,
+    source: status.source || 'manual',
+    state: transcriptCompactionState(status.status),
+    durability: status.durability || '',
+    ...(status.detail ? { detail: status.detail } : {}),
+  }
+  const index = messages.value.findIndex(message => (
+    message.role === 'maintenance'
+    && message.maintenance?.kind === 'context_compaction'
+    && message.maintenance.compactionId === compactionId
+  ))
+  if (index >= 0) {
+    const previous = messages.value[index]!
+    messages.value.splice(index, 1, { ...previous, maintenance })
+    return
+  }
+  messages.value.push({
+    role: 'maintenance',
+    text: '',
+    ts: Date.now(),
+    clientId: `live-maintenance:context-compaction:${compactionId}`,
+    maintenance,
+  })
+}, { flush: 'sync' })
 
 const chatUsageWidget = useChatUsageWidget({
   rpc,
@@ -1418,6 +1556,23 @@ const {
 } = chatHistory
 planMutationAccepted = () => scheduleHistorySync()
 
+// The durable artifact index fills gaps left by the bounded/compacted message
+// history. History and the in-flight ArtifactEvent stream remain live fallback
+// sources for mixed-version gateways and list-refresh races.
+const chatSessionArtifacts = useSessionArtifacts({
+  rpc,
+  sessionKey,
+  messages,
+  streamArtifacts,
+})
+const {
+  artifacts: sessionArtifacts,
+  load: loadSessionArtifacts,
+  loadAfterReconnect: loadSessionArtifactsAfterReconnect,
+  reset: resetSessionArtifacts,
+  cleanup: cleanupSessionArtifacts,
+} = chatSessionArtifacts
+
 const voiceInput = useVoiceInput()
 const {
   voiceBusy,
@@ -1456,6 +1611,7 @@ const chatMessageActions = useChatMessageActions({
     }
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
+  notifyEditBlocked: () => pushToast(t('chat.pending.editWhileStreaming'), { tone: 'info' }),
 })
 const {
   copyMessage,
@@ -1495,8 +1651,8 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onRunModeLock: lock => {
     if (lock.locked === false) return
-    if (isSandboxRunMode(lock.runMode)) {
-      activeRunModeLock.value = lock.runMode
+    if (isRecognizedSandboxRunMode(lock.runMode)) {
+      activeRunModeLock.value = normalizeSandboxRunMode(lock.runMode)
     } else if (activeRunModeLock.value === null) {
       activeRunModeLock.value = globalRunMode.value
     }
@@ -1674,6 +1830,7 @@ watch(activeWorkspaceStatus, (status, previousStatus) => {
 const sessionHasActiveWork = computed(() => (
   isStreaming.value
   || activeTaskGroups.value.size > 0
+  || isCompactInFlightForCurrentSession()
   || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status)
   || activePlanRun.value?.status === 'queued'
   || activePlanRun.value?.status === 'running'
@@ -1765,10 +1922,12 @@ const chatSlashCommands = useChatSlashCommands({
   },
   resetCurrentSession: () => {
     resetCurrentSessionAfterSlash()
+    resetSessionArtifacts()
     chatPlans.reset()
   },
   setCompactInFlight,
   showCompactStatus,
+  showCompactionToast,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
   dispatchHidden: (providerText: string, displayText: string) => dispatchHiddenForMeta(providerText, displayText),
   dispatchPlanPrompt: (prompt: string, composerText: string) => {
@@ -1981,38 +2140,12 @@ async function steerPendingMessage(index: number) {
   }
 }
 
-// Deny notes are immutable queue payloads. They never borrow or clear the
-// operator's editable composer, even if project validation or live recovery
-// delays delivery.
-function queueDenyFeedback(note: string) {
-  const context = pendingQueueOwnerContext.value
-  const owner = context?.sessionKey === sessionKey.value
-    ? { ownerRequestId: context.ownerRequestId }
-    : undefined
-  const queued = enqueuePendingPayload({
-    text: note,
-    attachments: [],
-    intent: null,
-  }, owner)
-  if (!queued) {
-    inputText.value = [note, inputText.value].filter(text => text.trim()).join('\n')
-    autoResizeTextarea()
-    pushToast(t('chat.toast.queueFull'), { tone: 'info' })
-    return
-  }
-  if (!isStreaming.value && !isCompactInFlightForCurrentSession()) {
-    schedulePendingDrainAfterTerminal()
-    flushDeferredPendingDrain()
-  }
-}
-
 const chatApprovals = useChatApprovals({
   rpc,
   sessionKey,
   runStatus,
   stream: { isStreaming, appendInterruptFrame, ensureInterruptBubble },
   interruptState,
-  onDenyFeedback: queueDenyFeedback,
   onSnapshotCount: count => appStore.setApprovalCount(count),
 })
 const {
@@ -2063,6 +2196,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   clearPendingRouterDecision,
   handleRouterControlReplay,
   showCompactionToast,
+  getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
@@ -2137,6 +2271,7 @@ const liveActivityPhaseLabel = computed(() => {
     .find(step => step.isCurrent)
   if (
     currentStatus
+    && currentStatus.category !== 'maintenance'
     && !currentStatus.label.code.startsWith('chat.activity.lifecycle.')
     && !liveActivityProjection.value.currentClusterKey
   ) {
@@ -2652,16 +2787,56 @@ function readAuthToken(): string {
   }
 }
 
-async function setComposerRunMode(mode: SandboxRunMode) {
+function reportRunModePersistenceError(cause: unknown): void {
+  const detail = cause instanceof Error ? cause.message : String(cause)
+  console.warn('Failed to persist sandbox run mode:', detail)
+  pushToast(detail, { tone: 'danger' })
+}
+
+async function persistComposerRunMode(mode: SandboxRunMode): Promise<void> {
+  await setGlobalRunMode(mode)
+  void sandboxSetupRecovery.refresh()
+}
+
+async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
   if (runModeLocked.value) return
-  try {
-    await setGlobalRunMode(mode)
-    void sandboxSetupRecovery.refresh()
-  } catch (cause) {
-    const detail = cause instanceof Error ? cause.message : String(cause)
-    console.warn('Failed to persist sandbox run mode:', detail)
-    pushToast(detail, { tone: 'danger' })
+  sandboxSetupStore.noteRunModeSelection(mode)
+  const action = composerRunModeSelectionAction(
+    mode,
+    sandboxSetupStatus.value,
+    composerSafeSetupAvailable.value,
+    sandboxSetupRecovery.resolved.value,
+  )
+  if (action === 'ignore') return
+  if (action === 'setup') {
+    sandboxSetupStore.resetOutcome()
+    composerSandboxSetupOpen.value = true
+    return
   }
+  try {
+    await persistComposerRunMode(mode)
+  } catch (cause) {
+    reportRunModePersistenceError(cause)
+  }
+}
+
+function cancelComposerSandboxSetup(): void {
+  if (sandboxSetupPending.value) return
+  composerSandboxSetupOpen.value = false
+}
+
+async function confirmComposerSandboxSetup(): Promise<void> {
+  if (sandboxSetupPending.value) return
+  const ready = await sandboxSetupStore.startSafeSetup()
+  if (ready) {
+    composerSandboxSetupOpen.value = false
+    await refreshRunModePreference()
+    await sandboxSetupRecovery.refresh()
+  }
+}
+
+function runComposerSandboxSetupInBackground(): void {
+  composerSandboxSetupOpen.value = false
 }
 
 async function setComposerModelRoutingMode(mode: ModelRoutingMode) {
@@ -2818,38 +2993,11 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   }
 }
 
-/**
- * Every deliverable the current session has produced, deduped by identity.
- * Artifacts arrive on completed/replayed assistant turns (`message.artifacts`,
- * filled from chat.history and from the streamed turn that just ended) and on
- * the in-flight turn (`streamArtifacts`); both feed the per-session drawer.
- */
-const sessionArtifacts = computed<ArtifactPayload[]>(() => {
-  const seen = new Set<string>()
-  const collected: ArtifactPayload[] = []
-  const consider = (artifact: ArtifactPayload | undefined | null) => {
-    if (!artifact) return
-    const id = String(artifact.id || artifact.download_url || artifact.name || '')
-    if (!id || seen.has(id)) return
-    seen.add(id)
-    collected.push(artifact)
-  }
-  for (const message of messages.value) {
-    message.artifacts?.forEach(consider)
-  }
-  streamArtifacts.value.forEach(consider)
-  return collected
-})
-
 const sessionWorkbenchArtifacts = computed(() =>
   sessionArtifacts.value.filter(artifactUsesWorkbenchPreview),
 )
 
-const headerDeliverableCount = computed(() =>
-  workbenchEnabled.value
-    ? sessionWorkbenchArtifacts.value.length
-    : sessionArtifacts.value.length,
-)
+const headerDeliverableCount = computed(() => sessionArtifacts.value.length)
 
 const deliverablesOpen = ref(false)
 
@@ -2861,7 +3009,9 @@ function focusHeaderAction(
 
 function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
-  if (workbenchEnabled.value) {
+  const allArtifactsUseWorkbench = sessionWorkbenchArtifacts.value.length
+    === sessionArtifacts.value.length
+  if (workbenchEnabled.value && allArtifactsUseWorkbench) {
     const recentPreview = workbenchStore.findMostRecentItem(item => {
       if (
         item.kind !== 'artifact-preview'
@@ -2884,14 +3034,6 @@ function openDeliverables() {
       openArtifact(artifact)
       return
     }
-
-    const latestArtifact = sessionArtifacts.value[sessionArtifacts.value.length - 1]
-    if (latestArtifact && artifactCategory(latestArtifact) === 'visual') {
-      openArtifact(latestArtifact)
-      return
-    }
-    if (latestArtifact) focusInlineDeliverable(latestArtifact)
-    return
   }
   deliverablesOpen.value = true
 }
@@ -3529,6 +3671,7 @@ function enterDraft() {
 
 onMounted(async () => {
   chatViewDisposed = false
+  const initialRouteFullPath = route.fullPath
   // Initialize session key. Without an explicit ?session= the view opens as a
   // draft instead of restoring a previous session.
   const initialSession = resolveInitialSession()
@@ -3598,8 +3741,14 @@ onMounted(async () => {
 
   if (initialDraftProjectGeneration !== null) {
     const synced = await initialDraftProjectSync
-    if (synced) {
-      if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
+    if (synced && shouldCanonicalizeInitialDraftRoute({
+      disposed: chatViewDisposed,
+      initialFullPath: initialRouteFullPath,
+      currentFullPath: route.fullPath,
+      currentPathIsDraft: isDraftRoute(),
+      hasLegacyNewChatQuery: hasLegacyNewChatQuery(),
+    })) {
+      goToDraft({ replace: true })
     }
   }
 
@@ -3649,6 +3798,7 @@ onUnmounted(() => {
   unsubs = []
   cleanupPendingQueue()
   cleanupHistory()
+  cleanupSessionArtifacts()
   cleanupStream()
   cleanupCompaction()
   cleanupVoiceInput()
@@ -3739,9 +3889,26 @@ watch(() => [route.query.newChat, route.query.new], () => {
 
 watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
+  // Retire any in-flight page walk and clear the old Session before starting
+  // the new one, so a late response cannot leak deliverables across tabs/routes.
+  resetSessionArtifacts()
   if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
+  if (sessionKey.value && pendingSessionIntent.value !== 'new_chat') void loadSessionArtifacts()
+})
+
+// Hello refreshes method capabilities on reconnect. Retry the durable index
+// for the current Session then; older gateways simply remain on history/live.
+watch(() => rpc.state, (state, previous) => {
+  if (
+    state === 'connected'
+    && previous !== 'connected'
+    && sessionKey.value
+    && pendingSessionIntent.value !== 'new_chat'
+  ) {
+    void loadSessionArtifactsAfterReconnect()
+  }
 })
 
 watch(shareableMessageCount, (count) => {

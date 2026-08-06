@@ -78,6 +78,42 @@ def _make_assistant_reasoning_entry(content: str, reasoning_content: str) -> Tra
     )
 
 
+def test_routed_small_window_cannot_lower_durable_history_boundary() -> None:
+    assert runtime_module._durable_compaction_window_tokens(
+        8_000,
+        stable_consumer_window_tokens=128_000,
+        routing_applied=True,
+    ) == 128_000
+    assert runtime_module._durable_compaction_window_tokens(
+        8_000,
+        stable_consumer_window_tokens=128_000,
+        routing_applied=False,
+    ) == 8_000
+    # A compaction deployment is deliberately not an input to this decision:
+    # its larger window may size the summary request, never durable pressure.
+    assert runtime_module._durable_compaction_window_tokens(
+        8_000,
+        stable_consumer_window_tokens=8_000,
+        routing_applied=True,
+    ) == 8_000
+
+
+def test_durable_history_uses_pre_router_deployment_identity() -> None:
+    metadata = {
+        "routing_applied": True,
+        "durable_base_provider": "openai",
+        "durable_base_model": "large-session-model",
+        # These mutable fields now describe this turn's small routed leg.
+        "executed_provider": "openrouter",
+        "executed_model": "small-route-model",
+    }
+
+    assert runtime_module._stable_consumer_execution_identity(metadata) == (
+        "openai",
+        "large-session-model",
+    )
+
+
 def _checkpoint_receipt() -> SimpleNamespace:
     return SimpleNamespace(
         scope="checkpoint",
@@ -226,6 +262,20 @@ class _StaleResultCompactionSessionManager(_ResultCompactionSessionManager):
         )
 
 
+def _assert_armed_compaction_call(
+    calls: list[tuple[str, int, object | None]],
+    session_key: str,
+    context_window: int,
+) -> CompactionConfig:
+    assert len(calls) == 1
+    called_key, called_window, config = calls[0]
+    assert (called_key, called_window) == (session_key, context_window)
+    assert isinstance(config, CompactionConfig)
+    assert config.operation_id
+    assert config.deadline_at_monotonic is not None
+    return config
+
+
 @pytest.fixture
 async def session_mgr(tmp_path):
     storage = SessionStorage(":memory:")
@@ -301,6 +351,351 @@ async def test_preflight_empty_transcript_is_noop() -> None:
     await runner._maybe_preflight_compact("user:session", 200_000)
 
     mock_sm.compact.assert_not_called()
+
+
+def test_current_turn_suffix_uses_bound_prompt_and_includes_queued_prompts() -> None:
+    older_user = _make_entry("older user")
+    older_assistant = _make_entry("older assistant", role="assistant")
+    active_user = _make_entry("active user")
+    queued_user = _make_entry("queued user")
+
+    protected = TurnRunner._protected_current_turn_suffix_count(
+        [older_user, older_assistant, active_user, queued_user],
+        history_has_persisted_user=True,
+        bound_user_message_id=active_user.message_id,
+    )
+
+    assert protected == 2
+
+
+def test_current_turn_suffix_fails_closed_when_bound_prompt_is_missing() -> None:
+    transcript = [
+        _make_entry("older user"),
+        _make_entry("older assistant", role="assistant"),
+    ]
+
+    protected = TurnRunner._protected_current_turn_suffix_count(
+        transcript,
+        history_has_persisted_user=True,
+        bound_user_message_id="missing-active-user",
+    )
+
+    assert protected == len(transcript)
+
+
+@pytest.mark.asyncio
+async def test_preflight_protects_active_and_queued_prompts_from_durable_compaction() -> None:
+    context_window = 1000
+    active_user = _make_entry("active user")
+    active_user.token_count = 10
+    queued_user = _make_entry("queued user")
+    queued_user.token_count = 10
+    old_user = _make_entry("old user")
+    old_user.token_count = 1_000
+    old_assistant = _make_entry("old assistant", role="assistant")
+    old_assistant.token_count = 1_000
+    transcript = [old_user, old_assistant, active_user, queued_user]
+    sm = _ResultCompactionSessionManager(transcript)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
+
+    await runner._maybe_preflight_compact(
+        "user:session",
+        context_window,
+        history_has_persisted_user=True,
+        bound_user_message_id=active_user.message_id,
+    )
+
+    config = _assert_armed_compaction_call(
+        sm.compact_with_result_calls,
+        "user:session",
+        context_window,
+    )
+    assert config.protected_recent_messages == 2
+
+
+@pytest.mark.asyncio
+async def test_preflight_compacts_to_final_envelope_history_capacity() -> None:
+    context_window = 1000
+    history_capacity = 600
+    transcript = [
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key="user:session",
+            role="user",
+            content="old history",
+            token_count=900,
+        ),
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key="user:session",
+            role="assistant",
+            content="recent answer",
+            token_count=20,
+        ),
+    ]
+    sm = _ResultCompactionSessionManager(transcript)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
+
+    await runner._maybe_preflight_compact(
+        "user:session",
+        context_window,
+        history_capacity_tokens=history_capacity,
+    )
+
+    _assert_armed_compaction_call(
+        sm.compact_with_result_calls,
+        "user:session",
+        history_capacity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_preflight_character_pressure_uses_final_envelope_capacity() -> None:
+    transcript = [
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key="user:session",
+            role="user",
+            content="character-heavy history " + ("x" * 4_000),
+            token_count=1,
+        ),
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key="user:session",
+            role="assistant",
+            content="short answer",
+            token_count=1,
+        ),
+    ]
+    sm = _ResultCompactionSessionManager(transcript)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
+
+    await runner._maybe_preflight_compact(
+        "user:session",
+        20_000,
+        history_capacity_tokens=20_000,
+        history_capacity_chars=1_000,
+    )
+
+    _assert_armed_compaction_call(
+        sm.compact_with_result_calls,
+        "user:session",
+        20_000,
+    )
+    assert len(sm.compact_with_result_kwargs) == 1
+    assert sm.compact_with_result_kwargs[0]["context_window_chars"] == 1_000
+
+
+@pytest.mark.asyncio
+async def test_preflight_skips_when_fixed_envelope_exhausts_input_budget() -> None:
+    sm = _ResultCompactionSessionManager(
+        [
+            TranscriptEntry(
+                session_id="test-session-id",
+                session_key="user:session",
+                role="user",
+                content="old history",
+                token_count=900,
+            )
+        ]
+    )
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
+
+    await runner._maybe_preflight_compact(
+        "user:session",
+        1000,
+        history_capacity_tokens=0,
+    )
+
+    assert sm.compact_with_result_calls == []
+
+
+@pytest.mark.asyncio
+async def test_preflight_skips_durable_work_when_active_prompt_alone_is_too_large() -> None:
+    context_window = 1000
+    active_user = TranscriptEntry(
+        session_id="test-session-id",
+        session_key="user:session",
+        role="user",
+        content="active user",
+        token_count=1000,
+    )
+    transcript = [
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key="user:session",
+            role="assistant",
+            content="small old history",
+            token_count=10,
+        ),
+        active_user,
+    ]
+    sm = _ResultCompactionSessionManager(transcript)
+    sm.record_memory_checkpoint = AsyncMock()
+    flush_service = MagicMock()
+    flush_service.execute = AsyncMock(return_value=_flush_receipt())
+    runner = TurnRunner(
+        provider_selector=MagicMock(),
+        session_manager=sm,
+        session_flush_service=flush_service,
+        config=_flush_enabled_config(),
+    )
+
+    await runner._maybe_preflight_compact(
+        "user:session",
+        context_window,
+        history_has_persisted_user=True,
+        bound_user_message_id=active_user.message_id,
+    )
+
+    assert sm.compact_with_result_calls == []
+    sm.record_memory_checkpoint.assert_not_called()
+    flush_service.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preflight_does_not_attribute_active_prompt_pressure_to_history() -> None:
+    context_window = 1000
+    old_history = TranscriptEntry(
+        session_id="test-session-id",
+        session_key="user:session",
+        role="assistant",
+        content="old history",
+        token_count=400,
+    )
+    active_user = TranscriptEntry(
+        session_id="test-session-id",
+        session_key="user:session",
+        role="user",
+        content="active user",
+        token_count=500,
+    )
+    sm = _ResultCompactionSessionManager([old_history, active_user])
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
+
+    await runner._maybe_preflight_compact(
+        "user:session",
+        context_window,
+        history_has_persisted_user=True,
+        bound_user_message_id=active_user.message_id,
+    )
+
+    assert sm.compact_with_result_calls == []
+
+
+@pytest.mark.asyncio
+async def test_preflight_skips_when_only_active_request_is_present() -> None:
+    active_user = _make_entry("active user")
+    sm = _ResultCompactionSessionManager([active_user])
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
+
+    with patch("opensquilla.session.tokenizer.estimate_tokens", return_value=1000):
+        await runner._maybe_preflight_compact(
+            "user:session",
+            1000,
+            history_has_persisted_user=True,
+            bound_user_message_id=active_user.message_id,
+        )
+
+    assert sm.compact_with_result_calls == []
+
+
+@pytest.mark.asyncio
+async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_key = "user:legacy-protected"
+    active_user = TranscriptEntry(
+        session_id="test-session-id",
+        session_key=session_key,
+        role="user",
+        content="active user",
+        token_count=10,
+    )
+    queued_user = TranscriptEntry(
+        session_id="test-session-id",
+        session_key=session_key,
+        role="user",
+        content="queued user",
+        token_count=10,
+    )
+    transcript = [
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key=session_key,
+            role="user",
+            content="old user",
+            token_count=600,
+        ),
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key=session_key,
+            role="assistant",
+            content="old assistant",
+            token_count=600,
+        ),
+        active_user,
+        queued_user,
+    ]
+    durable_calls: list[tuple[str, int]] = []
+    manager = MagicMock()
+    manager.get_transcript = AsyncMock(return_value=transcript)
+
+    async def legacy_compact(key: str, window: int) -> str:
+        durable_calls.append((key, window))
+        return "unsafe durable summary"
+
+    manager.compact = AsyncMock(side_effect=legacy_compact)
+    emergency_requests: list[Any] = []
+
+    async def emergency_compact(request: Any) -> SimpleNamespace:
+        emergency_requests.append(request)
+        return SimpleNamespace(
+            summary="safe request-only summary",
+            kept_entries=request.entries[2:],
+            removed_count=2,
+            chunks_processed=1,
+            tokens_before=1220,
+            tokens_after=20,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.compact_context",
+        emergency_compact,
+    )
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
+
+    await runner._maybe_preflight_compact(
+        session_key,
+        1000,
+        history_has_persisted_user=True,
+        bound_user_message_id=active_user.message_id,
+    )
+
+    assert durable_calls == []
+    assert len(emergency_requests) == 1
+    assert emergency_requests[0].config.protected_recent_messages == 2
+
+    class _HistoryCapture:
+        provider = SimpleNamespace(provider_name="test")
+
+        def __init__(self) -> None:
+            self.history: list[Any] = []
+
+        def set_history(self, history: list[Any]) -> None:
+            self.history = history
+
+    agent = _HistoryCapture()
+    summary_context = await runner._load_history(
+        agent,
+        session_key,
+        trim_last_user=True,
+        bound_user_message_id=active_user.message_id,
+    )
+
+    assert agent.history == []
+    assert summary_context is not None
+    assert "safe request-only summary" in summary_context
 
 
 @pytest.mark.asyncio
@@ -485,7 +880,11 @@ async def test_preflight_completed_event_reports_compaction_metadata(
     with patch("opensquilla.session.tokenizer.estimate_tokens", return_value=1000):
         await runner._maybe_preflight_compact("user:session", context_window)
 
-    assert sm.compact_with_result_calls == [("user:session", context_window, None)]
+    compaction_config = _assert_armed_compaction_call(
+        sm.compact_with_result_calls,
+        "user:session",
+        context_window,
+    )
     assert [(key, payload["status"]) for key, payload in events] == [
         ("user:session", "started"),
         ("user:session", "observed"),
@@ -495,6 +894,7 @@ async def test_preflight_completed_event_reports_compaction_metadata(
     compaction_ids = {payload.get("compaction_id") for _, payload in events}
     assert len(compaction_ids) == 1
     assert None not in compaction_ids
+    assert compaction_config.operation_id in compaction_ids
     assert events[0][1]["event"] == "compaction.triggered"
     assert events[1][1]["event"] == "compaction.chunk_summarized"
     assert events[2][1]["event"] == "compaction.summary_verified"
@@ -727,7 +1127,11 @@ async def test_preflight_protect_flush_receipt_marks_degraded_forensic() -> None
 
     await asyncio.sleep(0)
     flush_service.execute.assert_awaited_once()
-    assert sm.compact_with_result_calls == [("agent:ops:long-session", context_window, None)]
+    _assert_armed_compaction_call(
+        sm.compact_with_result_calls,
+        "agent:ops:long-session",
+        context_window,
+    )
     assert sm.compact_with_result_kwargs[0]["flush_receipt_status"] == "degraded_forensic"
 
 
@@ -777,7 +1181,7 @@ async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim()
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
 
-    assert sm.compact_with_result_calls == [(session_key, context_window, None)]
+    _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert len(await sm.get_transcript(session_key)) == len(entries)
     assert 0 < len(agent.history) < len(entries)
     assert summary_context is not None
@@ -918,7 +1322,7 @@ async def test_preflight_empty_summary_uses_emergency_ephemeral_history_trim() -
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
 
-    assert sm.compact_with_result_calls == [(session_key, context_window, None)]
+    _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert len(await sm.get_transcript(session_key)) == len(entries)
     assert 0 < len(agent.history) < len(entries)
     assert summary_context is not None
@@ -953,7 +1357,7 @@ async def test_preflight_stale_preimage_skip_does_not_use_emergency_trim(
 
     await runner._maybe_preflight_compact(session_key, context_window)
 
-    assert sm.compact_with_result_calls == [(session_key, context_window, None)]
+    _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert runner.has_compacted_this_turn(session_key) is False
     assert runner._compaction_failures[session_key].count == 1
     skipped = [payload for _, payload in events if payload.get("status") == "skipped"]

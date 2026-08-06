@@ -283,7 +283,7 @@ async def test_local_approval_resolver_threads_sandbox_choice(
     assert pending.claim_token is None
     assert captured["choice"] == "allow_same_type"
     assert captured["approved"] is True
-    assert captured["params"] == params
+    assert captured["params"] == {**params, "resolutionSource": "user_web"}
     assert captured["approval_id"] == approval_id
     assert captured["session_manager"] is manager
 

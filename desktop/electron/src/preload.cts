@@ -17,6 +17,9 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   resetDesktopSettings: () => ipcRenderer.invoke('desktop:settings:reset'),
   getDesktopPreferences: () => ipcRenderer.invoke('desktop:preferences:get'),
   saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
+  reportSandboxUnavailable: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:sandbox:unavailable', payload)
+  ),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   chooseProjectDirectory: (payload: unknown) => (

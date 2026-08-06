@@ -60,6 +60,37 @@ def test_desktop_gateway_completion_uses_current_live_window() -> None:
     assert "if (mainWindow === window) mainWindow = null" in main_ts
 
 
+def test_desktop_opens_directly_on_the_new_task_route() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    load_control = _section(
+        main_ts,
+        "async function loadControlUi(",
+        "function isAllowedMainWindowNavigation",
+    )
+
+    assert "const url = `${gatewayUrl}/control/chat/new`" in load_control
+    assert "const url = `${gatewayUrl}/control/chat`" not in load_control
+
+
+def test_desktop_owned_gateway_is_unconditionally_loopback_bound() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start_gateway = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    # ``gateway run`` treats the default-looking ``--bind 127.0.0.1`` as
+    # unspecified so CLI users can inherit the TOML host.  Desktop must use
+    # the higher-precedence ``--listen`` flag; otherwise a legacy
+    # ``host = \"0.0.0.0\"`` silently makes the desktop-owned Gateway public.
+    assert "'--listen', '127.0.0.1'" in start_gateway
+    assert "'--bind', '127.0.0.1'" not in start_gateway
+    assert "OPENSQUILLA_GATEWAY_HOST" not in start_gateway
+    assert "OPENSQUILLA_LISTEN" not in start_gateway
+    assert "'0.0.0.0'" not in start_gateway
+
+
 def test_desktop_activation_and_second_instance_share_safe_reveal_helper() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
 
@@ -997,6 +1028,19 @@ def test_desktop_local_web_build_installs_locked_dependencies_first() -> None:
     assert package_json["scripts"]["build:web"] == (
         "cd ../../opensquilla-webui && npm ci && npm run build"
     )
+
+
+def test_desktop_local_packaging_hydrates_and_verifies_bundled_runtimes() -> None:
+    scripts = json.loads(_read("desktop/electron/package.json"))["scripts"]
+
+    for local_script in ("dist:local", "pack:local"):
+        commands = scripts[local_script].split(" && ")
+        assert commands.index("npm run fetch:runtimes") < commands.index(
+            "npm run build:gateway"
+        )
+
+    assert scripts["dist"].endswith(" && npm run verify:package")
+    assert scripts["pack"].endswith(" && npm run verify:package")
 
 
 def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
@@ -2415,6 +2459,18 @@ def test_desktop_gateway_ownership_control_dir_is_outside_profile_data_state() -
     assert "record.profile_fingerprint === authority.profileFingerprint" in launch_match
     assert "record.port === authority.port" in launch_match
     assert "record.pid" not in launch_match
+
+
+def test_windows_process_start_identity_avoids_powershell_module_autoload() -> None:
+    ownership = _read("desktop/electron/src/desktop-gateway-ownership.ts")
+    windows_probe = _section(
+        ownership,
+        "function windowsProcessStartIdentity",
+        "function posixProcessStartIdentity",
+    )
+
+    assert "Get-Process" not in windows_probe
+    assert "[System.Diagnostics.Process]::GetProcessById" in windows_probe
 
 
 def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:

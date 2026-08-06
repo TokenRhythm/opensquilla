@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 from opensquilla import __version__
 from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, GuestRpcPolicyError
 from opensquilla.gateway.protocol import (
     ERROR_METHOD_NOT_FOUND,
     ERROR_UNAUTHORIZED,
@@ -89,6 +90,7 @@ class RpcContext:
     flush_service: Any = None  # SessionFlushService | None (injected at boot)
     heartbeat_service: Any = None  # Task-style heartbeat service (injected at boot)
     heartbeat_loop: Any = None  # Background heartbeat loop (injected at boot)
+    prompt_cache_keepalive_service: Any = None  # Opt-in, in-memory session lease service.
     agent_registry: Any = None  # AgentRegistry instance (injected at boot)
     diagnostics_state: Any = None  # DiagnosticsState instance (injected at boot)
     provider_stats: Any = None  # ProviderStatsStore instance (injected at boot)
@@ -97,6 +99,8 @@ class RpcContext:
     memory_stores: dict[str, Any] = field(default_factory=dict)
     memory_retrievers: dict[str, Any] = field(default_factory=dict)
     originating_envelope: Any = None  # Channel RouteEnvelope for RPC side effects
+    protocol: int = 4
+    sandbox_schema_version: int = 2
 
     @property
     def role(self) -> str:
@@ -232,6 +236,15 @@ class RpcRegistry:
         entry = self._methods.get(method)
         if entry is None:
             return make_error_res(req_id, ERROR_METHOD_NOT_FOUND, f"Method not found: {method}")
+
+        try:
+            params = GuestRpcPolicy.authorize(method, params, ctx)
+        except GuestRpcPolicyError:
+            return make_error_res(
+                req_id,
+                ERROR_UNAUTHORIZED,
+                "Anonymous guest is not authorized for this RPC method or session",
+            )
 
         allowed, missing = authorize_call(
             method,

@@ -100,7 +100,12 @@ describe('approval safe display contracts', () => {
       expect(fetchMock).not.toHaveBeenCalled()
       expect(runtime.appendInterruptFrame).toHaveBeenLastCalledWith(expect.objectContaining({
         approvalId: 'new-push',
-        data: expect.objectContaining({ toolName: 'sandbox path', args: null, warning: '' }),
+        data: expect.objectContaining({
+          toolName: '',
+          displayKind: 'path_access',
+          args: null,
+          warning: '',
+        }),
       }))
 
       const oldPush = {
@@ -132,7 +137,9 @@ describe('approval safe display contracts', () => {
       expect(runtime.appendInterruptFrame).toHaveBeenCalledWith(expect.objectContaining({
         approvalId: 'sandbox-snapshot',
         data: expect.objectContaining({
-          toolName: 'sandbox path',
+          toolName: '',
+          displayKind: 'path_access',
+          displayTarget: '/workspace/report.md',
           approvalKind: 'sandbox_path',
           args: { path: '/workspace/report.md', access: 'write', workspace: '/workspace' },
         }),

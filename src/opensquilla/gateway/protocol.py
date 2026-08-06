@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel
 
 # Protocol version negotiated during handshake
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # Payload limits
 MAX_PAYLOAD_BYTES = 26_214_400  # 25 MiB

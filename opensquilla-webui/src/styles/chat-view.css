@@ -395,124 +395,54 @@
   line-height: 1.5;
 }
 
-/* Compaction maintenance card — blue (--info) marks maintenance, never the
-   task accent. */
-.chat-compact-status {
-  --compact-tone: var(--info);
-  flex-shrink: 0;
-  width: min(560px, calc(100% - var(--sp-8)));
-  margin: var(--sp-2) auto;
-  padding: var(--sp-3) var(--sp-4);
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-}
-
-.chat-compact-status--ok { --compact-tone: var(--ok); }
-.chat-compact-status--warn { --compact-tone: var(--warn); }
-.chat-compact-status--err { --compact-tone: var(--danger); }
-
-.chat-compact-status__head {
+/* A session-level maintenance boundary: deliberately aligned with transcript
+   content and styled below task activity, never as a floating success card. */
+.chat-compaction-event {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
+  gap: 0.625rem;
+  width: var(--chat-col);
+  max-width: calc(100% - 48px);
+  min-height: 1.75rem;
+  margin: 0.125rem auto 0.625rem;
+  padding: 0.25rem 0.125rem;
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+  font-size: var(--fs-xs);
+  line-height: 1.45;
 }
 
-.chat-compact-status__dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--compact-tone);
-  flex-shrink: 0;
+.chat-compaction-event__marker {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex: 0 0 auto;
+  margin: 0 0.1875rem;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-full);
 }
 
-.chat-compact-status__dot--pulsing {
-  animation: compactDotPulse 1.6s ease-in-out infinite;
+.chat-compaction-event--running .chat-compaction-event__marker {
+  border-color: var(--accent);
+  border-right-color: transparent;
+  animation: compactionEventSpin 0.9s linear infinite;
 }
 
-@keyframes compactDotPulse {
-  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--compact-tone) 45%, transparent); }
-  55% { box-shadow: 0 0 0 5px transparent; }
+@keyframes compactionEventSpin {
+  to { transform: rotate(360deg); }
 }
 
-.chat-compact-status__title {
-  font-size: var(--fs-sm);
-  font-weight: 500;
-  color: var(--text);
+.chat-compaction-event--failed {
+  color: var(--danger);
 }
 
-.chat-compact-status--ok .chat-compact-status__title,
-.chat-compact-status--warn .chat-compact-status__title,
-.chat-compact-status--err .chat-compact-status__title {
-  color: var(--compact-tone);
-}
-
-.chat-compact-status__elapsed {
+.chat-compaction-event__detail {
   margin-left: auto;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-}
-
-.chat-compact-status__detail {
-  margin: var(--sp-1) 0 0;
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-}
-
-.chat-compact-status__gauge {
-  height: 8px;
-  margin-top: var(--sp-2);
-  border-radius: var(--radius-full);
-  background: var(--bg-hover);
-  overflow: hidden;
-}
-
-.chat-compact-status__gauge-fill {
-  display: block;
-  height: 100%;
-  /* Indeterminate default: a partial fill so the breathing bar cannot be
-     misread as "context 100% full"; real occupancy overrides via style. */
-  width: 60%;
-  border-radius: var(--radius-full);
-  background: linear-gradient(90deg, color-mix(in srgb, var(--info) 55%, transparent), var(--info));
-  transition: width var(--transition), background var(--transition), opacity var(--transition);
-}
-
-/* Breathing = "working", an opacity oscillation — never a fake progress sweep. */
-.chat-compact-status__gauge-fill--breathing {
-  animation: compactGaugeBreathe 2.2s ease-in-out infinite;
-}
-
-@keyframes compactGaugeBreathe {
-  0%, 100% { opacity: 0.65; }
-  50% { opacity: 1; }
-}
-
-.chat-compact-status__gauge-fill--done {
-  background: var(--ok);
-  opacity: 1;
-}
-
-.chat-compact-status__legend {
-  display: flex;
-  justify-content: space-between;
-  margin-top: var(--sp-1);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
+  color: color-mix(in srgb, var(--text) 46%, transparent);
+  font-size: 0.75rem;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .chat-compact-status__dot--pulsing,
-  .chat-compact-status__gauge-fill--breathing {
+  .chat-compaction-event--running .chat-compaction-event__marker {
     animation: none;
-  }
-
-  .chat-compact-status__gauge-fill {
-    transition: none;
   }
 }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import ipaddress
 import logging
 import os
 import threading
@@ -83,6 +84,38 @@ class AuthConfig(BaseSettings):
     trusted_proxy: str | None = None
     token_scopes: list[str] = Field(default_factory=lambda: ["operator.admin"])
     allowed_roles: list[str] = Field(default_factory=lambda: ["operator", "node"])
+    # Empty means the built-in loopback/RFC1918/ULA set.  Custom values may
+    # narrow that set but can never widen it to public address space.
+    allowed_client_cidrs: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_client_cidrs")
+    @classmethod
+    def _validate_allowed_client_cidrs(cls, values: list[str]) -> list[str]:
+        private_v4 = tuple(
+            ipaddress.IPv4Network(value)
+            for value in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+        )
+        private_v6 = tuple(
+            ipaddress.IPv6Network(value)
+            for value in ("::1/128", "fc00::/7")
+        )
+        normalized: list[str] = []
+        for raw in values:
+            network = ipaddress.ip_network(str(raw).strip(), strict=False)
+            allowed = (
+                any(network.subnet_of(parent) for parent in private_v4)
+                if isinstance(network, ipaddress.IPv4Network)
+                else any(network.subnet_of(parent) for parent in private_v6)
+            )
+            if not allowed:
+                raise ValueError(
+                    "auth.allowed_client_cidrs may only narrow loopback, "
+                    "RFC1918, or IPv6 ULA networks"
+                )
+            text = network.with_prefixlen
+            if text not in normalized:
+                normalized.append(text)
+        return normalized
 
 
 class CorsConfig(BaseSettings):
@@ -277,7 +310,7 @@ class PermissionsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    default_mode: Literal["off", "on", "bypass", "full"] = "bypass"
+    default_mode: Literal["off", "on", "bypass", "full"] = "off"
 
 
 class TaskRuntimeConfig(BaseModel):
@@ -1295,11 +1328,51 @@ class AgentTokenSavingConfig(BaseSettings):
 class CompactionLlmConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_COMPACTION_")
 
+    # A provider is meaningful only together with ``model``.  Model-only
+    # remains the backwards-compatible "override the selected provider's
+    # model" form; a complete pair selects an explicit physical deployment.
+    provider: str | None = None
     model: str | None = None  # None = use session model
     timeout_seconds: float = 90.0
+    # Absolute budget shared by all summarization chunks and fallbacks.  The
+    # durable commit has separate bounded SQLite semantics and is reconciled if
+    # cancellation races with commit completion.
+    total_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0)
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     protected_recent_messages: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _normalize_explicit_deployment(self) -> CompactionLlmConfig:
+        self.provider = str(self.provider or "").strip() or None
+        self.model = str(self.model or "").strip() or None
+        if self.provider and not self.model:
+            logger.warning(
+                "Ignoring compaction.provider=%s because compaction.model is not set",
+                self.provider,
+            )
+            self.provider = None
+        return self
+
+
+def validate_compaction_deployment_write(payload: dict[str, Any]) -> None:
+    """Reject newly saved provider-only compaction deployments.
+
+    Load-time validation remains deliberately tolerant so an older hand-written
+    config cannot brick gateway startup. Config writers call this stricter
+    validator on their post-mutation payload before persistence.
+    """
+
+    compaction = payload.get("compaction")
+    if not isinstance(compaction, dict):
+        return
+    provider = str(compaction.get("provider") or "").strip()
+    model = str(compaction.get("model") or "").strip()
+    if provider and not model:
+        raise ValueError(
+            "compaction.provider requires compaction.model when saving config"
+        )
 
 
 class SessionNamingConfig(BaseSettings):
@@ -1983,10 +2056,14 @@ class TlsConfig(BaseSettings):
 
 
 class LlmProviderProfile(BaseModel):
-    """Named credential profile for a non-primary LLM provider.
+    """Credential profile for a non-primary or session-pinned LLM deployment.
 
-    Written as ``[llm_profiles.<provider_id>]`` in the config TOML and
+    Provider defaults are written as ``[llm_profiles.<provider_id>]`` and are
     referenced by router tiers through their existing ``provider`` field.
+    A session-pinned named profile may use an exact qualified key such as
+    ``[llm_profiles."openai:work"]``; manual compaction resolves that key only
+    when ``auth_profile_override`` names it and never treats it as a provider
+    default.
     Resolution order per field matches the primary provider: explicit value,
     then ``api_key_env_pool`` (when non-empty), then ``api_key_env`` (or the
     registry env key), then the registry default base URL.
@@ -2173,8 +2250,10 @@ class GatewayConfig(BaseSettings):
     task_runtime: TaskRuntimeConfig = Field(default_factory=TaskRuntimeConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     llm: LlmProviderConfig = Field(default_factory=LlmProviderConfig)
-    # Credential profiles for non-primary providers, keyed by registry
-    # provider id; consumed by cross-provider router tiers.
+    # Credential profiles for non-primary providers, normally keyed by
+    # registry provider id and consumed by cross-provider router tiers.
+    # Qualified ``provider:name`` keys are reserved for exact session-pinned
+    # profile selection and are never implicit provider defaults.
     llm_profiles: dict[str, LlmProviderProfile] = Field(default_factory=dict)
     llm_ensemble: LlmEnsembleConfig = Field(default_factory=LlmEnsembleConfig)
     # Model metadata catalog behavior (offline-first; see ModelCatalogConfig).
@@ -2211,7 +2290,7 @@ class GatewayConfig(BaseSettings):
     def effective_run_mode(self) -> str:
         """Return the canonical sandbox run mode for this validated config."""
 
-        from opensquilla.sandbox.run_mode import config_run_mode
+        from opensquilla.run_mode import config_run_mode
 
         return config_run_mode(self).value
 

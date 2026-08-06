@@ -1,7 +1,10 @@
 // @vitest-environment happy-dom
 import { ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useChatSessionRoute } from './useChatSessionRoute'
+import {
+  shouldCanonicalizeInitialDraftRoute,
+  useChatSessionRoute,
+} from './useChatSessionRoute'
 
 const { routeMock, routerMock } = vi.hoisted(() => ({
   routeMock: {
@@ -63,5 +66,23 @@ describe('useChatSessionRoute', () => {
       path: '/chat/new',
       query: { agent: 'main' },
     })
+  })
+
+  it('never canonicalizes a slow initial draft after the user leaves Chat', () => {
+    expect(shouldCanonicalizeInitialDraftRoute({
+      disposed: false,
+      initialFullPath: '/chat/new',
+      currentFullPath: '/settings',
+      currentPathIsDraft: false,
+      hasLegacyNewChatQuery: false,
+    })).toBe(false)
+
+    expect(shouldCanonicalizeInitialDraftRoute({
+      disposed: false,
+      initialFullPath: '/chat',
+      currentFullPath: '/chat',
+      currentPathIsDraft: false,
+      hasLegacyNewChatQuery: false,
+    })).toBe(true)
   })
 })

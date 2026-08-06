@@ -492,7 +492,7 @@ async def test_workspace_inside_sensitive_parent_allows_normal_files(
     target.write_text("hello\n", encoding="utf-8")
 
     with tool_context(workspace):
-        write_gate, elevated = await fs._gate_out_of_workspace_write(
+        write_gate, elevated, _backups = await fs._gate_out_of_workspace_write(
             "write_file",
             target.resolve(),
             "notes/plan.md",
@@ -526,7 +526,7 @@ async def test_workspace_inside_sensitive_parent_keeps_leaf_secret_blocks(
     )
 
     with tool_context(workspace):
-        payload, elevated = await fs._gate_out_of_workspace_write(
+        payload, elevated, _backups = await fs._gate_out_of_workspace_write(
             "write_file",
             (workspace / ".env").resolve(),
             ".env",

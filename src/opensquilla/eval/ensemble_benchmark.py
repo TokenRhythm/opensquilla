@@ -32,6 +32,10 @@ from opensquilla.engine.pricing import (
     estimate_cost,
     resolve_model_price,
 )
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.protocol import provider_metadata
 from opensquilla.provider.types import (
@@ -332,6 +336,27 @@ async def run_single(
 
     start = clock()
     try:
+        request_budget = resolve_auxiliary_request_budget(
+            provider,
+            provider_id=provider_hint,
+            model=model_hint,
+            max_output_tokens=config.max_tokens,
+            provider_request_max_chars=config.provider_request_max_chars,
+        )
+        config = config.model_copy(
+            update={
+                "max_tokens": request_budget.max_output_tokens,
+                "provider_request_max_chars": (
+                    request_budget.provider_request_max_chars
+                ),
+            }
+        )
+        ensure_auxiliary_text_fits(
+            messages,
+            system=str(config.system or ""),
+            max_chars=request_budget.provider_request_max_chars,
+            max_tokens=request_budget.max_input_tokens,
+        )
         stream: Any
         if injector is not None:
             stream = injector.chat(provider, messages, config=config)

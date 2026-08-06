@@ -83,7 +83,7 @@ def test_sandbox_off_uses_full_host_access_without_workspace_containment(
     assert captured["cwd"] == str(repo)
 
 
-def test_sandbox_on_keeps_workspace_containment(monkeypatch, tmp_path):
+def test_legacy_trusted_mode_keeps_restricted_workspace_containment(monkeypatch, tmp_path):
     captured = {}
     _install_popen(monkeypatch, captured, stdout='{"status": "ok", "text": "done", "usage": {}}')
     _capture_agent_argv(monkeypatch, captured)
@@ -105,7 +105,7 @@ def test_sandbox_on_keeps_workspace_containment(monkeypatch, tmp_path):
 
     assert out.success is True
     argv = captured["argv"]
-    assert argv[argv.index("--permissions") + 1] == "bypass"
+    assert argv[argv.index("--permissions") + 1] == "restricted"
     assert "--workspace-strict" in argv
     assert "--workspace-lockdown" in argv
     assert "--no-workspace-strict" not in argv

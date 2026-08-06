@@ -117,10 +117,61 @@ def _accepted_run_mode_payload(override: Any) -> dict[str, str] | None:
 def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
     """Detach one route for reuse without execution-scoped freshness."""
 
+    metadata = dict(envelope.metadata)
+    if metadata.get("guest_safe") is True:
+        for key in (
+            "guest_profile_root",
+            "guest_managed_root",
+            "guest_environment",
+            "sandbox_mounts",
+            "sandbox_run_context",
+        ):
+            metadata.pop(key, None)
     return replace(
         envelope,
-        metadata=dict(envelope.metadata),
+        metadata=metadata,
         sandbox_run_context_fresh=False,
+    )
+
+
+def _materialize_guest_task_envelope(
+    envelope: RouteEnvelope,
+    task_id: str,
+) -> RouteEnvelope:
+    """Attach one new process-local guest profile to an execution envelope."""
+
+    if envelope.metadata.get("guest_safe") is not True:
+        return envelope
+    existing_root = envelope.metadata.get("guest_profile_root")
+    if isinstance(existing_root, str) and existing_root:
+        return envelope
+    factory = envelope.runtime_services.get("guest_profile_factory")
+    if not callable(factory):
+        from opensquilla.sandbox.guest_profile import GuestProfileBoundaryError
+
+        raise GuestProfileBoundaryError(
+            f"{GuestProfileBoundaryError.code}: guest runtime profile factory is unavailable"
+        )
+    profile = factory(task_id)
+    if profile is None:
+        from opensquilla.sandbox.guest_profile import GuestProfileBoundaryError
+
+        raise GuestProfileBoundaryError(
+            f"{GuestProfileBoundaryError.code}: guest runtime profile is unavailable"
+        )
+    run_context_payload = profile.run_context().to_origin_payload()
+    metadata = {
+        **envelope.metadata,
+        "guest_profile_root": str(profile.root),
+        "guest_managed_root": str(profile.managed_root),
+        "guest_environment": dict(profile.environment),
+        "sandbox_mounts": run_context_payload["mounts"],
+        "sandbox_run_context": run_context_payload,
+    }
+    return replace(
+        envelope,
+        metadata=metadata,
+        sandbox_run_context_fresh=True,
     )
 
 
@@ -315,6 +366,7 @@ class _RuntimeTask:
     terminal_emitted: bool = False
     cancel_requested: bool = False
     execution_started: bool = False
+    guest_profile_cleaned: bool = False
     acquired_slot: bool = False
     overflow_dropped: bool = False
     cancel_source: str | None = None
@@ -344,6 +396,29 @@ class _RuntimeTask:
     ) -> None:
         self.terminal_assistant_message_id = message_id
         self.terminal_assistant_message_content = content
+
+
+def _cleanup_guest_profile(task: _RuntimeTask) -> None:
+    """Remove one task-owned guest profile exactly once."""
+
+    if task.guest_profile_cleaned:
+        return
+    task.guest_profile_cleaned = True
+    guest_profile_root = task.envelope.metadata.get("guest_profile_root")
+    guest_managed_root = task.envelope.metadata.get("guest_managed_root")
+    if not (
+        isinstance(guest_profile_root, str)
+        and guest_profile_root
+        and isinstance(guest_managed_root, str)
+        and guest_managed_root
+    ):
+        return
+    from opensquilla.sandbox.guest_profile import cleanup_guest_profile_root
+
+    cleanup_guest_profile_root(
+        guest_profile_root,
+        managed_root=guest_managed_root,
+    )
 
 
 @dataclass(frozen=True)
@@ -652,6 +727,11 @@ class TaskRuntime:
         self._pending_by_session: dict[str, list[_RuntimeTask]] = {}
         self._running_by_session: dict[str, _RuntimeTask] = {}
         self._reservations_by_session: dict[str, list[TaskReservation]] = {}
+        # Low-priority, non-durable provider work (currently prompt-cache
+        # keepalive). A real enqueue cancels this task before reserving its
+        # turn, so auxiliary work can never make user input wait for network I/O.
+        self._auxiliary_tasks_by_session: dict[str, asyncio.Task[Any]] = {}
+        self._auxiliary_slot = asyncio.Semaphore(1)
         self._reserved_overflow_victims: set[str] = set()
         self._last_envelope_by_session: dict[str, RouteEnvelope] = {}
         self._last_envelope_task_id_by_session: dict[str, str] = {}
@@ -726,6 +806,7 @@ class TaskRuntime:
             valid = ", ".join(sorted(self.supported_queue_modes))
             raise ValueError(f"mode must be one of {{{valid}}}")
         async with self.collect_admission(envelope.session_key):
+            await self.cancel_auxiliary(envelope.session_key)
             if queue_mode == "collect":
                 collected = await self._try_collect(
                     envelope=envelope,
@@ -778,6 +859,64 @@ class TaskRuntime:
         async with lock:
             yield
 
+    async def cancel_auxiliary(self, session_key: str) -> None:
+        """Cancel low-priority work for one session without waiting on it."""
+
+        key = canonicalize_session_key(session_key)
+        async with self._state_lock:
+            task = self._auxiliary_tasks_by_session.get(key)
+        current = asyncio.current_task()
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+
+    async def run_auxiliary_if_idle(
+        self,
+        session_key: str,
+        operation: Callable[[], Awaitable[None]],
+    ) -> bool:
+        """Run cancellable work only while the session has no real task.
+
+        Returns ``False`` when admission found real work or another auxiliary
+        owner. The caller's task becomes the auxiliary owner so cancellation
+        from ``enqueue`` propagates directly into the provider stream.
+        """
+
+        key = canonicalize_session_key(session_key)
+        current = asyncio.current_task()
+        if current is None:
+            return False
+
+        async with self.collect_admission(key):
+            async with self._state_lock:
+                busy = bool(
+                    self._pending_by_session.get(key)
+                    or self._running_by_session.get(key)
+                    or self._reservations_by_session.get(key)
+                    or self._auxiliary_tasks_by_session.get(key)
+                )
+                if busy:
+                    return False
+                self._auxiliary_tasks_by_session[key] = current
+
+        execution_lock = self._session_execution_locks.setdefault(key, asyncio.Lock())
+        try:
+            async with self._auxiliary_slot:
+                async with execution_lock:
+                    async with self._state_lock:
+                        real_work_arrived = bool(
+                            self._pending_by_session.get(key)
+                            or self._running_by_session.get(key)
+                            or self._reservations_by_session.get(key)
+                        )
+                    if real_work_arrived:
+                        return False
+                    await operation()
+                    return True
+        finally:
+            async with self._state_lock:
+                if self._auxiliary_tasks_by_session.get(key) is current:
+                    self._auxiliary_tasks_by_session.pop(key, None)
+
     @contextlib.asynccontextmanager
     async def quiesce_sessions(
         self,
@@ -807,6 +946,9 @@ class TaskRuntime:
 
         key_set = frozenset(keys)
         while True:
+            await asyncio.gather(
+                *(self.cancel_auxiliary(key) for key in keys),
+            )
             await self._cancel_and_drain_session_drivers(keys, key_set)
 
             async with contextlib.AsyncExitStack() as fences:
@@ -1210,6 +1352,18 @@ class TaskRuntime:
             self._reservations_by_session.setdefault(envelope.session_key, []).append(
                 reservation
             )
+        try:
+            runtime_task.envelope = _materialize_guest_task_envelope(
+                runtime_task.envelope,
+                runtime_task.task_id,
+            )
+            if isinstance(reservation.task_record.details, dict):
+                reservation.task_record.details["metadata"] = dict(
+                    runtime_task.envelope.metadata
+                )
+        except BaseException:
+            await self.abort_reservation(reservation)
+            raise
         return reservation
 
     async def abort_reservation(self, reservation: TaskReservation) -> None:
@@ -1228,6 +1382,7 @@ class TaskRuntime:
                     reservation.overflow_victim.task_id
                 )
             reservation.aborted = True
+        _cleanup_guest_profile(reservation.runtime_task)
 
     async def _emit_queued_activation(
         self,
@@ -1975,11 +2130,20 @@ class TaskRuntime:
             Deadline (seconds) for the graceful drain phase.  ``None`` means
             wait indefinitely (use with care in production; set a finite value).
         """
+        auxiliary_tasks = [
+            task
+            for task in self._auxiliary_tasks_by_session.values()
+            if not task.done()
+        ]
+        for auxiliary_task in auxiliary_tasks:
+            auxiliary_task.cancel()
         tasks = [
             task.asyncio_task
             for task in self._tasks.values()
             if task.asyncio_task is not None and not task.asyncio_task.done()
         ]
+        if auxiliary_tasks:
+            await asyncio.gather(*auxiliary_tasks, return_exceptions=True)
         if not tasks:
             return
 
@@ -2648,6 +2812,7 @@ class TaskRuntime:
         finally:
             self._user_input_broker.cancel_task(task.task_id)
             await self._settle_attached_plan_run(task)
+            _cleanup_guest_profile(task)
 
     async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
         """Snapshot session collaboration state at the actual turn boundary.
@@ -3982,15 +4147,21 @@ class TaskRuntime:
     ) -> None:
         """Finalize one task after collect and same-turn admissions settle."""
 
-        async with task.collect_claim:
-            async with task.steer_claim:
-                await self._mark_terminal_claimed(
-                    task,
-                    status,
-                    terminal_reason=terminal_reason,
-                    error_class=error_class,
-                    error_message=error_message,
-                )
+        try:
+            async with task.collect_claim:
+                async with task.steer_claim:
+                    await self._mark_terminal_claimed(
+                        task,
+                        status,
+                        terminal_reason=terminal_reason,
+                        error_class=error_class,
+                        error_message=error_message,
+                    )
+        finally:
+            # A driver cancelled before its first event-loop step never enters
+            # ``_execute`` and therefore has no execution ``finally`` block.
+            if not task.execution_started:
+                _cleanup_guest_profile(task)
 
     async def _mark_terminal_claimed(
         self,

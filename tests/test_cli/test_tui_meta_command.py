@@ -143,6 +143,52 @@ async def test_meta_run_ok_triggers_turn(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_meta_run_keeps_inline_request_out_of_skill_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.repl import slash_adapter
+    from opensquilla.cli.repl.slash_adapter import (
+        GatewaySlashContext,
+        handle_gateway_slash_command,
+    )
+
+    console, _buffer = _make_console()
+    monkeypatch.setattr(slash_adapter, "console", console)
+
+    captured: dict[str, Any] = {}
+
+    async def fake_stream_response_gateway(
+        gateway_client: object,
+        session_key: str,
+        message: str,
+        elevated_state: dict[str, str | None],
+        attachments: list[dict[str, Any]] | None = None,
+        *,
+        tui_output: object | None = None,
+    ) -> TurnResult:
+        captured["message"] = message
+        return TurnResult(text="launched")
+
+    monkeypatch.setattr(slash_adapter, "stream_response_gateway", fake_stream_response_gateway)
+
+    client = _FakeGatewayClient(responses={"meta.run": {"ok": True}})
+    state = ChatSessionState(session_key="agent:main:test", model="local/test")
+    command = "/meta meta-tiny create a competitor research meta-skill"
+
+    handled = await handle_gateway_slash_command(
+        command,
+        GatewaySlashContext(state=state, client=client, elevated_state={"mode": None}),
+    )
+
+    assert handled is True
+    assert client.calls == [
+        ("meta.run", {"name": "meta-tiny", "sessionKey": "agent:main:test"}),
+    ]
+    assert captured["message"] == command
+    assert command in state.transcript.to_markdown()
+
+
+@pytest.mark.asyncio
 async def test_meta_run_not_ok_prints_error_and_skips_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

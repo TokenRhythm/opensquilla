@@ -186,6 +186,48 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
     expect(f.statusHistory[0].at).toBeLessThanOrEqual(f.statusHistory[1].at)
   })
 
+  it('merges maintenance completion into its original compaction row', () => {
+    const f = fold([
+      {
+        kind: 'status',
+        seq: 0,
+        action: 'context_compaction',
+        label: '',
+        at: 1000,
+        id: 'cmp-1',
+        category: 'maintenance',
+        state: 'running',
+        source: 'automatic',
+        durability: 'durable',
+      },
+      {
+        kind: 'status',
+        seq: 1,
+        action: 'context_compaction',
+        label: '',
+        at: 2000,
+        id: 'cmp-1',
+        category: 'maintenance',
+        state: 'completed',
+        source: 'automatic',
+        durability: 'durable',
+        detail: 'Stable context compacted',
+      },
+    ])
+
+    expect(f.statusHistory).toEqual([{
+      action: 'context_compaction',
+      label: '',
+      at: 1000,
+      id: 'cmp-1',
+      category: 'maintenance',
+      state: 'completed',
+      source: 'automatic',
+      durability: 'durable',
+      detail: 'Stable context compacted',
+    }])
+  })
+
   it('preserves artifact arrival order', () => {
     const a1 = { id: 'a1', name: 'one.txt' } as unknown as ArtifactPayload
     const a2 = { id: 'a2', name: 'two.txt' } as unknown as ArtifactPayload

@@ -77,7 +77,7 @@ def plan_acl_refresh(
         marker = sensitive_marker(grant.path)
         if marker:
             denied.append(AclDeniedGrant(grant=grant, reason=marker))
-        elif mode is RunMode.TRUSTED:
+        elif mode is RunMode.SAFE:
             auto.append(grant)
         else:
             ask.append(grant)

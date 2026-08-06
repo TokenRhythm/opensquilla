@@ -17,6 +17,7 @@ import json
 import tracemalloc
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -35,6 +36,7 @@ from opensquilla.gateway.routing import (
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_sessions import _handle_plans_cancel_run
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.sandbox.guest_profile import GuestProfileFactory
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,
@@ -140,6 +142,125 @@ async def test_terminal_clears_all_dicts() -> None:
     # _session_locks is intentionally retained: never pop while _execute may
     # still hold the lock; prevents split-brain on rapid re-enqueue.
     assert sk not in rt._last_envelope_by_session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("followup_api", ["send", "send_with_envelope"])
+async def test_guest_runtime_send_materializes_fresh_profile_per_task(
+    tmp_path,
+    followup_api: str,
+) -> None:
+    """A reusable route must never point a follow-up at the prior deleted root."""
+
+    state_dir = tmp_path / "state"
+    first_profile = GuestProfileFactory.create("ingress", state_dir=state_dir)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    observed_roots: list[Path] = []
+    roots_were_live: list[bool] = []
+
+    async def handler(run: Any) -> None:
+        root = Path(run.envelope.metadata["guest_profile_root"])
+        observed_roots.append(root)
+        roots_were_live.append(root.is_dir())
+        if len(observed_roots) == 1:
+            started.set()
+            await release.wait()
+
+    rt = _make_runtime(handler, max_concurrency=1)
+    envelope = replace(
+        _make_envelope("agent:main:webchat:guest:runtime-send"),
+        metadata={
+            "guest_safe": True,
+            "guest_profile_root": str(first_profile.root),
+            "guest_managed_root": str(first_profile.managed_root),
+            "guest_environment": dict(first_profile.environment),
+            "run_mode": "safe",
+            "sandbox_mounts": first_profile.run_context().to_origin_payload()["mounts"],
+            "sandbox_run_context": first_profile.run_context().to_origin_payload(),
+        },
+        sandbox_run_context_fresh=True,
+        runtime_services={
+            "guest_profile_factory": lambda task_id: GuestProfileFactory.create(
+                task_id,
+                state_dir=state_dir,
+            )
+        },
+    )
+
+    first = await rt.enqueue(envelope, "first")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    if followup_api == "send_with_envelope":
+        second = await rt.send_with_envelope(envelope, "second")
+    else:
+        second = await rt.send(envelope.session_key, "second")
+    cached = rt._last_envelope_by_session[envelope.session_key]
+    try:
+        release.set()
+        first_record = await rt.wait(first.task_id, timeout=2.0)
+        second_record = await rt.wait(second.task_id, timeout=2.0)
+    finally:
+        release.set()
+        await rt.shutdown()
+        first_profile.cleanup()
+
+    assert first_record.status.value == "succeeded", first_record.error_message
+    assert second_record.status.value == "succeeded", second_record.error_message
+    assert observed_roots[0] != observed_roots[1]
+    assert roots_were_live == [True, True]
+    assert not observed_roots[0].exists()
+    assert not observed_roots[1].exists()
+    for stale_key in (
+        "guest_profile_root",
+        "guest_environment",
+        "sandbox_mounts",
+        "sandbox_run_context",
+    ):
+        assert stale_key not in cached.metadata
+
+
+@pytest.mark.asyncio
+async def test_guest_profile_is_cleaned_when_driver_is_cancelled_before_start(
+    tmp_path,
+) -> None:
+    """Activation followed by same-tick cancellation cannot leak a guest root."""
+
+    state_dir = tmp_path / "state"
+    ingress_profile = GuestProfileFactory.create("ingress", state_dir=state_dir)
+    envelope = replace(
+        _make_envelope("agent:main:webchat:guest:prestart-cancel"),
+        metadata={"guest_safe": True},
+        runtime_services={
+            "guest_profile_factory": lambda task_id: GuestProfileFactory.create(
+                task_id,
+                state_dir=state_dir,
+            )
+        },
+    )
+    storage = _make_storage()
+    rt = TaskRuntime(storage=storage, turn_handler=lambda _run: None)
+
+    async def no_yield_queued_event(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    rt._emit_queued_activation = no_yield_queued_event  # type: ignore[method-assign]
+    reservation = await rt.reserve(envelope, "cancel immediately")
+    profile_root = Path(
+        reservation.runtime_task.envelope.metadata["guest_profile_root"]
+    )
+    await storage.create_agent_task(reservation.task_record)
+
+    try:
+        handle = await rt.activate(reservation)
+        assert profile_root.is_dir()
+        assert await rt.cancel(task_id=handle.task_id) == 1
+        record = await rt.wait(handle.task_id, timeout=2.0)
+    finally:
+        await rt.shutdown()
+        ingress_profile.cleanup()
+
+    assert record.status.value == "cancelled"
+    assert not profile_root.exists()
 
 
 async def _make_durable_plan_run(

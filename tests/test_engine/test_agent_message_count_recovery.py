@@ -68,6 +68,21 @@ class _ExactMessageLimitProvider:
             additional_messages=additional_messages,
         )
 
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> Any:
+        return self._projector.project_final_request(
+            messages,
+            tools,
+            config,
+            message_limit=message_limit,
+        )
+
     def chat(
         self,
         messages: list[Message],
@@ -108,6 +123,79 @@ class _ExactMessageLimitProvider:
 
     async def list_models(self) -> list[Any]:
         return []
+
+
+class _LiveTurnMessageLimitProvider(_ExactMessageLimitProvider):
+    """Build a long tool loop, reject its count once, then accept recovery."""
+
+    def __init__(self, *, completed_rounds: int = 10, limit: int = 20) -> None:
+        super().__init__([])
+        self.completed_rounds = completed_rounds
+        self.limit = limit
+        self.rounds_started = 0
+        self.limit_rejected = False
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,  # noqa: ARG002
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(list(messages))
+        projection = self.project_message_count(messages, config)
+        self.projections.append(projection)
+        if self.rounds_started < self.completed_rounds:
+            action = "tool"
+            tool_index = self.rounds_started
+            self.rounds_started += 1
+        elif not self.limit_rejected:
+            assert projection.actual_wire_messages > self.limit
+            action = "limit"
+            tool_index = -1
+            self.limit_rejected = True
+        else:
+            action = "final"
+            tool_index = -1
+        return self._live_stream(action, tool_index, projection)
+
+    async def _live_stream(
+        self,
+        action: str,
+        tool_index: int,
+        projection: ProviderMessageCountProjection,
+    ) -> AsyncIterator[Any]:
+        if action == "tool":
+            tool_id = f"live-provider-{tool_index}"
+            yield ToolUseStartEvent(tool_use_id=tool_id, tool_name="check")
+            yield ToolUseEndEvent(
+                tool_use_id=tool_id,
+                tool_name="check",
+                arguments={"part": tool_index},
+            )
+            yield ProviderDoneEvent(
+                stop_reason="tool_use",
+                input_tokens=1,
+                output_tokens=1,
+            )
+            return
+        if action == "limit":
+            yield ProviderErrorEvent(
+                message="TokenRhythm chat request failed (HTTP 400): BAD_REQUEST; too many",
+                code="400",
+                message_limit_proof=ProviderMessageLimitProof(
+                    actual_wire_messages=projection.actual_wire_messages,
+                    limit=self.limit,
+                    logical_messages=projection.logical_messages,
+                    system_messages=projection.system_messages,
+                    tool_result_messages=projection.tool_result_messages,
+                    provider_kind=projection.provider_kind,
+                    model=projection.model,
+                    base_host=projection.base_host,
+                ),
+            )
+            return
+        yield TextDeltaEvent(text="completed after live-turn recovery")
+        yield ProviderDoneEvent(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
 class _ScaffoldLimitToolProvider:
@@ -364,6 +452,21 @@ class _CountAwareEnsembleMemberProvider:
             messages,
             config,
             additional_messages=additional_messages,
+        )
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> Any:
+        return self._projector.project_final_request(
+            messages,
+            tools,
+            config,
+            message_limit=message_limit,
         )
 
     def chat(
@@ -635,6 +738,176 @@ async def test_protected_current_turn_over_limit_refuses_without_summary(
         and event.code == "provider_request_message_limit_exhausted"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_cannot_fit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_requests: list[Any] = []
+    _install_exact_compactor(monkeypatch, compact_requests)
+    provider = _ExactMessageLimitProvider([None])
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_provider_retries=0, flush_enabled=False),
+    )
+    active_text = "finish this active request byte-for-byte: 你好 🦑"
+    active_user = Message(role="user", content=active_text)
+    rounds: list[tuple[Message, Message]] = []
+    for index in range(10):
+        tool_use = Message(
+            role="assistant",
+            content=[
+                ContentBlockToolUse(
+                    id=f"live-{index}",
+                    name="check",
+                    input={"part": index},
+                )
+            ],
+        )
+        result_content = f"result-{index}"
+        is_error = index == 4
+        if index == 5:
+            result_content = '{"status":"awaiting_approval","approval_id":"approval-live-5"}'
+        tool_result = Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(
+                    tool_use_id=f"live-{index}",
+                    content=result_content,
+                    is_error=is_error,
+                )
+            ],
+        )
+        rounds.append((tool_use, tool_result))
+    messages = [active_user, *(message for pair in rounds for message in pair)]
+    canonical_snapshot = list(messages)
+    agent._current_turn_message = active_text
+    runtime_context = Message(role="user", content="[Runtime context]\ncontinue")
+    chat_config = ChatConfig()
+    initial_projection = agent._project_provider_request_message_count(
+        messages,
+        config=chat_config,
+        identical_request_perturbed=False,
+        request_context_message=None,
+        request_context_insert_index=0,
+        runtime_context_message=runtime_context,
+        runtime_context_insert_index=0,
+        turn_objective_message=None,
+    )
+    assert initial_projection is not None
+    limit = 20
+    assert initial_projection.actual_wire_messages > limit
+    proof = ProviderMessageLimitProof(
+        actual_wire_messages=initial_projection.actual_wire_messages,
+        limit=limit,
+        logical_messages=initial_projection.logical_messages,
+        system_messages=initial_projection.system_messages,
+        tool_result_messages=initial_projection.tool_result_messages,
+        provider_kind=initial_projection.provider_kind,
+        model=initial_projection.model,
+        base_host=initial_projection.base_host,
+    )
+
+    outcome, reason = await agent._recover_provider_message_count_limit(
+        messages,
+        request_suffix_messages=[],
+        proof=proof,
+        config=chat_config,
+        identical_request_perturbed=False,
+        request_context_message=None,
+        request_context_insert_index=0,
+        runtime_context_message=runtime_context,
+        runtime_context_insert_index=0,
+        turn_objective_message=None,
+        protected_turn_start_index=0,
+    )
+
+    assert reason == "recovered_live_turn"
+    assert outcome is not None
+    assert outcome.projected_wire_messages <= (
+        limit - agent._message_count_headroom(limit)
+    )
+    assert outcome.messages[2] is active_user
+    assert outcome.messages[2].content == active_text
+    # The error and pending-approval rounds force the raw tail to begin at
+    # round four; the newest two rounds therefore remain raw as well.
+    assert outcome.messages[-12:] == [
+        message for pair in rounds[4:] for message in pair
+    ]
+    assert outcome.messages[-2] is rounds[-1][0]
+    assert outcome.messages[-1] is rounds[-1][1]
+    assert "approval-live-5" in str(outcome.messages)
+    assert "result-4" in str(outcome.messages)
+    assert messages == canonical_snapshot
+    assert all(
+        entry["content"] != active_text
+        for entry in compact_requests[0].entries
+    )
+    assert compact_requests[0].forced_prefix_cut == 8
+
+
+@pytest.mark.asyncio
+async def test_long_tool_loop_continues_after_live_turn_message_count_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_requests: list[Any] = []
+    _install_exact_compactor(monkeypatch, compact_requests)
+    provider = _LiveTurnMessageLimitProvider()
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content=f"raw-result-for-{call.tool_use_id}",
+        )
+
+    active_text = "complete every tool round and keep this exact request"
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=20,
+            max_provider_retries=0,
+            flush_enabled=False,
+            model_capabilities=ModelCapabilities(supports_tools=True),
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="check",
+                description="Run one synthetic offline check.",
+                input_schema=ToolInputSchema(),
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn(active_text)]
+
+    assert provider.limit_rejected is True
+    assert provider.rounds_started == provider.completed_rounds
+    assert provider.projections[-2].actual_wire_messages > provider.limit
+    assert provider.projections[-1].actual_wire_messages <= (
+        provider.limit - agent._message_count_headroom(provider.limit)
+    )
+    assert len(compact_requests) == 1
+    assert compact_requests[0].forced_prefix_cut == 16
+    assert any(
+        isinstance(event, WarningEvent)
+        and event.code == "provider_request_message_limit_recovery_success"
+        for event in events
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert any(getattr(event, "kind", None) == "done" for event in events)
+    # The provider request is ephemeral; the canonical transcript keeps the
+    # original prompt and every raw tool pair without a summary marker.
+    assert sum(
+        message.role == "user" and message.content == active_text
+        for message in agent._history
+    ) == 1
+    assert not any("[Context summary]" in str(message.content) for message in agent._history)
+    for index in range(provider.completed_rounds):
+        tool_id = f"live-provider-{index}"
+        assert sum(tool_id in str(message.content) for message in agent._history) == 2
 
 
 @pytest.mark.asyncio

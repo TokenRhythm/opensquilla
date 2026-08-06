@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from opensquilla.sandbox.run_mode import RunMode, config_run_mode
+from opensquilla.run_mode import RunMode, config_run_mode
 
 ELEVATED_PERMISSION_MODES = frozenset({"on", "bypass", "full"})
 PERMISSION_MODES = frozenset({"off", *ELEVATED_PERMISSION_MODES})

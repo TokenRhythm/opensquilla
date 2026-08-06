@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,11 @@ from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.operation_runtime import SandboxOperation
 from opensquilla.sandbox.path_validation import decide_path_access
-from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
+from opensquilla.sandbox.permissions import (
+    FileSystemAccess,
+    FileSystemPermissionEntry,
+    FileSystemPermissionProfile,
+)
 from opensquilla.sandbox.policy import build_policy
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.sandbox.types import (
@@ -34,8 +39,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _require_windows_native_setup() -> None:
+@pytest.fixture(autouse=True)
+def _require_windows_native_setup(
+    _isolate_opensquilla_state,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del _isolate_opensquilla_state
+    monkeypatch.delenv("OPENSQUILLA_STATE_DIR", raising=False)
     if sys.platform.startswith("win") and not WindowsDefaultBackend().available():
         pytest.skip("Windows native sandbox setup or identity marker is unavailable")
 
@@ -106,13 +116,22 @@ def _request(
     tmp_path: Path,
     argv: tuple[str, ...],
     *,
-    run_mode: RunMode = RunMode.TRUSTED,
+    run_mode: RunMode = RunMode.SAFE,
 ) -> SandboxRequest:
+    policy = replace(
+        _policy(),
+        file_system=build_policy(
+            SecurityLevel.STANDARD,
+            "shell.exec",
+            tmp_path,
+            SandboxSettings(),
+        ).file_system,
+    )
     return SandboxRequest(
         argv=argv,
         cwd=tmp_path,
         action_kind="shell.exec",
-        policy=_policy(),
+        policy=policy,
         env=dict(os.environ),
         run_mode=run_mode.value,
     )
@@ -220,30 +239,25 @@ async def test_windows_default_runtime_readonly_blocks_nested_powershell_set_con
 async def test_windows_default_proxy_allowlist_without_proxy_fails_closed(
     tmp_path: Path,
 ) -> None:
-    policy = _policy()
-    proxy_policy = SandboxPolicy(
-        level=policy.level,
+    base_request = _request(tmp_path, (sys.executable, "-c", "print('should-not-run')"))
+    proxy_policy = replace(
+        base_request.policy,
         network=NetworkMode.PROXY_ALLOWLIST,
-        mounts=policy.mounts,
-        workspace_rw=policy.workspace_rw,
-        tmp_writable=policy.tmp_writable,
-        limits=policy.limits,
-        env_allowlist=policy.env_allowlist,
-        require_approval=policy.require_approval,
     )
     request = SandboxRequest(
-        argv=(sys.executable, "-c", "print('should-not-run')"),
+        argv=base_request.argv,
         cwd=tmp_path,
         action_kind="shell.exec",
         policy=proxy_policy,
         env=dict(os.environ),
-        run_mode=RunMode.TRUSTED.value,
+        run_mode=RunMode.SAFE.value,
     )
 
-    result = await WindowsDefaultBackend().run(request)
-
-    assert result.returncode != 0
-    assert "requires network_proxy endpoint" in result.stderr
+    with pytest.raises(
+        SandboxBackendError,
+        match="PROXY_ALLOWLIST requires network_proxy endpoint",
+    ):
+        await WindowsDefaultBackend().run(request)
 
 
 @pytest.mark.asyncio
@@ -258,6 +272,19 @@ async def test_windows_shell_and_worker_share_codex_projection(tmp_path: Path) -
         SandboxSettings(),
     )
     assert policy.file_system is not None
+    policy = replace(
+        policy,
+        file_system=FileSystemPermissionProfile(
+            entries=(
+                FileSystemPermissionEntry(
+                    Path(os.environ["USERPROFILE"]),
+                    FileSystemAccess.READ,
+                ),
+                FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            ),
+            default_access=FileSystemAccess.READ,
+        ),
+    )
     targets = (
         Path(os.environ["SystemRoot"]),
         Path(os.environ["USERPROFILE"]) / "Documents",
@@ -373,12 +400,12 @@ async def test_windows_shell_and_worker_workspace_writes_succeed(tmp_path: Path)
     )
     shell = await WindowsDefaultBackend().run(
         SandboxRequest(
-            argv=(
-                "cmd.exe",
-                "/d",
-                "/c",
-                f'(echo shell-write) > "{shell_target}"',
-            ),
+                argv=(
+                    "cmd.exe",
+                    "/d",
+                    "/c",
+                    "echo shell-write>shell-created.txt",
+                ),
             cwd=workspace,
             action_kind="shell.exec",
             policy=policy,

@@ -19,6 +19,7 @@ from opensquilla.provider import (
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.openai_responses import OpenAIResponsesProvider
 from opensquilla.provider.registry import get_provider_spec
+from opensquilla.provider.request_proof import ProviderRequestBudgetExceededError
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.types import (
     ContentBlockImage,
@@ -70,6 +71,55 @@ def _collect_events(
         ]
 
     return asyncio.run(_run())
+
+
+def test_openai_responses_final_request_proof_blocks_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    async def _run() -> list[Any]:
+        return [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="x" * 5000)],
+                config=ChatConfig(provider_request_max_chars=1000),
+            )
+        ]
+
+    events = asyncio.run(_run())
+
+    assert captured == {}
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "provider_request_budget_exhausted"
+    proof = json.loads(events[0].message)
+    assert proof["projection_adapter"] == "openai_responses"
+    assert proof["request_sequence_key"] == "input"
+    assert proof["request_system_key"] == "instructions"
+    assert proof["request_compaction_supported"] is False
+    assert proof["conversation_chars"] > 0
+    assert proof["retry_count"] == 0
+
+
+def test_openai_responses_non_finite_json_is_controlled_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(
+        provider,
+        config=ChatConfig(temperature=float("nan")),
+    )
+
+    assert captured == {}
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "provider_internal"
+    assert events[0].message == "Provider request could not be serialized."
 
 
 def test_openai_responses_provider_is_separate_from_chat_completions_provider() -> None:
@@ -140,7 +190,11 @@ def test_openai_responses_provider_posts_responses_payload_and_usage(
             event
             async for event in provider.chat(
                 [Message(role="user", content="hi")],
-                config=ChatConfig(system="stable system", max_tokens=12),
+                config=ChatConfig(
+                    system="stable system",
+                    max_tokens=12,
+                    provider_request_max_chars=100_000,
+                ),
             )
         ]
 
@@ -649,11 +703,75 @@ def test_openai_responses_compact_window_returns_opaque_output(
         {"type": "message", "role": "assistant", "content": "second"},
     ]
 
-    compacted = asyncio.run(provider.compact_window(input_items))
+    compacted = asyncio.run(
+        provider.compact_window(
+            input_items,
+            config=ChatConfig(provider_request_max_chars=100_000),
+        )
+    )
 
     assert captured["url"] == "https://api.openai.com/v1/responses/compact"
     assert captured["payload"] == {"model": "gpt-5.5", "input": input_items}
     assert compacted["output"] == compact_output
+
+
+def test_openai_responses_compact_window_budget_blocks_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.5")
+    input_items = [
+        {"type": "message", "role": "user", "content": "x" * 5000},
+    ]
+
+    with pytest.raises(ProviderRequestBudgetExceededError) as exc_info:
+        asyncio.run(
+            provider.compact_window(
+                input_items,
+                config=ChatConfig(provider_request_max_chars=1000),
+            )
+        )
+
+    assert captured == {}
+    assert exc_info.value.proof["projection_adapter"] == "openai_responses_compact"
+    assert exc_info.value.proof["request_sequence_key"] == "input"
+    assert exc_info.value.proof["request_system_key"] == "instructions"
+    assert exc_info.value.proof["request_compaction_supported"] is False
+
+
+def test_openai_responses_compact_window_requires_bound_request_budget(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.5")
+
+    with pytest.raises(ValueError, match="provider_request_budget_unbound"):
+        asyncio.run(
+            provider.compact_window(
+                [{"type": "message", "role": "user", "content": "hello"}],
+            )
+        )
+
+    assert captured == {}
+
+
+def test_openai_responses_compact_window_invalid_json_blocks_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.5")
+
+    with pytest.raises(ValueError, match="provider_request_serialization_failed"):
+        asyncio.run(
+            provider.compact_window(
+                [{"type": "message", "role": "user", "weight": float("nan")}],
+            )
+        )
+
+    assert captured == {}
 
 
 def test_openai_responses_chat_items_sends_canonical_window_as_input(

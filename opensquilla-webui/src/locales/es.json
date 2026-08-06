@@ -448,6 +448,52 @@
         "default": "OpenSquilla no pudo completar esta solicitud. No se aplicaron cambios de perfil sin confirmar."
       }
     },
+    "sandbox": {
+      "back": "Volver",
+      "eyebrow": "Seguridad",
+      "title": "Sandbox",
+      "subtitle": "Configura archivos, comandos, red, runtimes y tokens LAN del modo seguro.",
+      "available": "Modo seguro disponible",
+      "unavailable": "Modo seguro no disponible",
+      "builtin": "Integrado",
+      "actions": { "add": "Añadir", "remove": "Quitar", "retry": "Reintentar", "copy": "Copiar", "saving": "Guardando…", "redetect": "Volver a detectar" },
+      "mode": {
+        "title": "Modo de acceso predeterminado", "description": "Elige el modo inicial de las tareas nuevas. Seguro no se puede seleccionar si falla la comprobación.",
+        "default": "Modo predeterminado", "safe": "Seguro", "full": "Acceso completo", "resetWarning": "Volver a mostrar el aviso al iniciar"
+      },
+      "setup": {
+        "title": "Configurar el modo Seguro", "description": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar la protección de archivos y red.", "descriptionWithDuration": "OpenSquilla necesita una autorización de administrador para crear una cuenta aislada y configurar las protecciones. La primera configuración suele tardar unos 20–30 segundos. Mantén OpenSquilla abierto.",
+        "continue": "Continuar", "configuring": "Configurando…", "requestingApproval": "Confirma el aviso de Windows para continuar.", "configuringProtection": "OpenSquilla está completando la configuración del modo Seguro. Mantén la aplicación abierta.", "takingLonger": "La primera configuración puede tardar unos minutos. La verificación se ejecutará automáticamente.", "elapsed": "{seconds} s transcurridos", "cancelled": "Configuración cancelada. El acceso completo no cambia; puedes volver a intentarlo.",
+        "failed": "No se pudo configurar el modo Seguro. El acceso completo no cambia.", "verificationFailed": "La configuración terminó, pero falló la comprobación de seguridad. El acceso completo no cambia.",
+        "runInBackground": "Configurar en segundo plano", "readyToast": "El modo Seguro está listo.", "failedToast": "No se pudo completar la configuración del modo Seguro. Vuelve a intentarlo desde el modo Seguro."
+      },
+      "files": {
+        "title": "Seguridad de archivos", "description": "Los archivos normales son legibles. Los cambios en rutas protegidas requieren aprobación.", "readsAllowed": "Lectura permitida",
+        "customPath": "Ruta protegida personalizada", "pathPlaceholder": "Añadir ruta protegida", "backupTitle": "Crear copia antes de cambios destructivos",
+        "backupDescription": "Crea copias recuperables antes de eliminar o modificar archivos existentes y borra automáticamente las más antiguas cuando hace falta espacio.", "quota": "Límite de copias",
+        "recursiveWarning": "Sin copia, eliminar o reemplazar puede ser irrecuperable. Si la copia sigue fallando tras borrar las antiguas, OpenSquilla vuelve a pedir confirmación."
+      },
+      "commands": {
+        "title": "Seguridad de comandos", "description": "Los comandos se ejecutan automáticamente; operaciones como git push requieren aprobación.",
+        "systemTools": "Herramientas del sistema", "systemToolsAuto": "Permitir automáticamente", "systemToolsPrompt": "Preguntar antes", "systemToolsDisabled": "Desactivado",
+        "approvalPrefixes": "Prefijos que requieren aprobación", "autoPrefixes": "Prefijos siempre permitidos", "prefixPlaceholder": "Por ejemplo: git push"
+      },
+      "network": {
+        "title": "Seguridad de red", "description": "La red pública se permite por defecto y se mantienen las protecciones SSRF y de metadatos.",
+        "blockAll": "Bloquear toda la red", "blockAllDescription": "Los dominios permitidos siguen siendo excepciones.", "allowDomains": "Dominios permitidos", "denyDomains": "Dominios rechazados"
+      },
+      "runtimes": { "title": "Runtimes incluidos", "description": "Seguro prioriza las herramientas incluidas; Acceso completo prioriza las del host.", "target": "Destino del paquete" },
+      "lan": {
+        "listen": "Escuchar en la red local", "listenDescription": "Se enlaza a todas las interfaces locales tras reiniciar; los pares públicos siguen bloqueados.",
+        "allowedCidrs": "CIDR de clientes permitidos", "cidrDescription": "Opcional. Vacío permite loopback, RFC1918 e IPv6 ULA; solo se puede restringir ese rango.",
+        "restartRequired": "Reinicia OpenSquilla para aplicar el cambio.",
+        "title": "Acceso Web y tokens con nombre", "description": "El acceso Web remoto sin un token válido usa el modo seguro de invitado; los tokens con nombre conceden los permisos configurados.",
+        "guest": "Sin token o token incorrecto:", "guestDescription": " modo seguro de invitado: los archivos normales se pueden leer, solo se puede escribir en el espacio de trabajo predeterminado y no se pueden leer credenciales.",
+        "authenticated": "Token válido:", "authenticatedDescription": " puede usar Seguro o Acceso completo según sus capacidades.",
+        "tokenName": "Nombre del token, por ejemplo Portátil", "hostExecute": "Permitir host / Acceso completo", "createToken": "Crear token",
+        "copyNow": "Cópialo ahora. No volverá a mostrarse.", "fullCapable": "Seguro y Acceso completo", "safeOnly": "Solo Seguro", "revoke": "Revocar"
+      }
+    },
     "dialog": {
       "title": "Ajustes",
       "actionNeeded": "Acción necesaria ({count})",
@@ -483,6 +529,7 @@
       "modelStrategy": "Enrutamiento de modelos",
       "behavior": "Comportamiento",
       "privacy": "Privacidad",
+      "sandbox": "Sandbox",
       "memory": "Memoria y perfil",
       "router": "Enrutador",
       "ensemble": "Conjunto",
@@ -3048,6 +3095,29 @@
     }
   },
   "chat": {
+    "promptCacheKeepalive": {
+      "action": "Mantener caché del prompt",
+      "title": "Mantener caché del prompt",
+      "description": "Mantiene activo el prefijo confirmado durante un periodo de inactividad limitado.",
+      "enable": "Activar para esta sesión",
+      "enableHint": "Solo para esta sesión; se aplica al guardar y se desactiva al reiniciar el Gateway.",
+      "enabledToast": "Conservación activada. Comenzará después del próximo mensaje correcto.",
+      "disabledToast": "Conservación de la caché del prompt desactivada.",
+      "unavailableHint": "Disponible después de enviar el primer mensaje",
+      "sessionUnavailable": "Esta sesión aún no está disponible. Envía un mensaje o vuelve a cargar la sesión y prueba de nuevo.",
+      "ttlMinutes": "Duración de caché del proveedor (TTL)",
+      "minutesUnit": "min",
+      "ttlHint": "Usa la duración publicada para el proveedor y modelo actuales.",
+      "idleTimeoutMinutes": "Duración de conservación inactiva",
+      "idleTimeoutHint": "Se pausa después y se reanuda tras el siguiente mensaje correcto.",
+      "idleTimeoutInvalid": "La duración debe superar el intervalo de unos {minutes} minutos.",
+      "planTitle": "Plan de conservación",
+      "planSummary": "Aproximadamente cada {interval} min · hasta unas {count} solicitudes · pausa tras {duration} min.",
+      "costWarning": "Las solicitudes reales al proveedor pueden generar costes de tokens; no aparecen en el chat ni ejecutan herramientas.",
+      "statusLabel": "Estado", "targetLabel": "Proveedor / modelo", "lastHitLabel": "Últimos tokens en caché",
+      "autoPauseLabel": "Pausa automática",
+      "states": { "off": "Desactivado", "waiting": "Esperando un prefijo estable", "scheduled": "Programado", "probing": "Sondeando", "paused": "Límite de inactividad alcanzado; esperando el siguiente mensaje", "stopped": "Detenido tras fallo" }
+    },
     "send": "Enviar",
     "sendQueues": "Enviar (se pone en cola hasta después de la respuesta actual)",
     "sendSteers": "Enviar (redirige la respuesta actual ahora)",
@@ -3321,24 +3391,45 @@
     },
     "approval": {
       "required": "Aprobación requerida",
-      "requiredFor": "Aprobación requerida: {tool}",
-      "neededFor": "Aprobación necesaria: {tool}",
+      "requiredFor": "Aprobación requerida: {action}",
+      "neededFor": "Aprobación necesaria: {action}",
       "command": "Comando",
       "arguments": "Argumentos",
       "extend": "Extender",
-      "denyReasonPlaceholder": "Motivo de la denegación (opcional) — se envía al agente",
-      "denyReasonLabel": "Motivo de la denegación, opcional, se envía al agente",
       "allowOnce": "Permitir una vez",
+      "continueWithoutBackup": "Continuar sin copia",
       "allowSameType": "Permitir el mismo tipo",
       "deny": "Denegar",
       "expiresIn": "Caduca en {time}",
-      "outcomeExpired": "Caducada — no ejecutada",
+      "outcomeExpired": "Caducada, no ejecutada",
       "outcomeDenied": "Denegada",
-      "outcomeApproved": "Aprobada · ejecución reanudada",
+      "outcomeApproved": "Aprobada. Ejecución reanudada",
       "target": "Objetivo",
       "access": "Acceso",
       "workspace": "Espacio de trabajo",
-      "outcomeUnavailable": "La aprobación ya no está disponible"
+      "outcomeUnavailable": "La aprobación ya no está disponible",
+      "irreversibleTitle": "Esta acción no se puede deshacer",
+      "irreversibleBody": "Comprueba el objetivo exacto antes de continuar.",
+      "kinds": {
+        "delete": "Eliminar archivos o carpetas",
+        "modify": "Modificar un archivo existente",
+        "create": "Crear un archivo",
+        "runCommand": "Ejecutar un comando",
+        "runCode": "Ejecutar código",
+        "networkAccess": "Acceder a la red",
+        "pathAccess": "Acceder a archivos o carpetas",
+        "pluginPermission": "Conceder permiso a una extensión",
+        "sensitiveOperation": "Operación sensible"
+      },
+      "backup": {
+        "enabledTitle": "Se creará una copia recuperable antes de este cambio.",
+        "enabledBody": "Las copias más antiguas pueden borrarse automáticamente para liberar espacio.",
+        "disabledTitle": "No se creará ninguna copia",
+        "disabledBody": "Puede que esta acción no se pueda recuperar.",
+        "settingsHint": "Activa las copias en Ajustes > Sandbox > Seguridad de archivos.",
+        "unavailableTitle": "No hay ninguna copia disponible",
+        "unavailableBody": "Esta acción no se podrá recuperar. Continúa solo si aceptas una pérdida permanente de datos."
+      }
     },
     "plan": {
       "label": "Plan",
@@ -3452,10 +3543,8 @@
       "modelRoutingEnsemble": "Enrutador de conjunto con IA",
       "modelRoutingEnsembleDesc": "La IA coordina varios modelos para mejorar la capacidad en tareas complejas.",
       "runMode": "Modo de ejecución",
-      "runModeStandard": "Preguntar siempre",
-      "runModeStandardDesc": "Pregunta antes de acceder a archivos fuera del proyecto, la red o ajustes del sistema.",
-      "runModeTrusted": "Ejecución gestionada",
-      "runModeTrustedDesc": "Evalúa el riesgo automáticamente, por lo que normalmente no necesitas confirmar cada acción.",
+      "runModeSafe": "Seguro",
+      "runModeSafeDesc": "Usa el sandbox y tus reglas de archivos, comandos y red.",
       "runModeFull": "Acceso completo",
       "runModeFullDesc": "Accede directamente a archivos, la red y el sistema sin preguntar cada vez.",
       "runModeFullUnavailable": "El acceso completo solo está disponible para el propietario de la sesión.",
@@ -3469,6 +3558,7 @@
       "queueHint": "Modo cola: estos mensajes se envían automáticamente en orden cuando termina la respuesta actual",
       "clearAll": "Borrar todo",
       "editMessage": "Editar mensaje",
+      "editWhileStreaming": "Espera a que termine la respuesta actual antes de editar",
       "attachmentNeedsAttention": "Revisar adjunto",
       "fixAttachmentBeforeSteer": "Edita este mensaje y vuelve a intentar o elimina el adjunto fallido antes de enviarlo",
       "clearQueue": "Vaciar cola",
@@ -3488,7 +3578,8 @@
       "compacted": "Contexto compactado",
       "failed": "Error al compactar",
       "withinBudget": "Contexto dentro del presupuesto.",
-      "cancelled": "Compactación cancelada"
+      "cancelled": "Compactación cancelada",
+      "requestScoped": "Solo para esta solicitud; no se reescribió el historial de la sesión"
     },
     "tool": {
       "discoverLinks": "Descubrir enlaces",

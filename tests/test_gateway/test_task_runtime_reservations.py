@@ -355,7 +355,7 @@ async def test_try_collect_atomically_mutates_only_after_persist_and_skips_repla
 
 @pytest.mark.parametrize(
     ("pending_mode", "later_mode"),
-    [("full", "standard"), ("standard", "full")],
+    [("full", "safe"), ("safe", "full")],
 )
 @pytest.mark.asyncio
 async def test_try_collect_atomically_rejects_different_accepted_mode_capabilities(
@@ -432,7 +432,7 @@ async def test_try_collect_atomically_rejects_different_accepted_mode_capabiliti
         await runtime.wait(candidate_handle.task_id, timeout=1.0)
 
 
-@pytest.mark.parametrize("mode", [None, "standard", "full"])
+@pytest.mark.parametrize("mode", [None, "safe", "full"])
 @pytest.mark.asyncio
 async def test_try_collect_atomically_accepts_identical_mode_capabilities(
     mode: str | None,

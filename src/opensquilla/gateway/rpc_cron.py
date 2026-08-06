@@ -13,6 +13,12 @@ from opensquilla.project_workspaces import (
     ProjectWorkspaceStateError,
     resolve_validated_project_workspace,
 )
+from opensquilla.sandbox.run_context import resolve_default_run_mode
+from opensquilla.sandbox.run_mode_policy import (
+    coerce_run_mode_for_principal,
+    default_run_mode_for_principal,
+    principal_has_host_execute,
+)
 from opensquilla.scheduler.payloads import (
     REMINDER_KIND,
     SYSTEM_EVENT_KIND,
@@ -597,6 +603,15 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
     delivery_raw = params.get("delivery")
     _ensure_delivery_supported(session_target=session_target, delivery_raw=delivery_raw)
     scheduler = _require_scheduler(ctx)
+    default_run_mode, _source = await resolve_default_run_mode(
+        ctx.session_manager,
+        ctx.config,
+    )
+    if ctx.config is None:
+        default_run_mode = default_run_mode_for_principal(ctx.principal)
+    run_mode = coerce_run_mode_for_principal(default_run_mode, ctx.principal)
+    creator_is_owner = ctx.principal.is_owner
+    creator_host_execute = principal_has_host_execute(ctx.principal)
 
     # Webhook delivery bypasses session-based channel inference entirely.
     if _is_webhook_delivery(delivery_raw):
@@ -614,6 +629,9 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
             schedule_kind=schedule_kind,
             schedule_value=schedule_value,
             schedule_tz=schedule_tz,
+            run_mode=run_mode.value,
+            creator_is_owner=creator_is_owner,
+            creator_host_execute=creator_host_execute,
         )
 
     # Infer or parse delivery config
@@ -670,6 +688,9 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
         schedule_kind=schedule_kind,
         schedule_value=schedule_value,
         schedule_tz=schedule_tz,
+        run_mode=run_mode.value,
+        creator_is_owner=creator_is_owner,
+        creator_host_execute=creator_host_execute,
     )
 
 
@@ -687,6 +708,9 @@ async def _finalize_cron_add(
     schedule_kind: ScheduleKind,
     schedule_value: str,
     schedule_tz: str,
+    run_mode: str,
+    creator_is_owner: bool,
+    creator_host_execute: bool,
 ) -> dict[str, Any]:
     tz_value = (
         schedule_tz
@@ -714,8 +738,9 @@ async def _finalize_cron_add(
         tool_policy=_tool_policy_from_params(params),
         tz=tz_value,
         jitter_seconds=jitter_seconds,
-        creator_is_owner=True,
-        run_mode="full",
+        creator_is_owner=creator_is_owner,
+        creator_host_execute=creator_host_execute,
+        run_mode=run_mode,
         idempotency_key=_idempotency_key_from_params(params),
         schedule_kind=schedule_kind,
         schedule_value=schedule_value,

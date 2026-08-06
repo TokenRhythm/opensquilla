@@ -126,7 +126,7 @@ async def test_warnlist_shell_uses_sandbox_gate_without_exec_approval(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_trusted_workspace_shell_cleanup_stays_out_of_locked_approval(
+async def test_trusted_workspace_shell_cleanup_requires_exact_brokered_delete(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -186,11 +186,11 @@ async def test_trusted_workspace_shell_cleanup_stays_out_of_locked_approval(
         current_tool_context.reset(token)
         reset_approval_queue()
 
-    assert "shell-workspace-ok" in result
+    payload = json.loads(result)
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "recursive_delete_target_not_static"
     assert get_approval_queue().list_pending("exec") == []
-    assert [name for name, _ in calls] == ["gate", "backend"]
-    hints = calls[0][1]["hints"]  # type: ignore[index]
-    assert hints.high_impact is False
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -439,7 +439,7 @@ async def test_trusted_mode_allows_without_hidden_approval_wait(
 
     assert policy.require_approval is False
     assert decision is ALLOW
-    assert _request.run_mode == "trusted"
+    assert _request.run_mode == "safe"
     assert queue.requests == []
 
 

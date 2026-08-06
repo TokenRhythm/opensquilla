@@ -209,3 +209,86 @@ def test_live_turn_snapshot_is_replaced_by_the_next_task_and_cleared_on_terminal
     assert terminal_snapshot.task_id is None
     assert terminal_snapshot.events == []
     assert terminal_snapshot.current_stream_seq == registry.current_seq(session_key)
+
+
+def test_session_stream_registry_preserves_compaction_boundaries_over_heartbeats() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=2)
+    session_key = "agent:main:compaction-lifecycle"
+    compaction_id = "compaction-replay"
+    registry.record(
+        session_key,
+        "session.event.compaction",
+        {"status": "started", "compaction_id": compaction_id, "sequence": 1},
+    )
+    registry.record(
+        session_key,
+        "session.event.compaction",
+        {
+            "status": "observed",
+            "compaction_id": compaction_id,
+            "sequence": 2,
+            "heartbeat": True,
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.compaction",
+        {
+            "status": "observed",
+            "compaction_id": compaction_id,
+            "sequence": 3,
+            "heartbeat": True,
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.compaction",
+        {"status": "completed", "compaction_id": compaction_id, "sequence": 4},
+    )
+
+    replay = registry.replay(session_key, 0)
+
+    assert replay.current_stream_seq == 4
+    assert replay.replay_complete is True
+    assert replay.gap_reason is None
+    assert [event.payload["status"] for event in replay.events] == ["started", "completed"]
+    assert [event.payload["sequence"] for event in replay.events] == [1, 4]
+    assert all(event.payload.get("heartbeat") is not True for event in replay.events)
+
+
+def test_live_turn_snapshot_preserves_active_compaction_state() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=2)
+    session_key = "agent:main:active-compaction"
+    compaction_id = "compaction-live"
+    registry.record(
+        session_key,
+        "session.event.compaction",
+        {"status": "started", "compaction_id": compaction_id, "sequence": 1},
+    )
+    registry.record(
+        session_key,
+        "session.event.compaction",
+        {
+            "status": "observed",
+            "compaction_id": compaction_id,
+            "sequence": 2,
+            "heartbeat": True,
+            "phase": "summarizing",
+        },
+    )
+
+    snapshot = registry.live_snapshot(session_key)
+
+    assert snapshot.current_stream_seq == 2
+    assert [event.event_name for event in snapshot.events] == [
+        "session.event.compaction",
+        "session.event.compaction",
+    ]
+    assert [event.payload["status"] for event in snapshot.events] == [
+        "started",
+        "observed",
+    ]
+    assert all(
+        event.payload["compaction_id"] == compaction_id
+        for event in snapshot.events
+    )

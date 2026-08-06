@@ -88,6 +88,8 @@
                readiness catalog loading is unavailable. -->
           <SettingsMemoryPanel v-else-if="section === 'memory'" />
 
+          <SandboxSettingsPanel v-else-if="section === 'sandbox'" />
+
           <!-- Optional cross-installation discovery is deliberately mounted
                only when the user opens this section. It never runs at app or
                Settings-dialog startup. -->
@@ -95,8 +97,10 @@
 
           <!-- Config-backed sections wait for readiness so their baselines are
                final before any field can be edited. -->
-          <div v-else-if="!loaded" class="settings-loading">
+          <div v-else-if="!loaded" class="settings-loading" role="status">
             <LoadingSpinner />
+            <strong>{{ t('settings.rail.' + section) }}</strong>
+            <span>{{ t('shared.loading') }}</span>
           </div>
           <template v-else>
             <SetupProviderPanel
@@ -237,6 +241,7 @@ import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePan
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
+import SandboxSettingsPanel from '@/components/settings/SandboxSettingsPanel.vue'
 import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
@@ -812,7 +817,16 @@ onUnmounted(() => {
   align-items: center;
   display: flex;
   flex: 1;
+  flex-direction: column;
+  gap: var(--sp-2);
   justify-content: center;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.settings-loading strong {
+  color: var(--text);
+  font-size: var(--fs-md);
 }
 
 /* Body: rail + active section */

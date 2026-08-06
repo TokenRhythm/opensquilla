@@ -5,7 +5,12 @@ import type {
   ChatUsagePayload,
   RawToolCallPayload,
 } from '@/types/chat'
-import type { ChatHistoryMessage, ChatHistoryResponse } from '@/types/rpc'
+import type {
+  ChatCompactionSummary,
+  ChatHistoryMessage,
+  ChatHistoryResponse,
+} from '@/types/rpc'
+import type { StatusPart } from '@/types/parts'
 import { normalizeDisplayAttachments } from '@/utils/chat/attachments'
 import {
   historyWindowsOverlap,
@@ -121,6 +126,174 @@ function historyContextInteger(value: unknown, key: string): number | undefined 
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const number = Number((value as Record<string, unknown>)[key])
   return Number.isInteger(number) && number >= 0 ? number : undefined
+}
+
+function historyActivityMarkers(value: unknown): StatusPart[] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+  const markers = (value as Record<string, unknown>).activity_markers
+  if (!Array.isArray(markers)) return []
+  return markers.flatMap((marker): StatusPart[] => {
+    if (!marker || typeof marker !== 'object' || Array.isArray(marker)) return []
+    const data = marker as Record<string, unknown>
+    if (data.kind !== 'context_compaction') return []
+    const id = String(data.id || '').trim()
+    if (!id) return []
+    const rawStatus = String(data.status || 'completed').toLowerCase()
+    const state = rawStatus === 'completed'
+      ? 'completed'
+      : rawStatus === 'failed' ? 'failed' : 'running'
+    const at = Number(data.at)
+    return [{
+      action: 'context_compaction',
+      label: '',
+      at: Number.isFinite(at) ? at : 0,
+      id,
+      category: 'maintenance',
+      state,
+      source: 'automatic',
+      durability: 'durable',
+    }]
+  })
+}
+
+function summaryStableValue(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  if (typeof value !== 'string') return null
+  const normalized = value.trim()
+  return normalized || null
+}
+
+function summaryCount(value: unknown): number | undefined {
+  const count = Number(value)
+  return Number.isInteger(count) && count >= 0 ? count : undefined
+}
+
+function manualCompactionMessage(summary: ChatCompactionSummary): ChatMessage | null {
+  if (String(summary.trigger_reason || '').trim().toLowerCase() !== 'manual') return null
+
+  const summaryId = summaryStableValue(summary.id)
+  const compactionId = summaryStableValue(summary.compaction_id)
+  const compactionIndex = summaryStableValue(summary.compaction_index)
+  const identity = summaryId
+    ? `summary:${summaryId}`
+    : compactionId
+      ? `compaction:${compactionId}`
+      : compactionIndex
+        ? `index:${compactionIndex}`
+        : null
+  if (!identity) return null
+
+  return {
+    role: 'maintenance',
+    text: '',
+    ts: normalizedEpochMilliseconds(summary.created_at),
+    messageId: `maintenance:context-compaction:${identity}`,
+    restoredFromHistory: true,
+    maintenance: {
+      kind: 'context_compaction',
+      compactionId: compactionId || identity,
+      source: 'manual',
+      state: 'completed',
+      durability: 'durable',
+      removedCount: summaryCount(summary.removed_count),
+      keptCount: summaryCount(summary.kept_count),
+    },
+  }
+}
+
+function manualCompactionMessages(data: ChatHistoryResponse): ChatMessage[] {
+  const summaries = data.compaction_summaries ?? data.compactionSummaries ?? []
+  return summaries.flatMap((summary) => {
+    const message = manualCompactionMessage(summary)
+    return message ? [message] : []
+  })
+}
+
+function isHistoryMaintenance(message: ChatMessage): boolean {
+  return message.role === 'maintenance'
+    && message.maintenance?.kind === 'context_compaction'
+    && Boolean(message.maintenance.compactionId.trim())
+}
+
+function maintenancePriority(message: ChatMessage): number {
+  return (message.restoredFromHistory === true ? 2 : 0)
+    + (message.maintenance?.durability === 'durable' ? 1 : 0)
+}
+
+function normalizedEpochMilliseconds(value: unknown): number | null {
+  if (typeof value !== 'number' && typeof value !== 'string') return null
+  if (typeof value === 'string' && !value.trim()) return null
+  const numeric = Number(value)
+  if (Number.isFinite(numeric)) {
+    // Persisted summaries from older gateways may use epoch seconds while
+    // transcript rows and relativeTime use epoch milliseconds.
+    return Math.abs(numeric) < 100_000_000_000 ? numeric * 1_000 : numeric
+  }
+  if (typeof value !== 'string') return null
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function historyTimestamp(value: ChatMessage['ts']): number {
+  return normalizedEpochMilliseconds(value) ?? Number.POSITIVE_INFINITY
+}
+
+/** Merge durable maintenance without letting it participate in canonical page overlap. */
+function mergeHistoryMaintenance(
+  messages: ChatMessage[],
+  maintenance: ChatMessage[],
+): ChatMessage[] {
+  const canonical = messages.filter(message => !isHistoryMaintenance(message))
+  const embeddedCompactionIds = new Set(
+    canonical.flatMap(message =>
+      (message.statusHistory ?? []).flatMap(entry =>
+        entry.category === 'maintenance' && entry.id ? [entry.id] : [],
+      ),
+    ),
+  )
+  const maintenanceByCompactionId = new Map<string, ChatMessage>()
+  const candidates = [
+    ...messages.filter(isHistoryMaintenance),
+    ...maintenance,
+  ]
+  for (const message of candidates) {
+    if (!isHistoryMaintenance(message)) continue
+    const compactionId = message.maintenance!.compactionId.trim()
+    if (embeddedCompactionIds.has(compactionId)) continue
+    const existing = maintenanceByCompactionId.get(compactionId)
+    if (!existing || maintenancePriority(message) >= maintenancePriority(existing)) {
+      maintenanceByCompactionId.set(compactionId, message)
+    }
+  }
+  if (maintenanceByCompactionId.size === 0) return canonical
+
+  const orderedMaintenance = [...maintenanceByCompactionId.values()].sort((left, right) => {
+    const leftTime = historyTimestamp(left.ts)
+    const rightTime = historyTimestamp(right.ts)
+    if (leftTime !== rightTime) return leftTime < rightTime ? -1 : 1
+    const leftIdentity = left.messageId || left.clientId || left.maintenance!.compactionId
+    const rightIdentity = right.messageId || right.clientId || right.maintenance!.compactionId
+    return leftIdentity.localeCompare(rightIdentity)
+  })
+  const merged = canonical.slice()
+
+  for (const event of orderedMaintenance) {
+    const eventTime = historyTimestamp(event.ts)
+    // Canonical order can intentionally be non-chronological (for example a
+    // promoted steer re-homed behind the completed turn it originally
+    // targeted). Never sort those rows. Insert the maintenance event at the
+    // first timestamp boundary after it, with equal timestamps remaining
+    // canonical-first.
+    const nextCanonicalIndex = Number.isFinite(eventTime)
+      ? merged.findIndex(candidate =>
+          !isHistoryMaintenance(candidate)
+          && historyTimestamp(candidate.ts) > eventTime,
+        )
+      : -1
+    merged.splice(nextCanonicalIndex < 0 ? merged.length : nextCanonicalIndex, 0, event)
+  }
+
+  return merged
 }
 
 function attachHistoryTurnOutcomes(
@@ -292,6 +465,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       model: msg.model || undefined,
       input: msg.input || msg.input_tokens || undefined,
       output: msg.output || msg.output_tokens || undefined,
+      statusHistory: msg.role === 'assistant'
+        ? historyActivityMarkers(msg.turn_context)
+        : undefined,
       messageId,
       restoredFromHistory: true,
     }
@@ -446,7 +622,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           ? Math.min(200, options.messages.value.length)
           : 50,
         includeCanonical: true,
-        includeSummaries: false,
+        includeSummaries: true,
       }
       if (params.before != null) request.before = params.before
       const data = await callHistory<ChatHistoryResponse>(request, bootstrap)
@@ -480,13 +656,16 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
       let mapped = attachHistoryTurnOutcomes(msgs.map(mapHistoryMessage), data)
       const previousMessages = crossedSession ? [] : options.messages.value
+      const previousMaintenance = previousMessages.filter(isHistoryMaintenance)
+      const previousTranscript = previousMessages.filter(message => !isHistoryMaintenance(message))
+      const maintenanceMessages = manualCompactionMessages(data)
       let historyData = data
       let bridgeContinuationNeeded = false
       const needsForwardBridge = canonicalAvailable !== false
         && !params.prepend
         && hasLoadedEarlier
         && mapped.length > 0
-        && !historyWindowsOverlap(previousMessages, mapped)
+        && !historyWindowsOverlap(previousTranscript, mapped)
       if (needsForwardBridge) {
         bridgeAttempted = true
         failedHistoryRequest = { kind: 'bridge', key }
@@ -495,7 +674,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           loadEarlierError: false,
         }
 
-        const anchor = [...previousMessages]
+        const anchor = [...previousTranscript]
           .reverse()
           .find(message => message.restoredFromHistory === true && Boolean(message.messageId))
         const bridgeStart = historyState.value.newestCursor
@@ -525,7 +704,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
               limit: 200,
               after,
               includeCanonical: true,
-              includeSummaries: false,
+              includeSummaries: true,
             },
             bootstrap,
           )
@@ -550,6 +729,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             (bridgeData.messages || []).map(mapHistoryMessage),
             bridgeData,
           )
+          maintenanceMessages.push(...manualCompactionMessages(bridgeData))
           for (const message of page) {
             const keyValue = messageKey(message)
             if (bridgedKeys.has(keyValue)) continue
@@ -621,11 +801,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       const preserveLiveTail = !crossedSession && Boolean(options.preserveLiveTail?.value)
 
       if (msgs.length === 0 && !params.prepend) {
-        options.messages.value = preserveLiveTail
-          ? reconcileRunningHistoryMessages(options.messages.value, [])
-          : !crossedSession && hasLocalOptimisticRows(options.messages.value)
-            ? options.messages.value
+        const transcript = preserveLiveTail
+          ? reconcileRunningHistoryMessages(previousTranscript, [])
+          : !crossedSession && hasLocalOptimisticRows(previousTranscript)
+            ? previousTranscript
             : []
+        options.messages.value = mergeHistoryMaintenance(
+          transcript,
+          [...previousMaintenance, ...maintenanceMessages],
+        )
         if (options.messages.value.length === 0) {
           options.lastHeaderRole.value = ''
           options.lastHeaderDay.value = ''
@@ -638,25 +822,33 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       const prependAnchor = captureVisibleMessageAnchor(prependContainer)
       const prependFallbackHeight = prependAnchor ? 0 : prependContainer?.scrollHeight ?? 0
       if (params.prepend) {
-        const existing = new Set(options.messages.value.map(messageKey))
-        options.messages.value = interleaveHistoryModelCallSegments(
+        const existing = new Set(previousTranscript.map(messageKey))
+        const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows([
             ...mapped.filter(msg => !existing.has(messageKey(msg))),
-            ...options.messages.value,
+            ...previousTranscript,
           ]),
         )
+        options.messages.value = mergeHistoryMaintenance(
+          transcript,
+          [...previousMaintenance, ...maintenanceMessages],
+        )
       } else {
-        const refreshedWindow = reconcileHistoryWindow(previousMessages, mapped)
+        const refreshedWindow = reconcileHistoryWindow(previousTranscript, mapped)
         let nextMessages: ChatMessage[]
         if (preserveLiveTail) {
-          nextMessages = reconcileRunningHistoryMessages(previousMessages, refreshedWindow)
+          nextMessages = reconcileRunningHistoryMessages(previousTranscript, refreshedWindow)
         } else {
           nextMessages = refreshedWindow
         }
-        options.messages.value = interleaveHistoryModelCallSegments(
+        const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
-            reconcileClientTerminalNotices(previousMessages, nextMessages),
+            reconcileClientTerminalNotices(previousTranscript, nextMessages),
           ),
+        )
+        options.messages.value = mergeHistoryMaintenance(
+          transcript,
+          [...previousMaintenance, ...maintenanceMessages],
         )
       }
 

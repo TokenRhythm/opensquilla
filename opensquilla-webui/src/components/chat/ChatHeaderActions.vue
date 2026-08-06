@@ -479,6 +479,11 @@ defineExpose({ focusAction, closeMenu })
   width: 44px;
 }
 
+.chat-header__action--icon-small {
+  min-width: 30px;
+  padding: 0.25rem;
+}
+
 .chat-header__menu {
   background: var(--bg-elevated);
   border: 1px solid var(--border);

@@ -7,7 +7,7 @@ const CONTROL_URL = '/control/'
 // are ordinary client-only preferences.
 // (Runtime exists too, but it is desktop-only so the web rail hides it.)
 const SECTIONS = ['Connection', 'Model Service', 'Model Routing', 'Capabilities', 'Behavior', 'Privacy']
-const CLIENT_SECTIONS = ['Memory & Profile', 'Appearance', 'Keyboard', 'Advanced']
+const CLIENT_SECTIONS = ['Sandbox', 'Memory & Profile', 'Appearance', 'Keyboard', 'Advanced']
 
 const settingsRow = (page: import('@playwright/test').Page) =>
   page.locator('.sidebar-foot button')

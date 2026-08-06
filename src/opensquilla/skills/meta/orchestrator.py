@@ -46,6 +46,10 @@ from opensquilla.engine.usage_accounting import (
     current_usage_accounting_scope,
     provider_accounts_physical_usage,
 )
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.correlation_context import (
     bind_provider_request_correlation,
     current_provider_request_correlation,
@@ -2020,6 +2024,22 @@ def make_llm_chat_from_provider(
     from opensquilla.provider.types import ChatConfig, DoneEvent, Message
     from opensquilla.provider.types import TextDeltaEvent as ProviderTextDelta
 
+    request_budget = resolve_auxiliary_request_budget(
+        provider,
+        max_output_tokens=max_tokens,
+        provider_id=str(getattr(base_config, "provider_id", "") or ""),
+        model=str(getattr(base_config, "model_id", "") or ""),
+        context_window_tokens=int(
+            getattr(base_config, "context_window_tokens", 0) or 0
+        ),
+        provider_request_max_chars=int(
+            getattr(base_config, "provider_request_proof_max_chars", 0) or 0
+        ),
+        context_overflow_threshold=float(
+            getattr(base_config, "context_overflow_threshold", 0.85) or 0.85
+        ),
+    )
+
     async def _chat(system_prompt: str, user_message: str) -> str:
         call_provider_request_correlation = (
             provider_request_correlation
@@ -2032,11 +2052,18 @@ def make_llm_chat_from_provider(
         )
         config = ChatConfig(
             system=system_prompt,
-            max_tokens=max_tokens,
+            max_tokens=request_budget.max_output_tokens,
             temperature=0.0,
+            provider_request_max_chars=request_budget.provider_request_max_chars,
             provider_request_correlation=call_provider_request_correlation,
         )
         messages = [Message(role="user", content=user_message)]
+        ensure_auxiliary_text_fits(
+            messages,
+            system=system_prompt,
+            max_chars=request_budget.provider_request_max_chars,
+            max_tokens=request_budget.max_input_tokens,
+        )
         parts: list[str] = []
         first_error: str = ""
         inherited_scope = current_usage_accounting_scope()

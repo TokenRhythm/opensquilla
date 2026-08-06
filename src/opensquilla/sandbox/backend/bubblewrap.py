@@ -80,6 +80,7 @@ from opensquilla.sandbox.operation_runtime import (
     SandboxOperationDomain,
     SandboxOperationResult,
 )
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import (
     MountSpec,
     NetworkMode,
@@ -445,11 +446,10 @@ async def _run_linux_helper_payload(payload: HelperPayload) -> dict[str, object]
         payload_path = Path(temp_dir) / "payload.json"
         payload_path.write_text(encode_payload(payload), encoding="utf-8")
         proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "opensquilla.sandbox.backend.linux_helper",
-            "--payload",
-            str(payload_path),
+            *internal_child_argv(
+                ChildRole.LINUX_HELPER,
+                args=("--payload", str(payload_path)),
+            ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,

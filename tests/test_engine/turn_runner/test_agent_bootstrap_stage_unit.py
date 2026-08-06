@@ -80,6 +80,8 @@ def _default_aux(
         flush_compaction_safety_mode="protect",
         compaction_profile="conversation",
         compaction_protected_recent_messages=0,
+        compaction_total_timeout_seconds=120.0,
+        compaction_heartbeat_interval_seconds=15.0,
         tool_result_projection_max_inline_chars=60_000,
         tool_result_fresh_diagnostic_policy_enabled=False,
         tool_result_diagnostic_retrieval_gate_enabled=False,
@@ -339,6 +341,8 @@ async def test_case01_success_all_defaults() -> None:
     assert o.agent_config.context_window_tokens == 200_000
     assert o.agent_config.max_history_turns == 0
     assert o.agent_config.preserve_historical_images is False
+    assert o.agent_config.compaction_total_timeout_seconds == 120.0
+    assert o.agent_config.compaction_heartbeat_interval_seconds == 15.0
     assert o.agent_config.length_capped_continuations == 3
     assert o.agent_config.metadata["agent_max_iterations"] == 10
     assert o.agent_config.metadata["agent_max_iterations_source"] == "test budget"
@@ -666,6 +670,24 @@ async def test_catalog_sampling_controls_thread_to_agent_config() -> None:
 
     assert out.output.agent_config.temperature == 1.0
     assert out.output.agent_config.top_p == 0.95
+
+
+@pytest.mark.asyncio
+async def test_global_context_window_override_threads_to_agent_config() -> None:
+    catalog = _RecordingModelCatalog(
+        catalog=_ResolvedCatalog(
+            max_tokens=2_048,
+            context_window=8_192,
+            context_window_tokens_global_override=8_192,
+            capabilities=None,
+        )
+    )
+    stage = _make_stage(catalog=catalog)
+
+    out = await stage.run(_make_input())
+
+    assert out.output.agent_config.context_window_tokens == 8_192
+    assert out.output.agent_config.context_window_tokens_global_override == 8_192
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ const confirmAction = vi.fn()
 vi.mock('@/composables/setup/useSetupCatalog', () => ({
   SETTINGS_SECTIONS: [
     { id: 'behavior', label: 'Behavior', icon: 'chat', group: 'preferences' },
+    { id: 'capabilities', label: 'Capabilities', icon: 'star', group: 'capabilities' },
   ],
   useSetupCatalog: () => catalogApi,
 }))
@@ -154,6 +155,19 @@ afterEach(() => {
 })
 
 describe('SettingsDialog save-all pending state', () => {
+  it('shows local section feedback instead of a blank loading pane', async () => {
+    mockCatalog()
+    catalogApi.loaded.value = false
+    catalogApi.section.value = 'capabilities'
+    routeState.params.section = 'capabilities'
+
+    const el = await mountDialog()
+    const loading = el.querySelector<HTMLElement>('.settings-loading')
+
+    expect(loading?.textContent).toContain('Capabilities')
+    expect(loading?.getAttribute('role')).toBe('status')
+  })
+
   it('locks settings edits and dirty-bar actions while showing progress', async () => {
     const controls = mockCatalog()
     const el = await mountDialog()

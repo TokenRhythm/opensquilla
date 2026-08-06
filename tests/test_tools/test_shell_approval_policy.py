@@ -401,7 +401,7 @@ async def test_exec_command_approved_locked_action_uses_host_once(
 
 
 @pytest.mark.asyncio
-async def test_exec_command_real_locked_approval_deletes_once_on_host(
+async def test_nonrecursive_delete_requires_exact_recoverable_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -424,10 +424,16 @@ async def test_exec_command_real_locked_approval_deletes_once_on_host(
         workspace=tmp_path,
     )
 
-    async def fail_backend(*args: object, **kwargs: object) -> object:
-        raise AssertionError("approved L3 call must not run under the backend")
+    async def fake_backend(*args: object, **kwargs: object) -> object:
+        return SimpleNamespace(
+            returncode=0,
+            stdout="sandboxed\n",
+            stderr="",
+            timed_out=False,
+            backend_notes=(),
+        )
 
-    monkeypatch.setattr(shell, "_run_backend_with_managed_network", fail_backend)
+    monkeypatch.setattr(shell, "_run_backend_with_managed_network", fake_backend)
 
     command = (
         f'Remove-Item -Force "{target.name}"'
@@ -436,12 +442,15 @@ async def test_exec_command_real_locked_approval_deletes_once_on_host(
     )
     result = await shell.exec_command(command, workdir=str(tmp_path))
 
-    assert result.startswith("exit_code=0\n")
-    assert target.exists() is False
-    assert queue.params is not None
-    assert queue.params["action_kind"] == "shell.exec"
-    assert queue.request_count == 1
-    assert queue.consumed == ["approval-1"]
+    payload = json.loads(result)
+    assert payload["status"] == "approval_required"
+    assert payload["target"] == str(target)
+    assert payload["backup_state"] == "enabled"
+    assert payload["irreversible"] is False
+    assert target.exists() is True
+    assert queue.params is None
+    assert queue.request_count == 0
+    assert queue.consumed == []
 
 
 @pytest.mark.asyncio
@@ -571,7 +580,7 @@ async def test_warnlisted_exec_unattended_runs_without_approval_when_no_sandbox_
 
 
 @pytest.mark.asyncio
-async def test_destructive_code_exec_uses_sandbox_gate_when_runtime_enabled(
+async def test_single_file_code_delete_uses_sandbox_without_high_impact_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -619,7 +628,7 @@ async def test_destructive_code_exec_uses_sandbox_gate_when_runtime_enabled(
     assert payload["stdout"] == "sandboxed\n"
     assert [name for name, _ in calls] == ["gate", "backend"]
     hints = calls[0][1]["hints"]  # type: ignore[index]
-    assert hints.high_impact is True
+    assert hints.high_impact is False
     assert target.exists()
     assert get_approval_queue().list_pending("exec") == []
 
@@ -879,7 +888,7 @@ async def test_workspace_lockdown_allows_configured_scratch_dir_write(
     ctx.scratch_dir = str(scratch)  # type: ignore[attr-defined]
     ctx.workspace_lockdown = True  # type: ignore[attr-defined]
 
-    result, elevated = await filesystem._gate_out_of_workspace_write(
+    result, elevated, _backups = await filesystem._gate_out_of_workspace_write(
         "write_file",
         target.resolve(strict=False),
         str(target),

@@ -565,6 +565,6 @@ def test_meta_runs_rpc_does_not_import_cli_private_helpers() -> None:
 
 
 def test_meta_runs_cli_uses_neutral_report_helpers() -> None:
-    source = Path("src/opensquilla/cli/skills_meta_cmd.py").read_text()
+    source = Path("src/opensquilla/cli/skills_meta_cmd.py").read_text(encoding="utf-8")
     assert "opensquilla.gateway.rpc_meta_runs" not in source
     assert "opensquilla.skills.meta.run_reports" in source

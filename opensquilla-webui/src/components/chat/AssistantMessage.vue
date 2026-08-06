@@ -89,7 +89,7 @@
                 v-if="part.resolution"
                 :part="part"
                 timeline
-                @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+                @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
                 @extend="id => $emit('extendInterrupt', id)"
                 @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
                 @clarify-dismiss="$emit('clarifyDismiss')"
@@ -132,7 +132,7 @@
               v-if="part.resolution"
               :part="part"
               timeline
-              @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+              @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
               @extend="id => $emit('extendInterrupt', id)"
               @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
               @clarify-dismiss="$emit('clarifyDismiss')"
@@ -329,7 +329,7 @@
         v-for="part in standaloneInterruptParts"
         :key="part.key"
         :part="part"
-        @resolve="(id, decision, note) => $emit('resolveInterrupt', id, decision, note)"
+        @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
         @extend="id => $emit('extendInterrupt', id)"
         @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
         @clarify-dismiss="$emit('clarifyDismiss')"
@@ -420,7 +420,7 @@ const emit = defineEmits<{
   toggleToolItem: [renderKey: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
   fork: []
-  resolveInterrupt: [id: string, decision: 'allow-once' | 'allow-always' | 'deny', note?: string]
+  resolveInterrupt: [id: string, decision: 'allow-once' | 'allow-always' | 'deny']
   extendInterrupt: [id: string]
   clarifySubmit: [fields: Record<string, string>, request?: NonNullable<Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>['clarify']>]
   clarifyDismiss: []
@@ -740,7 +740,7 @@ const hasActivity = computed(() =>
 const activityStepCount = computed(() => Math.max(
   1,
   visibleActivityClusters.value.length
-    + activityProjection.value.statusSteps.length
+    + activityProjection.value.statusSteps.filter(step => step.category !== 'maintenance').length
     + (reasoningPart.value ? 1 : 0),
 ))
 // Keep live work visible without making its expansion sticky. The disclosure
@@ -849,6 +849,21 @@ const activityDetailLabel = computed(() => {
   return parts.join(' · ')
 })
 
+const completedMaintenanceCount = computed(() =>
+  activityProjection.value.statusSteps.filter(step =>
+    step.category === 'maintenance' && step.state === 'completed',
+  ).length,
+)
+
+function withMaintenanceSummary(label: string): string {
+  const count = completedMaintenanceCount.value
+  if (!count) return label
+  const maintenance = count > 1
+    ? `${String(t('chat.compact.compacted'))} ×${count}`
+    : String(t('chat.compact.compacted'))
+  return [label, maintenance].filter(Boolean).join(' · ')
+}
+
 const activitySummaryLabel = computed(() => {
   if (outcomePresentation.value !== 'completed') {
     const label = String(t({
@@ -858,15 +873,17 @@ const activitySummaryLabel = computed(() => {
       failed: 'sessions.status.failed',
       completed: 'chat.activity.lifecycle.settled',
     }[outcomePresentation.value]))
-    return [label, activityCompactElapsedLabel.value].filter(Boolean).join(' · ')
+    return withMaintenanceSummary(
+      [label, activityCompactElapsedLabel.value].filter(Boolean).join(' · '),
+    )
   }
   if (activityCompletionConfirmed.value) {
-    return [
-      String(t('chat.activity.lifecycle.settled')),
-      activityCompactElapsedLabel.value,
-    ].filter(Boolean).join(' · ')
+    return withMaintenanceSummary([
+        String(t('chat.activity.lifecycle.settled')),
+        activityCompactElapsedLabel.value,
+      ].filter(Boolean).join(' · '))
   }
-  return activityDetailLabel.value
+  return withMaintenanceSummary(activityDetailLabel.value)
 })
 const planActivitySummaryLabel = computed(() => [
   String(t('chat.plan.process')),

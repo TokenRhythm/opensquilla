@@ -44,6 +44,12 @@ def test_subagent_keys_are_canonical_and_detected() -> None:
 
 def test_private_memory_prompt_injection_is_denied_for_shared_or_runtime_keys() -> None:
     assert allows_private_memory_prompt_injection("agent:main:webchat:default") is True
+    assert (
+        allows_private_memory_prompt_injection(
+            f"agent:main:webchat:guest:{'a' * 64}:browser-session"
+        )
+        is False
+    )
     assert allows_private_memory_prompt_injection("agent:main:slack:group:g1") is False
     assert allows_private_memory_prompt_injection("agent:main:subagent:run-1") is False
     assert allows_private_memory_prompt_injection("cron:dream:run:1") is False

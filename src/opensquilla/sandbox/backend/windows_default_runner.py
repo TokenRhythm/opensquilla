@@ -19,6 +19,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
+
 HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
 _LOCK_ACQUIRE_TIMEOUT_S = 30.0
 _LOCK_RETRY_INTERVAL_S = 0.05
@@ -216,8 +218,15 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
         raise SystemExit("invalid windows_default payload: policy is required")
 
     run_mode = raw.get("runMode")
-    if run_mode not in {"standard", "trusted"}:
-        raise SystemExit("invalid windows_default payload: runMode must be standard or trusted")
+    from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+
+    try:
+        normalized_run_mode = normalize_run_mode(run_mode)
+    except ValueError as exc:
+        raise SystemExit("invalid windows_default payload: runMode must be safe") from exc
+    if normalized_run_mode is not RunMode.SAFE:
+        raise SystemExit("invalid windows_default payload: runMode must be safe")
+    run_mode = normalized_run_mode.value
 
     timeout = raw.get("timeout")
     if not isinstance(timeout, int | float) or timeout <= 0:
@@ -254,6 +263,8 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
 
 
 def _validate_policy_is_enforceable(policy: dict[str, Any]) -> None:
+    if "capabilityProbe" in policy and not isinstance(policy["capabilityProbe"], bool):
+        raise SystemExit("windows_default capabilityProbe marker must be boolean")
     network = policy.get("network")
     if network not in {"none", "host", "proxy_allowlist"}:
         raise SystemExit(f"windows_default runner received unknown network mode: {network!r}")
@@ -311,7 +322,11 @@ def _run_windows_default(payload: HelperPayload) -> int:
 
         offline_identity_from_boundary(boundary)
         return _run_windows_default_with_acl_lease(payload, acl_plan, credentials=None)
-    credentials = _resolve_offline_launch_credentials(payload)
+    credentials = (
+        None
+        if payload.policy.get("capabilityProbe") is True
+        else _resolve_offline_launch_credentials(payload)
+    )
     with _windows_acl_execution_lease():
         return _run_windows_default_with_acl_lease(
             payload,
@@ -665,6 +680,7 @@ def _should_reexec_as_offline_identity(payload: HelperPayload) -> bool:
         not payload.offline_child
         and str(payload.run_mode).strip().lower() != "full"
         and _network_boundary(payload.policy) is not None
+        and payload.policy.get("capabilityProbe") is not True
     )
 
 
@@ -1600,6 +1616,31 @@ def _sync_allow_acl_state(
             Path(item["path"]).expanduser().absolute(): item["access"]
             for item in principals.get(sid, [])
         }
+        previous_by_key = {
+            _acl_path_key(path): (path, access) for path, access in previous.items()
+        }
+        desired_by_key = {
+            _acl_path_key(path): (path, access) for path, access in normalized.items()
+        }
+        retained_read = {
+            key: item
+            for key, item in previous_by_key.items()
+            if item[1] == "RX" and key not in desired_by_key and item[0].exists()
+        }
+        # The offline account's allow ACL is only the first half of the
+        # access check. Every untrusted child also carries this request's
+        # capability SIDs as restricting SIDs, so an old RX allow cannot make
+        # an unlisted path readable. Retaining RX avoids expensive read-ACL
+        # teardown/rebuild when shell and filesystem workers alternate. Stale
+        # RWX is still revoked so the trusted offline bootstrap process never
+        # accumulates write authority.
+        effective_by_key = {**retained_read, **desired_by_key}
+        if {
+            key: access for key, (_path, access) in previous_by_key.items()
+        } == {
+            key: access for key, (_path, access) in effective_by_key.items()
+        }:
+            return
         _mark_acl_state_tainted(
             state_path,
             kind="allow",
@@ -1607,23 +1648,23 @@ def _sync_allow_acl_state(
             paths=(*previous, *normalized),
         )
         try:
-            previous_by_key = {
-                _acl_path_key(path): (path, access) for path, access in previous.items()
-            }
-            desired_by_key = {
-                _acl_path_key(path): (path, access) for path, access in normalized.items()
-            }
             for key, (path, access) in desired_by_key.items():
                 old = previous_by_key.get(key)
                 if old is not None and old[1] != access:
                     _revoke_allow_path_for_sid(old[0], sid)
-                _grant_path_to_sid(path, access, sid)
+                if old is None or old[1] != access:
+                    _grant_path_to_sid(path, access, sid)
             for key, (path, _access) in previous_by_key.items():
-                if key not in desired_by_key:
+                if (
+                    key not in desired_by_key
+                    and previous_by_key[key][1] == "RWX"
+                    and path.exists()
+                ):
                     _revoke_allow_path_for_sid(path, sid)
             updated = dict(principals)
             updated[sid] = [
-                {"access": access, "path": str(path)} for path, access in normalized.items()
+                {"access": access, "path": str(path)}
+                for path, access in effective_by_key.values()
             ]
             _write_deny_acl_state(state_path, {"version": 1, "principals": updated})
             _clear_acl_state_taint(state_path)
@@ -1727,7 +1768,17 @@ def _sync_deny_acl_state_locked(
     state = _read_deny_acl_state(state_path)
     _recover_deny_acl_taint(state_path, state)
     _materialize_deny_paths(tuple(normalized_desired))
-    principals = state["principals"]
+    stored_principals = state["principals"]
+    principals: dict[str, list[dict[str, object]]] = {}
+    for principal_sid, entries in stored_principals.items():
+        live_entries = [
+            item
+            for item in entries
+            if Path(str(item["path"])).expanduser().absolute().exists()
+        ]
+        if live_entries:
+            principals[principal_sid] = live_entries
+    journal_pruned = principals != stored_principals
     previous = _principal_deny_acl_entries(principals.get(sid, []), sid=sid)
     previous_by_key = {_acl_path_key(path): (path, mask) for path, mask in previous.items()}
     desired_by_key = {
@@ -1744,6 +1795,11 @@ def _sync_deny_acl_state_locked(
                     mask=mask,
                     label="desired-state-verify",
                 )
+        if journal_pruned:
+            _write_deny_acl_state(
+                state_path,
+                {"version": 1, "principals": principals},
+            )
         return
 
     _mark_acl_state_tainted(
@@ -2004,13 +2060,22 @@ def _recover_allow_acl_taint(state_path: Path, state: dict[str, Any]) -> None:
         Path(item["path"]).expanduser().absolute(): str(item["access"])
         for item in state["principals"].get(sid, [])
     }
-    paths = _dedupe_acl_paths(
+    intent_paths = _dedupe_acl_paths(
         tuple(Path(item).expanduser().absolute() for item in intent["paths"]) + tuple(persisted)
     )
+    persisted_by_key = {_acl_path_key(path): (path, access) for path, access in persisted.items()}
     try:
-        for path in paths:
-            _revoke_allow_path_for_sid(path, sid)
+        # A crashed transaction can only have removed a persisted RWX grant
+        # (during downgrade/removal) or added a path absent from the persisted
+        # journal. Persisted RX grants are never revoked by normal sync, so
+        # tearing all of them down and rebuilding them turns one cancellation
+        # into a minute-long restart loop on Windows.
+        for path in intent_paths:
+            if _acl_path_key(path) not in persisted_by_key and path.exists():
+                _revoke_allow_path_for_sid(path, sid)
         for path, access in persisted.items():
+            if access != "RWX" or not path.exists():
+                continue
             _grant_path_to_sid(path, access, sid)
     except BaseException as exc:
         raise SystemExit(
@@ -2233,6 +2298,13 @@ def _cancel_child_pipe_io(kernel32: object, handles: Sequence[object]) -> None:
             cancel(handle, None)
 
 
+def _offline_helper_argv() -> tuple[str, ...]:
+    return internal_child_argv(
+        ChildRole.WINDOWS_DEFAULT_RUNNER,
+        args=(OFFLINE_PAYLOAD_STDIN_ARG,),
+    )
+
+
 def _run_payload_as_offline_identity_native(
     payload: HelperPayload,
     *,
@@ -2453,14 +2525,7 @@ def _run_payload_as_offline_identity_native(
             raise win_error("SetInformationJobObject")
 
         command_line = ctypes.create_unicode_buffer(
-            subprocess.list2cmdline(
-                [
-                    sys.executable,
-                    "-m",
-                    HELPER_MODULE,
-                    OFFLINE_PAYLOAD_STDIN_ARG,
-                ]
-            )
+            subprocess.list2cmdline(_offline_helper_argv())
         )
         child_env = _helper_child_env()
         env_block = ctypes.create_unicode_buffer(_environment_block(child_env))
@@ -2595,8 +2660,15 @@ def _find_git_worktree_root_for_safe_directory(start: Path) -> Path | None:
     except OSError:
         current = start
     while True:
-        if (current / ".git").exists():
-            return current
+        try:
+            if (current / ".git").exists():
+                return current
+        except OSError:
+            # Parent traversal can cross an intentional deny ACL (for
+            # example a stale or protected .git marker). Git safe-directory
+            # discovery is optional metadata and must not abort the sandboxed
+            # command when that marker is unreadable.
+            pass
         parent = current.parent
         if parent == current:
             return None

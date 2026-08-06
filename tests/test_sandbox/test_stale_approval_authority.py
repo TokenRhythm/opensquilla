@@ -238,7 +238,7 @@ async def test_stale_approval_cannot_mutate_recreated_same_key_session(
     workspace.mkdir()
     requested.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -301,7 +301,7 @@ async def test_raw_queue_approval_id_without_generation_fails_closed(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -348,7 +348,7 @@ async def test_generation_reset_expires_real_rpc_approval(tmp_path: Path) -> Non
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -424,7 +424,7 @@ async def test_turn_cleanup_first_prevents_real_rpc_same_type_cas(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -525,7 +525,7 @@ async def test_real_rpc_same_type_apply_first_blocks_cancelled_turn_cleanup(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -684,7 +684,7 @@ async def test_repeated_turn_cancel_revokes_generation_and_expires_rpc_approval(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -847,7 +847,7 @@ async def test_path_allow_once_is_zero_write_latest_delta_and_execution_scoped(
         bundle="python-package-install",
         public_scope="chat",
         public_source="captured",
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         run_mode_source="operator_default",
     )
     latest = _state_context(
@@ -857,7 +857,7 @@ async def test_path_allow_once_is_zero_write_latest_delta_and_execution_scoped(
         bundle="node-package-install",
         public_scope="chat",
         public_source="latest",
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         run_mode_source="user",
     )
     storage, manager, node = await _create_session(
@@ -915,7 +915,7 @@ async def test_path_allow_once_is_zero_write_latest_delta_and_execution_scoped(
         finally:
             current_tool_context.reset(active_token)
         assert effective is not None
-        assert effective.run_mode is RunMode.TRUSTED
+        assert effective.run_mode is RunMode.SAFE
         assert {grant.path for grant in effective.mounts} == {
             str(added_mount),
             str(requested),
@@ -976,7 +976,7 @@ async def test_path_once_cleanup_is_execution_scoped(tmp_path: Path) -> None:
     for path in (workspace, requested_a, requested_b):
         path.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -1067,7 +1067,7 @@ async def test_network_allow_once_consumes_only_target_without_captured_state(
         bundle="python-package-install",
         public_scope="chat",
         public_source="captured",
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         run_mode_source="operator_default",
     )
     latest = _state_context(
@@ -1077,7 +1077,7 @@ async def test_network_allow_once_consumes_only_target_without_captured_state(
         bundle="node-package-install",
         public_scope="chat",
         public_source="latest",
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         run_mode_source="user",
     )
     storage, manager, node = await _create_session(
@@ -1180,7 +1180,7 @@ async def test_network_once_consumption_is_execution_scoped(tmp_path: Path) -> N
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -1281,10 +1281,16 @@ async def test_auto_review_once_uses_only_generation_bound_delta(
     from opensquilla.provider import Message
     from opensquilla.sandbox import escalation as escalation_module
 
+    monkeypatch.setattr(
+        agent_module,
+        "effective_approval_reviewer",
+        lambda configured, run_mode: "auto_review",
+    )
+
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -1438,12 +1444,18 @@ async def test_auto_review_binding_failure_cleans_generation(
     from opensquilla.gateway.approval_queue import get_approval_queue
     from opensquilla.sandbox import escalation as escalation_module
 
+    monkeypatch.setattr(
+        agent_module,
+        "effective_approval_reviewer",
+        lambda configured, run_mode: "auto_review",
+    )
+
     workspace = tmp_path / "workspace"
     replacement = tmp_path / "replacement"
     workspace.mkdir()
     replacement.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -1474,7 +1486,12 @@ async def test_auto_review_binding_failure_cleans_generation(
     approval_id = str(approval["approval_id"])
     original = tmp_path / "workspace-original"
     workspace.rename(original)
-    workspace.symlink_to(replacement, target_is_directory=True)
+    try:
+        workspace.symlink_to(replacement, target_is_directory=True)
+    except OSError:
+        original.rename(workspace)
+        await storage.close()
+        pytest.skip("creating directory symlinks requires additional Windows privileges")
     monkeypatch.setattr(
         agent_module,
         "local_elevation_assessment",
@@ -1537,10 +1554,16 @@ async def test_auto_review_revalidates_current_session_identity(
     from opensquilla.gateway.approval_queue import get_approval_queue
     from opensquilla.sandbox import escalation as escalation_module
 
+    monkeypatch.setattr(
+        agent_module,
+        "effective_approval_reviewer",
+        lambda configured, run_mode: "auto_review",
+    )
+
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -1637,13 +1660,19 @@ async def test_auto_review_revalidates_current_project_binding(
     from opensquilla.gateway.approval_queue import get_approval_queue
     from opensquilla.sandbox import escalation as escalation_module
 
+    monkeypatch.setattr(
+        agent_module,
+        "effective_approval_reviewer",
+        lambda configured, run_mode: "auto_review",
+    )
+
     global_workspace = tmp_path / "global"
     project_path = tmp_path / "project"
     replacement_path = tmp_path / "replacement-project"
     for path in (global_workspace, project_path, replacement_path):
         path.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(project_path),
         run_mode_source="project_default",
         source="saved",
@@ -1764,7 +1793,7 @@ async def test_allow_same_type_merges_target_into_latest_durable_state(
         bundle="python-package-install",
         public_scope="chat",
         public_source="captured",
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         run_mode_source="operator_default",
     )
     latest = _state_context(
@@ -1774,7 +1803,7 @@ async def test_allow_same_type_merges_target_into_latest_durable_state(
         bundle="node-package-install",
         public_scope="chat",
         public_source="latest",
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         run_mode_source="user",
     )
     storage, manager, node = await _create_session(
@@ -1832,7 +1861,7 @@ async def test_allow_same_type_merges_target_into_latest_durable_state(
         )
 
         durable = await _durable_context(manager, node.session_key)
-        assert durable.run_mode is RunMode.TRUSTED
+        assert durable.run_mode is RunMode.SAFE
         assert durable.run_mode_source == "user"
         assert str(revoked_mount) not in {grant.path for grant in durable.mounts}
         assert "revoked.example" not in {grant.domain for grant in durable.domains}
@@ -1862,7 +1891,7 @@ async def test_same_type_overlay_does_not_leak_to_new_session_incarnation(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -1936,7 +1965,7 @@ async def test_project_approval_revalidates_workspace_binding_at_resolution(
     for path in (global_workspace, project_path, replacement_path, requested):
         path.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(project_path),
         run_mode_source="project_default",
         source="saved",
@@ -2012,18 +2041,18 @@ async def test_session_origin_cas_rejects_changed_origin(tmp_path: Path) -> None
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
     latest = RunContext(
-        run_mode=RunMode.TRUSTED,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         run_mode_source="user",
         source="saved",
     )
     proposed = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         domains=(
             DomainGrant(
@@ -2064,7 +2093,7 @@ async def test_same_type_fails_closed_when_storage_cas_is_unavailable(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -2117,7 +2146,7 @@ async def test_turn_runner_artifact_context_carries_session_identity(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -2164,7 +2193,7 @@ async def test_agent_turn_finally_clears_only_its_execution_approval_deltas(
     for path in (workspace, requested, parallel_requested):
         path.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -2279,7 +2308,7 @@ async def test_cancelled_turn_waits_for_apply_first_then_revokes_delta(
     workspace.mkdir()
     requested.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -2410,7 +2439,7 @@ async def test_stale_path_ro_approval_preserves_latest_covering_rw_grant(
     workspace.mkdir()
     requested.mkdir(parents=True)
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -2498,7 +2527,7 @@ async def test_stale_path_ro_approval_preserves_latest_covering_rw_grant(
     ],
 )
 @pytest.mark.asyncio
-async def test_network_approval_cannot_authorize_another_target_or_execution(
+async def test_safe_public_network_targets_do_not_create_approval(
     tmp_path: Path,
     second_host: str,
     second_execution: str,
@@ -2522,7 +2551,7 @@ async def test_network_approval_cannot_authorize_another_target_or_execution(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )
@@ -2583,49 +2612,15 @@ async def test_network_approval_cannot_authorize_another_target_or_execution(
         finally:
             current_tool_context.reset(token)
 
-    async def _wait_for_pending_count(count: int) -> list[dict[str, Any]]:
-        for _ in range(100):
-            pending = get_approval_queue().list_pending("exec")
-            if len(pending) >= count:
-                return pending
-            await asyncio.sleep(0)
-        return get_approval_queue().list_pending("exec")
-
-    first_task: asyncio.Task[Any] | None = None
-    second_task: asyncio.Task[Any] | None = None
     try:
-        first_task = asyncio.create_task(_decide("first.example", "execution-network-a"))
-        first_pending = await _wait_for_pending_count(1)
-        assert len(first_pending) == 1
-        first_id = str(first_pending[0]["id"])
-
-        second_task = asyncio.create_task(_decide(second_host, second_execution))
-        pending = await _wait_for_pending_count(2)
-        second_ids = {str(item["id"]) for item in pending if str(item["id"]) != first_id}
-
-        first_entry = get_approval_queue().get(first_id)
-        await apply_sandbox_approval_choice(
-            first_entry.params,
-            approval_id=first_id,
-            choice="allow_once",
-            approved=True,
-            session_manager=manager,
-            config=_config(workspace),
-        )
-        get_approval_queue().resolve(first_id, True)
-        for second_id in second_ids:
-            get_approval_queue().resolve(second_id, False)
-
-        first_decision, second_decision = await asyncio.gather(
-            first_task,
-            second_task,
-        )
+        first_decision = await _decide("first.example", "execution-network-a")
+        second_decision = await _decide(second_host, second_execution)
         assert first_decision.status == "allow"
-        assert second_decision.status == "block"
+        assert first_decision.reason == "public_default"
+        assert second_decision.status == "allow"
+        assert second_decision.reason == "public_default"
+        assert get_approval_queue().list_pending("exec") == []
     finally:
-        for task in (first_task, second_task):
-            if task is not None and not task.done():
-                task.cancel()
         await storage.close()
 
 
@@ -2636,7 +2631,7 @@ async def test_unresolved_explicit_approval_id_must_match_exact_generation(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     initial = RunContext(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         workspace=str(workspace),
         source="saved",
     )

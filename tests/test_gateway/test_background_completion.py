@@ -305,7 +305,7 @@ async def test_parent_wake_preserves_captured_full_host_envelope_after_parent_fi
 async def test_active_run_mode_override_tracks_background_group_lifecycle() -> None:
     runtime = _TaskRuntime()
     accepted_override = AcceptedRunModeOverride(
-        run_mode=RunMode.STANDARD,
+        run_mode=RunMode.SAFE,
         run_mode_source="user",
         source="request",
     )
