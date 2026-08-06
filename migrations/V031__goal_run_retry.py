@@ -1,10 +1,10 @@
-"""V030 - goal run failure retry ledger (backoff, pause reason, last error)."""
+"""V031 - goal run failure retry ledger (backoff, pause reason, last error)."""
 
 from __future__ import annotations
 
 from yoyo import step
 
-__depends__: set[str] = {"V029__goal_runs"}
+__depends__: set[str] = {"V030__goal_runs"}
 
 ADD_FAILURE_RETRIES = """
 ALTER TABLE goal_runs ADD COLUMN failure_retries INTEGER NOT NULL DEFAULT 0

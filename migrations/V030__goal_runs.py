@@ -1,4 +1,4 @@
-"""V029 - server-authoritative long-running goal execution runs."""
+"""V030 - server-authoritative long-running goal execution runs."""
 
 from __future__ import annotations
 
