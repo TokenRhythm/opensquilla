@@ -5500,18 +5500,24 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
     lock = get_session_lock(ctx.turn_runner, key) if deployment_patch else None
     if lock is not None:
         async with lock:
-            return await _apply_sessions_patch(
+            result = await _apply_sessions_patch(
                 params,
                 ctx,
                 key=key,
                 storage=storage,
             )
-    return await _apply_sessions_patch(
-        params,
-        ctx,
-        key=key,
-        storage=storage,
-    )
+    else:
+        result = await _apply_sessions_patch(
+            params,
+            ctx,
+            key=key,
+            storage=storage,
+        )
+    if deployment_patch:
+        keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
+        if keepalive_service is not None:
+            keepalive_service.refresh_required(key, "session_deployment_changed")
+    return result
 
 
 @_d.method("sessions.reset", scope="operator.write")
@@ -5778,9 +5784,14 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
             return await _run_locked()
 
     if lock is None:
-        return await _run_accounted()
-    async with lock:
-        return await _run_accounted()
+        result = await _run_accounted()
+    else:
+        async with lock:
+            result = await _run_accounted()
+    keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
+    if keepalive_service is not None:
+        await keepalive_service.invalidate(key)
+    return result
 
 
 async def _ensure_and_emit_reset_epoch(
@@ -5926,6 +5937,9 @@ async def _delete_session_with_lifecycle(
 
         get_approval_queue().expire_pending_for_session(canonical_key)
         await storage.delete_session(canonical_key)
+        keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
+        if keepalive_service is not None:
+            await keepalive_service.invalidate(canonical_key)
 
         evict_runtime_state = getattr(
             ctx.session_manager,

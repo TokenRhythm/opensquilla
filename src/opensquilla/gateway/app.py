@@ -86,6 +86,7 @@ def create_gateway_app(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     extra_routes: list[Route] | None = None,
+    prompt_cache_keepalive_service: Any = None,
 ) -> Starlette:
     """Build and return the Starlette ASGI application."""
     if diagnostics_state is None:
@@ -483,6 +484,7 @@ def create_gateway_app(
             flush_service=flush_service,
             heartbeat_service=heartbeat_service,
             heartbeat_loop=heartbeat_loop,
+            prompt_cache_keepalive_service=prompt_cache_keepalive_service,
             agent_registry=agent_registry,
             diagnostics_state=diagnostics_state,
             provider_stats=provider_stats,
@@ -751,6 +753,7 @@ def create_gateway_app(
             memory_managers=memory_managers,
             memory_stores=memory_stores,
             memory_retrievers=memory_retrievers,
+            prompt_cache_keepalive_service=prompt_cache_keepalive_service,
         )
 
     # ── Routes ───────────────────────────────────────────────────────────────

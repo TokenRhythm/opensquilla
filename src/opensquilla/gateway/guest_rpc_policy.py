@@ -17,6 +17,8 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "chat.history",
         "chat.abort",
         "chat.clarify_submit",
+        "artifacts.list",
+        "artifacts.get",
         "sessions.list",
         "sessions.bootstrap",
         "sessions.messages.subscribe",
@@ -27,6 +29,8 @@ GUEST_RPC_ALLOWLIST = frozenset(
 )
 
 _SESSION_KEY_FIELDS = {
+    "artifacts.list": ("sessionKey",),
+    "artifacts.get": ("sessionKey",),
     "chat.history": ("sessionKey", "key"),
     "chat.abort": ("sessionKey", "key"),
     "chat.clarify_submit": ("sessionKey", "key"),

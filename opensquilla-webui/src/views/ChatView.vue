@@ -513,6 +513,9 @@
       :plan-mode-disabled="planActionPending !== null"
       :plan-mode-applies-next-turn="planModeAppliesNextTurn"
       :replan-active="replanActive"
+      :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
+      :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
+      :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -533,6 +536,8 @@
       @stop="onComposerStop"
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
+      @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
+      @refresh-prompt-cache-keepalive="void refreshPromptCacheKeepaliveStatus()"
     />
     <SandboxSetupDialog
       :open="composerSandboxSetupOpen"
@@ -583,6 +588,14 @@
       @set-theme="onShareSetTheme"
     />
 
+    <PromptCacheKeepaliveDialog
+      v-if="promptCacheKeepaliveAvailable"
+      :open="promptCacheKeepaliveOpen"
+      :session-key="sessionKey"
+      @close="promptCacheKeepaliveOpen = false"
+      @saved="onPromptCacheKeepaliveSaved"
+    />
+
     <!-- Persistent completion announcer: the live block's role="status" phase
          label unmounts with the block when streaming ends, so on its own the
          settle would never reach a screen reader. This region stays mounted
@@ -608,6 +621,7 @@ import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import ChatHeaderActions from '@/components/chat/ChatHeaderActions.vue'
+import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
@@ -691,6 +705,7 @@ import { useChatSlashCommands } from '@/composables/chat/useChatSlashCommands'
 import { useChatStream } from '@/composables/chat/useChatStream'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
+import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
@@ -732,6 +747,10 @@ import {
   type SandboxRunMode,
 } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
+import type {
+  PromptCacheKeepaliveStatus,
+  PromptCacheKeepaliveStatusUpdate,
+} from '@/types/promptCacheKeepalive'
 import type {
   CollaborationMode,
   PlanCardAction,
@@ -887,6 +906,12 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const promptCacheKeepaliveOpen = ref(false)
+const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
+const promptCacheKeepaliveAvailable = computed(() => (
+  rpc.supportsMethod('sessions.promptCacheKeepalive.status')
+  && rpc.supportsMethod('sessions.promptCacheKeepalive.set')
+))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const inputText = ref('')
 const composerRevision = ref(0)
@@ -1022,6 +1047,35 @@ let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
+const promptCacheKeepaliveSessionReady = computed(() => pendingSessionIntent.value === null)
+
+async function refreshPromptCacheKeepaliveStatus() {
+  const key = sessionKey.value
+  if (
+    !key
+    || !promptCacheKeepaliveAvailable.value
+    || !promptCacheKeepaliveSessionReady.value
+  ) return
+  try {
+    const next = await rpc.call<PromptCacheKeepaliveStatus>(
+      'sessions.promptCacheKeepalive.status',
+      { key },
+    )
+    if (sessionKey.value === key) promptCacheKeepaliveStatus.value = next
+  } catch {
+    // The settings dialog owns actionable RPC errors. Menu refresh is best effort.
+  }
+}
+
+function onPromptCacheKeepaliveSaved(update: PromptCacheKeepaliveStatusUpdate) {
+  if (update.sessionKey === sessionKey.value) {
+    promptCacheKeepaliveStatus.value = update.status
+  }
+}
+
+watch(sessionKey, () => {
+  promptCacheKeepaliveStatus.value = null
+})
 
 function activeSnapshot(workspace: ProjectWorkspaceItem): ActiveProjectWorkspaceSnapshot {
   return {
@@ -1501,6 +1555,23 @@ const {
 } = chatHistory
 planMutationAccepted = () => scheduleHistorySync()
 
+// The durable artifact index fills gaps left by the bounded/compacted message
+// history. History and the in-flight ArtifactEvent stream remain live fallback
+// sources for mixed-version gateways and list-refresh races.
+const chatSessionArtifacts = useSessionArtifacts({
+  rpc,
+  sessionKey,
+  messages,
+  streamArtifacts,
+})
+const {
+  artifacts: sessionArtifacts,
+  load: loadSessionArtifacts,
+  loadAfterReconnect: loadSessionArtifactsAfterReconnect,
+  reset: resetSessionArtifacts,
+  cleanup: cleanupSessionArtifacts,
+} = chatSessionArtifacts
+
 const voiceInput = useVoiceInput()
 const {
   voiceBusy,
@@ -1850,6 +1921,7 @@ const chatSlashCommands = useChatSlashCommands({
   },
   resetCurrentSession: () => {
     resetCurrentSessionAfterSlash()
+    resetSessionArtifacts()
     chatPlans.reset()
   },
   setCompactInFlight,
@@ -2911,38 +2983,11 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   }
 }
 
-/**
- * Every deliverable the current session has produced, deduped by identity.
- * Artifacts arrive on completed/replayed assistant turns (`message.artifacts`,
- * filled from chat.history and from the streamed turn that just ended) and on
- * the in-flight turn (`streamArtifacts`); both feed the per-session drawer.
- */
-const sessionArtifacts = computed<ArtifactPayload[]>(() => {
-  const seen = new Set<string>()
-  const collected: ArtifactPayload[] = []
-  const consider = (artifact: ArtifactPayload | undefined | null) => {
-    if (!artifact) return
-    const id = String(artifact.id || artifact.download_url || artifact.name || '')
-    if (!id || seen.has(id)) return
-    seen.add(id)
-    collected.push(artifact)
-  }
-  for (const message of messages.value) {
-    message.artifacts?.forEach(consider)
-  }
-  streamArtifacts.value.forEach(consider)
-  return collected
-})
-
 const sessionWorkbenchArtifacts = computed(() =>
   sessionArtifacts.value.filter(artifactUsesWorkbenchPreview),
 )
 
-const headerDeliverableCount = computed(() =>
-  workbenchEnabled.value
-    ? sessionWorkbenchArtifacts.value.length
-    : sessionArtifacts.value.length,
-)
+const headerDeliverableCount = computed(() => sessionArtifacts.value.length)
 
 const deliverablesOpen = ref(false)
 
@@ -2954,7 +2999,9 @@ function focusHeaderAction(
 
 function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
-  if (workbenchEnabled.value) {
+  const allArtifactsUseWorkbench = sessionWorkbenchArtifacts.value.length
+    === sessionArtifacts.value.length
+  if (workbenchEnabled.value && allArtifactsUseWorkbench) {
     const recentPreview = workbenchStore.findMostRecentItem(item => {
       if (
         item.kind !== 'artifact-preview'
@@ -2977,14 +3024,6 @@ function openDeliverables() {
       openArtifact(artifact)
       return
     }
-
-    const latestArtifact = sessionArtifacts.value[sessionArtifacts.value.length - 1]
-    if (latestArtifact && artifactCategory(latestArtifact) === 'visual') {
-      openArtifact(latestArtifact)
-      return
-    }
-    if (latestArtifact) focusInlineDeliverable(latestArtifact)
-    return
   }
   deliverablesOpen.value = true
 }
@@ -3749,6 +3788,7 @@ onUnmounted(() => {
   unsubs = []
   cleanupPendingQueue()
   cleanupHistory()
+  cleanupSessionArtifacts()
   cleanupStream()
   cleanupCompaction()
   cleanupVoiceInput()
@@ -3839,9 +3879,26 @@ watch(() => [route.query.newChat, route.query.new], () => {
 
 watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
+  // Retire any in-flight page walk and clear the old Session before starting
+  // the new one, so a late response cannot leak deliverables across tabs/routes.
+  resetSessionArtifacts()
   if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
+  if (sessionKey.value && pendingSessionIntent.value !== 'new_chat') void loadSessionArtifacts()
+})
+
+// Hello refreshes method capabilities on reconnect. Retry the durable index
+// for the current Session then; older gateways simply remain on history/live.
+watch(() => rpc.state, (state, previous) => {
+  if (
+    state === 'connected'
+    && previous !== 'connected'
+    && sessionKey.value
+    && pendingSessionIntent.value !== 'new_chat'
+  ) {
+    void loadSessionArtifactsAfterReconnect()
+  }
 })
 
 watch(shareableMessageCount, (count) => {

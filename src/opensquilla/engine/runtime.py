@@ -103,6 +103,7 @@ from opensquilla.engine.hooks import (
 from opensquilla.engine.outcome import outcome_from_error, turn_outcome_details
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import PriceEntry, lookup_price
+from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
 from opensquilla.engine.route_plan import record_execution_leg
 from opensquilla.engine.router_decision import build_router_decision_event
 from opensquilla.engine.turn_policy import resolve_turn_policy
@@ -3049,6 +3050,10 @@ class TurnRunner:
         turn_error_writer: Any | None = None,
         provider_call_observer: Callable[..., None] | None = None,
         usage_event_sink: UsageEventSink | None = None,
+        prompt_cache_keepalive_recorder: (
+            Callable[[PromptCacheKeepaliveCandidate], None] | None
+        ) = None,
+        prompt_cache_keepalive_armed: Callable[[str], bool] | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._tool_registry = tool_registry
@@ -3066,6 +3071,8 @@ class TurnRunner:
         self._meta_run_writer = meta_run_writer
         self._turn_error_writer = turn_error_writer
         self._usage_event_sink = usage_event_sink
+        self._prompt_cache_keepalive_recorder = prompt_cache_keepalive_recorder
+        self._prompt_cache_keepalive_armed = prompt_cache_keepalive_armed
         # Populated alongside the existing session-id lookup so live usage
         # events retain reset fencing without a second storage round trip.
         self._usage_session_epoch_by_key: dict[str, int] = {}
@@ -3488,6 +3495,17 @@ class TurnRunner:
     def set_session_lock_provider(self, provider: Callable[[str], asyncio.Lock]) -> None:
         """Replace the lock provider at the gateway composition root."""
         self._session_lock_provider = provider
+
+    def set_prompt_cache_keepalive_recorder(
+        self,
+        recorder: Callable[[PromptCacheKeepaliveCandidate], None] | None,
+        *,
+        armed: Callable[[str], bool] | None = None,
+    ) -> None:
+        """Install the gateway's storage-free candidate recorder."""
+
+        self._prompt_cache_keepalive_recorder = recorder
+        self._prompt_cache_keepalive_armed = armed
 
     @contextlib.asynccontextmanager
     async def _session_write_context(self, session_key: str) -> AsyncIterator[None]:
@@ -4026,6 +4044,42 @@ class TurnRunner:
             )
             ab_out = ab_outcome.require_output()
             agent = ab_out.agent
+            keepalive_capture_enabled = False
+            if (
+                self._prompt_cache_keepalive_recorder is not None
+                and self._prompt_cache_keepalive_armed is not None
+            ):
+                try:
+                    keepalive_capture_enabled = bool(
+                        self._prompt_cache_keepalive_armed(session_key)
+                    )
+                except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                    log.warning(
+                        "turn_runner.prompt_cache_keepalive_arm_check_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
+            capture_setter = getattr(
+                agent,
+                "set_prompt_cache_keepalive_capture_enabled",
+                None,
+            )
+            if callable(capture_setter):
+                try:
+                    capture_setter(keepalive_capture_enabled)
+                except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                    keepalive_capture_enabled = False
+                    log.warning(
+                        "turn_runner.prompt_cache_keepalive_capture_setup_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
+            elif keepalive_capture_enabled:
+                keepalive_capture_enabled = False
+                log.warning(
+                    "turn_runner.prompt_cache_keepalive_capture_unavailable",
+                    session_key=session_key,
+                )
             agent_config = ab_out.agent_config
             # These locals are read by the test_agent_bootstrap_stage_snapshot
             # frame-walking probe. Do not remove.
@@ -4689,6 +4743,34 @@ class TurnRunner:
             fin_out = fin_outcome.require_output()
             final_text = fin_out.final_text
             turn_segments = fin_out.turn_segments
+            if (
+                fin_out.transcript_appended
+                and not error_message
+                and self._prompt_cache_keepalive_recorder is not None
+            ):
+                candidate_getter = getattr(
+                    agent,
+                    "prompt_cache_keepalive_candidate",
+                    None,
+                )
+                try:
+                    candidate = candidate_getter() if callable(candidate_getter) else None
+                except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                    candidate = None
+                    log.warning(
+                        "turn_runner.prompt_cache_keepalive_candidate_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
+                if candidate is not None:
+                    try:
+                        self._prompt_cache_keepalive_recorder(candidate)
+                    except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                        log.warning(
+                            "turn_runner.prompt_cache_keepalive_record_failed",
+                            session_key=session_key,
+                            exc_info=True,
+                        )
             if (
                 fin_out.transcript_appended
                 and fin_out.assistant_message_content is not None

@@ -238,6 +238,34 @@
                   <Icon name="download" :size="16" />
                   <span>{{ t('chat.exportMarkdown') }}</span>
                 </button>
+                <button
+                  v-if="promptCacheKeepaliveAvailable"
+                  type="button"
+                  role="menuitem"
+                  data-testid="chat-composer-action-keepalive"
+                  :title="promptCacheKeepaliveSessionReady
+                    ? t('chat.promptCacheKeepalive.action')
+                    : t('chat.promptCacheKeepalive.unavailableHint')"
+                  :aria-label="promptCacheKeepaliveAriaLabel"
+                  :disabled="!promptCacheKeepaliveSessionReady"
+                  @click="openPromptCacheKeepalive"
+                >
+                  <Icon name="clock" :size="16" />
+                  <span class="chat-more-actions-menu__copy">
+                    <span>{{ t('chat.promptCacheKeepalive.action') }}</span>
+                    <small v-if="!promptCacheKeepaliveSessionReady">
+                      {{ t('chat.promptCacheKeepalive.unavailableHint') }}
+                    </small>
+                    <small
+                      v-else-if="promptCacheKeepaliveStatusText"
+                      class="chat-more-actions-menu__keepalive-status"
+                      :data-state="promptCacheKeepaliveStatus?.state"
+                    >
+                      <span class="chat-more-actions-menu__status-dot" aria-hidden="true" />
+                      {{ promptCacheKeepaliveStatusText }}
+                    </small>
+                  </span>
+                </button>
               </div>
             </div>
           </div>
@@ -315,6 +343,7 @@ import type { Attachment } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { CollaborationMode } from '@/types/plans'
+import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachments'
 
 interface ChatComposerExpose {
@@ -359,6 +388,9 @@ const props = withDefaults(defineProps<{
   planModeDisabled?: boolean
   planModeAppliesNextTurn?: boolean
   replanActive?: boolean
+  promptCacheKeepaliveAvailable?: boolean
+  promptCacheKeepaliveSessionReady?: boolean
+  promptCacheKeepaliveStatus?: PromptCacheKeepaliveStatus | null
 }>(), {
   canChooseProject: true,
   codingModeEnabled: false,
@@ -388,6 +420,8 @@ const emit = defineEmits<{
   stop: []
   chooseProject: []
   closeProject: []
+  openPromptCacheKeepalive: []
+  refreshPromptCacheKeepalive: []
 }>()
 
 const { t } = useI18n()
@@ -402,6 +436,17 @@ const moreActionsOpen = ref(false)
 const showProjectContext = computed(() =>
   Boolean(props.projectWorkspace && (props.canCloseProject || props.projectStatusMessage)),
 )
+const promptCacheKeepaliveStatusText = computed(() => {
+  const status = props.promptCacheKeepaliveStatus
+  if (!status || status.state === 'off') return ''
+  return t(`chat.promptCacheKeepalive.states.${status.state}`)
+})
+const promptCacheKeepaliveAriaLabel = computed(() => {
+  const action = t('chat.promptCacheKeepalive.action')
+  return promptCacheKeepaliveStatusText.value
+    ? `${action}. ${promptCacheKeepaliveStatusText.value}`
+    : action
+})
 
 // "NEW" badge on the routing control — the single-model AI router is now the
 // default, so flag it until the user first opens the control, then never again.
@@ -498,6 +543,12 @@ function toggleMoreActions() {
     addMenuOpen.value = false
     modelRoutingOpen.value = false
     runModeOpen.value = false
+    if (
+      props.promptCacheKeepaliveAvailable
+      && props.promptCacheKeepaliveSessionReady
+    ) {
+      emit('refreshPromptCacheKeepalive')
+    }
   }
 }
 
@@ -522,6 +573,12 @@ function triggerVoice() {
 function exportConversation() {
   moreActionsOpen.value = false
   emit('exportMarkdown')
+}
+
+function openPromptCacheKeepalive() {
+  if (!props.promptCacheKeepaliveSessionReady) return
+  moreActionsOpen.value = false
+  emit('openPromptCacheKeepalive')
 }
 
 function attachmentIcon(att: Attachment): IconName {
@@ -991,6 +1048,43 @@ defineExpose<ChatComposerExpose>({
 .chat-more-actions-menu button:disabled {
   cursor: default;
   opacity: var(--state-disabled-opacity);
+}
+
+.chat-more-actions-menu__copy,
+.chat-more-actions-menu__copy small {
+  display: block;
+}
+
+.chat-more-actions-menu__copy small {
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+
+.chat-more-actions-menu__keepalive-status {
+  align-items: center;
+  display: flex !important;
+  gap: 0.375rem;
+}
+
+.chat-more-actions-menu__status-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+
+.chat-more-actions-menu__keepalive-status[data-state='scheduled']
+  .chat-more-actions-menu__status-dot,
+.chat-more-actions-menu__keepalive-status[data-state='probing']
+  .chat-more-actions-menu__status-dot {
+  background: var(--accent);
+}
+
+.chat-more-actions-menu__keepalive-status[data-state='stopped']
+  .chat-more-actions-menu__status-dot {
+  background: var(--danger);
 }
 
 .chat-input-actions--right {
