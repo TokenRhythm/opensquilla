@@ -18,7 +18,7 @@
           </span>
           <span class="attachment-chip__name">{{ att.name }}</span>
           <span class="attachment-chip__meta">{{ attachmentMeta(att) }}</span>
-          <button v-if="att.kind === 'failed' && att.file" class="attachment-action" title="Retry upload" aria-label="Retry upload" @click="emit('retryAttachment', i)">
+          <button v-if="att.kind === 'failed' && att.file" class="attachment-action" :title="t('chat.retryUpload')" :aria-label="t('chat.retryUpload')" @click="emit('retryAttachment', i)">
             <Icon name="refresh" :size="12" />
           </button>
           <button class="attachment-action attachment-remove" :title="t('chat.remove')" :aria-label="t('chat.remove')" @click="emit('removeAttachment', i)">

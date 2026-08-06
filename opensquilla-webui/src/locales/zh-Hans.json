@@ -3257,6 +3257,7 @@
     "previewTimedOutShort": "预览超时",
     "previewFailedShort": "预览失败",
     "retry": "重试",
+    "retryUpload": "重新上传",
     "retryPreviewFor": "重试预览 {title}",
     "artifactTitleSubtitle": "{title}，{subtitle}",
     "agentLabel": "智能体：{name}",
@@ -3304,6 +3305,11 @@
     "regenerate": "重新生成",
     "forkConversation": "复刻对话",
     "edit": "编辑",
+    "time": {
+      "justNow": "刚刚",
+      "minutesAgo": "{n}分钟前",
+      "hoursAgo": "{n}小时前"
+    },
     "addToShare": "添加到分享图片",
     "removeFromShare": "从分享图片中移除",
     "aiModelRouter": "AI 模型路由",

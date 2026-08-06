@@ -3206,6 +3206,7 @@
     "previewTimedOutShort": "プレビューがタイムアウト",
     "previewFailedShort": "プレビュー失敗",
     "retry": "再試行",
+    "retryUpload": "アップロードを再試行",
     "retryPreviewFor": "{title} のプレビューを再試行",
     "artifactTitleSubtitle": "{title}、{subtitle}",
     "agentLabel": "エージェント: {name}",
@@ -3253,6 +3254,11 @@
     "regenerate": "再生成",
     "forkConversation": "会話をフォーク",
     "edit": "編集",
+    "time": {
+      "justNow": "たった今",
+      "minutesAgo": "{n}分前",
+      "hoursAgo": "{n}時間前"
+    },
     "addToShare": "共有画像に追加",
     "removeFromShare": "共有画像から削除",
     "aiModelRouter": "AI モデルルーター",

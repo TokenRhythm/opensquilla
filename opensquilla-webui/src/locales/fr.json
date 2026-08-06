@@ -3206,6 +3206,7 @@
     "previewTimedOutShort": "Aperçu expiré",
     "previewFailedShort": "Échec de l'aperçu",
     "retry": "Réessayer",
+    "retryUpload": "Réessayer le téléversement",
     "retryPreviewFor": "Réessayer l'aperçu pour {title}",
     "artifactTitleSubtitle": "{title}, {subtitle}",
     "agentLabel": "Agent : {name}",
@@ -3253,6 +3254,11 @@
     "regenerate": "Régénérer",
     "forkConversation": "Bifurquer la conversation",
     "edit": "Modifier",
+    "time": {
+      "justNow": "à l'instant",
+      "minutesAgo": "il y a {n} min",
+      "hoursAgo": "il y a {n} h"
+    },
     "addToShare": "Ajouter à l'image de partage",
     "removeFromShare": "Retirer de l'image de partage",
     "aiModelRouter": "Routeur de modèle IA",

@@ -3257,6 +3257,7 @@
     "previewTimedOutShort": "Preview timed out",
     "previewFailedShort": "Preview failed",
     "retry": "Retry",
+    "retryUpload": "Retry upload",
     "retryPreviewFor": "Retry preview for {title}",
     "artifactTitleSubtitle": "{title}, {subtitle}",
     "agentLabel": "Agent: {name}",
@@ -3304,6 +3305,11 @@
     "regenerate": "Regenerate",
     "forkConversation": "Fork conversation",
     "edit": "Edit",
+    "time": {
+      "justNow": "just now",
+      "minutesAgo": "{n}m ago",
+      "hoursAgo": "{n}h ago"
+    },
     "addToShare": "Add to share image",
     "removeFromShare": "Remove from share image",
     "aiModelRouter": "AI model router",
