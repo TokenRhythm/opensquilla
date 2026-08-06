@@ -92,3 +92,42 @@ async def test_feishu_send_delivers_attachment_then_text() -> None:
         await channel.stop()
 
     assert len(requests) >= 1
+
+
+@pytest.mark.asyncio
+async def test_qq_send_file_uploads_and_sends_media_message() -> None:
+    """QQ send_file uploads local bytes via file_data then sends msg_type=7."""
+
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from opensquilla.channels.qq import QQChannel, QQChannelConfig
+
+    channel = QQChannel(QQChannelConfig(name="qq", app_id="a", app_secret="s"))
+    uploaded: dict = {}
+
+    async def fake_upload(route, **kwargs):
+        uploaded["json"] = kwargs.get("json", {})
+        return {"file_info": "fi-123"}
+
+    channel.api = SimpleNamespace(
+        _http=SimpleNamespace(request=fake_upload),
+        post_c2c_message=AsyncMock(),
+        post_group_message=AsyncMock(),
+    )
+
+    tmp = Path("qq-test-file.txt")
+    tmp.write_text("hello qq", encoding="utf-8")
+    try:
+        result = await channel.send_file("openid-1", str(tmp), chat_type="c2c")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    assert uploaded["json"]["file_type"] == 4
+    assert "hello qq" in __import__("base64").b64decode(uploaded["json"]["file_data"]).decode()
+    channel.api.post_c2c_message.assert_awaited_once()
+    kwargs = channel.api.post_c2c_message.await_args.kwargs
+    assert kwargs["msg_type"] == 7
+    assert kwargs["media"] == {"file_info": "fi-123"}
+    assert result.target_id == "openid-1"

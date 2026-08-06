@@ -947,6 +947,46 @@ class WeComChannel:
                 metadata["wecom_req_id_expires_at"] = float(expires_at)
         return metadata
 
+    async def resolve_inbound_attachment(self, attachment: Attachment) -> Attachment:
+        """Resolve a WeCom webhook image URL into bytes for shared ingest.
+
+        WeCom webhook images arrive as a public ``PicUrl``. The generic ingest
+        path requires ``data`` bytes, so the URL is downloaded here with the
+        shared size bound; the payload is then validated by the ingest stage.
+        """
+
+        if attachment.data is not None:
+            return attachment
+        url = str(attachment.url or "").strip()
+        if not url:
+            return attachment
+        from opensquilla.channels._attachment_io import (
+            attachment_limit_for_mime,
+            ensure_bytes_within_limit,
+        )
+
+        limit = attachment_limit_for_mime(attachment.mime_type)
+        import httpx
+
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            payload = ensure_bytes_within_limit(
+                resp.content,
+                name=attachment.name,
+                limit=limit,
+            )
+        return Attachment(
+            name=attachment.name or "wecom-image",
+            mime_type=attachment.mime_type,
+            data=payload,
+            size=len(payload),
+            metadata=attachment.metadata,
+        )
+
     def build_reply_message(self, content: str, inbound: IncomingMessage) -> OutgoingMessage:
         if self.config.connection_mode != "websocket":
             metadata: dict[str, Any] = {}

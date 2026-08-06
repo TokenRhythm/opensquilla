@@ -370,3 +370,55 @@ async def test_matrix_oversize_declared_attachment_skips_download() -> None:
                 metadata={"matrix_mxc_url": "mxc://example.test/media"},
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_qq_inbound_resolver_downloads_bytes(monkeypatch) -> None:
+    """QQ image URL is downloaded into bytes for the shared ingest path."""
+
+    import httpx
+
+    from opensquilla.channels.qq import QQChannel, QQChannelConfig
+
+    channel = QQChannel(QQChannelConfig(name="qq", app_id="a", app_secret="s"))
+    attachment = Attachment(
+        name="photo.png",
+        mime_type="image/png",
+        url="https://cdn.example.com/photo.png",
+        size=4,
+    )
+    mock_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, content=b"img!", headers={"content-type": "image/png"})
+        )
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda **_: mock_client)
+    resolved = await channel.resolve_inbound_attachment(attachment)
+    assert resolved.data == b"img!"
+    assert resolved.mime_type == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_wecom_inbound_resolver_downloads_bytes(monkeypatch) -> None:
+    """WeCom PicUrl is downloaded into bytes with the shared size bound."""
+
+    import httpx
+
+    from opensquilla.channels.wecom import WeComChannel, WeComChannelConfig
+
+    channel = WeComChannel(WeComChannelConfig(name="wecom"))
+    attachment = Attachment(
+        name="wecom-image",
+        mime_type="image/jpeg",
+        url="https://qcdn.example.com/pic.jpg",
+        size=4,
+    )
+    mock_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, content=b"pic!", headers={"content-type": "image/jpeg"})
+        )
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda **_: mock_client)
+    resolved = await channel.resolve_inbound_attachment(attachment)
+    assert resolved.data == b"pic!"
+    assert resolved.mime_type == "image/jpeg"
