@@ -23,7 +23,7 @@ from tui_real_terminal.targets import (
     TUI_READY_TIMEOUT_SECONDS,
     TargetContext,
     build_tui_target,
-    opentui_host_skip_reason,
+    opentui_host_capability_gate,
 )
 
 pytestmark = pytest.mark.tui_real_terminal
@@ -342,9 +342,10 @@ def test_idle_resize_narrow_large_narrow_repaints_complete_framebuffer(
     )
     if not target.available:
         pytest.skip(target.skip_reason or "OpenTUI test target is unavailable")
-    host_skip_reason = opentui_host_skip_reason(target.env)
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
+    )
     target.env.update(
         {
             "OPENSQUILLA_TUI_THEME": "opensquilla-dark",
@@ -463,9 +464,10 @@ def test_collapsed_stream_resize_round_trip_recovers_without_stale_geometry(
     )
     if not target.available:
         pytest.skip(target.skip_reason or "OpenTUI test target is unavailable")
-    host_skip_reason = opentui_host_skip_reason(target.env)
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
+    )
     target.env.update(
         {
             "OPENSQUILLA_TUI_THEME": "opensquilla-dark",
@@ -583,9 +585,10 @@ def test_empty_welcome_resize_remount_recovers_without_duplicate_frames(
     )
     if not target.available:
         pytest.skip(target.skip_reason or "OpenTUI test target is unavailable")
-    host_skip_reason = opentui_host_skip_reason(target.env)
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
+    )
     target.env.update(
         {
             "OPENSQUILLA_TUI_THEME": "opensquilla-dark",

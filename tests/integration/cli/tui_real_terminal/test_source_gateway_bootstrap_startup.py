@@ -19,7 +19,7 @@ from tui_real_terminal.driver import (
 )
 from tui_real_terminal.evidence import EvidenceBundle
 from tui_real_terminal.framebuffer import assert_opentui_framebuffer
-from tui_real_terminal.targets import opentui_host_skip_reason
+from tui_real_terminal.targets import opentui_host_capability_gate
 from tui_real_terminal.test_packaged_gateway_e2e import (
     _free_port,
     _stop_process,
@@ -120,9 +120,12 @@ async def test_source_tui_real_gateway_empty_bootstrap_first_screen(
                 "COLORTERM": "truecolor",
             }
         )
-        host_skip_reason = opentui_host_skip_reason(tui_env)
-        if host_skip_reason is not None:
-            pytest.skip(host_skip_reason)
+        opentui_host_capability_gate(
+            tui_env,
+            require_capabilities=bool(
+                pytestconfig.getoption("--tui-require-capabilities")
+            ),
+        )
         session = TmuxTerminalSession(
             command=[
                 sys.executable,

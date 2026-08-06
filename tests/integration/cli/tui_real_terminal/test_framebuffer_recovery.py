@@ -21,7 +21,7 @@ from tui_real_terminal.targets import (
     TUI_READY_TIMEOUT_SECONDS,
     TargetContext,
     build_tui_target,
-    opentui_host_skip_reason,
+    opentui_host_capability_gate,
 )
 
 pytestmark = pytest.mark.tui_real_terminal
@@ -158,9 +158,10 @@ def test_focus_in_restores_same_size_cleared_framebuffer(
     )
     if not target.available:
         pytest.skip(target.skip_reason or "OpenTUI test target is unavailable")
-    host_skip_reason = opentui_host_skip_reason(target.env)
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
+    )
     # This test proves the focus seam specifically. Keep the eventless fallback
     # disabled so its low-frequency repaint cannot race the deliberately blank
     # intermediate framebuffer asserted below.
@@ -308,9 +309,10 @@ def test_watchdog_restores_same_size_framebuffer_without_terminal_event(
     )
     if not target.available:
         pytest.skip(target.skip_reason or "OpenTUI test target is unavailable")
-    host_skip_reason = opentui_host_skip_reason(target.env)
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
+    )
     # Periodic full repaint is deliberately not a production default: it can
     # flash a healthy retained surface. Keep the otherwise-undetectable,
     # eventless path as an explicit diagnostic/recovery capability.
@@ -424,9 +426,10 @@ def test_watchdog_reenters_alternate_screen_without_polluting_scrollback_or_curs
     )
     if not target.available:
         pytest.skip(target.skip_reason or "OpenTUI test target is unavailable")
-    host_skip_reason = opentui_host_skip_reason(target.env)
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
+    )
     # Leave a deterministic observation window after fault injection, then let
     # at least two independent recovery ticks prove they do not append frames.
     target.env["OPENSQUILLA_TUI_REPAINT_WATCHDOG_MS"] = "2000"
@@ -556,9 +559,10 @@ def test_restores_same_size_framebuffer_during_live_stream(
     )
     if not target.available:
         pytest.skip(target.skip_reason or "OpenTUI test target is unavailable")
-    host_skip_reason = opentui_host_skip_reason(target.env)
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
+    )
     if recovery_mode == "focus":
         target.env["OPENSQUILLA_TUI_REPAINT_WATCHDOG_MS"] = "0"
     else:

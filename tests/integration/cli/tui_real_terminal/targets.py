@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+import pytest
 
 from tui_real_terminal.driver import TerminalSize
 
@@ -62,22 +65,54 @@ def opentui_host_skip_reason(env: Mapping[str, str]) -> str | None:
     Kept separate from ``TuiTarget.available`` so target construction keeps
     describing the target rather than the machine it would run on.
     """
-    try:
-        from opensquilla.cli.tui.opentui.bridge import (  # type: ignore[import-untyped]
-            check_opentui_host_available,
-        )
-        from opensquilla.cli.tui.opentui.host_runtime import (  # type: ignore[import-untyped]
-            source_host_requested,
-        )
+    from opensquilla.cli.tui.opentui.bridge import (  # type: ignore[import-untyped]
+        DEFAULT_HOST_PACKAGE_DIR,
+        check_opentui_host_available,
+    )
+    from opensquilla.cli.tui.opentui.host_runtime import (  # type: ignore[import-untyped]
+        source_host_requested,
+    )
+    from opensquilla.cli.tui.renderers.selection import (  # type: ignore[import-untyped]
+        RendererBackendUnavailableReason,
+    )
 
-        availability = check_opentui_host_available(
-            use_source_host=source_host_requested(env),
-        )
-    except Exception as exc:  # noqa: BLE001 - a failed probe is itself a skip reason
-        return f"OpenTUI host probe failed: {exc}"
+    use_source_host = source_host_requested(env)
+    runtime_bin: str | None = None
+    if use_source_host:
+        main_script = DEFAULT_HOST_PACKAGE_DIR / "src" / "main.mjs"
+        if not main_script.is_file():
+            raise AssertionError(f"OpenTUI source host entrypoint is missing: {main_script}")
+        runtime_bin = shutil.which("bun", path=env.get("PATH", os.defpath))
+        if runtime_bin is None:
+            return "Bun is not installed or is not on PATH"
+
+    availability = check_opentui_host_available(
+        runtime_bin=runtime_bin,
+        use_source_host=use_source_host,
+    )
     if availability.available:
         return None
+    if availability.reason_code is not RendererBackendUnavailableReason.MISSING:
+        code = availability.reason_code or RendererBackendUnavailableReason.UNKNOWN
+        raise AssertionError(
+            f"OpenTUI host probe failed with {code.value}: "
+            f"{availability.reason or 'no reason provided'}"
+        )
     return availability.reason or "OpenTUI host unavailable"
+
+
+def opentui_host_capability_gate(
+    env: Mapping[str, str],
+    *,
+    require_capabilities: bool,
+) -> None:
+    """Skip an optional missing host, or fail when capabilities are required."""
+    reason = opentui_host_skip_reason(env)
+    if reason is None:
+        return
+    if require_capabilities:
+        pytest.fail(f"required real-terminal capability is unavailable: {reason}")
+    pytest.skip(reason)
 
 
 def build_tui_target(backend_id: str, context: TargetContext) -> TuiTarget:

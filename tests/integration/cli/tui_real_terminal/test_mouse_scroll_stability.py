@@ -16,7 +16,7 @@ from tui_real_terminal.targets import (
     TUI_READY_TIMEOUT_SECONDS,
     TargetContext,
     build_tui_target,
-    opentui_host_skip_reason,
+    opentui_host_capability_gate,
 )
 
 pytestmark = pytest.mark.tui_real_terminal
@@ -63,9 +63,10 @@ def test_sgr_wheel_holds_streaming_view_and_end_restores_follow(
     )
     if not target.available:
         pytest.skip(target.skip_reason or "OpenTUI test target is unavailable")
-    host_skip_reason = opentui_host_skip_reason(target.env)
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
+    )
     target.env["OPENSQUILLA_TUI_REPAINT_WATCHDOG_MS"] = "0"
     # Keep a deterministic live window after token 055 even when the complete
     # real-terminal suite is contending for CPU. This gate must exercise wheel

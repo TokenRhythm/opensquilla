@@ -23,7 +23,7 @@ from tui_real_terminal.scenarios import TuiScenario, run_scenario  # noqa: E402
 from tui_real_terminal.targets import (  # noqa: E402
     TargetContext,
     build_tui_target,
-    opentui_host_skip_reason,
+    opentui_host_capability_gate,
 )
 
 
@@ -133,9 +133,10 @@ def run_real_terminal_scenario(
                 f"scenario {scenario.scenario_id!r} requires "
                 f"--tui-backend={scenario.required_backend_id}"
             )
-        host_skip_reason = opentui_host_skip_reason(target.env)
-        if host_skip_reason is not None:
-            capability_miss(host_skip_reason)
+        opentui_host_capability_gate(
+            target.env,
+            require_capabilities=require_capabilities,
+        )
         scenario_driver = tui_driver
         if scenario.requires_tmux:
             if not capabilities.tmux_available:

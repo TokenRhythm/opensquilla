@@ -17,7 +17,7 @@ from tui_real_terminal.evidence import EvidenceBundle
 from tui_real_terminal.targets import (
     TargetContext,
     build_tui_target,
-    opentui_host_skip_reason,
+    opentui_host_capability_gate,
 )
 
 pytestmark = pytest.mark.tui_real_terminal
@@ -60,9 +60,10 @@ def test_exit_restores_primary_screen_and_shell(
             size=TerminalSize(cols=100, rows=30),
         ),
     )
-    host_skip_reason = opentui_host_skip_reason(target.env)
-    if host_skip_reason is not None:
-        pytest.skip(host_skip_reason)
+    opentui_host_capability_gate(
+        target.env,
+        require_capabilities=bool(pytestconfig.getoption("--tui-require-capabilities")),
+    )
     shell_script = (
         f"{shlex.join(target.command)}; "
         f"printf '\\n{_EXIT_MARKER} status=%s\\n' \"$?\"; "
