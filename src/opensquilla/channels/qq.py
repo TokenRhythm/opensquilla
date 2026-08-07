@@ -190,11 +190,13 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             splits_natively=False,
             group_chat=True,
             mentions=True,
+            native_file_upload=True,
+            media=True,
             reply=True,
             transports=("websocket",),
             notes=(
-                "QQ Bot Platform rich-media APIs exist, but this adapter currently "
-                "sends text replies only.",
+                "QQ official rich-media API (msg_type=7) delivers images and "
+                "files via base64 upload plus media.file_info.",
             ),
         )
 
@@ -202,16 +204,30 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
     def platform_capability_manifest(self) -> ChannelPlatformManifest:
         return ChannelPlatformManifest.from_channel_profile(
             self.capability_profile,
+            has_send_file=True,
+            has_inbound_attachment_resolver=True,
         ).with_capabilities(
             ChannelPlatformCapability(
                 category=ChannelPlatformCategories.FILES,
-                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                notes=("QQ official bot file delivery is not implemented in this adapter.",),
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=(
+                    "POST /v2/users/{openid}/files",
+                    "POST /v2/groups/{group_openid}/files",
+                    "msg_type=7 media send",
+                ),
+                notes=(
+                    "Files are uploaded as base64 file_data to the official "
+                    "rich-media endpoint, then delivered as msg_type=7 media.",
+                ),
             ),
             ChannelPlatformCapability(
                 category=ChannelPlatformCategories.MEDIA,
-                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                notes=("QQ official bot rich media is not implemented in this adapter.",),
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("msg_type=7 media.file_info",),
+                notes=(
+                    "Images and files are sent through the official media "
+                    "message API with a short-lived file_info.",
+                ),
             ),
         )
 
@@ -583,6 +599,11 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         if chat_type is None and self._last_incoming_envelope is not None:
             chat_type = str(
                 (self._last_incoming_envelope.metadata or {}).get("chat_type", "")
+            )
+        if msg_id is None and self._last_incoming_envelope is not None:
+            msg_id = (
+                (self._last_incoming_envelope.metadata or {}).get("msg_id")
+                or (self._last_incoming_envelope.metadata or {}).get("reply_to_msg_id")
             )
         if chat_type not in {"c2c", "group"}:
             chat_type = "c2c"

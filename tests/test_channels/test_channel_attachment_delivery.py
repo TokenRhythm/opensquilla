@@ -127,3 +127,20 @@ async def test_qq_send_file_uploads_and_sends_media_message(tmp_path) -> None:
     assert kwargs["msg_type"] == 7
     assert kwargs["media"] == {"file_info": "fi-123"}
     assert result.target_id == "openid-1"
+
+
+def test_qq_artifact_delivery_gate_is_unlocked_by_capability_profile() -> None:
+    """QQ send_file must not be gated off by its capability profile.
+
+    Regression guard: the adapter implements the official rich-media send_file,
+    so ``can_deliver_channel_files`` must return True. When this gate was left
+    False, artifacts were only shown in the WebUI and the channel got the
+    ``available in WebUI`` fallback line instead of the file.
+    """
+
+    from opensquilla.channels.artifact_delivery import can_deliver_channel_files
+    from opensquilla.channels.qq import QQChannel, QQChannelConfig
+
+    channel = QQChannel(QQChannelConfig(name="qq", app_id="a", app_secret="s"))
+
+    assert can_deliver_channel_files(channel) is True
