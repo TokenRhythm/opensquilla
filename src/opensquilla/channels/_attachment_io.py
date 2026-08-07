@@ -162,10 +162,13 @@ async def deliver_message_attachments(
         try:
             send = channel.send_file
             sig = inspect.signature(send)
+            call_kwargs: dict[str, Any] = {}
             if "content" in sig.parameters:
-                send_result = send(target, str(path), content=content)
-            else:
-                send_result = send(target, str(path))
+                call_kwargs["content"] = content
+            attachment_name = getattr(attachment, "name", None)
+            if "file_name" in sig.parameters and isinstance(attachment_name, str) and attachment_name:
+                call_kwargs["file_name"] = attachment_name
+            send_result = send(target, str(path), **call_kwargs)
             if asyncio.iscoroutine(send_result):
                 await send_result
         finally:

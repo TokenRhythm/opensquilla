@@ -181,7 +181,10 @@ async def deliver_artifacts_as_channel_files(
         try:
             ref, path = store.resolve_for_download(artifact_id, session_id=session_id)
             with _named_artifact_delivery_path(path, ref.name) as delivery_path:
-                result = send_file(msg.channel_id, str(delivery_path), **send_kwargs)
+                artifact_kwargs = dict(send_kwargs)
+                if "file_name" in sig.parameters and ref.name:
+                    artifact_kwargs["file_name"] = ref.name
+                result = send_file(msg.channel_id, str(delivery_path), **artifact_kwargs)
                 if inspect.isawaitable(result):
                     result = await result
                 normalized = normalize_channel_send_result(

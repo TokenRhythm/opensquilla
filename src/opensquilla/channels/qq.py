@@ -574,6 +574,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         *,
         chat_type: str | None = None,
         msg_id: str | None = None,
+        file_name: str | None = None,
     ) -> ChannelSendResult:
         """Send a local file to a QQ chat via the official rich-media API.
 
@@ -609,6 +610,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             chat_type = "c2c"
         file_type = self._qq_file_type(path)
         payload = base64.b64encode(path.read_bytes()).decode("ascii")
+        display_name = file_name or path.name
 
         from botpy.http import Route
 
@@ -621,7 +623,13 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             route = Route("POST", "/v2/users/{openid}/files", openid=target)
         upload = await http.request(
             route,
-            json={"file_type": file_type, "file_data": payload},
+            json={
+                "file_type": file_type,
+                "file_data": payload,
+                # Official API accepts an optional file_name; without it the
+                # platform names received files generically ("未命名").
+                "file_name": display_name,
+            },
         )
         file_info = ""
         if isinstance(upload, dict):

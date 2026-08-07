@@ -118,9 +118,10 @@ async def test_qq_send_file_uploads_and_sends_media_message(tmp_path) -> None:
 
     tmp = tmp_path / "qq-test-file.txt"
     tmp.write_text("hello qq", encoding="utf-8")
-    result = await channel.send_file("openid-1", str(tmp), chat_type="c2c")
+    result = await channel.send_file("openid-1", str(tmp), chat_type="c2c", file_name="qq-test-file.txt")
 
     assert uploaded["json"]["file_type"] == 4
+    assert uploaded["json"]["file_name"] == "qq-test-file.txt"
     assert "hello qq" in __import__("base64").b64decode(uploaded["json"]["file_data"]).decode()
     channel.api.post_c2c_message.assert_awaited_once()
     kwargs = channel.api.post_c2c_message.await_args.kwargs
