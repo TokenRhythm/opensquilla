@@ -727,6 +727,7 @@ async def test_reasoning_only_retry_restores_thinking_after_retry_call() -> None
         provider=provider,
         config=AgentConfig(
             thinking=ThinkingLevel.MEDIUM,
+            reasoning_only_thinking_fallback=True,
             max_iterations=3,
             retry_base_backoff_ms=0,
             retry_max_backoff_ms=0,
@@ -871,7 +872,7 @@ async def test_large_reasoning_only_uses_fallback_before_same_model_retry() -> N
 
 
 @pytest.mark.asyncio
-async def test_large_reasoning_only_without_fallback_retries_once_with_thinking_disabled() -> None:
+async def test_large_reasoning_only_without_fallback_keeps_thinking_by_default() -> None:
     provider = _SequenceProvider(
         [
             [_large_reasoning_only_done()],
@@ -895,9 +896,13 @@ async def test_large_reasoning_only_without_fallback_retries_once_with_thinking_
 
     assert len(provider.calls) == 2
     assert provider.calls[0]["config"].thinking is True
-    assert provider.calls[1]["config"].thinking is False
-    assert provider.calls[1]["config"].thinking_level is None
-    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert provider.calls[1]["config"].thinking is True
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.MEDIUM
+    assert (
+        provider.calls[1]["config"].thinking_budget_tokens
+        == provider.calls[0]["config"].thinking_budget_tokens
+        == 10_000
+    )
     assert any(
         event.kind == "warning" and event.code == "provider_large_context_visible_retry"
         for event in events
@@ -906,6 +911,13 @@ async def test_large_reasoning_only_without_fallback_retries_once_with_thinking_
         event.kind == "warning" and event.code == "provider_reasoning_only_retry"
         for event in events
     )
+    visible_retry = next(
+        event
+        for event in events
+        if event.kind == "warning"
+        and event.code == "provider_large_context_visible_retry"
+    )
+    assert "thinking disabled" not in visible_retry.message
     assert not any(event.kind == "error" for event in events)
     done = next(event for event in events if event.kind == "done")
     assert done.text == "ok"
@@ -994,6 +1006,7 @@ async def test_repeated_large_dashscope_reasoning_only_disables_thinking_after_n
                 reasoning_format="dashscope",
             ),
             reasoning_prefill_recovery_mode="recover",
+            reasoning_only_thinking_fallback=True,
             retry_base_backoff_ms=0,
             retry_max_backoff_ms=0,
         ),
@@ -1013,6 +1026,49 @@ async def test_repeated_large_dashscope_reasoning_only_disables_thinking_after_n
     assert not any(event.kind == "error" for event in events)
     assert any(event.kind == "done" and event.text == "ok" for event in events)
     assert provider.calls[2]["config"].thinking is False
+
+
+@pytest.mark.asyncio
+async def test_repeated_large_dashscope_reasoning_only_keeps_thinking_when_fallback_off() -> None:
+    provider = _SequenceProvider(
+        [
+            [_large_reasoning_only_done()],
+            [_large_reasoning_only_done()],
+            [
+                ProviderText(text="ok"),
+                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                supports_tools=True,
+                reasoning_format="dashscope",
+            ),
+            reasoning_prefill_recovery_mode="recover",
+            reasoning_only_thinking_fallback=False,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 3
+    assert not any(event.kind == "error" for event in events)
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
+    assert all(call["config"].thinking is True for call in provider.calls)
+    visible_retry = next(
+        event
+        for event in events
+        if event.kind == "warning"
+        and event.code == "provider_large_context_visible_retry"
+    )
+    assert "thinking disabled" not in visible_retry.message
 
 
 @pytest.mark.asyncio

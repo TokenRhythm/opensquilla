@@ -7582,6 +7582,17 @@ class Agent:
                                     wrapup_margin_seconds > 0
                                     and _total_deadline is not None
                                     and not deadline_wrapup_armed
+                                    # A policy preempt retries the provider call.
+                                    # Composite providers mark that unsafe because
+                                    # replaying the call repeats every child request.
+                                    and (
+                                        getattr(
+                                            self.provider,
+                                            "retry_failed_call_safe",
+                                            True,
+                                        )
+                                        is not False
+                                    )
                                     and not attempt_user_visible_emitted
                                     and not pending_tools
                                     and not tool_calls
@@ -8233,6 +8244,7 @@ class Agent:
                                 if (
                                     thinking_enabled
                                     and not _thinking_fallback_done
+                                    and self.config.provider_error_thinking_fallback
                                     and ("thinking" in _err_lower or "reasoning" in _err_lower)
                                 ):
                                     _thinking_fallback_done = True
@@ -8792,8 +8804,16 @@ class Agent:
                                 )
                             ):
                                 _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
-                                _thinking_fallback_done = True
-                                _disable_thinking_for_next_provider_call = True
+                                disable_thinking = bool(
+                                    getattr(
+                                        self.config,
+                                        "reasoning_only_thinking_fallback",
+                                        False,
+                                    )
+                                )
+                                if disable_thinking:
+                                    _thinking_fallback_done = True
+                                    _disable_thinking_for_next_provider_call = True
                                 logger.warning(
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
@@ -8812,13 +8832,18 @@ class Agent:
                                     iter_output_tokens=iter_output_tokens,
                                     iter_reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_chars=len(iter_reasoning_content or ""),
+                                    thinking_disabled=disable_thinking,
                                 )
                                 yield WarningEvent(
                                     code="provider_large_context_visible_retry",
                                     message=(
                                         "The provider returned reasoning without visible "
-                                        "content for a large input; retrying once with "
-                                        "thinking disabled."
+                                        "content for a large input; "
+                                        + (
+                                            "retrying once with thinking disabled."
+                                            if disable_thinking
+                                            else "retrying once to request visible content."
+                                        )
                                     ),
                                 )
                                 _call_attempt += 1
@@ -19730,6 +19755,9 @@ class Agent:
             placeholder_escalation_threshold=self.config.placeholder_escalation_threshold,
             deadline_wrapup_margin_seconds=self.config.deadline_wrapup_margin_seconds,
             reasoning_only_thinking_fallback=self.config.reasoning_only_thinking_fallback,
+            provider_error_thinking_fallback=(
+                self.config.provider_error_thinking_fallback
+            ),
             deadline_thinking_off_margin_seconds=(
                 self.config.deadline_thinking_off_margin_seconds
             ),
