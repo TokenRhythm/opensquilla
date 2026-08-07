@@ -882,7 +882,23 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
         usage_event_sink = getattr(self._runner, "_usage_event_sink", None)
         usage_execution_context = None
         if usage_event_sink is not None:
+            # Usage identity is ``uuid5(f"…:{execution_id}:{call_index}")`` and
+            # ``call_index`` counts per ``UsageAccountingScope``, so two attempts
+            # of one turn must not share an ``execution_id``. A router-control
+            # replay re-enters the turn with the same ``turn_id`` and builds a
+            # fresh scope, so keying on the bare ``turn_id`` makes the replay's
+            # first leg re-derive the first attempt's identity; the ledger's
+            # start guard then rejects it as a reused identity and the turn fails
+            # closed before the provider is called. Attempt 0 keeps the bare
+            # ``turn_id`` so stored values keep their shape on the common path.
+            # Replay depth provides a deterministic attempt namespace without
+            # weakening the ledger's exact-start idempotency guard.
+            replay_depth = max(
+                0, int(getattr(tool_context, "router_control_replay_depth", 0) or 0)
+            )
             execution_id = turn_id or uuid.uuid4().hex
+            if replay_depth:
+                execution_id = f"{execution_id}:{replay_depth}"
             usage_execution_context = UsageExecutionContext(
                 execution_id=execution_id,
                 agent_run_id=execution_id,
