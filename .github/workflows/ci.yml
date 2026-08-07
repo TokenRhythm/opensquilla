@@ -873,13 +873,28 @@ jobs:
           retention-days: 14
 
   desktop-recovery-e2e:
-    name: Desktop recovery E2E (${{ matrix.os }})
+    # Windows hosted runners can retain Chromium network resources briefly
+    # after a heavy Electron test process exits.  Run the independent recovery
+    # groups on fresh Windows runners so an earlier test cannot starve a later
+    # one of local socket buffers. Linux and macOS retain the full serial
+    # contract, which is useful for their native recovery coverage.
+    name: Desktop recovery E2E (${{ matrix.os }}, ${{ matrix.shard }})
     needs: [classify-changes, frontend-check]
     if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            shard: all
+          - os: macos-latest
+            shard: all
+          - os: windows-latest
+            shard: profiles
+          - os: windows-latest
+            shard: ownership
+          - os: windows-latest
+            shard: workbench
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
 
@@ -1010,18 +1025,52 @@ jobs:
             fi
           }
 
-          for entry in \
-            'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs' \
-            'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs' \
-            'profile-import-flow:scripts/test-profile-import-flow.mjs' \
-            'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs' \
-            'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs' \
-            'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
-            'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
-            'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs' \
-            'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs' \
-            'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs' \
-            'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
+          case "${{ matrix.shard }}" in
+            all)
+              entries=(
+                'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
+                'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
+                'profile-import-flow:scripts/test-profile-import-flow.mjs'
+                'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
+                'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
+                'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
+                'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
+                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
+              )
+              ;;
+            profiles)
+              entries=(
+                'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
+                'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
+                'profile-import-flow:scripts/test-profile-import-flow.mjs'
+                'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
+              )
+              ;;
+            ownership)
+              entries=(
+                'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
+                'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
+                'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+              )
+              ;;
+            workbench)
+              entries=(
+                'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
+                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
+              )
+              ;;
+            *)
+              echo "ERROR: unknown Desktop recovery E2E shard: ${{ matrix.shard }}" >&2
+              exit 2
+              ;;
+          esac
+
+          for entry in "${entries[@]}"
           do
             name="${entry%%:*}"
             script="${entry#*:}"
@@ -1036,7 +1085,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-recovery-e2e-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          name: desktop-recovery-e2e-${{ matrix.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/desktop-recovery-e2e
           if-no-files-found: error
           retention-days: 14

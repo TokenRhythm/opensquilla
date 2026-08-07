@@ -772,6 +772,68 @@ def test_repeated_install_reuses_verified_package_without_downloading(
     assert repaired.package_relpath == first.package_relpath
 
 
+def test_windows_payload_promotion_retries_transient_sharing_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "payload"
+    package = tmp_path / "package"
+    payload.mkdir()
+    (payload / "ready.txt").write_text("verified", encoding="utf-8")
+    real_replace = os.replace
+    attempts = 0
+    delays: list[float] = []
+
+    class TransientWindowsReplaceError(PermissionError):
+        winerror = 5
+
+    def flaky_replace(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise TransientWindowsReplaceError("Windows indexer still has the payload open")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(manager.os, "name", "nt")
+    monkeypatch.setattr(manager.os, "replace", flaky_replace)
+    monkeypatch.setattr(manager.time, "sleep", delays.append)
+
+    manager._promote_package_payload(payload, package)
+
+    assert attempts == 3
+    assert delays == [0.05, 0.1]
+    assert not payload.exists()
+    assert (package / "ready.txt").read_text(encoding="utf-8") == "verified"
+
+
+def test_windows_payload_promotion_does_not_retry_nontransient_denial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "payload"
+    package = tmp_path / "package"
+    payload.mkdir()
+    attempts = 0
+
+    class PermanentWindowsReplaceError(PermissionError):
+        winerror = 50
+
+    def denied_replace(_source: Path, _destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise PermanentWindowsReplaceError("permanent policy denial")
+
+    monkeypatch.setattr(manager.os, "name", "nt")
+    monkeypatch.setattr(manager.os, "replace", denied_replace)
+
+    with pytest.raises(PermanentWindowsReplaceError, match="permanent policy denial"):
+        manager._promote_package_payload(payload, package)
+
+    assert attempts == 1
+    assert payload.is_dir()
+    assert not package.exists()
+
+
 def test_install_accepts_cataloged_hidden_archive_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -33,6 +33,7 @@ def test_llm_trace_recorder_redacts_secret_values_in_strings(
         assistant_text=f"debug DASHSCOPE_API_KEY={secret}",
         response={"choices": [{"message": {"content": f"token={secret}"}}]},
     )
+    recorder.record_response_headers(response_ids=[f"gen-{secret}"])
     recorder.record_error(
         code="bad",
         message=f"failed with {secret}",
@@ -47,5 +48,6 @@ def test_llm_trace_recorder_redacts_secret_values_in_strings(
     )
     assert rows[0]["headers"]["Authorization"] == "[REDACTED]"
     assert rows[1]["assistant_text"] == "debug DASHSCOPE_API_KEY=[REDACTED]"
-    assert rows[2]["message"] == "failed with [REDACTED]"
-    assert rows[2]["response_body"] == "OPENROUTER_API_KEY=[REDACTED]"
+    assert secret not in json.dumps(rows[2], sort_keys=True)
+    assert rows[3]["message"] == "failed with [REDACTED]"
+    assert rows[3]["response_body"] == "OPENROUTER_API_KEY=[REDACTED]"
