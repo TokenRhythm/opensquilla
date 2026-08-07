@@ -102,9 +102,7 @@ describe('ChatComposerPlanMode', () => {
   })
 
   it('is rendered inside the composer footer instead of as an external strip', () => {
-    // The footer carries a dynamic popover-open class binding, so match the
-    // class token itself rather than the exact single-line opening tag.
-    const footerIndex = chatComposerSource.indexOf('class="chat-input-footer"')
+    const footerIndex = chatComposerSource.indexOf('<div class="chat-input-footer">')
     const modeIndex = chatComposerSource.indexOf('<ChatComposerPlanMode', footerIndex)
     const rightActionsIndex = chatComposerSource.indexOf(
       '<div class="chat-input-actions chat-input-actions--right">',

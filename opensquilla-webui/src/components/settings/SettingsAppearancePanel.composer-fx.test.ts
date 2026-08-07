@@ -3,9 +3,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createApp, nextTick } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import i18n from '@/i18n'
+import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
 import SettingsAppearancePanel from './SettingsAppearancePanel.vue'
 
 const mountedApps: Array<{ app: ReturnType<typeof createApp>, el: HTMLElement }> = []
+const composerPreference = useComposerFloatingPreference()
 
 async function mountPanel() {
   const el = document.createElement('div')
@@ -23,6 +25,7 @@ async function mountPanel() {
 
 beforeEach(() => {
   localStorage.clear()
+  composerPreference.setEnabled(true)
   i18n.global.locale.value = 'en'
 })
 
@@ -35,7 +38,7 @@ afterEach(() => {
 })
 
 describe('SettingsAppearancePanel — floating composer', () => {
-  it('renders the floating-composer toggle, on by default', async () => {
+  it('renders the enabled floating-composer preference', async () => {
     const el = await mountPanel()
     const toggle = el.querySelector<HTMLInputElement>('[data-testid="settings-composer-fx-toggle"]')
 
@@ -59,7 +62,7 @@ describe('SettingsAppearancePanel — floating composer', () => {
   })
 
   it('flips back on and persists the enabled preference', async () => {
-    localStorage.setItem('opensquilla.composerFx', JSON.stringify({ enabled: false }))
+    composerPreference.setEnabled(false)
     const el = await mountPanel()
     const toggle = el.querySelector<HTMLInputElement>('[data-testid="settings-composer-fx-toggle"]')!
 

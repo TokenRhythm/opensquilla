@@ -84,6 +84,11 @@
           :aria-label="t('chat.conversation')"
           :aria-busy="isStreaming"
           @scroll="onThreadScroll"
+          @wheel.passive="onThreadWheel"
+          @touchmove.passive="markThreadScrollIntent('either')"
+          @pointerdown="markThreadScrollIntent('either')"
+          @pointermove="onThreadPointerMove"
+          @keydown="onThreadScrollKeydown"
         >
         <template v-if="isNewChatLanding">
           <div class="chat-landing-brand" :aria-label="t('chat.newChatBrand')">
@@ -534,7 +539,7 @@
       :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
       :collapsed="composerCollapsed && composerFxEnabled && !isNewChatLanding"
       :floating="composerFxEnabled && !isNewChatLanding"
-      @expand="composerCollapsed = false"
+      @expand="expandComposer"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -812,6 +817,10 @@ import {
 import { listPendingMetaDiscards } from '@/utils/chat/metaDiscardOutbox'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
+  createComposerRetractionController,
+  type ComposerScrollIntent,
+} from '@/utils/chat/composerRetraction'
+import {
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
   isCurrentSessionPayload as payloadIsCurrentSession,
@@ -851,6 +860,7 @@ import {
 
 interface ChatComposerHandle {
   composerElement: () => HTMLElement | null
+  canCollapse: () => boolean
   focusTextarea: () => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
@@ -937,23 +947,17 @@ const pendingAutoSendSessionKey = ref('')
 
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
-/* Floating-composer retract: scrolling up off the live edge collapses to a
-   single-line input; any downward browsing (or landing back at the live edge)
-   restores the full panel. Direction + hysteresis keeps slow drags near the
-   edge from flapping the panel. */
-const COMPOSER_RETRACT_GAP = 120
-const COMPOSER_EXPAND_GAP = 60
-const COMPOSER_SCROLL_DEADZONE = 4
+/* Floating-composer retract: a pure controller accumulates slow user travel
+   while ignoring scrollTop changes caused by history, minimap, and layout. */
+const composerRetraction = createComposerRetractionController()
 const composerCollapsed = ref(false)
-let lastThreadScrollTop: number | null = null
+let pendingComposerScrollIntent: ComposerScrollIntent = null
+let composerScrollIntentTimer: number | null = null
 
 // Settings → Appearance "Floating composer" toggle. Off: the composer docks in
 // the normal layout and never retracts; on (default): it floats over the
 // transcript and collapses to a single line while scrolling up.
 const { enabled: composerFxEnabled } = useComposerFloatingPreference()
-watch(composerFxEnabled, (on) => {
-  if (!on) composerCollapsed.value = false
-})
 type ChatHeaderActionsHandle = {
   focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
 }
@@ -962,6 +966,43 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+
+function clearPendingComposerScrollIntent() {
+  pendingComposerScrollIntent = null
+  if (composerScrollIntentTimer !== null) {
+    window.clearTimeout(composerScrollIntentTimer)
+    composerScrollIntentTimer = null
+  }
+}
+
+function resetComposerRetraction() {
+  clearPendingComposerScrollIntent()
+  composerCollapsed.value = composerRetraction.reset()
+}
+
+function expandComposer() {
+  clearPendingComposerScrollIntent()
+  composerCollapsed.value = composerRetraction.expand(threadRef.value?.scrollTop ?? null)
+}
+
+function markThreadScrollIntent(intent: Exclude<ComposerScrollIntent, null>) {
+  pendingComposerScrollIntent = intent
+  if (composerScrollIntentTimer !== null) window.clearTimeout(composerScrollIntentTimer)
+  // Wheel scrolling can land one frame after its input event. A short token
+  // covers that browser scheduling gap; direction matching still rejects a
+  // history-prepend correction that moves opposite to the gesture.
+  composerScrollIntentTimer = window.setTimeout(() => {
+    pendingComposerScrollIntent = null
+    composerScrollIntentTimer = null
+  }, 120)
+}
+
+function currentThreadScrollIntent(): ComposerScrollIntent {
+  return pendingComposerScrollIntent
+}
+
+watch(composerFxEnabled, resetComposerRetraction, { flush: 'sync' })
+watch(sessionKey, resetComposerRetraction, { flush: 'sync' })
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
@@ -2835,7 +2876,9 @@ watch(messages, () => attachTurnReasoning())
 // Unsubscribers
 let unsubs: (() => void)[] = []
 let chatViewDisposed = false
-let composerResizeObserver: ResizeObserver | null = null
+let composerDockResizeObserver: ResizeObserver | null = null
+let composerDockPinFrame: number | null = null
+let lastComposerDockHeight = -1
 
 /* ── Computed ──────────────────────────────────────────────────────── */
 
@@ -2850,6 +2893,8 @@ const isNewChatLanding = computed(() => {
     pendingQueue.value.length === 0 &&
     !compactStatus.value.visible
 })
+
+watch(isNewChatLanding, resetComposerRetraction, { flush: 'sync' })
 
 const historyRecoveryState = computed(() => {
   return resolveChatHistoryRecoveryState({
@@ -3676,40 +3721,72 @@ function onThreadScroll() {
   if (!el) return
   const gap = el.scrollHeight - el.scrollTop - el.clientHeight
   historyNavigationScrollLock.updateFromScroll(gap)
-  if (isNewChatLanding.value || !composerFxEnabled.value) return
-  if (lastThreadScrollTop === null) {
-    // First scroll of the session: no direction baseline yet, so fall back to
-    // the absolute live-edge gap (also covers programmatic first scrolls).
-    lastThreadScrollTop = el.scrollTop
-    if (composerCollapsed.value) {
-      if (gap < COMPOSER_EXPAND_GAP) composerCollapsed.value = false
-    } else if (gap > COMPOSER_RETRACT_GAP) {
-      composerCollapsed.value = true
-    }
+  if (isNewChatLanding.value || !composerFxEnabled.value) {
+    resetComposerRetraction()
     return
   }
-  const delta = el.scrollTop - lastThreadScrollTop
-  lastThreadScrollTop = el.scrollTop
-  if (composerCollapsed.value) {
-    // Any downward browsing — even a short nudge — restores the panel.
-    if (delta > COMPOSER_SCROLL_DEADZONE || gap < COMPOSER_EXPAND_GAP) {
-      composerCollapsed.value = false
-    }
-  } else if (delta < -COMPOSER_SCROLL_DEADZONE && gap > COMPOSER_RETRACT_GAP) {
-    composerCollapsed.value = true
+  const wasCollapsed = composerCollapsed.value
+  composerCollapsed.value = composerRetraction.observe({
+    scrollTop: el.scrollTop,
+    bottomGap: gap,
+    intent: currentThreadScrollIntent(),
+    canCollapse: !slashOpen.value && (composerRef.value?.canCollapse() ?? true),
+    navigationLocked: historyNavigationScrollLock.locked,
+  })
+  if (composerCollapsed.value !== wasCollapsed) clearPendingComposerScrollIntent()
+}
+
+function onThreadWheel(event: WheelEvent) {
+  if (event.deltaY === 0) return
+  markThreadScrollIntent(event.deltaY < 0 ? 'up' : 'down')
+}
+
+function onThreadPointerMove(event: PointerEvent) {
+  if (event.buttons !== 0 || event.pointerType === 'touch') {
+    markThreadScrollIntent('either')
   }
+}
+
+function onThreadScrollKeydown(event: KeyboardEvent) {
+  if (event.target !== event.currentTarget) return
+  const up = event.key === 'ArrowUp'
+    || event.key === 'PageUp'
+    || event.key === 'Home'
+    || (event.key === ' ' && event.shiftKey)
+  const down = event.key === 'ArrowDown'
+    || event.key === 'PageDown'
+    || event.key === 'End'
+    || (event.key === ' ' && !event.shiftKey)
+  if (up || down) markThreadScrollIntent(up ? 'up' : 'down')
+}
+
+function syncComposerRetractionFromThread() {
+  const el = threadRef.value
+  if (!el) return
+  clearPendingComposerScrollIntent()
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
+  historyNavigationScrollLock.updateFromScroll(gap)
+  composerCollapsed.value = composerRetraction.observe({
+    scrollTop: el.scrollTop,
+    bottomGap: gap,
+    intent: null,
+    canCollapse: !slashOpen.value && (composerRef.value?.canCollapse() ?? true),
+    navigationLocked: false,
+  })
 }
 
 function onHistoryNavigate() {
   cancelAnchorStabilization()
+  syncComposerRetractionFromThread()
   historyNavigationScrollLock.start()
 }
 
 function onHistoryNavigateEnd() {
   historyNavigationScrollLock.finish()
-  // Reconcile once at the final position: scroll events emitted during the
-  // smooth transition were intentionally ignored while the lock was active.
-  onThreadScroll()
+  // Smooth-scroll frames and the final arrival are navigation, not transcript
+  // browsing gestures. Establish a baseline without toggling the composer.
+  syncComposerRetractionFromThread()
+  if (autoScroll.value) expandComposer()
 }
 
 // Show the jump-to-latest affordance whenever the reader has scrolled up off the
@@ -3719,6 +3796,7 @@ const showJumpToLatest = computed(() => !autoScroll.value && messages.value.leng
 function jumpToLatest() {
   cancelAnchorStabilization()
   historyNavigationScrollLock.finish()
+  expandComposer()
   autoScroll.value = true
   scrollToBottom()
 }
@@ -4129,14 +4207,27 @@ onMounted(async () => {
       error instanceof Error ? error.message : error,
     )
   })
-  // Composer resize observer
-  const composerEl = composerRef.value?.composerElement()
-  if (composerEl) {
-    composerResizeObserver = new ResizeObserver(() => {
-      const h = composerRef.value?.composerElement()?.getBoundingClientRect().height || 0
-      document.documentElement.style.setProperty('--composer-h', h + 'px')
-    })
-    composerResizeObserver.observe(composerEl)
+  // The entire dock can grow through attachments, pending work, and textarea
+  // autoresize. Publish its real height locally so the thread always reserves
+  // exactly enough clearance for the floating surface.
+  const composerDock = composerRef.value?.composerElement()?.parentElement ?? null
+  if (composerDock && typeof ResizeObserver !== 'undefined') {
+    const publishComposerDockHeight = () => {
+      const height = Math.ceil(composerDock.getBoundingClientRect().height)
+      if (height === lastComposerDockHeight) return
+      lastComposerDockHeight = height
+      threadRef.value?.style.setProperty('--composer-dock-h', `${height}px`)
+      if (autoScroll.value && composerDockPinFrame === null) {
+        composerDockPinFrame = requestAnimationFrame(() => {
+          composerDockPinFrame = null
+          const thread = threadRef.value
+          if (thread && autoScroll.value) thread.scrollTop = thread.scrollHeight
+        })
+      }
+    }
+    composerDockResizeObserver = new ResizeObserver(publishComposerDockHeight)
+    composerDockResizeObserver.observe(composerDock)
+    publishComposerDockHeight()
   }
 
   // Focus textarea on desktop
@@ -4212,8 +4303,16 @@ onUnmounted(() => {
   cleanupVoiceInput()
   chatApprovals.cleanup()
   metaRuns.cleanup()
-  if (composerResizeObserver) { composerResizeObserver.disconnect(); composerResizeObserver = null }
-  document.documentElement.style.removeProperty('--composer-h')
+  if (composerDockResizeObserver) {
+    composerDockResizeObserver.disconnect()
+    composerDockResizeObserver = null
+  }
+  if (composerDockPinFrame !== null) {
+    cancelAnimationFrame(composerDockPinFrame)
+    composerDockPinFrame = null
+  }
+  clearPendingComposerScrollIntent()
+  threadRef.value?.style.removeProperty('--composer-dock-h')
   // Drop any live share-preview object URL so the blob can be reclaimed.
   if (sharePreview.value) {
     URL.revokeObjectURL(sharePreview.value.url)

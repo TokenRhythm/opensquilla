@@ -26,6 +26,23 @@ describe('useComposerFloatingPreference', () => {
     expect(useComposerFloatingPreference().enabled.value).toBe(false)
   })
 
+  it('falls back to enabled for malformed or inaccessible storage', async () => {
+    vi.stubGlobal('localStorage', {
+      getItem: vi.fn(() => '{not-json'),
+      setItem: vi.fn(),
+    })
+    let preference = await import('./useComposerFloatingPreference')
+    expect(preference.useComposerFloatingPreference().enabled.value).toBe(true)
+
+    vi.resetModules()
+    vi.stubGlobal('localStorage', {
+      getItem: vi.fn(() => { throw new Error('blocked') }),
+      setItem: vi.fn(),
+    })
+    preference = await import('./useComposerFloatingPreference')
+    expect(preference.useComposerFloatingPreference().enabled.value).toBe(true)
+  })
+
   it('shares live state across consumers and persists the toggle', async () => {
     const setItem = vi.fn()
     vi.stubGlobal('localStorage', {
@@ -48,6 +65,18 @@ describe('useComposerFloatingPreference', () => {
     const { enabled, setEnabled } = useComposerFloatingPreference()
 
     expect(enabled.value).toBe(true)
+    expect(() => setEnabled(false)).not.toThrow()
+    expect(enabled.value).toBe(false)
+  })
+
+  it('keeps live state when persisting is blocked', async () => {
+    vi.stubGlobal('localStorage', {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(() => { throw new Error('quota') }),
+    })
+    const { useComposerFloatingPreference } = await import('./useComposerFloatingPreference')
+    const { enabled, setEnabled } = useComposerFloatingPreference()
+
     expect(() => setEnabled(false)).not.toThrow()
     expect(enabled.value).toBe(false)
   })

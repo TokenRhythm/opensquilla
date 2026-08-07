@@ -2,55 +2,63 @@
   <div
     ref="composerEl"
     class="chat-composer"
-    :class="{ 'chat-composer--new-landing': isNewLanding, 'chat-composer--collapsed': collapsed, 'chat-composer--docked': !floating }"
+    :class="{
+      'chat-composer--new-landing': isNewLanding,
+      'chat-composer--collapsed': collapsed,
+      'chat-composer--floating': floating,
+      'chat-composer--docked': !floating,
+    }"
   >
     <div class="chat-composer-inner">
-      <div v-if="attachments.length > 0" class="chat-attachments">
-        <div
-          v-for="(att, i) in attachments"
-          :key="att.local_id"
-          class="attachment-chip"
-          :class="{ 'attachment-chip--busy': isAttachmentBusy(att), 'attachment-chip--failed': att.kind === 'failed' }"
-          :data-mime="att.mime || ''"
-          :title="attachmentTitle(att)"
-        >
-          <span class="attachment-chip__icon" aria-hidden="true">
-            <span v-if="isAttachmentBusy(att)" class="spinner attachment-chip__spinner" />
-            <Icon v-else-if="att.kind === 'failed'" name="info" :size="15" />
-            <img v-else-if="isImageDisplayAttachment(att) && att.dataUrl" class="attachment-chip__thumb" :src="att.dataUrl" alt="" />
-            <Icon v-else :name="attachmentIcon(att)" :size="15" />
-          </span>
-          <span class="attachment-chip__name">{{ att.name }}</span>
-          <span class="attachment-chip__meta">{{ attachmentMeta(att) }}</span>
-          <button v-if="att.kind === 'failed' && att.file" class="attachment-action" title="Retry upload" aria-label="Retry upload" @click="emit('retryAttachment', i)">
-            <Icon name="refresh" :size="12" />
-          </button>
-          <button class="attachment-action attachment-remove" :title="t('chat.remove')" :aria-label="t('chat.remove')" @click="emit('removeAttachment', i)">
-            <Icon name="x" :size="12" />
-          </button>
+      <div v-if="attachments.length > 0" class="chat-collapse-region">
+        <div class="chat-attachments">
+          <div
+            v-for="(att, i) in attachments"
+            :key="att.local_id"
+            class="attachment-chip"
+            :class="{ 'attachment-chip--busy': isAttachmentBusy(att), 'attachment-chip--failed': att.kind === 'failed' }"
+            :data-mime="att.mime || ''"
+            :title="attachmentTitle(att)"
+          >
+            <span class="attachment-chip__icon" aria-hidden="true">
+              <span v-if="isAttachmentBusy(att)" class="spinner attachment-chip__spinner" />
+              <Icon v-else-if="att.kind === 'failed'" name="info" :size="15" />
+              <img v-else-if="isImageDisplayAttachment(att) && att.dataUrl" class="attachment-chip__thumb" :src="att.dataUrl" alt="" />
+              <Icon v-else :name="attachmentIcon(att)" :size="15" />
+            </span>
+            <span class="attachment-chip__name">{{ att.name }}</span>
+            <span class="attachment-chip__meta">{{ attachmentMeta(att) }}</span>
+            <button v-if="att.kind === 'failed' && att.file" class="attachment-action" title="Retry upload" aria-label="Retry upload" @click="emit('retryAttachment', i)">
+              <Icon name="refresh" :size="12" />
+            </button>
+            <button class="attachment-action attachment-remove" :title="t('chat.remove')" :aria-label="t('chat.remove')" @click="emit('removeAttachment', i)">
+              <Icon name="x" :size="12" />
+            </button>
+          </div>
         </div>
       </div>
       <div class="chat-input-panel">
-        <div
-          v-if="replanActive"
-          class="chat-replan-draft"
-          role="status"
-          aria-live="polite"
-        >
-          <span class="chat-replan-draft__icon" aria-hidden="true">
-            <Icon name="pencil" :size="14" />
-          </span>
-          <span class="chat-replan-draft__copy">
-            <strong>{{ t('chat.plan.revising') }}</strong>
-            {{ t('chat.plan.reviseDraftHint') }}
-          </span>
-          <button
-            type="button"
-            class="chat-replan-draft__cancel"
-            @click="emit('cancelReplan')"
+        <div v-if="replanActive" class="chat-collapse-region">
+          <div
+            class="chat-replan-draft"
+            role="status"
+            aria-live="polite"
           >
-            {{ t('common.cancel') }}
-          </button>
+            <span class="chat-replan-draft__icon" aria-hidden="true">
+              <Icon name="pencil" :size="14" />
+            </span>
+            <span class="chat-replan-draft__copy">
+              <strong>{{ t('chat.plan.revising') }}</strong>
+              {{ t('chat.plan.reviseDraftHint') }}
+            </span>
+            <button
+              type="button"
+              class="chat-replan-draft__cancel"
+              @click="emit('cancelReplan')"
+            >
+              {{ t('common.cancel') }}
+            </button>
+          </div>
         </div>
         <div class="chat-input-wrap">
           <textarea
@@ -63,18 +71,17 @@
             maxlength="100000"
             :aria-label="t('chat.messageToSend')"
             :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
-            @beforeinput="emit('beforeinput', $event)"
+            @beforeinput="emit('expand'); emit('beforeinput', $event)"
             @input="emit('input', $event)"
             @keydown="emit('keydown', $event)"
             @compositionstart="emit('compositionChange', true)"
             @compositionend="emit('compositionChange', false)"
+            @pointerdown="emit('expand')"
             @focus="emit('expand')"
           />
         </div>
-        <div
-          class="chat-input-footer"
-          :class="{ 'chat-input-footer--popover-open': anyPopoverOpen }"
-        >
+        <div class="chat-collapse-region chat-collapse-region--footer">
+          <div class="chat-input-footer">
           <div class="chat-input-actions chat-input-actions--left">
             <div ref="addMenuAnchorEl" class="chat-settings-anchor">
               <button
@@ -316,17 +323,21 @@
               </button>
             </Transition>
           </div>
+          </div>
         </div>
       </div>
-      <p
-        v-if="sendBlockedMessage"
-        id="chat-composer-send-status"
-        class="chat-composer-send-status"
-        role="status"
-        aria-live="polite"
-        aria-atomic="true"
-      >{{ sendBlockedMessage }}</p>
-      <p class="chat-ai-disclaimer" role="note">{{ t('chat.aiDisclaimer') }}</p>
+      <div v-if="sendBlockedMessage" class="chat-collapse-region">
+        <p
+          id="chat-composer-send-status"
+          class="chat-composer-send-status"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >{{ sendBlockedMessage }}</p>
+      </div>
+      <div class="chat-collapse-region">
+        <p class="chat-ai-disclaimer" role="note">{{ t('chat.aiDisclaimer') }}</p>
+      </div>
     </div>
     <input
       ref="fileInputEl"
@@ -356,6 +367,7 @@ import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachm
 
 interface ChatComposerExpose {
   composerElement: () => HTMLElement | null
+  canCollapse: () => boolean
   focusTextarea: () => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
@@ -410,7 +422,7 @@ const props = withDefaults(defineProps<{
   codingModeSettingsBusy: false,
   inputDisabled: false,
   safeSetupAvailable: false,
-  floating: true,
+  floating: false,
 })
 
 const emit = defineEmits<{
@@ -637,6 +649,16 @@ function composerElement(): HTMLElement | null {
   return composerEl.value
 }
 
+function canCollapse(): boolean {
+  const activeElement = document.activeElement
+  return !anyPopoverOpen.value
+    && (
+      !activeElement
+      || activeElement === textareaEl.value
+      || !composerEl.value?.contains(activeElement)
+    )
+}
+
 function documentCanReceiveFocus(): boolean {
   return document.visibilityState === 'visible' && document.hasFocus()
 }
@@ -666,6 +688,7 @@ function resizeTextarea() {
 
 defineExpose<ChatComposerExpose>({
   composerElement,
+  canCollapse,
   focusTextarea,
   isTextareaFocused,
   resizeTextarea,
@@ -678,12 +701,17 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-composer {
-  /* Floating composer: no bottom-bar band, just breathing room around the
-     glass panel so it reads as a card hovering over the transcript. */
-  padding: 0.5rem 1.5rem 1.25rem;
+  padding: 0.75rem 1.5rem 1.875rem;
   border-top: 0;
-  background: transparent;
+  background: var(--bg-surface);
   flex-shrink: 0;
+}
+
+.chat-composer--floating {
+  /* No bottom-bar band: leave breathing room around the glass card while the
+     disabled preference retains the established docked surface exactly. */
+  padding: 0.5rem 1.5rem 1.25rem;
+  background: transparent;
 }
 
 .chat-composer--new-landing {
@@ -949,13 +977,32 @@ defineExpose<ChatComposerExpose>({
   min-height: 128px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-modal);
-  /* Glass card: translucent surface + backdrop blur so the transcript scrolls
-     softly behind the floating composer instead of a solid bottom bar. */
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-xs);
+  position: relative;
+}
+
+/* Glass is opt-in. ChatComposer is also reused outside ChatView, where an
+   opaque panel remains the compatibility-safe default. */
+.chat-composer--floating .chat-input-panel {
   background: color-mix(in srgb, var(--bg-surface) 72%, transparent);
   -webkit-backdrop-filter: blur(16px) saturate(140%);
   backdrop-filter: blur(16px) saturate(140%);
   box-shadow: var(--shadow-lg);
-  position: relative;
+}
+
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .chat-composer--floating .chat-input-panel {
+    background: var(--bg-surface);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .chat-composer--floating .chat-input-panel {
+    background: var(--bg-surface);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
 }
 
 .chat-replan-draft {
@@ -1021,11 +1068,8 @@ defineExpose<ChatComposerExpose>({
   transition: padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.chat-composer--collapsed {
-  /* !important: the bundler emits a duplicate .chat-composer rule scoped to
-     the parent (ChatView) that lands later in the chunk CSS and would
-     otherwise win the cascade for padding-bottom. */
-  padding-bottom: 0.5rem !important;
+.chat-composer--floating.chat-composer--collapsed {
+  padding-bottom: 0.5rem;
 }
 
 /* Floating-composer toggle off (docked layout): the panel is a solid surface
@@ -1037,87 +1081,42 @@ defineExpose<ChatComposerExpose>({
   backdrop-filter: none !important;
 }
 
-.chat-attachments,
-.chat-replan-draft,
-.chat-composer-send-status,
-.chat-ai-disclaimer {
-  overflow: hidden;
-  transition:
-    opacity var(--dur-base) var(--ease-out),
-    transform var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
-    max-height var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
-    margin var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
-    padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
-    visibility 0s linear;
-}
-.chat-attachments { max-height: 180px; }
-.chat-replan-draft { max-height: 96px; }
-.chat-composer-send-status { max-height: 64px; }
-.chat-ai-disclaimer { max-height: 64px; }
-
-.chat-composer--collapsed .chat-attachments,
-.chat-composer--collapsed .chat-replan-draft,
-.chat-composer--collapsed .chat-composer-send-status,
-.chat-composer--collapsed .chat-ai-disclaimer {
-  opacity: 0;
-  transform: translateY(6px);
-  max-height: 0 !important;
-  margin-top: 0 !important;
-  margin-bottom: 0 !important;
-  padding-top: 0 !important;
-  padding-bottom: 0 !important;
-  visibility: hidden;
-  pointer-events: none;
-  transition:
-    opacity var(--dur-base) var(--ease-out),
-    transform var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
-    max-height var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
-    margin var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
-    padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
-    visibility 0s linear var(--dur-enter);
-}
-
-/* Toolbar row: animate its height precisely with the grid-rows trick. */
-.chat-input-footer {
+/* A one-row grid animates to zero without imposing an arbitrary max-height on
+   attachments or status copy. Expanded content therefore keeps its natural
+   height, including on narrow screens and with many attachments. */
+.chat-collapse-region {
   display: grid;
-  grid-template-columns: 1fr auto;
-  grid-template-rows: 1fr;
-  justify-content: initial;
-  gap: 0.75rem;
-  padding: 0.25rem 0.625rem 0.625rem;
+  grid-template-rows: minmax(0, 1fr);
+  opacity: 1;
+  overflow: hidden;
   transition:
     grid-template-rows var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
     opacity var(--dur-base) var(--ease-out),
-    padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    transform var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
     visibility 0s linear;
 }
-.chat-input-footer > * {
+
+.chat-collapse-region > * {
   min-height: 0;
-  overflow: hidden;
 }
 
-/* While a composer menu is open, the footer must not clip it: the menus are
-   absolutely positioned above their anchor (bottom: calc(100% + 8px)) and the
-   overflow: hidden above exists only for the retract animation. Collapsing
-   closes menus (see closeAllPopovers) and re-applies the clip below. */
-.chat-input-footer--popover-open > * {
+/* Composer menus are positioned above their anchors and must escape the
+   animation wrapper while the footer is fully expanded. */
+.chat-composer:not(.chat-composer--collapsed) .chat-collapse-region--footer {
   overflow: visible;
 }
 
-.chat-composer--collapsed .chat-input-footer > * {
-  overflow: hidden !important;
-}
-.chat-composer--collapsed .chat-input-footer {
-  grid-template-rows: 0fr !important;
+.chat-composer--collapsed .chat-collapse-region {
+  grid-template-rows: minmax(0, 0fr);
   opacity: 0;
-  padding-top: 0 !important;
-  padding-bottom: 0 !important;
+  transform: translateY(6px);
   visibility: hidden;
   pointer-events: none;
+  overflow: hidden;
   transition:
     grid-template-rows var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
     opacity var(--dur-base) var(--ease-out),
-    padding var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
+    transform var(--dur-enter) cubic-bezier(0.4, 0, 0.2, 1),
     visibility 0s linear var(--dur-enter);
 }
 
@@ -1153,16 +1152,13 @@ defineExpose<ChatComposerExpose>({
   box-shadow: var(--shadow-xl);
 }
 
+.chat-input-footer,
 .chat-input-actions {
   display: flex;
   align-items: center;
 }
 
 .chat-input-footer {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  grid-template-rows: 1fr;
-  align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
   padding: 0.25rem 0.625rem 0.625rem;
@@ -1550,6 +1546,13 @@ defineExpose<ChatComposerExpose>({
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .chat-composer,
+  .chat-collapse-region,
+  .chat-input-panel,
+  .chat-textarea {
+    transition: none !important;
+  }
+
   .chat-run-mode-lock-tip {
     transition: none;
   }
@@ -1557,6 +1560,20 @@ defineExpose<ChatComposerExpose>({
   .composer-ctl-enter-active,
   .composer-ctl-leave-active {
     transition: none;
+  }
+}
+
+@media (max-width: 768px) {
+  .chat-composer {
+    padding: 0.5rem 0.75rem;
+  }
+
+  .chat-composer--floating {
+    padding: 0.5rem 0.75rem calc(0.875rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  .chat-composer--floating.chat-composer--collapsed {
+    padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
   }
 }
 

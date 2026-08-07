@@ -758,7 +758,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 /* The composer is a single floating work surface. A quiet hairline, a top
    highlight, and two shadow depths create separation without a heavy frame. */
 #app .chat .chat-input-panel {
-  background: color-mix(in srgb, var(--bg-surface) 72%, transparent);
+  background: color-mix(in srgb, var(--bg-surface) 97%, var(--bg-surface-2));
   border-color: color-mix(in srgb, var(--text) 9%, transparent);
   box-shadow:
     inset 0 1px 0 var(--elev-highlight),
@@ -770,13 +770,36 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 #app .chat .chat-input-panel:focus-within,
 #app .chat .chat-composer--new-landing .chat-input-panel:focus-within {
-  background: color-mix(in srgb, var(--bg-surface) 85%, transparent);
+  background: var(--bg-surface);
   border-color: color-mix(in srgb, var(--text) 18%, transparent);
   box-shadow:
     inset 0 1px 0 var(--elev-highlight),
     0 0 0 3px color-mix(in srgb, var(--accent) 7%, transparent),
     0 2px 5px color-mix(in srgb, var(--text) 8%, transparent),
     0 18px 42px -26px color-mix(in srgb, var(--text) 34%, transparent);
+}
+
+/* Only the opted-in conversation composer is translucent. Landing and other
+   ChatComposer consumers retain the established opaque surface. */
+#app .chat .chat-composer--floating .chat-input-panel {
+  background: color-mix(in srgb, var(--bg-surface) 72%, transparent);
+}
+
+#app .chat .chat-composer--floating .chat-input-panel:focus-within {
+  background: color-mix(in srgb, var(--bg-surface) 85%, transparent);
+}
+
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  #app .chat .chat-composer--floating .chat-input-panel {
+    background: var(--bg-surface);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  #app .chat .chat-composer--floating .chat-input-panel,
+  #app .chat .chat-composer--floating .chat-input-panel:focus-within {
+    background: var(--bg-surface);
+  }
 }
 
 #app .chat .chat-textarea,
