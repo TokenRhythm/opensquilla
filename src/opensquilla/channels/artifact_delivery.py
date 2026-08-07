@@ -164,6 +164,13 @@ async def deliver_artifacts_as_channel_files(
         return artifacts
 
     store = ArtifactStore(media_root_from_config(config))
+    sig = inspect.signature(send_file)
+    meta = msg.metadata or {}
+    send_kwargs: dict[str, Any] = {}
+    if "chat_type" in sig.parameters and meta.get("chat_type"):
+        send_kwargs["chat_type"] = meta["chat_type"]
+    if "msg_id" in sig.parameters and meta.get("msg_id"):
+        send_kwargs["msg_id"] = meta["msg_id"]
     undelivered: list[dict[str, Any]] = []
     for artifact in dedupe_artifacts_for_channel_delivery(artifacts):
         artifact_id = artifact.get("id")
@@ -174,13 +181,6 @@ async def deliver_artifacts_as_channel_files(
         try:
             ref, path = store.resolve_for_download(artifact_id, session_id=session_id)
             with _named_artifact_delivery_path(path, ref.name) as delivery_path:
-                send_kwargs: dict[str, Any] = {}
-                sig = inspect.signature(send_file)
-                meta = msg.metadata or {}
-                if "chat_type" in sig.parameters and meta.get("chat_type"):
-                    send_kwargs["chat_type"] = meta["chat_type"]
-                if "msg_id" in sig.parameters and meta.get("msg_id"):
-                    send_kwargs["msg_id"] = meta["msg_id"]
                 result = send_file(msg.channel_id, str(delivery_path), **send_kwargs)
                 if inspect.isawaitable(result):
                     result = await result
