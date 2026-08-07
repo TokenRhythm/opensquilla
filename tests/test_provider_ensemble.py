@@ -1911,6 +1911,47 @@ async def test_control_wins_if_it_arrives_with_primary_failure(
 
 
 @pytest.mark.asyncio
+async def test_proposer_physical_calls_disable_provider_private_state_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft"),
+                    DoneEvent(input_tokens=1, output_tokens=1, model="p1"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final"),
+                    DoneEvent(input_tokens=1, output_tokens=1, model="agg"),
+                ]
+            ),
+        }
+    )
+    built_configs: list[ProviderConfig] = []
+
+    def build_provider(cfg: ProviderConfig) -> _FakeProvider:
+        built_configs.append(cfg)
+        return registry.provider_for(cfg)
+
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", build_provider)
+    provider = EnsembleProvider(
+        profile_name="private-state-boundary",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+
+    await _collect(provider)
+
+    replay_by_model = {cfg.model: cfg.replay_provider_state for cfg in built_configs}
+    assert replay_by_model == {"p1": False, "agg": True}
+
+
+@pytest.mark.asyncio
 async def test_ensemble_proposer_tool_events_violate_inert_candidate_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
