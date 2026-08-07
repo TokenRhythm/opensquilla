@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_cron import (
     _build_payload,
@@ -26,6 +28,8 @@ from opensquilla.scheduler.types import (
     ReplyTargetSnapshot,
     SessionTarget,
 )
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.storage import SessionStorage
 
 SESSION_KEY = "agent:main:webchat:abc123"
 CRON_SESSION_KEY = "cron:drink:run:def456"
@@ -52,6 +56,7 @@ class _FakeScheduler:
             delivery=kwargs.get("delivery") or DeliveryConfig(),
             tool_policy=kwargs.get("tool_policy") or {},
             creator_is_owner=bool(kwargs.get("creator_is_owner", False)),
+            creator_host_execute=bool(kwargs.get("creator_host_execute", False)),
         )
 
     async def update_job(self, job_id, **patch) -> CronJob:
@@ -72,6 +77,11 @@ class _FakeSessionManager:
     def __init__(self) -> None:
         self.created = []
         self.rows = {}
+        self._storage = SimpleNamespace(bind_session_workspace=self._bind_session_workspace)
+        self.workspace_bindings = []
+
+    async def _bind_session_workspace(self, session_key, workspace_id):
+        self.workspace_bindings.append((session_key, workspace_id))
 
     async def get_or_create(self, **kwargs):
         self.created.append(kwargs)
@@ -116,6 +126,33 @@ class _FakeTurnRunner:
             yield SimpleNamespace(kind="done")
 
         return events()
+
+
+@pytest.mark.asyncio
+async def test_agent_run_binds_the_isolated_session_to_the_job_workspace() -> None:
+    session_manager = _FakeSessionManager()
+    turn_runner = _FakeTurnRunner(session_manager)
+    job = CronJob(
+        id="project-check",
+        name="Project check",
+        handler_key="agent_run",
+        payload={
+            "kind": AGENT_TURN_KIND,
+            "task": "inspect the project",
+            "agent_id": "main",
+            "_workspace_id": "project-123",
+        },
+        session_target=SessionTarget.ISOLATED,
+    )
+    handler = make_agent_run_handler(
+        DeliveryChain(),
+        turn_runner_ref=lambda: turn_runner,
+        session_manager_ref=lambda: session_manager,
+    )
+
+    result = await handler(job)
+
+    assert session_manager.workspace_bindings == [(result.session_key, "project-123")]
 
 
 class _FakeTaskRuntime:
@@ -231,6 +268,86 @@ async def test_rpc_create_current_session_job_passes_session_binding_to_schedule
     assert result["sessionTarget"] == "current"
     assert result["targetSessionKey"] == SESSION_KEY
     assert result["originSessionKey"] == SESSION_KEY
+
+
+@pytest.mark.parametrize(
+    (
+        "stored_mode",
+        "capabilities",
+        "is_owner",
+        "expected_mode",
+        "expected_host_execute",
+    ),
+    [
+        pytest.param(
+            "safe", frozenset(), True, "safe", True, id="owner-stored-safe"
+        ),
+        pytest.param(
+            "full",
+            frozenset({"task.read"}),
+            False,
+            "safe",
+            False,
+            id="admin-without-host",
+        ),
+        pytest.param(
+            "full",
+            frozenset({"host.execute"}),
+            False,
+            "full",
+            True,
+            id="named-host-token",
+        ),
+        pytest.param(None, frozenset(), True, "full", True, id="fresh-owner"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rpc_create_background_job_resolves_persisted_mode_for_principal(
+    tmp_path,
+    stored_mode: str | None,
+    capabilities: frozenset[str],
+    is_owner: bool,
+    expected_mode: str,
+    expected_host_execute: bool,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "cron-preference.db"))
+    if stored_mode is not None:
+        await storage.set_runtime_preference("sandbox.run_mode", stored_mode)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    scheduler = _FakeScheduler()
+    principal = Principal(
+        role="operator",
+        scopes=frozenset({"operator.admin"}),
+        is_owner=is_owner,
+        authenticated=True,
+        capabilities=capabilities,
+        auth_state="authenticated",
+        token_public_id=None if is_owner else "named-token",
+    )
+
+    try:
+        await _handle_cron_add(
+            {
+                "name": "Background",
+                "expression": "*/5 * * * *",
+                "payloadKind": AGENT_TURN_KIND,
+                "text": "check status",
+                "agentId": "main",
+            },
+            RpcContext(
+                conn_id="test",
+                cron_scheduler=scheduler,
+                session_manager=manager,
+                config=GatewayConfig(),
+                principal=principal,
+            ),
+        )
+    finally:
+        await storage.close()
+
+    assert scheduler.added["run_mode"] == expected_mode
+    assert scheduler.added["creator_is_owner"] is is_owner
+    assert scheduler.added["creator_host_execute"] is expected_host_execute
 
 
 @pytest.mark.asyncio
@@ -495,12 +612,22 @@ def test_delivery_sanitizes_reply_directives_across_cron_outputs() -> None:
             session_key=CRON_SESSION_KEY,
         )
     )
+    asyncio.run(
+        chain.notify_finished(
+            job,
+            success=True,
+            summary="[[reply_to_current]]Here is the scheduled reply",
+            session_key=CRON_SESSION_KEY,
+            run_id="run-1",
+        )
+    )
 
     assert report.channel_status == "delivered"
-    assert report.ws_status == "delivered"
+    assert report.ws_status == "skipped"
     assert report.session_status == "skipped"
     assert cm.adapter.sent[0].content == "Here is the scheduled reply"
     assert ws_events[0][2]["summary"] == "Here is the scheduled reply"
+    assert ws_events[0][2]["runId"] == "run-1"
     assert forward_calls == []
 
     forward_job = CronJob(
@@ -884,6 +1011,7 @@ async def test_owner_current_session_agent_run_uses_owner_tool_boundary() -> Non
         session_key=SESSION_KEY,
         origin_session_key=SESSION_KEY,
         creator_is_owner=True,
+        creator_host_execute=True,
         tool_policy={
             "profile": "minimal",
             "also_allow": ["memory_search", "exec_command"],

@@ -113,6 +113,35 @@ describe('ActivityDisclosure lifecycle transitions', () => {
       expect(summary?.getAttribute('aria-expanded')).toBe('true')
     },
   )
+
+  it('follows the live default open and folds when the turn settles', async () => {
+    const state = reactive({ lifecycle: 'working' as 'working' | 'settled' })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, {
+        lifecycle: state.lifecycle,
+        defaultOpen: state.lifecycle === 'working',
+        stepCount: 1,
+        failureCount: 0,
+        stateKey: 'message-live-to-settled',
+        continuityKey: 'turn-live-to-settled',
+      }, { default: () => 'Activity details' }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    expect(host.querySelector('.assistant-activity__live-head')?.getAttribute('aria-expanded'))
+      .toBe('true')
+
+    state.lifecycle = 'settled'
+    await nextTick()
+
+    expect(host.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('false')
+  })
 })
 
 describe('ActivityDisclosure resting affordance', () => {
@@ -204,7 +233,7 @@ describe('ActivityDisclosure summary label', () => {
 })
 
 describe('ActivityDisclosure live header', () => {
-  it('starts live work collapsed and expands from its status row', async () => {
+  it('still allows a live disclosure to be collapsed and expanded manually', async () => {
     const host = mountDisclosure({
       lifecycle: 'working',
       stepCount: 2,
@@ -319,7 +348,7 @@ describe('ActivityDisclosure stale state', () => {
 })
 
 describe('ActivityDisclosure expanded boundary', () => {
-  it('reveals its height progressively and closes it with a separator', () => {
+  it('reveals its height progressively without drawing a frame', () => {
     const bodyRule = cssRule('.assistant-activity__body')
     expect(bodyRule).toContain('grid-template-rows: 0fr;')
     expect(bodyRule).toContain('grid-template-rows var(--dur-base)')
@@ -331,15 +360,11 @@ describe('ActivityDisclosure expanded boundary', () => {
 
     const innerRule = cssRule('.assistant-activity__body-inner')
     expect(innerRule).toContain('overflow: hidden;')
-    expect(innerRule).toContain('border-left: 1px solid var(--border);')
+    expect(innerRule).not.toContain('border-left:')
     expect(innerRule).toContain('padding: 0 0 0 0.75rem;')
     expect(activityDisclosureSource).toContain('assistant-activity-item-enter')
-
-    const separatorRule = cssRule(
-      '.assistant-activity--settled[data-share-expanded="true"]::after',
-    )
-    expect(separatorRule).toContain('height: 1px;')
-    expect(separatorRule).toContain('background: var(--border);')
+    expect(activityDisclosureSource)
+      .not.toContain('.assistant-activity--settled[data-share-expanded="true"]::after')
   })
 })
 

@@ -105,6 +105,7 @@ export interface DesktopPreferences {
   effectiveWorkbenchPreviewMode?: WorkbenchPreviewMode
   workbenchPreviewNoticeShown?: boolean
   workbenchPreviewForcedOffline?: boolean
+  sandboxUnavailableWarningSuppressed?: boolean
 }
 
 export interface PlatformCapabilities {
@@ -358,8 +359,12 @@ export interface PlatformSettingsApi {
       mainWindowCloseBehavior?: DesktopMainWindowCloseBehavior
       workbenchPreviewMode?: WorkbenchPreviewMode
       workbenchPreviewNoticeShown?: boolean
+      sandboxUnavailableWarningSuppressed?: boolean
     },
   ) => Promise<DesktopPreferences>
+  reportSandboxUnavailable?: (
+    payload: { state: 'failed' | 'unavailable'; message?: string },
+  ) => Promise<{ shown: boolean; suppressed: boolean }>
 }
 
 export interface PlatformOnboardingApi {

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -177,13 +177,35 @@ def _patch_load_history(runner, *, return_value=None, raises=None, calls=None):
 
 
 def _patch_post_slice_probe(runner):
-    """Hook _build_attachment_messages (first call past the slice)."""
+    """Stop at Agent.run_turn, after compaction/history output is installed."""
 
-    def _probe(self, *args, **kwargs):  # noqa: ARG001, ARG002
-        snapshot = _capture_locals_at_post_slice()
-        raise _SliceCapture(snapshot)
+    factory = runner._agent_bootstrap_stage._agent_factory
+    original_build = factory.build
 
-    runner._build_attachment_messages = _probe.__get__(runner, TurnRunner)
+    class _ProbeAgentFactory:
+        def build(self, **kwargs: Any):
+            agent = original_build(**kwargs)
+
+            async def _probe_run_turn(
+                probe_agent: Any,
+                *_args: Any,
+                **_kwargs: Any,
+            ):
+                snapshot = {
+                    "outcome": "success",
+                    "agent_request_context_prompt_after": getattr(
+                        getattr(probe_agent, "config", None),
+                        "request_context_prompt",
+                        None,
+                    ),
+                }
+                raise _SliceCapture(snapshot)
+                yield  # pragma: no cover
+
+            agent.run_turn = MethodType(_probe_run_turn, agent)
+            return agent
+
+    runner._agent_bootstrap_stage._agent_factory = _ProbeAgentFactory()
 
 
 # ---------------------------------------------------------------------------

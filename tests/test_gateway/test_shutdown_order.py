@@ -140,3 +140,34 @@ async def test_service_close_does_not_block_event_loop_on_sidecar_writer(
         release_timer.cancel()
         release.set()
         await close_task
+
+
+@pytest.mark.asyncio
+async def test_service_close_cancels_deferred_warmup_before_catalog_coordinator() -> None:
+    warmup_started = asyncio.Event()
+    warmup_cancelled = asyncio.Event()
+    close_observations: list[bool] = []
+
+    async def _warmup() -> None:
+        warmup_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            warmup_cancelled.set()
+
+    class _Coordinator:
+        async def close(self) -> None:
+            close_observations.append(warmup_cancelled.is_set())
+
+    warmup_task = asyncio.create_task(_warmup())
+    await warmup_started.wait()
+    services = ServiceContainer(
+        config=GatewayConfig(),
+        model_catalog_refresh_coordinator=_Coordinator(),
+        deferred_warmup_task=warmup_task,
+    )
+
+    await services.close()
+
+    assert warmup_task.cancelled()
+    assert close_observations == [True]

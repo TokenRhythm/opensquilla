@@ -6,6 +6,7 @@ from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
 from opensquilla.provider.openai import _build_openai_wire_messages
+from opensquilla.provider.request_proof import project_final_request_payload
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ChatConfig, Message, ModelCapabilities
 
@@ -956,6 +957,33 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
                 return
             yield TextDeltaEvent(text="candidate")
             yield DoneEvent(model=self.model, input_tokens=1, output_tokens=1)
+
+        def project_final_request(
+            self,
+            messages,
+            tools=None,
+            config=None,
+            *,
+            message_limit=None,
+        ):
+            cfg = config or ChatConfig()
+            payload = {
+                "model": self.model,
+                "messages": [
+                    message.model_dump(mode="json", exclude_none=True)
+                    for message in messages
+                ],
+                "tools": [
+                    tool.model_dump(mode="json", exclude_none=True)
+                    for tool in (tools or [])
+                ],
+            }
+            return project_final_request_payload(
+                payload,
+                projection_adapter="synthetic_ensemble_member",
+                proof_budget=cfg.provider_request_max_chars or 1_000_000,
+                message_limit=message_limit,
+            )
 
     monkeypatch.setattr(
         "opensquilla.provider.ensemble._build_provider",

@@ -26,6 +26,7 @@ from opensquilla.gateway.boot import (
     start_gateway_server,
 )
 from opensquilla.gateway.config import GatewayConfig, is_public_bind, resolve_listen_address
+from opensquilla.gateway.config_migration import ConfigParseError
 from opensquilla.paths import default_opensquilla_home
 
 _SHUTDOWN_SIGNALS: tuple[signal.Signals, ...] = tuple(
@@ -108,6 +109,18 @@ def _gateway_bind_available(host: str, port: int) -> bool:
     return False if last_error is not None else True
 
 
+def _load_gateway_config(config_path: str | None, *, read_only: bool = False) -> GatewayConfig:
+    try:
+        return GatewayConfig.load(config_path, read_only=read_only)
+    except ConfigParseError as exc:
+        console.print(f"[red]Invalid gateway config:[/red] {exc}")
+        console.print(
+            "Fix the file, or restore the newest valid backup with "
+            "[bold]opensquilla recovery recover-config --home <profile>[/bold]."
+        )
+        raise typer.Exit(code=1) from None
+
+
 def run_gateway(
     port: int | None = typer.Option(18791, "--port", "-p", help="Port to bind"),
     bind: str | None = typer.Option("127.0.0.1", "--bind", "-b", help="Host to bind"),
@@ -137,7 +150,9 @@ def run_gateway(
         raise typer.Exit(code=1)
     # Load config FIRST so its ``host`` field can act as the final
     # fallback below ``OPENSQUILLA_GATEWAY_HOST``.
-    config = GatewayConfig.load(config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
+    config = _load_gateway_config(
+        config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH")
+    )
     if config_path and not config.config_path:
         config.config_path = str(config_path)
     # Treat the CLI ``--bind`` default as "not explicitly supplied" so the
@@ -327,7 +342,7 @@ def _lifecycle_manager(
     health_timeout: float = 60.0,
     shutdown_timeout: float = 10.0,
 ) -> GatewayLifecycleManager:
-    config = GatewayConfig.load(
+    config = _load_gateway_config(
         config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"),
         read_only=desktop_profile_lifecycle_active(),
     )

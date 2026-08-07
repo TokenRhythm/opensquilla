@@ -816,7 +816,11 @@ summary.control-row--divider:focus-visible {
 /* ── Sidebar: per-row ⋯ actions menu ───────────────────────────────── */
 
 .sidebar-row-menu-wrap {
-  position: relative;
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
   flex-shrink: 0;
 }
 

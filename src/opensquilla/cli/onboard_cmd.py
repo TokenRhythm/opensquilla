@@ -21,6 +21,8 @@ from opensquilla.cli.ui import (
     markup_escape,
     warning_panel,
 )
+from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config_migration import ConfigParseError
 from opensquilla.onboarding.config_store import load_config, resolve_config_path
 from opensquilla.onboarding.errors import UserCancelledError
 from opensquilla.onboarding.flow import (
@@ -29,6 +31,7 @@ from opensquilla.onboarding.flow import (
     run_interactive_onboard,
 )
 from opensquilla.onboarding.legacy_data import legacy_data_payload
+from opensquilla.onboarding.mutations import capability_resettable
 from opensquilla.onboarding.next_steps import (
     env_recovery_commands,
     env_reference_warnings,
@@ -247,7 +250,7 @@ def _exit_config_load_error(exc: Exception, path: str | Path | None = None) -> N
 def _load_config_for_cli(path: str | Path | None = None):
     try:
         return load_config(path)
-    except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
         _exit_config_load_error(exc, path)
 
 
@@ -448,8 +451,12 @@ def _probe_saved_provider(cfg) -> bool:
     import asyncio
 
     from opensquilla.onboarding.probe import probe_llm_provider
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
 
     llm = cfg.llm
+    prewarm_tokenrhythm_install_id(config=cfg)
     console.print(f"[{ACCENT_SOFT}]◆[/] Checking the connection…")
     try:
         result = asyncio.run(
@@ -602,16 +609,19 @@ def onboard_command(
             router_mode = "recommended"
         try:
             engine = SetupEngine(cfg_before, path=config_path)
+            provider_payload = {
+                "providerId": provider,
+                "model": model,
+                "apiKey": api_key,
+                "apiKeyEnv": api_key_env,
+                "baseUrl": base_url,
+                "proxy": proxy,
+            }
+            if skip_image_generation:
+                provider_payload["imageGenerationIntent"] = "preserve"
             engine.apply(
                 "provider",
-                {
-                    "providerId": provider,
-                    "model": model,
-                    "apiKey": api_key,
-                    "apiKeyEnv": api_key_env,
-                    "baseUrl": base_url,
-                    "proxy": proxy,
-                },
+                provider_payload,
             )
             if router_mode:
                 engine.apply("router", {"mode": router_mode})
@@ -684,7 +694,7 @@ def onboard_command(
         # EOFError covers Ctrl+D / exhausted piped stdin at a prompt — the
         # same operator intent as Esc/Ctrl+C, so the same productized exit.
         _exit_cancelled(exc)
-    except (tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
         # Corrupt config discovered mid-wizard (e.g. re-loaded after an
         # out-of-band edit): route through the same productized handoff as
         # `--if-needed`/`status` instead of a raw traceback.
@@ -736,7 +746,7 @@ _STATUS_STYLE: dict[SectionStatus, str] = {
 }
 
 
-def _status_payload(status: OnboardingStatus) -> dict:
+def _status_payload(status: OnboardingStatus, *, config: GatewayConfig) -> dict:
     """Machine-readable ``onboard status --json`` payload.
 
     Superset contract: every key of the RPC ``onboarding.status`` payload
@@ -774,6 +784,7 @@ def _status_payload(status: OnboardingStatus) -> dict:
         "imageGenerationProvider": status.image_generation_provider,
         "imageGenerationPrimary": status.image_generation_primary,
         "imageGenerationEnvKey": status.image_generation_env_key,
+        "imageGenerationState": dict(status.image_generation_state),
         "audioConfigured": status.audio_configured,
         "audioEnabled": status.audio_enabled,
         "audioSource": status.audio_source,
@@ -783,6 +794,17 @@ def _status_payload(status: OnboardingStatus) -> dict:
         "memoryEmbeddingProvider": status.memory_embedding_provider,
         "memoryEmbeddingSource": status.memory_embedding_source,
         "memoryEmbeddingEnvKey": status.memory_embedding_env_key,
+        "capabilityConfiguration": {
+            capability_id: {
+                "resettable": capability_resettable(config, capability_id=capability_id)
+            }
+            for capability_id in (
+                "search",
+                "image_generation",
+                "audio",
+                "memory_embedding",
+            )
+        },
         "ensembleCredentialStatus": list(status.ensemble_credential_status),
         "envRecoveryCommands": env_recovery_commands(status),
         "channelCount": status.channel_count,
@@ -1205,7 +1227,7 @@ def onboard_status_command(
     status = get_onboarding_status(cfg)
 
     if json_output:
-        typer.echo(_json.dumps(_status_payload(status), ensure_ascii=False))
+        typer.echo(_json.dumps(_status_payload(status, config=cfg), ensure_ascii=False))
         return
 
     console.print(banner_panel("OpenSquilla Setup Cockpit", _status_cockpit_summary(status)))
@@ -1738,7 +1760,7 @@ def configure_command(
                 # Explicit flags without the section's gate flag: refuse
                 # instead of silently forwarding nothing to the wizard.
                 _exit_incomplete_headless_flags(normalized, given)
-        except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+        except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
             _exit_config_load_error(exc, config_path)
         except (KeyError, TypeError, ValueError) as exc:
             error_console.print(f"[red]Error:[/red] {markup_escape(exc)}")
@@ -1760,7 +1782,7 @@ def configure_command(
         # EOFError covers Ctrl+D / exhausted piped stdin at a prompt — the
         # same operator intent as Esc/Ctrl+C, so the same productized exit.
         _exit_cancelled(exc)
-    except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, ConfigParseError, ValidationError) as exc:
         _exit_config_load_error(exc, config_path)
     except (KeyError, TypeError, ValueError) as exc:
         # Mutation-level validation failures reachable from the wizard (e.g.

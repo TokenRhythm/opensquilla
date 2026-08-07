@@ -24,6 +24,7 @@ from opensquilla.sandbox.run_mode import (
 from opensquilla.sandbox.user_grants import load_user_grants_payload
 
 RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
+RUN_MODE_PREFERENCE_KEY = "sandbox.run_mode"
 DEFAULT_ROOT_WORKSPACE = "/root/.opensquilla/workspace"
 
 
@@ -547,7 +548,6 @@ async def get_run_context(
     include_user_grants: bool = True,
     session_node: Any | None = None,
 ) -> RunContext:
-    configured_mode = config_run_mode(config)
     node = (
         session_node
         if session_node is not None
@@ -561,12 +561,40 @@ async def get_run_context(
         )
         if saved is not None:
             return _with_user_grants(saved) if include_user_grants else saved
+    configured_mode, _source = await resolve_default_run_mode(session_manager, config)
     context = RunContext(
         run_mode=configured_mode,
         workspace=_workspace_from_payload(workspace),
         source="default",
     )
     return _with_user_grants(context) if include_user_grants else context
+
+
+async def resolve_default_run_mode(
+    session_manager: Any,
+    config: Any,
+) -> tuple[RunMode, str]:
+    """Resolve the durable owner default before falling back to configuration."""
+
+    storage = getattr(session_manager, "storage", None)
+    if storage is None:
+        storage = getattr(session_manager, "_storage", None)
+    get_preference = getattr(storage, "get_runtime_preference", None)
+    if callable(get_preference):
+        stored = await get_preference(RUN_MODE_PREFERENCE_KEY)
+        if stored is not None:
+            return normalize_run_mode(stored), "preference"
+
+    sandbox = getattr(config, "sandbox", None)
+    fields_set = getattr(sandbox, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(sandbox, "__fields_set__", ())
+    source = (
+        "config"
+        if fields_set is not None and "run_mode" in fields_set
+        else "default"
+    )
+    return config_run_mode(config), source
 
 
 async def persist_run_context(
@@ -621,11 +649,11 @@ def effective_project_run_mode(context: RunContext, config: Any) -> RunContext:
         context.run_mode is RunMode.FULL
         and context.run_mode_source is None
         and config_run_mode(config) is RunMode.FULL
-        and project_default_run_mode(config) is RunMode.STANDARD
+        and project_default_run_mode(config) is RunMode.SAFE
     ):
         return replace(
             context,
-            run_mode=RunMode.STANDARD,
+            run_mode=RunMode.SAFE,
             run_mode_source="project_default",
         )
     return context
@@ -633,6 +661,7 @@ def effective_project_run_mode(context: RunContext, config: Any) -> RunContext:
 
 __all__ = [
     "RUN_CONTEXT_ORIGIN_KEY",
+    "RUN_MODE_PREFERENCE_KEY",
     "DEFAULT_ROOT_WORKSPACE",
     "DomainGrant",
     "MountGrant",
@@ -647,5 +676,6 @@ __all__ = [
     "persist_run_context",
     "run_context_from_origin_payload",
     "run_context_for_subagent",
+    "resolve_default_run_mode",
     "set_run_mode",
 ]

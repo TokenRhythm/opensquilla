@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import functools
 import hashlib
 import inspect
@@ -18,7 +19,7 @@ import stat
 import subprocess
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -57,7 +58,11 @@ from opensquilla.engine.finalize_evidence_gate import (
 from opensquilla.engine.finalize_evidence_gate import (
     WRITE_TOOL_NAMES as _GATE_WRITE_TOOL_NAMES,
 )
-from opensquilla.engine.history import limit_turns, repair_tool_pairing
+from opensquilla.engine.history import (
+    limit_turns,
+    reconstruct_messages_from_entry,
+    repair_tool_pairing,
+)
 from opensquilla.engine.patch_evidence_ledger import PatchEvidenceLedger
 from opensquilla.engine.post_write_convergence import (
     PostWriteConvergenceDecision,
@@ -65,6 +70,7 @@ from opensquilla.engine.post_write_convergence import (
     PostWriteConvergenceTracker,
 )
 from opensquilla.engine.progress_watchdog import ProgressObservation, ProgressWatchdog
+from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
 from opensquilla.engine.runtime_diagnostics import RuntimeDiagnosticsObserver
 from opensquilla.engine.runtime_events import append_runtime_event
 from opensquilla.engine.runtime_recovery import (
@@ -134,9 +140,11 @@ from opensquilla.engine.usage_accounting import (
 )
 from opensquilla.execution_status import (
     mark_execution_status_truncated,
+    normalize_execution_status,
     runtime_execution_status,
 )
 from opensquilla.observability.turn_call_log import TurnCallLogger
+from opensquilla.persistence.meta_run_writer import replay_inputs_are_modified
 from opensquilla.provider import (
     ChatConfig,
     ContentBlockText,
@@ -169,13 +177,22 @@ from opensquilla.provider import (
 )
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+from opensquilla.provider.model_identity import is_deepseek_v4_model_id
 from opensquilla.provider.protocol import (
+    project_provider_final_request,
     project_provider_message_count,
+    provider_metadata,
     validate_provider_chat_request,
+)
+from opensquilla.provider.request_proof import (
+    ProviderRequestBudgetExceededError,
+    prove_provider_payload,
 )
 from opensquilla.provider.types import (
     ContentBlockImage,
     FailureInjector,
+    ModelCapabilities,
+    ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
     ProviderRequestCorrelation,
@@ -202,13 +219,18 @@ from opensquilla.sandbox.elevation import (
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
+    arm_compaction_deadline,
     build_compaction_config_from_provider,
     compact_context,
+    compaction_remaining_seconds,
+    compaction_replay_summary,
+    require_compaction_time,
 )
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
+    CompactionTimeoutError,
     compaction_effect_payload,
     compaction_lifecycle_payload,
     compaction_result_payload,
@@ -218,6 +240,7 @@ from opensquilla.session.compaction_lifecycle import (
     new_compaction_id,
     pre_compaction_flush_requires_safe_receipt,
 )
+from opensquilla.session.context_view import format_compaction_summary_context
 from opensquilla.session.terminal_reply import build_terminal_reply
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.patch_classification import is_instrumentation_only_patch
@@ -232,7 +255,16 @@ from opensquilla.usage_reasons import (
 )
 
 from .context import ContextAssembly
-from .subagent import SubagentManager, SubagentSpec, SubagentUsage
+from .subagent import (
+    MAX_REFERENCED_SUBAGENT_TASK_BYTES,
+    SubagentManager,
+    SubagentSpec,
+    SubagentUsage,
+    render_subagent_task_reference,
+    resolve_subagent_execution_target,
+    subagent_task_inline_limit_bytes,
+    subagent_task_reference_slice_limit_chars,
+)
 from .types import (
     _THINKING_BUDGET_DEFAULT,
     AgentConfig,
@@ -1099,11 +1131,6 @@ def _is_deepseek_model_id(model_id: str | None) -> bool:
     return normalized.startswith("deepseek") or "/deepseek" in normalized
 
 
-def _is_direct_deepseek_v4_model_id(model_id: str | None) -> bool:
-    normalized = (model_id or "").strip().lower()
-    return normalized in {"deepseek-v4-flash", "deepseek-v4-pro"}
-
-
 _LARGE_JSON_TOOL_FIELD_KEYS: frozenset[str] = frozenset({"body", "body_base64"})
 _LARGE_JSON_TOOL_FIELD_CHARS = 20_000
 _TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
@@ -1953,6 +1980,51 @@ def _tail_has_tool_result(messages: list[Message], *, lookback: int = 2) -> bool
     return any(_message_has_tool_result(message) for message in messages[-lookback:])
 
 
+_SYNTHETIC_USER_CONTEXT_PREFIXES = (
+    "[Available skills for this turn]",
+    "[Context summary]",
+    "[Request context for this turn]",
+    "[Runtime context for this turn]",
+    "[Current user request reminder]",
+    "Runtime state capsule:",
+)
+
+
+def _active_user_message_index_for_request(
+    messages: list[Message],
+    *,
+    current_user_text: str = "",
+) -> int | None:
+    """Locate the real user request before provider wrappers add synthetic users."""
+
+    normalized_current = current_user_text.strip()
+    if normalized_current:
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.role != "user" or _message_has_tool_result(message):
+                continue
+            content = (
+                message.content
+                if isinstance(message.content, str)
+                else _flatten_content_blocks(message.content)
+            )
+            if content.strip() == normalized_current:
+                return index
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.role != "user" or _message_has_tool_result(message):
+            continue
+        content = (
+            message.content
+            if isinstance(message.content, str)
+            else _flatten_content_blocks(message.content)
+        )
+        if not content.lstrip().startswith(_SYNTHETIC_USER_CONTEXT_PREFIXES):
+            return index
+    return None
+
+
 def _is_mid_budget_nudge_message(message: Message) -> bool:
     return (
         message.role == "user"
@@ -2086,6 +2158,21 @@ class _ProviderAttemptKind(StrEnum):
 
 class _IterationStreamTimeoutError(TimeoutError):
     """Raised when provider streaming exceeds the active Agent iteration budget."""
+
+
+_STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
+
+
+def _provider_stream_deadline_timeout(
+    *,
+    timeout_seconds: float,
+    deadline_at_monotonic: float,
+) -> TimeoutError:
+    """Tag a plain TimeoutError with the deadline enforced by the stream wrapper."""
+
+    error = TimeoutError(f"Agent total timeout after {timeout_seconds}s")
+    setattr(error, _STREAM_DEADLINE_ATTRIBUTE, deadline_at_monotonic)
+    return error
 
 
 def _is_large_context_invalid_response(
@@ -2307,6 +2394,12 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         model_capabilities=chat_cfg.model_capabilities,
         thinking_level=None,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
+        context_window_tokens_global_override=(
+            chat_cfg.context_window_tokens_global_override
+        ),
+        provider_request_max_chars_explicit_cap=(
+            chat_cfg.provider_request_max_chars_explicit_cap
+        ),
         tool_choice=chat_cfg.tool_choice,
     )
 
@@ -2348,6 +2441,133 @@ def _strip_historical_image_blocks(
         kept.extend(ContentBlockText(text=marker) for marker in omitted)
         sanitized.append(Message(role=msg.role, content=kept))
     return sanitized
+
+
+def _trusted_meta_replay_seed_outputs(
+    *,
+    plan: Any,
+    persisted_steps: Any,
+    failed_step_id: str,
+    replay_failover_aliases: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return only complete outputs that are safe to reuse in a live replay.
+
+    Persistence is deliberately fail-open during a live run, so a historical
+    row can be absent or incomplete even when the in-memory step progressed.
+    Replay must make the opposite choice: ambiguous evidence is not a cache
+    hit and the scheduler reruns that step.
+
+    Failover rows need paired handling.  The primary row records only a
+    ``substitute_step_id``; the actual output lives on the successful
+    substitute row.  Reuse that output under both ids so dependencies on the
+    primary alias and dependencies on the explicit substitute remain
+    satisfied.  If either side of the pair cannot be proven, seed neither.
+    """
+
+    plan_steps = tuple(getattr(plan, "steps", ()) or ())
+    plan_steps_by_id = {
+        step_id: step
+        for step in plan_steps
+        if isinstance((step_id := getattr(step, "id", None)), str) and step_id
+    }
+    substitute_owner_by_id = {
+        substitute_id: step.id
+        for step in plan_steps
+        if isinstance((substitute_id := getattr(step, "on_failure", None)), str)
+        and substitute_id
+        and isinstance(getattr(step, "id", None), str)
+    }
+
+    try:
+        persisted = tuple(persisted_steps or ())
+    except TypeError:
+        persisted = ()
+
+    records_by_id: dict[str, Any] = {}
+    duplicate_ids: set[str] = set()
+    for record in persisted:
+        step_id = getattr(record, "step_id", None)
+        if not isinstance(step_id, str) or step_id not in plan_steps_by_id:
+            continue
+        if step_id in records_by_id:
+            duplicate_ids.add(step_id)
+            continue
+        records_by_id[step_id] = record
+    for step_id in duplicate_ids:
+        records_by_id.pop(step_id, None)
+
+    def complete_ok_output(record: Any) -> str | None:
+        if record is None or getattr(record, "status", None) != "ok":
+            return None
+        truncated_fields = getattr(record, "truncated_fields", None)
+        if not isinstance(truncated_fields, (tuple, list, set, frozenset)):
+            return None
+        if not all(isinstance(field, str) for field in truncated_fields):
+            return None
+        if "output_text" in truncated_fields:
+            return None
+        output_text = getattr(record, "output_text", None)
+        return output_text if isinstance(output_text, str) else None
+
+    seeds: dict[str, str] = {}
+    trusted_pair_ids: set[str] = set()
+
+    # Validate each primary/fallback pair from the immutable plan rather than
+    # accepting an arbitrary pointer from a persistence row.
+    for primary in plan_steps:
+        primary_id = getattr(primary, "id", None)
+        substitute_id = getattr(primary, "on_failure", None)
+        if not isinstance(primary_id, str) or not isinstance(substitute_id, str):
+            continue
+        if not primary_id or not substitute_id:
+            continue
+        if failed_step_id == substitute_id:
+            # "Retry failed step" for a failed fallback must retry that
+            # fallback, not rerun its primary. This is critical when the
+            # primary is a non-idempotent paid submit whose response was lost.
+            primary_record = records_by_id.get(primary_id)
+            if (
+                primary_record is not None
+                and getattr(primary_record, "status", None) == "substituted"
+                and getattr(primary_record, "substitute_step_id", None) == substitute_id
+            ):
+                # The placeholder is scheduler-internal; the forced fallback
+                # overwrites the alias before any dependency on the pair can
+                # complete.
+                seeds[primary_id] = ""
+                trusted_pair_ids.add(primary_id)
+                if replay_failover_aliases is not None:
+                    replay_failover_aliases[substitute_id] = primary_id
+            continue
+        if failed_step_id == primary_id:
+            continue
+        primary_record = records_by_id.get(primary_id)
+        if (
+            primary_record is None
+            or getattr(primary_record, "status", None) != "substituted"
+            or getattr(primary_record, "substitute_step_id", None) != substitute_id
+        ):
+            continue
+        output_text = complete_ok_output(records_by_id.get(substitute_id))
+        if output_text is None:
+            continue
+        seeds[primary_id] = output_text
+        seeds[substitute_id] = output_text
+        trusted_pair_ids.update((primary_id, substitute_id))
+
+    for step_id in plan_steps_by_id:
+        if step_id == failed_step_id or step_id in trusted_pair_ids:
+            continue
+        # A substitute-only row is meaningful only together with its primary
+        # failover record.  Seeding it alone can leak stale output into a run
+        # where the primary is about to execute again.
+        if step_id in substitute_owner_by_id:
+            continue
+        output_text = complete_ok_output(records_by_id.get(step_id))
+        if output_text is not None:
+            seeds[step_id] = output_text
+
+    return seeds
 
 
 @dataclass
@@ -2453,6 +2673,11 @@ class Agent:
         self._usage_event_sink = usage_event_sink
         self._usage_execution_context = usage_execution_context
         self._provider_request_correlation = provider_request_correlation
+        # Populated only by a successful real provider stream.  TurnRunner
+        # publishes it after durable finalization, so failed/cancelled turns
+        # can never arm a gateway keepalive probe.
+        self._prompt_cache_keepalive_candidate: PromptCacheKeepaliveCandidate | None = None
+        self._prompt_cache_keepalive_capture_enabled = False
         if self.tool_handler is not None and self._tool_context is not None:
             self.tool_handler = self._bind_tool_handler_context(
                 self.tool_handler,
@@ -2481,6 +2706,25 @@ class Agent:
         self._flush_backoff_seconds: float = 0.0
         self._session_flush_service = session_flush_service
         self._last_compaction_refusal_reason: str | None = None
+        self._pending_durable_compaction_event: CompactionEvent | None = None
+        # Stable session/base consumer identity. Turn routing and ensemble
+        # wrapping may replace ``self.provider`` with a narrower physical leg,
+        # but that one-call choice must never redefine the window that owns
+        # durable history.
+        self._durable_consumer_provider: Any = self.provider
+        self._durable_consumer_model_id = self.config.model_id
+        self._durable_consumer_window_tokens = self.config.context_window_tokens
+        self._durable_consumer_max_output_tokens = self.config.max_tokens
+        self._durable_consumer_model_capabilities = (
+            self.config.model_capabilities
+        )
+        self._durable_consumer_provider_request_max_chars = (
+            self.config.provider_request_proof_max_chars
+        )
+        # Frozen before durable admission and consumed by the ensuing turn.
+        # Compaction can take long enough to cross a minute boundary; reusing
+        # the same runtime message keeps the admitted and sent envelopes equal.
+        self._preflight_runtime_context_message: Message | None = None
         self._tool_failure_loop_counts: dict[tuple[str, str], int] = {}
         self._identical_request_last_sha: str | None = None
         self._identical_request_streak: int = 0
@@ -2535,29 +2779,90 @@ class Agent:
                 message="Context compaction did not reduce the provider request.",
                 code="compaction_not_smaller",
             )
-        if reason == "provider_recent_tail_too_large":
+        if reason in {
+            "provider_native_overflow_after_admission",
+            "provider_recent_tail_too_large",
+        }:
             return ErrorEvent(
                 message=(
-                    "The request is too large for the provider context window after "
-                    "automatic context compaction and payload reduction. OpenSquilla "
-                    "preserved the recoverable state; retry with a narrower request "
-                    "or a larger-context model."
+                    "The final provider request is too large after safe request-only "
+                    "reduction. Durable session history was not changed; retry with "
+                    "a narrower current request or a larger-context model."
                 ),
                 code="provider_request_too_large",
             )
         if reason == "provider_request_budget_exhausted":
             return ErrorEvent(
                 message=(
-                    "The request is too large for the provider context window after "
-                    "automatic context compaction and payload reduction. OpenSquilla "
-                    "preserved the recoverable state; retry with a narrower request "
-                    "or a larger-context model."
+                    "The final provider request exceeds its request budget. Durable "
+                    "session history was not changed; narrow the current input or "
+                    "tools, or choose a larger-context model."
                 ),
                 code="provider_request_too_large",
             )
         return ErrorEvent(
             message="Context overflow persists after compaction",
             code="compaction_exhausted",
+        )
+
+    def _terminalize_pending_durable_compaction(
+        self,
+        *,
+        status: Literal["cancelled", "failed", "stale", "timed_out"],
+        reason: str,
+    ) -> None:
+        """Close a generated-but-uninstalled inline compaction candidate."""
+
+        event = self._pending_durable_compaction_event
+        if event is None:
+            return
+        self._pending_durable_compaction_event = None
+        if not self._session_key:
+            return
+        compaction_id = event.compaction_id or new_compaction_id()
+        notify_compaction(
+            self._session_key,
+            source="automatic",
+            phase="agent_inline_overflow",
+            status=status,
+            reason=reason,
+            removed_count=event.removed_count,
+            kept_count=event.kept_count,
+            **compaction_effect_payload(status=status, reason=reason),
+            **compaction_lifecycle_payload(
+                compaction_id,
+                COMPACTION_TRIGGERED_EVENT,
+            ),
+        )
+
+    def _stage_pending_durable_compaction(
+        self,
+        outcome: CompactionOutcome,
+    ) -> None:
+        """Track a durable candidate before any fallible request rebuilding.
+
+        Inline compaction emits ``started`` while producing the candidate.
+        Registering it immediately after generation ensures every later exit
+        path can emit a terminal event with the same operation id.
+        """
+
+        if outcome.ephemeral_only:
+            return
+        self._pending_durable_compaction_event = CompactionEvent(
+            compaction_id=outcome.compaction_id,
+            compaction_deadline_at_monotonic=(
+                outcome.compaction_deadline_at_monotonic
+            ),
+            compaction_timeout_seconds=outcome.compaction_timeout_seconds,
+            summary=outcome.summary,
+            summary_payload=outcome.summary_payload,
+            summary_format=outcome.summary_format,
+            coverage_status=outcome.coverage_status,
+            missing_obligations=outcome.missing_obligations,
+            critical_carry_forward=outcome.critical_carry_forward,
+            kept_entries=outcome.kept_entries,
+            kept_count=len(outcome.messages),
+            removed_count=outcome.removed_count,
         )
 
     def _record_provider_context_overflow_reason(
@@ -2649,39 +2954,754 @@ class Agent:
 
         return _handler
 
-    def _provider_budget_compaction_window_tokens(
-        self,
-        provider_error: ProviderErrorEvent,
-    ) -> int | None:
-        proof = self._provider_request_budget_proof(provider_error)
-        if proof is None:
-            return None
-        proof_budget = self._positive_int(
-            proof.get("effective_proof_budget") or proof.get("proof_budget")
-        )
-        if proof_budget is None:
-            return None
-        estimated_chars = self._positive_int(proof.get("estimated_chars"))
-        estimated_tokens = self._positive_int(proof.get("estimated_tokens"))
-        if estimated_chars and estimated_tokens:
-            window_tokens = int(proof_budget * (estimated_tokens / estimated_chars))
-        else:
-            window_tokens = proof_budget // 4
-        if window_tokens <= 0:
-            return None
-        return min(self.config.context_window_tokens, window_tokens)
-
-    def _provider_budget_estimated_tokens(
-        self,
-        provider_error: ProviderErrorEvent,
-    ) -> int | None:
-        proof = self._provider_request_budget_proof(provider_error)
-        if proof is None:
-            return None
-        return self._positive_int(proof.get("estimated_tokens"))
-
     def _provider_request_proof_max_chars(self) -> int:
         return self._context_budget_governor().snapshot().provider_request_max_chars
+
+    def bind_durable_consumer(
+        self,
+        *,
+        provider: Any,
+        model_id: str | None,
+        context_window_tokens: int,
+        max_output_tokens: int,
+        model_capabilities: ModelCapabilities | None = None,
+        provider_request_proof_max_chars: int = 0,
+    ) -> None:
+        """Freeze the deployment that owns durable session-history pressure."""
+
+        self._durable_consumer_provider = provider
+        self._durable_consumer_model_id = model_id
+        self._durable_consumer_window_tokens = max(
+            1,
+            int(context_window_tokens or 0),
+        )
+        self._durable_consumer_max_output_tokens = max(
+            1,
+            int(max_output_tokens or 0),
+        )
+        self._durable_consumer_model_capabilities = model_capabilities
+        self._durable_consumer_provider_request_max_chars = max(
+            0,
+            int(provider_request_proof_max_chars or 0),
+        )
+
+    def _freeze_preflight_runtime_context_message(self) -> Message:
+        message = self._preflight_runtime_context_message
+        if message is None:
+            message = self._runtime_context_message(self._runtime_context_block())
+            self._preflight_runtime_context_message = message
+        return message
+
+    def _provider_admission_chat_config(
+        self,
+        active_user_message: str,
+        *,
+        context_window_tokens: int,
+        max_output_tokens: int | None = None,
+        model_capabilities: ModelCapabilities | None = None,
+        provider_request_proof_max_chars: int | None = None,
+    ) -> ChatConfig:
+        """Build the same baseline request config used by the physical turn."""
+
+        resolved_capabilities = (
+            model_capabilities
+            if model_capabilities is not None
+            else self.config.model_capabilities
+        )
+        if (
+            resolved_capabilities is not None
+            and not isinstance(resolved_capabilities, ModelCapabilities)
+        ):
+            # Catalog extensions and older test doubles may expose a
+            # capability-shaped object rather than the concrete dataclass.
+            # Exact admission must remain compatible without passing an
+            # unvalidated object through the ChatConfig protocol boundary.
+            try:
+                resolved_capabilities = ModelCapabilities(
+                    supports_reasoning=bool(
+                        getattr(resolved_capabilities, "supports_reasoning", False)
+                    ),
+                    supports_tools=bool(
+                        getattr(resolved_capabilities, "supports_tools", True)
+                    ),
+                    supports_streaming=bool(
+                        getattr(resolved_capabilities, "supports_streaming", True)
+                    ),
+                    supports_vision=bool(
+                        getattr(resolved_capabilities, "supports_vision", False)
+                    ),
+                    reasoning_format=str(
+                        getattr(resolved_capabilities, "reasoning_format", "none")
+                        or "none"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - admission can omit unknown hints
+                resolved_capabilities = None
+        thinking_enabled, thinking_budget = self.config.resolve_thinking(
+            active_user_message
+        )
+        output_tokens = max(
+            1,
+            int(max_output_tokens or self.config.max_tokens or 1),
+        )
+        explicit_proof_budget = max(
+            0,
+            int(provider_request_proof_max_chars or 0),
+        )
+        if (
+            int(context_window_tokens) == int(self.config.context_window_tokens)
+            and output_tokens == int(self.config.max_tokens)
+            and model_capabilities is None
+            and provider_request_proof_max_chars is None
+        ):
+            proof_budget = self._provider_request_proof_max_chars()
+        else:
+            proof_budget = ContextBudgetGovernor.from_values(
+                context_window_tokens=max(1, int(context_window_tokens)),
+                max_output_tokens=output_tokens,
+                thinking_budget_tokens=(
+                    thinking_budget if thinking_enabled else 0
+                ),
+                context_overflow_threshold=(
+                    self.config.context_overflow_threshold
+                ),
+                provider_request_proof_max_chars=explicit_proof_budget,
+            ).snapshot().provider_request_max_chars
+        return ChatConfig(
+            max_tokens=output_tokens,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            system=self.config.system_prompt or "",
+            thinking=thinking_enabled,
+            thinking_budget_tokens=thinking_budget,
+            thinking_budget_explicit=(
+                self.config.thinking_budget_tokens != _THINKING_BUDGET_DEFAULT
+            ),
+            timeout=self.config.request_timeout,
+            stop_sequences=self.config.stop_sequences,
+            cache_breakpoints=self._cache_breakpoints_without_runtime_context(
+                self.config.cache_breakpoints
+            ),
+            cache_mode=self.config.cache_mode,
+            output_json_schema=self.config.output_json_schema,
+            output_json_schema_strict=self.config.output_json_schema_strict,
+            model_capabilities=(
+                resolved_capabilities
+            ),
+            thinking_level=(
+                self.config.thinking
+                if isinstance(self.config.thinking, ThinkingLevel)
+                else None
+            ),
+            provider_request_max_chars=proof_budget,
+            context_window_tokens_global_override=(
+                self.config.context_window_tokens_global_override
+            ),
+            provider_request_max_chars_explicit_cap=(
+                max(0, int(provider_request_proof_max_chars or 0))
+                if provider_request_proof_max_chars is not None
+                else (
+                    max(0, int(self.config.provider_request_proof_max_chars or 0))
+                    if self.config.provider_request_proof_max_chars_explicit
+                    else 0
+                )
+            ),
+            tool_choice=None,
+            provider_request_correlation=self._provider_request_correlation,
+        )
+
+    def _project_durable_consumer_final_request(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None,
+        active_config: ChatConfig,
+    ) -> ProviderFinalRequestProjection | None:
+        """Re-prove one live logical request against the stable session consumer."""
+
+        provider = self._durable_consumer_provider
+        if provider is None:
+            return None
+        max_output_tokens = max(
+            1,
+            int(self._durable_consumer_max_output_tokens or 0),
+        )
+        proof_budget = max(
+            0,
+            int(self._durable_consumer_provider_request_max_chars or 0),
+        )
+        if proof_budget <= 0:
+            proof_budget = ContextBudgetGovernor.from_values(
+                context_window_tokens=max(
+                    1,
+                    int(self._durable_consumer_window_tokens or 0),
+                ),
+                max_output_tokens=max_output_tokens,
+                thinking_budget_tokens=(
+                    max(
+                        0,
+                        int(active_config.thinking_budget_tokens or 0),
+                    )
+                    if active_config.thinking
+                    else 0
+                ),
+                context_overflow_threshold=self.config.context_overflow_threshold,
+            ).snapshot().provider_request_max_chars
+        stable_config = active_config.model_copy(
+            update={
+                "max_tokens": max_output_tokens,
+                "model_capabilities": self._durable_consumer_model_capabilities,
+                "provider_request_max_chars": proof_budget,
+                "provider_request_max_chars_explicit_cap": proof_budget,
+            }
+        )
+        return project_provider_final_request(
+            provider,
+            messages,
+            tools,
+            stable_config,
+        )
+
+    def _history_messages_for_compaction_admission(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        active_user_message: str,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+    ) -> list[Message] | None:
+        """Rebuild the candidate's provider-visible durable history."""
+
+        skip_indexes: set[int] = set()
+        if active_user_in_history and entries:
+            if bound_user_message_id:
+                bound_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(entries)
+                        if str(entry.get("message_id") or "")
+                        == bound_user_message_id
+                    ),
+                    None,
+                )
+                if bound_index is None:
+                    # A bound active prompt must never be guessed from position.
+                    return None
+                skip_indexes = {
+                    index
+                    for index, entry in enumerate(entries)
+                    if index >= bound_index
+                    and str(entry.get("role") or "") == "user"
+                }
+            else:
+                for index in range(len(entries) - 1, -1, -1):
+                    if str(entries[index].get("role") or "") == "user":
+                        skip_indexes.add(index)
+                        break
+
+        history: list[Message] = []
+        for index, entry in enumerate(entries):
+            if index in skip_indexes:
+                continue
+            history.extend(
+                reconstruct_messages_from_entry(
+                    str(entry.get("role") or ""),
+                    entry.get("content") or "",
+                    entry.get("tool_calls"),
+                    entry.get("reasoning_content"),
+                )
+            )
+
+        thinking_enabled, _thinking_budget = self.config.resolve_thinking(
+            active_user_message
+        )
+        effective_capabilities = (
+            consumer_model_capabilities
+            if consumer_model_capabilities is not None
+            else self.config.model_capabilities
+        )
+        effective_model_id = consumer_model_id or self.config.model_id
+        caps_reasoning_format = (
+            getattr(effective_capabilities, "reasoning_format", "")
+            if effective_capabilities is not None
+            else ""
+        )
+        preserve_reasoning_content = bool(
+            is_deepseek_v4_model_id(effective_model_id)
+            or (
+                thinking_enabled
+                and caps_reasoning_format == "deepseek"
+                and _is_deepseek_model_id(effective_model_id)
+            )
+            or (thinking_enabled and caps_reasoning_format == "dashscope")
+        )
+        history, _sanitize_result = sanitize_session_messages(history)
+        history, _projection_result = project_historical_tool_payloads(
+            history,
+            preserve_reasoning_content=preserve_reasoning_content,
+        )
+        history = repair_tool_pairing(history)
+        history = drop_reasoning(
+            history,
+            preserve_tool_call_reasoning=thinking_enabled,
+            preserve_reasoning_content=preserve_reasoning_content,
+        )
+        preserve_historical_images = bool(
+            self.config.preserve_historical_images
+            and getattr(effective_capabilities, "supports_vision", False)
+            if effective_capabilities is not None
+            else False
+        )
+        history = _strip_historical_image_blocks(
+            history,
+            preserve_images=preserve_historical_images,
+        )
+        return repair_tool_pairing(
+            limit_turns(history, self.config.max_history_turns)
+        )
+
+    def _assemble_compaction_consumer_request(
+        self,
+        *,
+        replay_summary: str,
+        kept_entries: list[dict[str, Any]],
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        runtime_context_message: Message,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+    ) -> list[Message] | None:
+        history = self._history_messages_for_compaction_admission(
+            kept_entries,
+            active_user_in_history=active_user_in_history,
+            bound_user_message_id=bound_user_message_id,
+            active_user_message=active_user_message,
+            consumer_model_id=consumer_model_id,
+            consumer_model_capabilities=consumer_model_capabilities,
+        )
+        if history is None:
+            return None
+
+        turn_messages = list(history)
+        skills_message = self._skills_context_message()
+        if skills_message is not None:
+            turn_messages.append(skills_message)
+        request_context_insert_index = len(turn_messages)
+        runtime_context_insert_index = len(turn_messages)
+        if attachment_messages:
+            turn_messages.extend(attachment_messages)
+        elif active_user_message:
+            turn_messages.append(
+                Message(role="user", content=active_user_message)
+            )
+
+        summary_context = (
+            format_compaction_summary_context([replay_summary])
+            if replay_summary.strip()
+            else None
+        )
+        existing_context: str | None = self.config.request_context_prompt
+        request_context: str | None
+        if summary_context and existing_context and existing_context.strip():
+            request_context = (
+                f"{summary_context.strip()}\n\n{existing_context.strip()}"
+            )
+        elif summary_context:
+            request_context = summary_context.strip()
+        else:
+            request_context = existing_context
+        request_context_message = self._request_context_message(request_context)
+        turn_objective_message = self._turn_objective_message(
+            active_user_message,
+            enabled=self._turn_objective_reminder_enabled,
+            max_chars=self._turn_objective_reminder_max_chars,
+        )
+        return self._provider_request_messages_for_count_projection(
+            turn_messages,
+            request_context_message=request_context_message,
+            request_context_insert_index=request_context_insert_index,
+            runtime_context_message=runtime_context_message,
+            runtime_context_insert_index=runtime_context_insert_index,
+            turn_objective_message=turn_objective_message,
+        )
+
+    def _project_compaction_consumer_request(
+        self,
+        *,
+        consumer_provider: Any,
+        replay_summary: str,
+        kept_entries: list[dict[str, Any]],
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        runtime_context_message: Message,
+        context_window_tokens: int,
+        max_output_tokens: int | None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+    ) -> Any | None:
+        request_messages = self._assemble_compaction_consumer_request(
+            replay_summary=replay_summary,
+            kept_entries=kept_entries,
+            active_user_message=active_user_message,
+            active_user_in_history=active_user_in_history,
+            bound_user_message_id=bound_user_message_id,
+            attachment_messages=attachment_messages,
+            runtime_context_message=runtime_context_message,
+            consumer_model_id=consumer_model_id,
+            consumer_model_capabilities=consumer_model_capabilities,
+        )
+        if request_messages is None:
+            return None
+        chat_config = self._provider_admission_chat_config(
+            active_user_message,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            model_capabilities=consumer_model_capabilities,
+            provider_request_proof_max_chars=(
+                consumer_provider_request_max_chars
+            ),
+        )
+        active_user_index = _active_user_message_index_for_request(
+            request_messages,
+            current_user_text=active_user_message,
+        )
+        if active_user_message and active_user_index is None:
+            return None
+        if active_user_index is not None:
+            chat_config = chat_config.model_copy(
+                update={"active_user_message_index": active_user_index}
+            )
+        return project_provider_final_request(
+            consumer_provider,
+            request_messages,
+            self.tool_definitions,
+            chat_config,
+        )
+
+    def build_compaction_consumer_admission(
+        self,
+        *,
+        consumer_provider: Any,
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        context_window_tokens: int,
+        max_output_tokens: int | None = None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+    ) -> tuple[
+        Callable[[str, list[dict[str, Any]]], bool],
+        str,
+    ]:
+        """Freeze a pure final-envelope gate and its singleflight identity."""
+
+        runtime_context_message = self._freeze_preflight_runtime_context_message()
+        template_summary = "[candidate checkpoint]"
+        template_projection = self._project_compaction_consumer_request(
+            consumer_provider=consumer_provider,
+            replay_summary=template_summary,
+            kept_entries=[],
+            active_user_message=active_user_message,
+            active_user_in_history=False,
+            bound_user_message_id=None,
+            attachment_messages=attachment_messages,
+            runtime_context_message=runtime_context_message,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            consumer_model_id=consumer_model_id,
+            consumer_model_capabilities=consumer_model_capabilities,
+            consumer_provider_request_max_chars=(
+                consumer_provider_request_max_chars
+            ),
+        )
+        metadata = provider_metadata(consumer_provider)
+        fingerprint_payload = {
+            "provider": metadata.provider_id or metadata.provider_kind,
+            "model": metadata.model,
+            "consumer_model_id": consumer_model_id or metadata.model,
+            "context_window_tokens": int(context_window_tokens),
+            "max_output_tokens": int(
+                max_output_tokens or self.config.max_tokens or 0
+            ),
+            "system_sha256": hashlib.sha256(
+                (self.config.system_prompt or "").encode("utf-8")
+            ).hexdigest(),
+            "tools_sha256": hashlib.sha256(
+                json.dumps(
+                    self._live_request_jsonable(self.tool_definitions),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "active_user_sha256": hashlib.sha256(
+                active_user_message.encode("utf-8")
+            ).hexdigest(),
+            "attachments_sha256": hashlib.sha256(
+                json.dumps(
+                    self._live_request_jsonable(attachment_messages or []),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "request_context_sha256": hashlib.sha256(
+                (self.config.request_context_prompt or "").encode("utf-8")
+            ).hexdigest(),
+            "runtime_context_sha256": hashlib.sha256(
+                json.dumps(
+                    self._live_request_jsonable(runtime_context_message),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "template_payload_sha256": (
+                hashlib.sha256(
+                    json.dumps(
+                        template_projection.payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if template_projection is not None
+                else "projection_unavailable"
+            ),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        def _consumer_admission(
+            replay_summary: str,
+            kept_entries: list[dict[str, Any]],
+        ) -> bool:
+            projection = self._project_compaction_consumer_request(
+                consumer_provider=consumer_provider,
+                replay_summary=replay_summary,
+                kept_entries=kept_entries,
+                active_user_message=active_user_message,
+                active_user_in_history=active_user_in_history,
+                bound_user_message_id=bound_user_message_id,
+                attachment_messages=attachment_messages,
+                runtime_context_message=runtime_context_message,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                consumer_model_id=consumer_model_id,
+                consumer_model_capabilities=consumer_model_capabilities,
+                consumer_provider_request_max_chars=(
+                    consumer_provider_request_max_chars
+                ),
+            )
+            return bool(projection is not None and projection.fits)
+
+        return _consumer_admission, fingerprint
+
+    def preflight_history_capacity(
+        self,
+        *,
+        active_user_message: str,
+        active_user_in_history: bool,
+        attachments: list[dict[str, Any]] | None = None,
+        attachment_messages: list[Message] | None = None,
+        context_window_tokens: int | None = None,
+        consumer_provider: Any | None = None,
+        consumer_max_output_tokens: int | None = None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+    ) -> tuple[int, int]:
+        """Return token/character budgets left for checkpoint + raw history.
+
+        This is deliberately conservative. It uses the same proof budget and
+        media-aware serializer as provider adapters, but includes only the
+        fixed/current-turn components that preflight compaction cannot remove.
+        The protected persisted user prompt remains part of the durable
+        candidate and is therefore not double-counted here.
+        """
+
+        effective_window = int(
+            context_window_tokens or self.config.context_window_tokens
+        )
+        exact_provider = (
+            consumer_provider
+            if consumer_provider is not None
+            else self.provider
+        )
+        if exact_provider is not None and (attachment_messages or not attachments):
+            projection = self._project_compaction_consumer_request(
+                consumer_provider=exact_provider,
+                replay_summary="[candidate checkpoint]",
+                kept_entries=[],
+                active_user_message=active_user_message,
+                active_user_in_history=False,
+                bound_user_message_id=None,
+                attachment_messages=attachment_messages,
+                runtime_context_message=(
+                    self._freeze_preflight_runtime_context_message()
+                ),
+                context_window_tokens=effective_window,
+                max_output_tokens=consumer_max_output_tokens,
+                consumer_model_id=consumer_model_id,
+                consumer_model_capabilities=consumer_model_capabilities,
+                consumer_provider_request_max_chars=(
+                    consumer_provider_request_max_chars
+                ),
+            )
+            if projection is not None:
+                proof = projection.proof
+                required_budget_fields = {
+                    "effective_proof_token_budget",
+                    "estimated_tokens",
+                    "effective_proof_budget",
+                    "estimated_chars",
+                }
+                if required_budget_fields.issubset(proof):
+                    return (
+                        max(
+                            0,
+                            int(proof["effective_proof_token_budget"] or 0)
+                            - int(proof["estimated_tokens"] or 0),
+                        ),
+                        max(
+                            0,
+                            int(proof["effective_proof_budget"] or 0)
+                            - int(proof["estimated_chars"] or 0),
+                        ),
+                    )
+
+        fixed_messages: list[Message] = []
+        skills_message = self._skills_context_message()
+        if skills_message is not None:
+            fixed_messages.append(skills_message)
+        request_context_message = self._request_context_message(
+            self.config.request_context_prompt
+        )
+        if request_context_message is None:
+            # Durable compaction creates this request-scoped wrapper even when
+            # the turn had no pre-existing request context. Reserve the
+            # message/framing now; the candidate gate counts its summary text.
+            request_context_message = self._request_context_message(
+                "[Compaction summary candidate]"
+            )
+        if request_context_message is not None:
+            fixed_messages.append(request_context_message)
+        fixed_messages.append(
+            self._runtime_context_message(self._runtime_context_block())
+        )
+        turn_objective = self._turn_objective_message(
+            active_user_message,
+            enabled=self._turn_objective_reminder_enabled,
+            max_chars=self._turn_objective_reminder_max_chars,
+        )
+        if turn_objective is not None:
+            fixed_messages.append(turn_objective)
+        if attachment_messages:
+            # AttachmentStage has already produced the exact typed message
+            # that the provider call will consume. It also carries the active
+            # user text, so the plain user message must not be counted again.
+            fixed_messages.extend(attachment_messages)
+        elif active_user_message and not active_user_in_history:
+            fixed_messages.append(Message(role="user", content=active_user_message))
+        fixed_message_payload = self._live_request_jsonable(fixed_messages)
+        if attachments and not attachment_messages:
+            # These are ingress records before AttachmentStage has converted
+            # them to typed provider content blocks. Keep them JSON-shaped so
+            # the proof can conservatively count bytes/media without asking
+            # Message validation to accept a not-yet-canonical protocol.
+            fixed_message_payload.append(
+                {
+                    "role": "user",
+                    "content": self._live_request_jsonable(attachments),
+                }
+            )
+
+        payload: dict[str, Any] = {
+            "model": self.config.model_id or "",
+            "system": self.config.system_prompt or "",
+            "messages": fixed_message_payload,
+            "tools": self._live_request_jsonable(self.tool_definitions),
+            "max_tokens": self.config.max_tokens,
+        }
+        if self.config.output_json_schema is not None:
+            payload["response_format"] = self._live_request_jsonable(
+                self.config.output_json_schema
+            )
+        proof_budget = self._provider_request_proof_max_chars()
+        if context_window_tokens is not None:
+            try:
+                thinking_enabled, thinking_budget = self.config.resolve_thinking(
+                    active_user_message
+                )
+            except Exception:  # noqa: BLE001 - lightweight config compatibility
+                thinking_enabled = False
+                thinking_budget = 0
+            proof_budget = ContextBudgetGovernor.from_values(
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=(
+                    consumer_max_output_tokens or self.config.max_tokens
+                ),
+                thinking_budget_tokens=thinking_budget if thinking_enabled else 0,
+                context_overflow_threshold=self.config.context_overflow_threshold,
+                provider_request_proof_max_chars=max(
+                    0,
+                    int(consumer_provider_request_max_chars or 0),
+                ),
+            ).snapshot().provider_request_max_chars
+        try:
+            proof = prove_provider_payload(
+                payload,
+                projection_adapter="preflight_history_capacity",
+                proof_budget=proof_budget,
+            )
+        except ProviderRequestBudgetExceededError as exc:
+            proof = exc.proof
+        effective_token_budget = max(
+            0,
+            int(proof.get("effective_proof_token_budget", 0) or 0),
+        )
+        fixed_tokens = max(0, int(proof.get("estimated_tokens", 0) or 0))
+        effective_char_budget = max(
+            0,
+            int(proof.get("effective_proof_budget", 0) or 0),
+        )
+        fixed_chars = max(0, int(proof.get("estimated_chars", 0) or 0))
+        return (
+            max(0, effective_token_budget - fixed_tokens),
+            max(0, effective_char_budget - fixed_chars),
+        )
+
+    def preflight_history_capacity_tokens(
+        self,
+        *,
+        active_user_message: str,
+        active_user_in_history: bool,
+        attachments: list[dict[str, Any]] | None = None,
+        context_window_tokens: int | None = None,
+    ) -> int:
+        """Compatibility projection of the token side of preflight capacity."""
+
+        tokens, _chars = self.preflight_history_capacity(
+            active_user_message=active_user_message,
+            active_user_in_history=active_user_in_history,
+            attachments=attachments,
+            context_window_tokens=context_window_tokens,
+        )
+        return tokens
 
     def _context_budget_governor(self) -> ContextBudgetGovernor:
         return ContextBudgetGovernor.from_config(self.config)
@@ -4813,6 +5833,16 @@ class Agent:
 
         return list(self._history)
 
+    def prompt_cache_keepalive_candidate(self) -> PromptCacheKeepaliveCandidate | None:
+        """Return the last successful call's stable-prefix candidate, if any."""
+
+        return self._prompt_cache_keepalive_candidate
+
+    def set_prompt_cache_keepalive_capture_enabled(self, enabled: bool) -> None:
+        """Arm stable-prefix copying for an explicitly enabled session only."""
+
+        self._prompt_cache_keepalive_capture_enabled = bool(enabled)
+
     def _usage_context_for_turn(self) -> UsageExecutionContext:
         """Return the injected execution identity or a safe direct-Agent fallback."""
 
@@ -4918,6 +5948,8 @@ class Agent:
             prune_once_mount_grants,
         )
 
+        self._prompt_cache_keepalive_candidate = None
+
         try:
             if self._session_key:
                 clear_sandbox_approval_denials(self._session_key)
@@ -4946,6 +5978,10 @@ class Agent:
                 ):
                     yield event
         finally:
+            self._terminalize_pending_durable_compaction(
+                status="cancelled",
+                reason="turn_closed_before_compaction_install",
+            )
             approval_cleanup = asyncio.create_task(
                 clear_approval_run_context_deltas_for_tool_context(
                     self._tool_context,
@@ -4995,13 +6031,50 @@ class Agent:
             async for ev in self._run_meta_resume(meta_resume):
                 yield ev
             return
+        meta_replay_error = metadata.pop("meta_replay_error", None)
+        if meta_replay_error is not None:
+            async for ev in self._emit_terminal_text(
+                str(meta_replay_error), iterations=0
+            ):
+                yield ev
+            return
+        meta_replay = metadata.get("meta_replay")
+        if isinstance(meta_replay, dict):
+            replay_name = str(meta_replay.get("name") or "")
+            replay_run_id = str(meta_replay.get("run_id") or "")
+            replay_mode = str(meta_replay.get("mode") or "")
+            if replay_name and replay_run_id and replay_mode:
+                async for ev in self._run_meta_launch(
+                    replay_name,
+                    replay_run_id=replay_run_id,
+                    replay_mode=replay_mode,
+                ):
+                    yield ev
+                return
+            metadata.pop("meta_replay", None)
+            async for ev in self._emit_terminal_text(
+                "This replay request is invalid. Choose Retry failed step again.",
+                iterations=0,
+            ):
+                yield ev
+            return
         meta_launch = metadata.get("meta_launch")
         if meta_launch is not None:
             launch_name = (
                 meta_launch.get("name") if isinstance(meta_launch, dict) else None
             )
             if launch_name:
-                async for ev in self._run_meta_launch(launch_name):
+                launch_request = (
+                    meta_launch.get("request")
+                    if isinstance(meta_launch, dict)
+                    else None
+                )
+                launch_events = (
+                    self._run_meta_launch(launch_name, user_request=launch_request)
+                    if isinstance(launch_request, str)
+                    else self._run_meta_launch(launch_name)
+                )
+                async for ev in launch_events:
                     yield ev
                 return
         clarify_outcome = self._read_clarify_outcome(metadata)
@@ -5033,7 +6106,7 @@ class Agent:
             else ""
         )
         preserve_reasoning_content = bool(
-            _is_direct_deepseek_v4_model_id(self.config.model_id)
+            is_deepseek_v4_model_id(self.config.model_id)
             or (
                 thinking_enabled
                 and caps_reasoning_format == "deepseek"
@@ -5084,6 +6157,18 @@ class Agent:
         # Skills context, multimodal inputs, and the active user request all
         # belong to the protected current turn.
         current_turn_start_index = len(turn_messages)
+        # A one-turn-lag prefix is intentional: every message in this slice was
+        # already provider input before this turn.  The newly generated
+        # assistant response was not, so including it would claim a cache
+        # identity the provider has never seen.
+        keepalive_stable_history = (
+            tuple(
+                message.model_copy(deep=True)
+                for message in turn_messages[:current_turn_start_index]
+            )
+            if self._prompt_cache_keepalive_capture_enabled
+            else ()
+        )
         message_count_request_view: _MessageCountRequestView | None = None
         # Insert this turn's skills context BEFORE the user content so it
         # joins turn_messages permanently (persists into self._history at
@@ -5115,8 +6200,16 @@ class Agent:
             turn_messages,
             image_blocks=self._count_image_blocks(turn_messages),
         )
-        runtime_context = self._runtime_context_block()
-        runtime_context_message = self._runtime_context_message(runtime_context)
+        runtime_context_message = (
+            self._preflight_runtime_context_message
+            or self._runtime_context_message(self._runtime_context_block())
+        )
+        self._preflight_runtime_context_message = None
+        runtime_context = (
+            runtime_context_message.content
+            if isinstance(runtime_context_message.content, str)
+            else self._runtime_context_block()
+        )
         request_context_message = self._request_context_message(self.config.request_context_prompt)
         turn_objective_message = self._turn_objective_message(
             semantic_message if semantic_message is not None else message,
@@ -5125,30 +6218,10 @@ class Agent:
         )
         runtime_context_hash = hashlib.sha256(runtime_context.encode("utf-8")).hexdigest()[:16]
 
-        chat_cfg = ChatConfig(
-            max_tokens=self.config.max_tokens,
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
-            system=self._context.system_prompt,
-            thinking=thinking_enabled,
-            thinking_budget_tokens=thinking_budget,
-            thinking_budget_explicit=(
-                self.config.thinking_budget_tokens != _THINKING_BUDGET_DEFAULT
-            ),
-            timeout=self.config.request_timeout,
-            stop_sequences=self.config.stop_sequences,
-            cache_breakpoints=self._cache_breakpoints_without_runtime_context(
-                self.config.cache_breakpoints
-            ),
-            cache_mode=self.config.cache_mode,
-            output_json_schema=self.config.output_json_schema,
-            output_json_schema_strict=self.config.output_json_schema_strict,
-            model_capabilities=self.config.model_capabilities,
-            thinking_level=(
-                self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
-            ),
-            provider_request_max_chars=self._provider_request_proof_max_chars(),
-            tool_choice=None,
+        chat_cfg = self._provider_admission_chat_config(
+            thinking_prompt,
+            context_window_tokens=self.config.context_window_tokens,
+            max_output_tokens=self.config.max_tokens,
         )
         _thinking_fallback_done = False
         _disable_thinking_for_next_provider_call = False
@@ -5231,6 +6304,10 @@ class Agent:
         )
         turn_llm_calls = 0
         turn_tool_errors = 0
+        # A durable inline candidate is installed only after the rebuilt
+        # request crosses the provider adapter's final admission boundary.
+        self._pending_durable_compaction_event = None
+
         async def _review_inflight_sandbox_request(
             payload: dict[str, object],
         ) -> RuleAssessment | None:
@@ -6343,6 +7420,18 @@ class Agent:
                                 )
                             }
                         )
+                    active_user_message_index = _active_user_message_index_for_request(
+                        request_messages,
+                        current_user_text=self._current_turn_message or "",
+                    )
+                    if active_user_message_index is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "active_user_message_index": (
+                                    active_user_message_index
+                                )
+                            }
+                        )
 
                     self._write_turn_call_log(
                         "llm_request",
@@ -6413,10 +7502,26 @@ class Agent:
                                 tools=provider_tools_for_call,
                                 config=call_chat_cfg,
                             )
+                        pending_install_deadline: float | None = (
+                            self._pending_durable_compaction_event
+                            .compaction_deadline_at_monotonic
+                            if self._pending_durable_compaction_event is not None
+                            else None
+                        )
+
+                        def _pending_install_stream_deadline() -> float | None:
+                            pending_event = self._pending_durable_compaction_event
+                            return (
+                                pending_event.compaction_deadline_at_monotonic
+                                if pending_event is not None
+                                else None
+                            )
+
                         async for raw_ev in self._stream_provider_events_with_deadline(
                             raw_stream,
                             loop=_loop,
                             total_deadline=_total_deadline,
+                            deadline_provider=_pending_install_stream_deadline,
                         ):
                             if not isinstance(raw_ev, ProviderErrorEvent):
                                 # Provider.chat commonly returns an async
@@ -6428,6 +7533,13 @@ class Agent:
                                     iteration=iterations,
                                     model_call_id=call_id,
                                 )
+                                if self._pending_durable_compaction_event is not None:
+                                    pending_event = self._pending_durable_compaction_event
+                                    # Clear before yielding: if the consumer closes
+                                    # immediately after persisting this event, the
+                                    # wrapper must not emit a second terminal state.
+                                    self._pending_durable_compaction_event = None
+                                    yield pending_event
                             if first_event_at is None:
                                 first_event_at = time.monotonic()
                             if isinstance(raw_ev, ProviderTextDelta):
@@ -6838,6 +7950,51 @@ class Agent:
                                     continue
                                 provider_done_for_log = raw_ev
                                 _got_done_event = True
+                                if keepalive_stable_history and self._session_key:
+                                    try:
+                                        self._prompt_cache_keepalive_candidate = (
+                                            PromptCacheKeepaliveCandidate(
+                                                session_key=self._session_key,
+                                                provider=self.provider,
+                                                provider_id=str(
+                                                    getattr(
+                                                        self.provider,
+                                                        "active_provider_id",
+                                                        "",
+                                                    )
+                                                    or self.config.provider_id
+                                                    or getattr(
+                                                        self.provider,
+                                                        "provider_id",
+                                                        "",
+                                                    )
+                                                    or getattr(
+                                                        self.provider,
+                                                        "provider_name",
+                                                        "",
+                                                    )
+                                                    or ""
+                                                ),
+                                                model=str(
+                                                    raw_ev.model
+                                                    or self.config.model_id
+                                                    or ""
+                                                ),
+                                                messages=keepalive_stable_history,
+                                                tools=tuple(
+                                                    copy.deepcopy(
+                                                        provider_tools_for_call or []
+                                                    )
+                                                ),
+                                                config=call_chat_cfg.model_copy(
+                                                    deep=True
+                                                ),
+                                            )
+                                        )
+                                    except Exception:
+                                        # Snapshotting is strictly optional and
+                                        # must never change a real user turn.
+                                        self._prompt_cache_keepalive_candidate = None
                                 physical_usage_provider = str(
                                     getattr(
                                         raw_ev,
@@ -7132,7 +8289,45 @@ class Agent:
                     except asyncio.CancelledError:
                         usage_unknown_reason = "cancelled"
                         raise
-                    except TimeoutError:
+                    except TimeoutError as exc:
+                        enforced_stream_deadline = getattr(
+                            exc,
+                            _STREAM_DEADLINE_ATTRIBUTE,
+                            None,
+                        )
+                        pending_install_timeout = (
+                            enforced_stream_deadline
+                            == pending_install_deadline
+                            if enforced_stream_deadline is not None
+                            else (
+                                pending_install_deadline is not None
+                                and _loop.time() >= pending_install_deadline
+                            )
+                        )
+                        if (
+                            pending_install_deadline is not None
+                            and self._pending_durable_compaction_event is not None
+                            and pending_install_timeout
+                        ):
+                            usage_unknown_reason = "compaction_install_timeout"
+                            _notify_call_outcome(
+                                ok=False,
+                                failure_kind="compaction_install_timeout",
+                            )
+                            self._terminalize_pending_durable_compaction(
+                                status="timed_out",
+                                reason="compaction_deadline_exceeded",
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "Context compaction could not be installed "
+                                    "before its absolute deadline."
+                                ),
+                                code="compaction_deadline_exceeded",
+                            )
+                            yield terminal_error
+                            break
                         # Total-deadline timeout raised by the stream wrapper:
                         # record the failed call, then propagate unchanged.
                         usage_unknown_reason = "total_timeout"
@@ -8182,11 +9377,128 @@ class Agent:
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
                             self._record_provider_context_overflow_reason(provider_error)
-                            provider_compaction_window_tokens = (
-                                self._provider_budget_compaction_window_tokens(provider_error)
+                            provider_budget_proof = (
+                                self._provider_request_budget_proof(provider_error)
                             )
-                            provider_estimated_tokens = self._provider_budget_estimated_tokens(
-                                provider_error
+                            durable_projection = None
+                            durable_consumer_overflow_proven: bool | None = None
+                            if provider_error.code == "provider_request_budget_exhausted":
+                                durable_projection = (
+                                    self._project_durable_consumer_final_request(
+                                        request_messages,
+                                        tools=provider_tools_for_call,
+                                        active_config=call_chat_cfg,
+                                    )
+                                )
+                                durable_consumer_overflow_proven = bool(
+                                    durable_projection is not None
+                                    and not durable_projection.fits
+                                )
+                                live_turn_recovery_possible = (
+                                    self._live_turn_compaction_boundary(
+                                        turn_messages,
+                                        protected_turn_start_index=(
+                                            current_turn_start_index
+                                        ),
+                                    )
+                                    is not None
+                                )
+                                if durable_consumer_overflow_proven:
+                                    self._write_turn_call_log(
+                                        "provider_request_budget_durable_pressure_proven",
+                                        durable_consumer_fits=False,
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                    )
+                                elif live_turn_recovery_possible:
+                                    self._write_turn_call_log(
+                                        "provider_request_budget_live_turn_recovery",
+                                        durable_consumer_fits=(
+                                            durable_projection.fits
+                                            if durable_projection is not None
+                                            else None
+                                        ),
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                    )
+                                else:
+                                    self._write_turn_call_log(
+                                        "provider_request_budget_recovery_refused",
+                                        reason="request_envelope_source_ambiguous",
+                                        durable_consumer_fits=(
+                                            durable_projection.fits
+                                            if durable_projection is not None
+                                            else None
+                                        ),
+                                        iteration=iterations,
+                                        attempt=_call_attempt,
+                                    )
+                                    yield self._transition(AgentState.ERROR)
+                                    terminal_error = self._context_overflow_error()
+                                    yield terminal_error
+                                    break
+                            elif bool(
+                                getattr(
+                                    self.provider,
+                                    "final_request_admission_guaranteed",
+                                    False,
+                                )
+                            ):
+                                self._last_compaction_refusal_reason = (
+                                    "provider_native_overflow_after_admission"
+                                )
+                                self._write_turn_call_log(
+                                    "provider_request_budget_recovery_refused",
+                                    reason=(
+                                        "provider_native_overflow_after_final_admission"
+                                    ),
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = self._context_overflow_error()
+                                yield terminal_error
+                                break
+                            compaction_budget_proof = provider_budget_proof
+                            if (
+                                durable_consumer_overflow_proven is True
+                                and durable_projection is not None
+                            ):
+                                # Durable pressure must be recovered against the
+                                # stable consumer's exact final-envelope budget,
+                                # including output/thinking reserve.  Using the
+                                # model's total context window here can make a
+                                # request that already exceeded the provider's
+                                # admissible input look "within budget" and turn
+                                # automatic compaction into a no-op.
+                                compaction_budget_proof = durable_projection.proof
+                            provider_request_window_tokens = self._positive_int(
+                                (compaction_budget_proof or {}).get(
+                                    "effective_proof_token_budget"
+                                )
+                            )
+                            provider_compaction_window_tokens = (
+                                max(
+                                    1,
+                                    int(self._durable_consumer_window_tokens or 0),
+                                )
+                                if durable_consumer_overflow_proven is True
+                                else None
+                            )
+                            provider_request_window_chars = self._positive_int(
+                                (compaction_budget_proof or {}).get(
+                                    "effective_proof_budget"
+                                )
+                            )
+                            provider_estimated_tokens = self._positive_int(
+                                (compaction_budget_proof or {}).get(
+                                    "estimated_tokens"
+                                )
+                            )
+                            provider_estimated_chars = self._positive_int(
+                                (compaction_budget_proof or {}).get(
+                                    "estimated_chars"
+                                )
                             )
                             provider_compaction_refusal_reason = (
                                 self._last_compaction_refusal_reason
@@ -8197,7 +9509,11 @@ class Agent:
                                     provider_compaction_window_tokens
                                     or self.config.context_window_tokens
                                 ) + 1
-                            if overflow_retries >= self.config.max_overflow_retries:
+                            effective_overflow_retries = min(
+                                1,
+                                max(0, int(self.config.max_overflow_retries or 0)),
+                            )
+                            if overflow_retries >= effective_overflow_retries:
                                 yield self._transition(AgentState.ERROR)
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
@@ -8217,6 +9533,12 @@ class Agent:
                                 runtime_context_insert_index=runtime_context_insert_index,
                                 protected_turn_start_index=current_turn_start_index,
                                 compaction_window_tokens=provider_compaction_window_tokens,
+                                request_window_tokens=provider_request_window_tokens,
+                                request_window_chars=provider_request_window_chars,
+                                estimated_context_chars=provider_estimated_chars,
+                                durable_consumer_overflow_proven=(
+                                    durable_consumer_overflow_proven
+                                ),
                             )
                             if overflow_outcome is None:
                                 yield self._transition(AgentState.ERROR)
@@ -8230,6 +9552,7 @@ class Agent:
                                 self._last_compaction_refusal_reason = (
                                     provider_compaction_refusal_reason
                                 )
+                            self._stage_pending_durable_compaction(overflow_outcome)
                             next_request_context_insert_index = (
                                 overflow_outcome.request_context_insert_index
                                 if overflow_outcome.request_context_insert_index is not None
@@ -8240,14 +9563,82 @@ class Agent:
                                 if overflow_outcome.runtime_context_insert_index is not None
                                 else runtime_context_insert_index
                             )
-                            next_request_messages = await self._provider_request_messages_async(
-                                overflow_outcome.messages,
-                                request_context_message=request_context_message,
-                                request_context_insert_index=next_request_context_insert_index,
-                                runtime_context_message=runtime_context_message,
-                                runtime_context_insert_index=next_runtime_context_insert_index,
-                                turn_objective_message=turn_objective_message,
-                            )
+                            try:
+                                rebuild_deadline = (
+                                    overflow_outcome.compaction_deadline_at_monotonic
+                                    if not overflow_outcome.ephemeral_only
+                                    else None
+                                )
+                                if rebuild_deadline is None:
+                                    next_request_messages = (
+                                        await self._provider_request_messages_async(
+                                            overflow_outcome.messages,
+                                            request_context_message=(
+                                                request_context_message
+                                            ),
+                                            request_context_insert_index=(
+                                                next_request_context_insert_index
+                                            ),
+                                            runtime_context_message=(
+                                                runtime_context_message
+                                            ),
+                                            runtime_context_insert_index=(
+                                                next_runtime_context_insert_index
+                                            ),
+                                            turn_objective_message=(
+                                                turn_objective_message
+                                            ),
+                                        )
+                                    )
+                                else:
+                                    async with asyncio.timeout_at(rebuild_deadline):
+                                        next_request_messages = (
+                                            await self._provider_request_messages_async(
+                                                overflow_outcome.messages,
+                                                request_context_message=(
+                                                    request_context_message
+                                                ),
+                                                request_context_insert_index=(
+                                                    next_request_context_insert_index
+                                                ),
+                                                runtime_context_message=(
+                                                    runtime_context_message
+                                                ),
+                                                runtime_context_insert_index=(
+                                                    next_runtime_context_insert_index
+                                                ),
+                                                turn_objective_message=(
+                                                    turn_objective_message
+                                                ),
+                                            )
+                                        )
+                            except asyncio.CancelledError:
+                                self._terminalize_pending_durable_compaction(
+                                    status="cancelled",
+                                    reason="request_rebuild_cancelled",
+                                )
+                                raise
+                            except TimeoutError:
+                                self._terminalize_pending_durable_compaction(
+                                    status="timed_out",
+                                    reason="compaction_deadline_exceeded",
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    message=(
+                                        "Context compaction could not rebuild the "
+                                        "provider request before its absolute deadline."
+                                    ),
+                                    code="compaction_deadline_exceeded",
+                                )
+                                yield terminal_error
+                                break
+                            except Exception:
+                                self._terminalize_pending_durable_compaction(
+                                    status="failed",
+                                    reason="request_rebuild_failed",
+                                )
+                                raise
                             if not self._provider_request_is_smaller(
                                 request_messages,
                                 next_request_messages,
@@ -8258,28 +9649,578 @@ class Agent:
                                     != "provider_recent_tail_too_large"
                                 ):
                                     self._last_compaction_refusal_reason = "compaction_not_smaller"
+                                self._terminalize_pending_durable_compaction(
+                                    status="failed",
+                                    reason="compaction_not_smaller",
+                                )
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
-                            turn_messages = overflow_outcome.messages
-                            request_context_insert_index = next_request_context_insert_index
-                            runtime_context_insert_index = next_runtime_context_insert_index
-                            if overflow_outcome.protected_turn_start_index is not None:
-                                current_turn_start_index = (
-                                    overflow_outcome.protected_turn_start_index
+                            next_active_user_index = (
+                                _active_user_message_index_for_request(
+                                    next_request_messages,
+                                    current_user_text=(
+                                        self._current_turn_message or ""
+                                    ),
                                 )
-                            message_count_request_view = None
-                            yield WarningEvent(
-                                code="context_auto_compaction_retry",
-                                message="Context compacted; retrying the provider request.",
                             )
-                            yield CompactionEvent(
-                                compaction_id=overflow_outcome.compaction_id,
-                                summary=overflow_outcome.summary,
-                                kept_entries=overflow_outcome.kept_entries,
-                                kept_count=len(overflow_outcome.messages),
-                                removed_count=overflow_outcome.removed_count,
+                            next_chat_cfg = call_chat_cfg.model_copy(
+                                update={
+                                    "active_user_message_index": (
+                                        next_active_user_index
+                                    )
+                                }
                             )
+                            stable_live_recovery: CompactionOutcome | None = None
+                            if durable_consumer_overflow_proven is True:
+                                durable_next_projection = (
+                                    self._project_durable_consumer_final_request(
+                                        next_request_messages,
+                                        tools=provider_tools_for_call,
+                                        active_config=next_chat_cfg,
+                                    )
+                                )
+                                admission_proof = (
+                                    durable_next_projection.proof
+                                    if durable_next_projection is not None
+                                    else {}
+                                )
+                                logger.debug(
+                                    "compaction.consumer_admission_projection",
+                                    consumer="durable",
+                                    ephemeral_only=overflow_outcome.ephemeral_only,
+                                    active_user_found=next_active_user_index is not None,
+                                    fits=(
+                                        durable_next_projection.fits
+                                        if durable_next_projection is not None
+                                        else None
+                                    ),
+                                    estimated_tokens=admission_proof.get(
+                                        "estimated_tokens"
+                                    ),
+                                    effective_token_budget=admission_proof.get(
+                                        "effective_proof_token_budget"
+                                    ),
+                                    estimated_chars=admission_proof.get(
+                                        "estimated_chars"
+                                    ),
+                                    effective_char_budget=admission_proof.get(
+                                        "effective_proof_budget"
+                                    ),
+                                )
+                                if (
+                                    next_active_user_index is None
+                                    or durable_next_projection is None
+                                    or not durable_next_projection.fits
+                                ):
+                                    stable_protected_start = (
+                                        overflow_outcome.protected_turn_start_index
+                                        if (
+                                            overflow_outcome
+                                            .protected_turn_start_index
+                                            is not None
+                                        )
+                                        else current_turn_start_index
+                                    )
+                                    stable_source_messages = overflow_outcome.messages
+                                    stable_source_request_index = (
+                                        next_request_context_insert_index
+                                    )
+                                    stable_source_runtime_index = (
+                                        next_runtime_context_insert_index
+                                    )
+                                    stable_keep_recent_rounds = 2
+                                    if overflow_outcome.ephemeral_only:
+                                        # The first request-scoped summary keeps
+                                        # two raw rounds. If exact final-envelope
+                                        # admission still fails, retry within the
+                                        # same compaction deadline/call budget by
+                                        # summarizing one more completed round.
+                                        stable_source_messages = turn_messages
+                                        stable_protected_start = (
+                                            current_turn_start_index
+                                        )
+                                        stable_source_request_index = (
+                                            request_context_insert_index
+                                        )
+                                        stable_source_runtime_index = (
+                                            runtime_context_insert_index
+                                        )
+                                        stable_keep_recent_rounds = 1
+                                    if (
+                                        next_active_user_index is not None
+                                        and durable_next_projection is not None
+                                        and self._live_turn_compaction_boundary(
+                                            stable_source_messages,
+                                            protected_turn_start_index=(
+                                                stable_protected_start
+                                            ),
+                                            keep_recent_rounds=(
+                                                stable_keep_recent_rounds
+                                            ),
+                                        )
+                                        is not None
+                                    ):
+                                        try:
+                                            stable_live_recovery = (
+                                                await self._recover_live_turn_request_overflow(
+                                                    stable_source_messages,
+                                                    protected_turn_start_index=(
+                                                        stable_protected_start
+                                                    ),
+                                                    context_window_tokens=(
+                                                        provider_request_window_tokens
+                                                        or max(
+                                                            1,
+                                                            int(
+                                                                self._durable_consumer_window_tokens
+                                                                or self.config.context_window_tokens
+                                                            ),
+                                                        )
+                                                    ),
+                                                    context_window_chars=(
+                                                        provider_request_window_chars
+                                                    ),
+                                                    keep_recent_rounds=(
+                                                        stable_keep_recent_rounds
+                                                    ),
+                                                    request_context_insert_index=(
+                                                        stable_source_request_index
+                                                    ),
+                                                    runtime_context_insert_index=(
+                                                        stable_source_runtime_index
+                                                    ),
+                                                    shared_compaction_config=(
+                                                        overflow_outcome
+                                                        .runtime_compaction_config
+                                                    ),
+                                                )
+                                            )
+                                        except asyncio.CancelledError:
+                                            raise
+                                        except Exception as exc:  # noqa: BLE001
+                                            logger.warning(
+                                                "compaction.stable_live_turn_projection_failed",
+                                                error_type=type(exc).__name__,
+                                                error=str(exc),
+                                            )
+                                    if stable_live_recovery is not None:
+                                        stable_live_request_index = (
+                                            stable_live_recovery
+                                            .request_context_insert_index
+                                            if (
+                                                stable_live_recovery
+                                                .request_context_insert_index
+                                                is not None
+                                            )
+                                            else next_request_context_insert_index
+                                        )
+                                        stable_live_runtime_index = (
+                                            stable_live_recovery
+                                            .runtime_context_insert_index
+                                            if (
+                                                stable_live_recovery
+                                                .runtime_context_insert_index
+                                                is not None
+                                            )
+                                            else next_runtime_context_insert_index
+                                        )
+                                        stable_live_request_messages = (
+                                            await self._provider_request_messages_async(
+                                                stable_live_recovery.messages,
+                                                request_context_message=(
+                                                    request_context_message
+                                                ),
+                                                request_context_insert_index=(
+                                                    stable_live_request_index
+                                                ),
+                                                runtime_context_message=(
+                                                    runtime_context_message
+                                                ),
+                                                runtime_context_insert_index=(
+                                                    stable_live_runtime_index
+                                                ),
+                                                turn_objective_message=(
+                                                    turn_objective_message
+                                                ),
+                                            )
+                                        )
+                                        stable_live_active_user_index = (
+                                            _active_user_message_index_for_request(
+                                                stable_live_request_messages,
+                                                current_user_text=(
+                                                    self._current_turn_message or ""
+                                                ),
+                                            )
+                                        )
+                                        stable_live_chat_cfg = (
+                                            call_chat_cfg.model_copy(
+                                                update={
+                                                    "active_user_message_index": (
+                                                        stable_live_active_user_index
+                                                    )
+                                                }
+                                            )
+                                        )
+                                        stable_live_projection = (
+                                            self._project_durable_consumer_final_request(
+                                                stable_live_request_messages,
+                                                tools=provider_tools_for_call,
+                                                active_config=(
+                                                    stable_live_chat_cfg
+                                                ),
+                                            )
+                                        )
+                                        if (
+                                            stable_live_active_user_index is not None
+                                            and stable_live_projection is not None
+                                            and stable_live_projection.fits
+                                        ):
+                                            next_request_messages = (
+                                                stable_live_request_messages
+                                            )
+                                            next_active_user_index = (
+                                                stable_live_active_user_index
+                                            )
+                                            next_chat_cfg = stable_live_chat_cfg
+                                            durable_next_projection = (
+                                                stable_live_projection
+                                            )
+                                        else:
+                                            stable_live_recovery = None
+                                    if (
+                                        next_active_user_index is None
+                                        or durable_next_projection is None
+                                        or not durable_next_projection.fits
+                                    ):
+                                        self._last_compaction_refusal_reason = (
+                                            "compaction_consumer_admission_failed"
+                                        )
+                                        self._terminalize_pending_durable_compaction(
+                                            status="failed",
+                                            reason=(
+                                                "compaction_consumer_admission_failed"
+                                            ),
+                                        )
+                                        yield self._transition(AgentState.ERROR)
+                                        terminal_error = (
+                                            self._context_overflow_error()
+                                        )
+                                        yield terminal_error
+                                        break
+                                if not overflow_outcome.ephemeral_only:
+                                    pending_event = (
+                                        self._pending_durable_compaction_event
+                                    )
+                                    if pending_event is None:
+                                        self._last_compaction_refusal_reason = (
+                                            "compaction_consumer_admission_failed"
+                                        )
+                                        yield self._transition(AgentState.ERROR)
+                                        terminal_error = self._context_overflow_error()
+                                        yield terminal_error
+                                        break
+                                    # Stable consumer admission, rather than the
+                                    # temporary routed leg, owns installation.
+                                    # Clear before yielding so cancellation after
+                                    # persistence cannot produce a second
+                                    # terminal lifecycle event.
+                                    self._pending_durable_compaction_event = None
+                                    yield pending_event
+                                    turn_messages = overflow_outcome.messages
+                                    request_context_insert_index = (
+                                        next_request_context_insert_index
+                                    )
+                                    runtime_context_insert_index = (
+                                        next_runtime_context_insert_index
+                                    )
+                                    if (
+                                        overflow_outcome.protected_turn_start_index
+                                        is not None
+                                    ):
+                                        current_turn_start_index = (
+                                            overflow_outcome.protected_turn_start_index
+                                        )
+                                    message_count_request_view = None
+                            next_projection = project_provider_final_request(
+                                self.provider,
+                                next_request_messages,
+                                provider_tools_for_call,
+                                next_chat_cfg,
+                            )
+                            if (
+                                stable_live_recovery is not None
+                                and next_active_user_index is not None
+                                and next_projection is not None
+                                and next_projection.fits
+                            ):
+                                message_count_request_view = (
+                                    _MessageCountRequestView(
+                                        messages=stable_live_recovery.messages,
+                                        canonical_tail_start=len(turn_messages),
+                                        request_context_insert_index=(
+                                            stable_live_recovery
+                                            .request_context_insert_index
+                                            if (
+                                                stable_live_recovery
+                                                .request_context_insert_index
+                                                is not None
+                                            )
+                                            else next_request_context_insert_index
+                                        ),
+                                        runtime_context_insert_index=(
+                                            stable_live_recovery
+                                            .runtime_context_insert_index
+                                            if (
+                                                stable_live_recovery
+                                                .runtime_context_insert_index
+                                                is not None
+                                            )
+                                            else next_runtime_context_insert_index
+                                        ),
+                                        protected_turn_start_index=(
+                                            stable_live_recovery
+                                            .protected_turn_start_index
+                                            if (
+                                                stable_live_recovery
+                                                .protected_turn_start_index
+                                                is not None
+                                            )
+                                            else current_turn_start_index
+                                        ),
+                                    )
+                                )
+                                self._last_compaction_refusal_reason = None
+                                _call_attempt += 1
+                                continue
+                            if (
+                                next_active_user_index is None
+                                or next_projection is None
+                                or not next_projection.fits
+                            ):
+                                routed_recovery = stable_live_recovery
+                                routed_protected_start = (
+                                    overflow_outcome.protected_turn_start_index
+                                    if overflow_outcome.protected_turn_start_index
+                                    is not None
+                                    else current_turn_start_index
+                                )
+                                routed_source_messages = overflow_outcome.messages
+                                routed_source_request_index = (
+                                    next_request_context_insert_index
+                                )
+                                routed_source_runtime_index = (
+                                    next_runtime_context_insert_index
+                                )
+                                routed_keep_recent_rounds = 2
+                                if overflow_outcome.ephemeral_only:
+                                    routed_source_messages = turn_messages
+                                    routed_protected_start = current_turn_start_index
+                                    routed_source_request_index = (
+                                        request_context_insert_index
+                                    )
+                                    routed_source_runtime_index = (
+                                        runtime_context_insert_index
+                                    )
+                                    routed_keep_recent_rounds = 1
+                                if (
+                                    routed_recovery is None
+                                    and next_active_user_index is not None
+                                    and next_projection is not None
+                                    and (
+                                        overflow_outcome.ephemeral_only
+                                        or durable_consumer_overflow_proven is True
+                                    )
+                                    and self._live_turn_compaction_boundary(
+                                        routed_source_messages,
+                                        protected_turn_start_index=(
+                                            routed_protected_start
+                                        ),
+                                        keep_recent_rounds=(
+                                            routed_keep_recent_rounds
+                                        ),
+                                    )
+                                    is not None
+                                ):
+                                    try:
+                                        routed_recovery = (
+                                            await self._recover_live_turn_request_overflow(
+                                                routed_source_messages,
+                                                protected_turn_start_index=(
+                                                    routed_protected_start
+                                                ),
+                                                context_window_tokens=(
+                                                    provider_request_window_tokens
+                                                    or self.config.context_window_tokens
+                                                ),
+                                                context_window_chars=(
+                                                    provider_request_window_chars
+                                                ),
+                                                keep_recent_rounds=(
+                                                    routed_keep_recent_rounds
+                                                ),
+                                                request_context_insert_index=(
+                                                    routed_source_request_index
+                                                ),
+                                                runtime_context_insert_index=(
+                                                    routed_source_runtime_index
+                                                ),
+                                                shared_compaction_config=(
+                                                    overflow_outcome
+                                                    .runtime_compaction_config
+                                                ),
+                                            )
+                                        )
+                                    except asyncio.CancelledError:
+                                        raise
+                                    except Exception as exc:  # noqa: BLE001
+                                        logger.warning(
+                                            "compaction.routed_live_turn_projection_failed",
+                                            error_type=type(exc).__name__,
+                                            error=str(exc),
+                                        )
+                                if routed_recovery is not None:
+                                    routed_request_index = (
+                                        routed_recovery.request_context_insert_index
+                                        if (
+                                            routed_recovery
+                                            .request_context_insert_index
+                                            is not None
+                                        )
+                                        else next_request_context_insert_index
+                                    )
+                                    routed_runtime_index = (
+                                        routed_recovery.runtime_context_insert_index
+                                        if (
+                                            routed_recovery
+                                            .runtime_context_insert_index
+                                            is not None
+                                        )
+                                        else next_runtime_context_insert_index
+                                    )
+                                    routed_request_messages = (
+                                        await self._provider_request_messages_async(
+                                            routed_recovery.messages,
+                                            request_context_message=(
+                                                request_context_message
+                                            ),
+                                            request_context_insert_index=(
+                                                routed_request_index
+                                            ),
+                                            runtime_context_message=(
+                                                runtime_context_message
+                                            ),
+                                            runtime_context_insert_index=(
+                                                routed_runtime_index
+                                            ),
+                                            turn_objective_message=(
+                                                turn_objective_message
+                                            ),
+                                        )
+                                    )
+                                    routed_active_user_index = (
+                                        _active_user_message_index_for_request(
+                                            routed_request_messages,
+                                            current_user_text=(
+                                                self._current_turn_message or ""
+                                            ),
+                                        )
+                                    )
+                                    routed_chat_cfg = call_chat_cfg.model_copy(
+                                        update={
+                                            "active_user_message_index": (
+                                                routed_active_user_index
+                                            )
+                                        }
+                                    )
+                                    routed_projection = (
+                                        project_provider_final_request(
+                                            self.provider,
+                                            routed_request_messages,
+                                            provider_tools_for_call,
+                                            routed_chat_cfg,
+                                        )
+                                    )
+                                    if (
+                                        routed_active_user_index is not None
+                                        and routed_projection is not None
+                                        and routed_projection.fits
+                                    ):
+                                        message_count_request_view = (
+                                            _MessageCountRequestView(
+                                                messages=(
+                                                    routed_recovery.messages
+                                                ),
+                                                canonical_tail_start=len(
+                                                    turn_messages
+                                                ),
+                                                request_context_insert_index=(
+                                                    routed_request_index
+                                                ),
+                                                runtime_context_insert_index=(
+                                                    routed_runtime_index
+                                                ),
+                                                protected_turn_start_index=(
+                                                    routed_recovery
+                                                    .protected_turn_start_index
+                                                    if (
+                                                        routed_recovery
+                                                        .protected_turn_start_index
+                                                        is not None
+                                                    )
+                                                    else current_turn_start_index
+                                                ),
+                                            )
+                                        )
+                                        self._last_compaction_refusal_reason = None
+                                        _call_attempt += 1
+                                        continue
+                                self._last_compaction_refusal_reason = (
+                                    "provider_request_budget_exhausted"
+                                    if durable_consumer_overflow_proven is True
+                                    else "compaction_final_admission_failed"
+                                )
+                                self._terminalize_pending_durable_compaction(
+                                    status="failed",
+                                    reason=self._last_compaction_refusal_reason,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = self._context_overflow_error()
+                                yield terminal_error
+                                break
+                            if overflow_outcome.ephemeral_only:
+                                message_count_request_view = _MessageCountRequestView(
+                                    messages=overflow_outcome.messages,
+                                    canonical_tail_start=len(turn_messages),
+                                    request_context_insert_index=(
+                                        next_request_context_insert_index
+                                    ),
+                                    runtime_context_insert_index=(
+                                        next_runtime_context_insert_index
+                                    ),
+                                    protected_turn_start_index=(
+                                        overflow_outcome.protected_turn_start_index
+                                        if overflow_outcome.protected_turn_start_index
+                                        is not None
+                                        else current_turn_start_index
+                                    ),
+                                )
+                            else:
+                                turn_messages = overflow_outcome.messages
+                                request_context_insert_index = (
+                                    next_request_context_insert_index
+                                )
+                                runtime_context_insert_index = (
+                                    next_runtime_context_insert_index
+                                )
+                                if (
+                                    overflow_outcome.protected_turn_start_index
+                                    is not None
+                                ):
+                                    current_turn_start_index = (
+                                        overflow_outcome.protected_turn_start_index
+                                )
+                                message_count_request_view = None
                             _call_attempt += 1
                             continue
                         should_retry = _fallback.should_retry(kind, _retry_attempt)
@@ -8430,85 +10371,6 @@ class Agent:
 
                 if iter_reasoning_content:
                     final_reasoning_parts.append(iter_reasoning_content)
-
-                # Check overflow against the live provider request, not
-                # cumulative billable usage for the whole turn.
-                estimated_context_tokens = self._estimate_live_request_tokens(
-                    request_messages,
-                    tools=provider_tools_for_call,
-                    config=call_chat_cfg,
-                )
-                overflow_outcome = await self._check_context_overflow(
-                    turn_messages,
-                    estimated_context_tokens,
-                    request_context_insert_index=request_context_insert_index,
-                    runtime_context_insert_index=runtime_context_insert_index,
-                    protected_turn_start_index=current_turn_start_index,
-                )
-                if overflow_outcome is None:
-                    if overflow_retries >= self.config.max_overflow_retries:
-                        yield self._transition(AgentState.ERROR)
-                        terminal_error = self._context_overflow_error()
-                        yield terminal_error
-                        break
-                    overflow_retries += 1
-                    _log.warning(
-                        "compaction.retry",
-                        attempt=overflow_retries,
-                        max=self.config.max_overflow_retries,
-                    )
-                    continue  # retry the tool loop iteration
-                if overflow_outcome.compacted:
-                    # Compaction happened — replace message list. Lifetime
-                    # counters keep feeding DoneEvent usage/cost accounting for
-                    # this turn.
-                    turn_messages = overflow_outcome.messages
-                    if overflow_outcome.request_context_insert_index is not None:
-                        request_context_insert_index = overflow_outcome.request_context_insert_index
-                    if overflow_outcome.runtime_context_insert_index is not None:
-                        runtime_context_insert_index = overflow_outcome.runtime_context_insert_index
-                    if overflow_outcome.protected_turn_start_index is not None:
-                        current_turn_start_index = overflow_outcome.protected_turn_start_index
-                    message_count_request_view = None
-                    yield CompactionEvent(
-                        compaction_id=overflow_outcome.compaction_id,
-                        summary=overflow_outcome.summary,
-                        kept_entries=overflow_outcome.kept_entries,
-                        kept_count=len(overflow_outcome.messages),
-                        removed_count=overflow_outcome.removed_count,
-                    )
-                    overflow_retries = 0  # reset on success
-                    # Rebuild chat_cfg so next LLM call uses refreshed system
-                    # prompt. Read cache_breakpoints from the
-                    # refreshed self.config (re-anchored by
-                    # refresh_system_prompt) — chat_cfg.cache_breakpoints
-                    # would still hold pre-compaction base text and miss the
-                    # cache on the next provider call.
-                    chat_cfg = ChatConfig(
-                        max_tokens=chat_cfg.max_tokens,
-                        temperature=chat_cfg.temperature,
-                        top_p=chat_cfg.top_p,
-                        system=self._context.system_prompt,
-                        thinking=thinking_enabled,
-                        thinking_budget_tokens=thinking_budget,
-                        thinking_budget_explicit=chat_cfg.thinking_budget_explicit,
-                        timeout=chat_cfg.timeout,
-                        stop_sequences=chat_cfg.stop_sequences,
-                        cache_breakpoints=self._cache_breakpoints_without_runtime_context(
-                            self.config.cache_breakpoints
-                        ),
-                        cache_mode=chat_cfg.cache_mode,
-                        output_json_schema=chat_cfg.output_json_schema,
-                        output_json_schema_strict=chat_cfg.output_json_schema_strict,
-                        model_capabilities=self.config.model_capabilities,
-                        thinking_level=(
-                            self.config.thinking
-                            if isinstance(self.config.thinking, ThinkingLevel)
-                            else None
-                        ),
-                        provider_request_max_chars=(self._provider_request_proof_max_chars()),
-                        tool_choice=chat_cfg.tool_choice,
-                    )
 
                 assembled_text = "".join(assistant_text_parts)
                 visible_text = assembled_text
@@ -10019,7 +11881,16 @@ class Agent:
                         ):
                             yield event
                         mutex_result = results_by_id.get(tc.tool_use_id)
-                        if mutex_result is not None and mutex_result.terminates_turn:
+                        # A structured-input attempt owns the remainder of the
+                        # provider response even when its arguments are invalid.
+                        # Keep the error non-terminal so the next provider
+                        # iteration can correct it, but never let a tail call in
+                        # the same response (notably submit_plan) race past it.
+                        if mutex_result is not None and (
+                            mutex_result.terminates_turn
+                            or tc.tool_name == "request_user_input"
+                            or _pending_approval_payload(mutex_result.content) is not None
+                        ):
                             dispatch_boundary = mutex_result
                         if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
                             plan_run_delivery_only = True
@@ -10122,82 +11993,121 @@ class Agent:
                         if deferred_user_input_handled
                         else _pending_approval_payload(result.content)
                     )
-                    if pending_approval is not None and not tc.arguments.get("approval_id"):
-                        suspended = _suspend_tool_request(tc, pending_approval)
-                        assessment = await _review_pending_elevation_if_configured(
-                            pending_approval,
-                            transcript=turn_messages,
-                            runtime_events_path=self.config.runtime_events_path,
-                            suspended_action=suspended.action,
-                        )
-                        # Human-owned approvals need a lifecycle event so the UI can
-                        # render its card. Automatic rule reviews remain internal.
-                        if assessment is None:
-                            yield ToolResultEvent(
-                                tool_use_id=projected_result.tool_use_id,
-                                tool_name=projected_result.tool_name,
-                                result=projected_result.content,
-                                is_error=projected_result.is_error,
-                                arguments=tc.arguments,
-                                execution_status=projected_result.execution_status,
+                    if pending_approval is not None:
+                        # One logical tool execution may intentionally have more
+                        # than one approval boundary (for example, a second
+                        # explicit confirmation after backup becomes unavailable).
+                        # Keep waiting and resuming the original tool call until it
+                        # completes, or until the user denies any step.
+                        while pending_approval is not None:
+                            suspended = _suspend_tool_request(tc, pending_approval)
+                            assessment = await _review_pending_elevation_if_configured(
+                                pending_approval,
+                                transcript=turn_messages,
+                                runtime_events_path=self.config.runtime_events_path,
+                                suspended_action=suspended.action,
                             )
-                        approval_wait_started = _loop.time()
-                        await _wait_for_pending_approval_resolution(pending_approval)
-                        approval_wait_duration = max(
-                            0.0,
-                            _loop.time() - approval_wait_started,
-                        )
-                        # Human review is a suspended state, not execution time.
-                        # Shift both active deadlines so an approval that arrives
-                        # much later still resumes with the same tool/turn budget.
-                        tool_deadline += approval_wait_duration
-                        if _total_deadline is not None:
-                            _total_deadline += approval_wait_duration
-                        approval_entry = None
-                        from opensquilla.gateway.approval_queue import get_approval_queue
-
-                        try:
-                            approval_entry = get_approval_queue().get(
-                                str(pending_approval["approval_id"])
+                            # Human-owned approvals need a lifecycle event so the UI
+                            # can render its card. Automatic reviews remain internal.
+                            if assessment is None:
+                                yield ToolResultEvent(
+                                    tool_use_id=projected_result.tool_use_id,
+                                    tool_name=projected_result.tool_name,
+                                    result=projected_result.content,
+                                    is_error=projected_result.is_error,
+                                    arguments=tc.arguments,
+                                    execution_status=projected_result.execution_status,
+                                )
+                            approval_wait_started = _loop.time()
+                            await _wait_for_pending_approval_resolution(pending_approval)
+                            approval_wait_duration = max(
+                                0.0,
+                                _loop.time() - approval_wait_started,
                             )
-                        except KeyError:
+                            # Human review is suspended state, not execution time.
+                            tool_deadline += approval_wait_duration
+                            if _total_deadline is not None:
+                                _total_deadline += approval_wait_duration
                             approval_entry = None
-                        if approval_entry is None or not approval_entry.resolved:
-                            turn_yielded = True
-                        elif not approval_entry.approved:
-                            suspended.deny(str(pending_approval["approval_id"]))
-                            rationale = str(
-                                approval_entry.params.get("reviewRationale") or ""
-                            ).strip()
-                            result = ToolResult(
-                                tool_use_id=tc.tool_use_id,
-                                tool_name=tc.tool_name,
-                                content=json.dumps(
-                                    {
-                                        "status": "approval_denied",
-                                        "approval_id": pending_approval["approval_id"],
-                                        "message": rationale
-                                        or "The exact elevated action was not approved.",
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                is_error=False,
+                            from opensquilla.gateway.approval_queue import (
+                                get_approval_queue,
                             )
-                            projected_result = await self._project_tool_result_for_delivery(
-                                result,
-                                tool_call=tc,
-                            )
-                            yield ToolResultEvent(
-                                tool_use_id=projected_result.tool_use_id,
-                                tool_name=projected_result.tool_name,
-                                result=projected_result.content,
-                                is_error=projected_result.is_error,
-                                arguments=tc.arguments,
-                                execution_status=projected_result.execution_status,
-                            )
-                            if approval_entry.resolution == "expired":
+
+                            try:
+                                approval_entry = get_approval_queue().get(
+                                    str(pending_approval["approval_id"])
+                                )
+                            except KeyError:
+                                approval_entry = None
+                            if approval_entry is None or not approval_entry.resolved:
                                 turn_yielded = True
-                        else:
+                                break
+                            if not approval_entry.approved:
+                                suspended.deny(str(pending_approval["approval_id"]))
+                                resolution = str(approval_entry.resolution or "")
+                                reviewer = str(
+                                    approval_entry.params.get("reviewer") or "user"
+                                )
+                                resolution_source = str(
+                                    approval_entry.params.get("resolutionSource") or ""
+                                )
+                                explicit_human_denial = (
+                                    resolution == "denied"
+                                    and reviewer == "user"
+                                    and resolution_source
+                                    in {"", "user", "user_web", "user_channel"}
+                                    and approval_entry.params.get("humanActionable")
+                                    is not False
+                                )
+                                rationale = str(
+                                    approval_entry.params.get("reviewRationale") or ""
+                                ).strip()
+                                result_status = (
+                                    "approval_expired"
+                                    if resolution == "expired"
+                                    else "approval_denied"
+                                )
+                                result = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name=tc.tool_name,
+                                    content=json.dumps(
+                                        {
+                                            "status": result_status,
+                                            "approval_id": pending_approval["approval_id"],
+                                            "message": rationale
+                                            or (
+                                                "The approval expired before the exact "
+                                                "action was authorized."
+                                                if resolution == "expired"
+                                                else "The exact elevated action was not approved."
+                                            ),
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    is_error=False,
+                                    terminates_turn=explicit_human_denial,
+                                )
+                                projected_result = (
+                                    await self._project_tool_result_for_delivery(
+                                        result,
+                                        tool_call=tc,
+                                    )
+                                )
+                                yield ToolResultEvent(
+                                    tool_use_id=projected_result.tool_use_id,
+                                    tool_name=projected_result.tool_name,
+                                    result=projected_result.content,
+                                    is_error=projected_result.is_error,
+                                    arguments=tc.arguments,
+                                    execution_status=projected_result.execution_status,
+                                )
+                                # Only a deliberate human refusal is terminal. An
+                                # expired record or an internal rule decision must
+                                # still reach the model as a non-terminal tool result.
+                                if explicit_human_denial:
+                                    turn_yielded = True
+                                break
+
                             resumed_call = suspended.approve(
                                 str(pending_approval["approval_id"])
                             )
@@ -10210,21 +12120,21 @@ class Agent:
                                 result,
                                 tool_call=result_tool_call,
                             )
-                            yield ToolResultEvent(
-                                tool_use_id=projected_result.tool_use_id,
-                                tool_name=projected_result.tool_name,
-                                result=projected_result.content,
-                                is_error=projected_result.is_error,
-                                arguments=tc.arguments,
-                                execution_status=projected_result.execution_status,
-                            )
-                            replay_event = router_control_replay_event_from_payload(
-                                result.content
-                            )
-                            if replay_event is not None:
-                                yield replay_event
-                            if _pending_approval_payload(result.content) is not None:
-                                turn_yielded = True
+                            pending_approval = _pending_approval_payload(result.content)
+                            if pending_approval is None:
+                                yield ToolResultEvent(
+                                    tool_use_id=projected_result.tool_use_id,
+                                    tool_name=projected_result.tool_name,
+                                    result=projected_result.content,
+                                    is_error=projected_result.is_error,
+                                    arguments=tc.arguments,
+                                    execution_status=projected_result.execution_status,
+                                )
+                                replay_event = router_control_replay_event_from_payload(
+                                    result.content
+                                )
+                                if replay_event is not None:
+                                    yield replay_event
                     elif not deferred_user_input_handled:
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
@@ -11118,6 +13028,10 @@ class Agent:
         )
         if final_ensemble_trace is not None and turn_ensemble_request_count > 0:
             final_ensemble_trace["llm_request_count"] = turn_ensemble_request_count
+        self._terminalize_pending_durable_compaction(
+            status="failed",
+            reason="rebuilt_request_not_admitted",
+        )
         await self._write_patch_evidence_ledger(
             final_status=(
                 "ok"
@@ -13452,16 +15366,32 @@ class Agent:
         *,
         loop: asyncio.AbstractEventLoop,
         total_deadline: float | None,
+        deadline_provider: Callable[[], float | None] | None = None,
     ) -> AsyncIterator[Any]:
         stream_iter = stream.__aiter__()
         while True:
+            dynamic_deadline = (
+                deadline_provider()
+                if deadline_provider is not None
+                else None
+            )
+            active_deadline = total_deadline
+            if dynamic_deadline is not None:
+                active_deadline = (
+                    min(active_deadline, dynamic_deadline)
+                    if active_deadline is not None
+                    else dynamic_deadline
+                )
             wait_budget = max(0.001, self.config.iteration_timeout)
             total_deadline_limits_wait = False
-            if total_deadline is not None:
-                remaining_total = total_deadline - loop.time()
+            if active_deadline is not None:
+                remaining_total = active_deadline - loop.time()
                 if remaining_total <= 0:
                     await self._close_provider_stream(stream_iter)
-                    raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                    raise _provider_stream_deadline_timeout(
+                        timeout_seconds=self.config.timeout,
+                        deadline_at_monotonic=active_deadline,
+                    )
                 if remaining_total <= wait_budget:
                     wait_budget = remaining_total
                     total_deadline_limits_wait = True
@@ -13479,9 +15409,14 @@ class Agent:
                 with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
                     await next_event
                 if total_deadline_limits_wait or (
-                    total_deadline is not None and loop.time() >= total_deadline
+                    active_deadline is not None
+                    and loop.time() >= active_deadline
                 ):
-                    raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
+                    assert active_deadline is not None
+                    raise _provider_stream_deadline_timeout(
+                        timeout_seconds=self.config.timeout,
+                        deadline_at_monotonic=active_deadline,
+                    )
                 raise _IterationStreamTimeoutError
             try:
                 yield next_event.result()
@@ -13565,15 +15500,6 @@ class Agent:
         mode = str(getattr(self.config, "runtime_state_capsule_mode", "off") or "off")
         if mode not in {"log", "inject"}:
             return None
-        if preview:
-            # Count projection needs the exact assembly rule, not capsule
-            # contents.  Avoid filesystem reads, metadata writes, and runtime
-            # events while preserving the one-message injection cardinality.
-            return (
-                Message(role="user", content="[runtime state capsule preview]")
-                if mode == "inject"
-                else None
-            )
         ctx = self._tool_context or current_tool_context.get()
         workspace = (
             getattr(ctx, "workspace_dir", None)
@@ -13581,6 +15507,19 @@ class Agent:
             else self.config.workspace_dir
         )
         capsule = build_runtime_state_capsule(workspace=workspace, tool_context=ctx)
+        if preview:
+            # Durable final-envelope admission needs the real serialized
+            # capsule bytes. Keep preview side-effect free, but do not replace
+            # variable workspace state with a tiny placeholder that could
+            # admit an envelope the physical call cannot send.
+            return (
+                Message(
+                    role="user",
+                    content=runtime_state_capsule_message(capsule),
+                )
+                if mode == "inject"
+                else None
+            )
         self.config.metadata["runtime_state_capsule_observed"] = (
             self.config.metadata.get("runtime_state_capsule_observed", 0) + 1
         )
@@ -13766,6 +15705,384 @@ class Agent:
             )
         return entries
 
+    @staticmethod
+    def _tool_result_requires_raw_preservation(message: Message) -> bool:
+        if not isinstance(message.content, list):
+            return False
+        unresolved_markers = {
+            "pending",
+            "queued",
+            "running",
+            "in_progress",
+            "requires_action",
+            "awaiting_approval",
+        }
+        for block in message.content:
+            if not isinstance(block, ContentBlockToolResult):
+                continue
+            if bool(getattr(block, "is_error", False)):
+                return True
+            raw_status = getattr(block, "execution_status", None)
+            if isinstance(raw_status, dict):
+                raw_status_name = str(
+                    raw_status.get("status") or ""
+                ).strip().lower()
+                if raw_status_name in unresolved_markers | {
+                    "error",
+                    "failed",
+                    "failure",
+                    "timeout",
+                    "timed_out",
+                    "cancelled",
+                    "unresolved",
+                }:
+                    return True
+                normalized_status = normalize_execution_status(raw_status)
+                normalized_name = normalized_status["status"]
+                if normalized_name in {"error", "timeout", "cancelled"}:
+                    return True
+                if normalized_name == "unknown" and (
+                    normalized_status["source"] != "legacy"
+                    or normalized_status["reason"]
+                    not in {None, "legacy_missing_status"}
+                    or normalized_status["preservation_class"] == "ephemeral"
+                ):
+                    return True
+            raw = block.content
+            if not isinstance(raw, str):
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed, dict) and str(
+                parsed.get("status") or parsed.get("execution_status") or ""
+            ).lower() in unresolved_markers:
+                return True
+        return False
+
+    def _live_turn_compaction_boundary(
+        self,
+        messages: list[Message],
+        *,
+        protected_turn_start_index: int,
+        keep_recent_rounds: int = 2,
+    ) -> tuple[int, int] | None:
+        """Return the active-user index and raw-tail start for a live tool loop."""
+
+        protected_start = max(
+            0,
+            min(protected_turn_start_index, len(messages)),
+        )
+        active_user_index = _active_user_message_index_for_request(
+            messages[protected_start:],
+            current_user_text=getattr(self, "_current_turn_message", "") or "",
+        )
+        if active_user_index is None:
+            return None
+        active_user_index += protected_start
+
+        assistant_starts = [
+            index
+            for index in range(active_user_index + 1, len(messages))
+            if messages[index].role == "assistant"
+        ]
+        protected_round_count = max(1, int(keep_recent_rounds))
+        # Preserve two complete physical rounds by default. Final-envelope
+        # admission may retry once with one raw round when the first summary is
+        # still too large. At least one older round must exist before a live
+        # summary is worthwhile.
+        if len(assistant_starts) <= protected_round_count:
+            return None
+
+        rounds: list[tuple[int, int, bool]] = []
+        for position, start in enumerate(assistant_starts):
+            end = (
+                assistant_starts[position + 1]
+                if position + 1 < len(assistant_starts)
+                else len(messages)
+            )
+            group = messages[start:end]
+            has_result = any(_message_has_tool_result(message) for message in group)
+            unresolved = (
+                _message_has_tool_use(messages[start])
+                and not has_result
+            )
+            critical = unresolved or any(
+                self._tool_result_requires_raw_preservation(message)
+                for message in group
+            )
+            rounds.append((start, end, critical))
+
+        keep_round = max(0, len(rounds) - protected_round_count)
+        critical_rounds = [
+            index for index, (_, _, critical) in enumerate(rounds) if critical
+        ]
+        if critical_rounds:
+            keep_round = min(keep_round, min(critical_rounds))
+        if keep_round <= 0:
+            return None
+        return active_user_index, rounds[keep_round][0]
+
+    @staticmethod
+    def _live_turn_mapped_index(
+        original_index: int | None,
+        *,
+        protected_start: int,
+        active_user_index: int,
+        keep_start: int,
+        active_prefix_count: int,
+    ) -> int | None:
+        if original_index is None:
+            return None
+        if original_index <= active_user_index:
+            return 2 + max(0, original_index - protected_start)
+        if original_index >= keep_start:
+            return 2 + active_prefix_count + (original_index - keep_start)
+        return 2 + active_prefix_count
+
+    async def _recover_live_turn_request_overflow(
+        self,
+        messages: list[Message],
+        *,
+        protected_turn_start_index: int,
+        context_window_tokens: int,
+        context_window_chars: int | None = None,
+        keep_recent_rounds: int = 2,
+        request_context_insert_index: int | None,
+        runtime_context_insert_index: int | None,
+        shared_compaction_config: CompactionConfig | None = None,
+    ) -> CompactionOutcome | None:
+        """Summarize completed live rounds into an ephemeral provider view."""
+
+        boundary = self._live_turn_compaction_boundary(
+            messages,
+            protected_turn_start_index=protected_turn_start_index,
+            keep_recent_rounds=keep_recent_rounds,
+        )
+        if boundary is None:
+            return None
+        active_user_index, keep_start = boundary
+        protected_start = max(
+            0,
+            min(protected_turn_start_index, len(messages)),
+        )
+        active_prefix = messages[protected_start : active_user_index + 1]
+        raw_tail = messages[keep_start:]
+        summary_messages = [
+            *messages[:protected_start],
+            *messages[active_user_index + 1 : keep_start],
+        ]
+        if not summary_messages:
+            return None
+
+        config = shared_compaction_config or self._build_compaction_config()
+        # This request contains only the already-completed prefix. The caller
+        # retains the active user and the verified recent/error raw tail.
+        compaction_id = new_compaction_id()
+        if shared_compaction_config is None:
+            arm_compaction_deadline(config, operation_id=compaction_id)
+        original_protect_semantic_tail = config.protect_semantic_tail
+        original_protected_recent_messages = config.protected_recent_messages
+        config.protect_semantic_tail = False
+        config.protected_recent_messages = 0
+        try:
+            result = await compact_context(
+                CompactionRequest(
+                    session_id="agent-live-turn-request-view",
+                    entries=self._message_count_compaction_entries(
+                        summary_messages
+                    ),
+                    context_window_tokens=context_window_tokens,
+                    context_window_chars=context_window_chars,
+                    config=config,
+                    forced_prefix_cut=len(summary_messages),
+                    trigger="message_count",
+                    reason="live_turn_request_overflow",
+                    provider_request_correlation=(
+                        derive_provider_request_correlation(
+                            self._provider_request_correlation,
+                            execution_id=uuid.uuid4().hex,
+                            call_kind="auxiliary.compaction",
+                        )
+                    ),
+                )
+            )
+        finally:
+            if shared_compaction_config is not None:
+                config.protect_semantic_tail = original_protect_semantic_tail
+                config.protected_recent_messages = (
+                    original_protected_recent_messages
+                )
+        replacement_applied = bool(
+            result.removed_count > 0
+            or getattr(result, "replaced_previous_summary", False)
+        )
+        # Rejected candidates intentionally keep their structured payload for
+        # diagnostics. They are not installed state and must never be replayed
+        # ahead of the unchanged raw history.
+        replay_summary = (
+            compaction_replay_summary(result)
+            if replacement_applied
+            else ""
+        )
+        if (
+            result.removed_count != len(summary_messages)
+            or not replay_summary
+        ):
+            return None
+
+        projected = [
+            Message(
+                role="user",
+                content=(
+                    "[Context summary]\n"
+                    "Completed work from this still-active request:\n"
+                    f"{replay_summary}"
+                ),
+            ),
+            Message(
+                role="assistant",
+                content="Understood. Continuing the active request.",
+            ),
+            *active_prefix,
+            *raw_tail,
+        ]
+        if projected[2 : 2 + len(active_prefix)] != active_prefix:
+            return None
+        if projected[-len(raw_tail) :] != raw_tail:
+            return None
+        if repair_tool_pairing(projected) != projected:
+            return None
+
+        mapped_request_index = self._live_turn_mapped_index(
+            request_context_insert_index,
+            protected_start=protected_start,
+            active_user_index=active_user_index,
+            keep_start=keep_start,
+            active_prefix_count=len(active_prefix),
+        )
+        mapped_runtime_index = self._live_turn_mapped_index(
+            runtime_context_insert_index,
+            protected_start=protected_start,
+            active_user_index=active_user_index,
+            keep_start=keep_start,
+            active_prefix_count=len(active_prefix),
+        )
+        if self._session_key:
+            notify_compaction(
+                self._session_key,
+                source="automatic",
+                phase="agent_live_turn",
+                status="emergency_ephemeral",
+                reason="live_turn_request_overflow",
+                removed_count=result.removed_count,
+                kept_count=len(projected),
+                tokens_before=result.tokens_before,
+                tokens_after=result.tokens_after,
+                **compaction_effect_payload(
+                    status="emergency_ephemeral",
+                    reason="live_turn_request_overflow",
+                ),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
+        return CompactionOutcome(
+            messages=projected,
+            compacted=True,
+            summary=replay_summary,
+            removed_count=result.removed_count,
+            compaction_id=compaction_id,
+            compaction_deadline_at_monotonic=config.deadline_at_monotonic,
+            compaction_timeout_seconds=config.total_timeout_seconds,
+            request_context_insert_index=mapped_request_index,
+            runtime_context_insert_index=mapped_runtime_index,
+            protected_turn_start_index=2,
+            ephemeral_only=True,
+            runtime_compaction_config=config,
+        )
+
+    async def _recover_live_turn_message_count_limit(
+        self,
+        messages: list[Message],
+        *,
+        request_suffix_messages: list[Message],
+        target_wire_messages: int,
+        config: ChatConfig,
+        identical_request_perturbed: bool,
+        request_context_message: Message | None,
+        request_context_insert_index: int,
+        runtime_context_message: Message,
+        runtime_context_insert_index: int,
+        turn_objective_message: Message | None,
+        protected_turn_start_index: int,
+    ) -> tuple[_MessageCountRecoveryOutcome | None, str]:
+        """Project completed live rounds when durable count recovery cannot fit.
+
+        The canonical turn remains untouched.  The shared live-turn projector
+        preserves the active user plus its recent, error, and unresolved tool
+        rounds as raw ``Message`` objects; this adapter only re-runs the exact
+        provider wire-count proof for the resulting request view.
+        """
+
+        try:
+            outcome = await self._recover_live_turn_request_overflow(
+                messages,
+                protected_turn_start_index=protected_turn_start_index,
+                context_window_tokens=self.config.context_window_tokens,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_insert_index=runtime_context_insert_index,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - refusal is surfaced as a stable reason
+            return None, "live_turn_summary_failed"
+        if outcome is None or not outcome.ephemeral_only:
+            return None, "no_safe_cut_or_live_turn_boundary"
+
+        mapped_request_index = (
+            outcome.request_context_insert_index
+            if outcome.request_context_insert_index is not None
+            else request_context_insert_index
+        )
+        mapped_runtime_index = (
+            outcome.runtime_context_insert_index
+            if outcome.runtime_context_insert_index is not None
+            else runtime_context_insert_index
+        )
+        verified = self._project_provider_request_message_count(
+            [*outcome.messages, *request_suffix_messages],
+            config=config,
+            identical_request_perturbed=identical_request_perturbed,
+            request_context_message=request_context_message,
+            request_context_insert_index=mapped_request_index,
+            runtime_context_message=runtime_context_message,
+            runtime_context_insert_index=mapped_runtime_index,
+            turn_objective_message=turn_objective_message,
+        )
+        if verified is None:
+            return None, "projection_unavailable_after_live_turn_summary"
+        if verified.actual_wire_messages > target_wire_messages:
+            return None, "projection_above_target_after_live_turn_summary"
+
+        return (
+            _MessageCountRecoveryOutcome(
+                messages=outcome.messages,
+                request_context_insert_index=mapped_request_index,
+                runtime_context_insert_index=mapped_runtime_index,
+                protected_turn_start_index=(
+                    outcome.protected_turn_start_index
+                    if outcome.protected_turn_start_index is not None
+                    else protected_turn_start_index
+                ),
+                projected_wire_messages=verified.actual_wire_messages,
+                removed_count=outcome.removed_count,
+            ),
+            "recovered_live_turn",
+        )
+
     async def _recover_provider_message_count_limit(
         self,
         messages: list[Message],
@@ -13854,9 +16171,25 @@ class Agent:
                 break
 
         if selected_cut is None or selected_projection is None:
-            return None, "no_safe_cut"
+            return await self._recover_live_turn_message_count_limit(
+                messages,
+                request_suffix_messages=request_suffix_messages,
+                target_wire_messages=target,
+                config=config,
+                identical_request_perturbed=identical_request_perturbed,
+                request_context_message=request_context_message,
+                request_context_insert_index=request_context_insert_index,
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=runtime_context_insert_index,
+                turn_objective_message=turn_objective_message,
+                protected_turn_start_index=protected_start,
+            )
 
         compaction_config = self._build_compaction_config()
+        arm_compaction_deadline(
+            compaction_config,
+            operation_id=new_compaction_id(),
+        )
         protected_tail_count = len(messages) - protected_start
         compaction_config.protected_recent_messages = max(
             int(compaction_config.protected_recent_messages or 0),
@@ -13880,6 +16213,18 @@ class Agent:
             result = await compact_context(request)
         except Exception:  # noqa: BLE001 - refusal is surfaced as a stable terminal state
             return None, "summary_failed"
+        replacement_applied = bool(
+            result.removed_count > 0
+            or getattr(result, "replaced_previous_summary", False)
+        )
+        # Quality/coverage rejection returns the candidate payload for
+        # diagnostics, but it is not installed state. Replaying that payload
+        # while retaining the full raw history would make the request larger.
+        replay_summary = (
+            compaction_replay_summary(result)
+            if replacement_applied
+            else ""
+        )
         kept_start_index = int(
             getattr(result, "kept_start_index", result.removed_count)
             or result.removed_count
@@ -13887,12 +16232,12 @@ class Agent:
         if (
             result.removed_count != selected_cut
             or kept_start_index != selected_cut
-            or not result.summary
+            or not replay_summary
         ):
             return None, str(result.skip_reason or "summary_failed")
 
         compacted = [
-            Message(role="user", content=f"[Context summary]\n{result.summary}"),
+            Message(role="user", content=f"[Context summary]\n{replay_summary}"),
             summary_ack,
             *messages[selected_cut:],
         ]
@@ -14175,12 +16520,34 @@ class Agent:
         return "The generated file is ready."
 
     def _build_compaction_config(self) -> CompactionConfig:
+        compaction_plan = self.config.compaction_execution_plan
+        plan_factory = self.config.compaction_execution_plan_factory
+        provider_for_compaction: Any | None = self.provider
+        if plan_factory is not None:
+            # A factory exists specifically because credentials and selector
+            # state must be rebound for each logical compaction operation.
+            # Never fall back to the previously frozen provider objects when
+            # refresh fails or produces no executable deployment.
+            compaction_plan = None
+            try:
+                compaction_plan = plan_factory()
+            except Exception as exc:  # noqa: BLE001 - fail closed to deterministic
+                logger.warning(
+                    "compaction.execution_plan_refresh_failed",
+                    error=type(exc).__name__,
+                )
+            if compaction_plan is None:
+                provider_for_compaction = None
         config = build_compaction_config_from_provider(
-            self.provider,
+            provider_for_compaction,
             default_model=self.config.model_id,
+            compaction_plan=compaction_plan,
+            context_window_tokens=self.config.context_window_tokens,
         )
         config.compaction_profile = self.config.compaction_profile
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
+        config.total_timeout_seconds = self.config.compaction_total_timeout_seconds
+        config.heartbeat_interval_seconds = self.config.compaction_heartbeat_interval_seconds
         return config
 
     @staticmethod
@@ -14243,6 +16610,10 @@ class Agent:
         runtime_context_insert_index: int | None = None,
         protected_turn_start_index: int | None = None,
         compaction_window_tokens: int | None = None,
+        request_window_tokens: int | None = None,
+        request_window_chars: int | None = None,
+        estimated_context_chars: int | None = None,
+        durable_consumer_overflow_proven: bool | None = None,
     ) -> CompactionOutcome | None:
         """Check if estimated live context tokens exceed the overflow threshold.
 
@@ -14251,8 +16622,19 @@ class Agent:
         """
         self._last_compaction_refusal_reason = None
         window_tokens = compaction_window_tokens or self.config.context_window_tokens
-        threshold = self.config.context_overflow_threshold * window_tokens
-        if estimated_context_tokens <= threshold:
+        pressure_window_tokens = request_window_tokens or window_tokens
+        threshold = self.config.context_overflow_threshold * pressure_window_tokens
+        char_threshold = (
+            self.config.context_overflow_threshold * request_window_chars
+            if request_window_chars is not None
+            else None
+        )
+        within_character_budget = bool(
+            char_threshold is None
+            or estimated_context_chars is None
+            or estimated_context_chars <= char_threshold
+        )
+        if estimated_context_tokens <= threshold and within_character_budget:
             return CompactionOutcome(
                 messages=messages,
                 request_context_insert_index=request_context_insert_index,
@@ -14260,7 +16642,156 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
+        durable_window_tokens = max(
+            1,
+            int(self._durable_consumer_window_tokens or 0),
+        )
+        request_scoped_only = durable_consumer_overflow_proven is False
+        routed_window_is_narrower = (
+            durable_window_tokens > window_tokens
+            and durable_consumer_overflow_proven is not True
+        )
+        if request_scoped_only or routed_window_is_narrower:
+            # A temporary route/member window is request scope. Preflight has
+            # already admitted durable history against the stable session
+            # consumer, so rewriting that history to satisfy a deployment-only
+            # physical budget would permanently over-compact the session.
+            if (
+                protected_turn_start_index is not None
+                and self._live_turn_compaction_boundary(
+                    messages,
+                    protected_turn_start_index=protected_turn_start_index,
+                )
+                is not None
+            ):
+                try:
+                    ephemeral = await self._recover_live_turn_request_overflow(
+                        messages,
+                        protected_turn_start_index=protected_turn_start_index,
+                        context_window_tokens=pressure_window_tokens,
+                        context_window_chars=request_window_chars,
+                        request_context_insert_index=request_context_insert_index,
+                        runtime_context_insert_index=runtime_context_insert_index,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - refusal remains bounded
+                    logger.warning(
+                        "compaction.routed_live_turn_projection_failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    ephemeral = None
+                if ephemeral is not None:
+                    return ephemeral
+            self._last_compaction_refusal_reason = (
+                "provider_request_budget_exhausted"
+            )
+            logger.warning(
+                "compaction.durable_rewrite_refused_for_routed_window",
+                routed_context_window_tokens=window_tokens,
+                durable_context_window_tokens=durable_window_tokens,
+                durable_consumer_overflow_proven=(
+                    durable_consumer_overflow_proven
+                ),
+                protected_turn_start_index=protected_turn_start_index,
+            )
+            return None
+
+        if protected_turn_start_index is not None:
+            protected_tail_start = max(
+                0,
+                min(protected_turn_start_index, len(messages)),
+            )
+            protected_tail_tokens = sum(
+                int(entry["token_count"])
+                for entry in self._message_count_compaction_entries(
+                    messages[protected_tail_start:]
+                )
+            )
+            protected_tail_chars = len(
+                json.dumps(
+                    [
+                        self._live_request_jsonable(message)
+                        for message in messages[protected_tail_start:]
+                    ],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            protected_tail_over_character_budget = bool(
+                char_threshold is not None
+                and protected_tail_chars > char_threshold
+            )
+            if (
+                protected_tail_tokens > threshold
+                or protected_tail_over_character_budget
+            ):
+                try:
+                    ephemeral = await self._recover_live_turn_request_overflow(
+                        messages,
+                        protected_turn_start_index=protected_tail_start,
+                        context_window_tokens=pressure_window_tokens,
+                        context_window_chars=request_window_chars,
+                        request_context_insert_index=request_context_insert_index,
+                        runtime_context_insert_index=runtime_context_insert_index,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - refusal remains bounded
+                    logger.warning(
+                        "compaction.live_turn_projection_failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    ephemeral = None
+                if ephemeral is not None:
+                    return ephemeral
+                self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
+                logger.warning(
+                    "compaction.protected_tail_too_large",
+                    protected_tail_tokens=protected_tail_tokens,
+                    protected_tail_chars=protected_tail_chars,
+                    threshold_tokens=int(threshold),
+                    threshold_chars=(
+                        int(char_threshold)
+                        if char_threshold is not None
+                        else None
+                    ),
+                    context_window_tokens=pressure_window_tokens,
+                    protected_message_count=len(messages) - protected_tail_start,
+                )
+                return None
+
+        protected_start: int | None = None
         compaction_id = new_compaction_id()
+        compaction_config = self._build_compaction_config()
+        if protected_turn_start_index is not None:
+            protected_start = max(
+                0,
+                min(protected_turn_start_index, len(messages)),
+            )
+            compaction_config.protected_recent_messages = max(
+                int(compaction_config.protected_recent_messages or 0),
+                len(messages) - protected_start,
+            )
+        arm_compaction_deadline(compaction_config, operation_id=compaction_id)
+        if self._session_key:
+            notify_compaction(
+                self._session_key,
+                source="automatic",
+                phase="agent_inline_overflow",
+                status="started",
+                tokens_before=estimated_context_tokens,
+                context_window_tokens=window_tokens,
+                heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
+                **compaction_effect_payload(status="started"),
+                **compaction_lifecycle_payload(
+                    compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
         # --- Pre-compaction flush; inline compaction can continue on degraded flush. ---
         flush_task: asyncio.Task | None = None
         self._consume_completed_flush_task()
@@ -14273,15 +16804,21 @@ class Agent:
                 if flush_task is self._flush_wait_timed_out_task:
                     return None
                 try:
+                    require_compaction_time(compaction_config, phase="flushing")
+                    remaining = compaction_remaining_seconds(compaction_config)
+                    wait_timeout = self.config.flush_timeout_seconds
+                    if remaining is not None:
+                        wait_timeout = min(wait_timeout, remaining)
                     receipt = await asyncio.wait_for(
                         asyncio.shield(flush_task),
-                        timeout=self.config.flush_timeout_seconds,
+                        timeout=wait_timeout,
                     )
                     logger.info("memory_flush.completed_after_compaction")
                     self._flush_wait_timed_out_task = None
                     self._mark_flush_task_completed(flush_task)
                     return receipt
                 except TimeoutError:
+                    require_compaction_time(compaction_config, phase="flushing")
                     self._flush_wait_timed_out_task = flush_task
                     next_retry_seconds = self._record_flush_timeout_backoff()
                     logger.warning(
@@ -14289,6 +16826,8 @@ class Agent:
                         timeout_seconds=self.config.flush_timeout_seconds,
                         next_retry_seconds=next_retry_seconds,
                     )
+                except CompactionTimeoutError:
+                    raise
                 except Exception as exc:
                     logger.warning("memory_flush.await_failed", error=str(exc))
                     self._mark_flush_task_completed(flush_task)
@@ -14368,7 +16907,39 @@ class Agent:
                     retry_after_seconds=round(self._flush_backoff_until - time.monotonic(), 3),
                 )
                 self._flush_done_this_cycle = False
-            receipt = await _await_flush_task()
+            try:
+                receipt = await _await_flush_task()
+            except asyncio.CancelledError:
+                if self._session_key:
+                    notify_compaction(
+                        self._session_key,
+                        source="automatic",
+                        phase="flushing",
+                        status="cancelled",
+                        reason="cancelled",
+                        **compaction_effect_payload(status="cancelled"),
+                        **compaction_lifecycle_payload(
+                            compaction_id,
+                            COMPACTION_TRIGGERED_EVENT,
+                        ),
+                    )
+                raise
+            except CompactionTimeoutError as exc:
+                self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+                if self._session_key:
+                    notify_compaction(
+                        self._session_key,
+                        source="automatic",
+                        phase=exc.phase,
+                        status="timed_out",
+                        reason=self._last_compaction_refusal_reason,
+                        **compaction_effect_payload(status="timed_out"),
+                        **compaction_lifecycle_payload(
+                            compaction_id,
+                            COMPACTION_TRIGGERED_EVENT,
+                        ),
+                    )
+                return None
             if not flush_receipt_allows_destructive_compaction(receipt):
                 reason = "memory_flush_degraded_before_compaction"
                 if flush_task is not None and self._flush_wait_timed_out_task is flush_task:
@@ -14434,7 +17005,7 @@ class Agent:
             session_id="agent-turn",
             entries=entries,
             context_window_tokens=window_tokens,
-            config=self._build_compaction_config(),
+            config=compaction_config,
             provider_request_correlation=derive_provider_request_correlation(
                 self._provider_request_correlation,
                 execution_id=uuid.uuid4().hex,
@@ -14442,23 +17013,43 @@ class Agent:
             ),
         )
 
-        if self._session_key:
-            notify_compaction(
-                self._session_key,
-                source="automatic",
-                phase="agent_inline_overflow",
-                status="started",
-                tokens_before=estimated_context_tokens,
-                context_window_tokens=window_tokens,
-                **compaction_effect_payload(status="started"),
-                **compaction_lifecycle_payload(
-                    compaction_id,
-                    COMPACTION_TRIGGERED_EVENT,
-                ),
-            )
-
         try:
             result = await compact_context(request)
+        except asyncio.CancelledError:
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="cancelled",
+                    reason="cancelled",
+                    tokens_before=estimated_context_tokens,
+                    context_window_tokens=window_tokens,
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            raise
+        except CompactionTimeoutError as exc:
+            self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason=self._last_compaction_refusal_reason,
+                    tokens_before=estimated_context_tokens,
+                    context_window_tokens=window_tokens,
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return None
         except Exception as exc:  # noqa: BLE001
             self._last_compaction_refusal_reason = "compaction_failed"
             if self._session_key:
@@ -14479,7 +17070,36 @@ class Agent:
                 )
             return None  # signal failure
 
-        if self._session_key and result.removed_count > 0 and result.summary:
+        replacement_applied = bool(
+            result.removed_count > 0
+            or getattr(result, "replaced_previous_summary", False)
+        )
+        # Quality/coverage rejection returns the candidate payload for
+        # diagnostics, but it is not installed state. Replaying that payload
+        # while retaining the full raw history would make the request larger.
+        replay_summary = (
+            compaction_replay_summary(result)
+            if replacement_applied
+            else ""
+        )
+        kept_start_index = int(
+            getattr(result, "kept_start_index", result.removed_count)
+            or result.removed_count
+        )
+        if protected_start is not None and (
+            int(result.removed_count) > protected_start
+            or kept_start_index > protected_start
+        ):
+            logger.warning(
+                "compaction.protected_tail_change_rejected",
+                removed_count=result.removed_count,
+                kept_start_index=kept_start_index,
+                protected_turn_start_index=protected_start,
+            )
+            self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
+            return None
+
+        if self._session_key and result.removed_count > 0 and replay_summary:
             for event in (
                 COMPACTION_CHUNK_SUMMARIZED_EVENT,
                 COMPACTION_SUMMARY_VERIFIED_EVENT,
@@ -14504,7 +17124,7 @@ class Agent:
         # Removing history without a replacement summary is equivalent to
         # bare truncation; reject it so the caller takes the existing
         # compaction failure path instead of silently dropping context.
-        if result.removed_count > 0 and not result.summary:
+        if result.removed_count > 0 and not replay_summary:
             logger.warning(
                 "compaction.empty_summary_rejected",
                 removed_count=result.removed_count,
@@ -14535,9 +17155,41 @@ class Agent:
         # compacted=True (the old behavior for string-only history) emits a
         # spurious CompactionEvent that rewrites the durable transcript and
         # corrupts row metadata, so short-circuit every no-op skip here.
-        if result.removed_count == 0 and not result.summary:
+        if not replacement_applied:
             has_structured_content = any(not isinstance(m.content, str) for m in messages)
-            await _await_flush_task()
+            try:
+                await _await_flush_task()
+            except asyncio.CancelledError:
+                if self._session_key:
+                    notify_compaction(
+                        self._session_key,
+                        source="automatic",
+                        phase="flushing",
+                        status="cancelled",
+                        reason="cancelled",
+                        **compaction_effect_payload(status="cancelled"),
+                        **compaction_lifecycle_payload(
+                            compaction_id,
+                            COMPACTION_TRIGGERED_EVENT,
+                        ),
+                    )
+                raise
+            except CompactionTimeoutError as exc:
+                self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+                if self._session_key:
+                    notify_compaction(
+                        self._session_key,
+                        source="automatic",
+                        phase=exc.phase,
+                        status="timed_out",
+                        reason=self._last_compaction_refusal_reason,
+                        **compaction_effect_payload(status="timed_out"),
+                        **compaction_lifecycle_payload(
+                            compaction_id,
+                            COMPACTION_TRIGGERED_EVENT,
+                        ),
+                    )
+                return None
             self._flush_done_this_cycle = False
             skip_reason = getattr(result, "skip_reason", None) or (
                 "structured_content_noop" if has_structured_content else "noop"
@@ -14570,61 +17222,104 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
-        # Rebuild message list from compacted entries
+        # ``compact_context`` is prefix-only. Keep the exact original tail in
+        # the live provider view so tool IDs, reasoning signatures, images,
+        # and provider-specific content blocks are not flattened by the text
+        # projection used solely as summarizer input.
         compacted: list[Message] = []
-        if result.summary:
-            compacted.append(Message(role="user", content=f"[Context summary]\n{result.summary}"))
+        if replay_summary:
+            compacted.append(Message(role="user", content=f"[Context summary]\n{replay_summary}"))
             compacted.append(
                 Message(role="assistant", content="Understood. Continuing from summary.")
             )
-        for entry in result.kept_entries:
-            compacted.append(Message(role=entry["role"], content=entry["content"]))
+        compacted.extend(messages[kept_start_index:])
 
-        await _await_flush_task()
+        try:
+            await _await_flush_task()
+        except asyncio.CancelledError:
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="flushing",
+                    status="cancelled",
+                    reason="cancelled",
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            raise
+        except CompactionTimeoutError as exc:
+            self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason=self._last_compaction_refusal_reason,
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+            return None
 
         # Reset flush flag so it can trigger again after next compaction
         self._flush_done_this_cycle = False
 
         # Trigger 6: post-compaction sync
         if self._memory_sync_manager is not None:
-            self._memory_sync_manager.mark_dirty()
+            try:
+                self._memory_sync_manager.mark_dirty()
+            except Exception as exc:  # sync refresh is non-authoritative
+                logger.warning("memory_sync.mark_dirty_failed", error=str(exc))
 
         kept_entries = [{"role": e["role"], "content": e["content"]} for e in result.kept_entries]
-        # compact_context is prefix-only.  Use its exact cut instead of
-        # content matching: duplicate role/content pairs can otherwise match
-        # an older row and move the protected current-turn boundary forward.
-        # ``getattr`` keeps older/custom compactor result stubs compatible;
-        # prefix-only compaction already guarantees that removed_count is the
-        # same boundary when the additive field is absent.
-        kept_start_index = int(
-            getattr(result, "kept_start_index", result.removed_count)
-            or result.removed_count
-        )
+        # Use the exact cut instead of content matching: duplicate role/content
+        # pairs can otherwise move the protected current-turn boundary.
         adjusted_request_idx = self._adjust_index_after_prefix_compaction(
             request_context_insert_index,
             kept_start_index,
-            summary_present=bool(result.summary),
+            summary_present=bool(replay_summary),
         )
         adjusted_runtime_idx = self._adjust_index_after_prefix_compaction(
             runtime_context_insert_index,
             kept_start_index,
-            summary_present=bool(result.summary),
+            summary_present=bool(replay_summary),
         )
         adjusted_protected_idx = self._adjust_index_after_prefix_compaction(
             protected_turn_start_index,
             kept_start_index,
-            summary_present=bool(result.summary),
+            summary_present=bool(replay_summary),
         )
         return CompactionOutcome(
             messages=compacted,
             compacted=True,
-            summary=result.summary,
+            summary=str(getattr(result, "summary", "") or ""),
+            summary_payload=getattr(result, "summary_payload", None),
+            summary_format=str(getattr(result, "summary_format", "text") or "text"),
+            coverage_status=str(
+                getattr(result, "coverage_status", "unknown") or "unknown"
+            ),
+            missing_obligations=getattr(result, "missing_obligations", None),
+            critical_carry_forward=getattr(
+                result,
+                "critical_carry_forward",
+                None,
+            ),
             kept_entries=kept_entries,
             removed_count=result.removed_count,
             compaction_id=compaction_id,
+            compaction_deadline_at_monotonic=compaction_config.deadline_at_monotonic,
+            compaction_timeout_seconds=compaction_config.total_timeout_seconds,
             request_context_insert_index=adjusted_request_idx,
             runtime_context_insert_index=adjusted_runtime_idx,
             protected_turn_start_index=adjusted_protected_idx,
+            runtime_compaction_config=compaction_config,
         )
 
     def _consume_completed_flush_task(self) -> None:
@@ -15408,6 +18103,8 @@ class Agent:
         workspace_dir: Any,
         triggered_by: str,
         skill_loader: Any,
+        parent_spec: Any,
+        plan: Any,
     ) -> tuple[Any, Any, Any]:
         """Construct a MetaOrchestrator wired to this agent's provider/tools.
 
@@ -15419,6 +18116,9 @@ class Agent:
             make_agent_runner_from_parent,
             make_llm_chat_from_provider,
             make_tool_invoker_from_handler,
+        )
+        from opensquilla.skills.meta.readiness import (
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
         )
 
         meta_correlation = derive_provider_request_correlation(
@@ -15463,6 +18163,25 @@ class Agent:
             if self._raw_tool_handler is not None
             else None
         )
+        skill_runtime_env: Mapping[str, Mapping[str, str]] = {}
+        runtime_env_provider = (self.config.metadata or {}).get(
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY
+        )
+        if (
+            callable(runtime_env_provider)
+            and parent_spec is not None
+            and plan is not None
+        ):
+            try:
+                resolved_runtime_env = runtime_env_provider(parent_spec, plan)
+            except Exception as exc:  # noqa: BLE001 - credential resolution fails closed
+                logger.warning(
+                    "agent.meta_skill_runtime_env_resolution_failed",
+                    error_type=type(exc).__name__,
+                )
+            else:
+                if isinstance(resolved_runtime_env, Mapping):
+                    skill_runtime_env = resolved_runtime_env
         orch = MetaOrchestrator(
             agent_runner=runner,
             skill_loader=skill_loader,
@@ -15475,8 +18194,40 @@ class Agent:
             turn_id=getattr(self, "_turn_id", None),
             memory_persist_enabled=True,
             usage_tracker=self._usage_tracker,
+            skill_runtime_env=skill_runtime_env,
         )
         return orch, llm_chat, tool_invoker
+
+    @staticmethod
+    def _meta_readiness_context_for_plan(
+        metadata: Mapping[str, Any],
+        *,
+        parent_spec: Any,
+        plan: Any,
+    ) -> Any:
+        """Resolve only parent+plan-scoped, non-secret readiness aliases."""
+
+        from opensquilla.skills.meta.readiness import (
+            META_READINESS_ENV_ALIASES_METADATA_KEY,
+            meta_readiness_context,
+        )
+
+        aliases: object = ()
+        alias_provider = metadata.get(META_READINESS_ENV_ALIASES_METADATA_KEY)
+        if callable(alias_provider):
+            try:
+                aliases = alias_provider(parent_spec, plan)
+            except Exception as exc:  # noqa: BLE001 - readiness fails closed
+                logger.warning(
+                    "agent.meta_readiness_alias_resolution_failed",
+                    error_type=type(exc).__name__,
+                )
+        return meta_readiness_context(
+            env_aliases=aliases,
+            parent_spec=parent_spec,
+            plan=plan,
+            skill_resolver=metadata.get("skill_loader"),
+        )
 
     async def _run_one_streaming(
         self,
@@ -15492,13 +18243,11 @@ class Agent:
             make_meta_inputs,
             meta_input_overrides_from_metadata,
         )
-        from opensquilla.skills.meta.orchestrator import (
-            MetaOrchestrator,
-            make_agent_runner_from_parent,
-            make_llm_chat_from_provider,
-            make_tool_invoker_from_handler,
-        )
         from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
+        from opensquilla.skills.meta.readiness import (
+            assess_meta_skill_readiness,
+            format_meta_setup_error,
+        )
         from opensquilla.skills.meta.types import MetaMatch, MetaResult
         from opensquilla.tools.dispatch import preflight_tool_call
         from opensquilla.tools.types import current_tool_context
@@ -15665,59 +18414,33 @@ class Agent:
                 )
                 return
 
-            meta_correlation = derive_provider_request_correlation(
-                self._provider_request_correlation,
-                execution_id=uuid.uuid4().hex,
-                call_kind="auxiliary.meta",
+            readiness = await asyncio.to_thread(
+                assess_meta_skill_readiness,
+                skill_spec,
+                loader=skill_loader,
+                ctx=self._meta_readiness_context_for_plan(
+                    metadata,
+                    parent_spec=skill_spec,
+                    plan=plan,
+                ),
+                validated_plan=plan,
             )
-            runner = make_agent_runner_from_parent(
-                provider=self.provider,
-                base_config=self.config,
-                tool_definitions=self.tool_definitions,
-                tool_handler=self._raw_tool_handler,
-                agent_factory=type(self),
-                workspace_dir=str(workspace_dir) if workspace_dir else None,
-                usage_tracker=self._usage_tracker,
-                session_key=self._session_key,
-                usage_event_sink=self._usage_event_sink,
-                usage_execution_context=self._usage_execution_context,
-                provider_request_correlation=meta_correlation,
-            )
-            llm_chat = getattr(self, "_test_llm_chat_override", None) or (
-                make_llm_chat_from_provider(
-                    provider=self.provider,
-                    base_config=self.config,
-                    usage_tracker=self._usage_tracker,
-                    session_key=self._session_key,
-                    usage_event_sink=self._usage_event_sink,
-                    usage_execution_context=self._usage_execution_context,
-                    provider_request_correlation=meta_correlation,
+            if not readiness.ready:
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=format_meta_setup_error(name, readiness),
+                    is_error=True,
+                    terminates_turn=False,
                 )
-                if self.provider is not None
-                else None
-            )
-            tool_invoker = (
-                make_tool_invoker_from_handler(
-                    tool_handler=self._raw_tool_handler,
-                    provider_request_correlation=meta_correlation,
-                )
-                if self._raw_tool_handler is not None
-                else None
-            )
+                return
 
-            memory_persist_enabled = True
-            orch = MetaOrchestrator(
-                agent_runner=runner,
-                skill_loader=skill_loader,
-                llm_chat=llm_chat,
-                tool_invoker=tool_invoker,
-                workspace_dir=str(workspace_dir) if workspace_dir else None,
-                run_writer=self._meta_run_writer,
+            orch, llm_chat, tool_invoker = self._build_meta_orchestrator(
+                workspace_dir=workspace_dir,
                 triggered_by="soft_meta_invoke",
-                session_key=getattr(self, "_session_key", None),
-                turn_id=getattr(self, "_turn_id", None),
-                memory_persist_enabled=memory_persist_enabled,
-                usage_tracker=self._usage_tracker,
+                skill_loader=skill_loader,
+                parent_spec=skill_spec,
+                plan=plan,
             )
 
             system_prompt = (
@@ -15870,12 +18593,6 @@ class Agent:
         outer stream pipeline can finalize the turn.
         """
         from opensquilla.engine.types import DoneEvent
-        from opensquilla.skills.meta.orchestrator import (
-            MetaOrchestrator,
-            make_agent_runner_from_parent,
-            make_llm_chat_from_provider,
-            make_tool_invoker_from_handler,
-        )
         from opensquilla.skills.meta.types import MetaResult
         from opensquilla.tools.types import current_tool_context
 
@@ -15901,6 +18618,52 @@ class Agent:
         if isinstance(metadata, dict):
             metadata.pop("meta_resume", None)
 
+        # Capability credentials are re-bound from durable state, never from
+        # the resume marker alone.  Require the claimed snapshot to match its
+        # current run row, then resolve the current parent from the pinned
+        # catalog.  Any missing/mismatched component leaves the orchestrator
+        # with an empty trusted child environment.
+        parent_spec: Any = None
+        resume_plan: Any = None
+        try:
+            claim_run_id = str(getattr(claim, "run_id", "") or "")
+            claim_snapshot = str(
+                getattr(claim, "plan_snapshot_json", "") or ""
+            )
+            resume_record = await asyncio.to_thread(
+                self._meta_run_writer.get_run,
+                claim_run_id,
+            )
+            if (
+                claim_run_id
+                and claim_snapshot
+                and self._session_key
+                and resume_record is not None
+                and str(getattr(resume_record, "run_id", "") or "")
+                == claim_run_id
+                and str(getattr(resume_record, "session_key", "") or "")
+                == self._session_key
+                and str(getattr(resume_record, "plan_snapshot_json", "") or "")
+                == claim_snapshot
+            ):
+                from opensquilla.skills.meta.plan_serde import from_jsonable
+
+                resume_plan = from_jsonable(json.loads(claim_snapshot))
+                candidate_parent = skill_loader.get_by_name(
+                    resume_record.meta_skill_name
+                )
+                if (
+                    candidate_parent is not None
+                    and getattr(resume_plan, "name", None)
+                    == resume_record.meta_skill_name
+                ):
+                    parent_spec = candidate_parent
+        except Exception as exc:  # noqa: BLE001 - capability grant fails closed
+            logger.warning(
+                "agent.meta_resume_capability_binding_failed",
+                error_type=type(exc).__name__,
+            )
+
         effective_ctx = current_tool_context.get() or None
         workspace_dir = (
             (getattr(effective_ctx, "workspace_dir", None) if effective_ctx else None)
@@ -15908,58 +18671,12 @@ class Agent:
             or getattr(self.config, "workspace_dir", None)
         )
 
-        meta_correlation = derive_provider_request_correlation(
-            self._provider_request_correlation,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.meta",
-        )
-        runner = make_agent_runner_from_parent(
-            provider=self.provider,
-            base_config=self.config,
-            tool_definitions=self.tool_definitions,
-            tool_handler=self._raw_tool_handler,
-            agent_factory=type(self),
-            workspace_dir=str(workspace_dir) if workspace_dir else None,
-            usage_tracker=self._usage_tracker,
-            session_key=self._session_key,
-            usage_event_sink=self._usage_event_sink,
-            usage_execution_context=self._usage_execution_context,
-            provider_request_correlation=meta_correlation,
-        )
-        llm_chat = getattr(self, "_test_llm_chat_override", None) or (
-            make_llm_chat_from_provider(
-                provider=self.provider,
-                base_config=self.config,
-                usage_tracker=self._usage_tracker,
-                session_key=self._session_key,
-                usage_event_sink=self._usage_event_sink,
-                usage_execution_context=self._usage_execution_context,
-                provider_request_correlation=meta_correlation,
-            )
-            if self.provider is not None
-            else None
-        )
-        tool_invoker = (
-            make_tool_invoker_from_handler(
-                tool_handler=self._raw_tool_handler,
-                provider_request_correlation=meta_correlation,
-            )
-            if self._raw_tool_handler is not None
-            else None
-        )
-
-        orch = MetaOrchestrator(
-            agent_runner=runner,
-            skill_loader=skill_loader,
-            llm_chat=llm_chat,
-            tool_invoker=tool_invoker,
-            workspace_dir=str(workspace_dir) if workspace_dir else None,
-            run_writer=self._meta_run_writer,
+        orch, _llm_chat, _tool_invoker = self._build_meta_orchestrator(
+            workspace_dir=workspace_dir,
             triggered_by="resume",
-            session_key=getattr(self, "_session_key", None),
-            turn_id=getattr(self, "_turn_id", None),
-            memory_persist_enabled=True,
-            usage_tracker=self._usage_tracker,
+            skill_loader=skill_loader,
+            parent_spec=parent_spec,
+            plan=resume_plan,
         )
 
         result: Any = None
@@ -16023,13 +18740,26 @@ class Agent:
             text_snapshot=final_text,
         )
 
-    async def _run_meta_launch(self, name: str) -> AsyncIterator[Any]:
+    async def _run_meta_launch(
+        self,
+        name: str,
+        *,
+        user_request: str | None = None,
+        replay_run_id: str | None = None,
+        replay_mode: str | None = None,
+    ) -> AsyncIterator[Any]:
         """Run a meta-skill by name from the explicit /meta command.
 
         Models its streaming/finalization on ``_run_meta_resume`` and reuses the
         resolution + guards from ``_run_one_streaming`` (enabled gate,
         awaiting-guard, kind/disable validation). Yields nested AgentEvents plus
-        a terminal DoneEvent so the turn pipeline finalizes normally.
+        a terminal DoneEvent so the turn pipeline finalizes normally. When the
+        command includes ``-- <request>``, ``user_request`` is the original
+        request and is passed to the orchestrator instead of the hidden command
+        envelope.  A trusted replay marker additionally supplies a persisted
+        source run and mode; in that path the original plan snapshot and all
+        successful step outputs are rehydrated and only failed/missing steps
+        are dispatched.
         """
         import opensquilla.skills.creator  # noqa: F401  (registers e2e hooks)
         from opensquilla.engine.types import DoneEvent, TextDeltaEvent
@@ -16046,13 +18776,17 @@ class Agent:
             meta_input_overrides_from_metadata,
         )
         from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
-        from opensquilla.skills.meta.types import MetaMatch, MetaResult
+        from opensquilla.skills.meta.readiness import (
+            assess_meta_skill_readiness,
+            format_meta_setup_error,
+        )
+        from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult
         from opensquilla.tools.types import current_tool_context
 
         metadata = self.config.metadata or {}
         # One-shot: drop the marker so a re-enter through this turn cannot re-run.
         if isinstance(metadata, dict):
-            metadata.pop("meta_launch", None)
+            metadata.pop("meta_replay" if replay_run_id else "meta_launch", None)
 
         if not is_meta_skill_enabled(self.config):
             async for ev in self._emit_terminal_text(
@@ -16069,6 +18803,46 @@ class Agent:
             ):
                 yield ev
             return
+
+        replay_record: Any = None
+        if replay_run_id is not None:
+            if replay_mode not in {"failed-step", "partial-context"}:
+                async for ev in self._emit_terminal_text(
+                    "This replay mode is invalid. Choose Retry failed step again.",
+                    iterations=0,
+                ):
+                    yield ev
+                return
+            replay_record = await asyncio.to_thread(
+                self._meta_run_writer.get_run,
+                replay_run_id,
+            )
+            if (
+                replay_record is None
+                or replay_record.meta_skill_name != name
+                or (
+                    replay_record.session_key
+                    and replay_record.session_key != self._session_key
+                )
+                or replay_record.status != "failed"
+                or not replay_record.failed_step_id
+            ):
+                async for ev in self._emit_terminal_text(
+                    "This replay is no longer available for this session. "
+                    "Choose Retry failed step again.",
+                    iterations=0,
+                ):
+                    yield ev
+                return
+            if replay_inputs_are_modified(replay_record):
+                async for ev in self._emit_terminal_text(
+                    "This run cannot safely retry only the failed step because "
+                    "its saved request was redacted or truncated. Start a new "
+                    "meta-skill run and provide the original request again.",
+                    iterations=0,
+                ):
+                    yield ev
+                return
 
         # Awaiting-guard parity with _run_one_streaming: refuse a new launch
         # while a prior run is waiting for input (avoids the opaque CAS error).
@@ -16099,29 +18873,93 @@ class Agent:
             ):
                 yield ev
             return
-        # Parity with _run_one_streaming and meta.list: skills flagged
-        # disable_model_invocation are neither listed nor runnable via /meta.
-        if getattr(skill_spec, "disable_model_invocation", False):
+        # Fresh launches respect the catalog gate. A trusted failed-run replay
+        # is different: its immutable plan came from the persisted ledger and
+        # may belong to a now-retired compatibility definition. Keeping that
+        # path available lets upgrades finish already-started work without
+        # making the retired skill discoverable or allowing a new run.
+        retired_replay = bool(
+            replay_record is not None
+            and getattr(skill_spec, "disable_model_invocation", False)
+        )
+        if getattr(skill_spec, "disable_model_invocation", False) and not retired_replay:
+            description = str(getattr(skill_spec, "description", "")).strip().lower()
+            unavailable_message = f"{name!r} is not available for invocation."
+            if description.startswith("retired compatibility"):
+                unavailable_message = (
+                    f"{name!r} has been retired and is not available for new runs. "
+                    "Previously saved runs remain available for inspection, resume, or replay."
+                )
             async for ev in self._emit_terminal_text(
-                f"{name!r} is not available for invocation.", iterations=0
+                unavailable_message, iterations=0
             ):
                 yield ev
             return
 
-        try:
-            plan = parse_meta_plan(skill_spec)
-        except MetaPlanError as exc:
-            async for ev in self._emit_terminal_text(
-                f"meta-skill {name!r} plan invalid: {exc}", iterations=0
-            ):
-                yield ev
-            return
+        plan: MetaPlan | None
+        if replay_record is not None:
+            try:
+                from opensquilla.skills.meta.plan_serde import from_jsonable
+
+                plan = from_jsonable(json.loads(replay_record.plan_snapshot_json))
+            except Exception as exc:  # noqa: BLE001 - persisted legacy snapshot
+                async for ev in self._emit_terminal_text(
+                    f"Cannot replay meta-skill {name!r}: its saved plan is invalid ({exc}).",
+                    iterations=0,
+                ):
+                    yield ev
+                return
+        else:
+            try:
+                plan = parse_meta_plan(skill_spec)
+            except MetaPlanError as exc:
+                async for ev in self._emit_terminal_text(
+                    f"meta-skill {name!r} plan invalid: {exc}", iterations=0
+                ):
+                    yield ev
+                return
         if plan is None:
             async for ev in self._emit_terminal_text(
                 f"meta-skill {name!r} parsed to None", iterations=0
             ):
                 yield ev
             return
+
+        # Current-manifest readiness may have changed after the source run was
+        # persisted. Do not let a retired tombstone redefine that immutable
+        # replay; each saved step still enforces its own runtime/tool gates.
+        if not retired_replay:
+            readiness = await asyncio.to_thread(
+                assess_meta_skill_readiness,
+                skill_spec,
+                loader=skill_loader,
+                ctx=self._meta_readiness_context_for_plan(
+                    metadata,
+                    parent_spec=skill_spec,
+                    plan=plan,
+                ),
+                validated_plan=plan,
+            )
+            if not readiness.ready:
+                async for ev in self._emit_terminal_text(
+                    format_meta_setup_error(name, readiness), iterations=0
+                ):
+                    yield ev
+                return
+        if replay_record is not None:
+            from opensquilla.skills.meta.replay_safety import (
+                paid_live_replay_block_reason,
+            )
+
+            paid_block = paid_live_replay_block_reason(
+                plan=plan,
+                persisted_steps=getattr(replay_record, "steps", ()),
+                failed_step_id=str(replay_record.failed_step_id or ""),
+            )
+            if paid_block:
+                async for ev in self._emit_terminal_text(paid_block, iterations=0):
+                    yield ev
+                return
 
         effective_ctx = current_tool_context.get() or None
         workspace_dir = (
@@ -16139,18 +18977,56 @@ class Agent:
             workspace_dir=workspace_dir,
             triggered_by="manual_command",
             skill_loader=skill_loader,
-        )
-        match = MetaMatch(
+            parent_spec=skill_spec,
             plan=plan,
-            inputs=make_meta_inputs(
-                user_message=(
-                    getattr(self, "_current_turn_message", "")
-                    or metadata.get("user_message", "")
-                ),
-                system_prompt=system_prompt,
-                **meta_input_overrides_from_metadata(metadata),
-            ),
         )
+        seed_outputs: dict[str, str] | None = None
+        trusted_replay_meta_run_id: str | None = None
+        if replay_record is not None:
+            try:
+                replay_inputs = json.loads(replay_record.inputs_json or "{}")
+            except json.JSONDecodeError:
+                replay_inputs = {}
+            if not isinstance(replay_inputs, dict):
+                replay_inputs = {}
+            # The artifact directory is a runtime-owned reserved input. Recover
+            # it only from the validated source row; never accept a value from
+            # the new replay turn. Legacy rows predate this field and map their
+            # persisted run id to the same bounded, path-safe namespace.
+            from opensquilla.skills.meta.orchestrator import _preserve_meta_run_id
+
+            trusted_replay_meta_run_id = _preserve_meta_run_id(
+                replay_inputs,
+                fallback_run_id=replay_record.run_id,
+            )
+            replay_inputs["meta_replay_source_run_id"] = replay_record.run_id
+            replay_inputs["meta_replay_mode"] = replay_mode
+            replay_inputs.setdefault("system_prompt", system_prompt)
+            failed_step_id = str(replay_record.failed_step_id or "")
+            replay_failover_aliases: dict[str, str] = {}
+            seed_outputs = _trusted_meta_replay_seed_outputs(
+                plan=plan,
+                persisted_steps=getattr(replay_record, "steps", ()),
+                failed_step_id=failed_step_id,
+                replay_failover_aliases=replay_failover_aliases,
+            )
+            match = MetaMatch(plan=plan, inputs=replay_inputs)
+        else:
+            match = MetaMatch(
+                plan=plan,
+                inputs=make_meta_inputs(
+                    user_message=(
+                        user_request
+                        if user_request is not None
+                        else (
+                            getattr(self, "_current_turn_message", "")
+                            or metadata.get("user_message", "")
+                        )
+                    ),
+                    system_prompt=system_prompt,
+                    **meta_input_overrides_from_metadata(metadata),
+                ),
+            )
 
         # Mirror _run_one_streaming: wrap iter_events in the runtime-e2e / smoke
         # ContextVars so a manually launched meta-skill that spawns sub-agents
@@ -16178,7 +19054,21 @@ class Agent:
         result: Any = None
         final_text_parts: list[str] = []
         try:
-            async for ev in orch.iter_events(match):
+            replay_kwargs: dict[str, Any] = {}
+            if replay_record is not None:
+                replay_kwargs = {
+                    "seed_outputs": seed_outputs,
+                    "trusted_preflight_replay": True,
+                    "trusted_replay_meta_run_id": trusted_replay_meta_run_id,
+                }
+                # Preserve the established replay call contract when there is
+                # no pending fallback alias.  The alias map is meaningful only
+                # for the narrow "retry failed fallback" recovery path.
+                if replay_failover_aliases:
+                    replay_kwargs["replay_failover_aliases"] = (
+                        replay_failover_aliases
+                    )
+            async for ev in orch.iter_events(match, **replay_kwargs):
                 if isinstance(ev, MetaResult):
                     result = ev
                     continue
@@ -16476,6 +19366,96 @@ class Agent:
         )
 
     # ------------------------------------------------------------------
+    def _prepare_subagent_execution_task(
+        self,
+        spec: SubagentSpec,
+        *,
+        execution_id: str,
+        child_target: Any,
+        child_context: ToolContext,
+        child_tool_definitions: list[ToolDefinition],
+    ) -> None:
+        """Keep oversized delegated tasks out of the child's initial request."""
+
+        task_bytes = len(spec.task.encode("utf-8"))
+        inline_limit = subagent_task_inline_limit_bytes(child_target)
+        if task_bytes <= inline_limit:
+            spec.execution_task = None
+            return
+        if task_bytes > MAX_REFERENCED_SUBAGENT_TASK_BYTES:
+            raise ValueError(
+                "Subagent task exceeds the safe handoff limit "
+                f"({task_bytes} > {MAX_REFERENCED_SUBAGENT_TASK_BYTES} bytes). "
+                "Publish the material as an artifact or workspace file and pass "
+                "a focused reference instead of copying the full parent context."
+            )
+        reference_slice_limit = subagent_task_reference_slice_limit_chars(
+            child_target
+        )
+        if reference_slice_limit < 1:
+            raise ValueError(
+                "Subagent deployment has no safe capacity for a referenced "
+                "task slice. Choose a larger child model or pass a focused "
+                "workspace-file reference."
+            )
+        if self._raw_tool_handler is None:
+            raise ValueError(
+                "Subagent task exceeds its inline request budget "
+                f"({task_bytes} > {inline_limit} bytes), and no retrieval-capable "
+                "tool handler is available. Pass an artifact/workspace reference."
+            )
+
+        has_retrieval_tool = any(
+            definition.name == "retrieve_tool_result"
+            for definition in child_tool_definitions
+        )
+        if not has_retrieval_tool and self._tool_registry is not None:
+            if child_context.surfaced_tools is None:
+                child_context.surfaced_tools = set()
+            child_context.surfaced_tools.add("retrieve_tool_result")
+            retrieval_definition = next(
+                (
+                    definition
+                    for definition in self._tool_registry.to_tool_definitions(child_context)
+                    if definition.name == "retrieve_tool_result"
+                ),
+                None,
+            )
+            if retrieval_definition is not None:
+                child_tool_definitions.append(retrieval_definition)
+                has_retrieval_tool = True
+        if not has_retrieval_tool:
+            raise ValueError(
+                "Subagent task exceeds its inline request budget "
+                f"({task_bytes} > {inline_limit} bytes), but retrieve_tool_result "
+                "is not available under the child tool policy. Pass an artifact "
+                "or workspace-file reference."
+            )
+
+        stored = self._store_tool_result_snapshot(
+            spec.task,
+            tool_use_id=f"subagent-task-{execution_id}",
+            tool_name="subagent_task_handoff",
+        )
+        if stored is None:
+            raise ValueError(
+                "Subagent task exceeds its inline request budget "
+                f"({task_bytes} > {inline_limit} bytes), and the configured "
+                "reference store could not persist it. Pass an artifact or "
+                "workspace-file reference."
+            )
+        spec.execution_task = render_subagent_task_reference(
+            stored,
+            slice_limit_chars=reference_slice_limit,
+        )
+        logger.info(
+            "subagent.task_externalized",
+            task_bytes=task_bytes,
+            inline_limit_bytes=inline_limit,
+            handle=stored.handle,
+            sha256=stored.sha256,
+        )
+
     # Subagent factory
     # ------------------------------------------------------------------
 
@@ -16502,6 +19482,11 @@ class Agent:
         parent_session_key = self._session_key or "unknown"
         subagent_label = spec.label or "subagent"
         child_execution_id = execution_id or uuid.uuid4().hex
+        child_target = resolve_subagent_execution_target(
+            self.provider,
+            self.config,
+            spec.model_id,
+        )
         child_provider_request_correlation = derive_provider_request_correlation(
             self._provider_request_correlation,
             execution_id=child_execution_id,
@@ -16522,11 +19507,18 @@ class Agent:
             run_context_mode = getattr(parent_run_context, "run_mode", None)
             parent_run_mode = getattr(run_context_mode, "value", run_context_mode)
         parent_elevated = getattr(parent_ctx, "elevated", None)
-        if parent_run_mode not in {"standard", "trusted", "full"}:
+        if parent_run_mode is not None:
+            from opensquilla.run_mode import normalize_run_mode
+
+            try:
+                parent_run_mode = normalize_run_mode(parent_run_mode).value
+            except ValueError:
+                parent_run_mode = None
+        if parent_run_mode is None:
             if parent_elevated == "full":
                 parent_run_mode = "full"
             elif parent_elevated in {"on", "bypass"}:
-                parent_run_mode = "trusted"
+                parent_run_mode = "safe"
             else:
                 parent_run_mode = None
 
@@ -16590,6 +19582,18 @@ class Agent:
             on_runtime_event=self._record_tool_context_runtime_event
             if self.config.runtime_events_path
             else None,
+            sandbox_policy=(
+                self._tool_context.sandbox_policy
+                if self._tool_context is not None
+                else None
+            ),
+        )
+        self._prepare_subagent_execution_task(
+            spec,
+            execution_id=child_execution_id,
+            child_target=child_target,
+            child_context=subagent_ctx,
+            child_tool_definitions=filtered_defs,
         )
 
         async def _subagent_tool_handler(tc: ToolCall) -> ToolResult:
@@ -16616,8 +19620,9 @@ class Agent:
         child_cfg = AgentConfig(
             max_iterations=spec.max_iterations,
             timeout=spec.timeout,
-            provider_id=self.config.provider_id,
-            max_tokens=self.config.max_tokens,
+            provider_id=child_target.provider_id,
+            model_id=child_target.model_id or self.config.model_id,
+            max_tokens=child_target.max_output_tokens,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
             max_turn_llm_calls=self.config.max_turn_llm_calls,
@@ -16627,7 +19632,7 @@ class Agent:
             max_turn_cost_usd=self.config.max_turn_cost_usd,
             max_turn_tool_errors=self.config.max_turn_tool_errors,
             length_capped_continuations=self.config.length_capped_continuations,
-            context_window_tokens=self.config.context_window_tokens,
+            context_window_tokens=child_target.context_window_tokens,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
             flush_enabled=self.config.flush_enabled,
             flush_triggers=list(self.config.flush_triggers),
@@ -16643,6 +19648,10 @@ class Agent:
             flush_compaction_safety_mode=self.config.flush_compaction_safety_mode,
             compaction_profile=self.config.compaction_profile,
             compaction_protected_recent_messages=(self.config.compaction_protected_recent_messages),
+            compaction_total_timeout_seconds=self.config.compaction_total_timeout_seconds,
+            compaction_heartbeat_interval_seconds=(
+                self.config.compaction_heartbeat_interval_seconds
+            ),
             tool_result_projection_max_inline_chars=(
                 self.config.tool_result_projection_max_inline_chars
             ),
@@ -16662,7 +19671,8 @@ class Agent:
             tool_result_provider_request_max_chars=(
                 self.config.tool_result_provider_request_max_chars
             ),
-            provider_request_proof_max_chars=self.config.provider_request_proof_max_chars,
+            provider_request_proof_max_chars=child_target.provider_request_max_chars,
+            provider_request_proof_max_chars_explicit=False,
             tool_use_argument_provider_request_max_chars=(
                 self.config.tool_use_argument_provider_request_max_chars
             ),
@@ -16747,9 +19757,11 @@ class Agent:
             tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
             tool_result_store_disk_budget_bytes=(self.config.tool_result_store_disk_budget_bytes),
             tool_result_store_retention_seconds=(self.config.tool_result_store_retention_seconds),
+            model_capabilities=child_target.model_capabilities,
+            compaction_execution_plan=child_target.compaction_plan,
         )
         return Agent(
-            provider=self.provider,
+            provider=child_target.provider,
             config=child_cfg,
             tool_definitions=filtered_defs,
             tool_handler=_subagent_tool_handler,

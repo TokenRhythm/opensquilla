@@ -74,6 +74,27 @@ def _collect(
     return asyncio.run(_run())
 
 
+def test_ollama_final_request_proof_blocks_before_http(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_stream(monkeypatch, captured)
+    provider = OllamaProvider(model="llama3")
+
+    events = _collect(
+        provider,
+        [Message(role="user", content="x" * 5000)],
+        ChatConfig(provider_request_max_chars=1000),
+    )
+
+    assert captured == {}
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "provider_request_budget_exhausted"
+    proof = json.loads(events[0].message)
+    assert proof["projection_adapter"] == "ollama"
+    assert proof["messages_chars"] > 0
+
+
 def test_tool_use_replayed_as_tool_calls_and_correlated_tool_message(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_stream(monkeypatch, captured)
@@ -201,21 +222,31 @@ def test_image_block_attached_to_message_images(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
     _patch_stream(monkeypatch, captured)
     provider = OllamaProvider(model="llava")
+    image_data = "QkFTRTY0" * 700
     messages = [
         Message(
             role="user",
             content=[
                 ContentBlockText(text="what is this"),
-                ContentBlockImage(source_type="base64", media_type="image/png", data="QkFTRTY0"),
+                ContentBlockImage(
+                    source_type="base64",
+                    media_type="image/png",
+                    data=image_data,
+                ),
             ],
         ),
     ]
 
-    _collect(provider, messages)
+    events = _collect(
+        provider,
+        messages,
+        ChatConfig(provider_request_max_chars=10_000),
+    )
 
     msg = captured["payload"]["messages"][0]
     assert msg["content"] == "what is this"
-    assert msg["images"] == ["QkFTRTY0"]
+    assert msg["images"] == [image_data]
+    assert any(isinstance(event, DoneEvent) for event in events)
 
 
 def test_system_prompt_is_first_message(monkeypatch: Any) -> None:

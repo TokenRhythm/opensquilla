@@ -1,9 +1,10 @@
 """Trusted normalization of provider text that may encode tool calls.
 
 The normalizer owns the boundary between literal model text and executable
-tool events.  It is deliberately independent from UI/display filtering:
-unconfirmed, malformed, unauthorized, oversized, or truncated candidates are
-returned byte-for-byte as literal text.
+tool events.  It is deliberately independent from UI/display filtering.
+Legacy compatibility dialects preserve rejected candidates as literal text;
+recognized DeepSeek DSML is instead returned as a payload-free rejection so
+the provider can fail explicitly without exposing machine protocol.
 """
 
 from __future__ import annotations
@@ -14,16 +15,18 @@ import re
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
 from .compat_policy import (
+    TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
     TEXT_TOOL_DIALECT_MINIMAX_XML,
     TEXT_TOOL_DIALECT_PLAIN_JSON,
     TEXT_TOOL_DIALECT_QWEN_TAG,
     TextToolDialect,
 )
+from .stream_assembly import DEFAULT_MAX_TOOL_CALLS
 from .types import ToolDefinition
 
 log = structlog.get_logger(__name__)
@@ -56,6 +59,20 @@ _MINIMAX_PARAMETER_OPEN_RE = re.compile(
     re.IGNORECASE,
 )
 _MINIMAX_PARAMETER_CLOSE_RE = re.compile(r"</parameter>", re.IGNORECASE)
+_DSML_TOOL_CALLS_OPEN = "<｜DSML｜tool_calls>"
+_DSML_TOOL_CALLS_CLOSE = "</｜DSML｜tool_calls>"
+_DSML_INVOKE_CLOSE = "</｜DSML｜invoke>"
+_DSML_PARAMETER_CLOSE = "</｜DSML｜parameter>"
+DSML_RECOGNITION_PREFIX = "<｜DSML｜"
+_DSML_ASCII_WHITESPACE = frozenset(" \t\r\n")
+_DSML_TOOL_CALLS_OPEN_RE = re.compile(re.escape(_DSML_TOOL_CALLS_OPEN))
+_DSML_INVOKE_OPEN_RE = re.compile(
+    r'<｜DSML｜invoke name="(?P<name>[^"]+)">',
+)
+_DSML_PARAMETER_OPEN_RE = re.compile(
+    r'<｜DSML｜parameter name="(?P<name>[^"]+)" '
+    r'string="(?P<string>true|false)">',
+)
 _STRUCTURED_TOOL_SCAFFOLD_RE = re.compile(
     r"<details><summary>View areas around line\b[\s\S]*?</details>\s*$",
     re.IGNORECASE,
@@ -66,6 +83,7 @@ _STRUCTURED_TOOL_SCAFFOLD_OPEN_RE = re.compile(
 )
 _CANONICAL_QWEN_PREFIX = "<tool_call>"
 _CANONICAL_MINIMAX_PREFIX = "<minimax:tool_call>"
+_CANONICAL_DSML_PREFIX = _DSML_TOOL_CALLS_OPEN
 _CANONICAL_SCAFFOLD_PREFIX = "<details><summary>view areas around line"
 _MARKDOWN_FENCE_LINE_RE = re.compile(r" {0,3}(?P<fence>`{3,}|~{3,})")
 _RAW_HTML_TAGS = ("pre", "code", "script", "style", "textarea")
@@ -81,6 +99,22 @@ def _reject_nonstandard_json_constant(value: str) -> Any:
 
 def _strict_json_loads(value: str) -> Any:
     return json.loads(value, parse_constant=_reject_nonstandard_json_constant)
+
+
+def _strict_dsml_json_loads(value: str) -> Any:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = item
+        return result
+
+    return json.loads(
+        value,
+        parse_constant=_reject_nonstandard_json_constant,
+        object_pairs_hook=unique_object,
+    )
 
 
 def _is_strict_json_value(value: Any) -> bool:
@@ -137,13 +171,71 @@ class SyntheticToolSegment:
     source_text: str
 
 
-type TextToolSegment = LiteralTextSegment | SyntheticToolSegment
+TextToolRejectionReason = Literal[
+    "dsml_malformed",
+    "dsml_incomplete",
+    "dsml_oversized",
+    "dsml_unknown_tool",
+    "dsml_schema_invalid",
+]
+
+
+@dataclass(frozen=True)
+class RejectedTextToolSegment:
+    """Recognized machine protocol that must be scrubbed without execution.
+
+    Deliberately retain only bounded metadata.  In particular, rejected
+    arguments and source protocol never cross the provider normalization
+    boundary or become log fields.
+    """
+
+    dialect: TextToolDialect
+    reason: TextToolRejectionReason
+    call_count: int = 0
+
+
+@dataclass(frozen=True)
+class DsmlCandidateCall:
+    """Syntax-only DSML action; it is inert until separately validated."""
+
+    tool_name: str
+    arguments: dict[str, Any]
+
+
+DsmlCandidateStatus = Literal["not_candidate", "complete", "rejected"]
+
+
+@dataclass(frozen=True)
+class DsmlCandidateResult:
+    """Bounded syntax result shared by normal and inert provider paths."""
+
+    status: DsmlCandidateStatus
+    calls: tuple[DsmlCandidateCall, ...] = ()
+    reason: TextToolRejectionReason | None = None
+    start: int = 0
+    end: int = 0
+    call_count: int = 0
+
+
+@dataclass(frozen=True)
+class InertDsmlSegment:
+    """Strictly parsed DSML for a non-executable proposer artifact."""
+
+    calls: tuple[DsmlCandidateCall, ...]
+
+
+type TextToolSegment = (
+    LiteralTextSegment
+    | SyntheticToolSegment
+    | RejectedTextToolSegment
+    | InertDsmlSegment
+)
 
 
 @dataclass(frozen=True)
 class _PendingStart:
     start: int
-    kind: str  # partial | literal_partial | protocol
+    kind: str  # partial | literal_partial | protocol | dsml_protocol
 
 
 @dataclass(frozen=True)
@@ -763,6 +855,12 @@ def _skip_whitespace(text: str, index: int) -> int:
     return index
 
 
+def _skip_dsml_whitespace(text: str, index: int) -> int:
+    while index < len(text) and text[index] in _DSML_ASCII_WHITESPACE:
+        index += 1
+    return index
+
+
 def _remove_one_framing_eol(value: str) -> str:
     """Remove at most one logical EOL at each XML framing boundary."""
 
@@ -900,6 +998,193 @@ def _minimax_protocol_span_at(text: str, start: int) -> _ProtocolSpan | None:
             value = text[parameter_open.end() : parameter_close.start()]
             arguments[parameter_name] = _remove_one_framing_eol(value)
             cursor = parameter_close.end()
+
+
+def _dsml_expected_token_reason(
+    text: str,
+    cursor: int,
+    expected: Sequence[str],
+) -> TextToolRejectionReason:
+    suffix = text[cursor:]
+    if not suffix or any(token.startswith(suffix) for token in expected):
+        return "dsml_incomplete"
+    return "dsml_malformed"
+
+
+def _parse_dsml_envelope_at(text: str, start: int) -> DsmlCandidateResult:
+    """Parse one exact canonical DSML envelope without authorizing its calls."""
+
+    cursor = start + len(_DSML_TOOL_CALLS_OPEN)
+    calls: list[DsmlCandidateCall] = []
+    while True:
+        cursor = _skip_dsml_whitespace(text, cursor)
+        if text.startswith(_DSML_TOOL_CALLS_CLOSE, cursor):
+            if not calls:
+                return DsmlCandidateResult(
+                    status="rejected",
+                    reason="dsml_malformed",
+                    start=start,
+                    end=len(text),
+                )
+            end = cursor + len(_DSML_TOOL_CALLS_CLOSE)
+            if any(char not in _DSML_ASCII_WHITESPACE for char in text[end:]):
+                return DsmlCandidateResult(
+                    status="rejected",
+                    reason="dsml_malformed",
+                    start=start,
+                    end=len(text),
+                    call_count=len(calls),
+                )
+            return DsmlCandidateResult(
+                status="complete",
+                calls=tuple(calls),
+                start=start,
+                end=end,
+                call_count=len(calls),
+            )
+
+        invoke_open = _DSML_INVOKE_OPEN_RE.match(text, cursor)
+        if invoke_open is None:
+            return DsmlCandidateResult(
+                status="rejected",
+                reason=_dsml_expected_token_reason(
+                    text,
+                    cursor,
+                    (
+                        '<｜DSML｜invoke name="',
+                        _DSML_TOOL_CALLS_CLOSE,
+                    ),
+                ),
+                start=start,
+                end=len(text),
+                call_count=len(calls),
+            )
+        tool_name = invoke_open.group("name")
+        cursor = invoke_open.end()
+        arguments: dict[str, Any] = {}
+        while True:
+            cursor = _skip_dsml_whitespace(text, cursor)
+            if text.startswith(_DSML_INVOKE_CLOSE, cursor):
+                if len(calls) >= DEFAULT_MAX_TOOL_CALLS:
+                    return DsmlCandidateResult(
+                        status="rejected",
+                        reason="dsml_oversized",
+                        start=start,
+                        end=len(text),
+                        call_count=len(calls) + 1,
+                    )
+                calls.append(DsmlCandidateCall(tool_name, arguments))
+                cursor += len(_DSML_INVOKE_CLOSE)
+                break
+
+            parameter_open = _DSML_PARAMETER_OPEN_RE.match(text, cursor)
+            if parameter_open is None:
+                return DsmlCandidateResult(
+                    status="rejected",
+                    reason=_dsml_expected_token_reason(
+                        text,
+                        cursor,
+                        (
+                            '<｜DSML｜parameter name="',
+                            _DSML_INVOKE_CLOSE,
+                        ),
+                    ),
+                    start=start,
+                    end=len(text),
+                    call_count=len(calls),
+                )
+            parameter_name = parameter_open.group("name")
+            if parameter_name in arguments:
+                return DsmlCandidateResult(
+                    status="rejected",
+                    reason="dsml_malformed",
+                    start=start,
+                    end=len(text),
+                    call_count=len(calls),
+                )
+            value_start = parameter_open.end()
+            parameter_close = text.find(_DSML_PARAMETER_CLOSE, value_start)
+            if parameter_close < 0:
+                return DsmlCandidateResult(
+                    status="rejected",
+                    reason="dsml_incomplete",
+                    start=start,
+                    end=len(text),
+                    call_count=len(calls),
+                )
+            raw_value = text[value_start:parameter_close]
+            if parameter_open.group("string") == "true":
+                value: Any = raw_value
+            else:
+                try:
+                    value = _strict_dsml_json_loads(raw_value)
+                except (
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                    OverflowError,
+                    RecursionError,
+                ):
+                    return DsmlCandidateResult(
+                        status="rejected",
+                        reason="dsml_malformed",
+                        start=start,
+                        end=len(text),
+                        call_count=len(calls),
+                    )
+                if not _is_strict_json_value(value):
+                    return DsmlCandidateResult(
+                        status="rejected",
+                        reason="dsml_malformed",
+                        start=start,
+                        end=len(text),
+                        call_count=len(calls),
+                    )
+            arguments[parameter_name] = value
+            cursor = parameter_close + len(_DSML_PARAMETER_CLOSE)
+
+
+def parse_dsml_candidate(full_text: str) -> DsmlCandidateResult:
+    """Recognize and strictly parse a terminal canonical DSML envelope.
+
+    This helper is intentionally syntax-only.  Its result is inert until the
+    normal adapter additionally applies the configured tool allowlist, alias
+    checks, and JSON-schema validation.  Markdown/HTML examples and embedded
+    prose are not candidates.
+    """
+
+    if not full_text:
+        return DsmlCandidateResult(status="not_candidate")
+    code_ranges = _markdown_code_ranges(full_text)
+    for opening in _DSML_TOOL_CALLS_OPEN_RE.finditer(full_text):
+        if _position_is_in_code(opening.start(), code_ranges):
+            continue
+        if not _candidate_starts_on_standalone_line(full_text, opening.start()):
+            continue
+        return _parse_dsml_envelope_at(full_text, opening.start())
+
+    # Once the protocol namespace and a prefix of the canonical envelope have
+    # arrived on an independent line, a successful response cannot safely
+    # publish it as prose.  Short generic prefixes such as "<" remain literal.
+    search_from = 0
+    while True:
+        marker = full_text.find(DSML_RECOGNITION_PREFIX, search_from)
+        if marker < 0:
+            break
+        search_from = marker + len(DSML_RECOGNITION_PREFIX)
+        if _position_is_in_code(marker, code_ranges):
+            continue
+        if not _candidate_starts_on_standalone_line(full_text, marker):
+            continue
+        suffix = full_text[marker:]
+        if _DSML_TOOL_CALLS_OPEN.startswith(suffix):
+            return DsmlCandidateResult(
+                status="rejected",
+                reason="dsml_incomplete",
+                start=marker,
+                end=len(full_text),
+            )
+    return DsmlCandidateResult(status="not_candidate")
 
 
 def _scan_protocol_spans(
@@ -1136,6 +1421,132 @@ def _validated_call(
     )
 
 
+def _validated_dsml_call(
+    *,
+    raw_call: DsmlCandidateCall,
+    tools_by_name: dict[str, ToolDefinition],
+) -> tuple[SyntheticTextToolCall | None, TextToolRejectionReason | None]:
+    """Apply execution policy without placing model-controlled data in logs."""
+
+    from opensquilla.tools.argument_normalization import canonicalize_tool_arguments
+
+    if raw_call.tool_name not in tools_by_name:
+        return None, "dsml_unknown_tool"
+    normalization = canonicalize_tool_arguments(
+        raw_call.tool_name,
+        raw_call.arguments,
+    )
+    if normalization.conflicts:
+        return None, "dsml_schema_invalid"
+    arguments = normalization.arguments
+    if _schema_validation_errors(tools_by_name[raw_call.tool_name], arguments):
+        return None, "dsml_schema_invalid"
+    return (
+        SyntheticTextToolCall(
+            tool_name=raw_call.tool_name,
+            arguments=arguments,
+            dialect=TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
+            parse_format="dsml",
+        ),
+        None,
+    )
+
+
+def _dsml_rejection_segments(
+    full_text: str,
+    *,
+    start: int,
+    end: int,
+    reason: TextToolRejectionReason,
+    call_count: int,
+) -> list[TextToolSegment]:
+    segments: list[TextToolSegment] = []
+    if start > 0:
+        segments.append(LiteralTextSegment(full_text[:start]))
+    segments.append(
+        RejectedTextToolSegment(
+            dialect=TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
+            reason=reason,
+            call_count=call_count,
+        )
+    )
+    if end < len(full_text):
+        segments.append(LiteralTextSegment(full_text[end:]))
+    return segments
+
+
+def _classify_dsml_candidate(
+    full_text: str,
+    tools_by_name: dict[str, ToolDefinition],
+) -> list[TextToolSegment] | None:
+    result = parse_dsml_candidate(full_text)
+    if result.status == "not_candidate":
+        return None
+    if result.status == "rejected":
+        assert result.reason is not None
+        return _dsml_rejection_segments(
+            full_text,
+            start=result.start,
+            end=result.end,
+            reason=result.reason,
+            call_count=result.call_count,
+        )
+
+    calls: list[SyntheticTextToolCall] = []
+    for raw_call in result.calls:
+        call, rejection = _validated_dsml_call(
+            raw_call=raw_call,
+            tools_by_name=tools_by_name,
+        )
+        if call is None:
+            assert rejection is not None
+            return _dsml_rejection_segments(
+                full_text,
+                start=result.start,
+                end=result.end,
+                reason=rejection,
+                call_count=result.call_count,
+            )
+        calls.append(call)
+
+    segments: list[TextToolSegment] = []
+    if result.start:
+        segments.append(LiteralTextSegment(full_text[: result.start]))
+    segments.append(
+        SyntheticToolSegment(
+            calls=tuple(calls),
+            source_text=full_text[result.start : result.end],
+        )
+    )
+    if result.end < len(full_text):
+        segments.append(LiteralTextSegment(full_text[result.end :]))
+    return segments
+
+
+def _classify_inert_dsml_candidate(full_text: str) -> list[TextToolSegment]:
+    """Classify DSML syntax without attaching executable-tool authority."""
+
+    result = parse_dsml_candidate(full_text)
+    if result.status == "not_candidate":
+        return [LiteralTextSegment(full_text)] if full_text else []
+    if result.status == "rejected":
+        assert result.reason is not None
+        return _dsml_rejection_segments(
+            full_text,
+            start=result.start,
+            end=result.end,
+            reason=result.reason,
+            call_count=result.call_count,
+        )
+    segments: list[TextToolSegment] = []
+    if result.start:
+        segments.append(LiteralTextSegment(full_text[: result.start]))
+    segments.append(InertDsmlSegment(result.calls))
+    if result.end < len(full_text):
+        segments.append(LiteralTextSegment(full_text[result.end :]))
+    return segments
+
+
 def _plain_text_tool_match(
     text: str,
     *,
@@ -1189,9 +1600,16 @@ def classify_text_tool_segments(
 
     if not full_text:
         return []
+    tools_by_name = {tool.name: tool for tool in tools or []}
+
+    if TEXT_TOOL_DIALECT_DEEPSEEK_DSML in dialects:
+        dsml_segments = _classify_dsml_candidate(full_text, tools_by_name)
+        if dsml_segments is not None:
+            return dsml_segments
+
     if not tools or not dialects:
         return [LiteralTextSegment(full_text)]
-    tools_by_name = {tool.name: tool for tool in tools}
+
     matches: list[tuple[int, int, tuple[SyntheticTextToolCall, ...]]] = []
 
     if TEXT_TOOL_DIALECT_QWEN_TAG in dialects:
@@ -1399,6 +1817,8 @@ def _static_candidate_prefixes(
         prefixes.append(_CANONICAL_QWEN_PREFIX)
     if TEXT_TOOL_DIALECT_MINIMAX_XML in dialects:
         prefixes.append(_CANONICAL_MINIMAX_PREFIX)
+    if TEXT_TOOL_DIALECT_DEEPSEEK_DSML in dialects:
+        prefixes.append(_CANONICAL_DSML_PREFIX)
     if include_structured_scaffold:
         prefixes.append(_CANONICAL_SCAFFOLD_PREFIX)
     return tuple(prefixes)
@@ -1447,7 +1867,14 @@ def _find_partial_suffix(
         partial_kind = "partial" if standalone else "literal_partial"
         suffix = text[index:]
         lower_suffix = lower_text[index:]
-        if any(prefix.startswith(lower_suffix) for prefix in prefixes):
+        if (
+            TEXT_TOOL_DIALECT_DEEPSEEK_DSML in dialects
+            and _CANONICAL_DSML_PREFIX.startswith(suffix)
+        ) or any(
+            prefix != _CANONICAL_DSML_PREFIX
+            and prefix.lower().startswith(lower_suffix)
+            for prefix in prefixes
+        ):
             return _PendingStart(index, partial_kind)
         if TEXT_TOOL_DIALECT_PLAIN_JSON not in dialects:
             continue
@@ -1509,6 +1936,15 @@ def _find_pending_start(
         )
         return "protocol" if standalone else "literal_protocol"
 
+    if TEXT_TOOL_DIALECT_DEEPSEEK_DSML in dialects:
+        for match in _DSML_TOOL_CALLS_OPEN_RE.finditer(text):
+            if _position_is_in_code(match.start(), code_ranges):
+                continue
+            kind = protocol_kind(match.start())
+            if kind != "literal_protocol":
+                candidates.append(_PendingStart(match.start(), "dsml_protocol"))
+                break
+
     patterns: list[re.Pattern[str]] = []
     if TEXT_TOOL_DIALECT_QWEN_TAG in dialects:
         patterns.append(_QWEN_TOOL_CALL_OPEN_RE)
@@ -1567,12 +2003,17 @@ def _find_pending_start(
 
 
 def _literalize_segments(segments: list[TextToolSegment]) -> str:
-    return "".join(
-        segment.text
-        if isinstance(segment, LiteralTextSegment)
-        else segment.source_text
-        for segment in segments
-    )
+    parts: list[str] = []
+    for segment in segments:
+        if isinstance(segment, LiteralTextSegment):
+            parts.append(segment.text)
+        elif isinstance(segment, SyntheticToolSegment):
+            parts.append(segment.source_text)
+        else:
+            # Owned machine protocol is intentionally not recoverable as
+            # display text.  Inert DSML remains host-rendered only.
+            assert isinstance(segment, RejectedTextToolSegment | InertDsmlSegment)
+    return "".join(parts)
 
 
 def _native_filtered_segments(
@@ -1601,6 +2042,22 @@ def _native_filtered_segments(
     for segment in segments:
         if isinstance(segment, LiteralTextSegment):
             output.append(segment)
+            continue
+        if isinstance(segment, RejectedTextToolSegment):
+            # A native call is authoritative.  Recognized DSML remains owned
+            # machine protocol but cannot reject or repair the native call.
+            continue
+        if isinstance(segment, InertDsmlSegment):
+            # Syntax-only proposer material is never replayed beside a native
+            # tool payload, regardless of whether the native payload validates.
+            continue
+        if any(
+            call.dialect == TEXT_TOOL_DIALECT_DEEPSEEK_DSML
+            for call in segment.calls
+        ):
+            # Unlike legacy compatibility dialects, DeepSeek may emit both
+            # DSML and native tool_calls for the same response.  Never replay
+            # or synthesize the redundant DSML, even when its payload differs.
             continue
         signatures = [
             signature(call.tool_name, call.arguments)
@@ -1631,9 +2088,25 @@ class TextToolStreamNormalizer:
         provider_kind: str,
         model: str,
         max_candidate_chars: int = MAX_TEXT_TOOL_CANDIDATE_CHARS,
+        dsml_syntax_only: bool = False,
     ) -> None:
+        self._dsml_syntax_only = dsml_syntax_only
         self._tools = tools
-        self._dialects = dialects if tools else frozenset()
+        eligible_dialects = (
+            frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML})
+            if dsml_syntax_only
+            and TEXT_TOOL_DIALECT_DEEPSEEK_DSML in dialects
+            else dialects
+        )
+        self._dialects = (
+            eligible_dialects
+            if tools
+            else frozenset(
+                dialect
+                for dialect in eligible_dialects
+                if dialect == TEXT_TOOL_DIALECT_DEEPSEEK_DSML
+            )
+        )
         self._provider_kind = provider_kind
         self._model = model
         self._allowed_tool_names = frozenset(tool.name for tool in tools or [])
@@ -1647,8 +2120,13 @@ class TextToolStreamNormalizer:
         self._native_tool_seen = False
         self._native_lifecycle_deferred = False
         self._native_candidate_text = ""
+        self._native_dsml_continuation = False
+        self._native_dsml_parts: list[str] = []
+        self._native_dsml_chars = 0
         self._owned_scaffold = ""
         self._synthesis_disabled = False
+        self._dsml_rejection_reason: TextToolRejectionReason | None = None
+        self._discard_dsml_until_finish = False
         self._line_leading_spaces = 0
         self._line_indented = False
         self._line_has_non_space = False
@@ -1657,6 +2135,31 @@ class TextToolStreamNormalizer:
         self._markdown_line_truncated = False
         self._raw_html_state = _RawHtmlState()
         self._last_raw_char = ""
+
+    def _classify(
+        self,
+        text: str,
+        *,
+        dsml_only: bool = False,
+    ) -> list[TextToolSegment]:
+        if self._dsml_syntax_only:
+            return _classify_inert_dsml_candidate(text)
+        dialects = (
+            frozenset(
+                dialect
+                for dialect in self._dialects
+                if dialect == TEXT_TOOL_DIALECT_DEEPSEEK_DSML
+            )
+            if dsml_only
+            else self._dialects
+        )
+        return classify_text_tool_segments(
+            text,
+            self._tools,
+            dialects=dialects,
+            provider_kind=self._provider_kind,
+            model=self._model,
+        )
 
     def _update_line_context(self, text: str) -> None:
         for char in text:
@@ -1786,6 +2289,7 @@ class TextToolStreamNormalizer:
             self._locked_chars
             + len(self._partial)
             + len(self._native_candidate_text)
+            + self._native_dsml_chars
             + len(self._owned_scaffold)
         )
 
@@ -1793,7 +2297,7 @@ class TextToolStreamNormalizer:
     def held_event_count(self) -> int:
         """One logical holdback entry when any candidate text is pending."""
 
-        return int(self.held_chars > 0)
+        return int(self.held_chars > 0 or self._dsml_rejection_reason is not None)
 
     def _unlock_literal(self) -> str:
         text = "".join(self._locked_parts)
@@ -1806,6 +2310,22 @@ class TextToolStreamNormalizer:
         self._locked_parts.append(text)
         self._locked_chars += len(text)
         if self._locked_chars > self._max_candidate_chars:
+            if self._locked_kind == "dsml_protocol":
+                self._locked_parts = []
+                self._locked_chars = 0
+                self._locked_kind = ""
+                self._synthesis_disabled = True
+                self._discard_dsml_until_finish = True
+                self._dsml_rejection_reason = "dsml_oversized"
+                log.warning(
+                    "provider.text_tool_candidate_oversized",
+                    provider=self._provider_kind,
+                    model=self._model,
+                    dialect=TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
+                    reason="candidate_char_limit_exceeded",
+                    max_candidate_chars=self._max_candidate_chars,
+                )
+                return []
             literal = self._unlock_literal()
             self._synthesis_disabled = True
             log.warning(
@@ -1826,7 +2346,23 @@ class TextToolStreamNormalizer:
     def _push_untracked(self, text: str) -> list[str]:
         if not text:
             return []
-        if not self._tools or self._synthesis_disabled:
+        if self._discard_dsml_until_finish:
+            return []
+        if self._native_dsml_continuation:
+            self._native_dsml_parts.append(text)
+            self._native_dsml_chars += len(text)
+            if self._native_dsml_chars > self._max_candidate_chars:
+                self._native_dsml_parts = []
+                self._native_dsml_chars = 0
+                self._discard_dsml_until_finish = True
+            return []
+        dsml_must_remain_owned = (
+            self._native_tool_seen
+            and TEXT_TOOL_DIALECT_DEEPSEEK_DSML in self._dialects
+        )
+        if (not self._tools and not self._dialects) or (
+            self._synthesis_disabled and not dsml_must_remain_owned
+        ):
             return [text]
         if self._locked_kind:
             return self._append_locked(text)
@@ -1841,7 +2377,15 @@ class TextToolStreamNormalizer:
         self._partial = ""
         self._partial_previous_char = ""
         self._partial_standalone = True
-        active_dialects = frozenset() if self._native_tool_seen else self._dialects
+        active_dialects = (
+            frozenset(
+                dialect
+                for dialect in self._dialects
+                if dialect == TEXT_TOOL_DIALECT_DEEPSEEK_DSML
+            )
+            if self._native_tool_seen
+            else self._dialects
+        )
         pending = _find_pending_start(
             combined,
             dialects=active_dialects,
@@ -1890,10 +2434,22 @@ class TextToolStreamNormalizer:
 
     def observe_native_tool_start(self, _tool_name: str) -> list[TextToolSegment]:
         self._native_tool_seen = True
+        if self._native_dsml_continuation:
+            return []
+        locked_kind = self._locked_kind
+        partial_is_dsml = bool(self._partial) and self._partial_standalone and (
+            _CANONICAL_DSML_PREFIX.startswith(self._partial)
+        )
         pending = self._unlock_literal() if self._locked_kind else self._partial
         self._partial = ""
         self._partial_previous_char = ""
         self._partial_standalone = True
+        if locked_kind == "dsml_protocol" or partial_is_dsml:
+            self._native_dsml_parts = [pending]
+            self._native_dsml_chars = len(pending)
+            self._native_dsml_continuation = True
+            self._native_lifecycle_deferred = True
+            return []
         scaffold_start = _complete_scaffold_tail_start(pending)
         if scaffold_start is not None:
             code_ranges = _markdown_code_ranges(pending)
@@ -1905,20 +2461,25 @@ class TextToolStreamNormalizer:
             self._native_lifecycle_deferred = True
         if not pending:
             return []
-        segments = classify_text_tool_segments(
-            pending,
-            self._tools,
-            dialects=self._dialects,
-            provider_kind=self._provider_kind,
-            model=self._model,
-        )
+        segments = self._classify(pending)
         calls = [
             call
             for segment in segments
             if isinstance(segment, SyntheticToolSegment)
             for call in segment.calls
         ]
-        if calls:
+        owns_dsml = any(
+            isinstance(segment, RejectedTextToolSegment | InertDsmlSegment)
+            or (
+                isinstance(segment, SyntheticToolSegment)
+                and any(
+                    call.dialect == TEXT_TOOL_DIALECT_DEEPSEEK_DSML
+                    for call in segment.calls
+                )
+            )
+            for segment in segments
+        )
+        if calls or owns_dsml:
             self._native_candidate_text = pending
             self._native_lifecycle_deferred = True
             return []
@@ -1926,6 +2487,16 @@ class TextToolStreamNormalizer:
 
     def abandon_native_lifecycle_defer(self) -> list[TextToolSegment]:
         """Replay ambiguous text before releasing a bounded native queue."""
+
+        if self._native_dsml_continuation:
+            self._native_candidate_text = ""
+            self._native_dsml_parts = []
+            self._native_dsml_chars = 0
+            self._owned_scaffold = ""
+            self._native_lifecycle_deferred = False
+            self._discard_dsml_until_finish = True
+            self._dsml_rejection_reason = None
+            return []
 
         pending = self._unlock_literal() if self._locked_kind else self._partial
         self._partial = ""
@@ -1935,8 +2506,16 @@ class TextToolStreamNormalizer:
         self._native_candidate_text = ""
         self._owned_scaffold = ""
         self._native_lifecycle_deferred = False
+        if not pending:
+            return []
         self._synthesis_disabled = True
-        return [LiteralTextSegment(pending)] if pending else []
+        self._discard_dsml_until_finish = False
+        self._dsml_rejection_reason = None
+        segments = self._classify(pending)
+        literal = _literalize_segments(
+            _native_filtered_segments(segments, native_calls=[])
+        )
+        return [LiteralTextSegment(literal)] if literal else []
 
     def finish(
         self,
@@ -1948,36 +2527,67 @@ class TextToolStreamNormalizer:
         self._partial = ""
         self._partial_previous_char = ""
         self._partial_standalone = True
-        native_candidate = self._native_candidate_text
+        native_candidate = self._native_candidate_text + "".join(
+            self._native_dsml_parts
+        )
         self._native_candidate_text = ""
+        self._native_dsml_parts = []
+        self._native_dsml_chars = 0
         owned_scaffold = self._owned_scaffold
         self._owned_scaffold = ""
+        dsml_rejection = self._dsml_rejection_reason
+        self._dsml_rejection_reason = None
+        self._discard_dsml_until_finish = False
+        self._native_dsml_continuation = False
         if self._native_tool_seen and not successful_text_tool_terminal:
             pending = native_candidate + owned_scaffold + pending
-        if not pending:
-            if not native_candidate:
-                return []
         if self._native_tool_seen:
-            candidate_text = native_candidate if successful_text_tool_terminal else pending
-            if not candidate_text:
-                return [LiteralTextSegment(pending)] if pending else []
-            segments = classify_text_tool_segments(
-                candidate_text,
-                self._tools,
-                dialects=self._dialects,
-                provider_kind=self._provider_kind,
-                model=self._model,
-            )
-            filtered = _native_filtered_segments(segments, native_calls or [])
-            if successful_text_tool_terminal and pending:
-                filtered.append(LiteralTextSegment(pending))
-            return filtered
+            filtered: list[TextToolSegment] = []
+            if successful_text_tool_terminal:
+                if native_candidate:
+                    segments = self._classify(native_candidate)
+                    filtered.extend(
+                        _native_filtered_segments(segments, native_calls or [])
+                    )
+                if pending:
+                    segments = self._classify(pending, dsml_only=True)
+                    filtered.extend(
+                        _native_filtered_segments(segments, native_calls or [])
+                    )
+                return filtered
+            if pending:
+                segments = self._classify(pending)
+                return _native_filtered_segments(segments, native_calls or [])
+            return []
+
+        if dsml_rejection is not None:
+            return [
+                RejectedTextToolSegment(
+                    dialect=TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
+                    reason=dsml_rejection,
+                )
+            ]
+        if not pending:
+            return []
         if not successful_text_tool_terminal or self._synthesis_disabled:
+            if TEXT_TOOL_DIALECT_DEEPSEEK_DSML in self._dialects:
+                result = parse_dsml_candidate(pending)
+                if result.status == "rejected":
+                    assert result.reason is not None
+                    return _dsml_rejection_segments(
+                        pending,
+                        start=result.start,
+                        end=result.end,
+                        reason=result.reason,
+                        call_count=result.call_count,
+                    )
+                if result.status == "complete":
+                    return _dsml_rejection_segments(
+                        pending,
+                        start=result.start,
+                        end=result.end,
+                        reason="dsml_incomplete",
+                        call_count=result.call_count,
+                    )
             return [LiteralTextSegment(pending)]
-        return classify_text_tool_segments(
-            pending,
-            self._tools,
-            dialects=self._dialects,
-            provider_kind=self._provider_kind,
-            model=self._model,
-        )
+        return self._classify(pending)

@@ -189,6 +189,7 @@ async def test_chat_send_fork_atomically_accepts_child_prefix_message_task_and_r
         }
         assert child_entries[-1].turn_context == {
             "turn_id": response.payload["task_id"],
+            "client_request_id": "atomic-fork-request",
             "client_message_id": response.payload["client_message_id"],
             "surface_id": response.payload["surface_id"],
             "intent": "send",

@@ -560,11 +560,15 @@ async def cron(
             else ""
         )
         context_run_mode = str(getattr(ctx, "run_mode", "") or "") if ctx is not None else ""
-        creator_run_mode = (
-            context_run_mode
-            if context_run_mode in {"standard", "trusted", "full"}
-            else ("full" if is_owner_caller else "trusted")
-        )
+        from opensquilla.run_mode import RunMode, normalize_run_mode
+
+        try:
+            creator_run_mode = normalize_run_mode(
+                context_run_mode,
+                default=RunMode.FULL if is_owner_caller else RunMode.SAFE,
+            ).value
+        except ValueError:
+            creator_run_mode = "full" if is_owner_caller else "safe"
         job = await sched.add_job(
             name=task or "cron-tool-job",
             handler_key=handler_key,

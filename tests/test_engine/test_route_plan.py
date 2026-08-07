@@ -57,6 +57,7 @@ def test_route_plan_is_pinned_once_with_capability_snapshot() -> None:
         fallback_capabilities={
             ("provider-a", "fallback/model"): (
                 32_000,
+                8_192,
                 ModelCapabilities(supports_tools=False),
             ),
         },
@@ -65,8 +66,10 @@ def test_route_plan_is_pinned_once_with_capability_snapshot() -> None:
     assert first.as_dict() == turn.metadata["route_plan"]
     assert first.fallback_chain[0].model == "fallback/model"
     assert first.fallback_chain[0].capabilities.context_window == 32_000
+    assert first.fallback_chain[0].capabilities.effective_max_tokens == 8_192
     assert first.fallback_chain[0].capabilities.supports_tools is False
     assert first.capabilities.context_window == 128_000
+    assert first.capabilities.effective_max_tokens == 0
     assert first.capabilities.supports_reasoning is True
 
     turn.metadata["routed_model"] = "must-not-replace-the-plan"

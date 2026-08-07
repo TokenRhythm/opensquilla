@@ -17,7 +17,7 @@ from opensquilla.cli.agent_cmd import (
     run_agent_command,
     run_agent_once,
 )
-from opensquilla.engine.types import ArtifactEvent, DoneEvent
+from opensquilla.engine.types import ArtifactEvent, DoneEvent, ThinkingEvent
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, PermissionsConfig
 from opensquilla.project_workspaces import (
     ProjectWorkspaceStateError,
@@ -282,6 +282,51 @@ async def test_run_agent_once_collects_artifact_events(
     assert result.artifacts[0]["download_url"] == "/api/v1/artifacts/art-cli"
 
 
+@pytest.mark.asyncio
+async def test_run_agent_once_continues_when_stderr_event_sink_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.agent_event_stream import StderrAgentEventSink
+
+    class FakeTurnRunner:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            yield ThinkingEvent(text="private")
+            yield DoneEvent(text="ok")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config)
+
+    class BrokenStream:
+        def __init__(self) -> None:
+            self.write_calls = 0
+
+        def write(self, _value: str) -> int:
+            self.write_calls += 1
+            raise BrokenPipeError("synthetic closed stderr")
+
+        def flush(self) -> None:
+            raise AssertionError("flush must not follow a failed write")
+
+    stream = BrokenStream()
+    sink = StderrAgentEventSink(stream=stream)  # type: ignore[arg-type]
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services",
+        lambda _services: FakeTurnRunner(),
+    )
+
+    result = await run_agent_once(
+        message="hello",
+        config=GatewayConfig(),
+        event_sink=sink,
+    )
+
+    assert result.status == "ok"
+    assert result.text == "ok"
+    assert sink.active is False
+    assert stream.write_calls == 2
+
+
 def test_run_agent_command_json_includes_artifacts(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -360,6 +405,7 @@ def test_run_agent_command_direct_call_normalizes_typer_defaults(
     assert captured["thinking"] is None
     assert captured["transcript_path"] is None
     assert captured["usage_path"] is None
+    assert captured["event_sink"] is None
     assert captured["session_db_path"] == ":memory:"
     assert captured["no_memory_capture"] is False
     assert captured["attachment_paths"] == []
@@ -367,6 +413,31 @@ def test_run_agent_command_direct_call_normalizes_typer_defaults(
     assert captured["stateless"] is False
     assert captured["stateless_keep_project_rules"] is False
     assert captured["permissions"] is None
+
+
+def test_run_agent_command_enables_stderr_event_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.agent_event_stream import StderrAgentEventSink
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_agent_once(**kwargs: Any) -> AgentRunResult:
+        captured.update(kwargs)
+        return AgentRunResult(
+            status="ok",
+            agent_id="main",
+            session_key="agent:main:main",
+            text="ok",
+            usage={},
+            errors=[],
+        )
+
+    monkeypatch.setattr("opensquilla.cli.agent_cmd.run_agent_once", fake_run_agent_once)
+
+    run_agent_command(message="hello", event_stream_stderr=True)
+
+    assert isinstance(captured["event_sink"], StderrAgentEventSink)
 
 
 def test_run_agent_command_json_includes_routing(
@@ -570,12 +641,12 @@ async def test_run_agent_once_uses_bound_project_workspace_over_tampered_origin(
 @pytest.mark.parametrize(
     ("requested_mode", "expected_mode", "expected_mode_source"),
     [
-        (None, "standard", "user"),
-        ("full", "full", "operator_default"),
+        (None, "safe", "user"),
+        ("full", "safe", "user"),
     ],
 )
 @pytest.mark.asyncio
-async def test_run_agent_once_refreshes_unbound_saved_context_before_typed_override(
+async def test_run_agent_once_refreshes_unbound_saved_context_before_config_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     requested_mode: str | None,
@@ -650,15 +721,16 @@ async def test_run_agent_once_refreshes_unbound_saved_context_before_typed_overr
 
 
 @pytest.mark.parametrize(
-    ("saved_mode", "requested_mode"),
-    [("full", "standard"), ("standard", "full")],
+    ("saved_mode", "requested_mode", "expected_mode"),
+    [("full", "standard", "full"), ("standard", "full", "safe")],
 )
 @pytest.mark.asyncio
-async def test_run_agent_once_preserves_explicit_mode_for_bound_project_execution(
+async def test_run_agent_once_preserves_saved_mode_over_config_fallback_for_project(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     saved_mode: str,
     requested_mode: str,
+    expected_mode: str,
 ) -> None:
     storage = await SessionStorage.open(
         str(tmp_path / f"cli-mode-{saved_mode}-{requested_mode}.db")
@@ -719,9 +791,9 @@ async def test_run_agent_once_preserves_explicit_mode_for_bound_project_executio
         await storage.close()
 
     tool_context = calls[0]["tool_context"]
-    assert tool_context.run_mode == requested_mode
+    assert tool_context.run_mode == expected_mode
     assert tool_context.workspace_dir == project.path
-    assert tool_context.sandbox_run_context.run_mode_source == "operator_default"
+    assert tool_context.sandbox_run_context.run_mode_source == "user"
     assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
         "example.com"
     ]
@@ -1011,6 +1083,63 @@ async def test_run_agent_once_uses_default_full_host_run_mode(
 
     assert captured["tool_context"].run_mode == "full"
     assert captured["tool_context"].elevated == "full"
+
+
+@pytest.mark.parametrize(
+    ("sandbox", "permissions", "expected_mode"),
+    [
+        pytest.param(SandboxSettings(), None, "safe", id="default-config"),
+        pytest.param(
+            SandboxSettings(run_mode="full"),
+            None,
+            "safe",
+            id="explicit-config",
+        ),
+        pytest.param(SandboxSettings(), "full", "full", id="explicit-cli-full"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_agent_once_resolves_persisted_safe_before_cli_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sandbox: SandboxSettings,
+    permissions: str | None,
+    expected_mode: str,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "cli-preference.db"))
+    await storage.set_runtime_preference("sandbox.run_mode", "safe")
+    manager = SessionManager(storage, inject_time_prefix=False)
+    captured: dict[str, Any] = {}
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            captured["tool_context"] = kwargs.get("tool_context")
+            yield DoneEvent(text="ok", model=kwargs.get("model") or "")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config, manager)
+
+    monkeypatch.delenv("OPENSQUILLA_AGENT_PERMISSIONS", raising=False)
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+
+    try:
+        await run_agent_once(
+            message="hello",
+            agent_id="main",
+            config=GatewayConfig(sandbox=sandbox),
+            permissions=permissions,
+        )
+    finally:
+        await storage.close()
+
+    tool_context = captured["tool_context"]
+    assert tool_context.run_mode == expected_mode
+    assert tool_context.sandbox_run_context.run_mode.value == expected_mode
+    assert tool_context.elevated == ("full" if expected_mode == "full" else None)
 
 
 @pytest.mark.asyncio
@@ -1591,6 +1720,27 @@ def test_top_level_agent_command_accepts_automation_options(
         "reports/*.txt, tmp/**",
         "generated/**",
     ]
+
+
+def test_top_level_agent_command_accepts_event_stream_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.main import app
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_agent_command(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("opensquilla.cli.main.run_agent_command", fake_run_agent_command)
+
+    result = CliRunner().invoke(
+        app,
+        ["agent", "--message", "hello", "--json", "--event-stream-stderr"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["event_stream_stderr"] is True
 
 
 def test_top_level_agent_command_accepts_length_capped_continuations(

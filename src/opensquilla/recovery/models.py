@@ -48,6 +48,9 @@ class RecoveryReport:
     transaction_id: str
     revision: int
     schema_version: int = SCHEMA_VERSION
+    # Human-readable diagnosis (sanitized: the profile home is spelled
+    # ``<HOME>``). Additive to schema 1; absent detail stays ``None``.
+    detail: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return the fixed JSON protocol shape expected by Desktop."""
@@ -63,4 +66,5 @@ class RecoveryReport:
             "allowed_actions": list(self.allowed_actions),
             "transaction_id": self.transaction_id,
             "revision": self.revision,
+            "detail": self.detail,
         }

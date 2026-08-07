@@ -83,7 +83,17 @@ export function useSettingsPromotedForm() {
       String(config.llm?.provider || ''),
       String(config.llm?.model || ''),
     )
+    commitProviderBaselines()
+    initMemoryCaptureFromConfig(config)
+    initAudioFromConfig(config)
+  }
+
+  function initMemoryCaptureFromConfig(config: PromotedConfigData) {
     memoryAutoCapture.value = config.memory?.auto_capture_enabled !== false
+    captureBaseline.value = memoryAutoCapture.value
+  }
+
+  function initAudioFromConfig(config: PromotedConfigData) {
     audioEnabled.value = config.audio?.enabled === true
     const audioProvider = config.audio?.providers?.[audioProviderId] || {}
     audioApiKeyEnv.value = audioProvider.api_key_env || ''
@@ -96,10 +106,12 @@ export function useSettingsPromotedForm() {
     audioKeyConfigured.value = Boolean(audioProvider.api_key)
     audioApiKey.value = ''
 
+    audioBaseline.value = audioSerialized.value
+  }
+
+  function commitProviderBaselines() {
     timeoutBaseline.value = llmTimeoutSeconds.value
     contextWindowBaseline.value = contextWindowTokens.value
-    captureBaseline.value = memoryAutoCapture.value
-    audioBaseline.value = audioSerialized.value
   }
 
   function setLlmTimeoutSeconds(value: number) {
@@ -158,10 +170,12 @@ export function useSettingsPromotedForm() {
   }
 
   function audioPayload(): Record<string, unknown> {
-    const params: Record<string, unknown> = { providerId: audioProviderId, enabled: audioEnabled.value }
+    // Configuration implies enablement for new clients. Older clients may
+    // continue sending an explicit `enabled` field to the compatible RPC.
+    const params: Record<string, unknown> = { providerId: audioProviderId }
     // One-time paste only; never echo the redacted stored key back.
     if (audioApiKey.value) params.apiKey = audioApiKey.value
-    if (audioApiKeyEnv.value.trim()) params.apiKeyEnv = audioApiKeyEnv.value.trim()
+    else if (audioApiKeyEnv.value.trim()) params.apiKeyEnv = audioApiKeyEnv.value.trim()
     // Empty is "keep current" backend-side, so only send populated tuning fields.
     if (audioBaseUrl.value.trim()) params.baseUrl = audioBaseUrl.value.trim()
     if (audioTtsVoice.value.trim()) params.ttsVoice = audioTtsVoice.value.trim()
@@ -187,6 +201,8 @@ export function useSettingsPromotedForm() {
     captureDirty,
     audioDirty,
     initFromConfig,
+    initMemoryCaptureFromConfig,
+    initAudioFromConfig,
     setLlmTimeoutSeconds,
     setContextWindowTokens,
     reseedContextWindow,

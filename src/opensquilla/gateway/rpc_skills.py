@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.skills.capability_runtime import trusted_capability_consumers_for_meta_plan
 from opensquilla.skills.dependency_summary import build_dependency_summary
 from opensquilla.skills.eligibility import (
     EligibilityContext,
@@ -24,6 +25,7 @@ from opensquilla.skills.hub.defaults import (
 )
 from opensquilla.skills.hub.deps import install_deps
 from opensquilla.skills.loader import SkillLoader
+from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
 
 _d = get_dispatcher()
 
@@ -243,6 +245,37 @@ def _requirements_payload(
     return {"summary": _requirements_summary(items), "items": items}
 
 
+def _provider_check_at_launch(
+    spec: Any,
+    *,
+    skill_index: dict[str, Any] | None,
+) -> bool:
+    """Whether this exact trusted MetaSkill plan needs provider readiness later.
+
+    Catalog eligibility intentionally remains an offline/local dependency view.
+    The separate flag prevents that view from presenting a provider-backed
+    MetaSkill as fully ready while keeping filtering and the existing tri-state
+    wire contract stable.  Trust and consumer discovery stay code-owned in the
+    capability registry; the Web UI does not need a provider or MetaSkill table.
+    """
+
+    if skill_index is None or getattr(spec, "kind", None) not in {"meta", "meta_sop"}:
+        return False
+    try:
+        plan = parse_meta_plan(spec)
+    except (MetaPlanError, TypeError, ValueError):
+        return False
+    if plan is None:
+        return False
+    return bool(
+        trusted_capability_consumers_for_meta_plan(
+            spec,
+            plan,
+            skill_resolver=skill_index,
+        )
+    )
+
+
 def _skill_to_dict(
     spec: Any,
     report: EligibilityReport,
@@ -325,6 +358,10 @@ def _skill_to_dict(
         "install": install_entries,
         "kind": kind,
         "sub_skills": sub_skills,
+        "provider_check_at_launch": _provider_check_at_launch(
+            spec,
+            skill_index=skill_index,
+        ),
         "requirements": _requirements_payload(
             spec,
             report,

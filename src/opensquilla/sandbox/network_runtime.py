@@ -29,6 +29,7 @@ from opensquilla.sandbox.escalation import (
 )
 from opensquilla.sandbox.governance import action_fingerprint
 from opensquilla.sandbox.network_guard import NetworkDecision, decide_network_access
+from opensquilla.sandbox.policy_models import SandboxPolicy
 from opensquilla.sandbox.run_context import RunContext
 from opensquilla.sandbox.types import SandboxRequest
 
@@ -90,6 +91,7 @@ class NetworkApprovalService:
     context: RunContext
     request: SandboxRequest
     runtime: Any
+    policy: SandboxPolicy = field(default_factory=SandboxPolicy)
     approval_timeout_seconds: float | None = None
     consume_temporary_grants: bool = True
     session_key_override: str | None = None
@@ -107,7 +109,7 @@ class NetworkApprovalService:
             self.context,
             fingerprint=self.fingerprint,
         )
-        return decide_network_access(host, effective_context)
+        return decide_network_access(host, effective_context, self.policy)
 
     async def decide(self, policy_request: NetworkPolicyRequest) -> NetworkDecision:
         key = HostApprovalKey.from_request(policy_request)
@@ -141,7 +143,11 @@ class NetworkApprovalService:
             self.context,
             fingerprint=self.fingerprint,
         )
-        decision = decide_network_access(policy_request.host, effective_context)
+        decision = decide_network_access(
+            policy_request.host,
+            effective_context,
+            self.policy,
+        )
         if decision.status == "allow":
             await self._consume_temporary_grant_if_needed(decision)
             return decision
@@ -245,6 +251,7 @@ class NetworkApprovalService:
         return decide_network_access(
             policy_request.host,
             effective,
+            self.policy,
         ).status == "allow"
 
     async def _run_auto_review(

@@ -15,7 +15,12 @@ import type {
  * by arrival), used only for ordering/dedup — never for gating.
  */
 export type Frame =
-  | { kind: 'text'; seq: number; text: string }
+  | {
+      kind: 'text'
+      seq: number
+      text: string
+      presentation?: 'intermediate' | 'answer'
+    }
   | { kind: 'tool-start'; seq: number; toolId: string; name: string; input: string; at: number }
   | { kind: 'tool-delta'; seq: number; toolId: string; fragment: string }
   | { kind: 'tool-result'; seq: number; toolId: string; name: string; result: string; isError: boolean; input: string; at: number }
@@ -50,6 +55,12 @@ export type Frame =
       action: string   // stable phase key (streamActivity.key)
       label: string    // human label (streamActivity.label)
       at: number       // phase startedAt
+      id?: string
+      category?: 'phase' | 'maintenance'
+      state?: 'running' | 'completed' | 'skipped' | 'stale' | 'cancelled' | 'failed'
+      source?: string
+      durability?: string
+      detail?: string
     }
 
 /** A frame as emitted by a mutator; `appendFrame` stamps the `seq` index. */

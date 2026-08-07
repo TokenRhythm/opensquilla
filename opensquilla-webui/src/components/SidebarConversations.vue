@@ -41,6 +41,7 @@ export type { SidebarSection as SidebarSectionType }
 <script setup lang="ts">
 import { computed, nextTick, ref, watch, type ComponentPublicInstance } from 'vue'
 import { useI18n } from 'vue-i18n'
+import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 import Icon from './Icon.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
@@ -67,6 +68,8 @@ const emit = defineEmits<{
   (e: 'rename', payload: { key: string; title: string }): void
   (e: 'delete', key: string): void
   (e: 'bulk-delete', keys: string[]): void
+  (e: 'reorder', payload: { draggedKey: string; targetKey: string; position: 'before' | 'after' }): void
+  (e: 'session-pin', payload: { key: string; pinned: boolean }): void
   (e: 'new-chat'): void
   (e: 'new-project'): void
   (e: 'new-project-task', workspaceId: string): void
@@ -79,6 +82,18 @@ const emit = defineEmits<{
 
 const { confirm } = useConfirm()
 const { t } = useI18n()
+
+const TASK_ATTENTION_LABEL_KEYS: Record<Exclude<SessionTaskAttention, 'none'>, string> = {
+  running: 'shared.sidebar.taskRunning',
+  completed: 'shared.sidebar.taskCompletedUnread',
+  failed: 'shared.sidebar.taskUnfinishedUnread',
+}
+
+function taskAttentionLabel(attention: SessionTaskAttention | undefined): string {
+  if (!attention || attention === 'none') return ''
+  const key = TASK_ATTENTION_LABEL_KEYS[attention]
+  return key ? t(key) : ''
+}
 
 /* ── Agent filter (lives within the Chats section) ─────────────────── */
 
@@ -281,6 +296,105 @@ const totalRows = computed(() =>
 const hasFilterMatches = computed(() =>
   visibleSections.value.some(section => section.rows.some(row => !isWorkspaceRow(row))),
 )
+
+/* ── Session drag ordering ────────────────────────────────────────── */
+
+const draggedRowKey = ref('')
+const draggedRowScope = ref('')
+const dropTargetKey = ref('')
+const dropPosition = ref<'before' | 'after'>('before')
+const pointerDrag = ref<{
+  key: string
+  scope: string
+  startX: number
+  startY: number
+  active: boolean
+} | null>(null)
+const suppressSelectKey = ref('')
+
+function reorderScope(row: SidebarConversationItem): string {
+  const pinGroup = row.pinned ? 'pinned' : 'regular'
+  if (!projectRowKeys.value.has(row.key)) return `recents:${pinGroup}`
+  return `project:${row.workspaceId || row.workspace || ''}:${pinGroup}`
+}
+
+function canDragRow(row: SidebarConversationItem): boolean {
+  return row.rowKind === 'session'
+    && row.sessionKind === 'chat'
+    && !row.provisional
+    && !selectionMode.value
+    && !agentFilter.value
+    && renamingKey.value !== row.key
+}
+
+function clearRowDrag() {
+  draggedRowKey.value = ''
+  draggedRowScope.value = ''
+  dropTargetKey.value = ''
+  pointerDrag.value = null
+}
+
+function findSessionRow(key: string): SidebarConversationItem | undefined {
+  for (const section of props.sections) {
+    const row = section.rows.find(candidate => candidate.key === key)
+    if (row) return row
+  }
+  return undefined
+}
+
+function onRowPointerDown(row: SidebarConversationItem, event: PointerEvent) {
+  if (event.button !== 0 || !canDragRow(row)) return
+  const target = event.target
+  if (target instanceof Element && target.closest('.sidebar-row-menu-wrap, input, .sidebar-agent-badge')) return
+  pointerDrag.value = {
+    key: row.key,
+    scope: reorderScope(row),
+    startX: event.clientX,
+    startY: event.clientY,
+    active: false,
+  }
+}
+
+useDocumentEvent('pointermove', (event) => {
+  const drag = pointerDrag.value
+  if (!drag) return
+  if (!drag.active) {
+    if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) return
+    drag.active = true
+    draggedRowKey.value = drag.key
+    draggedRowScope.value = drag.scope
+  }
+  event.preventDefault()
+  const target = document.elementFromPoint(event.clientX, event.clientY)
+    ?.closest<HTMLElement>('.sidebar-history-row[data-session-key]')
+  const targetKey = target?.dataset.sessionKey || ''
+  const row = findSessionRow(targetKey)
+  if (!target || !row || row.key === drag.key || !canDragRow(row) || reorderScope(row) !== drag.scope) {
+    dropTargetKey.value = ''
+    return
+  }
+  const rect = target.getBoundingClientRect()
+  dropTargetKey.value = row.key
+  dropPosition.value = event.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
+}, { passive: false })
+
+useDocumentEvent('pointerup', () => {
+  const drag = pointerDrag.value
+  if (!drag) return
+  if (drag.active) {
+    suppressSelectKey.value = drag.key
+    if (dropTargetKey.value) {
+      emit('reorder', {
+        draggedKey: drag.key,
+        targetKey: dropTargetKey.value,
+        position: dropPosition.value,
+      })
+    }
+  }
+  clearRowDrag()
+})
+
+useDocumentEvent('pointercancel', clearRowDrag)
 
 /* ── Bulk selection ───────────────────────────────────────────────── */
 
@@ -550,8 +664,17 @@ function emitProjectRemove(row: SidebarConversationItem) {
   if (row.workspaceId) emit('project-remove', row.workspaceId)
 }
 
+function emitSessionPin(row: SidebarConversationItem) {
+  closeMenu()
+  if (row.rowKind === 'session') emit('session-pin', { key: row.key, pinned: !row.pinned })
+}
+
 function onSelectRow(row: SidebarConversationItem) {
   if (row.rowKind !== 'session') return
+  if (suppressSelectKey.value === row.key) {
+    suppressSelectKey.value = ''
+    return
+  }
   if (row.provisional) return
   if (renamingKey.value === row.key) return
   if (selectionMode.value) {
@@ -728,6 +851,10 @@ function onSelectRow(row: SidebarConversationItem) {
               'sidebar-history-row--workspace-empty': row.rowKind === 'workspace-empty',
               'sidebar-history-row--recent-start': row.key === firstRecentRowKey,
               'is-unavailable': row.rowKind === 'workspace' && row.workspaceAvailable === false,
+              'is-reorderable': canDragRow(row),
+              'is-dragging': draggedRowKey === row.key,
+              'is-drop-before': dropTargetKey === row.key && dropPosition === 'before',
+              'is-drop-after': dropTargetKey === row.key && dropPosition === 'after',
             }"
             :data-family="section.family"
             :data-sidebar-zone="projectRowKeys.has(row.key) ? 'projects' : 'recents'"
@@ -735,6 +862,7 @@ function onSelectRow(row: SidebarConversationItem) {
             :data-depth="row.depth"
             :data-session-key="row.rowKind === 'session' ? row.key : undefined"
             :style="{ '--row-depth': row.depth }"
+            @pointerdown="onRowPointerDown(row, $event)"
           >
             <div
               v-if="row.rowKind === 'workspace'"
@@ -850,13 +978,29 @@ function onSelectRow(row: SidebarConversationItem) {
                 <Icon v-if="isRowSelected(row.key)" name="check" :size="11" />
               </span>
               <span class="sidebar-history-title">{{ row.title }}</span>
+              <Icon
+                v-if="row.pinned"
+                class="sidebar-history-pin"
+                name="arrowUp"
+                :size="11"
+                aria-hidden="true"
+              />
               <span
                 v-if="contractDebugEnabled && row.hasContractGaps"
                 class="sidebar-history-gap"
                 :aria-label="t('shared.sidebar.contractGap')"
                 :title="t('shared.sidebar.contractGap')"
               >{{ t('shared.sidebar.contractGapBadge') }}</span>
-              <span v-if="row.runStatus !== 'idle'" class="sidebar-history-run">{{ row.runLabel }}</span>
+              <span
+                v-if="!selectionMode"
+                class="sidebar-task-attention"
+                :class="`sidebar-task-attention--${row.taskAttention}`"
+                :role="row.taskAttention === 'none' ? undefined : 'img'"
+                :aria-hidden="row.taskAttention === 'none' ? 'true' : undefined"
+                :aria-label="taskAttentionLabel(row.taskAttention) || undefined"
+                :title="taskAttentionLabel(row.taskAttention) || undefined"
+                data-testid="sidebar-task-attention"
+              />
             </button>
 
             <!-- Chat-only ⋯ menu: rename + delete -->
@@ -920,7 +1064,7 @@ function onSelectRow(row: SidebarConversationItem) {
             <div
               v-if="
                 row.rowKind === 'session'
-                && row.sessionKind === 'chat'
+                && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
                 && !row.provisional
                 && renamingKey !== row.key
                 && !selectionMode
@@ -948,6 +1092,15 @@ function onSelectRow(row: SidebarConversationItem) {
                 :aria-label="t('shared.sidebar.rowActions', { title: row.title })"
                 @keydown="onMenuKeydown"
               >
+                <button
+                  type="button"
+                  class="sidebar-row-menu__item"
+                  role="menuitem"
+                  @click.stop="emitSessionPin(row)"
+                >
+                  <Icon name="arrowUp" :size="14" />
+                  <span>{{ row.pinned ? t('shared.sidebar.unpinTask') : t('shared.sidebar.pinTask') }}</span>
+                </button>
                 <button
                   type="button"
                   class="sidebar-row-menu__item"

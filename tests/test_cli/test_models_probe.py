@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from typer.testing import CliRunner
@@ -59,6 +60,32 @@ def _fake_discover(
         return results[kwargs["provider_id"]]
 
     return fake
+
+
+def _patch_draft_install_id_context(monkeypatch):
+    active_config = SimpleNamespace(
+        privacy=SimpleNamespace(disable_network_observability=True)
+    )
+    load_calls: list[Path | None] = []
+    prewarm_calls: list[Any] = []
+
+    def fake_load_config(path: Path | None):
+        load_calls.append(path)
+        return active_config
+
+    def fake_prewarm(*, config):
+        prewarm_calls.append(config)
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.cli.models_cmd.load_config",
+        fake_load_config,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.tokenrhythm_correlation.prewarm_tokenrhythm_install_id",
+        fake_prewarm,
+    )
+    return active_config, load_calls, prewarm_calls
 
 
 def test_probe_ok_renders_table_and_exits_zero(tmp_path: Path, monkeypatch) -> None:
@@ -176,6 +203,9 @@ def test_probe_json_shape(tmp_path: Path, monkeypatch) -> None:
 
 def test_probe_draft_reads_unsaved_credential_from_stdin(monkeypatch) -> None:
     calls: list[dict[str, Any]] = []
+    active_config, load_calls, prewarm_calls = _patch_draft_install_id_context(
+        monkeypatch
+    )
     monkeypatch.setattr(
         "opensquilla.cli.models_cmd.probe_llm_provider",
         _fake_probe(
@@ -220,9 +250,12 @@ def test_probe_draft_reads_unsaved_credential_from_stdin(monkeypatch) -> None:
             "timeout": 30.0,
         }
     ]
+    assert load_calls == [None]
+    assert prewarm_calls == [active_config]
 
 
 def test_probe_draft_redacts_failed_provider_detail(monkeypatch) -> None:
+    _patch_draft_install_id_context(monkeypatch)
     monkeypatch.setattr(
         "opensquilla.cli.models_cmd.probe_llm_provider",
         _fake_probe(
@@ -258,6 +291,27 @@ def test_probe_draft_redacts_failed_provider_detail(monkeypatch) -> None:
     assert row["ok"] is False
     assert row["kind"] == "auth_invalid"
     assert "***" in row["detail"]
+
+
+def test_probe_draft_config_load_failure_registers_disabled_privacy(
+    monkeypatch,
+) -> None:
+    from opensquilla.cli import models_cmd
+
+    def fail_load_config(_path):
+        raise ValueError("synthetic invalid config")
+
+    captured: list[Any] = []
+    monkeypatch.setattr(models_cmd, "load_config", fail_load_config)
+    monkeypatch.setattr(
+        "opensquilla.provider.tokenrhythm_correlation.prewarm_tokenrhythm_install_id",
+        lambda *, config: captured.append(config),
+    )
+
+    models_cmd._prewarm_draft_probe_install_id()
+
+    assert len(captured) == 1
+    assert captured[0].privacy.disable_network_observability is True
 
 
 def test_probe_unknown_provider_filter_exits_two(tmp_path: Path) -> None:

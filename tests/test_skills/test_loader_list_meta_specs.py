@@ -38,11 +38,21 @@ def test_list_meta_specs_includes_known_meta_bundles(loader: SkillLoader) -> Non
     names = {s.name for s in loader.list_meta_specs()}
     assert names == {
         "AwesomeWebpageMetaSkill",
-        "meta-kid-project-planner",
         "meta-paper-write",
         "meta-short-drama",
         "meta-skill-creator",
     }
+
+
+def test_retired_meta_skill_is_inspectable_but_not_discoverable(loader: SkillLoader) -> None:
+    retired = loader.get_by_name("meta-kid-project-planner")
+
+    assert retired is not None
+    assert retired.kind == "meta"
+    assert retired.user_invocable is False
+    assert retired.disable_model_invocation is True
+    assert retired.triggers == []
+    assert retired.name not in {spec.name for spec in loader.list_meta_specs()}
 
 
 def test_meta_short_drama_script_draft_requires_visible_script_text() -> None:

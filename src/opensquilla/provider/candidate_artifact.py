@@ -11,8 +11,12 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
+from opensquilla.provider.compat_policy import (
+    TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
+    TextToolDialect,
+)
 from opensquilla.provider.stream_assembly import (
     DEFAULT_MAX_TOOL_ARGUMENT_CHARS,
     DEFAULT_MAX_TOOL_CALLS,
@@ -26,6 +30,24 @@ _CANDIDATE_TOOL_IDENTITY_KEYS = frozenset(
 )
 _MAX_MALFORMED_WRAPPER_DEPTH = 64
 _MAX_MALFORMED_WRAPPER_NODES = 4096
+
+if TYPE_CHECKING:
+    from opensquilla.provider.text_tool_normalizer import (
+        TextToolSegment,
+        TextToolStreamNormalizer,
+    )
+
+
+DEFAULT_MAX_DSML_CANDIDATE_CHARS = 256_000
+_DSML_DIAGNOSTICS = frozenset(
+    {"dsml_malformed", "dsml_incomplete", "dsml_oversized"}
+)
+
+type CandidateDSMLDiagnostic = Literal[
+    "dsml_malformed",
+    "dsml_incomplete",
+    "dsml_oversized",
+]
 
 
 class CandidateArtifactLimitError(ValueError):
@@ -122,8 +144,15 @@ class CandidateArtifactBuilder:
         self._max_total_chars = max_total_chars
         self._execution_name_limit = execution_name_limit
         self._calls: dict[Any, _CandidateAction] = {}
+        self._diagnostics: set[CandidateDSMLDiagnostic] = set()
         self._event_count = 0
         self._char_count = 0
+
+    def add_diagnostic(self, diagnostic: CandidateDSMLDiagnostic) -> None:
+        """Add a bounded host-authored DSML diagnostic to the inert artifact."""
+        if diagnostic not in _DSML_DIAGNOSTICS:
+            raise ValueError("unsupported candidate DSML diagnostic")
+        self._diagnostics.add(diagnostic)
 
     def start(self, key: Any, *, name_text: object | None = None) -> None:
         """Start or revisit a keyed action and optionally append a name fragment."""
@@ -196,6 +225,37 @@ class CandidateArtifactBuilder:
             finish=True,
         )
 
+    def observe_calls_atomically(
+        self,
+        calls: tuple[tuple[Any, object | None, object | None], ...],
+    ) -> None:
+        """Record a batch without retaining a prefix when a hard limit rejects it."""
+        calls_snapshot = {
+            key: _CandidateAction(
+                name_parts=list(action.name_parts),
+                argument_parts=list(action.argument_parts),
+                issues=set(action.issues),
+                finished=action.finished,
+                char_count=action.char_count,
+            )
+            for key, action in self._calls.items()
+        }
+        event_count_snapshot = self._event_count
+        char_count_snapshot = self._char_count
+        try:
+            for key, name_text, arguments in calls:
+                self.observe_call(
+                    key,
+                    name_text=name_text,
+                    arguments=arguments,
+                )
+            self.render_text()
+        except CandidateArtifactLimitError:
+            self._calls = calls_snapshot
+            self._event_count = event_count_snapshot
+            self._char_count = char_count_snapshot
+            raise
+
     def render_text(self) -> str:
         """Return deterministic host-generated JSON, or ``""`` when empty."""
         actions: list[dict[str, object]] = []
@@ -209,13 +269,15 @@ class CandidateArtifactBuilder:
                     "name_text": action.name_text,
                 }
             )
-        if not actions:
+        if not actions and not self._diagnostics:
             return ""
-        payload = {
+        payload: dict[str, object] = {
             "actions": actions,
             "executable": False,
             "kind": "inert_proposer_tool_output",
         }
+        if self._diagnostics:
+            payload["diagnostics"] = sorted(self._diagnostics)
         encoder = json.JSONEncoder(
             allow_nan=False,
             ensure_ascii=False,
@@ -252,7 +314,13 @@ class CandidateArtifactBuilder:
 
     @property
     def has_content(self) -> bool:
-        return any(action.is_substantive for action in self._calls.values())
+        return bool(self._diagnostics) or any(
+            action.is_substantive for action in self._calls.values()
+        )
+
+    @property
+    def diagnostics(self) -> tuple[CandidateDSMLDiagnostic, ...]:
+        return tuple(sorted(self._diagnostics))
 
     @property
     def call_count(self) -> int:
@@ -424,6 +492,121 @@ class CandidateArtifactBuilder:
             limit=limit,
             observed=observed,
         )
+
+
+class InertCandidateTextNormalizer:
+    """Turn authorized proposer DSML into host-rendered, non-executable artifacts.
+
+    The same bounded provider stream state machine owns Markdown/HTML context,
+    native-call precedence, split prefixes, and oversize handling in executable
+    and proposer modes.  Its syntax-only segment can never become ToolUse.
+    """
+
+    def __init__(
+        self,
+        *,
+        artifact: CandidateArtifactBuilder,
+        dialects: frozenset[TextToolDialect],
+        max_candidate_chars: int = DEFAULT_MAX_DSML_CANDIDATE_CHARS,
+    ) -> None:
+        if max_candidate_chars <= 0:
+            raise ValueError("candidate text limit must be positive")
+        self._artifact = artifact
+        self._normalizer: TextToolStreamNormalizer | None = None
+        if TEXT_TOOL_DIALECT_DEEPSEEK_DSML in dialects:
+            from opensquilla.provider.text_tool_normalizer import (
+                TextToolStreamNormalizer,
+            )
+
+            self._normalizer = TextToolStreamNormalizer(
+                tools=None,
+                dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                provider_kind="candidate",
+                model="candidate",
+                max_candidate_chars=max_candidate_chars,
+                dsml_syntax_only=True,
+            )
+
+    @property
+    def native_lifecycle_deferred(self) -> bool:
+        return bool(
+            self._normalizer is not None
+            and self._normalizer.native_lifecycle_deferred
+        )
+
+    @property
+    def held_chars(self) -> int:
+        return self._normalizer.held_chars if self._normalizer is not None else 0
+
+    @property
+    def held_event_count(self) -> int:
+        return (
+            self._normalizer.held_event_count
+            if self._normalizer is not None
+            else 0
+        )
+
+    def push(self, text: str) -> list[str]:
+        if self._normalizer is None:
+            return [text] if text else []
+        return self._normalizer.push(text)
+
+    def observe_native_tool_start(self, tool_name: str) -> list[TextToolSegment]:
+        if self._normalizer is None:
+            return []
+        return self._normalizer.observe_native_tool_start(tool_name)
+
+    def abandon_native_lifecycle_defer(self) -> list[TextToolSegment]:
+        if self._normalizer is None:
+            return []
+        return self._normalizer.abandon_native_lifecycle_defer()
+
+    def finish(
+        self,
+        *,
+        successful_text_tool_terminal: bool,
+        native_calls: list[tuple[str, dict[str, Any]]] | None = None,
+    ) -> list[TextToolSegment]:
+        if self._normalizer is None:
+            return []
+        from opensquilla.provider.text_tool_normalizer import (
+            InertDsmlSegment,
+            LiteralTextSegment,
+            RejectedTextToolSegment,
+        )
+
+        segments = self._normalizer.finish(
+            successful_text_tool_terminal=successful_text_tool_terminal,
+            native_calls=native_calls,
+        )
+        output: list[TextToolSegment] = []
+        inert_calls: list[tuple[Any, object | None, object | None]] = []
+        for segment in segments:
+            if isinstance(segment, LiteralTextSegment):
+                output.append(segment)
+            elif isinstance(segment, RejectedTextToolSegment):
+                self._artifact.add_diagnostic(
+                    self._diagnostic_for_reason(segment.reason)
+                )
+            elif isinstance(segment, InertDsmlSegment):
+                inert_calls.extend(
+                    (("dsml", index), call.tool_name, call.arguments)
+                    for index, call in enumerate(segment.calls)
+                )
+            else:
+                raise AssertionError("syntax-only DSML emitted an executable segment")
+        if inert_calls:
+            try:
+                self._artifact.observe_calls_atomically(tuple(inert_calls))
+            except CandidateArtifactLimitError:
+                self._artifact.add_diagnostic("dsml_oversized")
+        return output
+
+    @staticmethod
+    def _diagnostic_for_reason(reason: object) -> CandidateDSMLDiagnostic:
+        if reason in _DSML_DIAGNOSTICS:
+            return cast(CandidateDSMLDiagnostic, reason)
+        return "dsml_malformed"
 
 
 def strip_candidate_tool_identity(value: object) -> object:

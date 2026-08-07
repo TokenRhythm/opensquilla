@@ -52,4 +52,59 @@ describe('ChatMessageList history anchors', () => {
     expect(anchor?.dataset.chatTurnKey).toBe('message-user-1')
     expect(anchor?.tabIndex).toBe(-1)
   })
+
+  it('renders a durable manual compaction as a neutral transcript event', () => {
+    const maintenanceMessage: ChatRenderedMessage = {
+      id: 'maintenance-1',
+      messageId: 'maintenance:context-compaction:summary:7',
+      role: 'maintenance',
+      displayRole: 'maintenance',
+      roleLabel: 'Maintenance',
+      text: '',
+      timeStr: 'just now',
+      showHeader: false,
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-7',
+        source: 'manual',
+        state: 'completed',
+        durability: 'durable',
+      },
+    }
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(ChatMessageList, {
+      messages: [maintenanceMessage],
+      shareMode: false,
+      selectedMessageIds: new Set<string>(),
+      stripTimePrefix: (value: string) => value,
+      renderMarkdown: (value: string) => value,
+      fmtTok: (value: number) => String(value),
+      subagentSummary: (value: string) => value,
+      subagentBody: (value: string) => value,
+      toolCallGroups: () => [],
+      isToolGroupOpen: () => false,
+      isToolItemOpen: () => false,
+      toolGroupStatusText: () => '',
+      toolStatusText: () => '',
+      toolSecondaryText: () => '',
+      copyMessage: async () => true,
+      downloadAttachment: async () => true,
+    })
+    app.use(i18n)
+    app.mount(host)
+    apps.push(app)
+
+    const event = host.querySelector<HTMLElement>('[data-testid="compaction-event"]')
+    expect(event?.dataset).toMatchObject({
+      compactionId: 'cmp-7',
+      status: 'completed',
+      source: 'manual',
+      durability: 'durable',
+      placement: 'transcript',
+    })
+    expect(event?.textContent).toContain('Context organized')
+    expect(host.querySelector('.msg-system')).toBeNull()
+    expect(host.querySelector('.msg-ai')).toBeNull()
+  })
 })

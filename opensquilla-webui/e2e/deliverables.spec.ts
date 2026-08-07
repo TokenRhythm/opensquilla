@@ -3,11 +3,20 @@ import { test, expect, type Locator, type Page } from '@playwright/test'
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2edeliverables'
 const EMPTY_SESSION_KEY = 'agent:main:webchat:e2edeliverablesempty'
+const INDEXED_SESSION_KEY = 'agent:main:webchat:e2edeliverablesindexed'
+
+interface SeedHistoryOptions {
+  indexedArtifacts?: Array<Record<string, unknown>>
+}
 
 // Seed a finished turn through the real WS pipeline: the page talks to the
 // real gateway, but chat.history responses are rewritten in flight so a
 // deliverable-bearing assistant turn renders without a live agent run.
-async function seedHistory(page: Page, withArtifacts: boolean) {
+async function seedHistory(
+  page: Page,
+  withArtifacts: boolean,
+  options: SeedHistoryOptions = {},
+) {
   await page.routeWebSocket(/\/ws$/, ws => {
     const server = ws.connectToServer()
     const historyIds = new Set<string>()
@@ -17,12 +26,37 @@ async function seedHistory(page: Page, withArtifacts: boolean) {
         if (frame?.type === 'req' && frame.method === 'chat.history') {
           historyIds.add(String(frame.id))
         }
+        if (
+          frame?.type === 'req'
+          && frame.method === 'artifacts.list'
+          && options.indexedArtifacts
+        ) {
+          ws.send(JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: true,
+            payload: {
+              artifacts: options.indexedArtifacts,
+              has_more: false,
+              oldest_cursor: options.indexedArtifacts[0]?.id || null,
+              newest_cursor: options.indexedArtifacts.at(-1)?.id || null,
+            },
+          }))
+          return
+        }
       } catch {}
       server.send(message)
     })
     server.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
+        if (frame?.protocol !== undefined && options.indexedArtifacts) {
+          const methods = Array.isArray(frame.features?.methods) ? frame.features.methods : []
+          frame.features = {
+            ...frame.features,
+            methods: [...new Set([...methods, 'artifacts.list'])],
+          }
+        }
         if (frame?.type === 'res' && frame.id !== undefined && historyIds.has(String(frame.id))) {
           historyIds.delete(String(frame.id))
           frame.ok = true
@@ -59,29 +93,42 @@ async function seedHistory(page: Page, withArtifacts: boolean) {
   })
 }
 
-async function openSeededSession(page: Page, key: string, withArtifacts: boolean) {
-  await seedHistory(page, withArtifacts)
+async function openSeededSession(
+  page: Page,
+  key: string,
+  withArtifacts: boolean,
+  options: SeedHistoryOptions = {},
+) {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
+  await seedHistory(page, withArtifacts, options)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(key))
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
   await page.waitForSelector('.chat-header', { timeout: 10000 })
 }
 
 async function deliverablesTrigger(page: Page): Promise<Locator> {
-  await expect(page.locator('.msg-artifact-chip').first()).toBeVisible({ timeout: 10000 })
-
   const directAction = page.getByTestId('chat-session-action-deliverables')
-  if (await directAction.isVisible()) return directAction
-
   const primaryAction = page.getByTestId('chat-header-primary-action')
-  if (await primaryAction.isVisible()
-    && await primaryAction.getAttribute('data-action') === 'deliverables') {
-    return primaryAction
-  }
+  const menuTrigger = page.getByTestId('chat-session-actions-trigger')
+  let menuOpened = false
 
-  await page.getByTestId('chat-session-actions-trigger').click()
-  const menuAction = page.getByTestId('chat-session-action-deliverables')
-  await expect(menuAction).toBeVisible()
-  return menuAction
+  await expect.poll(async () => {
+    if (await directAction.isVisible()) return 'deliverables'
+    if (await primaryAction.isVisible()
+      && await primaryAction.getAttribute('data-action') === 'deliverables') {
+      return 'primary'
+    }
+    if (!menuOpened && await menuTrigger.isVisible()) {
+      await menuTrigger.click()
+      menuOpened = true
+    }
+    return ''
+  }, { timeout: 10000 }).not.toBe('')
+
+  if (await directAction.isVisible()) return directAction
+  return primaryAction
 }
 
 test.describe('Per-session deliverables drawer', () => {
@@ -180,5 +227,37 @@ test.describe('Per-session deliverables drawer', () => {
 
     const width = await drawer.evaluate(el => el.getBoundingClientRect().width)
     expect(width).toBeGreaterThanOrEqual(375 - 1)
+  })
+})
+
+test.describe('Indexed deliverables with the default Workbench', () => {
+  test('unsupported indexed deliverables remain discoverable outside history', async ({ page }) => {
+    await openSeededSession(page, INDEXED_SESSION_KEY, false, {
+      indexedArtifacts: [{
+        id: 'art-deliv-indexed',
+        name: 'archived-report.csv',
+        mime: 'text/csv',
+        size: 4096,
+        created_at: '2026-08-01T00:00:00Z',
+        download_url: '/api/v1/artifacts/art-deliv-indexed',
+      }],
+    })
+
+    // The default Workbench cannot preview CSV, and the current history page
+    // has no artifact card. The index must still expose the complete Drawer.
+    await expect(page.locator('.msg-artifact-chip')).toHaveCount(0)
+    const trigger = await deliverablesTrigger(page)
+    await expect(trigger).toHaveAccessibleName('Deliverables (1)')
+    await trigger.click()
+
+    const drawer = page.locator('.deliv-drawer')
+    await expect(drawer).toBeVisible()
+    await expect(drawer).toHaveAttribute('aria-label', /Deliverables \(1\)/)
+    await expect(page.locator('.deliv-tile')).toHaveCount(1)
+    await expect(page.locator('.deliv-tile__name')).toHaveText('archived-report.csv')
+    await expect(page.locator('.deliv-tile__meta')).toHaveText('CSV · 4 KB')
+    await page.locator('.deliv-tile').click()
+    await expect(page.locator('.deliv-preview')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Download' })).toBeVisible()
   })
 })

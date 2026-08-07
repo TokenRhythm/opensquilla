@@ -92,6 +92,8 @@
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
+      @reorder="onReorderSidebarSession"
+      @session-pin="onPinSidebarSession"
       @new-chat="startNewChatInstant"
       @new-project="openProjectCreator"
       @new-project-task="startProjectTask"
@@ -433,6 +435,7 @@ import { useDialogLayer } from './composables/useDialogA11y'
 import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
 import { useAgentOptions } from './composables/useAgentOptions'
 import { useSessionListSubscription } from './composables/useSessionListSubscription'
+import { useSessionTaskAttention } from './composables/useSessionTaskAttention'
 import { useToasts } from './composables/useToasts'
 import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
@@ -457,6 +460,7 @@ import {
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
 } from './composables/chat/sessionBootstrapAdmission'
+import { markCronFinishNotified } from './utils/cron/notifications'
 
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
@@ -553,6 +557,34 @@ watch(
 const { enabled: bgmEnabled } = useBgm()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
+interface AppCronRunFinishedPayload {
+  jobId?: string
+  jobName?: string
+  runId?: string
+  success?: boolean
+}
+
+let unsubscribeCronFinished: (() => void) | null = null
+
+function handleCronRunFinished(payload: unknown) {
+  if (!payload || typeof payload !== 'object') return
+  const event = payload as AppCronRunFinishedPayload
+  const runId = typeof event.runId === 'string' ? event.runId : ''
+  const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
+  markCronFinishNotified(runId)
+  if (event.success === false) {
+    pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
+      tone: 'danger',
+      duration: 9_000,
+    })
+    return
+  }
+  pushToast(t('cronSkills.jobs.toastBackgroundComplete', { name: jobName }), {
+    tone: 'ok',
+    duration: 7_000,
+  })
+}
+
 installSessionNavigationDiagConsole()
 
 // Shared agents.list state + fetch (singleton) for sidebar session metadata.
@@ -637,6 +669,27 @@ useDocumentEvent('click', (e) => {
 // Current session key from ChatView via URL
 const currentSessionKey = computed(() => {
   return ($route.query.session as string) || ''
+})
+const sessionTaskAttention = useSessionTaskAttention()
+
+function currentSessionIsVisible(): boolean {
+  return (
+    $route.path === '/chat'
+    && document.visibilityState === 'visible'
+    && document.hasFocus()
+  )
+}
+
+function markCurrentSessionReadIfVisible() {
+  const sessionKey = currentSessionKey.value
+  if (sessionKey && currentSessionIsVisible()) {
+    sessionTaskAttention.markRead(sessionKey)
+  }
+}
+
+watch(currentSessionKey, markCurrentSessionReadIfVisible, {
+  flush: 'sync',
+  immediate: true,
 })
 
 // Chat layout applies to both the session view and the draft route.
@@ -853,6 +906,31 @@ watch(allSessions, sessions => {
   }
 })
 
+const SIDEBAR_SESSION_ORDER_KEY = 'opensquilla-sidebar-session-order-v1'
+const SIDEBAR_PINNED_SESSIONS_KEY = 'opensquilla-sidebar-pinned-sessions-v1'
+
+function readStoredSessionKeys(storageKey: string): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(storageKey) || '[]')
+    if (!Array.isArray(parsed)) return []
+    return [...new Set(parsed.filter((key): key is string => typeof key === 'string' && key.length > 0))]
+      .slice(0, 1000)
+  } catch {
+    return []
+  }
+}
+
+function writeStoredSessionKeys(storageKey: string, keys: readonly string[]) {
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(keys))
+  } catch {
+    // Storage can be unavailable in restricted browser contexts.
+  }
+}
+
+const sidebarSessionOrder = ref<string[]>(readStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY))
+const sidebarPinnedSessionKeys = ref<string[]>(readStoredSessionKeys(SIDEBAR_PINNED_SESSIONS_KEY))
+
 // Collapsible family sections (Chats / Channels / Automations). Row titles and
 // agent names are resolved here so the raw-session-id scrub and the display-name
 // lookup stay in App.vue; subagents indent under their parent via the helper.
@@ -863,6 +941,8 @@ const sidebarSections = computed((): SidebarSection[] => {
     rpcStore.canManageProjectWorkspaces && projectWorkspaces.hasLoaded.value
       ? projectWorkspaces.workspaces.value
       : undefined,
+    sidebarSessionOrder.value,
+    sidebarPinnedSessionKeys.value,
   ).map(section => ({
     ...section,
     rows: section.rows.map((row): SidebarSectionRow => {
@@ -874,10 +954,48 @@ const sidebarSections = computed((): SidebarSection[] => {
         ...row,
         title,
         agentName: agentDisplayName(normalizeAgentId(row.effectiveAgentId)),
+        taskAttention: sessionTaskAttention.attentionFor(row.key, row.runStatus),
       }
     }),
   }))
 })
+
+function onReorderSidebarSession(payload: {
+  draggedKey: string
+  targetKey: string
+  position: 'before' | 'after'
+}) {
+  const orderedKeys = sidebarSections.value
+    .flatMap(section => section.rows)
+    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
+    .map(row => row.key)
+  const from = orderedKeys.indexOf(payload.draggedKey)
+  if (from < 0 || !orderedKeys.includes(payload.targetKey) || payload.draggedKey === payload.targetKey) return
+
+  orderedKeys.splice(from, 1)
+  const target = orderedKeys.indexOf(payload.targetKey)
+  orderedKeys.splice(payload.position === 'after' ? target + 1 : target, 0, payload.draggedKey)
+  sidebarSessionOrder.value = orderedKeys
+  writeStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY, orderedKeys)
+}
+
+function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
+  const pinned = new Set(sidebarPinnedSessionKeys.value)
+  if (payload.pinned) pinned.add(payload.key)
+  else pinned.delete(payload.key)
+  sidebarPinnedSessionKeys.value = [...pinned]
+  writeStoredSessionKeys(SIDEBAR_PINNED_SESSIONS_KEY, sidebarPinnedSessionKeys.value)
+
+  if (!payload.pinned) return
+  const currentOrder = sidebarSections.value
+    .flatMap(section => section.rows)
+    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
+    .map(row => row.key)
+    .filter(key => key !== payload.key)
+  currentOrder.unshift(payload.key)
+  sidebarSessionOrder.value = currentOrder
+  writeStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY, currentOrder)
+}
 
 let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null
 let sidebarRefreshPending = false
@@ -1166,6 +1284,7 @@ async function onProjectDeleteHistory(workspaceId: string) {
       sessions: allSessions.value,
       deletedSessionKeys: result.deletedSessionKeys,
     })
+    sessionTaskAttention.removeMany(result.deletedSessionKeys)
     await loadSessions()
     if (leaveDeletedTask) void openDefaultDraft()
     pushToast(t('workspaces.historyDeleted'), { tone: 'ok' })
@@ -1178,9 +1297,26 @@ async function onProjectRemove(workspaceId: string) {
   if (!rpcStore.canManageProjectWorkspaces) return
   const project = projectWorkspaces.byId.value.get(workspaceId)
   if (!project) return
+  let affectedCronJobs = 0
+  try {
+    const jobs = await rpcStore.call<Array<{ workspaceId?: string }>>(
+      'cron.list',
+      {},
+    )
+    affectedCronJobs = (jobs || []).filter(
+      job => job.workspaceId === workspaceId,
+    ).length
+  } catch {
+    // The backend still enforces the pause atomically during removal.
+  }
   const approved = await confirm({
     title: t('workspaces.removeTitle'),
-    body: t('workspaces.removeBody', { name: project.name }),
+    body: affectedCronJobs > 0
+      ? t('workspaces.removeBodyWithCronJobs', {
+          name: project.name,
+          count: affectedCronJobs,
+        })
+      : t('workspaces.removeBody', { name: project.name }),
     primaryLabel: t('workspaces.removeConfirm'),
   })
   if (!approved) return
@@ -1228,6 +1364,7 @@ function onPaletteSelectSession(key: string) {
 
 function switchToSession(key: string, source = 'app.switchToSession') {
   if (!key) return
+  sessionTaskAttention.markRead(key)
   recordSessionNavigationDiag(source, {
     from: currentSessionKey.value,
     to: key,
@@ -1275,6 +1412,7 @@ function handleLocalSessionsDeleted(event: Event) {
   if (!detail || detail.source === APP_SESSION_SYNC_SOURCE) return
   const deleted = new Set(detail.keys)
   removeLocalSessions(deleted)
+  sessionTaskAttention.removeMany(deleted)
   appStore.removePendingApprovalsForSessions(deleted)
   scheduleSessionRefresh()
 }
@@ -1305,6 +1443,7 @@ async function onBulkDeleteSessions(keys: string[]) {
     return
   }
   removeLocalSessions(deleted)
+  sessionTaskAttention.removeMany(deleted)
   appStore.removePendingApprovalsForSessions(deleted)
   dispatchLocalSessionsDeleted(deleted, APP_SESSION_SYNC_SOURCE)
   const failedCount = Math.max(0, uniqueKeys.length - deleted.size)
@@ -1331,6 +1470,7 @@ async function onDeleteSession(key: string) {
   pushToast('Session deleted', { tone: 'ok' })
   const deleted = new Set([key])
   removeLocalSessions(deleted)
+  sessionTaskAttention.removeMany(deleted)
   appStore.removePendingApprovalsForSessions(deleted)
   dispatchLocalSessionsDeleted(deleted, APP_SESSION_SYNC_SOURCE)
   await loadSessions()
@@ -1427,11 +1567,27 @@ const sessionListSubscription = useSessionListSubscription({
   isAdmitted: () => optionalSessionRpcAllowed.value,
   refresh: refreshSidebarDataWhenAdmitted,
   scheduleRefresh: scheduleSessionRefresh,
+  onChanged: payload => {
+    sessionTaskAttention.handleSessionsChanged(payload, {
+      currentSessionKey: currentSessionKey.value,
+      currentSessionVisible: currentSessionIsVisible(),
+    })
+  },
   warn: (message, error) => console.warn(`[App] ${message}:`, errorMessage(error)),
 })
 
+function subscribeCronEventsWhenAdmitted() {
+  if (
+    !appAutomaticRpcMounted
+    || !optionalSessionRpcAllowed.value
+    || !rpcStore.isConnected
+  ) return
+  void rpcStore.call('cron.subscribe', {}).catch(() => undefined)
+}
+
 function resumeAutomaticAppRpc() {
   if (!appAutomaticRpcMounted || !optionalSessionRpcAllowed.value) return
+  subscribeCronEventsWhenAdmitted()
   sessionListSubscription.resume()
   if (!appAutomaticRpcStarted) {
     appAutomaticRpcStarted = true
@@ -1444,6 +1600,13 @@ function resumeAutomaticAppRpc() {
 watch(optionalSessionRpcAllowed, admitted => {
   if (admitted) resumeAutomaticAppRpc()
 }, { flush: 'sync' })
+
+watch(
+  () => rpcStore.state,
+  state => {
+    if (state === 'connected') subscribeCronEventsWhenAdmitted()
+  },
+)
 
 function handleKeydown(e: KeyboardEvent) {
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
@@ -1657,10 +1820,13 @@ onMounted(() => {
   appAutomaticRpcMounted = true
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
+  window.addEventListener('focus', markCurrentSessionReadIfVisible)
+  document.addEventListener('visibilitychange', markCurrentSessionReadIfVisible)
   sessionListSubscription.subscribe()
   resumeAutomaticAppRpc()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
+  unsubscribeCronFinished = rpcStore.on('cron.run.finished', handleCronRunFinished)
   // Seed now in case the socket is already connected (the `_state` listener
   // covers later reconnects); recovers a request pending before mount.
   if (rpcStore.isConnected) void seedPendingApprovals()
@@ -1670,9 +1836,14 @@ onUnmounted(() => {
   appAutomaticRpcMounted = false
   sidebarRefreshPending = false
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
+  window.removeEventListener('focus', markCurrentSessionReadIfVisible)
+  document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionListSubscription.cleanup()
   unsubscribeApprovals()
+  unsubscribeCronFinished?.()
+  unsubscribeCronFinished = null
+  void rpcStore.call('cron.unsubscribe', {}).catch(() => undefined)
   if (titleDebounce) {
     clearTimeout(titleDebounce)
     titleDebounce = null

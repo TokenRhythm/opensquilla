@@ -88,6 +88,8 @@
                readiness catalog loading is unavailable. -->
           <SettingsMemoryPanel v-else-if="section === 'memory'" />
 
+          <SandboxSettingsPanel v-else-if="section === 'sandbox'" />
+
           <!-- Optional cross-installation discovery is deliberately mounted
                only when the user opens this section. It never runs at app or
                Settings-dialog startup. -->
@@ -95,8 +97,10 @@
 
           <!-- Config-backed sections wait for readiness so their baselines are
                final before any field can be edited. -->
-          <div v-else-if="!loaded" class="settings-loading">
+          <div v-else-if="!loaded" class="settings-loading" role="status">
             <LoadingSpinner />
+            <strong>{{ t('settings.rail.' + section) }}</strong>
+            <span>{{ t('shared.loading') }}</span>
           </div>
           <template v-else>
             <SetupProviderPanel
@@ -111,6 +115,7 @@
               @update-llm-timeout="updateLlmTimeout"
               @update-context-window="updateContextWindow"
               @probe-connection="probeProviderConnection"
+              @refresh-models="refreshProviderModels"
               @save-provider="saveProvider"
               @cancel-provider-edit="cancelProviderEdit"
               @apply-preset="applyProviderPreset"
@@ -121,6 +126,7 @@
               @add-provider="requestAddProvider"
               @probe-configured-provider="probeConfiguredProvider"
               @activate-provider="activateProvider"
+              @update-image-generation-opt-in="setProviderImageGenerationOptIn"
             />
             <SetupBehaviorPanel
               v-else-if="section === 'behavior'"
@@ -131,6 +137,7 @@
               v-else-if="section === 'privacy'"
               :panel="privacyPanel"
               @update-disable-network-observability="setDisableNetworkObservability"
+              @update-memory-auto-capture="setMemoryAutoCapture"
             />
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
@@ -158,13 +165,9 @@
               :panel="capabilitiesPanel"
               @update-field="updateCapabilityField"
               @search-provider-change="onSearchProviderChange"
-              @memory-provider-change="onMemoryProviderChange"
               @image-provider-change="onImageProviderChange"
-              @save-search="saveSearch"
-              @save-memory="saveMemory"
-              @save-image="saveImage"
-              @save-audio="saveAudio"
-              @copy="copyCommand"
+              @use-image-recommendation="useImageRecommendation"
+              @reset-capability="resetCapability"
             />
             <SettingsAppearancePanel v-else-if="section === 'appearance'" />
             <SettingsKeyboardPanel v-else-if="section === 'keyboard'" />
@@ -238,6 +241,7 @@ import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePan
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
+import SandboxSettingsPanel from '@/components/settings/SandboxSettingsPanel.vue'
 import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
@@ -283,6 +287,8 @@ const {
   cancelProviderEdit,
   setAutoSessionTitles,
   setDisableNetworkObservability,
+  setMemoryAutoCapture,
+  setProviderImageGenerationOptIn,
   setModelStrategy,
   setFixedProvider,
   setFixedModel,
@@ -303,6 +309,7 @@ const {
   updateLlmTimeout,
   updateContextWindow,
   probeProviderConnection,
+  refreshProviderModels,
   probeConfiguredProvider,
   activateProvider,
   removeProviderProfile,
@@ -310,13 +317,10 @@ const {
   updateCapabilityField,
   onProviderChange,
   onSearchProviderChange,
-  onMemoryProviderChange,
   onImageProviderChange,
+  useImageRecommendation,
   saveProvider,
-  saveSearch,
-  saveMemory,
-  saveImage,
-  saveAudio,
+  resetCapability,
   copyCommand,
   copyConfigPath,
 } = useSetupCatalog()
@@ -813,7 +817,16 @@ onUnmounted(() => {
   align-items: center;
   display: flex;
   flex: 1;
+  flex-direction: column;
+  gap: var(--sp-2);
   justify-content: center;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.settings-loading strong {
+  color: var(--text);
+  font-size: var(--fs-md);
 }
 
 /* Body: rail + active section */

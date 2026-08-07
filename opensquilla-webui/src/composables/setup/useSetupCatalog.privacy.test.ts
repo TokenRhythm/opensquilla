@@ -66,11 +66,40 @@ afterEach(() => {
   supportsMethod.mockReset()
   supportsMethod.mockReturnValue(true)
   pushToast.mockClear()
-  confirmAction.mockClear()
+  confirmAction.mockReset()
+  confirmAction.mockResolvedValue(true)
   document.body.innerHTML = ''
 })
 
 describe('useSetupCatalog privacy settings', () => {
+  it('moves automatic memory capture into the privacy dirty/save flow', async () => {
+    mockConfigSequence([
+      {
+        privacy: { disable_network_observability: false },
+        memory: { auto_capture_enabled: true },
+      },
+      {
+        privacy: { disable_network_observability: false },
+        memory: { auto_capture_enabled: false },
+      },
+    ])
+    const { api, app } = await mountCatalog()
+
+    api.setMemoryAutoCapture(false)
+
+    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('capabilities')).toBe(false)
+    await api.saveDirtySections()
+    expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
+      patches: {
+        'privacy.disable_network_observability': false,
+        'memory.auto_capture_enabled': false,
+      },
+    })
+    expect(api.sectionDirty('privacy')).toBe(false)
+    app.unmount()
+  })
+
   it('saves disable_network_observability through the safe gateway config patch', async () => {
     mockConfigSequence([
       { privacy: { disable_network_observability: false } },
@@ -167,7 +196,547 @@ describe('useSetupCatalog privacy settings', () => {
   })
 })
 
+describe('useSetupCatalog capability reset', () => {
+  it('confirms a draft, resets through the advertised RPC, and preserves unrelated drafts', async () => {
+    let load = 0
+    rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          imageGenerationProviders: [{
+            providerId: 'openrouter',
+            label: 'OpenRouter',
+            defaultModel: 'google/gemini-image',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return load === 0
+          ? {
+              imageGenerationEnabled: true,
+              imageGenerationConfigured: true,
+              imageGenerationProvider: 'openrouter',
+              imageGenerationPrimary: 'openrouter/saved-image',
+              capabilityConfiguration: {
+                image_generation: { resettable: true },
+              },
+            }
+          : {
+              imageGenerationEnabled: false,
+              imageGenerationConfigured: false,
+              capabilityConfiguration: {
+                image_generation: { resettable: false },
+              },
+            }
+      }
+      if (method === 'config.get') {
+        const value = load === 0
+          ? {
+              naming: { enabled: false },
+              image_generation: {
+                providers: { openrouter: { api_key_env: 'OPENROUTER_API_KEY' } },
+              },
+            }
+          : { naming: { enabled: false }, image_generation: {} }
+        load += 1
+        return value
+      }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.capability.reset') {
+        expect(params).toEqual({ capabilityId: 'image_generation' })
+        return { restartRequired: false }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.setAutoSessionTitles(true)
+    api.updateCapabilityField('image', 'apiKey', 'test-inline-key')
+
+    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('capabilities')).toBe(true)
+    await api.resetCapability('image_generation')
+
+    expect(confirmAction).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.stringContaining('discard its unsaved changes'),
+    }))
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.capability.reset', {
+      capabilityId: 'image_generation',
+    })
+    expect(api.sectionDirty('capabilities')).toBe(false)
+    expect(api.sectionDirty('behavior')).toBe(true)
+    app.unmount()
+  })
+
+  it('does not expose or call reset against an older gateway', async () => {
+    mockConfigSequence([{}])
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.resettable('search')).toBe(false)
+    await api.resetCapability('search')
+
+    expect(confirmAction).not.toHaveBeenCalled()
+    expect(rpcCall).not.toHaveBeenCalledWith('onboarding.capability.reset', expect.anything())
+    app.unmount()
+  })
+
+  it('does not reset when the confirmation is cancelled', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {}
+      if (method === 'onboarding.status') {
+        return { capabilityConfiguration: { search: { resettable: true } } }
+      }
+      if (method === 'config.get') return { search_provider: 'brave' }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    confirmAction.mockResolvedValueOnce(false)
+    const { api, app } = await mountCatalog()
+
+    await api.resetCapability('search')
+
+    expect(rpcCall).not.toHaveBeenCalledWith('onboarding.capability.reset', expect.anything())
+    app.unmount()
+  })
+
+  it('keeps the current draft when reset fails', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          imageGenerationProviders: [{
+            providerId: 'openrouter',
+            label: 'OpenRouter',
+            defaultModel: 'google/gemini-image',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          imageGenerationEnabled: true,
+          imageGenerationConfigured: true,
+          imageGenerationProvider: 'openrouter',
+          imageGenerationPrimary: 'openrouter/saved-image',
+          capabilityConfiguration: { image_generation: { resettable: true } },
+        }
+      }
+      if (method === 'config.get') return { image_generation: {} }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.capability.reset') throw new Error('reset failed')
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.updateCapabilityField('image', 'apiKey', 'test-inline-key')
+
+    await api.resetCapability('image_generation')
+
+    expect(api.sectionDirty('capabilities')).toBe(true)
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.stringContaining('reset failed'),
+      { tone: 'danger' },
+    )
+    app.unmount()
+  })
+
+  it('keeps the current draft and suppresses success when the post-reset reload fails', async () => {
+    let resetApplied = false
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        if (resetApplied) throw new Error('reload failed')
+        return {
+          imageGenerationProviders: [{
+            providerId: 'openrouter',
+            label: 'OpenRouter',
+            defaultModel: 'google/gemini-image',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          imageGenerationEnabled: true,
+          imageGenerationConfigured: true,
+          imageGenerationProvider: 'openrouter',
+          imageGenerationPrimary: 'openrouter/saved-image',
+          capabilityConfiguration: { image_generation: { resettable: true } },
+        }
+      }
+      if (method === 'config.get') return { image_generation: {} }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.capability.reset') {
+        resetApplied = true
+        return { restartRequired: false }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+    api.updateCapabilityField('image', 'apiKey', 'test-inline-key')
+
+    await api.resetCapability('image_generation')
+
+    expect(api.sectionDirty('capabilities')).toBe(true)
+    expect(pushToast).toHaveBeenCalledTimes(1)
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.stringContaining('reload failed'),
+      { tone: 'danger' },
+    )
+    expect(pushToast).not.toHaveBeenCalledWith(
+      expect.stringContaining('was reset'),
+    )
+    app.unmount()
+  })
+})
+
+describe('useSetupCatalog memory capability summary', () => {
+  it('describes built-in retrieval without exposing its implementation model', async () => {
+    mockConfigSequence([{ memory: { embedding: { provider: 'auto' } } }])
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.memoryModeTitle)
+      .toBe('Find related content in saved memory')
+    expect(api.capabilitiesPanel.value.state.memoryModeDescription)
+      .toBe('Runs on this device')
+    expect(api.capabilitiesPanel.value.state.memoryExpandable).toBe(false)
+    app.unmount()
+  })
+
+  it('distinguishes keyword-only mode from built-in embeddings', async () => {
+    mockConfigSequence([{ memory: { embedding: { provider: 'none' } } }])
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.memoryModeTitle)
+      .toBe('Keyword-only local retrieval')
+    expect(api.capabilitiesPanel.value.state.capabilityBadgeLabel('memory_embedding'))
+      .toBe('Available')
+    app.unmount()
+  })
+
+  it('identifies a configured custom embedding provider without exposing its selector', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          memoryEmbeddingProviders: [{
+            providerId: 'openai',
+            label: 'OpenAI',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          memoryEmbeddingConfigured: true,
+          memoryEmbeddingProvider: 'openai',
+        }
+      }
+      if (method === 'config.get') {
+        return { memory: { embedding: { provider: 'openai' } } }
+      }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.memoryModeTitle)
+      .toBe('Custom embedding · OpenAI')
+    expect(api.capabilitiesPanel.value.state.capabilityBadgeLabel('memory_embedding'))
+      .toBe('Available')
+    app.unmount()
+  })
+
+  it('makes a managed custom embedding expandable for its restore action', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          memoryEmbeddingProviders: [{
+            providerId: 'openai',
+            label: 'OpenAI',
+            requiresApiKey: true,
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          memoryEmbeddingConfigured: true,
+          memoryEmbeddingProvider: 'openai',
+          capabilityConfiguration: {
+            memory_embedding: { resettable: true },
+          },
+        }
+      }
+      if (method === 'config.get') {
+        return { memory: { embedding: { provider: 'openai' } } }
+      }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.state.memoryExpandable).toBe(true)
+    app.unmount()
+  })
+})
+
+describe('useSetupCatalog image model catalog', () => {
+  it('loads the provider image-model catalog when the capabilities section opens', async () => {
+    rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          imageGenerationProviders: [{
+            providerId: 'openrouter',
+            label: 'OpenRouter Images',
+            runtimeSupported: true,
+            defaultModel: 'openrouter/google/fallback-image',
+            suggestedModels: ['openrouter/google/fallback-image'],
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          imageGenerationProvider: 'openrouter',
+          imageGenerationPrimary: 'openrouter/google/fallback-image',
+        }
+      }
+      if (method === 'config.get') return { image_generation: {} }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.imageGeneration.models.discover') {
+        expect(params).toEqual({ providerId: 'openrouter' })
+        return {
+          ok: true,
+          providerId: 'openrouter',
+          source: 'live',
+          models: [{
+            id: 'vendor/live-image',
+            name: 'Live Image',
+            contextWindow: null,
+            maxOutputTokens: null,
+            capabilities: [],
+            pricing: null,
+            capabilitySource: 'OpenRouter',
+          }],
+        }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.setSection('capabilities')
+    await nextTick()
+    await Promise.resolve()
+    await nextTick()
+
+    expect(api.capabilitiesPanel.value.options.imageModels).toEqual([
+      expect.objectContaining({ id: 'vendor/live-image', name: 'Live Image' }),
+    ])
+    expect(api.capabilitiesPanel.value.state.imageModelSource).toBe('live')
+    app.unmount()
+  })
+
+  it('uses curated image models when the gateway lacks discovery support', async () => {
+    supportsMethod.mockImplementation(
+      method => method !== 'onboarding.imageGeneration.models.discover',
+    )
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          imageGenerationProviders: [{
+            providerId: 'qwen_token_plan',
+            label: 'Qwen Images',
+            runtimeSupported: true,
+            defaultModel: 'qwen_token_plan/wan2.7-image',
+            suggestedModels: [
+              'qwen_token_plan/wan2.7-image',
+              'qwen_token_plan/wan2.7-image-pro',
+            ],
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return { imageGenerationProvider: 'qwen_token_plan' }
+      }
+      if (method === 'config.get') return { image_generation: {} }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.setSection('capabilities')
+    await nextTick()
+
+    expect(api.capabilitiesPanel.value.options.imageModels.map(model => model.id)).toEqual([
+      'wan2.7-image',
+      'wan2.7-image-pro',
+    ])
+    expect(api.capabilitiesPanel.value.state.imageModelSource).toBe('catalog')
+    expect(rpcCall).not.toHaveBeenCalledWith(
+      'onboarding.imageGeneration.models.discover',
+      expect.anything(),
+    )
+    app.unmount()
+  })
+})
+
+describe('useSetupCatalog search draft validation', () => {
+  it('keeps current DuckDuckGo status explicit and blocks a keyed provider without a key', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          searchProviders: [
+            {
+              providerId: 'duckduckgo',
+              label: 'DuckDuckGo',
+              runtimeSupported: true,
+              requiresApiKey: false,
+            },
+            {
+              providerId: 'brave',
+              label: 'Brave Search',
+              runtimeSupported: true,
+              requiresApiKey: true,
+            },
+          ],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          searchConfigured: true,
+          searchProvider: 'duckduckgo',
+        }
+      }
+      if (method === 'config.get') return { search_provider: 'duckduckgo' }
+      if (method === 'config.effective') return { fields: {} }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.updateCapabilityField('search', 'provider', 'brave')
+    api.onSearchProviderChange()
+
+    expect(api.capabilitiesPanel.value.state.capabilityBadgeLabel('search'))
+      .toBe('Currently available')
+    expect(api.capabilitiesPanel.value.state.searchDraftStatusText)
+      .toBe('Currently using DuckDuckGo; add an API key before switching to Brave Search.')
+    expect(api.capabilitiesPanel.value.state.searchDraftMissingKey).toBe(true)
+
+    await api.saveDirtySections()
+
+    expect(rpcCall).not.toHaveBeenCalledWith(
+      'onboarding.search.configure',
+      expect.anything(),
+    )
+    expect(pushToast).toHaveBeenCalledWith(
+      'Enter an API key before saving this search provider.',
+      { tone: 'danger' },
+    )
+    app.unmount()
+  })
+
+  it('allows the provider switch after a key is entered', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          searchProviders: [
+            {
+              providerId: 'duckduckgo',
+              label: 'DuckDuckGo',
+              runtimeSupported: true,
+              requiresApiKey: false,
+            },
+            {
+              providerId: 'brave',
+              label: 'Brave Search',
+              runtimeSupported: true,
+              requiresApiKey: true,
+            },
+          ],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return { searchConfigured: true, searchProvider: 'duckduckgo' }
+      }
+      if (method === 'config.get') return { search_provider: 'duckduckgo' }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.search.configure') return {}
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.updateCapabilityField('search', 'provider', 'brave')
+    api.onSearchProviderChange()
+    api.updateCapabilityField('search', 'apiKey', 'test-search-key')
+
+    expect(api.capabilitiesPanel.value.state.searchDraftMissingKey).toBe(false)
+    await api.saveSearch({ reload: false })
+
+    expect(rpcCall).toHaveBeenCalledWith(
+      'onboarding.search.configure',
+      expect.objectContaining({
+        providerId: 'brave',
+        apiKey: 'test-search-key',
+      }),
+    )
+    app.unmount()
+  })
+})
+
 describe('useSetupCatalog effective model limits', () => {
+  it('rediscovers on every Provider re-entry while deduplicating an in-flight request', async () => {
+    let discoverCalls = 0
+    let releaseFirstDiscovery!: () => void
+    const firstDiscovery = new Promise<void>((resolve) => { releaseFirstDiscovery = resolve })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          providers: [{
+            providerId: 'tokenrhythm',
+            label: 'TokenRhythm',
+            runtimeSupported: true,
+            fields: [{ name: 'model', label: 'Model' }],
+          }],
+        }
+      }
+      if (method === 'onboarding.status') return { hasConfig: true }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return { llm: { provider: 'tokenrhythm', model: 'qwen3.8-max' } }
+      }
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.models.discover') {
+        discoverCalls += 1
+        if (discoverCalls === 1) await firstDiscovery
+        return { ok: true, source: 'live', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    await vi.waitFor(() => expect(discoverCalls).toBe(1))
+
+    api.setSection('behavior')
+    await nextTick()
+    api.setSection('provider')
+    await nextTick()
+    expect(discoverCalls).toBe(1)
+
+    releaseFirstDiscovery()
+    await vi.waitFor(() => expect(api.providerPanel.value.connection.modelSource).toBe('live'))
+    await Promise.resolve()
+
+    api.setSection('behavior')
+    await nextTick()
+    api.setSection('provider')
+    await vi.waitFor(() => expect(discoverCalls).toBe(2))
+
+    api.setSection('behavior')
+    await nextTick()
+    api.setSection('provider')
+    await vi.waitFor(() => expect(discoverCalls).toBe(3))
+
+    expect(rpcCall).toHaveBeenLastCalledWith('onboarding.models.discover', {
+      providerId: 'tokenrhythm',
+      model: 'qwen3.8-max',
+    })
+    app.unmount()
+  })
+
   it('exposes only the effective value matching the current form identity', async () => {
     rpcCall.mockImplementation(async (method: string) => {
       if (method === 'onboarding.catalog') {
@@ -208,6 +777,49 @@ describe('useSetupCatalog effective model limits', () => {
     api.updateProviderField('model', 'glm-5')
     expect(api.providerPanel.value.effectiveMaxTokens).toBeNull()
 
+    app.unmount()
+  })
+
+  it('uses a force refresh for the manual model-catalog action', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          providers: [{
+            providerId: 'tokenrhythm',
+            label: 'TokenRhythm',
+            runtimeSupported: true,
+            fields: [{ name: 'model', label: 'Model' }],
+          }],
+        }
+      }
+      if (method === 'onboarding.status') return { hasConfig: true }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return { llm: { provider: 'tokenrhythm', model: 'qwen3.7-max' } }
+      }
+      if (method === 'onboarding.models.discover') {
+        return {
+          ok: true,
+          source: 'live',
+          models: [],
+          catalog: { lastSyncedAt: '2026-08-03T06:00:00Z', stale: false },
+        }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    await api.refreshProviderModels()
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', {
+      providerId: 'tokenrhythm',
+      model: 'qwen3.7-max',
+      forceRefresh: true,
+    })
+    expect(api.providerPanel.value.connection.catalog).toEqual({
+      lastSyncedAt: '2026-08-03T06:00:00Z',
+      stale: false,
+    })
     app.unmount()
   })
 })
@@ -447,7 +1059,7 @@ describe('useSetupCatalog model strategy IA', () => {
     app.unmount()
   })
 
-  it('deduplicates provider-scoped discovery when Model Strategy is reopened mid-request', async () => {
+  it('deduplicates only in-flight provider discovery and refreshes after it settles', async () => {
     const requests: string[] = []
     let releaseDiscoveries!: () => void
     const blocked = new Promise<void>((resolve) => { releaseDiscoveries = resolve })
@@ -495,6 +1107,21 @@ describe('useSetupCatalog model strategy IA', () => {
 
     expect(requests.sort()).toEqual(['openrouter', 'tokenrhythm'])
     releaseDiscoveries()
+    await vi.waitFor(() => expect(
+      Object.keys(api.routerPanel.value.discoveredModelsByProvider),
+    ).toHaveLength(2))
+
+    api.setSection('provider')
+    await nextTick()
+    api.setSection('modelStrategy')
+
+    await vi.waitFor(() => expect(requests).toHaveLength(4))
+    expect(requests.sort()).toEqual([
+      'openrouter',
+      'openrouter',
+      'tokenrhythm',
+      'tokenrhythm',
+    ])
     app.unmount()
   })
 
@@ -1731,6 +2358,120 @@ describe('useSetupCatalog configured provider management', () => {
     }
   }
 
+  function statusWithProfileBackedImage(
+    source: 'llm_fallback' | 'env' | 'none',
+  ) {
+    const available = source !== 'none'
+    const owner = source === 'llm_fallback' ? 'profile' : source === 'env' ? 'image' : 'none'
+    return {
+      ...statusWithDeepSeek(),
+      imageGenerationEnabled: true,
+      imageGenerationConfigured: available,
+      imageGenerationProvider: 'deepseek',
+      imageGenerationPrimary: 'deepseek/image-model',
+      imageGenerationSource: source,
+      imageGenerationEnvKey: source === 'env' ? 'DEEPSEEK_API_KEY' : '',
+      imageGenerationState: {
+        mode: 'custom',
+        storedEnabled: true,
+        effective: {
+          enabled: true,
+          available,
+          providerId: 'deepseek',
+          primary: 'deepseek/image-model',
+          credentialSource: source,
+          credentialOwner: owner,
+        },
+        credentialOptions: [{
+          providerId: 'deepseek',
+          available,
+          source,
+          owner,
+          envKey: source === 'env' ? 'DEEPSEEK_API_KEY' : '',
+        }],
+      },
+    }
+  }
+
+  it('uses persisted profile discovery for clean refreshes and post-probe refreshes', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return statusWithDeepSeek()
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return configWithProfiles('deepseek')
+      if (method === 'onboarding.models.discover') {
+        return { ok: true, source: 'live', models: [] }
+      }
+      if (method === 'onboarding.llmProfile.probe') return { ok: true, latencyMs: 19 }
+      if (method === 'onboarding.llmProfile.models.discover') {
+        return { ok: true, source: 'live', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.selectConfiguredProvider('deepseek')
+    await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
+      'onboarding.llmProfile.models.discover',
+      { providerId: 'deepseek' },
+    ))
+    expect(api.providerDraftDirty.value).toBe(false)
+    rpcCall.mockClear()
+
+    await api.probeProviderConnection()
+    await api.refreshProviderModels()
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.probe', {
+      providerId: 'deepseek',
+      model: 'deepseek-chat',
+    })
+    expect(rpcCall.mock.calls.filter(([method, params]) => (
+      method === 'onboarding.llmProfile.models.discover'
+      && (params as Record<string, unknown>).forceRefresh === true
+    ))).toHaveLength(2)
+    expect(rpcCall.mock.calls.some(([method]) => (
+      method === 'onboarding.llmProfile.draft.models.discover'
+      || method === 'onboarding.llmProfile.draft.probe'
+    ))).toBe(false)
+    app.unmount()
+  })
+
+  it('marks only unsaved provider/model candidates as awaiting an effective limit', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers: [...providers, customProvider] }
+      if (method === 'onboarding.status') return statusWithDeepSeek()
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return configWithProfiles('deepseek')
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'onboarding.models.discover') {
+        return { ok: true, source: 'live', models: [] }
+      }
+      if (method === 'onboarding.llmProfile.models.discover') {
+        return { ok: true, source: 'live', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    // Missing effective metadata is unknown, not evidence that the saved
+    // primary deployment is waiting to be persisted.
+    expect(api.providerPanel.value.effectiveMaxTokens).toBeNull()
+    expect(api.providerPanel.value.effectiveMaxTokensPending).toBe(false)
+
+    api.updateProviderField('model', 'gpt-4.1')
+    expect(api.providerPanel.value.effectiveMaxTokensPending).toBe(true)
+
+    api.selectConfiguredProvider('deepseek')
+    expect(api.providerPanel.value.effectiveMaxTokensPending).toBe(false)
+    api.updateProviderField('model', 'deepseek-reasoner')
+    expect(api.providerPanel.value.effectiveMaxTokensPending).toBe(true)
+
+    await api.requestAddProvider('custom')
+    api.updateProviderField('model', 'new-custom-model')
+    expect(api.providerPanel.value.effectiveMaxTokensPending).toBe(true)
+    app.unmount()
+  })
+
   it('activates a configured provider selected for fixed-model mode on save', async () => {
     let activeProvider = 'openai'
     let activeModel = 'gpt-4.1-mini'
@@ -2443,7 +3184,7 @@ describe('useSetupCatalog configured provider management', () => {
     ))
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.draft.models.discover',
-      expectedDraft,
+      { ...expectedDraft, forceRefresh: true },
     ))
     expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.probe')).toBe(false)
     expect(api.providerPanel.value.connection.phase).toBe('verified')
@@ -2730,8 +3471,8 @@ describe('useSetupCatalog configured provider management', () => {
           },
         }
       }
-      if (method === 'onboarding.llmProfile.draft.probe') return { ok: true, latencyMs: 17 }
-      if (method === 'onboarding.llmProfile.draft.models.discover') {
+      if (method === 'onboarding.llmProfile.probe') return { ok: true, latencyMs: 17 }
+      if (method === 'onboarding.llmProfile.models.discover') {
         return { ok: true, source: 'none', models: [] }
       }
       throw new Error(`Unexpected RPC method: ${method}`)
@@ -2742,8 +3483,8 @@ describe('useSetupCatalog configured provider management', () => {
     api.probeProviderConnection()
 
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
-      'onboarding.llmProfile.draft.probe',
-      { providerId: 'custom', model: 'local-chat-model', keepCurrentSecret: true },
+      'onboarding.llmProfile.probe',
+      { providerId: 'custom', model: 'local-chat-model' },
     ))
     expect(api.providerPanel.value.connection.phase).toBe('verified')
     app.unmount()
@@ -2951,12 +3692,86 @@ describe('useSetupCatalog configured provider management', () => {
 
     await api.removeProviderProfile('deepseek')
     expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.remove', { providerId: 'deepseek' })
+    expect(confirmAction).toHaveBeenCalledWith({
+      title: 'Remove provider?',
+      body: 'Remove DeepSeek from configured providers? Referenced providers cannot be removed.',
+      primaryLabel: 'Remove provider',
+    })
+    expect(pushToast).toHaveBeenCalledWith('DeepSeek was removed.')
 
     refuse = true
     await api.removeProviderProfile('deepseek')
     expect(pushToast).toHaveBeenCalledWith(
       expect.stringContaining('profile is still referenced'),
       { tone: 'danger' },
+    )
+    app.unmount()
+  })
+
+  it('warns that image generation switches from a removed profile to environment credentials', async () => {
+    let removed = false
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') {
+        return statusWithProfileBackedImage(removed ? 'env' : 'llm_fallback')
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return removed ? configWithProfiles() : configWithProfiles('deepseek')
+      }
+      if (method === 'onboarding.llmProfile.remove') {
+        removed = true
+        return { changed: true }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    await api.removeProviderProfile('deepseek')
+
+    expect(confirmAction).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.stringContaining(
+        'Image generation is currently reusing this provider\'s credential.',
+      ),
+    }))
+    expect(pushToast).toHaveBeenCalledTimes(1)
+    expect(pushToast).toHaveBeenCalledWith(
+      'DeepSeek was removed from Model Service. Image generation remains available through DEEPSEEK_API_KEY.',
+      { tone: 'warn' },
+    )
+    app.unmount()
+  })
+
+  it('warns when removing a profile leaves the retained image route without credentials', async () => {
+    let removed = false
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') {
+        return statusWithProfileBackedImage(removed ? 'none' : 'llm_fallback')
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return removed ? configWithProfiles() : configWithProfiles('deepseek')
+      }
+      if (method === 'onboarding.llmProfile.remove') {
+        removed = true
+        return { changed: true }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    await api.removeProviderProfile('deepseek')
+
+    expect(confirmAction).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.stringContaining(
+        'Image generation is currently reusing this provider\'s credential.',
+      ),
+    }))
+    expect(pushToast).toHaveBeenCalledTimes(1)
+    expect(pushToast).toHaveBeenCalledWith(
+      'DeepSeek was removed. Image generation kept its provider and model, but now needs a credential.',
+      { tone: 'warn' },
     )
     app.unmount()
   })
@@ -2993,6 +3808,75 @@ describe('useSetupCatalog configured provider management', () => {
       .toBe(false)
     expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.llmProfile.remove'))
       .toBe(false)
+    app.unmount()
+  })
+
+  it('requests the OpenRouter image default when active removal promotes that profile', async () => {
+    const openrouter = {
+      providerId: 'openrouter',
+      label: 'OpenRouter',
+      runtimeSupported: true,
+      requiresApiKey: true,
+      defaultDirectModel: 'openai/gpt-4.1-mini',
+      fields: [{ name: 'model', label: 'Model', required: true }],
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers: [...providers, openrouter] }
+      if (method === 'onboarding.status') {
+        return {
+          hasConfig: true,
+          llmConfigured: true,
+          llmCredentialStatus: {
+            provider: 'openai',
+            available: true,
+            source: 'explicit',
+          },
+          llmProfileStatus: [
+            {
+              provider: 'openai',
+              ready: true,
+              credentialSource: 'explicit',
+              primaryEligible: false,
+              primaryBlockReason: 'already_active',
+            },
+            {
+              provider: 'openrouter',
+              ready: true,
+              credentialSource: 'profile',
+              primaryEligible: true,
+              primaryBlockReason: '',
+            },
+          ],
+          imageGenerationState: { mode: 'unconfigured' },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'openai', model: 'gpt-4.1-mini' },
+          llm_profiles: {
+            openrouter: {
+              model: 'openai/gpt-4.1-mini',
+              base_url: 'https://openrouter.ai/api/v1',
+            },
+          },
+        }
+      }
+      if (method === 'onboarding.models.discover') {
+        return { ok: true, source: 'none', models: [] }
+      }
+      if (method === 'onboarding.llmProfile.active.remove') return { changed: true }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    await api.removeProviderProfile('openai')
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.active.remove', {
+      providerId: 'openai',
+      replacementProviderId: 'openrouter',
+      imageGenerationIntent: 'enable_provider_default',
+    })
     app.unmount()
   })
 
@@ -3989,6 +4873,431 @@ describe('useSetupCatalog image status localization', () => {
 
     expect(api.capabilitiesPanel.value.state.imageStatusText)
       .toBe('openai (endpoint/provider mismatch: configured openrouter official endpoint)')
+    app.unmount()
+  })
+})
+
+describe('useSetupCatalog image-generation onboarding intent', () => {
+  const openRouterProvider = {
+    providerId: 'openrouter',
+    label: 'OpenRouter',
+    runtimeSupported: true,
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://openrouter.ai/api/v1',
+    fields: [{
+      name: 'model',
+      label: 'Model',
+      required: true,
+      default: 'openai/gpt-4.1-mini',
+    }, {
+      name: 'base_url',
+      label: 'Base URL',
+      required: true,
+      default: 'https://openrouter.ai/api/v1',
+    }],
+  }
+
+  function mockFreshOpenRouter(mode: 'unconfigured' | 'custom' | 'disabled') {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers: [openRouterProvider] }
+      if (method === 'onboarding.status') {
+        return {
+          hasConfig: false,
+          llmConfigured: false,
+          imageGenerationState: { mode },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return {}
+      if (method === 'onboarding.models.discover') return { ok: false, source: 'none', models: [] }
+      if (method === 'onboarding.provider.configure') return { changed: true }
+      if (method === 'config.patch') return { restartRequired: false }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+  }
+
+  it('omits the additive intent when an older Gateway has no image state contract', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers: [openRouterProvider] }
+      if (method === 'onboarding.status') return { hasConfig: false, llmConfigured: false }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return {}
+      if (method === 'onboarding.models.discover') {
+        return { ok: false, source: 'none', models: [] }
+      }
+      if (method === 'onboarding.provider.configure') return { changed: true }
+      if (method === 'config.patch') return { restartRequired: false }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.selectProvider('openrouter')
+    api.onProviderChange()
+    expect(api.providerPanel.value.imageGenerationOffer).toBe(false)
+    await api.saveProvider()
+
+    const configureCall = rpcCall.mock.calls.find(
+      call => call[0] === 'onboarding.provider.configure',
+    )
+    expect(configureCall?.[1]).not.toHaveProperty('imageGenerationIntent')
+    app.unmount()
+  })
+
+  it('defaults OpenRouter image setup on and sends the atomic configure intent', async () => {
+    mockFreshOpenRouter('unconfigured')
+    const { api, app } = await mountCatalog()
+
+    api.selectProvider('openrouter')
+    api.onProviderChange()
+
+    expect(api.providerPanel.value).toMatchObject({
+      imageGenerationOffer: true,
+      imageGenerationOptIn: true,
+    })
+    await api.saveProvider()
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.objectContaining({
+      providerId: 'openrouter',
+      imageGenerationIntent: 'enable_provider_default',
+    }))
+    app.unmount()
+  })
+
+  it('lets the user preserve image setup from the default OpenRouter offer', async () => {
+    mockFreshOpenRouter('unconfigured')
+    const { api, app } = await mountCatalog()
+
+    api.selectProvider('openrouter')
+    api.onProviderChange()
+    api.setProviderImageGenerationOptIn(false)
+    expect(api.providerPanel.value.imageGenerationOptIn).toBe(false)
+
+    await api.saveProvider()
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.objectContaining({
+      imageGenerationIntent: 'preserve',
+    }))
+    app.unmount()
+  })
+
+  it('lets an existing OpenRouter primary save only the default image intent', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers: [openRouterProvider] }
+      if (method === 'onboarding.status') {
+        return {
+          hasConfig: true,
+          llmConfigured: true,
+          llmCredentialStatus: {
+            provider: 'openrouter',
+            available: true,
+            source: 'explicit',
+          },
+          imageGenerationState: { mode: 'unconfigured' },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: {
+            provider: 'openrouter',
+            model: 'openai/gpt-4.1-mini',
+            base_url: 'https://openrouter.ai/api/v1',
+          },
+        }
+      }
+      if (method === 'onboarding.models.discover') {
+        return { ok: false, source: 'none', models: [] }
+      }
+      if (method === 'onboarding.provider.configure') return { changed: true }
+      if (method === 'config.patch') return { restartRequired: false }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.providerPanel.value.imageGenerationOffer).toBe(true)
+    expect(api.providerDraftDirty.value).toBe(false)
+    await api.saveProvider()
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.objectContaining({
+      providerId: 'openrouter',
+      imageGenerationIntent: 'enable_provider_default',
+    }))
+    app.unmount()
+  })
+
+  it('preserves image setup when the OpenRouter draft uses a custom endpoint', async () => {
+    mockFreshOpenRouter('unconfigured')
+    const { api, app } = await mountCatalog()
+
+    api.selectProvider('openrouter')
+    api.onProviderChange()
+    expect(api.providerPanel.value.imageGenerationOffer).toBe(true)
+
+    api.updateProviderField('base_url', 'https://proxy.example.test/v1')
+    expect(api.providerPanel.value.imageGenerationOffer).toBe(false)
+    await api.saveProvider()
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.objectContaining({
+      providerId: 'openrouter',
+      imageGenerationIntent: 'preserve',
+    }))
+    app.unmount()
+  })
+
+  it('preserves image setup for a same-origin OpenRouter draft with the wrong API path', async () => {
+    mockFreshOpenRouter('unconfigured')
+    const { api, app } = await mountCatalog()
+
+    api.selectProvider('openrouter')
+    api.onProviderChange()
+    api.updateProviderField('base_url', 'https://openrouter.ai/compatible/v1')
+
+    expect(api.providerPanel.value.imageGenerationOffer).toBe(false)
+    await api.saveProvider()
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.objectContaining({
+      providerId: 'openrouter',
+      imageGenerationIntent: 'preserve',
+    }))
+    app.unmount()
+  })
+
+  it.each(['custom', 'disabled'] as const)(
+    'preserves an explicitly %s image configuration',
+    async mode => {
+      mockFreshOpenRouter(mode)
+      const { api, app } = await mountCatalog()
+
+      api.selectProvider('openrouter')
+      api.onProviderChange()
+      expect(api.providerPanel.value.imageGenerationOffer).toBe(false)
+      await api.saveProvider()
+
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.objectContaining({
+        imageGenerationIntent: 'preserve',
+      }))
+      app.unmount()
+    },
+  )
+
+  it('sends the OpenRouter default intent when activating a stored profile', async () => {
+    const providers = [
+      {
+        providerId: 'openai',
+        label: 'OpenAI',
+        runtimeSupported: true,
+        requiresApiKey: true,
+        fields: [{ name: 'model', label: 'Model', required: true }],
+      },
+      openRouterProvider,
+    ]
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') {
+        return {
+          hasConfig: true,
+          llmConfigured: true,
+          llmCredentialStatus: {
+            provider: 'openai',
+            available: true,
+            source: 'explicit',
+          },
+          llmProfileStatus: [{
+            provider: 'openrouter',
+            ready: true,
+            credentialSource: 'profile',
+            primaryEligible: true,
+            primaryBlockReason: '',
+          }],
+          imageGenerationState: { mode: 'unconfigured' },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'openai', model: 'gpt-4.1-mini' },
+          llm_profiles: { openrouter: { model: 'openai/gpt-4.1-mini' } },
+        }
+      }
+      if (method === 'onboarding.models.discover') return { ok: false, source: 'none', models: [] }
+      if (method === 'onboarding.llmProfile.activate') return { changed: true }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.selectConfiguredProvider('openrouter')
+    await api.activateProvider('openrouter')
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.activate', {
+      providerId: 'openrouter',
+      imageGenerationIntent: 'enable_provider_default',
+    })
+    app.unmount()
+  })
+
+  it('omits the activation intent for an older Gateway without the state contract', async () => {
+    const providers = [
+      {
+        providerId: 'openai',
+        label: 'OpenAI',
+        runtimeSupported: true,
+        requiresApiKey: true,
+        fields: [{ name: 'model', label: 'Model', required: true }],
+      },
+      openRouterProvider,
+    ]
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') {
+        return {
+          hasConfig: true,
+          llmConfigured: true,
+          llmCredentialStatus: {
+            provider: 'openai',
+            available: true,
+            source: 'explicit',
+          },
+          llmProfileStatus: [{
+            provider: 'openrouter',
+            ready: true,
+            credentialSource: 'profile',
+            primaryEligible: true,
+            primaryBlockReason: '',
+          }],
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: { provider: 'openai', model: 'gpt-4.1-mini' },
+          llm_profiles: { openrouter: { model: 'openai/gpt-4.1-mini' } },
+        }
+      }
+      if (method === 'onboarding.models.discover') {
+        return { ok: false, source: 'none', models: [] }
+      }
+      if (method === 'onboarding.llmProfile.models.discover') {
+        return { ok: false, source: 'none', models: [] }
+      }
+      if (method === 'onboarding.llmProfile.activate') return { changed: true }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.selectConfiguredProvider('openrouter')
+    await api.activateProvider('openrouter')
+
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.activate', {
+      providerId: 'openrouter',
+    })
+    app.unmount()
+  })
+
+  it('keeps a standalone TokenRhythm recommendation for a custom OpenRouter endpoint', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          providers: [openRouterProvider],
+          imageGenerationProviders: [{
+            providerId: 'tokenrhythm',
+            label: 'TokenRhythm Images',
+            runtimeSupported: true,
+            requiresApiKey: true,
+            defaultModel: 'tokenrhythm/qwen-image-2.0',
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          hasConfig: true,
+          llmConfigured: true,
+          imageGenerationState: {
+            mode: 'unconfigured',
+            recommendation: {
+              providerId: 'tokenrhythm',
+              reason: 'recommended_standalone',
+              canReuseCredential: false,
+              actionRequired: true,
+            },
+          },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return {
+          llm: {
+            provider: 'openrouter',
+            model: 'openai/gpt-4.1-mini',
+            base_url: 'https://proxy.example.test/v1',
+          },
+        }
+      }
+      if (method === 'onboarding.models.discover') {
+        return { ok: false, source: 'none', models: [] }
+      }
+      if (method === 'onboarding.imageGeneration.models.discover') {
+        return { ok: false, source: 'none', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.options.imageRecommendation).toMatchObject({
+      providerId: 'tokenrhythm',
+      actionRequired: true,
+    })
+    app.unmount()
+  })
+
+  it('shows only a server-recommended catalog provider and dirties on explicit use', async () => {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') {
+        return {
+          imageGenerationProviders: [{
+            providerId: 'tokenrhythm',
+            label: 'TokenRhythm Images',
+            runtimeSupported: true,
+            requiresApiKey: true,
+            defaultModel: 'tokenrhythm/qwen-image-2.0',
+          }],
+        }
+      }
+      if (method === 'onboarding.status') {
+        return {
+          llmConfigured: true,
+          imageGenerationState: {
+            mode: 'unconfigured',
+            recommendation: {
+              providerId: 'tokenrhythm',
+              reason: 'recommended_standalone',
+              canReuseCredential: false,
+              actionRequired: true,
+            },
+          },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return { llm: { provider: 'openai', model: 'gpt-4.1-mini' } }
+      }
+      if (method === 'onboarding.imageGeneration.models.discover') {
+        return { ok: false, source: 'none', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.capabilitiesPanel.value.options.imageRecommendation).toMatchObject({
+      providerId: 'tokenrhythm',
+      label: 'TokenRhythm Images',
+    })
+    expect(api.capabilitiesPanel.value.form.imageProvider).toBe('')
+    expect(api.sectionDirty('capabilities')).toBe(false)
+
+    api.useImageRecommendation('tokenrhythm')
+
+    expect(api.capabilitiesPanel.value.form.imageProvider).toBe('tokenrhythm')
+    expect(api.sectionDirty('capabilities')).toBe(true)
     app.unmount()
   })
 })

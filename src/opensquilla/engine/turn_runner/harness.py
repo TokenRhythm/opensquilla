@@ -476,9 +476,41 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
         if runner._model_catalog is not None:
             provider_name = provider or getattr(llm_cfg, "provider", "openrouter")
             base_url = getattr(llm_cfg, "base_url", "")
-            max_tokens = runner._model_catalog.resolve_max_tokens(
-                model_id, user_override=user_max_tokens, provider=provider_name
+            max_tokens_with_source = getattr(
+                runner._model_catalog,
+                "resolve_max_tokens_with_source",
+                None,
             )
+            if callable(max_tokens_with_source):
+                max_tokens, _max_tokens_source = max_tokens_with_source(
+                    model_id,
+                    user_override=user_max_tokens,
+                    provider=provider_name,
+                )
+                auto_max_tokens, auto_max_tokens_source = max_tokens_with_source(
+                    model_id,
+                    user_override=0,
+                    provider=provider_name,
+                )
+            else:
+                # Preserve the existing duck-typed catalog contract used by
+                # embedders and lightweight test doubles.  Older catalogs only
+                # expose the value API, so a positive auto value is the best
+                # available evidence that the physical ceiling is known.
+                resolve_max_tokens = runner._model_catalog.resolve_max_tokens
+                max_tokens = resolve_max_tokens(
+                    model_id,
+                    user_override=user_max_tokens,
+                    provider=provider_name,
+                )
+                auto_max_tokens = resolve_max_tokens(
+                    model_id,
+                    user_override=0,
+                    provider=provider_name,
+                )
+                auto_max_tokens_source = (
+                    "catalog" if _positive_int_or_zero(auto_max_tokens) else "default"
+                )
             # Per-model [models.*] context_window overrides beat the global
             # llm.context_window_tokens value; the global still beats the catalog.
             context_window, _context_window_source = resolve_effective_context_window(
@@ -492,15 +524,105 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
             )
         else:
             max_tokens = user_max_tokens if user_max_tokens > 0 else 16384
+            auto_max_tokens = 0
+            auto_max_tokens_source = "default"
             context_window = user_context_window if user_context_window > 0 else 200_000
             capabilities = None
         return _ResolvedCatalog(
             max_tokens=max_tokens,
             context_window=context_window,
             capabilities=capabilities,
+            context_window_tokens_global_override=user_context_window,
+            auto_max_tokens=auto_max_tokens,
+            auto_max_tokens_known=auto_max_tokens_source in {"catalog", "override"},
             temperature=getattr(llm_cfg, "temperature", None),
             top_p=getattr(llm_cfg, "top_p", None),
             provider_request_proof_max_chars=user_proof_max_chars,
+        )
+
+    def lookup_deployment(
+        self,
+        deployment: Any,
+        *,
+        include_global_overrides: bool = False,
+    ) -> _ResolvedCatalog:
+        """Resolve one selector leg against its exact in-process config.
+
+        This path is used only for private physical-fallback budgeting.  It
+        deliberately accepts the limit-relevant private ProviderConfig fields
+        rather than reconstructing an identity from sanitized route metadata.
+        """
+
+        runner = self._runner
+        model_id = str(getattr(deployment, "model", "") or "").strip()
+        provider_name = str(
+            getattr(deployment, "provider", "") or ""
+        ).strip()
+        if not model_id:
+            return self.lookup(model_id, provider_name)
+        catalog = runner._model_catalog
+        resolver = getattr(catalog, "resolve_deployment_limits", None)
+        if catalog is None or not callable(resolver):
+            return self.lookup(model_id, provider_name)
+        llm_cfg = getattr(runner._config, "llm", None) if runner._config else None
+        configured_max_tokens = _positive_int_or_zero(
+            getattr(llm_cfg, "max_tokens", 0)
+        )
+        limits = resolver(
+            model_id,
+            provider=provider_name,
+            api_key=str(getattr(deployment, "api_key", "") or ""),
+            base_url=str(getattr(deployment, "base_url", "") or ""),
+            proxy=str(getattr(deployment, "proxy", "") or ""),
+            logical_max_tokens_override=(
+                configured_max_tokens if include_global_overrides else 0
+            ),
+        )
+        base_url = str(getattr(deployment, "base_url", "") or "")
+        deployment_capabilities = getattr(
+            catalog,
+            "resolve_deployment_capabilities",
+            None,
+        )
+        capabilities = (
+            deployment_capabilities(
+                model_id,
+                provider=provider_name,
+                api_key=str(getattr(deployment, "api_key", "") or ""),
+                base_url=base_url,
+            )
+            if callable(deployment_capabilities)
+            else catalog.get_capabilities(
+                model_id,
+                provider_name=provider_name,
+                base_url=base_url,
+            )
+        )
+        context_window = limits.context_window
+        if include_global_overrides:
+            per_model_context = catalog.user_context_window_override(
+                model_id,
+                provider_name,
+            )
+            global_context = _positive_int_or_zero(
+                getattr(llm_cfg, "context_window_tokens", 0)
+            )
+            if per_model_context is None and global_context > 0:
+                context_window = global_context
+        max_tokens = limits.max_output_tokens
+        if include_global_overrides and configured_max_tokens > 0:
+            max_tokens = min(configured_max_tokens, context_window)
+        return _ResolvedCatalog(
+            max_tokens=max_tokens,
+            context_window=context_window,
+            capabilities=capabilities,
+            auto_max_tokens=limits.max_output_tokens,
+            auto_max_tokens_known=limits.max_output_tokens_known,
+            temperature=getattr(llm_cfg, "temperature", None),
+            top_p=getattr(llm_cfg, "top_p", None),
+            provider_request_proof_max_chars=_positive_int_or_zero(
+                getattr(llm_cfg, "provider_request_proof_max_chars", 0)
+            ),
         )
 
 class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
@@ -584,6 +706,16 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 compaction_cfg,
                 "protected_recent_messages",
                 0,
+            ),
+            compaction_total_timeout_seconds=getattr(
+                compaction_cfg,
+                "total_timeout_seconds",
+                120.0,
+            ),
+            compaction_heartbeat_interval_seconds=getattr(
+                compaction_cfg,
+                "heartbeat_interval_seconds",
+                15.0,
             ),
             tool_result_projection_max_inline_chars=getattr(
                 agent_token_cfg,
@@ -750,7 +882,23 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
         usage_event_sink = getattr(self._runner, "_usage_event_sink", None)
         usage_execution_context = None
         if usage_event_sink is not None:
+            # Usage identity is ``uuid5(f"…:{execution_id}:{call_index}")`` and
+            # ``call_index`` counts per ``UsageAccountingScope``, so two attempts
+            # of one turn must not share an ``execution_id``. A router-control
+            # replay re-enters the turn with the same ``turn_id`` and builds a
+            # fresh scope, so keying on the bare ``turn_id`` makes the replay's
+            # first leg re-derive the first attempt's identity; the ledger's
+            # start guard then rejects it as a reused identity and the turn fails
+            # closed before the provider is called. Attempt 0 keeps the bare
+            # ``turn_id`` so stored values keep their shape on the common path.
+            # Replay depth provides a deterministic attempt namespace without
+            # weakening the ledger's exact-start idempotency guard.
+            replay_depth = max(
+                0, int(getattr(tool_context, "router_control_replay_depth", 0) or 0)
+            )
             execution_id = turn_id or uuid.uuid4().hex
+            if replay_depth:
+                execution_id = f"{execution_id}:{replay_depth}"
             usage_execution_context = UsageExecutionContext(
                 execution_id=execution_id,
                 agent_run_id=execution_id,
@@ -802,7 +950,14 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        compaction_plan: Any | None = None,
+        history_capacity_tokens: int | None = None,
+        history_capacity_chars: int | None = None,
+        history_has_persisted_user: bool = False,
+        bound_user_message_id: str | None = None,
         provider_request_correlation: Any | None = None,
+        consumer_admission: Any | None = None,
+        consumer_admission_fingerprint: str = "",
     ) -> str:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -813,6 +968,45 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         ):
             correlation_kwargs["provider_request_correlation"] = (
                 provider_request_correlation
+            )
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "history_has_persisted_user",
+        ):
+            correlation_kwargs["history_has_persisted_user"] = (
+                history_has_persisted_user
+            )
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "bound_user_message_id",
+        ):
+            correlation_kwargs["bound_user_message_id"] = bound_user_message_id
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "compaction_plan",
+        ):
+            correlation_kwargs["compaction_plan"] = compaction_plan
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "history_capacity_tokens",
+        ):
+            correlation_kwargs["history_capacity_tokens"] = history_capacity_tokens
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "history_capacity_chars",
+        ):
+            correlation_kwargs["history_capacity_chars"] = history_capacity_chars
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "consumer_admission",
+        ):
+            correlation_kwargs["consumer_admission"] = consumer_admission
+        if _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "consumer_admission_fingerprint",
+        ):
+            correlation_kwargs["consumer_admission_fingerprint"] = (
+                consumer_admission_fingerprint
             )
         return await self._runner._maybe_compact_on_t3_upgrade(
             session_key,
@@ -840,7 +1034,14 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         context_window_tokens: int,
         compaction_provider: Any | None,
         compaction_model: str | None,
+        compaction_plan: Any | None = None,
+        history_capacity_tokens: int | None = None,
+        history_capacity_chars: int | None = None,
+        history_has_persisted_user: bool = False,
+        bound_user_message_id: str | None = None,
         provider_request_correlation: Any | None = None,
+        consumer_admission: Any | None = None,
+        consumer_admission_fingerprint: str = "",
     ) -> None:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -851,6 +1052,45 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         ):
             correlation_kwargs["provider_request_correlation"] = (
                 provider_request_correlation
+            )
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "history_has_persisted_user",
+        ):
+            correlation_kwargs["history_has_persisted_user"] = (
+                history_has_persisted_user
+            )
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "bound_user_message_id",
+        ):
+            correlation_kwargs["bound_user_message_id"] = bound_user_message_id
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "compaction_plan",
+        ):
+            correlation_kwargs["compaction_plan"] = compaction_plan
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "history_capacity_tokens",
+        ):
+            correlation_kwargs["history_capacity_tokens"] = history_capacity_tokens
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "history_capacity_chars",
+        ):
+            correlation_kwargs["history_capacity_chars"] = history_capacity_chars
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "consumer_admission",
+        ):
+            correlation_kwargs["consumer_admission"] = consumer_admission
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "consumer_admission_fingerprint",
+        ):
+            correlation_kwargs["consumer_admission_fingerprint"] = (
+                consumer_admission_fingerprint
             )
         await self._runner._maybe_preflight_compact(
             session_key,
@@ -960,11 +1200,24 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
-    ) -> None:
+        compaction_deadline_at_monotonic: float | None = None,
+        compaction_timeout_seconds: float | None = None,
+        removed_count: int = 0,
+        source_entries: tuple[Any, ...] | None = None,
+        source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_boundary_message_id: str | None = None,
+        source_boundary_entry_id: int | None = None,
+    ) -> bool | None:
         from opensquilla.engine.cache_break_monitor import notify_compaction
         from opensquilla.session.compaction_lifecycle import (
             COMPACTION_PERSISTED_EVENT,
+            COMPACTION_TRIGGERED_EVENT,
             compaction_effect_payload,
             compaction_lifecycle_payload,
             new_compaction_id,
@@ -972,26 +1225,71 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
 
         session_manager = self._runner._session_manager
         if session_manager is None:
-            return
+            return None
         persist_method = session_manager.persist_compaction_result
         params = inspect.signature(persist_method).parameters
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in params.values()
+        )
+        resolved_compaction_id = compaction_id or new_compaction_id()
         persist_kwargs: dict[str, Any] = {}
-        if "compaction_id" in params or any(
-            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-        ):
-            persist_kwargs["compaction_id"] = compaction_id
-        if "trigger_reason" in params or any(
-            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-        ):
+        if "compaction_id" in params or accepts_kwargs:
+            persist_kwargs["compaction_id"] = resolved_compaction_id
+        if "summary_payload" in params or accepts_kwargs:
+            persist_kwargs["summary_payload"] = summary_payload
+        if "summary_format" in params or accepts_kwargs:
+            persist_kwargs["summary_format"] = summary_format
+        if "coverage_status" in params or accepts_kwargs:
+            persist_kwargs["coverage_status"] = coverage_status
+        if "missing_obligations" in params or accepts_kwargs:
+            persist_kwargs["missing_obligations"] = missing_obligations
+        if "critical_carry_forward" in params or accepts_kwargs:
+            persist_kwargs["critical_carry_forward"] = critical_carry_forward
+        if "trigger_reason" in params or accepts_kwargs:
             persist_kwargs["trigger_reason"] = "agent_inline_overflow"
+        if "compaction_deadline_at_monotonic" in params or accepts_kwargs:
+            persist_kwargs["compaction_deadline_at_monotonic"] = (
+                compaction_deadline_at_monotonic
+            )
+        if "compaction_timeout_seconds" in params or accepts_kwargs:
+            persist_kwargs["compaction_timeout_seconds"] = compaction_timeout_seconds
+        if "removed_count" in params or accepts_kwargs:
+            persist_kwargs["removed_count"] = removed_count
+        if "source_entries" in params or accepts_kwargs:
+            persist_kwargs["source_entries"] = source_entries
+        if "source_preimage" in params or accepts_kwargs:
+            persist_kwargs["source_preimage"] = source_preimage
+        if "source_boundary_message_id" in params or accepts_kwargs:
+            persist_kwargs["source_boundary_message_id"] = source_boundary_message_id
+        if "source_boundary_entry_id" in params or accepts_kwargs:
+            persist_kwargs["source_boundary_entry_id"] = source_boundary_entry_id
         async with self._runner._session_write_context(session_key):
-            await persist_method(
+            installed = await persist_method(
                 session_key,
                 summary,
                 kept_entries,
                 **persist_kwargs,
             )
-        compaction_id = compaction_id or new_compaction_id()
+        if installed is False:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="agent_inline_overflow",
+                status="skipped",
+                reason="stale_preimage",
+                kept_count=len(kept_entries),
+                removed_count=removed_count,
+                **compaction_effect_payload(
+                    status="skipped",
+                    reason="stale_preimage",
+                ),
+                **compaction_lifecycle_payload(
+                    resolved_compaction_id,
+                    COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
+            return False
         notify_compaction(
             session_key,
             source="automatic",
@@ -1001,10 +1299,11 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
             summary_len=len(summary or ""),
             **compaction_effect_payload(status="completed"),
             **compaction_lifecycle_payload(
-                compaction_id,
+                resolved_compaction_id,
                 COMPACTION_PERSISTED_EVENT,
             ),
         )
+        return True
 
 class _TurnRunnerMemorySnapshotRefreshAdapter(MemorySnapshotRefreshPort):
     """Refresh ``runner._memory_snapshots[(agent_id, session_key)]`` after compaction.
@@ -1371,6 +1670,9 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             next_model_override = done_event.model or getattr(
                 current_session, "model_override", None
             )
+            next_model_provider = done_event.provider or getattr(
+                current_session, "model_provider", None
+            )
 
             # Persist the last actual model into usage metadata only.
             # Writing it to session.model would pin future turns and
@@ -1390,6 +1692,7 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
                 cache_read=next_cache_read,
                 cache_write=next_cache_write,
                 model_override=next_model_override,
+                model_provider=next_model_provider,
             )
         return CostRollupResult(
             input_tokens=next_input_tokens,
@@ -1404,6 +1707,7 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             cache_read=next_cache_read,
             cache_write=next_cache_write,
             model_override=next_model_override,
+            model_provider=next_model_provider,
         )
 
 class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):

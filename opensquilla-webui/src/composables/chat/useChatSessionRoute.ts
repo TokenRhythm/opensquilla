@@ -15,6 +15,24 @@ export interface PersistSessionOptions {
   source?: string
 }
 
+export interface InitialDraftCanonicalizationState {
+  disposed: boolean
+  initialFullPath: string
+  currentFullPath: string
+  currentPathIsDraft: boolean
+  hasLegacyNewChatQuery: boolean
+}
+
+export function shouldCanonicalizeInitialDraftRoute(
+  state: InitialDraftCanonicalizationState,
+): boolean {
+  return (
+    !state.disposed
+    && state.currentFullPath === state.initialFullPath
+    && (!state.currentPathIsDraft || state.hasLegacyNewChatQuery)
+  )
+}
+
 function routeStringParam(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }

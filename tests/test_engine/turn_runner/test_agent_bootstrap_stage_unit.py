@@ -80,6 +80,8 @@ def _default_aux(
         flush_compaction_safety_mode="protect",
         compaction_profile="conversation",
         compaction_protected_recent_messages=0,
+        compaction_total_timeout_seconds=120.0,
+        compaction_heartbeat_interval_seconds=15.0,
         tool_result_projection_max_inline_chars=60_000,
         tool_result_fresh_diagnostic_policy_enabled=False,
         tool_result_diagnostic_retrieval_gate_enabled=False,
@@ -118,6 +120,73 @@ class _RecordingModelCatalog:
     def lookup(self, model_id: str, provider: str = "") -> _ResolvedCatalog:
         self.calls.append((model_id, provider))
         return self.catalog
+
+
+@dataclass
+class _PerModelCatalog:
+    rows: dict[tuple[str, str], _ResolvedCatalog]
+    calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def lookup(self, model_id: str, provider: str = "") -> _ResolvedCatalog:
+        identity = (provider, model_id)
+        self.calls.append((model_id, provider))
+        return self.rows[identity]
+
+
+@dataclass
+class _FallbackLimitProvider:
+    limits: dict[tuple[str, str], tuple[int, int]] = field(default_factory=dict)
+
+    def configure_fallback_limits(
+        self,
+        limits: dict[tuple[str, str], tuple[int, int]],
+    ) -> None:
+        self.limits = dict(limits)
+
+
+@dataclass
+class _DeploymentAwareCatalog:
+    deployment_calls: list[tuple[str, bool]] = field(default_factory=list)
+    generic_calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def lookup(self, model_id: str, provider: str = "") -> _ResolvedCatalog:
+        self.generic_calls.append((model_id, provider))
+        return _ResolvedCatalog(
+            max_tokens=131_072,
+            context_window=1_000_000,
+            capabilities=None,
+        )
+
+    def lookup_deployment(
+        self,
+        deployment: Any,
+        *,
+        include_global_overrides: bool = False,
+    ) -> _ResolvedCatalog:
+        self.deployment_calls.append(
+            (str(getattr(deployment, "api_key", "")), include_global_overrides)
+        )
+        return _ResolvedCatalog(
+            max_tokens=8_192,
+            context_window=64_000,
+            capabilities=None,
+            auto_max_tokens=8_192,
+            auto_max_tokens_known=True,
+        )
+
+
+@dataclass
+class _DeploymentAwareProvider:
+    active: Any
+
+    def active_deployment_config(self) -> Any:
+        return self.active
+
+    def fallback_deployment_configs(self) -> tuple[Any, ...]:
+        return ()
+
+    def configure_fallback_deployment_limits(self, _limits: Any) -> None:
+        return None
 
 
 @dataclass
@@ -272,6 +341,8 @@ async def test_case01_success_all_defaults() -> None:
     assert o.agent_config.context_window_tokens == 200_000
     assert o.agent_config.max_history_turns == 0
     assert o.agent_config.preserve_historical_images is False
+    assert o.agent_config.compaction_total_timeout_seconds == 120.0
+    assert o.agent_config.compaction_heartbeat_interval_seconds == 15.0
     assert o.agent_config.length_capped_continuations == 3
     assert o.agent_config.metadata["agent_max_iterations"] == 10
     assert o.agent_config.metadata["agent_max_iterations_source"] == "test budget"
@@ -451,6 +522,92 @@ async def test_lookup_receives_active_provider_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_routed_primary_uses_exact_private_deployment_lookup() -> None:
+    catalog = _DeploymentAwareCatalog()
+    deployment = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-routed-key-b",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+    provider = _DeploymentAwareProvider(active=deployment)
+    stage = _make_stage(catalog=catalog)
+
+    out = await stage.run(
+        _make_input(
+            provider=provider,
+            resolved_model="shared/model",
+            active_provider_id="tokenrhythm",
+        )
+    )
+
+    assert out.output.agent_config.max_tokens == 8_192
+    assert out.output.agent_config.context_window_tokens == 64_000
+    assert catalog.deployment_calls == [("synthetic-routed-key-b", True)]
+    assert catalog.generic_calls == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() -> None:
+    catalog = _PerModelCatalog(
+        rows={
+            ("provider-a", "primary/model"): _ResolvedCatalog(
+                max_tokens=131_072,
+                context_window=1_000_000,
+                capabilities=None,
+                auto_max_tokens=131_072,
+                auto_max_tokens_known=True,
+            ),
+            ("provider-b", "fallback/model"): _ResolvedCatalog(
+                max_tokens=131_072,
+                context_window=32_000,
+                capabilities=None,
+                auto_max_tokens=8_192,
+                auto_max_tokens_known=True,
+            ),
+            ("provider-b", "unknown/model"): _ResolvedCatalog(
+                max_tokens=131_072,
+                context_window=200_000,
+                capabilities=None,
+                auto_max_tokens=16_384,
+                auto_max_tokens_known=False,
+            ),
+        }
+    )
+    provider = _FallbackLimitProvider()
+    turn = _make_turn(
+        metadata={
+            "routed_tier": "c2",
+            "routed_provider": "provider-a",
+            "routed_model": "primary/model",
+            "selector_execution_chain": [
+                {"provider": "provider-b", "model": "fallback/model"},
+                {"provider": "provider-b", "model": "unknown/model"},
+            ],
+        }
+    )
+    stage = _make_stage(catalog=catalog)
+
+    await stage.run(
+        _make_input(
+            provider=provider,
+            turn=turn,
+            resolved_model="primary/model",
+            active_provider_id="provider-a",
+        )
+    )
+
+    assert provider.limits == {
+        ("provider-b", "fallback/model"): (32_000, 8_192),
+        ("provider-b", "unknown/model"): (200_000, 0),
+    }
+    assert turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"][
+        "effective_max_tokens"
+    ] == 8_192
+
+
+@pytest.mark.asyncio
 async def test_case02_per_call_timeout_threaded() -> None:
     budgets = _RecordingTimeoutBudget()
     stage = _make_stage(budgets=budgets)
@@ -513,6 +670,24 @@ async def test_catalog_sampling_controls_thread_to_agent_config() -> None:
 
     assert out.output.agent_config.temperature == 1.0
     assert out.output.agent_config.top_p == 0.95
+
+
+@pytest.mark.asyncio
+async def test_global_context_window_override_threads_to_agent_config() -> None:
+    catalog = _RecordingModelCatalog(
+        catalog=_ResolvedCatalog(
+            max_tokens=2_048,
+            context_window=8_192,
+            context_window_tokens_global_override=8_192,
+            capabilities=None,
+        )
+    )
+    stage = _make_stage(catalog=catalog)
+
+    out = await stage.run(_make_input())
+
+    assert out.output.agent_config.context_window_tokens == 8_192
+    assert out.output.agent_config.context_window_tokens_global_override == 8_192
 
 
 @pytest.mark.asyncio

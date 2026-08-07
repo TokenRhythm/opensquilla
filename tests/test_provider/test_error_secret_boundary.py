@@ -24,6 +24,7 @@ from opensquilla.provider.types import ChatConfig, ErrorEvent, Message
 # provider-boundary replacement must protect it solely because it is the active
 # credential; the prefix also exercises Google-style API key shapes.
 _API_KEY = "AIza"
+_SHORT_INSTALL_ID = "i7"
 
 
 def test_tiny_synthetic_key_does_not_corrupt_unrelated_error_words() -> None:
@@ -33,6 +34,130 @@ def test_tiny_synthetic_key_does_not_corrupt_unrelated_error_words() -> None:
         redact_upstream_error_text("document block malformed", api_key="k")
         == "document block malformed"
     )
+
+
+def test_install_id_is_redacted_from_upstream_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.error_redaction import redact_upstream_error_code
+
+    monkeypatch.setattr(
+        "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(_SHORT_INSTALL_ID, "***"),
+    )
+
+    assert (
+        redact_upstream_error_code(
+            f"install-{_SHORT_INSTALL_ID}-rejected",
+            api_key="synthetic-key",
+        )
+        == "install-***-rejected"
+    )
+
+
+async def test_short_install_id_is_redacted_from_openai_chat_and_model_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(_SHORT_INSTALL_ID, "***"),
+    )
+    monkeypatch.setattr(
+        openai_module,
+        "tokenrhythm_install_id_headers",
+        lambda *_args, **_kwargs: {
+            "X-OpenSquilla-Install-Id": _SHORT_INSTALL_ID
+        },
+    )
+    provider = OpenAIProvider(
+        api_key="synthetic-key",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            raise httpx.ConnectError(
+                f"model discovery echoed {_SHORT_INSTALL_ID}",
+                request=request,
+            )
+        return httpx.Response(
+            401,
+            request=request,
+            json={"error": {"message": f"request echoed {_SHORT_INSTALL_ID}"}},
+        )
+
+    _patch_transport(monkeypatch, handler)
+
+    events = await _events(provider)
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1
+    assert _SHORT_INSTALL_ID not in errors[0].message
+    assert "***" in errors[0].message
+
+    with pytest.raises(httpx.ConnectError) as raised:
+        await provider.list_models(raise_on_error=True)
+    assert _SHORT_INSTALL_ID not in str(raised.value)
+    assert "model discovery echoed ***" in str(raised.value)
+    assert raised.value.request.headers["X-OpenSquilla-Install-Id"] == "[PRESENT]"
+    assert _SHORT_INSTALL_ID not in repr(raised.value.request.headers)
+    assert _SHORT_INSTALL_ID not in repr(raised.value.__context__)
+
+
+def test_http_status_error_clone_redacts_retained_request_and_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.error_redaction import redacted_httpx_error
+
+    monkeypatch.setattr(
+        "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(_SHORT_INSTALL_ID, "***"),
+    )
+    request = httpx.Request(
+        "POST",
+        f"https://tokenrhythm.studio/v1/models?echo={_SHORT_INSTALL_ID}",
+        headers={
+            "Authorization": f"Bearer {_API_KEY}",
+            "X-OpenSquilla-Install-Id": _SHORT_INSTALL_ID,
+            "X-Upstream-Echo": _SHORT_INSTALL_ID,
+        },
+        content=f'{{"echo":"{_SHORT_INSTALL_ID}"}}',
+    )
+    response = httpx.Response(
+        500,
+        request=request,
+        headers={
+            "X-Upstream-Echo": _SHORT_INSTALL_ID,
+            f"X-Echo-{_SHORT_INSTALL_ID}": "present",
+        },
+        text=f"upstream echoed {_SHORT_INSTALL_ID} and {_API_KEY}",
+    )
+    original = httpx.HTTPStatusError(
+        f"request failed for {_SHORT_INSTALL_ID} and {_API_KEY}",
+        request=request,
+        response=response,
+    )
+
+    safe = redacted_httpx_error(original, api_key=_API_KEY)
+
+    assert isinstance(safe, httpx.HTTPStatusError)
+    assert safe.response.request is safe.request
+    assert safe.request.headers["X-OpenSquilla-Install-Id"] == "[PRESENT]"
+    retained = " ".join(
+        (
+            str(safe),
+            repr(safe),
+            str(safe.request.url),
+            repr(safe.request.headers),
+            safe.request.content.decode("latin-1"),
+            repr(safe.response.headers),
+            safe.response.text,
+            repr(original.__dict__),
+        )
+    )
+    assert _SHORT_INSTALL_ID not in retained
+    assert _API_KEY not in retained
 
 
 class _CapturedLog:

@@ -38,9 +38,15 @@ Fusion policy:
     claims must never appear in IMPORT.
 11. Return complete candidate contents for USER and MEMORY, not patches. Return null for IMPORT
     when no accepted project/event/history content should be created.
-12. Do not return file paths. The application maps USER, MEMORY, and IMPORT to fixed paths.
-13. Each decision's source_excerpt must be a short exact substring of imported_profile.
-14. Use the requested UI locale for summary. In each candidate target, write new content in that
+12. Applied IMPORT decisions and candidate.import_md must agree in both directions. If any applied
+    decision targets IMPORT, candidate.import_md must be a non-empty, complete IMPORT document
+    containing the accepted project, event, plan, or historical content. If candidate.import_md is
+    non-empty, at least one applied decision must target IMPORT. Never create IMPORT content without
+    an applied IMPORT decision, or claim that IMPORT was applied while returning null, an empty
+    string, or only whitespace.
+13. Do not return file paths. The application maps USER, MEMORY, and IMPORT to fixed paths.
+14. Each decision's source_excerpt must be a short exact substring of imported_profile.
+15. Use the requested UI locale for summary. In each candidate target, write new content in that
     target's existing dominant language. Use the UI locale for candidate content only when that
     target is empty. Preserve names, organizations, product names, identifiers, code, and direct
     quotes.

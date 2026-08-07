@@ -248,7 +248,7 @@ def test_full_web_preview_origin_can_clear_site_data_before_revoke(tmp_path: Pat
     assert cleared.headers["cache-control"] == "no-store"
 
 
-def test_remote_web_request_is_forced_offline(tmp_path: Path) -> None:
+def test_public_web_request_is_rejected_before_preview_creation(tmp_path: Path) -> None:
     ref = _publish_html(tmp_path)
     app, service = _app(
         tmp_path,
@@ -269,10 +269,7 @@ def test_remote_web_request_is_forced_offline(tmp_path: Path) -> None:
             origin="https://gateway.example",
         )
 
-    assert created.status_code == 201
-    assert created.json()["effective_mode"] == "offline"
-    assert created.json()["launch_url"].startswith("/api/v1/artifact-preview/")
-    assert created.json()["preview_origin"] is None
+    assert created.status_code == 401
 
 
 def test_desktop_originless_loopback_request_can_use_full_mode(tmp_path: Path) -> None:

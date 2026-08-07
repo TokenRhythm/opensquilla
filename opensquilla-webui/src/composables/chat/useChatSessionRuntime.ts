@@ -5,6 +5,7 @@ import type {
 } from '@/types/chat'
 import type { PersistSessionOptions } from '@/composables/chat/useChatSessionRoute'
 import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
+import type { SessionSubscriptionResult } from '@/composables/chat/useChatSessionSubscription'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -17,6 +18,7 @@ export interface ChatUsageAccumulator {
 }
 
 export interface ResponseSessionAdoptionResult {
+  authoritative: boolean
   authoritativeIdle: boolean
   backgroundOnly: boolean
 }
@@ -135,6 +137,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     })
     const subscriptionOutcome = await bootstrap.live
     return {
+      authoritative: subscriptionOutcome?.authoritative === true,
       authoritativeIdle: subscriptionOutcome?.authoritative === true
         && subscriptionOutcome.live === false,
       backgroundOnly: subscriptionOutcome?.authoritative === true
@@ -148,6 +151,32 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
 
   function adoptResponseSession(key: string, ownerRequestId: string) {
     return switchSession(key, { kind: 'response_handoff', ownerRequestId })
+  }
+
+  async function rebindDraftSession(
+    key: string,
+    guard: DraftSessionRebindGuard,
+  ): Promise<SessionSubscriptionResult> {
+    const sourceSessionKey = options.sessionKey.value
+    if (!key || key === sourceSessionKey || !guard(sourceSessionKey)) return false
+
+    options.cancelSessionBootstrap()
+    if (options.sessionKey.value !== sourceSessionKey) return false
+    if (!guard(sourceSessionKey)) {
+      return options.startSessionBootstrap({ includeHistory: false, force: true }).live
+    }
+
+    resetCompactState()
+    options.switchPendingQueue(key)
+    // A recovered provisional draft remains a draft: do not write it to the URL
+    // or active-session storage before the first accepted send.
+    options.sessionKey.value = key
+    resetSessionRuntimeState()
+    options.pendingSessionIntent.value = 'new_chat'
+    options.applySessionRunState({ run_status: 'idle' })
+    resetSessionViewState()
+    options.restoreWidgetState()
+    return options.startSessionBootstrap({ includeHistory: false }).live
   }
 
   // Drafts keep their provisional key out of the URL and local storage; it
@@ -170,5 +199,8 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     startDraftSession,
     switchToSession,
     adoptResponseSession,
+    rebindDraftSession,
   }
 }
+
+export type DraftSessionRebindGuard = (sourceSessionKey: string) => boolean

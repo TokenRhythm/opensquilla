@@ -159,7 +159,10 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.querySelector('[role="radiogroup"]')?.getAttribute('aria-label')).toBe('Choose how models are used')
     expect(el.textContent).toContain('Intelligent model routing')
     expect(el.textContent).toContain('Fixed model')
-    expect(el.textContent).toContain('Multi-model collaboration')
+    expect(el.textContent).toContain('Model ensemble')
+    expect(el.textContent).toContain(
+      'Candidate models answer in parallel, then one aggregator model produces the final reply.',
+    )
     expect(el.querySelector('[role="radiogroup"]')).toBeTruthy()
     const choices = Array.from(el.querySelectorAll<HTMLInputElement>('input[type="radio"][name="setup_model_strategy"]'))
     expect(choices).toHaveLength(3)
@@ -177,7 +180,7 @@ describe('SetupModelStrategyPanel', () => {
     expect(strategyRowsText).not.toContain('Recommended')
     expect(strategyRowsText).not.toContain('Advanced')
     expect(strategyRowsText).not.toContain('Default')
-    expect(strategyRowsText).not.toContain('Model ensemble')
+    expect(strategyRowsText).not.toContain('Multi-model collaboration')
     expect(el.textContent).not.toContain('Preset and credentials')
     expect(el.textContent).not.toContain('OpenRouter aggregated')
     expect(el.textContent).not.toContain('OpenRouter mix')
@@ -1170,7 +1173,7 @@ describe('SetupModelStrategyPanel', () => {
         '#setup-provider-model_strategy_fixed_model-description',
       )
       expect(fixedFieldDescription?.textContent)
-        .toContain('as the fallback when routing or collaboration cannot complete')
+        .toContain('as the fallback if routing or ensemble execution cannot complete')
       expect(fixedFieldDescription?.classList.contains('setup-model-combobox__sr-only')).toBe(true)
       const fixedModelInfo = fixedSection.querySelector<HTMLElement>(
         '.setup-model-combobox__info',
@@ -1179,7 +1182,7 @@ describe('SetupModelStrategyPanel', () => {
       expect(fixedModelInfo?.getAttribute('aria-describedby'))
         .toBe('setup-provider-model_strategy_fixed_model-info-tooltip')
       expect(fixedModelInfo?.querySelector('[role="tooltip"]')?.textContent)
-        .toContain('as the fallback when routing or collaboration cannot complete')
+        .toContain('as the fallback if routing or ensemble execution cannot complete')
       expect(fixedModelInput?.getAttribute('aria-describedby'))
         .toBe('setup-provider-model_strategy_fixed_model-description')
       if (activeStrategy === 'single') {
@@ -1187,13 +1190,13 @@ describe('SetupModelStrategyPanel', () => {
         expect(fixedSection.querySelector('.control-section__head .control-section__desc')?.textContent)
           .toContain('Choose the model used for every request.')
         expect(fixedSection.textContent)
-          .toContain('without automatic routing or multi-model collaboration')
+          .toContain('without automatic routing or model ensemble')
       } else {
         expect(fixedSection.querySelector('.control-section__head')).toBeNull()
         expect(fixedSection.querySelector('.control-row__desc')).toBeNull()
         expect(fixedSection.textContent).not.toContain('Choose the model used for every request.')
         expect(fixedSection.textContent)
-          .not.toContain('without automatic routing or multi-model collaboration')
+          .not.toContain('without automatic routing or model ensemble')
       }
 
       app.unmount()
@@ -1246,7 +1249,7 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.textContent).toContain('Fixed model')
     expect(el.textContent).toContain('Choose the model used for every request.')
     expect(el.textContent).toContain('Fixed and fallback model')
-    expect(el.textContent).toContain('without automatic routing or multi-model collaboration')
+    expect(el.textContent).toContain('without automatic routing or model ensemble')
     expect(el.querySelector('[data-testid="setup-model-strategy-fixed-model"]')).toBeTruthy()
     expect(el.textContent).not.toContain('When routing is uncertain')
     expect(el.querySelector('[role="table"]')).toBeNull()

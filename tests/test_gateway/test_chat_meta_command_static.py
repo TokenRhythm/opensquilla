@@ -31,9 +31,16 @@ def test_slash_menu_supports_argument_completion() -> None:
 
 def test_meta_run_path_uses_meta_run_rpc() -> None:
     text = _read()
-    marker = "case 'meta.menu':"
-    assert marker in text, "missing meta.menu case in selectSlashCmd"
-    body = text[text.index(marker):]
-    assert "meta.run" in body, "running a chosen meta-skill must call the meta.run RPC"
-    assert "sessionKey" in body, "meta.run must pass the session key"
-    assert "dispatchHidden" in body, "running a meta-skill must trigger a turn via dispatchHidden"
+    case_marker = "case 'meta.menu':"
+    helper_marker = "async function runMetaInvocation("
+    helper_end = "async function restoreDurableMetaDrafts("
+    assert case_marker in text, "missing meta.menu case in selectSlashCmd"
+    assert helper_marker in text, "missing shared MetaSkill invocation helper"
+    case_body = text[text.index(case_marker):]
+    helper_body = text[text.index(helper_marker):text.index(helper_end)]
+    assert "runMetaInvocation" in case_body, "meta.menu must use the durable invocation path"
+    assert "meta.run" in helper_body, "running a chosen meta-skill must call the meta.run RPC"
+    assert "sessionKey" in helper_body, "meta.run must pass the session key"
+    assert "dispatchHidden" in helper_body, "running a meta-skill must trigger a hidden turn"
+    assert "setup_required" in helper_body, "setup failures must not start a turn"
+    assert "readiness.missing_bins" in helper_body, "setup must identify missing binaries"

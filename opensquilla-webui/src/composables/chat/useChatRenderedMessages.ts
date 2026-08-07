@@ -33,7 +33,7 @@ import {
   normalizeRouterTier,
   sortRouterTiers,
 } from '@/utils/chat/routerTiers'
-import { clarifyRequestFromValue } from '@/utils/chat/clarify'
+import { clarifyRequestFromValue, userInputOutcomeFromValue } from '@/utils/chat/clarify'
 import type { RouterVisualMode } from '@/utils/chat/routerVisualMode'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { InterruptViewState } from '@/types/parts'
@@ -98,9 +98,9 @@ const ROUTER_LEGACY_DECOY_MODELS = [
 function clarifyInterruptFromValue(value: unknown): ToPartsInterrupt | null {
   const data = clarifyRequestFromValue(value)
   if (!data) return null
-  const approvalId = `${data.runId}|${data.step}` === '|'
-    ? 'clarify:history'
-    : `${data.runId}|${data.step}`
+  const composite = `${data.runId}|${data.step}`
+  const approvalId = data.requestId
+    || (composite === '|' ? 'clarify:history' : composite)
   return {
     kind: 'clarify',
     approvalId,
@@ -112,7 +112,22 @@ function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined)
   if (!Array.isArray(segments) || !segments.length) return []
   const inputByToolId = new Map<string, unknown>()
   const out: ToPartsInterrupt[] = []
-  const seen = new Set<string>()
+  const indexByApprovalId = new Map<string, number>()
+
+  function upsert(interrupt: ToPartsInterrupt): void {
+    const existingIndex = indexByApprovalId.get(interrupt.approvalId)
+    if (existingIndex == null) {
+      indexByApprovalId.set(interrupt.approvalId, out.length)
+      out.push(interrupt)
+      return
+    }
+    const existing = out[existingIndex]
+    out[existingIndex] = {
+      ...existing,
+      data: { ...existing.data, ...interrupt.data },
+      ...(interrupt.resolution ? { resolution: interrupt.resolution } : {}),
+    } as ToPartsInterrupt
+  }
 
   for (const segment of segments) {
     const type = String(segment?.type || '')
@@ -120,19 +135,25 @@ function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined)
     if (type === 'tool_use' && toolId) {
       inputByToolId.set(toolId, segment.input)
       const direct = clarifyInterruptFromValue(segment.input)
-      if (direct && !seen.has(direct.approvalId)) {
-        seen.add(direct.approvalId)
-        out.push(direct)
-      }
+      if (direct) upsert(direct)
       continue
     }
     if (type !== 'tool_result') continue
-    const direct = clarifyInterruptFromValue(segment.result)
+    const outcome = userInputOutcomeFromValue(segment.result)
+    const direct = clarifyInterruptFromValue(segment.user_input_request)
+      || clarifyInterruptFromValue(segment.result)
       || clarifyInterruptFromValue(segment.arguments)
     const fromMatchingInput = direct || clarifyInterruptFromValue(inputByToolId.get(toolId))
-    if (fromMatchingInput && !seen.has(fromMatchingInput.approvalId)) {
-      seen.add(fromMatchingInput.approvalId)
-      out.push(fromMatchingInput)
+    if (fromMatchingInput) {
+      upsert({
+        ...fromMatchingInput,
+        ...(outcome ? { resolution: 'replied' } : {}),
+      })
+    } else if (outcome) {
+      const existingIndex = indexByApprovalId.get(outcome.requestId)
+      if (existingIndex != null) {
+        out[existingIndex] = { ...out[existingIndex], resolution: 'replied' }
+      }
     }
   }
   return out
@@ -310,6 +331,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const collapsible = displayRole === 'user' || displayRole === 'assistant'
       const sameGroup = collapsible && displayRole === prevRole && day === prevDay && day !== ''
       if (collapsible) prevRole = displayRole
+      else if (displayRole === 'maintenance') prevRole = ''
 
       const ownerKey = msg.messageId || msg.clientId || `${msg.role}-${i}`
       const planRevisions = (msg.planRevisions ?? []).map(plan => ({
@@ -335,9 +357,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         ts: msg.ts ?? null,
         showHeader: !sameGroup,
         messageId: msg.messageId,
+        restoredFromHistory: msg.restoredFromHistory,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
         inputDisposition: msg.inputDisposition,
         inputDispositionRevision: msg.inputDispositionRevision,
+        maintenance: msg.maintenance,
         turnOutcome: msg.turnOutcome,
         hasAttachments: !!msg.attachments?.length,
         attachments: msg.attachments,

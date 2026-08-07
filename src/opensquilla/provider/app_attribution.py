@@ -8,6 +8,7 @@ OPENSQUILLA_APP_REFERER = "https://opensquilla.ai"
 OPENSQUILLA_APP_TITLE = "OpenSquilla"
 
 _APP_ATTRIBUTION_ROOT_HOSTS = frozenset({"openrouter.ai", "tokenrhythm.studio"})
+_APP_ATTRIBUTION_HOST_MARKERS = frozenset({"tokenrhythm"})
 
 
 def _normalized_hostname(url: str | None) -> str:
@@ -44,10 +45,13 @@ def is_provider_app_host(url: str | None, root_host: str) -> bool:
 
 
 def provider_app_headers(url: str | None) -> dict[str, str]:
-    """Return OpenSquilla attribution headers for allowlisted provider hosts."""
-    if not any(
+    """Return OpenSquilla attribution headers for supported provider hosts."""
+    host = _normalized_hostname(url)
+    matches_root = any(
         is_provider_app_host(url, root) for root in _APP_ATTRIBUTION_ROOT_HOSTS
-    ):
+    )
+    matches_marker = any(marker in host for marker in _APP_ATTRIBUTION_HOST_MARKERS)
+    if not matches_root and not matches_marker:
         return {}
     return {
         "HTTP-Referer": OPENSQUILLA_APP_REFERER,

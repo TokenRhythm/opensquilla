@@ -8,10 +8,31 @@
         v-for="step in statusSteps"
         :key="step.key"
         class="assistant-activity-status__row"
-        :class="{ 'assistant-activity-status__row--current': step.isCurrent }"
+        :class="{
+          'assistant-activity-status__row--current': step.isCurrent,
+          'assistant-activity-status__row--maintenance': step.category === 'maintenance',
+          'assistant-activity-status__row--failed': step.state === 'failed',
+        }"
+        :data-testid="step.category === 'maintenance' ? 'compaction-event' : undefined"
+        :data-compaction-id="step.id"
+        :data-status="step.state"
+        :data-source="step.source"
+        :data-durability="step.durability"
       >
         <span class="assistant-activity-status__dot" aria-hidden="true" />
-        <span>{{ t(step.label.code, step.label.params) }}</span>
+        <span
+          :role="step.category === 'maintenance' ? (step.state === 'failed' ? 'alert' : 'status') : undefined"
+          :aria-live="step.category === 'maintenance' ? (step.state === 'failed' ? 'assertive' : 'polite') : undefined"
+          :aria-atomic="step.category === 'maintenance' ? 'true' : undefined"
+        >
+          <span>{{ t(step.label.code, step.label.params) }}</span>
+          <span
+            v-if="step.category === 'maintenance' && step.durability === 'request_scoped'"
+            class="assistant-activity-status__detail"
+          >
+            {{ t('chat.compact.requestScoped') }}
+          </span>
+        </span>
       </li>
     </ol>
     <template v-for="segment in segments" :key="segment.key">
@@ -141,7 +162,7 @@ const statusSteps = computed(() => {
   // completed/history playback can still show the full phase record when the
   // user expands it.
   return props.projection.statusSteps
-    .filter(isSemanticActivityStatusStep)
+    .filter(step => step.category === 'maintenance' || isSemanticActivityStatusStep(step))
     .slice(-3)
 })
 
@@ -301,6 +322,40 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
   background: var(--accent);
 }
 
+.assistant-activity-status__row--maintenance {
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+}
+
+.assistant-activity-status__row--maintenance .assistant-activity-status__dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  margin: 0 0.1875rem;
+  border: 1px solid currentColor;
+  background: transparent;
+}
+
+.assistant-activity-status__row--maintenance.assistant-activity-status__row--current
+  .assistant-activity-status__dot {
+  border-color: var(--accent);
+  border-right-color: transparent;
+  background: transparent;
+  animation: compactionActivitySpin 0.9s linear infinite;
+}
+
+.assistant-activity-status__row--failed {
+  color: var(--danger);
+}
+
+.assistant-activity-status__detail {
+  margin-left: auto;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 0.75rem;
+}
+
+@keyframes compactionActivitySpin {
+  to { transform: rotate(360deg); }
+}
+
 .assistant-activity-tool-batch {
   min-width: 0;
 }
@@ -358,6 +413,11 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
 @media (prefers-reduced-motion: reduce) {
   .assistant-activity-tool-batch__chevron {
     transition: none;
+  }
+
+  .assistant-activity-status__row--maintenance.assistant-activity-status__row--current
+    .assistant-activity-status__dot {
+    animation: none;
   }
 }
 </style>

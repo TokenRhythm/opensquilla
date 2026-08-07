@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -285,6 +286,122 @@ async def test_write_exec_stdin_waits_until_eof_is_delivered() -> None:
     assert stdin.writes == [b"payload"]
     assert stdin.closed is True
     assert stdin.close_waited is True
+
+
+@pytest.mark.asyncio
+async def test_windows_host_stdin_uses_blocking_communicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _CompletedProcess:
+        returncode = None
+        pid = 1
+
+        def communicate(self, *, input: bytes) -> tuple[None, None]:
+            captured["stdin_bytes"] = input
+            self.returncode = 0
+            return None, None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    def fake_create_subprocess(command: str, **kwargs: object):
+        captured["command"] = command
+        captured["stdin_target"] = kwargs["stdin"]
+        return _CompletedProcess()
+
+    monkeypatch.setattr(shell, "_use_windows_blocking_exec_stdin", lambda: True)
+    monkeypatch.setattr(shell, "_create_windows_host_shell_process", fake_create_subprocess)
+
+    result = await shell._run_host_shell_command(
+        "Write-Output ok",
+        cwd=None,
+        env={},
+        stdin_bytes=b"payload",
+        effective_timeout=1.0,
+    )
+
+    assert result == "exit_code=0\n"
+    assert captured == {
+        "command": "Write-Output ok",
+        "stdin_target": subprocess.PIPE,
+        "stdin_bytes": b"payload",
+    }
+
+
+@pytest.mark.asyncio
+async def test_windows_blocking_stdin_timeout_terminates_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    actions: list[str] = []
+
+    class _HangingProcess:
+        returncode = None
+        pid = 1
+
+        def communicate(self, *, input: bytes) -> tuple[None, None]:
+            assert input == b"payload"
+            assert release.wait(timeout=2)
+            return None, None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            actions.append("terminate")
+            self.returncode = -1
+            release.set()
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == shell._EXEC_TERMINATE_TIMEOUT
+            return -1
+
+    monkeypatch.setattr(shell, "_use_windows_blocking_exec_stdin", lambda: True)
+    monkeypatch.setattr(
+        shell,
+        "_create_windows_host_shell_process",
+        lambda _command, **_kwargs: _HangingProcess(),
+    )
+
+    result = await shell._run_host_shell_command(
+        "Write-Output ok",
+        cwd=None,
+        env={},
+        stdin_bytes=b"payload",
+        effective_timeout=0.01,
+    )
+
+    assert result.startswith("[timeout after 0.01s]")
+    assert actions == ["terminate"]
+
+
+@pytest.mark.asyncio
+async def test_wait_exec_stdin_writer_accepts_process_exit_before_pipe_close() -> None:
+    proc = _FakeProcess(returncode=None)
+    release_writer = asyncio.Event()
+
+    async def wait_for_pipe_close() -> None:
+        await release_writer.wait()
+
+    writer_task = asyncio.create_task(wait_for_pipe_close())
+
+    async def finish_process() -> None:
+        await asyncio.sleep(0.02)
+        proc.returncode = 0
+
+    process_task = asyncio.create_task(finish_process())
+    started = time.monotonic()
+    try:
+        assert await shell._wait_exec_stdin_writer(proc, writer_task, timeout=0.5)
+        assert time.monotonic() - started < 0.25
+        assert not writer_task.done()
+    finally:
+        await process_task
+        await shell._cancel_exec_stdin_writer(proc, writer_task)
+
+    assert writer_task.cancelled()
 
 
 @pytest.mark.asyncio

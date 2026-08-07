@@ -175,6 +175,7 @@ _SQLITE_ALL_SIDECAR_SUFFIXES = (
 )
 _WINDOWS_LOCK_ERROR_CODES = frozenset({32, 33})
 _REPARSE_POINT_ATTRIBUTE = 0x400
+_REPARSE_NAME_SURROGATE_BIT = 0x20000000
 _GATEWAY_AUTHORITY_MAX_BYTES = 64 * 1024
 _JOURNAL_PHASES = frozenset(
     {
@@ -280,10 +281,9 @@ def _path_is_relative_to_lexical(path: Path, root: Path) -> bool:
             result = candidate.lstat()
         except OSError:
             return None
-        attributes = int(getattr(result, "st_file_attributes", 0) or 0)
         if (
             stat.S_ISLNK(result.st_mode)
-            or attributes & _REPARSE_POINT_ATTRIBUTE
+            or _has_reparse_attribute(result)
             or not stat.S_ISDIR(result.st_mode)
         ):
             return None
@@ -979,7 +979,13 @@ def _remove_matching_staging(path: Path, expected: object) -> None:
 
 def _has_reparse_attribute(result: os.stat_result) -> bool:
     attributes = int(getattr(result, "st_file_attributes", 0) or 0)
-    return bool(attributes & _REPARSE_POINT_ATTRIBUTE)
+    if not attributes & _REPARSE_POINT_ATTRIBUTE:
+        return False
+    tag = int(getattr(result, "st_reparse_tag", 0) or 0)
+    # Data-only reparse points (cloud sync placeholders, WOF compression) do
+    # not redirect path resolution; only name surrogates - or an unreadable
+    # tag - stay blocked.
+    return tag == 0 or bool(tag & _REPARSE_NAME_SURROGATE_BIT)
 
 
 def _supported_entry_type(path: Path, result: os.stat_result) -> str:

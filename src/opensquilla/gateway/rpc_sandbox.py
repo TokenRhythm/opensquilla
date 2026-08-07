@@ -27,23 +27,37 @@ from opensquilla.gateway.rpc import (
     get_dispatcher,
 )
 from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.gateway.token_store import TokenRecord, TokenStore
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
 )
+from opensquilla.run_mode import (
+    RunMode,
+    display_name,
+    execution_target,
+    normalize_run_mode,
+)
 from opensquilla.sandbox.domain_validation import validate_domain_pattern
 from opensquilla.sandbox.escalation import remember_resolved_run_context
+from opensquilla.sandbox.file_policy import builtin_deny_write_paths
 from opensquilla.sandbox.package_bundles import expand_package_bundle
 from opensquilla.sandbox.path_validation import (
     decide_path_access,
     normalize_mount_access,
     normalize_path,
 )
+from opensquilla.sandbox.policy_store import (
+    PolicyVersionConflict,
+    SandboxPolicyStore,
+)
 from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
+    RUN_MODE_PREFERENCE_KEY,
     RunContext,
     get_run_context,
     normalize_workspace_path,
+    resolve_default_run_mode,
     set_run_mode,
 )
 from opensquilla.sandbox.run_context_service import (
@@ -55,30 +69,20 @@ from opensquilla.sandbox.run_context_service import (
     remove_mount_grant,
     set_workspace,
 )
-from opensquilla.sandbox.run_mode import (
-    RunMode,
-    config_run_mode,
-    display_name,
-    execution_target,
-    normalize_run_mode,
-)
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
     run_mode_allowed_for_principal,
 )
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.setup_runtime import (
+    current_sandbox_capability_report,
     current_sandbox_setup_runtime_status,
     ensure_sandbox_setup_auto,
-)
-from opensquilla.sandbox.setup_state import (
-    SandboxSetupState,
-    current_sandbox_setup_status,
 )
 from opensquilla.sandbox.status import status_payload
 from opensquilla.session.keys import parse_agent_id
 
 _d = get_dispatcher()
-_RUN_MODE_PREFERENCE_KEY = "sandbox.run_mode"
 _RUN_MODE_PREFERENCE_CHANGED_EVENT = "sandbox.run_mode.preference.changed"
 _WINDOWS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -87,6 +91,31 @@ def _require_params(params: dict | None) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
     return params
+
+
+def _sandbox_policy_store(ctx: RpcContext) -> SandboxPolicyStore:
+    state_dir = getattr(ctx.config, "state_dir", None)
+    if not state_dir:
+        raise RpcUnavailableError("Sandbox policy storage is unavailable.")
+    return SandboxPolicyStore(Path(str(state_dir)) / "sessions.db")
+
+
+def _sandbox_token_store(ctx: RpcContext) -> TokenStore:
+    state_dir = getattr(ctx.config, "state_dir", None)
+    if not state_dir:
+        raise RpcUnavailableError("Sandbox token storage is unavailable.")
+    return TokenStore(Path(str(state_dir)) / "sessions.db")
+
+
+def _sandbox_token_payload(record: TokenRecord) -> dict[str, Any]:
+    return {
+        "publicId": record.public_id,
+        "name": record.name,
+        "capabilities": sorted(record.capabilities),
+        "createdAt": record.created_at,
+        "lastUsedAt": record.last_used_at,
+        "lastPeer": record.last_peer,
+    }
 
 
 def _require_session_key(params: dict[str, Any]) -> str:
@@ -321,13 +350,10 @@ def _pick_directory_path(initial_dir: str | None = None) -> str | None:
 
 
 async def _pick_directory_path_windows(initial_dir: str | None = None) -> str | None:
-    command = [
-        sys.executable,
-        "-m",
-        "opensquilla.gateway.windows_directory_picker",
-    ]
+    arguments: list[str] = []
     if initial_dir:
-        command.append(initial_dir)
+        arguments.append(initial_dir)
+    command = internal_child_argv(ChildRole.DIRECTORY_PICKER, args=arguments)
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -673,6 +699,150 @@ async def _handle_sandbox_setup_status(params: dict | None, ctx: RpcContext) -> 
     return result.to_payload()
 
 
+@_d.method("sandbox.capability.status", scope="operator.read")
+async def _handle_sandbox_capability_status(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    refresh = (params or {}).get("refresh", False)
+    if not isinstance(refresh, bool):
+        raise ValueError("params.refresh must be a boolean")
+    report = await current_sandbox_capability_report(
+        ctx.config,
+        force_refresh=refresh,
+    )
+    return report.to_payload()
+
+
+@_d.method("sandbox.policy.get", scope="operator.read")
+async def _handle_sandbox_policy_get(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return _sandbox_policy_store(ctx).read().to_public_dict()
+
+
+@_d.method("sandbox.policy.defaults", scope="operator.read")
+async def _handle_sandbox_policy_defaults(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+    from opensquilla.sandbox.runtime_manifest import RuntimeManifest
+
+    resolver = bundled_runtime_resolver()
+    if resolver is None:
+        # Source checkouts do not have a packaged developer/ directory.  The
+        # checked-in manifest is still authoritative for the package being
+        # built and lets Settings show the pinned versions during development.
+        candidate = (
+            Path(__file__).resolve().parents[3]
+            / "desktop"
+            / "electron"
+            / "runtime"
+            / "runtime-manifest.json"
+        )
+        if candidate.is_file():
+            try:
+                from opensquilla.sandbox.runtime_manifest import BundledRuntimeResolver
+
+                resolver = BundledRuntimeResolver(
+                    RuntimeManifest.from_path(candidate),
+                    resource_root=candidate.parent / "developer",
+                )
+            except ValueError:
+                resolver = None
+    runtime_versions: dict[str, dict[str, object]] = {}
+    if resolver is not None:
+        assets = resolver.manifest.assets.get(resolver.target, {})
+        executable_paths = resolver.executable_paths()
+        for key, asset in assets.items():
+            executable_names = tuple(asset.executables)
+            runtime_versions[key] = {
+                "version": asset.version,
+                "available": any(
+                    executable_paths.get(name, Path()).is_file()
+                    for name in executable_names
+                ),
+            }
+    return {
+        "builtinDenyWritePaths": [
+            str(path) for path in builtin_deny_write_paths()
+        ],
+        "runtimeTarget": resolver.target if resolver is not None else None,
+        "runtimeVersions": runtime_versions,
+    }
+
+
+@_d.method("sandbox.policy.update", scope="operator.write")
+async def _handle_sandbox_policy_update(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.policy.update")
+    values = _require_params(params)
+    base_version = values.get("basePolicyVersion")
+    if not isinstance(base_version, int) or isinstance(base_version, bool):
+        raise ValueError("params.basePolicyVersion must be an integer")
+    policy = values.get("policy")
+    if not isinstance(policy, dict):
+        raise ValueError("params.policy must be an object")
+    try:
+        saved = _sandbox_policy_store(ctx).compare_and_swap(base_version, policy)
+    except PolicyVersionConflict as exc:
+        raise RpcHandlerError(
+            "POLICY_VERSION_CONFLICT",
+            "The sandbox policy changed in another client.",
+            details={"currentPolicy": exc.current_policy.to_public_dict()},
+        ) from exc
+    return saved.to_public_dict()
+
+
+@_d.method("sandbox.tokens.list", scope="operator.read")
+async def _handle_sandbox_token_list(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.tokens.list")
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return {
+        "tokens": [
+            _sandbox_token_payload(record)
+            for record in _sandbox_token_store(ctx).list_active()
+        ]
+    }
+
+
+@_d.method("sandbox.tokens.create", scope="operator.write")
+async def _handle_sandbox_token_create(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.tokens.create")
+    values = _require_params(params)
+    name = values.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("params.name must be a non-empty string")
+    host_execute = values.get("hostExecute", True)
+    if not isinstance(host_execute, bool):
+        raise ValueError("params.hostExecute must be a boolean")
+    capabilities = {"task.read", "task.submit"}
+    if host_execute:
+        capabilities.add("host.execute")
+    issued = _sandbox_token_store(ctx).create(
+        name=name.strip(),
+        roles={"operator"},
+        scopes={"operator.read", "operator.write"},
+        capabilities=capabilities,
+    )
+    return {
+        "token": issued.token,
+        "record": _sandbox_token_payload(issued.record),
+    }
+
+
+@_d.method("sandbox.tokens.revoke", scope="operator.write")
+async def _handle_sandbox_token_revoke(params: dict | None, ctx: RpcContext) -> dict:
+    _require_owner(ctx, "sandbox.tokens.revoke")
+    values = _require_params(params)
+    public_id = values.get("publicId")
+    if not isinstance(public_id, str) or not public_id.strip():
+        raise ValueError("params.publicId must be a non-empty string")
+    return {
+        "publicId": public_id.strip(),
+        "revoked": _sandbox_token_store(ctx).revoke(public_id.strip()),
+    }
+
+
 @_d.method("sandbox.setup.ensure", scope="operator.write")
 async def _handle_sandbox_setup_ensure(params: dict | None, ctx: RpcContext) -> dict:
     _require_owner(ctx, "sandbox.setup.ensure")
@@ -740,12 +910,12 @@ async def _require_sandbox_setup_ready_for_mode(ctx: RpcContext, run_mode: Any) 
     normalized = normalize_run_mode(run_mode)
     if normalized == RunMode.FULL:
         return
-    status = await current_sandbox_setup_status(ctx.config)
-    if status.state != SandboxSetupState.READY:
+    report = await current_sandbox_capability_report(ctx.config)
+    if not report.available:
         raise RpcHandlerError(
-            "SANDBOX_SETUP_REQUIRED",
-            "Sandbox setup must be completed before enabling sandbox run modes.",
-            details=status.to_payload(),
+            "SANDBOX_CAPABILITY_UNAVAILABLE",
+            "Safe mode cannot be enabled because live sandbox verification failed.",
+            details=report.to_payload(),
         )
 
 
@@ -756,10 +926,7 @@ async def _handle_run_mode_preference_get(
 ) -> dict[str, str]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
-    storage = _runtime_preference_storage(ctx)
-    stored = await storage.get_runtime_preference(_RUN_MODE_PREFERENCE_KEY)
-    source = "preference" if stored is not None else "config"
-    mode = normalize_run_mode(stored, default=config_run_mode(ctx.config))
+    mode, source = await resolve_default_run_mode(ctx.session_manager, ctx.config)
     mode = coerce_run_mode_for_principal(mode, ctx.principal)
     return {"runMode": mode.value, "source": source}
 
@@ -775,7 +942,7 @@ async def _handle_run_mode_preference_set(
     await _require_sandbox_setup_ready_for_mode(ctx, mode)
     storage = _runtime_preference_storage(ctx)
     confirmed = await storage.set_runtime_preference(
-        _RUN_MODE_PREFERENCE_KEY,
+        RUN_MODE_PREFERENCE_KEY,
         mode.value,
     )
     payload = {"runMode": confirmed, "source": "preference"}

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -21,6 +22,7 @@ import pytest
 import structlog.testing
 
 from opensquilla.provider.compat_policy import (
+    TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
     TEXT_TOOL_DIALECT_MINIMAX_XML,
     TEXT_TOOL_DIALECT_PLAIN_JSON,
     TEXT_TOOL_DIALECT_QWEN_TAG,
@@ -43,6 +45,7 @@ from opensquilla.provider.types import (
     DoneEvent,
     ErrorEvent,
     Message,
+    ModelCapabilities,
     TextDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
@@ -52,6 +55,7 @@ from opensquilla.provider.types import (
 )
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
+_UNSET = object()
 
 
 _SEARCH_TOOL = ToolDefinition(
@@ -132,6 +136,13 @@ _MINIMAX_CALL = (
     "<minimax:tool_call>"
     '<invoke name="search"><parameter name="query">x</parameter></invoke>'
     "</minimax:tool_call>"
+)
+_DSML_CALL = (
+    "<｜DSML｜tool_calls>"
+    '<｜DSML｜invoke name="search">'
+    '<｜DSML｜parameter name="query" string="true">x</｜DSML｜parameter>'
+    "</｜DSML｜invoke>"
+    "</｜DSML｜tool_calls>"
 )
 _PLAIN_CALL = 'search{"query":"x"}'
 _DETAILS_SCAFFOLD = (
@@ -320,6 +331,7 @@ def _collect_stream(
     native_query: str = "native",
     compat: OpenAICompatPolicy | None = None,
     raw_body: bytes | None = None,
+    config: ChatConfig | None = None,
 ) -> list[Any]:
     body = raw_body
     if body is None:
@@ -360,7 +372,7 @@ def _collect_stream(
             async for event in provider.chat(
                 [Message(role="user", content="hi")],
                 tools=tools,
-                config=ChatConfig(),
+                config=config or ChatConfig(),
             )
         ]
 
@@ -376,7 +388,11 @@ def _collect_non_stream(
     native_arguments: str | None = None,
     native_tool_name: str | None = "search",
     native_calls: list[tuple[str | None, str]] | None = None,
+    raw_tool_calls: object = _UNSET,
     tools: list[ToolDefinition] | None = None,
+    provider_kind: str = "profile_test",
+    model: str = "profile-test",
+    expected_calls: int = 2,
 ) -> list[Any]:
     calls = 0
 
@@ -387,7 +403,9 @@ def _collect_non_stream(
         if payload.get("stream"):
             raise httpx.ReadTimeout("force non-stream fallback")
         message: dict[str, Any] = {"content": text}
-        if native_calls is not None:
+        if raw_tool_calls is not _UNSET:
+            message["tool_calls"] = raw_tool_calls
+        elif native_calls is not None:
             tool_calls: list[dict[str, Any]] = []
             for index, (tool_name, arguments) in enumerate(native_calls):
                 function: dict[str, Any] = {"arguments": arguments}
@@ -437,8 +455,8 @@ def _collect_non_stream(
     )
     provider = OpenAIProvider(
         api_key="test",
-        model="profile-test",
-        provider_kind="profile_test",
+        model=model,
+        provider_kind=provider_kind,
         compat=compat,
     )
     tool_definitions = tools if tools is not None else [_SEARCH_TOOL]
@@ -454,7 +472,7 @@ def _collect_non_stream(
         ]
 
     events = asyncio.run(run())
-    assert calls == 2
+    assert calls == expected_calls
     return events
 
 
@@ -479,15 +497,30 @@ def _plain_profile() -> OpenAICompatPolicy:
 @pytest.mark.parametrize(
     ("provider_kind", "model", "expected"),
     [
+        (
+            "deepseek",
+            "deepseek-v4-flash",
+            {TEXT_TOOL_DIALECT_DEEPSEEK_DSML},
+        ),
+        ("deepseek", "deepseek-chat", set()),
         ("dashscope", "qwen3.6-flash", {TEXT_TOOL_DIALECT_QWEN_TAG}),
         ("dashscope", "deepseek-v3.2", set()),
         ("minimax", "MiniMax-M2.7", {TEXT_TOOL_DIALECT_MINIMAX_XML}),
         ("openrouter", "minimax/minimax-m2.7", {TEXT_TOOL_DIALECT_MINIMAX_XML}),
         ("openrouter", "deepseek/deepseek-v4", set()),
+        (
+            "openrouter",
+            "deepseek/deepseek-v4-flash",
+            {TEXT_TOOL_DIALECT_DEEPSEEK_DSML},
+        ),
         ("openrouter", "qwen/qwen3.7", set()),
         ("tokenrhythm", "minimax-m2.7", {TEXT_TOOL_DIALECT_MINIMAX_XML}),
         ("tokenrhythm", "qwen3.7-max", {TEXT_TOOL_DIALECT_QWEN_TAG}),
-        ("tokenrhythm", "deepseek-v4-flash", set()),
+        (
+            "tokenrhythm",
+            "deepseek-v4-flash",
+            {TEXT_TOOL_DIALECT_DEEPSEEK_DSML},
+        ),
         ("tokenrhythm", "glm-5.2", set()),
     ],
 )
@@ -499,6 +532,515 @@ def test_text_tool_profile_is_provider_and_model_scoped(
     policy = compat_policy_for_kind(provider_kind)
     assert policy.text_tool_profile.dialects_for_model(model) == frozenset(expected)
     assert policy.text_tool_synthesis is bool(expected or policy.text_tool_profile.model_rules)
+
+
+@pytest.mark.parametrize(
+    ("provider_kind", "model"),
+    [
+        ("deepseek", "deepseek-v4-flash-0731"),
+        ("tokenrhythm", "tokenrhythm/deepseek-v4-pro"),
+        ("openrouter", "deepseek/deepseek-v4-flash"),
+    ],
+)
+def test_dsml_executes_only_for_exact_packaged_provider_model_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_kind: str,
+    model: str,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind=provider_kind,
+        model=model,
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+    )
+
+    assert _text(events) == ""
+    starts = [event for event in events if isinstance(event, ToolUseStartEvent)]
+    ends = _tool_ends(events)
+    assert len(starts) == len(ends) == 1
+    assert starts[0].tool_use_id.startswith("deepseek_dsml_")
+    assert ends[0].tool_use_id == starts[0].tool_use_id
+    assert ends[0].arguments == {"query": "x"}
+    assert ends[0].synthetic_from_text is True
+    assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.parametrize(
+    ("provider_kind", "model"),
+    [
+        ("deepseek", "deepseek-chat"),
+        ("deepseek", "vendor/deepseek-v4-flash"),
+        ("openrouter", "deepseek-v4-flash"),
+        ("openai", "deepseek-v4-flash"),
+        ("dashscope", "deepseek-v4-pro"),
+    ],
+)
+def test_dsml_is_literal_outside_exact_packaged_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_kind: str,
+    model: str,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind=provider_kind,
+        model=model,
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+    )
+
+    assert _text(events) == _DSML_CALL
+    assert _tool_ends(events) == []
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_response_model_cannot_grant_dsml_execution_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _raw_sse(
+        [
+            {
+                "model": "deepseek-v4-flash",
+                "choices": [
+                    {"delta": {"content": _DSML_CALL}, "finish_reason": None}
+                ],
+            },
+            {
+                "model": "deepseek-v4-flash",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+    )
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="deepseek",
+        model="deepseek-chat",
+        text_chunks=[],
+        tools=[_SEARCH_TOOL],
+        raw_body=body,
+    )
+
+    assert _text(events) == _DSML_CALL
+    assert _tool_ends(events) == []
+
+
+def test_runtime_capability_metadata_cannot_grant_dsml_execution_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="custom",
+        model="deepseek-v4-flash",
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+        config=ChatConfig(
+            model_capabilities=ModelCapabilities(
+                supports_tools=True,
+                reasoning_format="deepseek",
+            )
+        ),
+    )
+
+    assert _text(events) == _DSML_CALL
+    assert _tool_ends(events) == []
+    assert isinstance(events[-1], DoneEvent)
+
+
+def test_dsml_non_stream_fallback_matches_stream_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _collect_non_stream(
+        monkeypatch,
+        text=_DSML_CALL,
+        finish_reason="stop",
+        compat=compat_policy_for_kind("openrouter"),
+        tools=[_SEARCH_TOOL],
+        provider_kind="openrouter",
+        model="deepseek/deepseek-v4-flash",
+    )
+
+    assert _text(events) == ""
+    assert [event.arguments for event in _tool_ends(events)] == [{"query": "x"}]
+    assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
+def test_dsml_unsuccessful_terminal_fails_without_text_or_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    finish_reason: str,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="deepseek",
+        model="deepseek-v4-flash",
+        text_chunks=list(_DSML_CALL),
+        tools=[_SEARCH_TOOL],
+        finish_reason=finish_reason,
+    )
+
+    assert _text(events) == ""
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert [
+        event.code for event in events if isinstance(event, ErrorEvent)
+    ] == ["incomplete_tool_call"]
+
+
+def test_incomplete_dsml_stream_preserves_transport_error_priority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="deepseek",
+        model="deepseek-v4-flash",
+        text_chunks=[_DSML_CALL[:-10]],
+        tools=[_SEARCH_TOOL],
+        finish_reason=None,
+        include_done=True,
+    )
+
+    assert _text(events) == ""
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert [
+        event.code for event in events if isinstance(event, ErrorEvent)
+    ] == ["incomplete_stream"]
+
+
+def test_rejected_dsml_is_scrubbed_and_logged_without_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "synthetic-secret-command --never-run"
+    malformed = _DSML_CALL.replace(
+        "</｜DSML｜invoke>",
+        '<｜DSML｜parameter name="query" string="true">'
+        f"{secret}</｜DSML｜parameter></｜DSML｜invoke>",
+    )
+    with structlog.testing.capture_logs() as captured:
+        events = _collect_stream(
+            monkeypatch,
+            provider_kind="deepseek",
+            model="deepseek-v4-flash",
+            text_chunks=list(malformed),
+            tools=[_SEARCH_TOOL],
+        )
+
+    assert _text(events) == ""
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert [event.code for event in errors] == ["incomplete_tool_call"]
+    assert secret not in errors[0].message
+    assert secret not in repr(captured)
+
+
+@pytest.mark.parametrize("native_first", [False, True])
+def test_native_tool_call_is_authoritative_over_dsml_in_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    native_first: bool,
+) -> None:
+    text_chunk = {
+        "choices": [{"delta": {"content": _DSML_CALL}, "finish_reason": None}]
+    }
+    native_chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_native",
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"query":"native"}',
+                            },
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ]
+    }
+    ordered_chunks = (
+        [native_chunk, text_chunk]
+        if native_first
+        else [text_chunk, native_chunk]
+    )
+    body = _raw_sse(
+        [
+            *ordered_chunks,
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+    )
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="deepseek",
+        model="deepseek-v4-flash",
+        text_chunks=[],
+        tools=[_SEARCH_TOOL],
+        raw_body=body,
+    )
+
+    assert _text(events) == ""
+    ends = _tool_ends(events)
+    assert len(ends) == 1
+    assert ends[0].tool_use_id == "call_native"
+    assert ends[0].arguments == {"query": "native"}
+    assert ends[0].synthetic_from_text is False
+
+
+def test_invalid_native_call_cannot_be_repaired_by_dsml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _raw_sse(
+        [
+            {"choices": [{"delta": {"content": _DSML_CALL}, "finish_reason": None}]},
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_invalid",
+                                    "function": {
+                                        "name": "search",
+                                        "arguments": "{malformed",
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+    )
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="deepseek",
+        model="deepseek-v4-flash",
+        text_chunks=[],
+        tools=[_SEARCH_TOOL],
+        raw_body=body,
+    )
+
+    assert _text(events) == ""
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_native",
+    [{}, "", 0, False],
+    ids=["object", "string", "zero", "false"],
+)
+@pytest.mark.parametrize("native_first", [False, True])
+def test_falsey_invalid_native_wrapper_cannot_authorize_dsml_in_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_native: object,
+    native_first: bool,
+) -> None:
+    text_chunk = {
+        "choices": [{"delta": {"content": _DSML_CALL}, "finish_reason": None}]
+    }
+    native_chunk = {
+        "choices": [
+            {
+                "delta": {"tool_calls": raw_native},
+                "finish_reason": None,
+            }
+        ]
+    }
+    ordered = (
+        [native_chunk, text_chunk]
+        if native_first
+        else [text_chunk, native_chunk]
+    )
+    body = _raw_sse(
+        [
+            *ordered,
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+    )
+
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="deepseek",
+        model="deepseek-v4-flash",
+        text_chunks=[],
+        tools=[_SEARCH_TOOL],
+        raw_body=body,
+    )
+
+    assert _text(events) == ""
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("empty_native", [None, []], ids=["null", "empty_array"])
+def test_empty_native_wrapper_does_not_suppress_valid_dsml(
+    monkeypatch: pytest.MonkeyPatch,
+    empty_native: object,
+) -> None:
+    body = _raw_sse(
+        [
+            {
+                "choices": [
+                    {"delta": {"tool_calls": empty_native}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [
+                    {"delta": {"content": _DSML_CALL}, "finish_reason": None}
+                ]
+            },
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+    )
+
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="deepseek",
+        model="deepseek-v4-flash",
+        text_chunks=[],
+        tools=[_SEARCH_TOOL],
+        raw_body=body,
+    )
+
+    assert _text(events) == ""
+    assert [event.arguments for event in _tool_ends(events)] == [{"query": "x"}]
+    assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.parametrize(
+    "raw_native",
+    [{}, "", 0, False],
+    ids=["object", "string", "zero", "false"],
+)
+def test_falsey_invalid_native_wrapper_cannot_authorize_dsml_in_non_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_native: object,
+) -> None:
+    events = _collect_non_stream(
+        monkeypatch,
+        text=_DSML_CALL,
+        finish_reason="tool_calls",
+        compat=replace(
+            compat_policy_for_kind("deepseek"),
+            stream_timeout_fallback=True,
+        ),
+        raw_tool_calls=raw_native,
+        tools=[_SEARCH_TOOL],
+        provider_kind="deepseek",
+        model="deepseek-v4-flash",
+    )
+
+    assert _text(events) == ""
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_native",
+    [{}, "", 0, False],
+    ids=["object", "string", "zero", "false"],
+)
+def test_falsey_invalid_native_wrapper_keeps_inert_dsml_non_executable(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_native: object,
+) -> None:
+    body = _raw_sse(
+        [
+            {
+                "choices": [
+                    {"delta": {"content": _DSML_CALL}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [
+                    {"delta": {"tool_calls": raw_native}, "finish_reason": None}
+                ]
+            },
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+    )
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="deepseek",
+        model="deepseek-v4-flash",
+        text_chunks=[],
+        tools=[],
+        raw_body=body,
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    text = _text(events)
+    assert _DSML_CALL not in text
+    assert _tool_ends(events) == []
+    if text:
+        assert not any(
+            action.get("name_text") == "search"
+            for action in json.loads(text).get("actions", [])
+        )
+
+
+@pytest.mark.parametrize(
+    ("candidate", "diagnostics"),
+    [
+        (_DSML_CALL, None),
+        ("<｜DSML｜tool_calls>bad", ["dsml_malformed"]),
+    ],
+)
+def test_inert_candidate_mode_demotes_dsml_without_tool_events(
+    monkeypatch: pytest.MonkeyPatch,
+    candidate: str,
+    diagnostics: list[str] | None,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="deepseek",
+        model="deepseek-v4-flash",
+        text_chunks=list(candidate),
+        tools=[],
+        config=ChatConfig(candidate_output_mode="inert_artifact"),
+    )
+
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent))
+        for event in events
+    )
+    text = _text(events)
+    assert candidate not in text
+    artifact = json.loads(text)
+    assert artifact["kind"] == "inert_proposer_tool_output"
+    assert artifact["executable"] is False
+    if diagnostics is None:
+        assert artifact["actions"] == [
+            {
+                "arguments_text": '{"query":"x"}',
+                "issues": [],
+                "name_text": "search",
+            }
+        ]
+        assert "diagnostics" not in artifact
+    else:
+        assert artifact["actions"] == []
+        assert artifact["diagnostics"] == diagnostics
+    assert isinstance(events[-1], DoneEvent)
 
 
 def test_literal_tool_calls_tag_survives_every_chunk_boundary(

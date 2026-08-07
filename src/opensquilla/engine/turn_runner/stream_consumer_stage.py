@@ -27,6 +27,7 @@ No ``TurnHook`` is fired from inside the stream loop today.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
@@ -36,6 +37,7 @@ import structlog
 from opensquilla.engine.hooks.types import CompactionState
 from opensquilla.engine.route_plan import route_plan_snapshot
 from opensquilla.observability.decision_log import build_vision_followup_gate_reason_code
+from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
 
 if TYPE_CHECKING:
     from opensquilla.engine.agent import Agent
@@ -109,8 +111,20 @@ class CompactionPersistPort(Protocol):
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
-    ) -> None: ...
+        compaction_deadline_at_monotonic: float | None = None,
+        compaction_timeout_seconds: float | None = None,
+        removed_count: int = 0,
+        source_entries: tuple[Any, ...] | None = None,
+        source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_boundary_message_id: str | None = None,
+        source_boundary_entry_id: int | None = None,
+    ) -> bool | None: ...
 
 @runtime_checkable
 class MemorySnapshotRefreshPort(Protocol):
@@ -267,6 +281,12 @@ class StreamConsumerStageInput:
     # Live delivery-ready authorization resolved on the event loop before the
     # blocking omitted-artifact publish enters its worker thread.
     attached_plan_run_ready: bool | None = None
+    # Frozen durable prefix used by in-turn compaction persistence. The storage
+    # adapter compares it atomically and preserves later append-only queue rows.
+    compaction_source_entries: tuple[Any, ...] | None = None
+    compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+    compaction_source_boundary_message_id: str | None = None
+    compaction_source_boundary_entry_id: int | None = None
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -342,6 +362,37 @@ def _clear_artifact_delivery_failure(state: _StreamState, target_key: str) -> No
         pass
 
 
+def _user_input_payload(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict) or value.get("kind") != "user_input":
+        return None
+    return dict(value)
+
+
+def _pending_user_input_request(value: Any) -> dict[str, Any] | None:
+    payload = _user_input_payload(value)
+    if (
+        payload is None
+        or payload.get("status") != "input_required"
+        or payload.get("paused") is not True
+    ):
+        return None
+    return payload
+
+
+def _is_terminal_user_input_outcome(value: Any) -> bool:
+    payload = _user_input_payload(value)
+    return bool(
+        payload is not None
+        and payload.get("status") in {"answered", "cancelled", "expired"}
+        and payload.get("paused") is False
+    )
+
+
 class _ToolResultHandler:
     """Capture artifact-delivery failures and append the tool_result segment."""
 
@@ -396,6 +447,16 @@ class _ToolResultHandler:
                 segment.get("type") == "tool_result"
                 and segment.get("tool_use_id") == event.tool_use_id
             ):
+                initial_user_input_request = segment.get("user_input_request")
+                if initial_user_input_request is None:
+                    initial_user_input_request = _pending_user_input_request(
+                        segment.get("result")
+                    )
+                if (
+                    initial_user_input_request is not None
+                    and _is_terminal_user_input_outcome(result_segment.get("result"))
+                ):
+                    result_segment["user_input_request"] = initial_user_input_request
                 state.turn_segments[index] = result_segment
                 break
         else:
@@ -1017,12 +1078,101 @@ class _CompactionHandler:
         await self._fire_before_compact(state)
         if inp.session_manager_present:
             try:
-                await self._persist.persist_and_notify(
-                    session_key=inp.session_key,
-                    summary=event.summary,
-                    kept_entries=event.kept_entries,
-                    compaction_id=event.compaction_id,
+                persist_kwargs: dict[str, Any] = {
+                    "session_key": inp.session_key,
+                    "summary": event.summary,
+                    "kept_entries": event.kept_entries,
+                    "summary_payload": event.summary_payload,
+                    "summary_format": event.summary_format,
+                    "coverage_status": event.coverage_status,
+                    "missing_obligations": event.missing_obligations,
+                    "critical_carry_forward": event.critical_carry_forward,
+                    "compaction_id": event.compaction_id,
+                    "removed_count": event.removed_count,
+                    "source_entries": inp.compaction_source_entries,
+                    "source_preimage": inp.compaction_source_preimage,
+                    "source_boundary_message_id": (
+                        inp.compaction_source_boundary_message_id
+                    ),
+                    "source_boundary_entry_id": (
+                        inp.compaction_source_boundary_entry_id
+                    ),
+                }
+                if event.compaction_deadline_at_monotonic is not None:
+                    persist_kwargs["compaction_deadline_at_monotonic"] = (
+                        event.compaction_deadline_at_monotonic
+                    )
+                if event.compaction_timeout_seconds is not None:
+                    persist_kwargs["compaction_timeout_seconds"] = (
+                        event.compaction_timeout_seconds
+                    )
+                installed = await self._persist.persist_and_notify(**persist_kwargs)
+                if installed is False:
+                    await self._fire_after_compact(
+                        state,
+                        {
+                            "status": "skipped",
+                            "reason": "stale_preimage",
+                        },
+                    )
+                    return
+            except asyncio.CancelledError:
+                from opensquilla.engine.cache_break_monitor import notify_compaction
+                from opensquilla.session.compaction_lifecycle import (
+                    COMPACTION_TRIGGERED_EVENT,
+                    compaction_effect_payload,
+                    compaction_lifecycle_payload,
+                    new_compaction_id,
                 )
+
+                compaction_id = event.compaction_id or new_compaction_id()
+                notify_compaction(
+                    inp.session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="cancelled",
+                    reason="cancelled",
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                await self._fire_after_compact(
+                    state,
+                    {"status": "cancelled", "reason": "cancelled"},
+                )
+                raise
+            except CompactionTimeoutError as exc:
+                from opensquilla.engine.cache_break_monitor import notify_compaction
+                from opensquilla.session.compaction_lifecycle import (
+                    COMPACTION_TRIGGERED_EVENT,
+                    compaction_effect_payload,
+                    compaction_lifecycle_payload,
+                    new_compaction_id,
+                )
+
+                compaction_id = event.compaction_id or new_compaction_id()
+                notify_compaction(
+                    inp.session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason="compaction_deadline_exceeded",
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                await self._fire_after_compact(
+                    state,
+                    {
+                        "status": "timed_out",
+                        "reason": "compaction_deadline_exceeded",
+                    },
+                )
+                return
             except Exception as exc:  # noqa: BLE001 - preserve turn recoverability
                 log.warning("compaction_persist_failed", error=str(exc))
                 from opensquilla.engine.cache_break_monitor import notify_compaction

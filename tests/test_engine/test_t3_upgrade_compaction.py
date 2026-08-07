@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -316,6 +317,97 @@ async def test_t3_passes_profile_config_without_provider_or_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_t3_protects_active_and_queued_prompts_in_compaction_config() -> None:
+    session_key = "agent:main:webchat:default"
+    active_user = TranscriptEntry(
+        session_id="s1",
+        session_key=session_key,
+        role="user",
+        content="active user",
+        token_count=10,
+    )
+    transcript = [
+        TranscriptEntry(
+            session_id="s1",
+            session_key=session_key,
+            role="user",
+            content="old user",
+            token_count=60_000,
+        ),
+        TranscriptEntry(
+            session_id="s1",
+            session_key=session_key,
+            role="assistant",
+            content="old assistant",
+            token_count=60_000,
+        ),
+        active_user,
+        TranscriptEntry(
+            session_id="s1",
+            session_key=session_key,
+            role="user",
+            content="queued user",
+            token_count=10,
+        ),
+    ]
+    sm = _ResultCompactionSessionManager(transcript)
+    runner = _make_runner(session_manager=sm, flush_service=_FakeFlushService())
+
+    result = await runner._maybe_compact_on_t3_upgrade(
+        session_key,
+        _make_turn(),
+        100_000,
+        history_has_persisted_user=True,
+        bound_user_message_id=active_user.message_id,
+    )
+
+    assert result == "handled"
+    assert len(sm.compact_configs) == 1
+    config = sm.compact_configs[0]
+    assert isinstance(config, CompactionConfig)
+    assert config.protected_recent_messages == 2
+
+
+@pytest.mark.asyncio
+async def test_t3_skips_durable_work_when_active_prompt_alone_is_too_large() -> None:
+    session_key = "agent:main:webchat:default"
+    active_user = TranscriptEntry(
+        session_id="s1",
+        session_key=session_key,
+        role="user",
+        content="active user",
+        token_count=1000,
+    )
+    transcript = [
+        TranscriptEntry(
+            session_id="s1",
+            session_key=session_key,
+            role="assistant",
+            content="small old history",
+            token_count=10,
+        ),
+        active_user,
+    ]
+    sm = _ResultCompactionSessionManager(transcript)
+    sm.record_memory_checkpoint = AsyncMock()
+    fs = _FakeFlushService()
+    runner = _make_runner(session_manager=sm, flush_service=fs)
+
+    result = await runner._maybe_compact_on_t3_upgrade(
+        session_key,
+        _make_turn(),
+        1000,
+        history_has_persisted_user=True,
+        bound_user_message_id=active_user.message_id,
+    )
+
+    assert result == "handled"
+    assert sm.compact_calls == []
+    sm.record_memory_checkpoint.assert_not_called()
+    assert fs.execute_calls == []
+
+
+@pytest.mark.asyncio
 async def test_t3_within_budget_skips_flush_and_compact() -> None:
     sm = _FakeSessionManager(_within_budget_transcript())
     fs = _FakeFlushService()
@@ -331,18 +423,30 @@ async def test_t3_within_budget_skips_flush_and_compact() -> None:
 
 
 @pytest.mark.asyncio
-async def test_t3_budget_check_counts_full_tool_call_replay() -> None:
-    from opensquilla.session.compaction import (
-        estimate_entry_model_replay_tokens,
-        estimate_entry_replay_tokens,
-    )
+async def test_t3_budget_check_counts_full_tool_call_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.session.compaction as compaction_module
 
+    monkeypatch.setattr(
+        compaction_module,
+        "_estimate_tokens",
+        lambda text: max(1, len(text) // 4),
+    )
     transcript = _tool_heavy_transcript()
-    window = 30_000
-    summarized = sum(estimate_entry_replay_tokens(e) for e in transcript)
-    model_replay = sum(estimate_entry_model_replay_tokens(e) for e in transcript)
+    summarized = sum(compaction_module.estimate_entry_replay_tokens(e) for e in transcript)
+    model_replay = sum(
+        compaction_module.estimate_entry_model_replay_tokens(e) for e in transcript
+    )
+    # Derive the window from the estimators instead of hard-coding a token
+    # count. This assertion is about WHICH estimator the budget check consults,
+    # not about an incidental absolute token count. The midpoint of the valid
+    # band keeps margin on both sides while deterministic token math keeps the
+    # test offline.
+    safety_margin = 1.2
+    window = int((summarized + model_replay) * safety_margin / 2)
     # The summarized estimate looks within budget while the model replay overflows.
-    assert summarized * 1.2 <= window < model_replay * 1.2
+    assert summarized * safety_margin <= window < model_replay * safety_margin
 
     sm = _FakeSessionManager(transcript)
     fs = _FakeFlushService()

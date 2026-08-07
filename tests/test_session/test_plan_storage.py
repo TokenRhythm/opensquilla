@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -23,7 +25,10 @@ from opensquilla.session.plans import (
     plan_revision_snapshot,
     plan_run_snapshot,
 )
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import (
+    PlanImplementationSessionBusyError,
+    SessionStorage,
+)
 
 SESSION_KEY = "agent:main:webchat:plans"
 SESSION_ID = "session-plans"
@@ -322,6 +327,76 @@ async def test_plan_run_progress_is_server_authoritative_and_cas_guarded(
     assert completed.active_task_id is None
     assert completed.finished_at is not None
     assert await storage.get_active_plan_run(SESSION_KEY) is None
+
+
+async def test_plan_run_ignores_requested_jump_and_recovers_earliest_pending_step(
+    storage: SessionStorage,
+) -> None:
+    candidate = _revision().model_copy(
+        update={
+            "steps": [
+                {"step_id": "step-1", "title": "First"},
+                {"step_id": "step-2", "title": "Second"},
+                {"step_id": "step-3", "title": "Third"},
+                {"step_id": "step-4", "title": "Fourth"},
+            ],
+            "content_hash": "",
+        }
+    )
+    revision = await storage.create_plan_revision(
+        candidate,
+        expected_parent_revision_id=None,
+    )
+    queued = await storage.start_plan_run(_run("run-canonical-next", revision.revision_id))
+    running = await storage.mark_plan_run_running(
+        queued.run_id,
+        expected_state_revision=queued.state_revision,
+        active_task_id="task-1",
+    )
+
+    canonical = await storage.checkpoint_plan_run(
+        running.run_id,
+        expected_state_revision=running.state_revision,
+        expected_active_task_id="task-1",
+        step_id="step-1",
+        step_status="completed",
+        next_step_id="step-3",
+    )
+    assert canonical.current_step_id == "step-2"
+    assert [state["status"] for state in canonical.step_states] == [
+        "completed",
+        "in_progress",
+        "pending",
+        "pending",
+    ]
+
+    # Simulate a pre-fix overlay that already jumped to a later step. Finishing
+    # that truthful current step must lazily converge to the earliest pending one.
+    await storage.conn.execute(
+        """
+        UPDATE plan_runs
+        SET step_states = ?, current_step_id = 'step-3'
+        WHERE run_id = ?
+        """,
+        (
+            '[{"step_id":"step-1","status":"completed"},'
+            '{"step_id":"step-2","status":"pending"},'
+            '{"step_id":"step-3","status":"in_progress"},'
+            '{"step_id":"step-4","status":"pending"}]',
+            running.run_id,
+        ),
+    )
+    legacy = await storage.get_plan_run(running.run_id)
+    assert legacy is not None
+    recovered = await storage.checkpoint_plan_run(
+        legacy.run_id,
+        expected_state_revision=legacy.state_revision,
+        expected_active_task_id="task-1",
+        step_id="step-3",
+        step_status="completed",
+        next_step_id="step-4",
+    )
+    assert recovered.current_step_id == "step-2"
 
 
 async def test_complete_plan_run_requires_final_checkpoint_owner_and_fresh_revision(
@@ -713,6 +788,205 @@ async def test_restart_abandonment_releases_plan_run_owner_for_resume(
     assert resumed.driver_id == "goal-a"
 
 
+@pytest.mark.parametrize(
+    ("run_status", "task_status", "delivery_ready", "expected_status", "expected_reason"),
+    [
+        pytest.param(
+            PlanRunStatus.QUEUED,
+            AgentTaskStatus.SUCCEEDED,
+            False,
+            PlanRunStatus.CANCELLED,
+            "implementation_turn_ended_before_start",
+            id="queued-terminal-owner-cancels",
+        ),
+        pytest.param(
+            PlanRunStatus.RUNNING,
+            AgentTaskStatus.SUCCEEDED,
+            True,
+            PlanRunStatus.COMPLETED,
+            None,
+            id="successful-delivery-ready-owner-completes",
+        ),
+        pytest.param(
+            PlanRunStatus.RUNNING,
+            AgentTaskStatus.FAILED,
+            False,
+            PlanRunStatus.PAUSED,
+            "manual_turn_failed",
+            id="failed-running-owner-pauses",
+        ),
+    ],
+)
+async def test_restart_reconciles_plan_run_with_terminal_owner(
+    storage: SessionStorage,
+    run_status: PlanRunStatus,
+    task_status: AgentTaskStatus,
+    delivery_ready: bool,
+    expected_status: PlanRunStatus,
+    expected_reason: str | None,
+) -> None:
+    await storage.create_plan_revision(
+        _revision(),
+        expected_parent_revision_id=None,
+    )
+    task_id = f"terminal-owner-{run_status.value}-{task_status.value}"
+    await storage.create_agent_task(_task(task_id))
+    queued = await storage.start_plan_run(
+        _run("run-terminal-owner", active_task_id=task_id)
+    )
+    current = queued
+    if run_status == PlanRunStatus.RUNNING:
+        current = await storage.mark_plan_run_running(
+            queued.run_id,
+            expected_state_revision=queued.state_revision,
+            active_task_id=task_id,
+        )
+        if delivery_ready:
+            current = await storage.checkpoint_plan_run(
+                current.run_id,
+                expected_state_revision=current.state_revision,
+                expected_active_task_id=task_id,
+                step_id="step-1",
+                step_status="completed",
+            )
+            current = await storage.checkpoint_plan_run(
+                current.run_id,
+                expected_state_revision=current.state_revision,
+                expected_active_task_id=task_id,
+                step_id="implement",
+                step_status="completed",
+            )
+    await storage.update_agent_task(
+        task_id,
+        status=task_status,
+        finished_at=475,
+        terminal_reason=task_status.value,
+    )
+
+    abandoned = await storage.mark_abandoned_agent_tasks(now_ms=500)
+    recovered = await storage.get_plan_run(current.run_id)
+
+    assert abandoned == 0
+    assert recovered is not None
+    assert recovered.status == expected_status
+    assert recovered.active_task_id is None
+    assert recovered.state_revision == current.state_revision + 1
+    if expected_status == PlanRunStatus.PAUSED:
+        assert recovered.pause_reason == expected_reason
+        assert recovered.finished_at is None
+    else:
+        assert recovered.terminal_reason == expected_reason
+        assert recovered.finished_at == 500
+
+
+async def test_restart_pauses_plan_run_with_missing_owner(
+    storage: SessionStorage,
+) -> None:
+    await storage.create_plan_revision(
+        _revision(),
+        expected_parent_revision_id=None,
+    )
+    queued = await storage.start_plan_run(
+        _run("run-orphan-owner", active_task_id="missing-task")
+    )
+    running = await storage.mark_plan_run_running(
+        queued.run_id,
+        expected_state_revision=queued.state_revision,
+        active_task_id="missing-task",
+    )
+
+    abandoned = await storage.mark_abandoned_agent_tasks(now_ms=500)
+    recovered = await storage.get_plan_run(running.run_id)
+
+    assert abandoned == 0
+    assert recovered is not None
+    assert recovered.status == PlanRunStatus.PAUSED
+    assert recovered.active_task_id is None
+    assert recovered.pause_reason == "orphaned_plan_run_owner"
+    assert recovered.terminal_reason == "orphaned_plan_run_owner"
+    assert recovered.finished_at is None
+    assert recovered.state_revision == running.state_revision + 1
+
+
+async def test_restart_pauses_plan_run_with_null_owner(
+    storage: SessionStorage,
+) -> None:
+    await storage.create_plan_revision(
+        _revision(),
+        expected_parent_revision_id=None,
+    )
+    queued = await storage.start_plan_run(_run("run-null-owner"))
+
+    abandoned = await storage.mark_abandoned_agent_tasks(now_ms=500)
+    recovered = await storage.get_plan_run(queued.run_id)
+
+    assert abandoned == 0
+    assert recovered is not None
+    assert recovered.status == PlanRunStatus.PAUSED
+    assert recovered.active_task_id is None
+    assert recovered.pause_reason == "orphaned_plan_run_owner"
+    assert recovered.terminal_reason == "orphaned_plan_run_owner"
+    assert recovered.finished_at is None
+    assert recovered.state_revision == queued.state_revision + 1
+
+
+async def test_storage_reopen_reconciles_terminal_owner_plan_run(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "plan-run-recovery.sqlite"
+    first = await SessionStorage.open(str(db_path))
+    await first.upsert_session(
+        SessionNode(
+            session_key=SESSION_KEY,
+            session_id=SESSION_ID,
+            agent_id="main",
+            created_at=100,
+            updated_at=100,
+            epoch=0,
+        )
+    )
+    await first.create_plan_revision(
+        _revision(),
+        expected_parent_revision_id=None,
+    )
+    task_id = "terminal-owner-before-restart"
+    await first.create_agent_task(_task(task_id))
+    queued = await first.start_plan_run(
+        _run("run-reconcile-on-open", active_task_id=task_id)
+    )
+    current = await first.mark_plan_run_running(
+        queued.run_id,
+        expected_state_revision=queued.state_revision,
+        active_task_id=task_id,
+    )
+    for step_id in ("step-1", "implement"):
+        current = await first.checkpoint_plan_run(
+            current.run_id,
+            expected_state_revision=current.state_revision,
+            expected_active_task_id=task_id,
+            step_id=step_id,
+            step_status="completed",
+        )
+    await first.update_agent_task(
+        task_id,
+        status=AgentTaskStatus.SUCCEEDED,
+        finished_at=475,
+        terminal_reason="completed",
+    )
+    await first.close()
+
+    reopened = await SessionStorage.open(str(db_path))
+    try:
+        recovered = await reopened.get_plan_run(current.run_id)
+        assert recovered is not None
+        assert recovered.status == PlanRunStatus.COMPLETED
+        assert recovered.active_task_id is None
+        assert recovered.current_step_id is None
+        assert recovered.finished_at is not None
+    finally:
+        await reopened.close()
+
+
 async def test_goal_run_owner_must_resume_the_same_run_and_driver(
     storage: SessionStorage,
 ) -> None:
@@ -989,6 +1263,167 @@ async def test_accept_turn_atomically_starts_run_and_updates_collaboration_state
     assert [
         entry.message_id for entry in await storage.get_transcript(SESSION_ID)
     ] == ["user-implement"]
+
+
+async def test_accept_turn_plan_implementation_requires_idle_session_without_writes(
+    storage: SessionStorage,
+) -> None:
+    revision = await storage.create_plan_revision(
+        _revision(),
+        expected_parent_revision_id=None,
+    )
+    before = await storage.get_session(SESSION_KEY)
+    assert before is not None
+    await storage.create_agent_task(_task("task-already-queued"))
+
+    with pytest.raises(PlanImplementationSessionBusyError) as busy:
+        await storage.accept_turn(
+            _user_entry("user-busy-implement"),
+            expected_epoch=0,
+            updated_at=500,
+            task_record=_task("task-must-not-persist"),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-busy-implement",
+            request_fingerprint="sha256:request-busy-implement",
+            session_updates={"collaboration_mode": CollaborationMode.DEFAULT},
+            plan_run=_run(
+                "run-must-not-persist",
+                revision_id=revision.revision_id,
+                active_task_id="task-must-not-persist",
+            ),
+            expected_collaboration_revision=before.collaboration_revision,
+            expected_active_plan_revision_id=revision.revision_id,
+            require_idle_for_current_plan_implementation=True,
+        )
+
+    assert busy.value.task_id == "task-already-queued"
+    after = await storage.get_session(SESSION_KEY)
+    assert after == before
+    assert await storage.count_transcript_entries(SESSION_ID) == 0
+    assert await storage.get_agent_task("task-must-not-persist") is None
+    assert await storage.get_plan_run("run-must-not-persist") is None
+    assert await storage.get_turn_ingress_receipt(
+        source_scope="webui",
+        request_session_key=SESSION_KEY,
+        client_request_id="request-busy-implement",
+    ) is None
+
+
+async def test_accept_turn_plan_cas_cannot_restore_a_stale_active_revision(
+    storage: SessionStorage,
+) -> None:
+    first = await storage.create_plan_revision(
+        _revision(),
+        expected_parent_revision_id=None,
+    )
+    second = await storage.create_plan_revision(
+        _revision(
+            "revision-2",
+            parent_revision_id=first.revision_id,
+            generation=2,
+            message_id="assistant-plan-2",
+        ),
+        expected_parent_revision_id=first.revision_id,
+    )
+    before = await storage.get_session(SESSION_KEY)
+    assert before is not None
+
+    with pytest.raises(PlanConflictError, match="active plan revision changed"):
+        await storage.accept_turn(
+            _user_entry("user-stale-implement"),
+            expected_epoch=0,
+            updated_at=500,
+            task_record=_task("task-stale-implement"),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-stale-implement",
+            request_fingerprint="sha256:request-stale-implement",
+            session_updates={"collaboration_mode": CollaborationMode.DEFAULT},
+            plan_run=_run(
+                "run-stale-implement",
+                revision_id=first.revision_id,
+                active_task_id="task-stale-implement",
+            ),
+            expected_collaboration_revision=before.collaboration_revision,
+            expected_active_plan_revision_id=first.revision_id,
+            require_idle_for_current_plan_implementation=True,
+        )
+
+    after = await storage.get_session(SESSION_KEY)
+    assert after == before
+    assert after.active_plan_revision_id == second.revision_id
+    assert await storage.count_transcript_entries(SESSION_ID) == 0
+    assert await storage.get_plan_run("run-stale-implement") is None
+
+
+async def test_two_connections_atomically_arbitrate_plan_implementation(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "plan-implementation-race.sqlite"
+    first = await SessionStorage.open(str(db_path))
+    await first.upsert_session(
+        SessionNode(
+            session_key=SESSION_KEY,
+            session_id=SESSION_ID,
+            agent_id="main",
+            created_at=100,
+            updated_at=100,
+            epoch=0,
+        )
+    )
+    revision = await first.create_plan_revision(
+        _revision(),
+        expected_parent_revision_id=None,
+    )
+    session = await first.get_session(SESSION_KEY)
+    assert session is not None
+    second = await SessionStorage.open(str(db_path))
+
+    async def accept(
+        storage: SessionStorage,
+        *,
+        suffix: str,
+    ) -> object:
+        return await storage.accept_turn(
+            _user_entry(f"user-concurrent-{suffix}"),
+            expected_epoch=0,
+            updated_at=500,
+            task_record=_task(f"task-concurrent-{suffix}"),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id=f"request-concurrent-{suffix}",
+            request_fingerprint=f"sha256:request-concurrent-{suffix}",
+            session_updates={"collaboration_mode": CollaborationMode.DEFAULT},
+            plan_run=_run(
+                f"run-concurrent-{suffix}",
+                revision_id=revision.revision_id,
+                active_task_id=f"task-concurrent-{suffix}",
+            ),
+            expected_collaboration_revision=session.collaboration_revision,
+            expected_active_plan_revision_id=revision.revision_id,
+            require_idle_for_current_plan_implementation=True,
+        )
+
+    try:
+        results = await asyncio.gather(
+            accept(first, suffix="first"),
+            accept(second, suffix="second"),
+            return_exceptions=True,
+        )
+        accepted = [result for result in results if not isinstance(result, Exception)]
+        rejected = [result for result in results if isinstance(result, Exception)]
+        assert len(accepted) == 1
+        assert len(rejected) == 1
+        assert isinstance(rejected[0], PlanImplementationSessionBusyError)
+        tasks = await first.list_agent_tasks(SESSION_KEY)
+        assert len(tasks) == 1
+        active_run = await first.get_active_plan_run(SESSION_KEY)
+        assert active_run is not None
+        assert active_run.active_task_id == tasks[0].task_id
+    finally:
+        await second.close()
+        await first.close()
 
 
 async def test_accept_turn_rolls_back_plan_run_supersession_on_failure(

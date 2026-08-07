@@ -22,6 +22,7 @@ import asyncio
 import builtins
 import contextlib
 import inspect
+import json
 import time
 import uuid
 from collections import deque
@@ -34,6 +35,7 @@ import structlog
 
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.outcome import completed_outcome, outcome_from_error
+from opensquilla.engine.steps.inject_time_prefix import TIME_PREFIX_RE
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.session_lifecycle import TaskLifecycleEvent, TaskLifecycleListener
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
@@ -117,10 +119,61 @@ def _accepted_run_mode_payload(override: Any) -> dict[str, str] | None:
 def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
     """Detach one route for reuse without execution-scoped freshness."""
 
+    metadata = dict(envelope.metadata)
+    if metadata.get("guest_safe") is True:
+        for key in (
+            "guest_profile_root",
+            "guest_managed_root",
+            "guest_environment",
+            "sandbox_mounts",
+            "sandbox_run_context",
+        ):
+            metadata.pop(key, None)
     return replace(
         envelope,
-        metadata=dict(envelope.metadata),
+        metadata=metadata,
         sandbox_run_context_fresh=False,
+    )
+
+
+def _materialize_guest_task_envelope(
+    envelope: RouteEnvelope,
+    task_id: str,
+) -> RouteEnvelope:
+    """Attach one new process-local guest profile to an execution envelope."""
+
+    if envelope.metadata.get("guest_safe") is not True:
+        return envelope
+    existing_root = envelope.metadata.get("guest_profile_root")
+    if isinstance(existing_root, str) and existing_root:
+        return envelope
+    factory = envelope.runtime_services.get("guest_profile_factory")
+    if not callable(factory):
+        from opensquilla.sandbox.guest_profile import GuestProfileBoundaryError
+
+        raise GuestProfileBoundaryError(
+            f"{GuestProfileBoundaryError.code}: guest runtime profile factory is unavailable"
+        )
+    profile = factory(task_id)
+    if profile is None:
+        from opensquilla.sandbox.guest_profile import GuestProfileBoundaryError
+
+        raise GuestProfileBoundaryError(
+            f"{GuestProfileBoundaryError.code}: guest runtime profile is unavailable"
+        )
+    run_context_payload = profile.run_context().to_origin_payload()
+    metadata = {
+        **envelope.metadata,
+        "guest_profile_root": str(profile.root),
+        "guest_managed_root": str(profile.managed_root),
+        "guest_environment": dict(profile.environment),
+        "sandbox_mounts": run_context_payload["mounts"],
+        "sandbox_run_context": run_context_payload,
+    }
+    return replace(
+        envelope,
+        metadata=metadata,
+        sandbox_run_context_fresh=True,
     )
 
 
@@ -275,6 +328,7 @@ class _CollectedPrimaryInput:
     """One durable prompt coalesced into an already queued collect turn."""
 
     persisted_user_message_id: str | None
+    client_request_id: str | None
     client_message_id: str | None
     surface_id: str | None
     intent: str = "send"
@@ -315,6 +369,7 @@ class _RuntimeTask:
     terminal_emitted: bool = False
     cancel_requested: bool = False
     execution_started: bool = False
+    guest_profile_cleaned: bool = False
     acquired_slot: bool = False
     overflow_dropped: bool = False
     cancel_source: str | None = None
@@ -344,6 +399,29 @@ class _RuntimeTask:
     ) -> None:
         self.terminal_assistant_message_id = message_id
         self.terminal_assistant_message_content = content
+
+
+def _cleanup_guest_profile(task: _RuntimeTask) -> None:
+    """Remove one task-owned guest profile exactly once."""
+
+    if task.guest_profile_cleaned:
+        return
+    task.guest_profile_cleaned = True
+    guest_profile_root = task.envelope.metadata.get("guest_profile_root")
+    guest_managed_root = task.envelope.metadata.get("guest_managed_root")
+    if not (
+        isinstance(guest_profile_root, str)
+        and guest_profile_root
+        and isinstance(guest_managed_root, str)
+        and guest_managed_root
+    ):
+        return
+    from opensquilla.sandbox.guest_profile import cleanup_guest_profile_root
+
+    cleanup_guest_profile_root(
+        guest_profile_root,
+        managed_root=guest_managed_root,
+    )
 
 
 @dataclass(frozen=True)
@@ -499,6 +577,28 @@ def _ordered_message_ids(
     return ordered
 
 
+def _recover_meta_control_message(content: object) -> str | None:
+    """Recover provider text from an accepted text-only control transcript."""
+
+    if not isinstance(content, str) or not content:
+        return None
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        # Plain user entries receive the standard timestamp prefix after the
+        # provider-facing text is captured. Remove only that exact prefix.
+        return TIME_PREFIX_RE.sub("", content, count=1)
+    if not isinstance(parsed, dict):
+        return TIME_PREFIX_RE.sub("", content, count=1)
+    text = parsed.get("text")
+    attachments = parsed.get("attachments")
+    # MetaSkill launch and replay controls are text-only. Anything else is a
+    # corrupted or mismatched recovery row and must fail closed.
+    if not isinstance(text, str) or attachments != []:
+        return None
+    return text
+
+
 class PendingOverflowPolicy(StrEnum):
     """Per-session pending queue overflow policy.
 
@@ -652,6 +752,11 @@ class TaskRuntime:
         self._pending_by_session: dict[str, list[_RuntimeTask]] = {}
         self._running_by_session: dict[str, _RuntimeTask] = {}
         self._reservations_by_session: dict[str, list[TaskReservation]] = {}
+        # Low-priority, non-durable provider work (currently prompt-cache
+        # keepalive). A real enqueue cancels this task before reserving its
+        # turn, so auxiliary work can never make user input wait for network I/O.
+        self._auxiliary_tasks_by_session: dict[str, asyncio.Task[Any]] = {}
+        self._auxiliary_slot = asyncio.Semaphore(1)
         self._reserved_overflow_victims: set[str] = set()
         self._last_envelope_by_session: dict[str, RouteEnvelope] = {}
         self._last_envelope_task_id_by_session: dict[str, str] = {}
@@ -694,6 +799,134 @@ class TaskRuntime:
         self._agent_in_flight: dict[str, int] = {}
         self._fair_cond: asyncio.Condition | None = None
 
+    async def recover_durable_meta_controls(self, *, limit: int = 64) -> int:
+        """Reactivate accepted MetaSkill controls that never started.
+
+        Session storage marks persisted QUEUED controls with a dedicated
+        restart reason before this runtime is constructed.  RUNNING controls
+        are intentionally excluded: once the durable running boundary was
+        crossed, provider side effects may already have happened and automatic
+        replay would not be safe.
+
+        The original task id, transcript row, and server-bound ``meta_control``
+        payload are reused.  No transcript row or ingress receipt is inserted
+        during recovery.
+        """
+
+        claim = getattr(self._storage, "claim_recoverable_meta_control_tasks", None)
+        if not callable(claim):
+            return 0
+        batch_limit = max(1, min(int(limit), 256))
+        recovered = 0
+        while True:
+            claimed = await claim(limit=batch_limit)
+            if not claimed:
+                break
+            batch_failed = False
+            for item in claimed:
+                task = item.task
+                entry = item.entry
+                reservation: TaskReservation | None = None
+                try:
+                    details = task.details if isinstance(task.details, dict) else {}
+                    metadata = details.get("metadata")
+                    if not isinstance(metadata, dict) or not isinstance(
+                        metadata.get("meta_control"), dict
+                    ):
+                        raise ValueError("missing durable MetaSkill control metadata")
+                    persisted_message = details.get("meta_control_message")
+                    message = (
+                        persisted_message
+                        if isinstance(persisted_message, str)
+                        else _recover_meta_control_message(entry.content)
+                    )
+                    if message is None:
+                        raise ValueError("invalid durable MetaSkill control transcript")
+                    persisted_semantic = details.get("meta_control_semantic_message")
+                    semantic_message = (
+                        persisted_semantic
+                        if isinstance(persisted_semantic, str)
+                        else message
+                    )
+                    source_name = details.get("source_name")
+                    input_provenance = details.get("input_provenance")
+                    persisted_ids = details.get("persisted_user_message_ids")
+                    if not isinstance(persisted_ids, list):
+                        persisted_ids = []
+                    persisted_ids = [
+                        value for value in persisted_ids if isinstance(value, str)
+                    ]
+                    if entry.message_id not in persisted_ids:
+                        persisted_ids.insert(0, entry.message_id)
+                    envelope = RouteEnvelope(
+                        source_kind=SourceKind(task.source_kind),
+                        source_name=(
+                            source_name
+                            if isinstance(source_name, str) and source_name
+                            else "recovered_meta_control"
+                        ),
+                        agent_id=task.agent_id,
+                        session_key=task.session_key,
+                        session_id=entry.session_id,
+                        input_provenance=(
+                            dict(input_provenance)
+                            if isinstance(input_provenance, dict)
+                            else {}
+                        ),
+                        metadata=dict(metadata),
+                    )
+                    from opensquilla.engine.start_turn import reserve_turn_via_runtime
+
+                    reservation = await reserve_turn_via_runtime(
+                        self,
+                        envelope,
+                        message,
+                        attachments=[],
+                        mode="followup",
+                        run_kind=task.run_kind,
+                        no_memory_capture=bool(details.get("no_memory_capture", False)),
+                        semantic_message=semantic_message,
+                        persisted_user_message_id=entry.message_id,
+                        fresh_user_session=bool(details.get("fresh_user_session", False)),
+                        turn_id=task.task_id,
+                        bypass_pending_limit=True,
+                    )
+                    await self.activate(
+                        reservation,
+                        persisted_user_message_id=entry.message_id,
+                        persisted_user_message_ids=persisted_ids,
+                        fresh_user_session=bool(details.get("fresh_user_session", False)),
+                    )
+                    recovered += 1
+                except Exception as exc:  # noqa: BLE001 - preserve accepted work.
+                    batch_failed = True
+                    if reservation is not None and not reservation.activated:
+                        with contextlib.suppress(Exception):
+                            await self.abort_reservation(reservation)
+                    with contextlib.suppress(Exception):
+                        await self._storage.update_agent_task(
+                            task.task_id,
+                            status=AgentTaskStatus.ABANDONED,
+                            finished_at=int(time.time() * 1000),
+                            terminal_reason="meta_control_restart_before_start",
+                            error_class=type(exc).__name__,
+                            error_message=(
+                                "Gateway could not reactivate the accepted MetaSkill control"
+                            ),
+                        )
+                    log.error(
+                        "task_runtime.meta_control_recovery_failed",
+                        task_id=task.task_id,
+                        session_key=task.session_key,
+                        error_class=type(exc).__name__,
+                        exc_info=True,
+                    )
+            # A failed row was returned to the same claim pool. Stop this boot
+            # pass to avoid a tight retry loop; a later restart can retry it.
+            if batch_failed or len(claimed) < batch_limit:
+                break
+        return recovered
+
     async def enqueue(
         self,
         envelope: RouteEnvelope,
@@ -726,6 +959,7 @@ class TaskRuntime:
             valid = ", ".join(sorted(self.supported_queue_modes))
             raise ValueError(f"mode must be one of {{{valid}}}")
         async with self.collect_admission(envelope.session_key):
+            await self.cancel_auxiliary(envelope.session_key)
             if queue_mode == "collect":
                 collected = await self._try_collect(
                     envelope=envelope,
@@ -778,6 +1012,64 @@ class TaskRuntime:
         async with lock:
             yield
 
+    async def cancel_auxiliary(self, session_key: str) -> None:
+        """Cancel low-priority work for one session without waiting on it."""
+
+        key = canonicalize_session_key(session_key)
+        async with self._state_lock:
+            task = self._auxiliary_tasks_by_session.get(key)
+        current = asyncio.current_task()
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+
+    async def run_auxiliary_if_idle(
+        self,
+        session_key: str,
+        operation: Callable[[], Awaitable[None]],
+    ) -> bool:
+        """Run cancellable work only while the session has no real task.
+
+        Returns ``False`` when admission found real work or another auxiliary
+        owner. The caller's task becomes the auxiliary owner so cancellation
+        from ``enqueue`` propagates directly into the provider stream.
+        """
+
+        key = canonicalize_session_key(session_key)
+        current = asyncio.current_task()
+        if current is None:
+            return False
+
+        async with self.collect_admission(key):
+            async with self._state_lock:
+                busy = bool(
+                    self._pending_by_session.get(key)
+                    or self._running_by_session.get(key)
+                    or self._reservations_by_session.get(key)
+                    or self._auxiliary_tasks_by_session.get(key)
+                )
+                if busy:
+                    return False
+                self._auxiliary_tasks_by_session[key] = current
+
+        execution_lock = self._session_execution_locks.setdefault(key, asyncio.Lock())
+        try:
+            async with self._auxiliary_slot:
+                async with execution_lock:
+                    async with self._state_lock:
+                        real_work_arrived = bool(
+                            self._pending_by_session.get(key)
+                            or self._running_by_session.get(key)
+                            or self._reservations_by_session.get(key)
+                        )
+                    if real_work_arrived:
+                        return False
+                    await operation()
+                    return True
+        finally:
+            async with self._state_lock:
+                if self._auxiliary_tasks_by_session.get(key) is current:
+                    self._auxiliary_tasks_by_session.pop(key, None)
+
     @contextlib.asynccontextmanager
     async def quiesce_sessions(
         self,
@@ -807,6 +1099,9 @@ class TaskRuntime:
 
         key_set = frozenset(keys)
         while True:
+            await asyncio.gather(
+                *(self.cancel_auxiliary(key) for key in keys),
+            )
             await self._cancel_and_drain_session_drivers(keys, key_set)
 
             async with contextlib.AsyncExitStack() as fences:
@@ -1066,6 +1361,7 @@ class TaskRuntime:
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
+        bypass_pending_limit: bool = False,
     ) -> TaskReservation:
         """Reserve queue admission without persistence, cancellation, or execution."""
 
@@ -1115,6 +1411,15 @@ class TaskRuntime:
                 "fresh_user_session": fresh_user_session,
             },
         )
+        if isinstance(envelope.metadata.get("meta_control"), dict):
+            # Controls are text-only and already present in the transcript.
+            # Persist their exact provider/semantic projections so restart
+            # recovery is independent of display envelopes and time stamping.
+            assert record.details is not None
+            record.details["meta_control_message"] = message
+            record.details["meta_control_semantic_message"] = (
+                semantic_message if isinstance(semantic_message, str) else message
+            )
         record.details = {
             **(record.details or {}),
             **_task_identity_payload(
@@ -1174,7 +1479,8 @@ class TaskRuntime:
 
         async with self._state_lock:
             if (
-                queue_mode not in {QueueMode.STEER.value, QueueMode.INTERRUPT.value}
+                not bypass_pending_limit
+                and queue_mode not in {QueueMode.STEER.value, QueueMode.INTERRUPT.value}
                 and self._max_pending_per_session is not None
             ):
                 pending = [
@@ -1210,6 +1516,18 @@ class TaskRuntime:
             self._reservations_by_session.setdefault(envelope.session_key, []).append(
                 reservation
             )
+        try:
+            runtime_task.envelope = _materialize_guest_task_envelope(
+                runtime_task.envelope,
+                runtime_task.task_id,
+            )
+            if isinstance(reservation.task_record.details, dict):
+                reservation.task_record.details["metadata"] = dict(
+                    runtime_task.envelope.metadata
+                )
+        except BaseException:
+            await self.abort_reservation(reservation)
+            raise
         return reservation
 
     async def abort_reservation(self, reservation: TaskReservation) -> None:
@@ -1228,6 +1546,7 @@ class TaskRuntime:
                     reservation.overflow_victim.task_id
                 )
             reservation.aborted = True
+        _cleanup_guest_profile(reservation.runtime_task)
 
     async def _emit_queued_activation(
         self,
@@ -1292,6 +1611,18 @@ class TaskRuntime:
                 raise RuntimeError("Unknown task reservation")
 
             runtime_task = reservation.runtime_task
+            persisted_details = reservation.task_record.details
+            if isinstance(persisted_details, dict):
+                persisted_metadata = persisted_details.get("metadata")
+                if isinstance(persisted_metadata, dict):
+                    # Durable acceptance may resolve authoritative metadata
+                    # (notably the actual collaboration revision) inside the
+                    # same transaction that admits the task. Activate that
+                    # exact snapshot instead of a caller-predicted value.
+                    runtime_task.envelope = replace(
+                        runtime_task.envelope,
+                        metadata=dict(persisted_metadata),
+                    )
             if not runtime_task.accepted_config_captured:
                 accepted_config = (
                     self._accepted_config_provider()
@@ -1963,11 +2294,20 @@ class TaskRuntime:
             Deadline (seconds) for the graceful drain phase.  ``None`` means
             wait indefinitely (use with care in production; set a finite value).
         """
+        auxiliary_tasks = [
+            task
+            for task in self._auxiliary_tasks_by_session.values()
+            if not task.done()
+        ]
+        for auxiliary_task in auxiliary_tasks:
+            auxiliary_task.cancel()
         tasks = [
             task.asyncio_task
             for task in self._tasks.values()
             if task.asyncio_task is not None and not task.asyncio_task.done()
         ]
+        if auxiliary_tasks:
+            await asyncio.gather(*auxiliary_tasks, return_exceptions=True)
         if not tasks:
             return
 
@@ -2135,18 +2475,22 @@ class TaskRuntime:
                 except (TypeError, ValueError):
                     revision = 2
                 try:
+                    context: dict[str, Any] = {
+                        "turn_id": handle.task_id,
+                        "client_message_id": metadata.get("client_message_id"),
+                        "surface_id": metadata.get("surface_id"),
+                        "intent": metadata.get("turn_context_intent", "send"),
+                        "disposition": "queued",
+                        "target_turn_id": handle.task_id,
+                        "revision": revision,
+                    }
+                    client_request_id = metadata.get("client_request_id")
+                    if isinstance(client_request_id, str) and client_request_id:
+                        context["client_request_id"] = client_request_id
                     identity_rebound = await self._update_transcript_turn_context(
                         envelope.session_key,
                         persisted_user_message_id,
-                        {
-                            "turn_id": handle.task_id,
-                            "client_message_id": metadata.get("client_message_id"),
-                            "surface_id": metadata.get("surface_id"),
-                            "intent": metadata.get("turn_context_intent", "send"),
-                            "disposition": "queued",
-                            "target_turn_id": handle.task_id,
-                            "revision": revision,
-                        },
+                        context,
                     )
                 except Exception as exc:
                     log.warning(
@@ -2334,6 +2678,9 @@ class TaskRuntime:
                 metadata = envelope.metadata
                 collected_identity: _CollectedPrimaryInput | None = None
                 if persisted_user_message_id or metadata.get("client_message_id"):
+                    client_request_id = metadata.get("client_request_id")
+                    if not isinstance(client_request_id, str) or not client_request_id:
+                        client_request_id = None
                     try:
                         revision = max(
                             2,
@@ -2343,6 +2690,7 @@ class TaskRuntime:
                         revision = 2
                     collected_identity = _CollectedPrimaryInput(
                         persisted_user_message_id=persisted_user_message_id,
+                        client_request_id=client_request_id,
                         client_message_id=metadata.get("client_message_id"),
                         surface_id=metadata.get("surface_id"),
                         intent=metadata.get("turn_context_intent", "send"),
@@ -2435,6 +2783,12 @@ class TaskRuntime:
                         ),
                         "revision": int(metadata.get("turn_context_revision", 1) or 1),
                     }
+                    client_request_id = metadata.get("client_request_id")
+                    if isinstance(client_request_id, str) and client_request_id:
+                        turn_context["client_request_id"] = client_request_id
+                    meta_control = metadata.get("meta_control")
+                    if isinstance(meta_control, dict):
+                        turn_context["meta_control"] = dict(meta_control)
                     if (
                         metadata.get("collaboration_mode") == "plan"
                         or int(metadata.get("collaboration_revision", 0) or 0) > 0
@@ -2636,6 +2990,7 @@ class TaskRuntime:
         finally:
             self._user_input_broker.cancel_task(task.task_id)
             await self._settle_attached_plan_run(task)
+            _cleanup_guest_profile(task)
 
     async def _freeze_collaboration_context(self, task: _RuntimeTask) -> None:
         """Snapshot session collaboration state at the actual turn boundary.
@@ -3970,15 +4325,21 @@ class TaskRuntime:
     ) -> None:
         """Finalize one task after collect and same-turn admissions settle."""
 
-        async with task.collect_claim:
-            async with task.steer_claim:
-                await self._mark_terminal_claimed(
-                    task,
-                    status,
-                    terminal_reason=terminal_reason,
-                    error_class=error_class,
-                    error_message=error_message,
-                )
+        try:
+            async with task.collect_claim:
+                async with task.steer_claim:
+                    await self._mark_terminal_claimed(
+                        task,
+                        status,
+                        terminal_reason=terminal_reason,
+                        error_class=error_class,
+                        error_message=error_message,
+                    )
+        finally:
+            # A driver cancelled before its first event-loop step never enters
+            # ``_execute`` and therefore has no execution ``finally`` block.
+            if not task.execution_started:
+                _cleanup_guest_profile(task)
 
     async def _mark_terminal_claimed(
         self,
@@ -4203,6 +4564,12 @@ class TaskRuntime:
             "disposition": disposition,
             "revision": max(2, base_revision + 1),
         }
+        client_request_id = metadata.get("client_request_id")
+        if isinstance(client_request_id, str) and client_request_id:
+            context["client_request_id"] = client_request_id
+        meta_control = metadata.get("meta_control")
+        if isinstance(meta_control, dict):
+            context["meta_control"] = dict(meta_control)
         for context_field in ("target_turn_id", "promoted_from_turn_id"):
             value = metadata.get(context_field)
             if isinstance(value, str) and value:
@@ -4284,6 +4651,8 @@ class TaskRuntime:
             "target_turn_id": task.task_id,
             "revision": item.revision,
         }
+        if item.client_request_id is not None:
+            context["client_request_id"] = item.client_request_id
         try:
             updated = await self._update_transcript_turn_context(
                 task.envelope.session_key,

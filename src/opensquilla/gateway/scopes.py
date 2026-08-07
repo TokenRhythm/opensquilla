@@ -38,6 +38,30 @@ NODE_SCOPE = "node"
 
 OPERATOR_SCOPE_NAMESPACE = "operator."
 
+# Execution capabilities are intentionally separate from RPC scopes.
+GUEST_SAFE_CAPABILITY = "guest.safe"
+HOST_EXECUTE_CAPABILITY = "host.execute"
+HOST_READ_CAPABILITY = "host.read"
+TASK_READ_CAPABILITY = "task.read"
+TASK_SUBMIT_CAPABILITY = "task.submit"
+LOCAL_OWNER_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        HOST_EXECUTE_CAPABILITY,
+        HOST_READ_CAPABILITY,
+        TASK_READ_CAPABILITY,
+        TASK_SUBMIT_CAPABILITY,
+    }
+)
+HUMAN_TOKEN_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        HOST_EXECUTE_CAPABILITY,
+        HOST_READ_CAPABILITY,
+        TASK_READ_CAPABILITY,
+        TASK_SUBMIT_CAPABILITY,
+    }
+)
+GUEST_SAFE_CAPABILITIES: frozenset[str] = frozenset({GUEST_SAFE_CAPABILITY})
+
 # Default scope set for a locally-proven operator: same machine, loopback
 # transport. Mirrors what the desktop CLI declares on connect.
 CLI_DEFAULT_OPERATOR_SCOPES: frozenset[str] = frozenset(
@@ -56,7 +80,7 @@ CLI_DEFAULT_OPERATOR_SCOPES: frozenset[str] = frozenset(
 # not get destructive privileges. Pairing and proposals are also excluded:
 # proposal mutation promotes generated SKILL.md files into the managed skill
 # layer, so remote callers need an authenticated/admin path for that surface.
-REMOTE_OPERATOR_SCOPES: frozenset[str] = frozenset({READ_SCOPE, WRITE_SCOPE, APPROVALS_SCOPE})
+REMOTE_OPERATOR_SCOPES: frozenset[str] = frozenset({READ_SCOPE, WRITE_SCOPE})
 
 # Default scopes for the node role (separate scope namespace).
 NODE_DEFAULT_SCOPES: frozenset[str] = frozenset({NODE_SCOPE})
@@ -105,6 +129,9 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.hydrate": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
+    "sessions.promptCacheKeepalive.status": READ_SCOPE,
+    "artifacts.list": READ_SCOPE,
+    "artifacts.get": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,
     "last-heartbeat": READ_SCOPE,
     "system-presence": READ_SCOPE,
@@ -130,6 +157,10 @@ METHOD_SCOPES: dict[str, str] = {
     "tools.search_provider": READ_SCOPE,  # OpenSquilla-only; classified read.
     "sandbox.status": READ_SCOPE,  # OpenSquilla-only; sandbox posture summary.
     "sandbox.setup.status": READ_SCOPE,  # OpenSquilla-only; setup readiness.
+    "sandbox.capability.status": READ_SCOPE,  # OpenSquilla-only; real Safe capability.
+    "sandbox.policy.get": READ_SCOPE,  # OpenSquilla-only; versioned Safe settings.
+    "sandbox.policy.defaults": READ_SCOPE,  # OpenSquilla-only; immutable Safe rules.
+    "sandbox.tokens.list": READ_SCOPE,  # OpenSquilla-only; owner token metadata.
     "sandbox.explain": READ_SCOPE,  # OpenSquilla-only; deterministic sandbox explanation.
     "sandbox.run_context.get": READ_SCOPE,  # OpenSquilla-only; session sandbox mode.
     "sandbox.run_mode.preference.get": READ_SCOPE,  # OpenSquilla-only; global picker default.
@@ -154,6 +185,8 @@ METHOD_SCOPES: dict[str, str] = {
     "usage.cost": READ_SCOPE,
     "usage.query": READ_SCOPE,
     "meta.list": READ_SCOPE,  # OpenSquilla-only; invokable meta-skill catalog.
+    "meta.setup.plan": READ_SCOPE,  # OpenSquilla-only; dependency setup preview.
+    "meta.setup.status": READ_SCOPE,  # OpenSquilla-only; background setup progress.
     "meta.runs.list": READ_SCOPE,
     "meta.runs.failures": READ_SCOPE,
     "meta.runs.cost": READ_SCOPE,
@@ -206,6 +239,7 @@ METHOD_SCOPES: dict[str, str] = {
     # REMOTE_OPERATOR_SCOPES (no admin) — surfacing as "Failed to delete session"
     # (issues #357, #307).
     "sessions.delete": WRITE_SCOPE,
+    "sessions.promptCacheKeepalive.set": WRITE_SCOPE,
     "sandbox.workspace.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.mount.add": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.mount.remove": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
@@ -214,6 +248,9 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.bundle.enable": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.bundle.disable": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.setup.ensure": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded setup.
+    "sandbox.policy.update": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded settings.
+    "sandbox.tokens.create": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded token issue.
+    "sandbox.tokens.revoke": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded token revoke.
     "sandbox.resume": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded denial-pause clear.
     "sandbox.run_context.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.run_mode.preference.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded default.
@@ -223,6 +260,11 @@ METHOD_SCOPES: dict[str, str] = {
     "config.patch.safe": WRITE_SCOPE,
     # OpenSquilla-only; manual ``/meta`` command launch stamp.
     "meta.run": WRITE_SCOPE,
+    # Raw prompts remain owner/admin-gated inside the handlers. WRITE_SCOPE is
+    # the dispatch envelope so a locally-proven owner using a least-privilege
+    # token can reach that second, transport-proven authorization check.
+    "meta.drafts.list": WRITE_SCOPE,
+    "meta.drafts.discard": WRITE_SCOPE,
     # ----- approvals -----
     # Policy getters/setters explicitly override the ``exec.approvals.`` prefix
     # so that approval workers (which hold operator.approvals) can read/set the
@@ -277,9 +319,11 @@ METHOD_SCOPES: dict[str, str] = {
     "skills.uninstall": ADMIN_SCOPE,
     "skills.reload": ADMIN_SCOPE,
     "skills.deps.install": ADMIN_SCOPE,
+    "meta.setup.install": ADMIN_SCOPE,
     "meta.runs.show": ADMIN_SCOPE,
     "meta.runs.draft": ADMIN_SCOPE,
     "meta.runs.confirm_preflight": ADMIN_SCOPE,
+    "meta.runs.recovery": ADMIN_SCOPE,
     "meta.runs.diff": ADMIN_SCOPE,
     "meta.runs.replay": ADMIN_SCOPE,
     "meta.runs.validate": ADMIN_SCOPE,
@@ -355,7 +399,9 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.memory_embedding.configure": ADMIN_SCOPE,
     "onboarding.search.configure": ADMIN_SCOPE,
     "onboarding.imageGeneration.configure": ADMIN_SCOPE,
+    "onboarding.imageGeneration.models.discover": ADMIN_SCOPE,
     "onboarding.audio.configure": ADMIN_SCOPE,
+    "onboarding.capability.reset": ADMIN_SCOPE,
     "onboarding.channel.probe": ADMIN_SCOPE,
     "onboarding.channel.upsert": ADMIN_SCOPE,
     "onboarding.channel.remove": ADMIN_SCOPE,

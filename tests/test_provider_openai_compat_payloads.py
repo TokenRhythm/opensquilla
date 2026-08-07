@@ -18,6 +18,9 @@ from opensquilla.provider.openai import (
     _tool_schema_accepts_arguments,
 )
 from opensquilla.provider.selector import build_provider
+from opensquilla.provider.tokenrhythm_correlation import (
+    is_tokenrhythm_correlation_target,
+)
 from opensquilla.provider.types import (
     ChatConfig,
     ContentBlockToolResult,
@@ -183,6 +186,67 @@ def _assistant_tool_call_messages(messages: list[dict[str, Any]]) -> list[dict[s
 
 def _tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [message for message in messages if message.get("role") == "tool"]
+
+
+def test_openrouter_receives_only_opaque_session_affinity_header(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="synthetic-key",
+        model="synthetic/model",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+    correlation = ProviderRequestCorrelation(
+        session_id="opaque-session-id",
+        turn_id="turn-id",
+        execution_id="execution-id",
+        call_kind="prompt_cache_keepalive",
+    )
+
+    async def run() -> None:
+        async for _ in provider.chat(
+            [Message(role="user", content="hello")],
+            config=ChatConfig(provider_request_correlation=correlation),
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert captured["headers"]["X-Session-Id"] == "opaque-session-id"
+    assert "agent:" not in captured["headers"]["X-Session-Id"]
+
+
+def test_openrouter_normal_request_omits_keepalive_affinity_header(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="synthetic-key",
+        model="synthetic/model",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+    correlation = ProviderRequestCorrelation(
+        session_id="opaque-session-id",
+        turn_id="turn-id",
+        execution_id="execution-id",
+        call_kind="agent.chat",
+    )
+
+    async def run() -> None:
+        async for _ in provider.chat(
+            [Message(role="user", content="hello")],
+            config=ChatConfig(provider_request_correlation=correlation),
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert "X-Session-Id" not in captured["headers"]
 
 
 def _payload_tool_descriptions(payload: dict[str, Any]) -> str:
@@ -396,6 +460,12 @@ def test_stream_timeout_fallback_preserves_tokenrhythm_correlation_headers(
             yield DoneEvent(model="deepseek-v4-flash")
 
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = CapturingFallbackProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -426,6 +496,78 @@ def test_stream_timeout_fallback_preserves_tokenrhythm_correlation_headers(
     }
     assert {name: stream_headers[name] for name in expected} == expected
     assert {name: fallback_headers[name] for name in expected} == expected
+    assert stream_headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
+    assert fallback_headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
+
+
+def test_stream_timeout_fallback_drops_stale_install_id_after_hot_disable(
+    monkeypatch: Any,
+) -> None:
+    captured_headers: dict[str, str] = {}
+    install_header_checks = 0
+
+    class FailingResponse:
+        status_code = 503
+        text = "synthetic fallback failure"
+        headers: dict[str, str] = {}
+
+    class CapturingClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> CapturingClient:
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+        async def post(self, _url: str, *, headers: dict[str, str], json: Any):
+            captured_headers.update(headers)
+            return FailingResponse()
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", CapturingClient)
+    def install_headers(
+        _provider_kind: str,
+        _base_url: str,
+        **_kwargs: Any,
+    ) -> dict[str, str]:
+        nonlocal install_header_checks
+        install_header_checks += 1
+        if install_header_checks == 1:
+            return {"X-OpenSquilla-Install-Id": "stale-install-id"}
+        return {}
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        install_headers,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    async def collect_fallback() -> list[Any]:
+        return [
+            event
+            async for event in provider._complete_non_stream(
+                payload={"model": "deepseek-v4-flash", "messages": [], "stream": True},
+                headers={
+                    "Authorization": "Bearer test",
+                    "X-OpenSquilla-Install-Id": "stale-install-id",
+                },
+                cfg=ChatConfig(timeout=1.0),
+                tools=None,
+                timeout_exc=httpx.ReadTimeout("synthetic timeout"),
+            )
+        ]
+
+    events = asyncio.run(collect_fallback())
+
+    assert install_header_checks == 2
+    assert "X-OpenSquilla-Install-Id" not in captured_headers
+    assert any(isinstance(event, ErrorEvent) for event in events)
 
 
 def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
@@ -481,21 +623,113 @@ def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     )
 
 
-def test_tokenrhythm_chat_adds_app_attribution_headers(monkeypatch: Any) -> None:
+@pytest.mark.parametrize(
+    ("base_url", "expected_url", "expects_install_id"),
+    [
+        (
+            "https://tokenrhythm.studio/v1",
+            "https://tokenrhythm.studio/v1/chat/completions",
+            True,
+        ),
+        (
+            "https://api-tokenrhythm.example/v1",
+            "https://api-tokenrhythm.example/v1/chat/completions",
+            False,
+        ),
+    ],
+)
+def test_tokenrhythm_chat_adds_app_attribution_headers(
+    monkeypatch: Any,
+    base_url: str,
+    expected_url: str,
+    expects_install_id: bool,
+) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda provider_kind, request_base_url, **_kwargs: (
+            {"X-OpenSquilla-Install-Id": "synthetic-install-id"}
+            if is_tokenrhythm_correlation_target(provider_kind, request_base_url)
+            else {}
+        ),
+    )
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
-        base_url="https://tokenrhythm.studio/v1",
+        base_url=base_url,
         provider_kind="tokenrhythm",
     )
 
     _collect(provider, ChatConfig())
 
-    assert captured["url"] == "https://tokenrhythm.studio/v1/chat/completions"
+    assert captured["url"] == expected_url
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
+    if expects_install_id:
+        assert (
+            captured["headers"].get("X-OpenSquilla-Install-Id")
+            == "synthetic-install-id"
+        )
+    else:
+        assert "X-OpenSquilla-Install-Id" not in captured["headers"]
+    assert "synthetic-install-id" not in json.dumps(captured["payload"], sort_keys=True)
+
+
+def test_tokenrhythm_chat_omits_install_id_with_explicit_proxy(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    helper_proxies: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_body(),
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        captured["client_proxy"] = kwargs.pop("proxy", None)
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    def install_headers(
+        _provider_kind: str,
+        _base_url: str,
+        *,
+        proxy: str | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, str]:
+        helper_proxies.append(proxy)
+        return {} if proxy else {"X-OpenSquilla-Install-Id": "must-not-send"}
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        patched_async_client,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        install_headers,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+        proxy="http://company-proxy.example:8080",
+    )
+
+    _collect(provider, ChatConfig())
+
+    assert captured["client_proxy"] == "http://company-proxy.example:8080"
+    assert helper_proxies
+    assert set(helper_proxies) == {"http://company-proxy.example:8080"}
+    assert "X-OpenSquilla-Install-Id" not in captured["headers"]
 
 
 def test_tokenrhythm_chat_adds_session_correlation_headers_only(
@@ -564,6 +798,12 @@ def test_tokenrhythm_chat_never_forwards_correlation_across_redirects(
         "opensquilla.provider.openai.httpx.AsyncClient",
         patched_async_client,
     )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -594,6 +834,7 @@ def test_tokenrhythm_chat_never_forwards_correlation_across_redirects(
     assert client_options["follow_redirects"] is False
     assert len(requests) == 1
     assert requests[0].url.host == "tokenrhythm.studio"
+    assert requests[0].headers["X-OpenSquilla-Install-Id"] == "synthetic-install-id"
     assert requests[0].headers["X-OpenSquilla-Session-Id"] == "session-1"
     assert any(isinstance(event, ErrorEvent) for event in events)
 
@@ -650,6 +891,12 @@ def test_tokenrhythm_list_models_adds_app_attribution_headers(
             request=httpx.Request("GET", "https://tokenrhythm.studio/v1/models"),
         ),
     )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url, **_kwargs: {
+            "X-OpenSquilla-Install-Id": "synthetic-install-id"
+        },
+    )
     provider = OpenAIProvider(
         api_key="test",
         model="deepseek-v4-flash",
@@ -662,6 +909,10 @@ def test_tokenrhythm_list_models_adds_app_attribution_headers(
     assert captured["url"] == "https://tokenrhythm.studio/v1/models"
     assert captured["headers"].get("HTTP-Referer") == "https://opensquilla.ai"
     assert captured["headers"].get("X-Title") == "OpenSquilla"
+    assert (
+        captured["headers"].get("X-OpenSquilla-Install-Id")
+        == "synthetic-install-id"
+    )
 
 
 def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) -> None:
@@ -1362,6 +1613,40 @@ def test_deepseek_v4_non_thinking_replays_prior_reasoning_content(
     )
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["deepseek-v4-flash-0731", "tokenrhythm/deepseek-v4-flash-0731"],
+)
+def test_tokenrhythm_deepseek_v4_flash_0731_requires_reasoning_content(
+    monkeypatch: Any,
+    model: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    messages = [
+        Message(role="assistant", content="Prior assistant turn."),
+        Message(role="user", content="continue"),
+    ]
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=ChatConfig(thinking=True)):
+            pass
+
+    asyncio.run(_run())
+
+    assert captured["payload"]["messages"][0] == {
+        "role": "assistant",
+        "content": "Prior assistant turn.",
+        "reasoning_content": "",
+    }
+
+
 def test_deepseek_v4_replays_reasoning_content_without_catalog_capabilities(
     monkeypatch: Any,
 ) -> None:
@@ -1927,6 +2212,115 @@ def test_tokenrhythm_embeds_json_schema_without_response_format(
     assert payload["messages"][1] == {"role": "user", "content": "hi"}
     assert config.system == "Fuse the imported profile."
     assert config.output_json_schema == schema
+
+
+def test_deepseek_embeds_json_schema_and_requests_json_object(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = build_provider(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_key="test",
+    )
+    assert isinstance(provider, OpenAIProvider)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"schema_version": {"type": "integer", "const": 1}},
+        "required": ["schema_version"],
+    }
+    config = ChatConfig(
+        system="Fuse the imported profile.",
+        output_json_schema=schema,
+        output_json_schema_strict=True,
+    )
+
+    _collect(provider, config)
+
+    payload = captured["payload"]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["messages"][0] == {
+        "role": "system",
+        "content": (
+            "Fuse the imported profile.\n\n"
+            "Return exactly one JSON value that validates against the authoritative "
+            "JSON Schema below. Do not use Markdown fences or add commentary.\n"
+            f"{json.dumps(schema, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}"
+        ),
+    }
+    assert config.system == "Fuse the imported profile."
+    assert config.output_json_schema == schema
+
+
+def test_deepseek_schema_prompt_message_projection_matches_payload_without_system(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = build_provider(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_key="test",
+    )
+    assert isinstance(provider, OpenAIProvider)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"schema_version": {"type": "integer", "const": 1}},
+        "required": ["schema_version"],
+    }
+    config = ChatConfig(output_json_schema=schema)
+
+    projection = provider.project_message_count(
+        [Message(role="user", content="hi")],
+        config,
+    )
+    _collect(provider, config)
+
+    payload_messages = captured["payload"]["messages"]
+    assert projection.actual_wire_messages == len(payload_messages) == 2
+    assert projection.system_messages == 1
+    assert payload_messages[0]["role"] == "system"
+    assert payload_messages[1] == {"role": "user", "content": "hi"}
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        None,
+        {"type": "array", "items": {"type": "string"}},
+    ],
+)
+def test_deepseek_omits_json_object_mode_without_an_object_schema(
+    monkeypatch: Any,
+    schema: dict[str, Any] | None,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        provider_kind="deepseek",
+    )
+
+    _collect(
+        provider,
+        ChatConfig(system="Return JSON.", output_json_schema=schema),
+    )
+
+    payload = captured["payload"]
+    assert "response_format" not in payload
+    if schema is not None:
+        serialized_schema = json.dumps(
+            schema,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        assert serialized_schema in payload["messages"][0]["content"]
 
 
 def test_openrouter_omits_response_format_without_output_schema(monkeypatch: Any) -> None:

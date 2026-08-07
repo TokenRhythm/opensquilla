@@ -32,20 +32,21 @@ def test_vue_chat_wires_policy_limited_run_mode_into_send_metadata() -> None:
     send = _read(CHAT_SEND)
 
     assert ':run-mode="runMode"' in view
-    assert ':allowed-run-modes="allowedRunModes"' in view
+    assert ':allowed-run-modes="composerAllowedRunModes"' in view
     assert '@set-run-mode="setComposerRunMode"' in view
     assert "SANDBOX_RUN_MODES" in run_mode
-    assert "const fullDisabled" in run_mode
     assert "return !allowedRunModes.value.includes(mode)" in run_mode
     assert "runMode: normalizeSandboxRunMode(options.runMode.value)" in send
 
 
-def test_webui_run_mode_locale_source_matches_managed_execution() -> None:
+def test_webui_run_mode_locale_source_uses_safe_and_full_names() -> None:
     english = json.loads(_read(WEBUI_LOCALES / "en.json"))
     chinese = json.loads(_read(WEBUI_LOCALES / "zh-Hans.json"))
 
-    assert english["chat"]["composer"]["runModeTrusted"] == "Managed Execution"
-    assert chinese["chat"]["composer"]["runModeTrusted"] == "托管执行"
+    assert english["chat"]["composer"]["runModeSafe"] == "Safe"
+    assert english["chat"]["composer"]["runModeFull"] == "Full Access"
+    assert chinese["chat"]["composer"]["runModeSafe"] == "安全模式"
+    assert chinese["chat"]["composer"]["runModeFull"] == "完全访问"
 
 
 def test_removed_trusted_sandbox_term_is_absent_from_all_webui_sources() -> None:

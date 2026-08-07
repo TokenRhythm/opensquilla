@@ -151,6 +151,7 @@ describe('SettingsMemoryPanel', () => {
     expect(writeText).toHaveBeenCalledTimes(1)
     expect(writeText.mock.calls[0][0]).toContain('Imported from: <AI assistant name>')
     expect(copy.textContent).toContain('Copied')
+    expect(el.textContent).toContain('for at most two calls')
   })
 
   it('previews with the advertised single model, renders a real diff, and applies by opaque ids', async () => {
@@ -165,6 +166,17 @@ describe('SettingsMemoryPanel', () => {
           batchId: 'batch-1',
           indexStatus: 'pending',
           appliedAt: '2026-07-28T08:00:00Z',
+          recentImport: {
+            receiptId: 'receipt-1',
+            batchId: 'batch-1',
+            status: 'applied',
+            provider: 'synthetic-provider',
+            model: 'synthetic-model',
+            summary: ['Claimed projects were imported, but no project file was written.'],
+            appliedAt: '2026-07-28T08:00:00Z',
+            fileCount: 1,
+            targets: ['MEMORY'],
+          },
         }
       }
       return { schemaVersion: 1, status: 'discarded' }
@@ -188,13 +200,16 @@ describe('SettingsMemoryPanel', () => {
       clientRequestId: expect.any(String),
     }))
     expect(el.textContent).toContain('Review every file change')
+    expect(el.textContent).toContain('Model analysis (verify against the file changes)')
     expect(el.textContent).toContain('Long-term preferences')
+    expect(el.textContent).not.toContain('Claimed projects were imported')
+    expect(el.textContent).not.toContain('Projects and history')
     expect(el.textContent).toContain('Changes in long-term preferences affect future conversations.')
     expect(el.textContent).toContain('old preference')
     expect(el.textContent).toContain('new preference')
     expect(el.textContent).toContain('Added')
     expect(el.textContent).toContain('Removed')
-    expect(el.textContent).toContain('This preview removes existing profile text')
+    expect(el.textContent).not.toContain('This preview includes removal-only changes')
     expect(el.querySelector('.memory-import__diff')?.getAttribute('tabindex')).toBe('0')
 
     el.querySelector<HTMLButtonElement>('[data-testid="memory-import-apply"]')!.click()
@@ -214,6 +229,33 @@ describe('SettingsMemoryPanel', () => {
     const details = el.querySelector<HTMLDetailsElement>('[data-testid="memory-import-details"]')!
     expect(details.open).toBe(false)
     expect(details.querySelector('summary')?.textContent).toContain('View processing details')
+  })
+
+  it('warns only when a canonical profile change removes content without replacement', async () => {
+    const removal = importPreview({
+      files: [{
+        target: 'MEMORY',
+        displayName: 'MEMORY.md',
+        relativePath: 'MEMORY.md',
+        status: 'modified',
+        additions: 0,
+        deletions: 1,
+        diff: '--- a/MEMORY.md\n+++ b/MEMORY.md\n@@ -1 +0,0 @@\n-old preference',
+      }],
+    })
+    const call = vi.fn(async (method: string) => {
+      if (method === 'memory.import.info') return importInfo()
+      if (method === 'memory.import.start') return importJob({ preview: removal })
+      return {}
+    })
+    const { el } = await mountPanel({ call })
+    const textarea = el.querySelector<HTMLTextAreaElement>('[data-testid="memory-import-textarea"]')!
+    textarea.value = 'Synthetic profile source'
+    textarea.dispatchEvent(new Event('input', { bubbles: true }))
+    el.querySelector<HTMLButtonElement>('[data-testid="memory-import-preview"]')!.click()
+    await waitForText(el, 'This preview includes removal-only changes')
+
+    expect(el.textContent).toContain('no files change until you apply')
   })
 
   it('shows the dedicated no-change result without offering an apply action', async () => {
@@ -255,6 +297,9 @@ describe('SettingsMemoryPanel', () => {
 
     expect(el.textContent).toContain('No new information to import')
     expect(el.textContent).toContain(
+      'The validated preview contained no file changes, so nothing was written.',
+    )
+    expect(el.textContent).not.toContain(
       'The pasted content appears to be an export prompt, not a returned profile.',
     )
     expect(el.querySelector('[data-testid="memory-import-apply"]')).toBeNull()
@@ -389,9 +434,9 @@ describe('SettingsMemoryPanel', () => {
     textarea.value = 'The user said "Keep answers concise."'
     textarea.dispatchEvent(new Event('input', { bubbles: true }))
     el.querySelector<HTMLButtonElement>('[data-testid="memory-import-preview"]')!.click()
-    await waitForText(el, 'default model did not complete the profile merge')
+    await waitForText(el, 'model call did not complete')
 
-    expect(el.textContent).toContain('default model did not complete the profile merge')
+    expect(el.textContent).toContain('model call did not complete')
     const retry = Array.from(el.querySelectorAll('button'))
       .find(button => button.textContent?.includes('Try again'))!
     retry.click()
@@ -547,7 +592,7 @@ describe('SettingsMemoryPanel', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="memory-import-undo"]')!.click()
     await waitForText(el, 'Undo review 1')
     el.querySelector<HTMLButtonElement>('[data-testid="memory-import-apply"]')!.click()
-    await waitForText(el, 'Local memory changed after this preview')
+    await waitForText(el, 'This preview can no longer be applied safely')
 
     const retry = Array.from(el.querySelectorAll('button'))
       .find(button => button.textContent?.includes('Try again'))!
@@ -575,9 +620,9 @@ describe('SettingsMemoryPanel', () => {
     textarea.value = 'Retain this input after failure'
     textarea.dispatchEvent(new Event('input', { bubbles: true }))
     el.querySelector<HTMLButtonElement>('[data-testid="memory-import-preview"]')!.click()
-    await waitForText(el, 'The default model did not complete the profile merge.')
+    await waitForText(el, 'The model call did not complete')
 
-    expect(el.textContent).toContain('The default model did not complete the profile merge.')
+    expect(el.textContent).toContain('The model call did not complete')
     expect(el.querySelector<HTMLTextAreaElement>('[data-testid="memory-import-textarea"]')?.value)
       .toBe('Retain this input after failure')
     const retry = Array.from(el.querySelectorAll('button')).find(button => button.textContent?.includes('Try again'))
@@ -608,12 +653,143 @@ describe('SettingsMemoryPanel', () => {
     await waitForText(el, 'current model is taking longer than usual')
 
     el.querySelector<HTMLButtonElement>('[data-testid="memory-import-cancel"]')!.click()
-    await waitForText(el, 'Import cancelled')
+    await waitForText(el, 'Preview generation cancelled')
 
     expect(call).toHaveBeenCalledWith('memory.import.cancel', expect.objectContaining({
       jobId: 'job-1',
     }))
-    expect(el.textContent).toContain('Continue import')
+    expect(el.textContent).toContain('Regenerate preview')
     expect(el.textContent).toContain('Discard import')
+  })
+
+  it('explains a failed model result and regenerates a preview from the retained source', async () => {
+    const failed = importJob({
+      status: 'failed',
+      stage: 'model',
+      preview: null,
+      canRetry: true,
+      errorCode: 'MEMORY_IMPORT_INVALID_OUTPUT',
+    })
+    const call = vi.fn(async (method: string) => {
+      if (method === 'memory.import.info') return importInfo({ draftJob: failed })
+      if (method === 'memory.import.retry') return importJob()
+      return {}
+    })
+    const { el } = await mountPanel({ call })
+    await waitForText(el, 'result did not pass validation')
+
+    expect(el.textContent).toContain('The model result did not pass validation')
+    expect(el.textContent).toContain('Regenerate preview')
+    expect(el.textContent).not.toContain('Continue import')
+
+    el.querySelector<HTMLButtonElement>('[data-testid="memory-import-retry-job"]')!.click()
+    await waitForText(el, 'Review every file change')
+
+    expect(call).toHaveBeenCalledWith('memory.import.retry', expect.objectContaining({
+      jobId: 'job-1',
+    }))
+    expect(call.mock.calls.some(([method]) => method === 'memory.import.start')).toBe(false)
+  })
+
+  it('falls back to the generic retry explanation when an older gateway omits errorCode', async () => {
+    const failed = importJob({
+      status: 'failed',
+      stage: 'model',
+      preview: null,
+      canRetry: true,
+    })
+    const call = vi.fn(async (method: string) => {
+      if (method === 'memory.import.info') return importInfo({ draftJob: failed })
+      return {}
+    })
+    const { el } = await mountPanel({ call })
+    await waitForText(el, 'This attempt did not produce a validated, reviewable preview')
+
+    expect(el.textContent).toContain('Regenerate preview')
+  })
+
+  it('does not render a model summary as a fact in the recent import card', async () => {
+    const { el } = await mountPanel({
+      call: vi.fn(async (method: string) => method === 'memory.import.info'
+        ? importInfo({
+            recentImport: {
+              receiptId: 'receipt-1',
+              batchId: 'batch-1',
+              status: 'applied',
+              provider: 'synthetic-provider',
+              model: 'synthetic-model',
+              summary: ['Projects and history were imported.'],
+              appliedAt: '2026-07-28T08:00:00Z',
+              fileCount: 1,
+              targets: ['MEMORY'],
+            },
+          })
+        : {}),
+    })
+
+    expect(el.textContent).toContain('Long-term preferences')
+    expect(el.textContent).not.toContain('Projects and history were imported.')
+  })
+
+  it('uses a generic paused message for a non-model job error', async () => {
+    const failed = importJob({
+      status: 'failed',
+      stage: 'diff',
+      preview: null,
+      canRetry: true,
+      errorCode: 'MEMORY_IMPORT_WRITE_FAILED',
+    })
+    const { el } = await mountPanel({
+      call: vi.fn(async (method: string) => method === 'memory.import.info'
+        ? importInfo({ draftJob: failed })
+        : {}),
+    })
+
+    await waitForText(el, 'did not produce a validated, reviewable preview')
+    expect(el.textContent).not.toContain('could not apply the batch safely')
+  })
+
+  it('shows a retry request failure without replacing the paused job error', async () => {
+    const failed = importJob({
+      status: 'failed',
+      stage: 'model',
+      preview: null,
+      canRetry: true,
+      errorCode: 'MEMORY_IMPORT_INVALID_OUTPUT',
+    })
+    const call = vi.fn(async (method: string) => {
+      if (method === 'memory.import.info') return importInfo({ draftJob: failed })
+      if (method === 'memory.import.retry') throw new Error('synthetic retry transport failure')
+      return {}
+    })
+    const { el } = await mountPanel({ call })
+
+    el.querySelector<HTMLButtonElement>('[data-testid="memory-import-retry-job"]')!.click()
+    await waitForText(el, 'The preview could not be regenerated')
+
+    expect(el.querySelector('[data-testid="memory-import-retry-error"]')?.getAttribute('role'))
+      .toBe('alert')
+    expect(el.textContent).toContain('The model result did not pass validation')
+    expect(el.textContent).toContain('no files were changed')
+  })
+
+  it('rejects a retry response with an incompatible schema version', async () => {
+    const failed = importJob({
+      status: 'failed',
+      stage: 'model',
+      preview: null,
+      canRetry: true,
+      errorCode: 'MEMORY_IMPORT_INVALID_OUTPUT',
+    })
+    const call = vi.fn(async (method: string) => {
+      if (method === 'memory.import.info') return importInfo({ draftJob: failed })
+      if (method === 'memory.import.retry') return importJob({ schemaVersion: 2 })
+      return {}
+    })
+    const { el } = await mountPanel({ call })
+
+    el.querySelector<HTMLButtonElement>('[data-testid="memory-import-retry-job"]')!.click()
+    await waitForText(el, 'The preview could not be regenerated')
+    expect(el.querySelector('[data-testid="memory-import-retry-error"]')).toBeTruthy()
   })
 })

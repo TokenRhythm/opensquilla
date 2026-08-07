@@ -331,6 +331,43 @@ def test_stateless_bootstrap_context_skips_persona_memory_and_bootstrap(tmp_path
     assert metadata["memory_md_present"] is False
 
 
+def test_guest_webchat_namespace_skips_host_bootstrap_and_private_memory(tmp_path) -> None:
+    for filename in (
+        "AGENTS.md",
+        "SOUL.md",
+        "IDENTITY.md",
+        "TOOLS.md",
+        "USER.md",
+        "MEMORY.md",
+        "HEARTBEAT.md",
+        "BOOTSTRAP.md",
+    ):
+        (tmp_path / filename).write_text(f"host secret from {filename}\n", encoding="utf-8")
+    runner = TurnRunner(
+        provider_selector=None,
+        config=SimpleNamespace(
+            workspace_dir=str(tmp_path),
+            memory=SimpleNamespace(source="workspace"),
+            tools=SimpleNamespace(profile=None),
+        ),
+    )
+    metadata: dict[str, object] = {}
+    session_key = f"agent:main:webchat:guest:{'a' * 64}:browser-session"
+
+    assembled = runner._assemble_prompt(
+        "main",
+        [],
+        session_key=session_key,
+        prompt_metadata=metadata,
+    )
+
+    full_prompt = "\n".join(assembled) if isinstance(assembled, tuple) else assembled
+    assert "host secret" not in full_prompt
+    assert metadata["bootstrap_files"] == []
+    assert metadata["memory_md_present"] is False
+    assert metadata["memory_prompt_injection_skipped"] == "session-scope"
+
+
 def test_stateless_keep_project_rules_preserves_only_agents_md(tmp_path) -> None:
     for filename in (
         "AGENTS.md",

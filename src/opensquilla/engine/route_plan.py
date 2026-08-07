@@ -42,10 +42,15 @@ class RouteCapabilitySnapshot:
     supports_streaming: bool | None
     supports_vision: bool | None
     reasoning_format: str
+    # A provider/model-specific automatic output ceiling.  Zero means the
+    # catalog did not have an authoritative value and physical fallback must
+    # preserve the caller's request unchanged.
+    effective_max_tokens: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "context_window": self.context_window,
+            "effective_max_tokens": self.effective_max_tokens,
             "supports_reasoning": self.supports_reasoning,
             "supports_tools": self.supports_tools,
             "supports_streaming": self.supports_streaming,
@@ -99,7 +104,8 @@ def _fallback_chain(
     primary_model: str,
     capability_snapshots: Mapping[
         tuple[str, str],
-        tuple[int, ModelCapabilities | None],
+        tuple[int, ModelCapabilities | None]
+        | tuple[int, int, ModelCapabilities | None],
     ] | None,
 ) -> tuple[RouteFallback, ...]:
     if not isinstance(value, list):
@@ -117,10 +123,12 @@ def _fallback_chain(
         if identity in seen:
             continue
         seen.add(identity)
-        context_window, capabilities = (capability_snapshots or {}).get(
-            identity,
-            (0, None),
-        )
+        raw_snapshot = (capability_snapshots or {}).get(identity, (0, None))
+        if len(raw_snapshot) == 3:
+            context_window, effective_max_tokens, capabilities = raw_snapshot
+        else:
+            context_window, capabilities = raw_snapshot
+            effective_max_tokens = 0
         result.append(
             RouteFallback(
                 tier=_text(item.get("tier")),
@@ -128,6 +136,7 @@ def _fallback_chain(
                 model=model,
                 capabilities=_capability_snapshot(
                     context_window=context_window,
+                    effective_max_tokens=effective_max_tokens,
                     capabilities=capabilities,
                 ),
             )
@@ -138,10 +147,12 @@ def _fallback_chain(
 def _capability_snapshot(
     *,
     context_window: int,
+    effective_max_tokens: int = 0,
     capabilities: ModelCapabilities | None,
 ) -> RouteCapabilitySnapshot:
     return RouteCapabilitySnapshot(
         context_window=max(0, int(context_window or 0)),
+        effective_max_tokens=max(0, int(effective_max_tokens or 0)),
         supports_reasoning=(
             bool(capabilities.supports_reasoning)
             if capabilities is not None
@@ -191,7 +202,8 @@ def pin_route_plan(
     effective_thinking: object,
     fallback_capabilities: Mapping[
         tuple[str, str],
-        tuple[int, ModelCapabilities | None],
+        tuple[int, ModelCapabilities | None]
+        | tuple[int, int, ModelCapabilities | None],
     ] | None = None,
 ) -> RoutePlan | None:
     """Create the turn's RoutePlan once and return the already-pinned value later."""

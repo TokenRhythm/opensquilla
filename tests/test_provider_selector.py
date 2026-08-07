@@ -254,6 +254,58 @@ async def test_list_models_detailed_reports_every_failed_chain_link(monkeypatch)
     ]
 
 
+async def test_list_models_detailed_resolves_snapshots_per_chain_link(monkeypatch) -> None:
+    built: list[str] = []
+
+    def fake_build_provider(cfg: ProviderConfig):
+        built.append(cfg.provider)
+        if cfg.provider == "tokenrhythm":  # pragma: no cover - regression guard
+            raise AssertionError("snapshot-backed chain link reached provider I/O")
+        if cfg.provider == "openrouter":
+            return _AuthRejectingProvider()
+        return _HealthyProvider()
+
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", fake_build_provider)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="tokenrhythm",
+                model="cached-model",
+                api_key="sk_tr_synthetic_selector_key",
+            ),
+            fallbacks=[
+                ProviderConfig(provider="ollama", model="test-model-good"),
+                ProviderConfig(provider="openrouter", model="auth-locked"),
+            ],
+        )
+    )
+    resolved: list[str] = []
+
+    def snapshot_resolver(cfg: ProviderConfig):
+        resolved.append(cfg.provider)
+        if cfg.provider != "tokenrhythm":
+            return None
+        return [
+            ModelInfo(
+                provider="tokenrhythm",
+                model_id="cached-model",
+                max_output_tokens=131_072,
+            )
+        ]
+
+    result = await selector.list_models_detailed(snapshot_resolver=snapshot_resolver)
+
+    assert resolved == ["tokenrhythm", "ollama", "openrouter"]
+    assert built == ["ollama", "openrouter"]
+    assert [model["model_id"] for model in result.models] == [
+        "cached-model",
+        "test-model-good",
+    ]
+    assert [(error.provider, error.kind) for error in result.errors] == [
+        ("openrouter", ProviderFailureKind.AUTH_INVALID.value)
+    ]
+
+
 async def test_detailed_listing_enables_adapter_strict_mode(monkeypatch) -> None:
     monkeypatch.setattr(
         "opensquilla.provider.selector._build_provider",

@@ -306,10 +306,19 @@ def _usage_row(
     }
 
 
-def _tracker_rows(ctx: RpcContext, *, now_ms: int) -> list[dict[str, Any]]:
+def _tracker_rows(
+    ctx: RpcContext,
+    *,
+    now_ms: int,
+    session_key: str | None = None,
+) -> list[dict[str, Any]]:
     if ctx.usage_tracker is None:
         return []
-    all_sessions = ctx.usage_tracker.all_sessions()
+    if session_key is not None:
+        usage = ctx.usage_tracker.get(session_key)
+        all_sessions = {session_key: usage} if usage is not None else {}
+    else:
+        all_sessions = ctx.usage_tracker.all_sessions()
     if not all_sessions:
         return []
 
@@ -603,7 +612,18 @@ def _usage_totals(rows: list[dict[str, Any]]) -> dict[str, int | float]:
 @_d.method("usage.status", scope="operator.read")
 async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     now_ms = _now_ms()
-    tracker_rows = _tracker_rows(ctx, now_ms=now_ms)
+    requested_session_key = None
+    if isinstance(params, Mapping):
+        raw_requested_session_key = (
+            params.get("sessionKey") or params.get("session_key") or params.get("key")
+        )
+        if isinstance(raw_requested_session_key, str) and raw_requested_session_key.strip():
+            requested_session_key = raw_requested_session_key.strip()
+    tracker_rows = _tracker_rows(
+        ctx,
+        now_ms=now_ms,
+        session_key=requested_session_key,
+    )
 
     if ctx.session_manager is None:
         totals = _usage_totals(tracker_rows)
@@ -620,12 +640,18 @@ async def _handle_usage_status(params: dict | None, ctx: RpcContext) -> dict[str
         }
 
     try:
-        requested_session_key = None
-        if isinstance(params, Mapping):
-            requested_session_key = (
-                params.get("sessionKey") or params.get("session_key") or params.get("key")
-            )
-        sessions = await ctx.session_manager.list_sessions()
+        get_session = getattr(ctx.session_manager, "get_session", None)
+        if requested_session_key is not None and callable(get_session):
+            requested_session = await get_session(requested_session_key)
+            sessions = [requested_session] if requested_session is not None else []
+        else:
+            sessions = await ctx.session_manager.list_sessions()
+            if requested_session_key is not None:
+                sessions = [
+                    session
+                    for session in sessions
+                    if _field(session, "session_key", "") == requested_session_key
+                ]
         rows = []
         active = sum(1 for s in sessions if _field(s, "status", "") == "running")
         for s in sessions:

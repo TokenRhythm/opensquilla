@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Literal
 
+from .model_identity import DEEPSEEK_V4_MODEL_IDS
 from .qwen_token_plan import (
     QWEN_TOKEN_PLAN_DEEPSEEK_V4_MODEL_IDS,
     QWEN_TOKEN_PLAN_FORCE_THINKING_MODEL_IDS,
@@ -29,11 +30,33 @@ from .qwen_token_plan import (
     QWEN_TOKEN_PLAN_PRESERVE_THINKING_MODEL_IDS,
 )
 
-TextToolDialect = Literal["qwen_tag", "minimax_xml", "plain_json"]
+TextToolDialect = Literal["qwen_tag", "minimax_xml", "plain_json", "deepseek_dsml"]
 
 TEXT_TOOL_DIALECT_QWEN_TAG: TextToolDialect = "qwen_tag"
 TEXT_TOOL_DIALECT_MINIMAX_XML: TextToolDialect = "minimax_xml"
 TEXT_TOOL_DIALECT_PLAIN_JSON: TextToolDialect = "plain_json"
+TEXT_TOOL_DIALECT_DEEPSEEK_DSML: TextToolDialect = "deepseek_dsml"
+
+
+# DSML is executable syntax, so its authorization stays independent from
+# reasoning/model-family helpers and names every trusted wire identity exactly.
+_DEEPSEEK_DSML_MODEL_IDS = (
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-0731",
+    "deepseek-v4-pro",
+)
+_TOKENRHYTHM_DSML_MODEL_IDS = (
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-0731",
+    "deepseek-v4-pro",
+    "tokenrhythm/deepseek-v4-flash",
+    "tokenrhythm/deepseek-v4-flash-0731",
+    "tokenrhythm/deepseek-v4-pro",
+)
+_OPENROUTER_DSML_MODEL_IDS = (
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+)
 
 
 @dataclass(frozen=True)
@@ -107,6 +130,12 @@ class OpenAICompatPolicy:
     # schema in the system prompt instead; callers still validate the returned
     # artifact locally.
     supports_native_json_schema_output: bool = True
+
+    # Whether the endpoint supports the less expressive
+    # ``response_format.type=json_object`` mode.  This is useful when native
+    # JSON Schema is unavailable: the schema remains in the trusted system
+    # prompt while the request still asks the upstream for a JSON object.
+    supports_json_object_output: bool = False
 
     # Text-to-tool execution is deliberately dialect- and model-scoped.  This
     # record is trusted packaged metadata: an online model catalog must never
@@ -245,8 +274,6 @@ _ARK_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS = frozenset(
     }
 )
 
-_DEEPSEEK_V4_MODEL_IDS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
-
 # TokenHub's hy3 family documents interleaved thinking: assistant turns must
 # carry reasoning_content back (an empty string when there is none), or the
 # reasoning context is lost across tool-call rounds.
@@ -282,6 +309,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                     model_patterns=("minimax/*",),
                     dialects=frozenset({TEXT_TOOL_DIALECT_MINIMAX_XML}),
                 ),
+                TextToolModelRule(
+                    model_patterns=_OPENROUTER_DSML_MODEL_IDS,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                ),
             ),
         ),
         trust_billed_cost=True,
@@ -300,10 +331,20 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "deepseek": OpenAICompatPolicy(
         display_name="DeepSeek",
         default_reasoning_format="deepseek",
+        supports_native_json_schema_output=False,
+        supports_json_object_output=True,
+        text_tool_profile=TextToolCompatProfile(
+            model_rules=(
+                TextToolModelRule(
+                    model_patterns=_DEEPSEEK_DSML_MODEL_IDS,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                ),
+            ),
+        ),
         # Reasoning replay is gated on the exact V4 ids (below), not on the
         # capability format: non-V4 DeepSeek models must not get replay.
-        thinking_toggle_model_ids=_DEEPSEEK_V4_MODEL_IDS,
-        require_reasoning_content_model_ids=_DEEPSEEK_V4_MODEL_IDS,
+        thinking_toggle_model_ids=DEEPSEEK_V4_MODEL_IDS,
+        require_reasoning_content_model_ids=DEEPSEEK_V4_MODEL_IDS,
     ),
     "gemini": OpenAICompatPolicy(display_name="Gemini"),
     "dashscope": OpenAICompatPolicy(
@@ -320,7 +361,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         stream_timeout_fallback=True,
         thinking_required_model_prefixes=("qwen3.8-",),
         thinking_tool_choice_auto_only=True,
-        implicit_thinking_tool_choice_model_ids=_DEEPSEEK_V4_MODEL_IDS,
+        implicit_thinking_tool_choice_model_ids=DEEPSEEK_V4_MODEL_IDS,
     ),
     "bailian_coding": OpenAICompatPolicy(display_name="Bailian Coding"),
     "qwen_token_plan": OpenAICompatPolicy(
@@ -404,9 +445,13 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                     model_patterns=("qwen*",),
                     dialects=frozenset({TEXT_TOOL_DIALECT_QWEN_TAG}),
                 ),
+                TextToolModelRule(
+                    model_patterns=_TOKENRHYTHM_DSML_MODEL_IDS,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                ),
             ),
         ),
-        require_reasoning_content_model_ids=_DEEPSEEK_V4_MODEL_IDS,
+        require_reasoning_content_model_ids=DEEPSEEK_V4_MODEL_IDS,
         allow_post_terminal_noop_choice=True,
         allow_post_terminal_null_usage_noop_choice=True,
         post_terminal_metadata_keys=frozenset(

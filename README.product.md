@@ -164,7 +164,7 @@ Read: [`docs/features/tool-compression.md`](docs/features/tool-compression.md)
 Meta-skills let OpenSquilla present higher-level workflows instead of making the
 user re-describe the same multi-step process. They are useful for repeatable
 research reports, document-to-decision work, daily operating briefs, account
-watching, job-search preparation, kid project planning, academic paper drafting,
+watching, job-search preparation, academic paper drafting, short-drama production,
 and MetaSkill proposal creation.
 
 By default, launch them deliberately with `/meta` and `/meta <name>`.

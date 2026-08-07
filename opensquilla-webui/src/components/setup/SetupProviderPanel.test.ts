@@ -325,6 +325,67 @@ describe('SetupProviderPanel — configured provider management', () => {
     },
   ]
 
+  it('shows the default-on accessible image offer only inside the OpenRouter editor', async () => {
+    const onUpdateImageGenerationOptIn = vi.fn()
+    const { app, el, panelState } = await mountPanel({
+      providerSelected: 'openrouter',
+      providerSummary: 'OpenRouter',
+      runtimeProviders: [OPENROUTER_PROVIDER],
+      imageGenerationOffer: true,
+      imageGenerationOptIn: true,
+      configuredProviders: [{
+        providerId: 'openrouter',
+        label: 'OpenRouter',
+        active: true,
+        ready: true,
+        credentialSource: 'explicit',
+        credentialEnv: '',
+        endpointSource: 'registry',
+        reason: '',
+      }],
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        providerLabel: 'OpenRouter',
+      },
+    }, { onUpdateImageGenerationOptIn })
+
+    el.querySelector<HTMLButtonElement>(
+      '[data-provider-id="openrouter"] .setup-provider-card__select',
+    )?.click()
+    await nextTick()
+
+    const offer = document.body.querySelector<HTMLElement>(
+      '[data-testid="openrouter-image-generation-offer"]',
+    )
+    const toggle = offer?.querySelector<HTMLInputElement>(
+      '[name="setup_provider_image_generation_opt_in"]',
+    )
+    expect(offer?.textContent).toContain('Also enable image generation (recommended)')
+    expect(toggle?.getAttribute('role')).toBe('switch')
+    expect(toggle?.getAttribute('aria-checked')).toBe('true')
+    expect(toggle?.getAttribute('aria-label')).toBe('Also enable image generation (recommended)')
+
+    const save = document.body.querySelector<HTMLButtonElement>(
+      '.setup-provider-modal__footer .btn--primary',
+    )
+    expect(save?.disabled).toBe(false)
+
+    toggle!.click()
+    expect(onUpdateImageGenerationOptIn).toHaveBeenCalledWith(false)
+
+    Object.assign(panelState, { imageGenerationOptIn: false })
+    await nextTick()
+    expect(save?.disabled).toBe(true)
+
+    Object.assign(panelState, {
+      imageGenerationOptIn: true,
+      imageGenerationOffer: false,
+    })
+    await nextTick()
+    expect(save?.disabled).toBe(true)
+    app.unmount()
+  })
+
   it('keeps provider state accessible while the visible list stays quiet', async () => {
     const { app, el } = await mountPanel({
       configuredProviders: configured,
@@ -1818,10 +1879,43 @@ describe('SetupProviderPanel — effective output limit', () => {
     app.unmount()
   })
 
+  it('keeps catalog freshness separate and emits an explicit model refresh', async () => {
+    const onRefreshModels = vi.fn()
+    const { app, el } = await mountPanel({
+      connection: connection({
+        catalog: { lastSyncedAt: null, stale: true },
+      }),
+    }, { onRefreshModels })
+
+    const status = el.querySelector('[data-testid="setup-model-catalog-sync"]')
+    expect(status?.textContent).toContain('Model metadata may be stale')
+    expect(status?.classList.contains('is-stale')).toBe(true)
+
+    const refresh = el.querySelector<HTMLButtonElement>('[data-testid="setup-refresh-models"]')
+    expect(refresh?.textContent).toContain('Refresh models')
+    refresh?.click()
+    await nextTick()
+    expect(onRefreshModels).toHaveBeenCalledOnce()
+
+    app.unmount()
+  })
+
   it('hides the readout when no identity-matched effective value is supplied', async () => {
     const { app, el } = await mountPanel({ effectiveMaxTokens: null })
 
     expect(el.querySelector('[data-testid="setup-effective-max-tokens"]')).toBeNull()
+
+    app.unmount()
+  })
+
+  it('does not infer an effective limit for an unsaved candidate model', async () => {
+    const { app, el } = await mountPanel({
+      effectiveMaxTokens: null,
+      effectiveMaxTokensPending: true,
+    })
+
+    const readout = el.querySelector('[data-testid="setup-effective-max-tokens"]')
+    expect(readout?.textContent).toContain('Calculated after saving')
 
     app.unmount()
   })
