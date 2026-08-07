@@ -600,7 +600,14 @@
     "title": "Something went wrong",
     "defaultMessage": "An unexpected error occurred.",
     "reload": "Reload page",
-    "dismiss": "Dismiss"
+    "dismiss": "Dismiss",
+    "detailsLabel": "Error details",
+    "copyDetails": "Copy details",
+    "copied": "Copied",
+    "openLogs": "Open logs folder",
+    "privacyHint": "Review before sharing. Error details may contain paths, URLs, or account information.",
+    "copyFailed": "Copy failed. Select the details and copy them manually.",
+    "openLogsFailed": "Could not open the logs folder."
   },
   "errors": {
     "saveFailed": "Save failed",
