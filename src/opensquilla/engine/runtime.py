@@ -4611,14 +4611,23 @@ class TurnRunner:
                 ),
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
+            # Keep ContextVar token ownership in this task: do not yield the
+            # replay event while the usage scope is still bound, and aclose the
+            # stream consumer here so cleanup is not deferred to another Context.
+            stream = self._stream_consumer_stage.run(stream_inp)
             with bind_usage_accounting_scope(turn_usage_scope):
-                async for event in self._stream_consumer_stage.run(stream_inp):
-                    if isinstance(event, RouterControlReplayEvent):
-                        router_control_replay_event = event
+                try:
+                    async for event in stream:
+                        if isinstance(event, RouterControlReplayEvent):
+                            router_control_replay_event = event
+                            break
                         yield event
-                        break
-                    yield event
+                finally:
+                    close = getattr(stream, "aclose", None)
+                    if callable(close):
+                        await close()
             if router_control_replay_event is not None:
+                yield router_control_replay_event
                 async for replayed_event in self._run_turn(
                     message,
                     session_key,
