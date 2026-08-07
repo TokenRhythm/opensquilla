@@ -1735,6 +1735,102 @@ async def test_runtime_channel_stream_relay_does_not_redeliver_transcript_artifa
 
 
 @pytest.mark.asyncio
+async def test_runtime_channel_stream_relay_no_edit_channel_does_not_double_send_text(
+    tmp_path,
+) -> None:
+    """A channel without edit (QQ) must not deliver the same text twice.
+
+    Regression guard: when the stream relay already delivered the terminal
+    text through send_streaming, the final runtime reply must not send the
+    same text again via channel.send. QQ has no edit primitive, so the
+    streamed preview cannot be reconciled and must never be re-sent as a
+    batch reply.
+    """
+
+    store = ArtifactStore(tmp_path)
+    ref = store.publish_bytes(
+        b"\x89PNG\r\n\x1a\nimage bytes",
+        session_id="session-1",
+        session_key="agent:main:qq:direct:u1",
+        name="chart.png",
+        mime="image/png",
+        source="publish_artifact",
+    )
+
+    class NoEditStreamingChannel(_FakeChannel):
+        """QQ-like: send_streaming buffers, no edit/delete, send_file exists."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.chunks: list[str] = []
+            self.files: list[tuple[str, str]] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            async for chunk in chunks:
+                self.chunks.append(chunk)
+            return None
+
+        async def send_file(self, chat_id: str, file_path: str) -> None:
+            assert Path(file_path).is_file()
+            self.files.append((chat_id, Path(file_path).name))
+
+    class FakeTaskRuntime:
+        async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
+            return None
+
+        async def wait(self, task_id: str):
+            return SimpleNamespace(status="succeeded")
+
+    class FakeSessionManager:
+        async def read_transcript(self, key: str):
+            return [
+                {"role": "user", "content": "send chart"},
+                {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "text": "Here is the chart.\n\n![chart](chart.png)",
+                            "artifacts": [ref.to_dict()],
+                        }
+                    ),
+                },
+            ]
+
+    config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
+    channel = NoEditStreamingChannel()
+    runtime = FakeTaskRuntime()
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel,
+        _message(),
+        runtime,
+        config,
+    )
+
+    assert relay is not None
+
+    await relay.emit(TextDeltaEvent(text="Here is the chart."))
+    await relay.emit(ArtifactEvent(**ref.to_dict()))
+    await _deliver_runtime_channel_reply(
+        channel=channel,
+        task_runtime=runtime,
+        session_manager=FakeSessionManager(),
+        session_key="agent:main:qq:direct:u1",
+        task_id="task-1",
+        route_envelope=SimpleNamespace(reply_target=None),
+        inbound=_message(),
+        transcript_watermark=1,
+        config=config,
+        stream_relay=relay,
+    )
+
+    # Text is delivered exactly once (via send_streaming); the artifact goes
+    # through send_file. No second text send via channel.send.
+    assert channel.chunks == ["Here is the chart."]
+    assert channel.files == [("c1", "chart.png")]
+    assert channel.sent == []
+
+
+@pytest.mark.asyncio
 async def test_direct_channel_turn_idle_timeout_sends_error_reply() -> None:
     class SlowTurnRunner:
         async def run(self, message: str, session_key: str, **kwargs):
