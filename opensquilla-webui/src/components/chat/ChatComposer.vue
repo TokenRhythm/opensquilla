@@ -335,7 +335,7 @@
           aria-atomic="true"
         >{{ sendBlockedMessage }}</p>
       </div>
-      <div class="chat-collapse-region">
+      <div class="chat-collapse-region chat-collapse-region--disclaimer">
         <p class="chat-ai-disclaimer" role="note">{{ t('chat.aiDisclaimer') }}</p>
       </div>
     </div>
@@ -865,6 +865,37 @@ defineExpose<ChatComposerExpose>({
   font-size: var(--fs-xs);
   line-height: 1.5;
   text-align: center;
+}
+
+/* Transcript content deliberately scrolls underneath the floating dock. The
+   input panel owns its glass surface, but the disclaimer sits outside that
+   panel; give the note its own content-sized surface so translated/wrapped
+   copy never collides visually with a message passing behind it. */
+.chat-composer--floating .chat-collapse-region--disclaimer > .chat-ai-disclaimer {
+  width: fit-content;
+  max-width: 100%;
+  margin-inline: auto;
+  padding: 0.25rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--border) 68%, transparent);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
+  box-shadow: 0 8px 20px -16px color-mix(in srgb, var(--text) 32%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(125%);
+  backdrop-filter: blur(16px) saturate(125%);
+}
+
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .chat-composer--floating .chat-collapse-region--disclaimer > .chat-ai-disclaimer {
+    background: var(--bg-surface);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .chat-composer--floating .chat-collapse-region--disclaimer > .chat-ai-disclaimer {
+    background: var(--bg-surface);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
 }
 
 .chat-composer-send-status {

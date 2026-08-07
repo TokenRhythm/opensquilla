@@ -230,7 +230,7 @@ test('disabled preference restores the established docked layout', async ({ page
 test.describe('mobile and reduced motion', () => {
   test.use({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce' })
 
-  test('keeps measured clearance and removes retract transitions', async ({ page }) => {
+  test('keeps the mobile dock legible, bounded, and motion-reduced', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' })
     await openChat(page)
     expect(await page.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches))
@@ -244,5 +244,30 @@ test.describe('mobile and reduced motion', () => {
       '.chat-textarea',
     ].map(selector => getComputedStyle(document.querySelector<HTMLElement>(selector)!).transitionDuration))
     expect(durations).toEqual(['0s', '0s', '0s', '0s'])
+
+    // Leave the live edge while keeping the composer expanded. Messages now
+    // pass behind the floating dock, reproducing the layout where an
+    // unbacked disclaimer used to draw directly over transcript text.
+    await page.locator('.chat-thread').evaluate(el => {
+      el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 320)
+    })
+    await expect(page.locator('.chat-jump-latest')).toBeVisible()
+
+    const mobileGeometry = await page.evaluate(() => {
+      const dock = document.querySelector<HTMLElement>('.chat-composer-dock')!
+      const disclaimer = document.querySelector<HTMLElement>('.chat-ai-disclaimer')!
+      const tabbar = document.querySelector<HTMLElement>('.mobile-tabbar')!
+      const disclaimerStyle = getComputedStyle(disclaimer)
+      return {
+        dockBottom: dock.getBoundingClientRect().bottom,
+        disclaimerBottom: disclaimer.getBoundingClientRect().bottom,
+        tabbarTop: tabbar.getBoundingClientRect().top,
+        disclaimerBackground: disclaimerStyle.backgroundColor,
+      }
+    })
+    expect(mobileGeometry.dockBottom).toBeLessThanOrEqual(mobileGeometry.tabbarTop + 1)
+    expect(mobileGeometry.disclaimerBottom).toBeLessThanOrEqual(mobileGeometry.tabbarTop + 1)
+    expect(mobileGeometry.disclaimerBackground).not.toBe('rgba(0, 0, 0, 0)')
+    expect(mobileGeometry.disclaimerBackground).not.toBe('transparent')
   })
 })
