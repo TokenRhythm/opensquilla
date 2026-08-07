@@ -2611,6 +2611,7 @@
       "toastConnectionRecovered": "Verbindung wiederhergestellt und Aufgabenstatus aktualisiert",
       "toastConnectionRetry": "Verbindung noch nicht wiederhergestellt. Bitte die Seite später aktualisieren.",
       "toastBackgroundComplete": "Aufgabe „{name}“ abgeschlossen. Das Ergebnis ist im Ausführungsverlauf verfügbar.",
+      "toastBackgroundReminder": "Erinnerung „{name}“: {text}",
       "toastBackgroundFailed": "Aufgabe „{name}“ fehlgeschlagen. Bitte die Schaltfläche zum erneuten Versuch verwenden.",
       "unnamedTask": "Unbenannte Aufgabe",
       "toastDeleted": "Job gelöscht",

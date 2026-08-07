@@ -560,6 +560,8 @@ const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 interface AppCronRunFinishedPayload {
   jobId?: string
   jobName?: string
+  handlerKey?: string
+  summary?: string
   runId?: string
   success?: boolean
 }
@@ -576,6 +578,16 @@ function handleCronRunFinished(payload: unknown) {
     pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
       tone: 'danger',
       duration: 9_000,
+    })
+    return
+  }
+  // Static reminders deliver the configured reminder text as the summary;
+  // surface that text directly in the completion toast so the user can see
+  // what the reminder actually said without opening run history.
+  if (event.handlerKey === 'static_message' && typeof event.summary === 'string' && event.summary.trim()) {
+    pushToast(t('cronSkills.jobs.toastBackgroundReminder', { name: jobName, text: event.summary.trim() }), {
+      tone: 'ok',
+      duration: 7_000,
     })
     return
   }

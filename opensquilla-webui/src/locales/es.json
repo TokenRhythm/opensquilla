@@ -2611,6 +2611,7 @@
       "toastConnectionRecovered": "Conexión restablecida y estado de tareas actualizado",
       "toastConnectionRetry": "La conexión aún no se ha restablecido. Actualiza la página en breve.",
       "toastBackgroundComplete": "La tarea «{name}» terminó. Consulta el resultado en el historial.",
+      "toastBackgroundReminder": "Recordatorio «{name}»: {text}",
       "toastBackgroundFailed": "La tarea «{name}» falló. Usa el botón Reintentar de su tarjeta.",
       "unnamedTask": "Tarea sin nombre",
       "toastDeleted": "Tarea eliminada",
