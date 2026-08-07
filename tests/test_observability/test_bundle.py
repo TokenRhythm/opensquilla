@@ -52,6 +52,12 @@ def _make_home(tmp_path: Path, *, desktop: bool = False) -> tuple[Path, Path]:
         (user_data / "logs" / "desktop.log").write_text(
             '{"at":"2026-07-07T00:00:00Z","event":"launch"}\n', encoding="utf-8"
         )
+        (user_data / "logs" / "desktop.log.1").write_text(
+            '{"at":"2026-07-06T00:00:00Z","event":"previous-launch"}\n', encoding="utf-8"
+        )
+        (user_data / "logs" / "desktop.log.2").write_text(
+            '{"at":"2026-07-05T00:00:00Z","event":"older-launch"}\n', encoding="utf-8"
+        )
         (user_data / "logs" / "gateway.log").write_text("gateway child out\n", encoding="utf-8")
         (user_data / "desktop-credential.json").write_text("{}", encoding="utf-8")
     else:
@@ -170,6 +176,8 @@ def test_desktop_logs_are_derived_and_credential_excluded(tmp_path) -> None:
 
     entries = _read_zip(dest)
     assert "desktop/desktop.log" in entries
+    assert "desktop/desktop.log.1" in entries
+    assert "desktop/desktop.log.2" in entries
     assert "desktop/gateway.log" in entries
     assert not any("desktop-credential" in name for name in entries)
 
