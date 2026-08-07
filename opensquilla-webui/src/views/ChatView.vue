@@ -996,6 +996,10 @@ const landingAgentId = computed(() => agentIdFromSessionKey(sessionKey.value))
 // True when the current draft opened with prefilled composer text (Sessions
 // Hub task input); the landing suggestion chips stay out of the way then.
 const landingPrefilled = ref(false)
+// One-shot latch: a landing suggestion chip click fires exactly once. Setting
+// this before sending hides the chips immediately so a double-click or a
+// blocked-composer residue can never re-emit the same prompt.
+const landingPicked = ref(false)
 // Holds the prefill text when the Sessions Hub hand-off requested a one-step
 // send ("Start task"). Flushed in onMounted once the draft subscription is live
 // so the first turn streams into this view. Empty string = nothing pending.
@@ -3099,7 +3103,7 @@ const currentPlanInHistory = computed(() => {
   )
 })
 
-const landingSuggestionsHidden = computed(() => landingPrefilled.value)
+const landingSuggestionsHidden = computed(() => landingPrefilled.value || landingPicked.value)
 const landingSuggestionsDisabled = computed(() => shouldDisableLandingSuggestions({
   landingPrefilled: landingPrefilled.value,
   composerText: inputText.value,
@@ -3321,6 +3325,7 @@ async function setComposerCodingModeEnabled(enabled: boolean) {
 // optimistic state, and recovery behavior stay identical.
 function applyLandingSuggestion(text: string) {
   if (landingSuggestionsDisabled.value) return
+  landingPicked.value = true
   sendComposerText(text)
 }
 

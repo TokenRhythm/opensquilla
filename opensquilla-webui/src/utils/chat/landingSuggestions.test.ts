@@ -31,8 +31,9 @@ describe('landing suggestion protection', () => {
   it('uses the same state for rendering and stale-click protection', () => {
     expect(viewSource).toContain(':suppressed="landingSuggestionsHidden"')
     expect(viewSource).toContain(':disabled="landingSuggestionsDisabled"')
-    expect(viewSource).toMatch(
-      /function applyLandingSuggestion\(text: string\) \{\s+if \(landingSuggestionsDisabled\.value\) return\s+sendComposerText\(text\)\s+\}/,
-    )
+    expect(viewSource).toMatch(/function applyLandingSuggestion\(text: string\) \{/)
+    expect(viewSource).toContain('if (landingSuggestionsDisabled.value) return')
+    expect(viewSource).toContain('landingPicked.value = true')
+    expect(viewSource).toContain('sendComposerText(text)')
   })
 })
