@@ -16,12 +16,50 @@ import contextlib
 import dataclasses
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from typing import cast
 
 from .types import AgentEvent, RunHeartbeatEvent, ToolUseStartEvent
 
 _STREAM_DONE = object()
+
+# How long a wrapper waits for a cancelled upstream task to actually finish
+# before giving up on it. An upstream whose cleanup blocks — a ``finally`` that
+# awaits a dead socket, a retry loop that swallows ``CancelledError`` — would
+# otherwise hold the timeout open forever, which is the exact stall the timeout
+# exists to end.
+_CANCEL_GRACE_SECONDS = 5.0
+
+# Abandoned tasks are parked here so the event loop keeps a strong reference and
+# cannot destroy them while they are still pending.
+_ORPHANED_TASKS: set[asyncio.Task[object]] = set()
+
+
+def _forget_orphan(task: asyncio.Task[object]) -> None:
+    _ORPHANED_TASKS.discard(task)
+    # Retrieve whatever it ended with so asyncio does not log it as never retrieved.
+    with contextlib.suppress(BaseException):
+        task.exception()
+
+
+async def _settle_or_abandon(task: asyncio.Task[object]) -> None:
+    """Cancel *task* and wait a bounded time for it to finish; else detach it.
+
+    ``asyncio.wait_for`` awaits the cancellation it requests, so an upstream
+    that never finishes cancelling makes the timeout itself unbounded. Waiting
+    only ``_CANCEL_GRACE_SECONDS`` and then walking away keeps the caller's
+    deadline real. The task is left running rather than awaited: it is already
+    unresponsive, and the turn it belonged to is failing regardless.
+    """
+    task.cancel()
+    done, _pending = await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+    if done:
+        with contextlib.suppress(BaseException):
+            task.exception()
+        return
+    _ORPHANED_TASKS.add(task)
+    task.add_done_callback(_forget_orphan)
+
 
 # ---------------------------------------------------------------------------
 # JSON repair helpers
@@ -100,17 +138,33 @@ async def idle_timeout_stream(
     stream: AsyncIterator[AgentEvent],
     timeout: float = 30.0,
 ) -> AsyncIterator[AgentEvent]:
-    """Raise ``TimeoutError`` if no event arrives within *timeout* seconds."""
-    # Obtain the underlying __anext__ coroutine so we can wrap it with asyncio.wait_for
+    """Raise ``TimeoutError`` if no event arrives within *timeout* seconds.
+
+    The pending ``__anext__`` is driven as a task and waited on with
+    :func:`asyncio.wait`, which reports the deadline without cancelling
+    anything. ``asyncio.wait_for`` would instead cancel the task and then await
+    that cancellation, so an upstream whose cleanup blocks kept the timeout
+    pending forever and the turn hung with no event and no error.
+    """
     aiter = stream.__aiter__()
-    while True:
-        try:
-            event = await asyncio.wait_for(aiter.__anext__(), timeout=timeout)
-        except StopAsyncIteration:
-            return
-        except TimeoutError as exc:
-            raise TimeoutError(f"Stream idle for more than {timeout}s") from exc
-        yield event
+    pending: asyncio.Task[AgentEvent] | None = None
+    try:
+        while True:
+            pending = asyncio.ensure_future(cast("Awaitable[AgentEvent]", aiter.__anext__()))
+            done, _still_waiting = await asyncio.wait({pending}, timeout=timeout)
+            if not done:
+                await _settle_or_abandon(cast("asyncio.Task[object]", pending))
+                pending = None
+                raise TimeoutError(f"Stream idle for more than {timeout}s")
+            settled, pending = pending, None
+            try:
+                event = settled.result()
+            except StopAsyncIteration:
+                return
+            yield event
+    finally:
+        if pending is not None:
+            await _settle_or_abandon(cast("asyncio.Task[object]", pending))
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +218,10 @@ async def heartbeat_stream(
             last_event_at = time.monotonic()
             yield event
     finally:
-        if not driver.done():
-            driver.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await driver
+        # Bounded for the same reason as the idle timeout: awaiting the driver's
+        # cancellation outright let a wedged upstream hang this wrapper's
+        # cleanup, and so the caller closing the stream after a failure.
+        await _settle_or_abandon(cast("asyncio.Task[object]", driver))
 
 
 async def _drain_stream(
