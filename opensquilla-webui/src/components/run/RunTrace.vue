@@ -57,8 +57,36 @@
     </div>
   </section>
   <TransitionGroup name="tool-row" tag="div" class="tool-row-group">
-  <template v-for="item in visibleItems" :key="item.key">
-    <div v-if="item.type === 'text'" class="msg-ai-text" v-html="item.html" />
+  <template v-for="item in displayItems" :key="item.key">
+    <div
+      v-if="item.type === 'bulk-control'"
+      class="tool-timeline__toolbar"
+      data-testid="run-trace-bulk-toolbar"
+      data-share-control
+    >
+      <span class="tool-timeline__summary">
+        <Icon name="listChecks" :size="13" aria-hidden="true" />
+        <span>{{ t('shared.runTrace.callsCount', { count: item.callCount }) }}</span>
+      </span>
+      <button
+        type="button"
+        class="tool-timeline__bulk-action"
+        data-testid="run-trace-bulk-toggle"
+        :title="bulkToggleLabel"
+        @click="toggleAllTools"
+      >
+        <span>{{ bulkToggleLabel }}</span>
+        <Icon
+          v-if="presentation !== 'activity'"
+          name="chevronDown"
+          :size="13"
+          class="tool-timeline__bulk-icon"
+          :class="{ 'is-collapse': anyBulkTargetOpen }"
+          aria-hidden="true"
+        />
+      </button>
+    </div>
+    <div v-else-if="item.type === 'text'" class="msg-ai-text" v-html="item.html" />
     <div v-else-if="item.type === 'interrupt'" class="run-trace__interrupt">
       <slot name="interrupt" :part="item.part" />
     </div>
@@ -567,6 +595,10 @@ type TimelineRenderItem =
   | ChatStreamTimelineItem
   | { type: 'overflow'; key: string; hiddenCount: number }
 
+type TimelineDisplayItem =
+  | TimelineRenderItem
+  | { type: 'bulk-control'; key: string; callCount: number }
+
 const props = defineProps<{
   // Chat path: the proven timeline shape (full group data). The lifted markup
   // renders this unchanged.
@@ -593,6 +625,9 @@ const props = defineProps<{
   // Chat activity disclosures opt into a quieter visual treatment. This is
   // presentation-only: disclosure state and tool behavior stay unchanged.
   presentation?: 'activity'
+  // Chat enables the turn-level bulk control through ToolCallTimeline. Direct
+  // RunTrace consumers such as Logs and Session Inspect keep their current UI.
+  showBulkToggle?: boolean
   // History can preserve provider group and tool ids that repeat across
   // messages. Scope only ephemeral disclosure keys; render ids stay unchanged.
   stateScope?: string
@@ -821,6 +856,10 @@ const visibleItems = computed<TimelineRenderItem[]>(() => {
   return out
 })
 
+type BulkToggleTarget =
+  | { kind: 'group'; id: string; open: boolean }
+  | { kind: 'item'; id: string; open: boolean }
+
 type DefaultOpenSnapshot = {
   groups: Map<string, boolean>
   items: Map<string, boolean>
@@ -832,6 +871,67 @@ type DefaultOpenTarget = {
   id: string
   defaultOpen: boolean
 }
+
+// A multi-call batch exposes one group disclosure; a single-call batch exposes
+// the call itself. Use the effective state that RunTrace renders, not the
+// caller-owned toggle bits that invert each row's default.
+const bulkToggleTargets = computed<BulkToggleTarget[]>(() => {
+  const targets: BulkToggleTarget[] = []
+  for (const item of visibleItems.value) {
+    if (item.type !== 'tool-group' || item.group.calls.length === 0) continue
+    if (item.group.calls.length > 1) {
+      targets.push({
+        kind: 'group',
+        id: groupStateId(item.group.groupId),
+        open: groupOpen(item.group),
+      })
+      continue
+    }
+    const call = item.group.calls[0]
+    targets.push({ kind: 'item', id: itemStateId(call.renderKey), open: callOpen(call) })
+  }
+  return targets
+})
+
+// Multi-call groups have a second disclosure level. Bulk expand/collapse owns
+// those member details too, while the button label follows the visible
+// top-level disclosures so a closed group never looks partially open.
+const bulkMemberTargets = computed<BulkToggleTarget[]>(() => visibleItems.value.flatMap(item => {
+  if (item.type !== 'tool-group' || item.group.calls.length <= 1) return []
+  return item.group.calls.map(call => ({
+    kind: 'item' as const,
+    id: itemStateId(call.renderKey),
+    open: callOpen(call),
+  }))
+}))
+
+const showBulkControl = computed(
+  () => props.showBulkToggle === true && bulkToggleTargets.value.length > 1,
+)
+const anyBulkTargetOpen = computed(() => bulkToggleTargets.value.some(target => target.open))
+const bulkToggleLabel = computed(() => t(
+  anyBulkTargetOpen.value ? 'chat.tool.collapseAll' : 'chat.tool.expandAll',
+))
+const visibleToolCallCount = computed(() => visibleItems.value.reduce(
+  (count, item) => item.type === 'tool-group' ? count + item.group.calls.length : count,
+  0,
+))
+
+// Keep the action next to the tools it controls without moving any preceding
+// assistant text. A synthetic keyed item also keeps TransitionGroup children
+// stable as the control appears during streaming.
+const displayItems = computed<TimelineDisplayItem[]>(() => {
+  const items: TimelineDisplayItem[] = [...visibleItems.value]
+  if (!showBulkControl.value) return items
+  const firstToolIndex = items.findIndex(item => item.type === 'tool-group')
+  if (firstToolIndex < 0) return items
+  items.splice(firstToolIndex, 0, {
+    type: 'bulk-control',
+    key: '__run-trace-bulk-control__',
+    callCount: visibleToolCallCount.value,
+  })
+  return items
+})
 
 const defaultOpenSnapshot = computed<DefaultOpenSnapshot>(() => {
   const groups = new Map<string, boolean>()
@@ -977,6 +1077,16 @@ function toggleGroupDisclosure(group: ChatToolCallGroup) {
 
 function toggleItemDisclosure(call: ChatToolCallRenderItem) {
   emit('toggleItem', itemStateId(call.renderKey))
+}
+
+function toggleAllTools() {
+  const targetOpen = !anyBulkTargetOpen.value
+  const targets = [...bulkToggleTargets.value, ...bulkMemberTargets.value]
+  for (const target of targets) {
+    if (target.open === targetOpen) continue
+    if (target.kind === 'group') emit('toggleGroup', target.id)
+    else emit('toggleItem', target.id)
+  }
 }
 
 function iconFor(call: ChatToolCallRenderItem): StatusVisual {
@@ -1236,6 +1346,72 @@ function fmtTok(n?: number | null): string {
 
 .step-group {
   border-radius: var(--radius-md);
+}
+
+.tool-timeline__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  width: 100%;
+  min-width: 0;
+  min-height: 2rem;
+  padding: 0 var(--sp-1) var(--sp-1);
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-dim);
+}
+
+.tool-timeline__summary,
+.tool-timeline__bulk-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-xs);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.tool-timeline__summary {
+  min-width: 0;
+}
+
+.tool-timeline__bulk-action {
+  flex: 0 0 auto;
+  min-height: 2rem;
+  padding: 0 var(--sp-1);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard);
+}
+
+.tool-timeline__bulk-action:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.tool-timeline__bulk-action:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-inset);
+}
+
+.tool-timeline__bulk-icon {
+  transition: transform var(--dur-fast) var(--ease-standard);
+}
+
+.tool-timeline__bulk-icon.is-collapse {
+  transform: rotate(180deg);
+}
+
+.tool-timeline__toolbar + .step-card {
+  margin-top: var(--sp-1);
 }
 
 .tool-overflow-note {
@@ -1502,6 +1678,10 @@ function fmtTok(n?: number | null): string {
   gap: 0.125rem;
 }
 
+.tool-timeline--checklist .tool-timeline__toolbar {
+  margin-bottom: var(--sp-1);
+}
+
 /* Flatten the per-group card chrome so the rows read as one running list. */
 .tool-timeline--checklist .step-card {
   margin: 0;
@@ -1510,14 +1690,6 @@ function fmtTok(n?: number | null): string {
   border-radius: 0;
   background: transparent;
   box-shadow: none;
-}
-
-/* Hierarchy reads through indentation: member rows hang a hairline guide
-   down the left edge under their group header, so a multi-call batch reads
-   as one nested level without any toolbar chrome. */
-.tool-timeline--checklist .step-group-members {
-  border-left: 1px solid var(--hairline);
-  margin-left: 0.375rem;
 }
 
 /* A running row earns a steady outlined ring; completed rows dim so attention

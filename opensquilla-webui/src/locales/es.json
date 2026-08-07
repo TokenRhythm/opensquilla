@@ -3681,7 +3681,9 @@
       "results": "{count} resultados",
       "countRunning": "{count} en ejecución",
       "countDone": "{count} hechos",
-      "countFailed": "{count} fallidos"
+      "countFailed": "{count} fallidos",
+      "collapseAll": "Contraer todo",
+      "expandAll": "Expandir todo"
     },
     "chips": {
       "whatCanYouDo": "¿Qué puedes hacer?",

@@ -3681,7 +3681,9 @@
       "results": "{count} 件の結果",
       "countRunning": "{count} 件実行中",
       "countDone": "{count} 件完了",
-      "countFailed": "{count} 件失敗"
+      "countFailed": "{count} 件失敗",
+      "collapseAll": "すべて折りたたむ",
+      "expandAll": "すべて展開"
     },
     "chips": {
       "whatCanYouDo": "何ができますか？",

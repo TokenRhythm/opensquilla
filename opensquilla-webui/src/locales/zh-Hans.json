@@ -3734,7 +3734,9 @@
       "results": "{count} 条结果",
       "countRunning": "{count} 项运行中",
       "countDone": "{count} 项完成",
-      "countFailed": "{count} 项失败"
+      "countFailed": "{count} 项失败",
+      "collapseAll": "全部折叠",
+      "expandAll": "全部展开"
     },
     "chips": {
       "whatCanYouDo": "你能做什么？",

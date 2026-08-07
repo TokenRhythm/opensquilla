@@ -206,7 +206,7 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('.tool-row__bullet--ok')).not.toBeNull()
     expect(el.querySelector('.tool-row__state-icon--ok')).not.toBeNull()
     expect(el.querySelector('.step-chevron')).not.toBeNull()
-    expect(el.querySelector('.tool-timeline__bulk-icon')).toBeNull()
+    expect(el.querySelector('.tool-timeline__bulk-icon')).not.toBeNull()
     expect(el.querySelector('.step-count')?.textContent).toBe('2 calls')
     expect(
       Array.from(el.querySelectorAll('.tool-row--group .tool-row__status'))
@@ -229,9 +229,6 @@ describe('RunTrace activity presentation', () => {
     expect(
       el.querySelector('.tool-row__activity-arrow')?.hasAttribute('data-share-control'),
     ).toBe(true)
-    // Hierarchy is expressed through indentation, not toolbar chrome: no
-    // summary/toggle toolbar, and member nesting is covered by the CSS rule
-    // assertions above. Activity keeps its own quiet chrome.
     expect(el.querySelector('.tool-timeline__toolbar')).toBeNull()
     expect(el.querySelector('.tool-timeline__bulk-icon')).toBeNull()
     // The footprint secondary already carries the call count, so the raw

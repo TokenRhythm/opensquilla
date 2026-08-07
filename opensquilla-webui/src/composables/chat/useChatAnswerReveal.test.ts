@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { ref, nextTick, effectScope, type EffectScope } from 'vue'
 import {
   useChatAnswerReveal,
+  ANSWER_REVEAL_MIN_MS as MIN,
   ANSWER_REVEAL_MAX_MS as MAX,
 } from './useChatAnswerReveal'
 
@@ -27,30 +28,44 @@ describe('useChatAnswerReveal', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
 
-  it('is open from the start: streamed content is never held', () => {
-    const h = harness()
-    expect(h.api.answerRevealOpen.value).toBe(true)
-    h.scope.stop()
-  })
-
-  it('stays open when streaming starts, even before any router decision', async () => {
+  it('holds the answer until MIN when the router decides quickly', async () => {
     const h = harness()
     h.isStreaming.value = true
     await nextTick()
-    expect(h.api.answerRevealOpen.value).toBe(true)
-    h.scope.stop()
-  })
+    expect(h.api.answerRevealOpen.value).toBe(false)
 
-  it('ignores router decision timing entirely (no MIN window to wait for)', async () => {
-    const h = harness()
-    h.isStreaming.value = true
-    await nextTick()
-    // No decision yet — content is still fully visible.
-    expect(h.api.answerRevealOpen.value).toBe(true)
-    vi.advanceTimersByTime(MAX + 1000)
-    expect(h.api.answerRevealOpen.value).toBe(true)
+    vi.advanceTimersByTime(50)          // decision arrives well before MIN
     h.decided.value = { tier: 'c1' }
     await nextTick()
+    expect(h.api.answerRevealOpen.value).toBe(false) // still held — MIN not reached
+
+    vi.advanceTimersByTime(MIN - 50 - 1) // just before MIN
+    expect(h.api.answerRevealOpen.value).toBe(false)
+    vi.advanceTimersByTime(1)            // == MIN
+    expect(h.api.answerRevealOpen.value).toBe(true)
+    h.scope.stop()
+  })
+
+  it('reveals as soon as the decision lands if MIN has already passed', async () => {
+    const h = harness()
+    h.isStreaming.value = true
+    await nextTick()
+    const past = Math.floor((MIN + MAX) / 2) // past MIN, before MAX
+    vi.advanceTimersByTime(past)
+    expect(h.api.answerRevealOpen.value).toBe(false) // no decision yet → still held
+    h.decided.value = { tier: 'c2' }
+    await nextTick()
+    expect(h.api.answerRevealOpen.value).toBe(true)  // decision after MIN → reveal now
+    h.scope.stop()
+  })
+
+  it('falls back to MAX when the decision never arrives', async () => {
+    const h = harness()
+    h.isStreaming.value = true
+    await nextTick()
+    vi.advanceTimersByTime(MAX - 1)
+    expect(h.api.answerRevealOpen.value).toBe(false)
+    vi.advanceTimersByTime(1)            // == MAX
     expect(h.api.answerRevealOpen.value).toBe(true)
     h.scope.stop()
   })
@@ -71,37 +86,25 @@ describe('useChatAnswerReveal', () => {
     h.scope.stop()
   })
 
-  it('resets only after streaming ends, then reopens on the next turn', async () => {
+  it('resets the gate and clears timers when streaming ends', async () => {
     const h = harness()
     h.isStreaming.value = true
     await nextTick()
+    vi.advanceTimersByTime(4000)
     expect(h.api.answerRevealOpen.value).toBe(true)
 
     h.isStreaming.value = false
     await nextTick()
     expect(h.api.answerRevealOpen.value).toBe(false) // reset for the next turn
-
-    h.isStreaming.value = true
-    await nextTick()
-    expect(h.api.answerRevealOpen.value).toBe(true) // immediately open again
     h.scope.stop()
   })
 
-  it('revealNow is a safe no-op while open', async () => {
+  it('clears pending timers on scope dispose (no late reveal)', async () => {
     const h = harness()
     h.isStreaming.value = true
     await nextTick()
-    h.api.revealNow()
-    expect(h.api.answerRevealOpen.value).toBe(true)
-    h.scope.stop()
-  })
-
-  it('clears on scope dispose without late reveals (interface stability)', async () => {
-    const h = harness()
-    h.isStreaming.value = true
-    await nextTick()
-    h.scope.stop()                      // unmount mid-stream
+    h.scope.stop()                      // unmount mid-window
     vi.advanceTimersByTime(5000)
-    expect(h.api.answerRevealOpen.value).toBe(true)
+    expect(h.api.answerRevealOpen.value).toBe(false)
   })
 })

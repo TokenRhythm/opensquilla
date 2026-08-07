@@ -3681,7 +3681,9 @@
       "results": "{count} Ergebnisse",
       "countRunning": "{count} laufen",
       "countDone": "{count} fertig",
-      "countFailed": "{count} fehlgeschlagen"
+      "countFailed": "{count} fehlgeschlagen",
+      "collapseAll": "Alle einklappen",
+      "expandAll": "Alle ausklappen"
     },
     "chips": {
       "whatCanYouDo": "Was kannst du?",

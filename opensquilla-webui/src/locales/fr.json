@@ -3681,7 +3681,9 @@
       "results": "{count} résultats",
       "countRunning": "{count} en cours",
       "countDone": "{count} terminé(s)",
-      "countFailed": "{count} en échec"
+      "countFailed": "{count} en échec",
+      "collapseAll": "Tout réduire",
+      "expandAll": "Tout développer"
     },
     "chips": {
       "whatCanYouDo": "Que peux-tu faire ?",

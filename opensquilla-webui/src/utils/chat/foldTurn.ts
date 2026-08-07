@@ -61,14 +61,11 @@ export interface ReconciledTextSnapshot {
 /**
  * Apply an authoritative terminal text snapshot without losing tool history.
  *
- * The product contract is "streamed content is the answer": what the user saw
- * stream by stream stays exactly as it was. A strict extension is still an
- * ordinary suffix and therefore stays after the last streamed segment. A
- * conflicting snapshot is deliberately NOT applied to the DOM — streamed text
- * segments and tool groups keep their original positions and order, so a turn
- * is never rewritten or reordered after it finishes. The snapshot remains
- * available for diagnostics/export via the returned rawText only when it is a
- * strict extension; on conflict the streamed accumulation stays canonical.
+ * A strict extension is still an ordinary suffix and therefore stays after the
+ * last streamed segment. A conflicting snapshot supersedes every streamed text
+ * segment, but keeps tool groups in arrival order and places the one canonical
+ * text segment after them. An empty snapshot intentionally clears text while
+ * retaining those tool groups.
  */
 export function reconcileTextSnapshot(
   segments: ChatStreamSegment[],
@@ -95,12 +92,11 @@ export function reconcileTextSnapshot(
     return { rawText: snapshot, segments: next, changed: true }
   }
 
-  const next = segments.slice()
-  // Conflict (snapshot neither equals nor extends the streamed text): keep the
-  // streamed content exactly as shown. No text segments are deleted, nothing is
-  // reordered, and the snapshot does not replace the answer. `changed: false`
-  // leaves the DOM untouched, so the user never sees a finished turn rewritten.
-  return { rawText: accumulatedText, segments: next, changed: false }
+  const next = segments.filter(segment => segment.type !== 'text')
+  if (snapshot) {
+    next.push({ type: 'text', raw: snapshot, html: '', dirty: true, presentation: 'answer' })
+  }
+  return { rawText: snapshot, segments: next, changed: true }
 }
 
 // A later requested-frame for the same approvalId (a re-broadcast or the

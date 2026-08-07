@@ -19339,63 +19339,18 @@ class Agent:
             lines.append("请按上次的表单格式重新回答，或回 '取消' 终止。")
         return "\n".join(lines)
 
-    @staticmethod
-    def _chunk_stream_text(text: str, *, max_chunk: int = 160) -> list[str]:
-        """Split canned terminal text into stream-sized deltas for live rendering.
-
-        Splits on line boundaries so markdown structure (blank lines, code
-        blocks, lists) is preserved; a single over-long line is split on space
-        boundaries, then as a hard character fallback. Concatenating the chunks
-        reproduces the input byte-for-byte, so the authoritative snapshot still
-        matches what the user saw stream in.
-        """
-        if not text or len(text) <= max_chunk:
-            return [text] if text else []
-        chunks: list[str] = []
-        current = ""
-        for line in text.splitlines(keepends=True):
-            if len(current) + len(line) <= max_chunk:
-                current += line
-                continue
-            if current:
-                chunks.append(current)
-                current = ""
-            if len(line) <= max_chunk:
-                current = line
-                continue
-            remainder = line
-            while len(remainder) > max_chunk:
-                cut = remainder.rfind(" ", 0, max_chunk + 1)
-                if cut <= 0:
-                    cut = max_chunk
-                chunks.append(remainder[:cut])
-                remainder = remainder[cut:]
-            if remainder:
-                current = remainder
-        if current:
-            chunks.append(current)
-        return chunks
-
     async def _emit_terminal_text(
         self,
         text: str,
         *,
         iterations: int,
     ) -> AsyncIterator[Any]:
-        """Yield ``TextDeltaEvent`` chunks + a minimal ``DoneEvent`` so the
-        stream consumer + transcript treat this as a full assistant turn.
-
-        Canned terminal text (clarify outcomes, meta-skill feedback, policy
-        finalization) is chunked with a small inter-chunk delay so the Web UI
-        streams it instead of dumping the whole payload at once — the product
-        contract is "streamed content is the answer".
-        """
+        """Yield ``TextDeltaEvent(text)`` + a minimal ``DoneEvent`` so the
+        stream consumer + transcript treat this as a full assistant turn."""
         from opensquilla.engine.types import DoneEvent, TextDeltaEvent
 
         if text:
-            for chunk in self._chunk_stream_text(text):
-                yield TextDeltaEvent(text=chunk)
-                await asyncio.sleep(0.02)
+            yield TextDeltaEvent(text=text)
         yield DoneEvent(
             text=text,
             input_tokens=0,
