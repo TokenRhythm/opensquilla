@@ -130,6 +130,50 @@ async def test_qq_send_file_uploads_and_sends_media_message(tmp_path) -> None:
     assert result.target_id == "openid-1"
 
 
+@pytest.mark.asyncio
+async def test_qq_send_with_attachment_delivers_file_not_degrade_text() -> None:
+    """QQ send() with attachments routes through send_file, not a text notice."""
+
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from opensquilla.channels.qq import QQChannel, QQChannelConfig
+
+    channel = QQChannel(QQChannelConfig(name="qq", app_id="a", app_secret="s"))
+    uploads: list[dict] = []
+
+    async def fake_upload(route, **kwargs):
+        uploads.append(kwargs.get("json", {}))
+        return {"file_info": "fi-456"}
+
+    channel.api = SimpleNamespace(
+        _http=SimpleNamespace(request=fake_upload),
+        post_c2c_message=AsyncMock(),
+        post_group_message=AsyncMock(),
+    )
+    await channel.send(
+        OutgoingMessage(
+            content="",
+            metadata={"chat_type": "c2c", "openid": "openid-1", "msg_id": "m-1"},
+            attachments=[
+                Attachment(
+                    name="a.txt",
+                    mime_type="text/plain",
+                    data=b"payload",
+                )
+            ],
+        )
+    )
+
+    assert uploads, "expected a file upload"
+    # The media message is sent via post_c2c_message (msg_type=7), not a text notice.
+    channel.api.post_c2c_message.assert_awaited_once()
+    send_kwargs = channel.api.post_c2c_message.await_args.kwargs
+    assert send_kwargs["msg_type"] == 7
+    assert "[attachment" not in str(send_kwargs)
+    channel.api.post_group_message.assert_not_awaited()
+
+
 def test_qq_artifact_delivery_gate_is_unlocked_by_capability_profile() -> None:
     """QQ send_file must not be gated off by its capability profile.
 

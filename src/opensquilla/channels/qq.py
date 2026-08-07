@@ -508,16 +508,26 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         chat_type = meta.get("chat_type", "")
         msg_id = meta.get("msg_id") or meta.get("reply_to_msg_id") or message.reply_to
         if message.attachments:
-            # The official QQ Bot platform has no file/media upload API on the
-            # passive message path; degrade to a text notice instead of
-            # silently dropping the attachment.
-            names = ", ".join(str(a.name or "attachment") for a in message.attachments)
-            suffix = (
-                f"\n\n[attachment unsupported: {names}]"
-                if message.content.strip()
-                else f"[attachment unsupported: {names}]"
+            from opensquilla.channels._attachment_io import deliver_message_attachments
+
+            target = (
+                meta.get("openid")
+                or meta.get("user_openid")
+                or meta.get("group_openid")
+                or ""
             )
-            message = message.model_copy(update={"content": message.content + suffix})
+            if not target:
+                raise ValueError("qq.send: attachment target is required")
+            await deliver_message_attachments(
+                self,
+                target=target,
+                content=message.content,
+                attachments=list(message.attachments),
+                chat_type=chat_type,
+                msg_id=msg_id,
+            )
+            if not message.content.strip():
+                return
 
         api = self.api
         if chat_type == "group":

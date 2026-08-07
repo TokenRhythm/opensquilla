@@ -194,6 +194,7 @@ async def deliver_message_attachments(
     target: str,
     content: str,
     attachments: list[Any],
+    **send_kwargs: Any,
 ) -> None:
     """Deliver every attachment on an outgoing message via ``channel.send_file``.
 
@@ -211,6 +212,7 @@ async def deliver_message_attachments(
             call_kwargs: dict[str, Any] = {}
             if "content" in sig.parameters:
                 call_kwargs["content"] = content
+            call_kwargs.update(send_kwargs)
             attachment_name = getattr(attachment, "name", None)
             if "file_name" in sig.parameters and isinstance(attachment_name, str) and attachment_name:
                 call_kwargs["file_name"] = attachment_name
