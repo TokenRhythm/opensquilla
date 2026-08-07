@@ -960,25 +960,9 @@ class WeComChannel:
         url = str(attachment.url or "").strip()
         if not url:
             return attachment
-        from opensquilla.channels._attachment_io import (
-            attachment_limit_for_mime,
-            ensure_bytes_within_limit,
-        )
+        from opensquilla.channels._attachment_io import download_attachment_bytes
 
-        limit = attachment_limit_for_mime(attachment.mime_type)
-        import httpx
-
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=httpx.Timeout(30.0, connect=10.0),
-        ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            payload = ensure_bytes_within_limit(
-                resp.content,
-                name=attachment.name,
-                limit=limit,
-            )
+        payload = await download_attachment_bytes(attachment)
         return Attachment(
             name=attachment.name or "wecom-image",
             mime_type=attachment.mime_type,

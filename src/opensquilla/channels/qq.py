@@ -416,8 +416,8 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         """Resolve a QQ image/file URL into bytes for shared ingest.
 
         QQ delivers attachments as ``url`` references. The generic ingest path
-        requires ``data`` bytes, so the URL is downloaded here with the shared
-        size bound; the payload is then validated by the ingest stage.
+        requires ``data`` bytes, so the URL is streamed down here with the
+        shared size bound instead of being read fully into memory first.
         """
 
         if attachment.data is not None:
@@ -425,25 +425,9 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         url = str(attachment.url or "").strip()
         if not url:
             return attachment
-        from opensquilla.channels._attachment_io import (
-            attachment_limit_for_mime,
-            ensure_bytes_within_limit,
-        )
+        from opensquilla.channels._attachment_io import download_attachment_bytes
 
-        limit = attachment_limit_for_mime(attachment.mime_type)
-        import httpx
-
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=httpx.Timeout(30.0, connect=10.0),
-        ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            payload = ensure_bytes_within_limit(
-                resp.content,
-                name=attachment.name,
-                limit=limit,
-            )
+        payload = await download_attachment_bytes(attachment)
         return Attachment(
             name=attachment.name or "qq-file",
             mime_type=attachment.mime_type,
@@ -641,7 +625,12 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
                 or ""
             )
         if not file_info:
-            raise RuntimeError("qq.send_file: upload returned no file_info")
+            code = upload.get("code") if isinstance(upload, dict) else None
+            message = upload.get("message") if isinstance(upload, dict) else None
+            raise RuntimeError(
+                "qq.send_file: upload returned no file_info"
+                + (f" (code={code}, message={message})" if code or message else "")
+            )
 
         api = self.api
         media = {"file_info": file_info}

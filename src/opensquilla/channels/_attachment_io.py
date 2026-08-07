@@ -127,6 +127,52 @@ async def materialize_attachment(attachment: Any) -> Path:
     return _write_temp(b"".join(chunks), name=name)
 
 
+async def download_attachment_bytes(
+    attachment: Any,
+    *,
+    client: Any = None,
+) -> bytes:
+    """Download an attachment URL into bytes, streaming with the size bound.
+
+    Shared by channel ``resolve_inbound_attachment`` implementations so every
+    adapter applies the same size limit while downloading (instead of reading
+    the full body into memory first). Accepts an optional httpx client so an
+    adapter can reuse its authenticated client (e.g. Slack's bot token).
+    """
+
+    url = str(getattr(attachment, "url", "") or "").strip()
+    if not url:
+        raise ValueError("attachment requires a URL")
+    name = getattr(attachment, "name", None)
+    declared_size = getattr(attachment, "size", None)
+    ensure_declared_size_within_limit(declared_size, name=name)
+    limit = attachment_limit_for_mime(getattr(attachment, "mime_type", None))
+
+    import httpx
+
+    async def _stream(stream_client: Any) -> bytes:
+        async with stream_client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes(_CHUNK_BYTES):
+                total += len(chunk)
+                if total > limit:
+                    raise RemoteAttachmentTooLargeError(
+                        f"{name or 'attachment'} exceeds the {limit} byte attachment limit"
+                    )
+                chunks.append(chunk)
+        return b"".join(chunks)
+
+    if client is not None:
+        return await _stream(client)
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(30.0, connect=10.0),
+    ) as client:
+        return await _stream(client)
+
+
 def _write_temp(payload: bytes, *, name: str | None) -> Path:
     """Write bytes to a temp file with a sane suffix from the attachment name."""
 

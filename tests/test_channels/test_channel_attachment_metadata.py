@@ -422,3 +422,44 @@ async def test_wecom_inbound_resolver_downloads_bytes(monkeypatch) -> None:
     resolved = await channel.resolve_inbound_attachment(attachment)
     assert resolved.data == b"pic!"
     assert resolved.mime_type == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_download_attachment_bytes_streams_with_size_bound(monkeypatch) -> None:
+    """Shared downloader streams bytes and enforces the MIME size limit."""
+
+    import httpx
+
+    from opensquilla.channels._attachment_io import (
+        RemoteAttachmentTooLargeError,
+        download_attachment_bytes,
+    )
+    from opensquilla.channels.types import Attachment
+
+    attachment = Attachment(
+        name="pic.png",
+        mime_type="image/png",
+        url="https://cdn.example.com/pic.png",
+    )
+    mock_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(
+                200,
+                content=b"x" * 4096,
+                headers={"content-type": "image/png"},
+            )
+        )
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda **_: mock_client)
+    payload = await download_attachment_bytes(attachment)
+    assert len(payload) == 4096
+
+    # Oversized (declared) attachment is rejected before download.
+    big = Attachment(
+        name="big.png",
+        mime_type="image/png",
+        url="https://cdn.example.com/big.png",
+        size=IMAGE_ATTACHMENT_BYTES + 1,
+    )
+    with pytest.raises(RemoteAttachmentTooLargeError):
+        await download_attachment_bytes(big)
