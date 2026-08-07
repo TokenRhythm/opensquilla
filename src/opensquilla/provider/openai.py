@@ -2554,6 +2554,9 @@ def _openrouter_non_system_prefix_item_hashes(
     return hashes
 
 
+_REASONING_REPLAY_MAX_CHARS = 32_000
+
+
 def _attach_reasoning_content(
     msg: Message,
     payload: dict[str, Any],
@@ -2562,7 +2565,14 @@ def _attach_reasoning_content(
     require_assistant_reasoning_content: bool = False,
 ) -> dict[str, Any]:
     if include_reasoning_content and msg.role == "assistant" and msg.reasoning_content:
-        payload["reasoning_content"] = msg.reasoning_content
+        if len(msg.reasoning_content) <= _REASONING_REPLAY_MAX_CHARS:
+            payload["reasoning_content"] = msg.reasoning_content
+        elif require_assistant_reasoning_content:
+            # Whole-message drop: an oversized reasoning chain exceeds the
+            # provider's per-field limit and would make the whole request
+            # fail (HTTP 400). Never replay a truncated fragment — a partial
+            # chain has no semantic value and can mislead the model.
+            payload["reasoning_content"] = ""
     elif require_assistant_reasoning_content and msg.role == "assistant":
         # Models that require the key on every assistant message get an
         # empty string whenever the actual reasoning is absent or withheld

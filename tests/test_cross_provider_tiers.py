@@ -21,7 +21,11 @@ from opensquilla.provider.anthropic import _build_message_payload
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.deployment import resolve_provider_deployment
 from opensquilla.provider.environment import environment_value
-from opensquilla.provider.openai import _build_openai_messages, _build_openai_wire_messages
+from opensquilla.provider.openai import (
+    _REASONING_REPLAY_MAX_CHARS,
+    _build_openai_messages,
+    _build_openai_wire_messages,
+)
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import (
     ChatConfig,
@@ -786,3 +790,36 @@ def test_openai_compat_a_to_b_drops_foreign_reasoning_content() -> None:
 
     assert replayed[0]["reasoning_content"] == "provider-a-private-reasoning"
     assert "reasoning_content" not in stripped[0]
+
+
+def test_openai_reasoning_replay_oversized_whole_message_drop() -> None:
+    """Oversized reasoning_content must not be replayed (whole-message drop)."""
+    msg = Message(
+        role="assistant",
+        content="short answer",
+        reasoning_content="x" * (_REASONING_REPLAY_MAX_CHARS + 1),
+    )
+    (payload,) = _build_openai_messages(msg)
+    assert "reasoning_content" not in payload
+
+
+def test_openai_reasoning_replay_under_limit_unchanged() -> None:
+    """Reasoning content within the replay cap is replayed byte-identical."""
+    reasoning = "chain of thought" * 100  # well under the cap
+    msg = Message(role="assistant", content="answer", reasoning_content=reasoning)
+    (payload,) = _build_openai_messages(msg)
+    assert payload["reasoning_content"] == reasoning
+
+
+def test_openai_reasoning_replay_oversized_requires_empty_string() -> None:
+    """Oversized reasoning + require flag degrades to an empty string."""
+    msg = Message(
+        role="assistant",
+        content="answer",
+        reasoning_content="x" * (_REASONING_REPLAY_MAX_CHARS + 1),
+    )
+    (payload,) = _build_openai_messages(
+        msg,
+        require_assistant_reasoning_content=True,
+    )
+    assert payload["reasoning_content"] == ""
