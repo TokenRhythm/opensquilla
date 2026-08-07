@@ -69,6 +69,10 @@ class _SequenceProvider:
         return []
 
 
+class _NonRetrySafeSequenceProvider(_SequenceProvider):
+    retry_failed_call_safe = False
+
+
 def _placeholder_tool_call(tool_use_id: str) -> list[Any]:
     return [
         ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="echo"),
@@ -458,6 +462,41 @@ async def test_deadline_wrapup_preempts_reasoning_only_stream() -> None:
         if text.startswith(_WRAPUP_PREFIX)
     ]
     assert len(wrapup_texts) == 1
+
+
+@pytest.mark.asyncio
+async def test_deadline_wrapup_does_not_replay_non_retry_safe_provider() -> None:
+    provider = _NonRetrySafeSequenceProvider(
+        [
+            [
+                ProviderReasoning(text="deep thought"),
+                2.5,
+                ProviderReasoning(text="more thought"),
+                ProviderText(text="composite completed"),
+                ProviderDone(stop_reason="stop", input_tokens=5, output_tokens=2),
+            ],
+            _final_text(),
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            timeout=8.0,
+            deadline_wrapup_margin_seconds=6,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("fix the bug")]
+
+    assert any(event.kind == "done" for event in events)
+    assert len(provider.calls) == 1
+    assert not [
+        text
+        for text in _user_texts(provider.calls[0]["messages"])
+        if text.startswith(_WRAPUP_PREFIX)
+    ]
 
 
 @pytest.mark.asyncio

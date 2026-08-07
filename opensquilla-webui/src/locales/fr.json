@@ -549,7 +549,14 @@
     "title": "Une erreur s'est produite",
     "defaultMessage": "Une erreur inattendue s'est produite.",
     "reload": "Recharger la page",
-    "dismiss": "Ignorer"
+    "dismiss": "Ignorer",
+    "detailsLabel": "Détails de l'erreur",
+    "copyDetails": "Copier les détails",
+    "copied": "Copié",
+    "openLogs": "Ouvrir le dossier des journaux",
+    "privacyHint": "Vérifiez le contenu avant de le partager. Les détails peuvent contenir des chemins, des URL ou des informations de compte.",
+    "copyFailed": "La copie a échoué. Sélectionnez les détails et copiez-les manuellement.",
+    "openLogsFailed": "Impossible d’ouvrir le dossier des journaux."
   },
   "errors": {
     "saveFailed": "Échec de l'enregistrement",

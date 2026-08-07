@@ -549,7 +549,14 @@
     "title": "問題が発生しました",
     "defaultMessage": "予期しないエラーが発生しました。",
     "reload": "ページを再読み込み",
-    "dismiss": "閉じる"
+    "dismiss": "閉じる",
+    "detailsLabel": "エラーの詳細",
+    "copyDetails": "詳細をコピー",
+    "copied": "コピーしました",
+    "openLogs": "ログフォルダーを開く",
+    "privacyHint": "共有する前に内容を確認してください。エラーの詳細にはパス、URL、アカウント情報が含まれる場合があります。",
+    "copyFailed": "コピーできませんでした。詳細を選択して手動でコピーしてください。",
+    "openLogsFailed": "ログフォルダーを開けませんでした。"
   },
   "errors": {
     "saveFailed": "保存に失敗しました",

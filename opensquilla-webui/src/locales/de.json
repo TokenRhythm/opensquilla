@@ -549,7 +549,14 @@
     "title": "Etwas ist schiefgelaufen",
     "defaultMessage": "Ein unerwarteter Fehler ist aufgetreten.",
     "reload": "Seite neu laden",
-    "dismiss": "Schließen"
+    "dismiss": "Schließen",
+    "detailsLabel": "Fehlerdetails",
+    "copyDetails": "Details kopieren",
+    "copied": "Kopiert",
+    "openLogs": "Protokollordner öffnen",
+    "privacyHint": "Prüfen Sie den Inhalt vor dem Teilen. Fehlerdetails können Pfade, URLs oder Kontoinformationen enthalten.",
+    "copyFailed": "Kopieren fehlgeschlagen. Wählen Sie die Details aus und kopieren Sie sie manuell.",
+    "openLogsFailed": "Der Protokollordner konnte nicht geöffnet werden."
   },
   "errors": {
     "saveFailed": "Speichern fehlgeschlagen",

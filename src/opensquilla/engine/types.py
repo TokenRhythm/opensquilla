@@ -719,6 +719,11 @@ class AgentConfig:
     # default (the retry keeps thinking on). Set via
     # OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK.
     reasoning_only_thinking_fallback: bool = False
+    # Retry provider errors mentioning thinking/reasoning with thinking
+    # disabled. Historical default on; strict benchmark arms can turn it off
+    # with OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK so every request keeps
+    # the frozen thinking contract.
+    provider_error_thinking_fallback: bool = True
     # Force thinking off for every provider call once remaining wall-clock
     # time drops below this many seconds. 0 = off. Complements the wrap-up
     # directive: the nudge alone leaves thinking enabled, so the model can

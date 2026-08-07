@@ -64,7 +64,8 @@ _ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS = 5.0
 # this a single 429/5xx blip would discard the whole billed proposer round.
 _ENSEMBLE_AGGREGATOR_MAX_RETRIES = 2
 _ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 4.0)
-_AGGREGATOR_RETRYABLE_FAILURE_KINDS = frozenset(
+_ENSEMBLE_PROPOSER_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 4.0)
+_ENSEMBLE_RETRYABLE_FAILURE_KINDS = frozenset(
     {
         ProviderFailureKind.RATE_LIMITED,
         ProviderFailureKind.PROVIDER_OVERLOADED,
@@ -88,6 +89,16 @@ def _aggregator_retry_backoff_seconds(attempt: int) -> float:
     """Backoff before aggregator retry ``attempt`` (1-indexed)."""
 
     delays = _ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS
+    if not delays:
+        return 0.0
+    index = min(max(attempt - 1, 0), len(delays) - 1)
+    return max(0.0, float(delays[index]))
+
+
+def _proposer_retry_backoff_seconds(attempt: int) -> float:
+    """Backoff before proposer retry ``attempt`` (1-indexed)."""
+
+    delays = _ENSEMBLE_PROPOSER_RETRY_BACKOFF_SECONDS
     if not delays:
         return 0.0
     index = min(max(attempt - 1, 0), len(delays) - 1)
@@ -319,10 +330,27 @@ class _CandidateResult:
     execution: dict[str, Any] = field(default_factory=dict)
     usage_reported: bool = False
     request_started: bool = False
+    # Populated only when proposer retries are explicitly enabled. Each child
+    # is one complete upstream attempt; the parent carries the final accepted
+    # body plus token/cost totals across every attempt.
+    attempts: list[_CandidateResult] = field(default_factory=list, repr=False)
+    attempt_index: int = 0
+    retryable: bool = False
+    retry_reason: str = ""
 
     @property
     def ok(self) -> bool:
-        return not self.error and bool(self.text.strip())
+        return (
+            not self.error
+            and str(self.stop_reason or "").strip().lower() != "error"
+            and bool(self.text.strip())
+        )
+
+    @property
+    def request_count(self) -> int:
+        if self.attempts:
+            return sum(1 for attempt in self.attempts if attempt.request_started)
+        return int(self.request_started)
 
     def usage_row(self, *, role: str, profile: str) -> dict[str, Any]:
         row = {
@@ -345,6 +373,22 @@ class _CandidateResult:
         }
         if self.billing_receipt is not None:
             row["billing_receipt"] = self.billing_receipt
+        if self.attempt_index > 0:
+            row.update(
+                {
+                    "attempt_index": self.attempt_index,
+                    "attempt_ok": self.ok,
+                    "request_started": self.request_started,
+                    "usage_reported": self.usage_reported,
+                    "usage_receipt_missing": (
+                        self.request_started and not self.usage_reported
+                    ),
+                    "stop_reason": self.stop_reason,
+                    "error_code": self.error_code,
+                    "retryable": self.retryable,
+                    "retry_reason": self.retry_reason,
+                }
+            )
         return row
 
     def trace_row(self, *, include_text: bool, content_max_chars: int) -> dict[str, Any]:
@@ -370,6 +414,29 @@ class _CandidateResult:
         if self.error:
             row["error"] = self.error
             row["error_code"] = self.error_code
+        if self.attempt_index > 0:
+            row.update(
+                {
+                    "attempt_index": self.attempt_index,
+                    "usage_reported": self.usage_reported,
+                    "usage_receipt_missing": (
+                        self.request_started and not self.usage_reported
+                    ),
+                    "error_code": self.error_code,
+                    "retryable": self.retryable,
+                    "retry_reason": self.retry_reason,
+                }
+            )
+        if self.attempts:
+            row["attempt_count"] = len(self.attempts)
+            row["request_count"] = self.request_count
+            row["attempts"] = [
+                attempt.trace_row(
+                    include_text=include_text,
+                    content_max_chars=content_max_chars,
+                )
+                for attempt in self.attempts
+            ]
         if include_text:
             row["text"] = self.text
         return row
@@ -767,21 +834,34 @@ def _candidate_usage_rows(
     *,
     profile: str,
 ) -> list[dict[str, Any]]:
-    return [
-        candidate.usage_row(role="proposer", profile=profile)
-        for candidate in candidates
-        if _candidate_has_usage(candidate)
-    ]
+    rows: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if candidate.attempts:
+            # Retry-enabled turns retain one auditable row for every started
+            # request. Missing receipts deliberately remain zero-usage rows
+            # and are also counted by usage_missing_count.
+            rows.extend(
+                attempt.usage_row(role="proposer", profile=profile)
+                for attempt in candidate.attempts
+                if attempt.request_started
+            )
+        elif _candidate_has_usage(candidate):
+            rows.append(candidate.usage_row(role="proposer", profile=profile))
+    return rows
 
 
 def _candidate_missing_usage_count(candidates: Sequence[_CandidateResult]) -> int:
     """Count only requests that started but never produced a usage receipt."""
 
-    return sum(
-        1
-        for candidate in candidates
-        if candidate.request_started and not candidate.usage_reported
-    )
+    missing_count = 0
+    for candidate in candidates:
+        attempts = candidate.attempts or [candidate]
+        missing_count += sum(
+            1
+            for attempt in attempts
+            if attempt.request_started and not attempt.usage_reported
+        )
+    return missing_count
 
 
 def _uniform_message_limit_proof(
@@ -878,6 +958,8 @@ class EnsembleProvider:
         fallback_model: str = "",
         fallback_api_key: str = "",
         min_successful_proposers: int = 1,
+        target_successful_proposers: int | None = None,
+        proposer_max_retries: int = 0,
         all_failed_policy: Literal["fallback_single", "error"] = "fallback_single",
         proposer_timeout_seconds: float = 3600.0,
         aggregator_timeout_seconds: float = 3600.0,
@@ -902,6 +984,17 @@ class EnsembleProvider:
         self.fallback_model = str(fallback_model or "")
         self._fallback_api_key = str(fallback_api_key or "")
         self.min_successful_proposers = max(1, int(min_successful_proposers or 1))
+        requested_target = int(
+            target_successful_proposers or self.min_successful_proposers
+        )
+        available_candidates = sum(
+            max(1, int(member.k or 1)) for member in self.proposers
+        )
+        self.target_successful_proposers = min(
+            max(1, available_candidates),
+            max(self.min_successful_proposers, requested_target),
+        )
+        self.proposer_max_retries = max(0, int(proposer_max_retries or 0))
         self.all_failed_policy = all_failed_policy
         self.proposer_timeout_seconds = float(proposer_timeout_seconds or 3600.0)
         self.aggregator_timeout_seconds = float(aggregator_timeout_seconds or 3600.0)
@@ -1249,17 +1342,32 @@ class EnsembleProvider:
                 high = mid - 1
         return best
 
-    def _aggregator_error_is_retryable(self, *, message: str, code: str) -> bool:
-        """True when the aggregator failure is a transient upstream condition."""
+    @staticmethod
+    def _member_error_is_retryable(
+        *,
+        provider_name: str,
+        message: str,
+        code: str,
+    ) -> bool:
+        """True when a member failure is a transient upstream condition."""
 
         raw_code = str(code or "")
         kind = classify_provider_error(
-            provider_name=self.aggregator.provider_config.provider,
+            provider_name=provider_name,
             status_code=int(raw_code) if raw_code.isdigit() else None,
             raw_code=raw_code,
             message=message,
         )
-        return kind in _AGGREGATOR_RETRYABLE_FAILURE_KINDS
+        return kind in _ENSEMBLE_RETRYABLE_FAILURE_KINDS
+
+    def _aggregator_error_is_retryable(self, *, message: str, code: str) -> bool:
+        """True when the aggregator failure is a transient upstream condition."""
+
+        return self._member_error_is_retryable(
+            provider_name=self.aggregator.provider_config.provider,
+            message=message,
+            code=code,
+        )
 
     def provider_metadata(self) -> ProviderMetadata:
         return ProviderMetadata(
@@ -1762,7 +1870,7 @@ class EnsembleProvider:
                     break
                 if (
                     self.quorum_grace_seconds > 0
-                    and successful_count >= self.min_successful_proposers
+                    and successful_count >= self.target_successful_proposers
                 ):
                     break
 
@@ -1842,7 +1950,7 @@ class EnsembleProvider:
         progress: Callable[[EnsembleProgressEvent], None] | None = None,
     ) -> _CandidateResult:
         cfg = member.provider_config
-        started = time.monotonic()
+        overall_started = time.monotonic()
         result = _CandidateResult(
             index=index,
             sample_index=sample_index,
@@ -1862,21 +1970,111 @@ class EnsembleProvider:
                 )
             )
         try:
-            return await asyncio.wait_for(
-                self._collect_candidate_inner(
-                    result=result,
+            max_attempts = self.proposer_max_retries + 1
+            retry_enabled = self.proposer_max_retries > 0
+            for attempt_index in range(1, max_attempts + 1):
+                attempt = (
+                    _CandidateResult(
+                        index=index,
+                        sample_index=sample_index,
+                        label=result.label,
+                        provider=result.provider,
+                        model=cfg.model,
+                        attempt_index=attempt_index,
+                    )
+                    if retry_enabled
+                    else result
+                )
+                attempt_started = time.monotonic()
+                controlled_cancel = False
+                try:
+                    await asyncio.wait_for(
+                        self._collect_candidate_inner(
+                            result=attempt,
+                            member=member,
+                            messages=messages,
+                            tools=tools,
+                            config=config,
+                            started=attempt_started,
+                        ),
+                        timeout=(
+                            self.proposer_timeout_seconds
+                            if self.proposer_timeout_seconds > 0
+                            else None
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    code = str(
+                        getattr(
+                            current_task,
+                            "_opensquilla_ensemble_cancel_code",
+                            "",
+                        )
+                        or ""
+                    )
+                    if not code:
+                        raise
+                    attempt.error_code = code
+                    attempt.error = str(
+                        getattr(
+                            current_task,
+                            "_opensquilla_ensemble_cancel_message",
+                            "proposer cancelled after ensemble quorum was reached",
+                        )
+                        or "proposer cancelled after ensemble quorum was reached"
+                    )
+                    controlled_cancel = True
+                except TimeoutError:
+                    attempt.error = (
+                        "proposer timed out after "
+                        f"{self.proposer_timeout_seconds:g}s"
+                    )
+                    attempt.error_code = "timeout"
+                except Exception as exc:  # noqa: BLE001 - diagnostic candidate data
+                    attempt.error = redact_upstream_error_text(
+                        str(exc),
+                        api_key=cfg.api_key,
+                        max_len=2000,
+                    )
+                    attempt.error_code = redact_upstream_error_code(
+                        type(exc).__name__,
+                        api_key=cfg.api_key,
+                    )
+                finally:
+                    attempt.elapsed_ms = int(
+                        (time.monotonic() - attempt_started) * 1000
+                    )
+
+                if not retry_enabled:
+                    return attempt
+
+                retry_reason = self._proposer_retry_reason(
+                    result=attempt,
                     member=member,
-                    messages=messages,
-                    tools=tools,
-                    config=config,
-                    started=started,
-                ),
-                timeout=(
-                    self.proposer_timeout_seconds
-                    if self.proposer_timeout_seconds > 0
-                    else None
-                ),
-            )
+                )
+                attempt.retryable = bool(retry_reason)
+                attempt.retry_reason = retry_reason
+                self._record_candidate_attempt(result, attempt)
+
+                if attempt.ok or controlled_cancel or not retry_reason:
+                    return result
+                if attempt_index >= max_attempts:
+                    return result
+
+                retry_number = attempt_index
+                log.info(
+                    "ensemble.proposer_retry",
+                    profile=self.profile_name,
+                    proposer_label=result.label,
+                    proposer_model=result.model,
+                    attempt_index=attempt_index,
+                    next_attempt_index=attempt_index + 1,
+                    retry_reason=retry_reason,
+                )
+                await asyncio.sleep(
+                    _proposer_retry_backoff_seconds(retry_number)
+                )
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
             code = str(getattr(current_task, "_opensquilla_ensemble_cancel_code", "") or "")
@@ -1891,21 +2089,8 @@ class EnsembleProvider:
                 )
                 or "proposer cancelled after ensemble quorum was reached"
             )
-        except TimeoutError:
-            result.error = f"proposer timed out after {self.proposer_timeout_seconds:g}s"
-            result.error_code = "timeout"
-        except Exception as exc:  # noqa: BLE001 - candidate failures are diagnostic data
-            result.error = redact_upstream_error_text(
-                str(exc),
-                api_key=cfg.api_key,
-                max_len=2000,
-            )
-            result.error_code = redact_upstream_error_code(
-                type(exc).__name__,
-                api_key=cfg.api_key,
-            )
         finally:
-            result.elapsed_ms = int((time.monotonic() - started) * 1000)
+            result.elapsed_ms = int((time.monotonic() - overall_started) * 1000)
             if progress is not None:
                 progress(
                     EnsembleProgressEvent(
@@ -1923,6 +2108,86 @@ class EnsembleProvider:
                     )
                 )
         return result
+
+    def _proposer_retry_reason(
+        self,
+        *,
+        result: _CandidateResult,
+        member: EnsembleMemberConfig,
+    ) -> str:
+        """Return the bounded retry reason for one failed proposer attempt."""
+
+        if result.ok:
+            return ""
+        if result.error:
+            if result.error_code == "candidate_error_finish_reason":
+                return "error_finish_reason"
+            if result.error_code in {"stream_incomplete", "timeout"}:
+                return "transient_transport"
+            if self._member_error_is_retryable(
+                provider_name=member.provider_config.provider,
+                message=result.error,
+                code=result.error_code,
+            ):
+                return "transient_upstream"
+            return ""
+        if not result.text.strip():
+            if str(result.stop_reason or "").strip().lower() == "length":
+                result.error = (
+                    "proposer exhausted its output budget without visible text"
+                )
+                result.error_code = "candidate_length_no_visible_text"
+                return "length_no_visible_text"
+            result.error = "proposer returned no visible candidate text"
+            result.error_code = "candidate_empty_output"
+            return "empty_output"
+        return ""
+
+    @staticmethod
+    def _record_candidate_attempt(
+        candidate: _CandidateResult,
+        attempt: _CandidateResult,
+    ) -> None:
+        """Accept the latest body while preserving all attempt accounting."""
+
+        candidate.attempts.append(attempt)
+        candidate.text = attempt.text
+        candidate.stop_reason = attempt.stop_reason
+        candidate.ttft_ms = attempt.ttft_ms
+        candidate.error = attempt.error
+        candidate.error_code = attempt.error_code
+        candidate.message_limit_proof = attempt.message_limit_proof
+        candidate.execution = dict(attempt.execution)
+        candidate.model = attempt.model
+        candidate.billing_receipt = attempt.billing_receipt
+        candidate.request_started = any(
+            item.request_started for item in candidate.attempts
+        )
+        candidate.usage_reported = any(
+            item.usage_reported for item in candidate.attempts
+        )
+        candidate.input_tokens = sum(item.input_tokens for item in candidate.attempts)
+        candidate.output_tokens = sum(item.output_tokens for item in candidate.attempts)
+        candidate.reasoning_tokens = sum(
+            item.reasoning_tokens for item in candidate.attempts
+        )
+        candidate.cached_tokens = sum(
+            item.cached_tokens for item in candidate.attempts
+        )
+        candidate.cache_write_tokens = sum(
+            item.cache_write_tokens for item in candidate.attempts
+        )
+        candidate.billed_cost = sum(
+            item.billed_cost for item in candidate.attempts
+        )
+        started_rows = [
+            item.usage_row(role="proposer", profile="")
+            for item in candidate.attempts
+            if item.request_started
+        ]
+        candidate.cost_source = (
+            _rollup_cost_source(started_rows) if started_rows else "none"
+        )
 
     async def _collect_candidate_inner(
         self,
@@ -2002,6 +2267,9 @@ class EnsembleProvider:
                 result.billing_receipt = event.billing_receipt
                 result.stop_reason = event.stop_reason
                 result.model = event.model or result.model
+                if str(event.stop_reason or "").strip().lower() == "error":
+                    result.error = "proposer terminated with error finish reason"
+                    result.error_code = "candidate_error_finish_reason"
             elif isinstance(event, ErrorEvent):
                 result.error = redact_upstream_error_text(
                     event.message,
@@ -2090,13 +2358,16 @@ class EnsembleProvider:
             "shuffle_candidates": self.shuffle_candidates,
             "record_candidates": self.record_candidates,
             "proposer_tools": self.proposer_tools,
+            "min_successful_proposers": self.min_successful_proposers,
+            "target_successful_proposers": self.target_successful_proposers,
+            "proposer_max_retries": self.proposer_max_retries,
             "proposer_timeout_seconds": self.proposer_timeout_seconds,
             "aggregator_timeout_seconds": self.aggregator_timeout_seconds,
             "quorum_grace_seconds": self.quorum_grace_seconds,
             "content_max_chars": TRACE_CONTENT_MAX_CHARS,
             "final_request_role": final_request_role,
             "llm_request_count": sum(
-                1 for candidate in candidates if candidate.request_started
+                candidate.request_count for candidate in candidates
             ),
             "selected_candidate_count": len(selected),
             "selected_candidate_indexes": [candidate.index for candidate in selected],
@@ -2153,6 +2424,8 @@ class EnsembleProvider:
     ) -> AsyncIterator[StreamEvent]:
         final_text_parts: list[str] = []
         aggregator_started = time.monotonic()
+        retry_rows: list[dict[str, Any]] = []
+        retry_missing_count = 0
 
         def aggregator_progress(
             event_type: str,
@@ -2180,9 +2453,16 @@ class EnsembleProvider:
                 error=error,
             )
 
-        def ensemble_done(event: DoneEvent, *, aggregator_elapsed_ms: int) -> DoneEvent:
-            output_text = "".join(final_text_parts)
-            _attach_final_request_output(trace, event=event, output_text=output_text)
+        def aggregator_usage_row(
+            event: DoneEvent,
+            *,
+            aggregator_elapsed_ms: int,
+            attempt_index: int,
+            attempt_ok: bool,
+            retryable: bool = False,
+            error_code: str = "",
+            retry_reason: str = "",
+        ) -> dict[str, Any]:
             acc = _AggregatorAccumulator(
                 input_tokens=event.input_tokens,
                 output_tokens=event.output_tokens,
@@ -2194,15 +2474,42 @@ class EnsembleProvider:
                 billing_receipt=event.billing_receipt,
                 model=event.model or self.aggregator.provider_config.model,
             )
+            row = acc.usage_row(
+                profile=self.profile_name,
+                member=self.aggregator,
+                role="aggregator",
+                label="aggregator",
+                elapsed_ms=aggregator_elapsed_ms,
+            )
+            if not attempt_ok or attempt_index > 1:
+                row.update(
+                    {
+                        "attempt_index": attempt_index,
+                        "attempt_ok": attempt_ok,
+                        "request_started": True,
+                        "usage_reported": True,
+                        "usage_receipt_missing": False,
+                        "stop_reason": event.stop_reason,
+                        "error_code": error_code,
+                        "retryable": retryable,
+                        "retry_reason": retry_reason,
+                    }
+                )
+            return row
+
+        def ensemble_done(event: DoneEvent, *, aggregator_elapsed_ms: int) -> DoneEvent:
+            output_text = "".join(final_text_parts)
+            _attach_final_request_output(trace, event=event, output_text=output_text)
+            success_row = aggregator_usage_row(
+                event,
+                aggregator_elapsed_ms=aggregator_elapsed_ms,
+                attempt_index=attempt + 1,
+                attempt_ok=True,
+            )
             rows = [
                 *prior_rows,
-                acc.usage_row(
-                    profile=self.profile_name,
-                    member=self.aggregator,
-                    role="aggregator",
-                    label="aggregator",
-                    elapsed_ms=aggregator_elapsed_ms,
-                ),
+                *retry_rows,
+                success_row,
             ]
             return replace(
                 event,
@@ -2212,22 +2519,22 @@ class EnsembleProvider:
                 cached_tokens=_summed_int(rows, "cached_tokens"),
                 cache_write_tokens=_summed_int(rows, "cache_write_tokens"),
                 billed_cost=_summed_float(rows, "billed_cost"),
-                model=acc.model,
+                model=str(success_row.get("model") or event.model),
                 provider=self.aggregator.provider_config.provider,
                 cost_source=_rollup_cost_source(rows),
                 model_usage_breakdown=rows,
                 ensemble_trace=trace,
-                # Each retried aggregator attempt started a request that never
-                # produced a usage receipt.
-                usage_missing_count=prior_missing_count + attempt,
+                usage_missing_count=prior_missing_count + retry_missing_count,
                 billing_receipt=None,
             )
 
         def partial_error(event: ErrorEvent) -> ErrorEvent:
             return replace(
                 event,
-                model_usage_breakdown=list(prior_rows),
-                usage_missing_count=prior_missing_count + attempt + 1,
+                model_usage_breakdown=[*prior_rows, *retry_rows],
+                usage_missing_count=(
+                    prior_missing_count + retry_missing_count + 1
+                ),
             )
 
         yield aggregator_progress("aggregator_start")
@@ -2235,6 +2542,7 @@ class EnsembleProvider:
         while True:
             content_streamed = False
             retry_error: ErrorEvent | None = None
+            retry_usage_reported = False
             heartbeat_stream: AsyncIterator[StreamEvent] | None = None
             try:
                 _mark_final_request_started(trace)
@@ -2255,6 +2563,57 @@ class EnsembleProvider:
                         aggregator_elapsed_ms = int(
                             (time.monotonic() - aggregator_started) * 1000
                         )
+                        if str(event.stop_reason or "").strip().lower() == "error":
+                            _attach_final_request_output(
+                                trace,
+                                event=event,
+                                output_text="".join(final_text_parts),
+                            )
+                            can_retry = (
+                                not content_streamed
+                                and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                            )
+                            failed_row = aggregator_usage_row(
+                                event,
+                                aggregator_elapsed_ms=aggregator_elapsed_ms,
+                                attempt_index=attempt + 1,
+                                attempt_ok=False,
+                                retryable=can_retry,
+                                error_code="aggregator_error_finish_reason",
+                                retry_reason=(
+                                    "error_finish_reason" if can_retry else ""
+                                ),
+                            )
+                            error = ErrorEvent(
+                                message=(
+                                    "ensemble aggregator terminated with error "
+                                    "finish reason"
+                                ),
+                                code="ensemble_aggregator_error_finish_reason",
+                            )
+                            if can_retry:
+                                retry_rows.append(failed_row)
+                                retry_usage_reported = True
+                                retry_error = error
+                                break
+                            terminal_rows = [
+                                *prior_rows,
+                                *retry_rows,
+                                failed_row,
+                            ]
+                            yield aggregator_progress(
+                                "aggregator_finish",
+                                usage=failed_row,
+                                error=error.message,
+                            )
+                            yield replace(
+                                error,
+                                model_usage_breakdown=terminal_rows,
+                                usage_missing_count=(
+                                    prior_missing_count + retry_missing_count
+                                ),
+                            )
+                            return
                         done_event = ensemble_done(
                             event,
                             aggregator_elapsed_ms=aggregator_elapsed_ms,
@@ -2329,9 +2688,15 @@ class EnsembleProvider:
                     ),
                     code="ensemble_aggregator_timeout",
                 )
-                yield aggregator_progress("aggregator_finish", error=error.message)
-                yield partial_error(error)
-                return
+                if (
+                    not content_streamed
+                    and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                ):
+                    retry_error = error
+                else:
+                    yield aggregator_progress("aggregator_finish", error=error.message)
+                    yield partial_error(error)
+                    return
             except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
                 safe_message = redact_upstream_error_text(
                     f"ensemble aggregator failed: {exc}",
@@ -2363,9 +2728,17 @@ class EnsembleProvider:
                     message="ensemble aggregator stream ended before DoneEvent",
                     code="ensemble_aggregator_incomplete",
                 )
-                yield aggregator_progress("aggregator_finish", error=error.message)
-                yield partial_error(error)
-                return
+                if (
+                    not content_streamed
+                    and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                ):
+                    retry_error = error
+                else:
+                    yield aggregator_progress("aggregator_finish", error=error.message)
+                    yield partial_error(error)
+                    return
+            if not retry_usage_reported:
+                retry_missing_count += 1
             close_stream = getattr(heartbeat_stream, "aclose", None)
             if callable(close_stream):
                 with contextlib.suppress(Exception):
@@ -4323,6 +4696,24 @@ def build_ensemble_provider_from_config(
             else _STATIC_B5_DEFAULT_MIN_SUCCESSFUL_PROPOSERS
         )
     min_successful_proposers = min(requested_min_success, max(1, len(proposers)))
+    configured_target_success = getattr(
+        ensemble_cfg,
+        "target_successful_proposers",
+        None,
+    )
+    requested_target_success = (
+        min_successful_proposers
+        if configured_target_success is None
+        else max(min_successful_proposers, int(configured_target_success))
+    )
+    target_successful_proposers = min(
+        requested_target_success,
+        max(1, len(proposers)),
+    )
+    proposer_max_retries = max(
+        0,
+        int(getattr(ensemble_cfg, "proposer_max_retries", 0) or 0),
+    )
     configured_proposer_timeout_seconds = float(
         getattr(ensemble_cfg, "proposer_timeout_seconds", _LEGACY_ENSEMBLE_TIMEOUT_SECONDS)
     )
@@ -4360,6 +4751,15 @@ def build_ensemble_provider_from_config(
     selection_plan["configured_shuffle_candidates"] = configured_shuffle_candidates
     selection_plan["effective_shuffle_candidates"] = shuffle_candidates
     selection_plan["quorum_grace_seconds"] = quorum_grace_seconds
+    if configured_target_success is not None:
+        selection_plan["configured_target_successful_proposers"] = int(
+            configured_target_success
+        )
+        selection_plan["effective_target_successful_proposers"] = (
+            target_successful_proposers
+        )
+    if proposer_max_retries:
+        selection_plan["proposer_max_retries"] = proposer_max_retries
     inherited_provider = str(inherited_provider_config.provider or "").strip().lower()
     cross_provider_lineup = any(
         member.provider_config.provider.strip().lower() != inherited_provider
@@ -4428,6 +4828,8 @@ def build_ensemble_provider_from_config(
         fallback_model=inherited_provider_config.model,
         fallback_api_key=inherited_provider_config.api_key,
         min_successful_proposers=min_successful_proposers,
+        target_successful_proposers=target_successful_proposers,
+        proposer_max_retries=proposer_max_retries,
         all_failed_policy=getattr(ensemble_cfg, "all_failed_policy", "fallback_single"),
         proposer_timeout_seconds=proposer_timeout_seconds,
         aggregator_timeout_seconds=aggregator_timeout_seconds,
