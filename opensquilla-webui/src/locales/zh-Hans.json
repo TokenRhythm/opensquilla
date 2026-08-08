@@ -2662,6 +2662,7 @@
       "toastConnectionRecovered": "连接已恢复，任务状态已自动刷新",
       "toastConnectionRetry": "连接尚未恢复，请稍后刷新页面",
       "toastBackgroundComplete": "任务“{name}”已完成，可在运行历史中查看结果",
+      "toastBackgroundCompleteWithSummary": "任务“{name}”已完成：{summary}",
       "toastBackgroundFailed": "任务“{name}”运行失败，请点击卡片上的重试按钮",
       "unnamedTask": "未命名任务",
       "toastDeleted": "任务已删除",

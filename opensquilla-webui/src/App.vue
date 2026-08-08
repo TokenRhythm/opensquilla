@@ -433,6 +433,10 @@ import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
 import { useDialogLayer } from './composables/useDialogA11y'
 import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
+import {
+  cronRunFinishedToast,
+  type CronRunFinishedEvent,
+} from './composables/cron/cronRunToast'
 import { useAgentOptions } from './composables/useAgentOptions'
 import { useSessionListSubscription } from './composables/useSessionListSubscription'
 import { useSessionTaskAttention } from './composables/useSessionTaskAttention'
@@ -557,32 +561,15 @@ watch(
 const { enabled: bgmEnabled } = useBgm()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
-interface AppCronRunFinishedPayload {
-  jobId?: string
-  jobName?: string
-  runId?: string
-  success?: boolean
-}
-
 let unsubscribeCronFinished: (() => void) | null = null
 
 function handleCronRunFinished(payload: unknown) {
   if (!payload || typeof payload !== 'object') return
-  const event = payload as AppCronRunFinishedPayload
+  const event = payload as CronRunFinishedEvent
   const runId = typeof event.runId === 'string' ? event.runId : ''
-  const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
   markCronFinishNotified(runId)
-  if (event.success === false) {
-    pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
-      tone: 'danger',
-      duration: 9_000,
-    })
-    return
-  }
-  pushToast(t('cronSkills.jobs.toastBackgroundComplete', { name: jobName }), {
-    tone: 'ok',
-    duration: 7_000,
-  })
+  const toast = cronRunFinishedToast(event, (key, params) => t(key, params ?? {}))
+  pushToast(toast.message, { tone: toast.tone, duration: toast.duration })
 }
 
 installSessionNavigationDiagConsole()

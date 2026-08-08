@@ -2611,6 +2611,7 @@
       "toastConnectionRecovered": "接続が復旧し、タスク状態を更新しました",
       "toastConnectionRetry": "接続はまだ復旧していません。しばらくしてからページを更新してください。",
       "toastBackgroundComplete": "タスク「{name}」が完了しました。実行履歴で結果を確認できます。",
+      "toastBackgroundCompleteWithSummary": "タスク「{name}」が完了しました：{summary}",
       "toastBackgroundFailed": "タスク「{name}」が失敗しました。カードの再試行ボタンを使用してください。",
       "unnamedTask": "名称未設定のタスク",
       "toastDeleted": "ジョブを削除しました",

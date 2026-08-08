@@ -2611,6 +2611,7 @@
       "toastConnectionRecovered": "Connexion rétablie et état des tâches actualisé",
       "toastConnectionRetry": "La connexion n’est pas encore rétablie. Actualisez bientôt la page.",
       "toastBackgroundComplete": "La tâche « {name} » est terminée. Consultez le résultat dans l’historique.",
+      "toastBackgroundCompleteWithSummary": "Tâche « {name} » terminée : {summary}",
       "toastBackgroundFailed": "La tâche « {name} » a échoué. Utilisez le bouton Réessayer de sa carte.",
       "unnamedTask": "Tâche sans nom",
       "toastDeleted": "Tâche supprimée",
