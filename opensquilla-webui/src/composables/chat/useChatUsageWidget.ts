@@ -55,10 +55,12 @@ export interface ContextStatus {
   warning_ratio?: number
 }
 
-export interface ContextWarning {
+export interface ContextUsage {
   pct: number
   usedK: number
   windowK: number
+  /** True once pressure reaches the gateway's own warning ratio (0.85). */
+  warning: boolean
 }
 
 interface UsageStatusSession {
@@ -103,21 +105,34 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   const lastSavingsPopupIdentity = ref('')
   const contextStatus = ref<ContextStatus | null>(null)
 
-  // Surfaced as a topbar chip only once the session's context window crosses the
-  // gateway's warning ratio (0.85) — a proactive heads-up before compaction,
-  // independent of any compaction event. Null when below threshold or unknown.
-  const contextWarning = computed<ContextWarning | null>(() => {
+  // Surfaced as a topbar chip whenever the gateway reports a usable window, so
+  // the reading is available while there is still room to act on it. Withheld
+  // until the warning ratio, it could only ever announce a compaction that was
+  // already imminent. ``warning`` carries the gateway's own ratio (0.85) so the
+  // existing pressure styling still keys off the server's threshold rather than
+  // a second one invented here.
+  //
+  // Null only when the window is unknown: a percentage needs a denominator the
+  // gateway actually resolved, and a guessed one would read as a measurement.
+  const contextUsage = computed<ContextUsage | null>(() => {
     const cs = contextStatus.value
     if (!cs) return null
-    const pressure = Number(cs.pressure ?? 0)
-    const ratio = Number(cs.warningRatio ?? cs.warning_ratio ?? 0.85)
     const windowTokens = Number(cs.contextWindowTokens ?? cs.context_window_tokens ?? 0)
-    if (!(ratio > 0) || !(windowTokens > 0) || pressure < ratio) return null
+    if (!Number.isFinite(windowTokens) || windowTokens <= 0) return null
     const used = Number(cs.contextTokens ?? cs.context_tokens ?? 0)
+    if (!Number.isFinite(used) || used < 0) return null
+    // ``pressure`` is the gateway's own ratio; fall back to the quotient only
+    // when an older gateway omits it. ``??`` keeps a legitimate 0.
+    const reported = Number(cs.pressure ?? used / windowTokens)
+    const pressure = Number.isFinite(reported)
+      ? Math.min(1, Math.max(0, reported))
+      : Math.min(1, used / windowTokens)
+    const ratio = Number(cs.warningRatio ?? cs.warning_ratio ?? 0.85)
     return {
-      pct: Math.round(Math.min(1, pressure) * 100),
+      pct: Math.round(pressure * 100),
       usedK: Math.round(used / 1000),
       windowK: Math.round(windowTokens / 1000),
+      warning: Number.isFinite(ratio) && ratio > 0 && pressure >= ratio,
     }
   })
 
@@ -194,7 +209,7 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   return {
     usageAccum,
     usageModel,
-    contextWarning,
+    contextUsage,
     resetSavingsPopupCooldown,
     saveWidgetState,
     restoreWidgetState,

@@ -3271,6 +3271,7 @@
     "deliverablesCount": "Deliverables ({count})",
     "contextPressure": "Context {pct}%",
     "contextPressureTitle": "Context window {used}k / {window}k tokens — nearing compaction",
+    "contextUsageTitle": "Context window {used}k / {window}k tokens",
     "sessionDeliverables": "Session deliverables",
     "noDeliverables": "No deliverables yet.",
     "openArtifact": "Open {title}, {subtitle}",

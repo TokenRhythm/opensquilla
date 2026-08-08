@@ -39,6 +39,7 @@
         :copy-icon="sessionCopyIcon"
         :copy-live-text="sessionCopyLiveText"
         :deliverable-count="headerDeliverableCount"
+        :context-usage="contextUsage"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
         @open-deliverables="openDeliverables"
@@ -1476,6 +1477,7 @@ const chatUsageWidget = useChatUsageWidget({
 const {
   usageAccum,
   usageModel,
+  contextUsage,
   resetSavingsPopupCooldown,
   saveWidgetState,
   restoreWidgetState,

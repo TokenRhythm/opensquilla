@@ -3218,6 +3218,7 @@
     "deliverablesCount": "Livrables ({count})",
     "contextPressure": "Contexte {pct} %",
     "contextPressureTitle": "Fenêtre de contexte {used}k / {window}k jetons — proche du seuil de compactage",
+    "contextUsageTitle": "Fenêtre de contexte {used}k / {window}k jetons",
     "sessionDeliverables": "Livrables de la session",
     "noDeliverables": "Aucun livrable pour l'instant.",
     "openArtifact": "Ouvrir {title}, {subtitle}",

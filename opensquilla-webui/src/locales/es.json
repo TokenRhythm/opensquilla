@@ -3218,6 +3218,7 @@
     "deliverablesCount": "Entregables ({count})",
     "contextPressure": "Contexto {pct} %",
     "contextPressureTitle": "Ventana de contexto {used}k / {window}k tokens — cerca del umbral de compactación",
+    "contextUsageTitle": "Ventana de contexto {used}k / {window}k tokens",
     "sessionDeliverables": "Entregables de la sesión",
     "noDeliverables": "Aún no hay entregables.",
     "openArtifact": "Abrir {title}, {subtitle}",

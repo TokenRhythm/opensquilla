@@ -4,6 +4,7 @@ import { createApp, nextTick, type App, type ComponentPublicInstance } from 'vue
 import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
+import type { ContextUsage } from '@/composables/chat/useChatUsageWidget'
 
 type Action = 'deliverables' | 'share' | 'copy-session-key'
 
@@ -18,12 +19,16 @@ const BASE_PROPS = {
   copyIcon: 'copy' as const,
   copyLiveText: '',
   deliverableCount: 2,
+  contextUsage: null as ContextUsage | null,
   shareMode: false,
   shareableMessageCount: 3,
 }
 
 const messages = {
   chat: {
+    contextPressure: 'Context {pct}%',
+    contextPressureTitle: 'Context window {used}k / {window}k tokens — nearing compaction',
+    contextUsageTitle: 'Context window {used}k / {window}k tokens',
     copied: 'Copied',
     copySessionKey: 'Copy session ID',
     deliverablesCount: 'Deliverables ({count})',
@@ -84,6 +89,10 @@ async function mountHeader(
   mounted.push({ app, el })
   await flush()
   return { el, handlers, instance }
+}
+
+function contextChip(el: HTMLElement): HTMLElement | null {
+  return el.querySelector<HTMLElement>('[data-testid="chat-header-context-usage"]')
 }
 
 function trigger(el: HTMLElement): HTMLButtonElement {
@@ -242,5 +251,45 @@ describe('ChatHeaderActions', () => {
     const tight = await mountHeader(120)
     expect(tight.instance.focusAction('deliverables')).toBe(true)
     expect(document.activeElement).toBe(trigger(tight.el))
+  })
+
+  it('reports context usage while there is still room to act on it', async () => {
+    const { el } = await mountHeader(800, {
+      contextUsage: { pct: 42, usedK: 54, windowK: 128, warning: false },
+    })
+    const chip = contextChip(el)
+
+    // The point of the readout: visible well below the warning ratio, where a
+    // user can still decide to compact instead of being told it is imminent.
+    expect(chip).not.toBeNull()
+    expect(chip!.textContent).toBe('Context 42%')
+    expect(chip!.getAttribute('title')).toBe('Context window 54k / 128k tokens')
+    expect(chip!.classList.contains('is-warning')).toBe(false)
+  })
+
+  it('keeps the pressure styling and wording once the gateway flags a warning', async () => {
+    const { el } = await mountHeader(800, {
+      contextUsage: { pct: 88, usedK: 113, windowK: 128, warning: true },
+    })
+    const chip = contextChip(el)
+
+    expect(chip!.classList.contains('is-warning')).toBe(true)
+    expect(chip!.getAttribute('title')).toBe(
+      'Context window 113k / 128k tokens — nearing compaction',
+    )
+  })
+
+  it('omits the chip when the gateway resolved no context window', async () => {
+    // A percentage needs a denominator the gateway actually resolved; showing
+    // one anyway would read as a measurement.
+    const { el } = await mountHeader(800, { contextUsage: null })
+    expect(contextChip(el)).toBeNull()
+  })
+
+  it('drops the chip in the tight layout, where the title is already squeezed', async () => {
+    const { el } = await mountHeader(120, {
+      contextUsage: { pct: 42, usedK: 54, windowK: 128, warning: false },
+    })
+    expect(contextChip(el)).toBeNull()
   })
 })
