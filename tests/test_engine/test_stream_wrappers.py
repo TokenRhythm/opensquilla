@@ -187,6 +187,57 @@ async def test_heartbeat_stream_closes_over_a_wedged_upstream(
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_recovered_orphan_closes_its_upstream(
+    short_cancel_grace: None,
+) -> None:
+    """A detached heartbeat driver must close a late-yielding upstream before exit."""
+    release = asyncio.Event()
+    finalized = asyncio.Event()
+
+    async def source():
+        try:
+            yield TextDeltaEvent(text="first")
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            yield TextDeltaEvent(text="recovered too late")
+            await asyncio.Event().wait()
+            yield TextDeltaEvent(text="never")
+        finally:
+            finalized.set()
+
+    already_parked = set(stream_wrappers._ORPHANED_TASKS)
+    parked: set[asyncio.Task[object]] = set()
+    stream = heartbeat_stream(source(), interval=0.02)
+    try:
+        async with asyncio.timeout(_HARD_LIMIT):
+            async for event in stream:
+                if isinstance(event, TextDeltaEvent):
+                    break
+            await asyncio.sleep(0.05)
+            await stream.aclose()
+
+            parked = set(stream_wrappers._ORPHANED_TASKS) - already_parked
+            assert parked, "the cancellation-resistant heartbeat driver should be parked"
+
+            release.set()
+            for _ in range(100):
+                if not parked & stream_wrappers._ORPHANED_TASKS:
+                    break
+                await asyncio.sleep(0.01)
+
+        assert not parked & stream_wrappers._ORPHANED_TASKS
+        assert finalized.is_set(), "the recovered upstream should be closed before exit"
+    finally:
+        release.set()
+        for task in parked:
+            task.cancel()
+        if parked:
+            await asyncio.gather(*parked, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_abandoned_upstream_is_released_once_it_finally_ends(
     short_cancel_grace: None,
 ) -> None:
@@ -222,6 +273,135 @@ async def test_abandoned_upstream_is_released_once_it_finally_ends(
             await asyncio.sleep(0.01)
 
     assert not parked & stream_wrappers._ORPHANED_TASKS
+
+
+@pytest.mark.asyncio
+async def test_abandoned_upstream_exits_after_ignored_cancellation_recovers(
+    short_cancel_grace: None,
+) -> None:
+    """A recovered orphan must stop instead of waiting forever for another pull."""
+    release = asyncio.Event()
+    finalized = asyncio.Event()
+
+    async def source():
+        try:
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                # Ignore the wrapper's cancellation once, then recover and
+                # produce the event that used to leave the driver orphaned.
+                await release.wait()
+            yield TextDeltaEvent(text="recovered too late")
+        finally:
+            finalized.set()
+
+    already_parked = set(stream_wrappers._ORPHANED_TASKS)
+    parked: set[asyncio.Task[object]] = set()
+    try:
+        async with asyncio.timeout(_HARD_LIMIT):
+            with pytest.raises(TimeoutError, match="Stream idle"):
+                async for _event in idle_timeout_stream(source(), timeout=0.02):
+                    pass
+
+            parked = set(stream_wrappers._ORPHANED_TASKS) - already_parked
+            assert parked, "the cancellation-resistant driver should initially be parked"
+
+            release.set()
+            for _ in range(100):
+                if not parked & stream_wrappers._ORPHANED_TASKS:
+                    break
+                await asyncio.sleep(0.01)
+
+        assert not parked & stream_wrappers._ORPHANED_TASKS
+        assert finalized.is_set(), "the recovered upstream should be closed before release"
+    finally:
+        # Keep a regression bounded and isolated from later tests.
+        release.set()
+        for task in parked:
+            task.cancel()
+        if parked:
+            await asyncio.gather(*parked, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_propagates_upstream_cancelled_error_immediately() -> None:
+    """An upstream cancellation is a result, not silence that becomes an idle timeout."""
+
+    async def source():
+        raise asyncio.CancelledError("upstream cancelled itself")
+        yield TextDeltaEvent(text="unreachable")
+
+    with pytest.raises(asyncio.CancelledError, match="upstream cancelled itself"):
+        async with asyncio.timeout(0.5):
+            async for _event in idle_timeout_stream(source(), timeout=_HARD_LIMIT):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_propagates_upstream_cancelled_error_immediately() -> None:
+    """The default heartbeat composition must preserve upstream cancellation too."""
+
+    async def source():
+        raise asyncio.CancelledError("upstream cancelled itself")
+        yield TextDeltaEvent(text="unreachable")
+
+    wrapped = heartbeat_stream(
+        idle_timeout_stream(source(), timeout=_HARD_LIMIT),
+        interval=0.01,
+    )
+    with pytest.raises(asyncio.CancelledError, match="upstream cancelled itself"):
+        async with asyncio.timeout(0.5):
+            async for _event in wrapped:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_repeated_caller_cancellation_keeps_pending_driver_bookkept() -> None:
+    """A second cancellation may interrupt grace without dropping the orphan reference."""
+    release = asyncio.Event()
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    stop_requested = asyncio.Event()
+
+    async def cancellation_resistant_work() -> None:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+
+    driver = asyncio.create_task(cancellation_resistant_work())
+    settle: asyncio.Task[None] | None = None
+    try:
+        async with asyncio.timeout(_HARD_LIMIT):
+            await started.wait()
+            settle = asyncio.create_task(
+                stream_wrappers._settle_or_abandon(driver, stop_requested)
+            )
+            await cancellation_seen.wait()
+
+            settle.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await settle
+
+            assert driver in stream_wrappers._ORPHANED_TASKS
+            release.set()
+            for _ in range(100):
+                if driver not in stream_wrappers._ORPHANED_TASKS:
+                    break
+                await asyncio.sleep(0.01)
+
+        assert driver not in stream_wrappers._ORPHANED_TASKS
+    finally:
+        release.set()
+        if settle is not None and not settle.done():
+            settle.cancel()
+        driver.cancel()
+        await asyncio.gather(
+            *(task for task in (settle, driver) if task is not None),
+            return_exceptions=True,
+        )
 
 
 @pytest.mark.asyncio
