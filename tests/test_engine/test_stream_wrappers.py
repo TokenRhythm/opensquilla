@@ -190,7 +190,12 @@ async def test_heartbeat_stream_closes_over_a_wedged_upstream(
 async def test_abandoned_upstream_is_released_once_it_finally_ends(
     short_cancel_grace: None,
 ) -> None:
-    """The orphan set holds a wedged task only until it actually finishes."""
+    """The orphan set holds a wedged task only until it actually finishes.
+
+    Scoped to the task this test parks: the set is module state shared by every
+    test in the process, so asserting it is empty would make this test report
+    another one's leftovers.
+    """
     release = asyncio.Event()
 
     async def source():
@@ -200,20 +205,126 @@ async def test_abandoned_upstream_is_released_once_it_finally_ends(
         finally:
             await release.wait()
 
+    already_parked = set(stream_wrappers._ORPHANED_TASKS)
+
     async with asyncio.timeout(_HARD_LIMIT):
         with pytest.raises(TimeoutError, match="Stream idle"):
             async for _event in idle_timeout_stream(source(), timeout=0.02):
                 pass
 
-        assert stream_wrappers._ORPHANED_TASKS, "a wedged task should be parked, not dropped"
+        parked = set(stream_wrappers._ORPHANED_TASKS) - already_parked
+        assert parked, "a wedged task should be parked, not dropped"
 
         release.set()
         for _ in range(100):
-            if not stream_wrappers._ORPHANED_TASKS:
+            if not parked & stream_wrappers._ORPHANED_TASKS:
                 break
             await asyncio.sleep(0.01)
 
-    assert not stream_wrappers._ORPHANED_TASKS
+    assert not parked & stream_wrappers._ORPHANED_TASKS
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_keeps_one_context_across_events() -> None:
+    """The upstream must resume in the context it started in, every event.
+
+    ``TurnRunner.run`` sets the session-lock owner before its first event, reads
+    it back between events to detect re-entry, and resets the token in a
+    ``finally``. Driving each ``__anext__`` in a task with its own context copy
+    silently loses the value and then fails the reset with "created in a
+    different Context" — a whole-turn crash no single-event test would catch.
+    """
+    owner: ContextVar[str | None] = ContextVar("lock_owner", default=None)
+    seen: list[str | None] = []
+
+    async def source():
+        token = owner.set("turn")
+        try:
+            for index in range(3):
+                seen.append(owner.get())
+                yield TextDeltaEvent(text=f"event-{index}")
+        finally:
+            owner.reset(token)
+
+    async with asyncio.timeout(_HARD_LIMIT):
+        events = [event async for event in idle_timeout_stream(source(), timeout=1.0)]
+
+    assert [event.text for event in events] == ["event-0", "event-1", "event-2"]
+    assert seen == ["turn", "turn", "turn"]
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_keeps_one_owner_task_across_events() -> None:
+    """The task the upstream runs on must outlive the event it produced.
+
+    ``notify_compaction`` registers ``asyncio.current_task()`` as the owner of
+    an in-flight compaction and publishes a terminal event when that task ends.
+    An upstream driven by a task per event would hand it an owner that dies with
+    the event, terminating a compaction that is still running.
+    """
+    producers: list[asyncio.Task[object] | None] = []
+
+    async def source():
+        for index in range(3):
+            producers.append(asyncio.current_task())
+            yield TextDeltaEvent(text=f"event-{index}")
+
+    alive_when_delivered: list[bool] = []
+    async with asyncio.timeout(_HARD_LIMIT):
+        async for _event in idle_timeout_stream(source(), timeout=1.0):
+            producer = producers[-1]
+            assert producer is not None
+            alive_when_delivered.append(not producer.done())
+
+    assert len(set(producers)) == 1, "the upstream ran on a different task per event"
+    assert all(alive_when_delivered), "the owner task died with the event it produced"
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_does_not_run_the_upstream_ahead_of_the_consumer() -> None:
+    """Handing the upstream to a driver must not turn a pull into a push.
+
+    A plain producer task would keep calling ``__anext__`` while the consumer is
+    still handling the previous event, so the turn would run tool calls the
+    caller has not seen yet.
+    """
+    produced: list[int] = []
+
+    async def source():
+        for index in range(4):
+            produced.append(index)
+            yield TextDeltaEvent(text=f"event-{index}")
+
+    consumed: list[str] = []
+    async with asyncio.timeout(_HARD_LIMIT):
+        async for event in idle_timeout_stream(source(), timeout=1.0):
+            assert len(produced) == len(consumed) + 1, (
+                f"upstream ran ahead: produced={produced} consumed={consumed}"
+            )
+            consumed.append(event.text)
+
+    assert consumed == ["event-0", "event-1", "event-2", "event-3"]
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_closes_the_upstream_when_the_consumer_stops_early() -> None:
+    """Closing the wrapper must run the upstream's own cleanup."""
+    finalized: list[str] = []
+
+    async def source():
+        try:
+            for index in range(100):
+                yield TextDeltaEvent(text=f"event-{index}")
+        finally:
+            finalized.append("closed")
+
+    stream = idle_timeout_stream(source(), timeout=1.0)
+    async with asyncio.timeout(_HARD_LIMIT):
+        async for _event in stream:
+            break
+        await stream.aclose()
+
+    assert finalized == ["closed"]
 
 
 @pytest.mark.asyncio

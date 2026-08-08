@@ -16,12 +16,13 @@ import contextlib
 import dataclasses
 import re
 import time
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator
 from typing import cast
 
 from .types import AgentEvent, RunHeartbeatEvent, ToolUseStartEvent
 
 _STREAM_DONE = object()
+_PULL_NEXT = object()
 
 # How long a wrapper waits for a cancelled upstream task to actually finish
 # before giving up on it. An upstream whose cleanup blocks — a ``finally`` that
@@ -140,31 +141,69 @@ async def idle_timeout_stream(
 ) -> AsyncIterator[AgentEvent]:
     """Raise ``TimeoutError`` if no event arrives within *timeout* seconds.
 
-    The pending ``__anext__`` is driven as a task and waited on with
-    :func:`asyncio.wait`, which reports the deadline without cancelling
-    anything. ``asyncio.wait_for`` would instead cancel the task and then await
-    that cancellation, so an upstream whose cleanup blocks kept the timeout
-    pending forever and the turn hung with no event and no error.
+    The upstream is advanced by a driver task and the deadline is applied to a
+    queue read, which is always safe to cancel. Awaiting ``__anext__`` directly
+    under ``asyncio.wait_for`` was not: on timeout it cancelled the upstream and
+    then *awaited that cancellation*, so an upstream whose cleanup blocked kept
+    the timeout pending forever and the turn hung with no event, no error and no
+    log line.
+
+    One driver for the whole stream — the shape ``heartbeat_stream`` already
+    uses — rather than a task per event. A task per event would hand the
+    upstream a fresh context copy and a fresh task identity every time, and the
+    turn depends on both being stable: ``TurnRunner.run`` sets the session-lock
+    owner before its first event and resets that token in a ``finally``, and
+    ``notify_compaction`` registers ``asyncio.current_task()`` as the owner
+    whose exit finalizes an in-flight compaction. The driver still waits to be
+    asked, so the upstream advances one event per consumed event exactly as it
+    did when this wrapper awaited ``__anext__`` inline.
     """
-    aiter = stream.__aiter__()
-    pending: asyncio.Task[AgentEvent] | None = None
+    requests: asyncio.Queue[object] = asyncio.Queue()
+    results: asyncio.Queue[AgentEvent | Exception | object] = asyncio.Queue()
+    driver = asyncio.create_task(_pull_on_demand(stream.__aiter__(), requests, results))
     try:
         while True:
-            pending = asyncio.ensure_future(cast("Awaitable[AgentEvent]", aiter.__anext__()))
-            done, _still_waiting = await asyncio.wait({pending}, timeout=timeout)
-            if not done:
-                await _settle_or_abandon(cast("asyncio.Task[object]", pending))
-                pending = None
-                raise TimeoutError(f"Stream idle for more than {timeout}s")
-            settled, pending = pending, None
+            requests.put_nowait(_PULL_NEXT)
             try:
-                event = settled.result()
-            except StopAsyncIteration:
+                item = await asyncio.wait_for(results.get(), timeout=timeout)
+            except TimeoutError as exc:
+                raise TimeoutError(f"Stream idle for more than {timeout}s") from exc
+            if item is _STREAM_DONE:
                 return
-            yield event
+            if isinstance(item, Exception):
+                raise item
+            yield cast(AgentEvent, item)
     finally:
-        if pending is not None:
-            await _settle_or_abandon(cast("asyncio.Task[object]", pending))
+        # Bounded: a wedged upstream must not hold the deadline it just missed.
+        await _settle_or_abandon(cast("asyncio.Task[object]", driver))
+
+
+async def _pull_on_demand(
+    aiter: AsyncIterator[AgentEvent],
+    requests: asyncio.Queue[object],
+    results: asyncio.Queue[AgentEvent | Exception | object],
+) -> None:
+    """Advance *aiter* once per request so the wrapper keeps pull semantics."""
+    try:
+        while True:
+            await requests.get()
+            try:
+                event = await aiter.__anext__()
+            except StopAsyncIteration:
+                await results.put(_STREAM_DONE)
+                return
+            except Exception as exc:
+                await results.put(exc)
+                return
+            await results.put(event)
+    finally:
+        # The consumer cannot close an iterator it never touches, and cancelling
+        # this task while it waits to be asked would otherwise leave the
+        # upstream's ``finally`` blocks to garbage collection.
+        close = getattr(aiter, "aclose", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                await close()
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +274,7 @@ async def _drain_stream(
         await queue.put(exc)
     finally:
         await queue.put(_STREAM_DONE)
+
 
 # ---------------------------------------------------------------------------
 # Wrapper 4: Tool-name trim
