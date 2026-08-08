@@ -79,6 +79,10 @@ from opensquilla.session.usage_ledger import (
     validate_usage_event_start,
     validate_usage_item,
 )
+from opensquilla.turn_outcome_projection import (
+    attach_fork_terminal_outcome_projection,
+    turn_id_from_context,
+)
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
@@ -9141,6 +9145,7 @@ class SessionStorage:
         source_session_id: str,
         target_session_id: str,
         target_session_key: str,
+        terminal_outcome_projections: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         """Copy archived compacted transcript rows into a forked session."""
         async with self._write_transaction("copy_compacted_transcript_entries") as conn:
@@ -9199,6 +9204,27 @@ class SessionStorage:
                 """,
                 (target_session_id, target_session_key, source_session_id),
             )
+            if terminal_outcome_projections is None:
+                return
+            async with conn.execute(
+                "SELECT id, turn_context FROM compacted_transcript_entries "
+                "WHERE session_id = ?",
+                (target_session_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                context = _json_object_or_none(row["turn_context"])
+                turn_id = turn_id_from_context(context)
+                rebound_context = attach_fork_terminal_outcome_projection(
+                    context,
+                    terminal_outcome_projections.get(turn_id or ""),
+                )
+                if rebound_context == context:
+                    continue
+                await conn.execute(
+                    "UPDATE compacted_transcript_entries SET turn_context = ? WHERE id = ?",
+                    (_serialize(rebound_context), row["id"]),
+                )
 
     @_serialized_read
     async def count_transcript_entries(self, session_id: str) -> int:

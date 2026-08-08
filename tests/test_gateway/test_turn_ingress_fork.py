@@ -177,6 +177,7 @@ async def test_chat_send_fork_atomically_accepts_child_prefix_message_task_and_r
         assert child is not None
         assert child.parent_session_key == PARENT_KEY
         assert child.forked_from_parent is True
+        assert child.display_name == "Atomic fork parent (2)"
         child_entries = await stack.manager.get_transcript(child_key)
         assert [entry.content for entry in child_entries] == ["A marker", "B edited"]
         assert child_entries[0].turn_context == {
@@ -255,6 +256,9 @@ async def test_chat_send_fork_replays_same_child_without_duplicate_side_effects(
         assert replay.payload["session_id"] == first.payload["session_id"]
         assert replay.payload["message_id"] == first.payload["message_id"]
         assert replay.payload["task_id"] == first.payload["task_id"]
+        child = await stack.storage.get_session(replay.payload["sessionKey"])
+        assert child is not None
+        assert child.display_name == "Atomic fork parent (2)"
         assert [
             entry.content
             for entry in await stack.manager.get_transcript(replay.payload["sessionKey"])

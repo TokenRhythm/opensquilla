@@ -47,12 +47,12 @@
       :workbench-enabled="workbenchEnabled"
       :artifact-navigation-items="artifactNavigationItems"
       :copy-message="copyMessage"
-      :is-tip="index === lastAssistantIndex"
+      :is-tip="isForkableAssistant(index)"
       :fork-busy="forkBusy"
       :plan-action-pending="planActionPending"
       :plan-actions-disabled="planActionsDisabled"
       :show-turn-outcome="isTurnTip(index)"
-      @fork="$emit('forkConversation')"
+      @fork="$emit('forkConversation', forkThroughTurnId(index))"
       @regenerate="$emit('regenerateMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
       @download-artifact="$emit('downloadArtifact', $event)"
@@ -131,7 +131,7 @@ defineEmits<{
   toggleToolGroup: [groupId: string]
   toggleToolItem: [renderKey: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
-  forkConversation: []
+  forkConversation: [throughTurnId?: string]
   resolveInterrupt: [id: string, decision: 'allow-once' | 'allow-always' | 'deny']
   extendInterrupt: [id: string]
   clarifySubmit: [fields: Record<string, string>, request?: NonNullable<Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>['clarify']>]
@@ -142,14 +142,34 @@ defineEmits<{
   planReplan: [target: PlanCardActionTarget]
 }>()
 
-// The conversation tip: forking is whole-conversation in this release, so the
-// fork action only renders on the thread's last assistant message.
+// Legacy transcripts can only use the whole-conversation fallback at the
+// current tip. Historical branches require a durable terminal turn identity so
+// the server, rather than a DOM/message index, owns the inclusive boundary.
 const lastAssistantIndex = computed(() => {
   for (let i = props.messages.length - 1; i >= 0; i--) {
     if (props.messages[i].displayRole === 'assistant' && !props.messages[i].stopNotice) return i
   }
   return -1
 })
+
+function forkThroughTurnId(index: number): string | undefined {
+  const turnId = props.messages[index]?.turnOutcome?.turnId?.trim()
+  return turnId || undefined
+}
+
+function isForkableAssistant(index: number): boolean {
+  const message = props.messages[index]
+  if (
+    props.isStreaming
+    || message?.displayRole !== 'assistant'
+    || message.stopNotice
+  ) return false
+  if (forkThroughTurnId(index)) return isTurnTip(index)
+  if (index !== lastAssistantIndex.value) return false
+  return !props.messages.slice(index + 1).some(next => (
+    next.displayRole === 'user' || next.displayRole === 'assistant'
+  ))
+}
 
 function isTurnTip(index: number): boolean {
   const message = props.messages[index]
