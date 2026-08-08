@@ -69,7 +69,9 @@ from opensquilla.provider.image_generation_policy import (
 from opensquilla.provider.preset_registry import ProviderPreset, get_preset
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
+    ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
     TEXT_TIERS,
+    TierConfig,
     normalize_text_tier,
 )
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS, MAX_SEARCH_RESULTS
@@ -89,6 +91,7 @@ _TIER_KEY_ALIASES = {
     "thinkingLevel": "thinking_level",
     "supportsImage": "supports_image",
     "imageOnly": "image_only",
+    "ensembleSelectionMode": "ensemble_selection_mode",
 }
 _REMOTE_MEMORY_EMBEDDING_PROVIDERS = {"openai", "openai-compatible"}
 _DEFAULT_REMOTE_EMBEDDING_BASE_URL = "https://api.openai.com/v1"
@@ -263,6 +266,9 @@ def _canonical_tier_value(tier: Mapping[str, Any]) -> dict[str, Any]:
         "thinking_level": (str(thinking or "").strip() or None),
         "supports_image": bool(tier.get("supports_image", tier.get("supportsImage", False))),
         "image_only": bool(tier.get("image_only", tier.get("imageOnly", False))),
+        "ensemble_selection_mode": str(
+            tier.get("ensemble_selection_mode", tier.get("ensembleSelectionMode", "")) or ""
+        ).strip(),
     }
 
 
@@ -342,6 +348,16 @@ def _validate_router_tiers(tiers: dict[str, Any], default_tier: str) -> None:
             raise ValueError(f"router tier {tier_name!r} requires provider")
         if not str(tier.get("model") or "").strip():
             raise ValueError(f"router tier {tier_name!r} requires model")
+        selection_mode = TierConfig.from_value(tier).ensemble_selection_mode
+        if (
+            selection_mode
+            and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES
+        ):
+            allowed = ", ".join(sorted(ROUTER_TIER_ENSEMBLE_SELECTION_MODES))
+            raise ValueError(
+                f"router tier {tier_name!r} ensembleSelectionMode must be one of: "
+                f"{allowed}"
+            )
 
 
 def _tier_provider_deployment_unready_reason(

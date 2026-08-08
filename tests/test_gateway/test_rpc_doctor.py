@@ -1035,6 +1035,45 @@ async def test_doctor_status_reports_static_tokenrhythm_b5_ready_when_keyed(
 
 
 @pytest.mark.asyncio
+async def test_doctor_reports_tier_managed_c3_ensemble_fallback_when_keyless(
+    monkeypatch,
+) -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    _patch_all_but_llm_ensemble(monkeypatch, rpc_doctor)
+
+    config = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "deepseek-v4-flash-0731",
+            "api_key": "",
+        },
+        llm_ensemble={"enabled": False},
+    )
+    response = await get_dispatcher().dispatch(
+        "req-1",
+        "doctor.status",
+        {},
+        RpcContext(conn_id="test", config=config),
+    )
+
+    assert response.ok is True
+    finding = next(
+        finding
+        for finding in response.payload["findings"]
+        if finding["id"]
+        == "llm_ensemble.static_tokenrhythm_b5.credentials.missing"
+    )
+    assert finding["evidence"]["globalEnabled"] is False
+    assert finding["evidence"]["activationSource"] == "router_tier"
+    assert finding["evidence"]["activationTiers"] == ["C3"]
+    assert "C3" in finding["detail"]
+    commands = [step["command"] for step in finding["fixSteps"] if "command" in step]
+    assert "opensquilla config set llm_ensemble.enabled false" not in commands
+
+
+@pytest.mark.asyncio
 async def test_doctor_status_skips_ensemble_finding_when_ensemble_disabled(
     monkeypatch,
 ) -> None:

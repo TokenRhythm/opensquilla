@@ -185,6 +185,153 @@ async def test_static_tokenrhythm_b5_wraps_when_active_provider_is_keyed(
     assert "ensemble_wrap_skipped_reason" not in turn.metadata
 
 
+@pytest.mark.parametrize(
+    ("routed_tier", "expected_model", "expect_ensemble"),
+    [
+        ("c0", "qwen3.7-flash", False),
+        ("c1", "deepseek-v4-flash-0731", False),
+        ("c2", "glm-5.2", False),
+        ("c3", "glm-5.2", True),
+    ],
+)
+async def test_tokenrhythm_router_uses_ensemble_only_for_c3(
+    monkeypatch: pytest.MonkeyPatch,
+    routed_tier: str,
+    expected_model: str,
+    expect_ensemble: bool,
+) -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "deepseek-v4-flash-0731",
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_ensemble={"enabled": False},
+    )
+    tier = cfg.squilla_router.tiers[routed_tier]
+
+    async def route_to_requested_tier(turn):
+        turn.model = tier["model"]
+        turn.metadata["routed_tier"] = routed_tier
+        turn.metadata["routing_applied"] = True
+        return turn
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.apply_squilla_router",
+        route_to_requested_tier,
+    )
+    runner = TurnRunner(provider_selector=None, config=cfg)
+    selector = _FakeSelector(provider="tokenrhythm", api_key="sk-tr-synthetic")
+
+    turn, provider = await runner._run_pipeline(
+        "route this request",
+        f"agent:main:tier-{routed_tier}",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert selector.current_config.model == expected_model
+    assert isinstance(provider, EnsembleProvider) is expect_ensemble
+    if expect_ensemble:
+        assert provider.profile_name == "static_tokenrhythm_b5"
+        assert provider.fallback_model == "glm-5.2"
+        assert turn.metadata["ensemble_activation_source"] == "router_tier"
+        assert turn.metadata["ensemble_selection_mode"] == "static_tokenrhythm_b5"
+    else:
+        assert "ensemble_enabled" not in turn.metadata
+
+
+async def test_tokenrhythm_c3_falls_back_to_glm_without_ensemble_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "deepseek-v4-flash-0731",
+            "api_key": "",
+        },
+        llm_ensemble={"enabled": False},
+    )
+    tier = cfg.squilla_router.tiers["c3"]
+
+    async def route_to_c3(turn):
+        turn.model = tier["model"]
+        turn.metadata["routed_tier"] = "c3"
+        turn.metadata["routing_applied"] = True
+        return turn
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.apply_squilla_router",
+        route_to_c3,
+    )
+    runner = TurnRunner(provider_selector=None, config=cfg)
+    selector = _FakeSelector(provider="tokenrhythm", api_key="")
+
+    turn, provider = await runner._run_pipeline(
+        "route this request",
+        "agent:main:tier-c3-keyless",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert not isinstance(provider, EnsembleProvider)
+    assert selector.current_config.model == "glm-5.2"
+    assert turn.metadata["ensemble_wrap_skipped_reason"] == (
+        "static_tokenrhythm_b5_no_credential"
+    )
+
+
+async def test_tokenrhythm_c3_observe_route_keeps_baseline_single_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "deepseek-v4-flash-0731",
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_ensemble={"enabled": False},
+    )
+
+    async def observe_c3(turn):
+        turn.metadata["baseline_model"] = turn.model
+        turn.metadata["routed_tier"] = "c3"
+        turn.metadata["routed_model"] = "glm-5.2"
+        turn.metadata["routing_applied"] = False
+        return turn
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.apply_squilla_router",
+        observe_c3,
+    )
+    runner = TurnRunner(provider_selector=None, config=cfg)
+    selector = _FakeSelector(provider="tokenrhythm", api_key="sk-tr-synthetic")
+
+    turn, provider = await runner._run_pipeline(
+        "observe this request",
+        "agent:main:tier-c3-observe",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert turn.metadata["routed_tier"] == "c3"
+    assert turn.metadata["routing_applied"] is False
+    assert selector.current_config.provider == "tokenrhythm"
+    assert selector.current_config.model == "deepseek-v4-flash-0731"
+    assert not isinstance(provider, EnsembleProvider)
+    assert "ensemble_enabled" not in turn.metadata
+
+
 async def test_router_dynamic_wrap_is_not_credential_gated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2862,7 +2862,7 @@ function setRouterVisualMode(value: string) {
 
 function updateTierField(
   name: string,
-  key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage',
+  key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleSelectionMode',
   value: string | boolean,
 ) {
   routerForm.updateTierField(name, key, value)

@@ -172,6 +172,35 @@ describe('SetupTierTable — editable routing rows', () => {
     app.unmount()
   })
 
+  it('shows the C3 fusion profile and exposes the single-model fallback', async () => {
+    const onUpdateTierField = vi.fn()
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        model: 'glm-5.2',
+        ensembleSelectionMode: 'static_tokenrhythm_b5',
+      }],
+      providerOptions: [{ providerId: 'openai', label: 'OpenAI' }],
+    }, { onUpdateTierField })
+
+    const execution = el.querySelector<HTMLSelectElement>(
+      'select[aria-label="c3 execution mode"]',
+    )!
+    expect(execution.value).toBe('static_tokenrhythm_b5')
+    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+      .toContain('Fallback: glm-5.2')
+
+    execution.value = ''
+    execution.dispatchEvent(new Event('change', { bubbles: true }))
+    expect(onUpdateTierField).toHaveBeenCalledWith(
+      'c3',
+      'ensembleSelectionMode',
+      '',
+    )
+    app.unmount()
+  })
+
   it('preserves an unknown stored provider as disabled while allowing configured choices', async () => {
     const onUpdateTierField = vi.fn()
     const { app, el } = await mountTable({
@@ -371,6 +400,25 @@ describe('SetupTierTable — readonly preview mode', () => {
     // The image switch stays visible (disabled) so the preview shows state.
     expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 supports image"]')?.disabled).toBe(true)
 
+    app.unmount()
+  })
+
+  it('renders C3 fusion and fallback semantics as read-only text', async () => {
+    const { app, el } = await mountTable({
+      readonly: true,
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        model: 'glm-5.2',
+        ensembleSelectionMode: 'static_tokenrhythm_b5',
+      }],
+    })
+
+    expect(el.querySelector('.setup-tier-table__execution-summary')?.textContent)
+      .toContain('Fusion: static_tokenrhythm_b5')
+    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+      .toContain('Fallback: glm-5.2')
+    expect(el.querySelector('select[aria-label="c3 execution mode"]')).toBeNull()
     app.unmount()
   })
 })

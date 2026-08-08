@@ -169,10 +169,58 @@ def _router_detail(cfg: GatewayConfig, llm_source: str) -> str:
     return f"SquillaRouter default tier: {default_tier}"
 
 
-def _ensemble_detail(cfg: GatewayConfig) -> str:
-    from opensquilla.provider.ensemble import ensemble_runtime_status
+_ENSEMBLE_ONBOARDING_STATUS_KEYS = (
+    "enabled",
+    "selectionMode",
+    "runtimeStatus",
+    "configurationReady",
+    "blockedReason",
+    "proposerCount",
+    "proposerCountRange",
+    "aggregatorCount",
+    "perTurnCallCount",
+    "perTurnCallCountRange",
+    "memberProviders",
+)
 
-    runtime = ensemble_runtime_status(cfg)
+
+def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
+    """Project global Ensemble state onto the frozen onboarding wire shape.
+
+    Tier-managed fusion is part of the router ladder and is diagnosed by the
+    doctor/router surfaces.  It must not make the global Ensemble toggle look
+    enabled or disable the router editor in older WebUI clients.
+    """
+    globally_enabled = bool(getattr(getattr(cfg, "llm_ensemble", None), "enabled", False))
+    if not globally_enabled:
+        selection_mode = str(
+            getattr(getattr(cfg, "llm_ensemble", None), "selection_mode", "") or ""
+        )
+        runtime = {
+            "enabled": False,
+            "selectionMode": selection_mode,
+            "runtimeStatus": "disabled",
+            "configurationReady": None,
+            "blockedReason": None,
+            "proposerCount": 0,
+            "proposerCountRange": None,
+            "aggregatorCount": 0,
+            "perTurnCallCount": 0,
+            "perTurnCallCountRange": None,
+            "memberProviders": [],
+        }
+    else:
+        # Runtime readiness may resolve several provider credentials. Avoid
+        # that work (and its diagnostic noise) when this global surface is
+        # disabled; tier-managed fusion is projected by router/doctor status.
+        from opensquilla.provider.ensemble import ensemble_runtime_status
+
+        runtime = ensemble_runtime_status(cfg)
+    return {key: runtime.get(key) for key in _ENSEMBLE_ONBOARDING_STATUS_KEYS}
+
+
+def _ensemble_detail(cfg: GatewayConfig) -> str:
+    runtime = _ensemble_onboarding_status(cfg)
     if not runtime["enabled"]:
         return "disabled"
     mode = str(runtime["selectionMode"])
@@ -1067,9 +1115,7 @@ def get_onboarding_status(
             _router_provider_conflicts(config)
         )
     if "ensemble" in section_details:
-        from opensquilla.provider.ensemble import ensemble_runtime_status
-
-        section_details["ensemble"].update(ensemble_runtime_status(config))
+        section_details["ensemble"].update(_ensemble_onboarding_status(config))
     resolution_getter = getattr(config, "provider_resolution", None)
     provider_resolution = (
         resolution_getter() if callable(resolution_getter) else {}

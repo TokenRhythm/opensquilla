@@ -100,7 +100,7 @@ const emit = defineEmits<{
   updateFixedModel: [value: string]
   updateRouterDefaultTier: [value: string]
   updateRouterVisualMode: [value: string]
-  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage', value: string | boolean]
+  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleSelectionMode', value: string | boolean]
   updateEnsembleScheme: [value: 'preset' | 'custom']
   addEnsembleCandidate: [provider: string, model: string, role: EnsembleCandidateRole]
   removeEnsembleCandidate: [candidate: EnsembleCandidateView]

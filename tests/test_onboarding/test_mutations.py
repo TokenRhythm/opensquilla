@@ -500,13 +500,13 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
         api_key="sk-test",
     )
     assert res.config.llm.provider == "tokenrhythm"
-    assert res.config.llm.model == "deepseek-v4-pro"
+    assert res.config.llm.model == "deepseek-v4-flash-0731"
     assert res.config.squilla_router.enabled is True
     assert res.config.squilla_router.tier_profile is None
     expected = {
-        "c0": "deepseek-v4-flash",
-        "c1": "deepseek-v4-pro",
-        "c2": "kimi-k2.7-code",
+        "c0": "qwen3.7-flash",
+        "c1": "deepseek-v4-flash-0731",
+        "c2": "glm-5.2",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
     }
@@ -516,6 +516,10 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
     persisted = res.config.to_toml_dict()["squilla_router"]
     assert "tier_profile" not in persisted
     assert persisted["tiers"]["c3"]["model"] == "glm-5.2"
+    assert (
+        persisted["tiers"]["c3"]["ensemble_selection_mode"]
+        == "static_tokenrhythm_b5"
+    )
 
 
 def test_provider_default_direct_model_does_not_follow_existing_router_tier():
@@ -1611,6 +1615,23 @@ def test_upsert_router_custom_merges_provided_tiers_over_preset():
     assert res.config.squilla_router.tiers["c3"]["model"] == "anthropic/claude-opus-4.8"
     # Unoverridden tiers keep the openrouter preset values.
     assert res.config.squilla_router.tiers["c0"]["provider"] == "openrouter"
+
+
+def test_upsert_router_rejects_unknown_tier_ensemble_selection_mode():
+    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "z-ai/glm-5.1"})
+
+    with pytest.raises(ValueError, match="ensembleSelectionMode must be one of"):
+        upsert_router(
+            cfg,
+            mode="custom",
+            tiers={
+                "c3": {
+                    "provider": "openrouter",
+                    "model": "z-ai/glm-5.2",
+                    "ensembleSelectionMode": "static_openrouter_typo",
+                }
+            },
+        )
 
 
 def test_upsert_router_can_enable_cross_provider_tiers():

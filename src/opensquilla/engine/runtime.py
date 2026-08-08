@@ -252,7 +252,12 @@ from opensquilla.router_control import (
     RouterControlHoldStore,
     render_router_control_prompt_block,
 )
-from opensquilla.router_tiers import HIGHEST_TEXT_TIER, normalize_text_tier, tier_index
+from opensquilla.router_tiers import (
+    HIGHEST_TEXT_TIER,
+    normalize_text_tier,
+    tier_ensemble_selection_mode,
+    tier_index,
+)
 from opensquilla.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
 from opensquilla.session.compaction_lifecycle import (
@@ -8205,7 +8210,18 @@ class TurnRunner:
             )
 
         ensemble_cfg = getattr(self._turn_config(), "llm_ensemble", None)
-        if provider is not None and getattr(ensemble_cfg, "enabled", False):
+        # A tier execution override is part of routing, not observation.  In
+        # observe rollout the router records the candidate tier/model while
+        # deliberately leaving the baseline provider in charge; wrapping the
+        # observed C3 candidate would otherwise execute routing by stealth.
+        tier_ensemble_mode = ""
+        if bool(turn.metadata.get("routing_applied", False)):
+            tier_ensemble_mode = tier_ensemble_selection_mode(
+                getattr(router_cfg, "tiers", None),
+                turn.metadata.get("routed_tier"),
+            )
+        ensemble_globally_enabled = bool(getattr(ensemble_cfg, "enabled", False))
+        if provider is not None and (ensemble_globally_enabled or tier_ensemble_mode):
             from opensquilla.engine.selector_override import (
                 acquire_profile_credential,
                 report_profile_credential_failure,
@@ -8222,7 +8238,22 @@ class TurnRunner:
                 if cloned_selector is not None
                 else None
             )
-            selection_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
+            configured_selection_mode = str(
+                getattr(ensemble_cfg, "selection_mode", "") or ""
+            )
+            selection_mode = tier_ensemble_mode or configured_selection_mode
+            if static_b5_profile(selection_mode) is None and selection_mode not in {
+                CUSTOM_B5_SELECTION_MODE,
+                "router_dynamic",
+            }:
+                log.warning(
+                    "llm_ensemble.wrap_skipped",
+                    reason=f"unsupported_tier_selection_mode:{selection_mode}",
+                )
+                turn.metadata["ensemble_wrap_skipped_reason"] = (
+                    f"unsupported_tier_selection_mode:{selection_mode}"
+                )
+                return turn, provider
             # The shared deployment resolver marks an unexecutable member
             # unavailable before any network call. Keep the ensemble wrapper so
             # custom lineups can retain quorum semantics when only one provider
@@ -8284,6 +8315,10 @@ class TurnRunner:
                 )
             else:
                 turn.metadata["ensemble_enabled"] = True
+                turn.metadata["ensemble_activation_source"] = (
+                    "router_tier" if tier_ensemble_mode else "global"
+                )
+                turn.metadata["ensemble_selection_mode"] = selection_mode
                 turn.metadata["routed_model_before_ensemble"] = (
                     turn.model or getattr(current_provider_config, "model", "")
                 )
@@ -8303,6 +8338,7 @@ class TurnRunner:
                     ),
                     _session_key=turn.session_key,
                     _fallback_selector=cloned_selector,
+                    _selection_mode_override=selection_mode,
                 )
 
         return turn, provider

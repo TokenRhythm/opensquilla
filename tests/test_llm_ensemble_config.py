@@ -28,6 +28,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.candidate_max_chars == 24_000
     assert ensemble.proposer_timeout_seconds == 3600.0
     assert ensemble.aggregator_timeout_seconds == 3600.0
+    assert ensemble.total_timeout_seconds is None
     assert ensemble.shuffle_candidates is True
     assert ensemble.record_candidates is False
 
@@ -55,8 +56,9 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.min_successful_proposers == 3
     assert provider.target_successful_proposers == 3
     assert provider.proposer_max_retries == 0
-    assert provider.proposer_timeout_seconds == 300.0
-    assert provider.aggregator_timeout_seconds == 480.0
+    assert provider.proposer_timeout_seconds == 120.0
+    assert provider.aggregator_timeout_seconds == 180.0
+    assert provider.total_timeout_seconds == 300.0
     assert provider.shuffle_candidates is False
     assert provider.quorum_grace_seconds == 10.0
 
@@ -124,8 +126,9 @@ def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
     assert provider.aggregator.provider_config.model == "glm-5.2"
     # Same aggregation defaults as the static OpenRouter profile.
     assert provider.min_successful_proposers == 3
-    assert provider.proposer_timeout_seconds == 300.0
-    assert provider.aggregator_timeout_seconds == 480.0
+    assert provider.proposer_timeout_seconds == 120.0
+    assert provider.aggregator_timeout_seconds == 180.0
+    assert provider.total_timeout_seconds == 300.0
     assert provider.shuffle_candidates is False
     assert provider.quorum_grace_seconds == 10.0
 
@@ -454,16 +457,19 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "configured_min_successful_proposers": 9,
             "effective_min_successful_proposers": 4,
             "configured_proposer_timeout_seconds": 3600.0,
-            "effective_proposer_timeout_seconds": 300.0,
+            "effective_proposer_timeout_seconds": 120.0,
             "configured_aggregator_timeout_seconds": 3600.0,
-            "effective_aggregator_timeout_seconds": 480.0,
+            "effective_aggregator_timeout_seconds": 180.0,
+            "configured_total_timeout_seconds": None,
+            "effective_total_timeout_seconds": 300.0,
             "configured_shuffle_candidates": False,
             "effective_shuffle_candidates": False,
             "quorum_grace_seconds": 10.0,
         }
         assert provider.min_successful_proposers == 4
-        assert provider.proposer_timeout_seconds == 300.0
-        assert provider.aggregator_timeout_seconds == 480.0
+        assert provider.proposer_timeout_seconds == 120.0
+        assert provider.aggregator_timeout_seconds == 180.0
+        assert provider.total_timeout_seconds == 300.0
         assert provider.shuffle_candidates is False
         assert provider.quorum_grace_seconds == 10.0
         members = [*provider.proposers, provider.aggregator]
@@ -501,10 +507,12 @@ def test_static_openrouter_b5_ensemble_uses_profile_effective_defaults() -> None
     assert cfg.llm_ensemble.min_successful_proposers == 1
     assert cfg.llm_ensemble.proposer_timeout_seconds == 3600.0
     assert cfg.llm_ensemble.aggregator_timeout_seconds == 3600.0
+    assert cfg.llm_ensemble.total_timeout_seconds is None
     assert cfg.llm_ensemble.shuffle_candidates is True
     assert provider.min_successful_proposers == 3
-    assert provider.proposer_timeout_seconds == 300.0
-    assert provider.aggregator_timeout_seconds == 480.0
+    assert provider.proposer_timeout_seconds == 120.0
+    assert provider.aggregator_timeout_seconds == 180.0
+    assert provider.total_timeout_seconds == 300.0
     assert provider.shuffle_candidates is False
     assert provider.quorum_grace_seconds == 10.0
 
@@ -534,6 +542,7 @@ def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> No
     assert provider.min_successful_proposers == 2
     assert provider.proposer_timeout_seconds == 180.0
     assert provider.aggregator_timeout_seconds == 900.0
+    assert provider.total_timeout_seconds == 300.0
     assert provider.shuffle_candidates is False
 
 

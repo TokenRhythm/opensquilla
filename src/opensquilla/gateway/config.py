@@ -40,6 +40,10 @@ from opensquilla.provider.credentials import (
 from opensquilla.provider.preset_registry import get_preset, legacy_profile_ids
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
+    ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
+    TEXT_TIERS,
+    TierConfig,
+    configured_tier_ensemble_selection_modes,
     normalize_text_tier,
     normalize_tier_mapping,
 )
@@ -394,7 +398,7 @@ class LlmProviderConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_LLM_")
 
     provider: str = "tokenrhythm"
-    model: str = "deepseek-v4-pro"
+    model: str = "deepseek-v4-flash-0731"
     api_key: str = ""
     api_key_env: str = ""
     base_url: str = "https://tokenrhythm.studio/v1"
@@ -566,6 +570,9 @@ class LlmEnsembleConfig(BaseSettings):
     candidate_max_chars: int = Field(default=24_000, ge=0)
     proposer_timeout_seconds: float = Field(default=3600.0, gt=0.0)
     aggregator_timeout_seconds: float = Field(default=3600.0, gt=0.0)
+    # Optional end-to-end wall-clock budget. None selects the profile default;
+    # zero explicitly disables the total cap.
+    total_timeout_seconds: float | None = Field(default=None, ge=0.0)
     shuffle_candidates: bool = True
     record_candidates: bool = False
 
@@ -687,13 +694,28 @@ def _non_negative_float(value: Any, default: float) -> float:
     return max(0.0, parsed)
 
 
-def static_b5_ensemble_enabled(config: Any) -> bool:
+def _configured_static_b5_selection_modes(config: Any) -> tuple[str, ...]:
+    modes: list[str] = []
     ensemble_cfg = getattr(config, "llm_ensemble", None)
-    if ensemble_cfg is None:
-        return False
-    return bool(getattr(ensemble_cfg, "enabled", False)) and (
-        str(getattr(ensemble_cfg, "selection_mode", "") or "") in STATIC_B5_SELECTION_MODES
-    )
+    global_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
+    if bool(getattr(ensemble_cfg, "enabled", False)) and global_mode in STATIC_B5_SELECTION_MODES:
+        modes.append(global_mode)
+
+    router = getattr(config, "squilla_router", None)
+    if bool(getattr(router, "enabled", False)):
+        tier_modes = configured_tier_ensemble_selection_modes(
+            getattr(router, "tiers", None)
+        )
+        modes.extend(
+            mode for mode in tier_modes.values() if mode in STATIC_B5_SELECTION_MODES
+        )
+    return tuple(dict.fromkeys(modes))
+
+
+def static_b5_ensemble_enabled(config: Any) -> bool:
+    """Whether global or tier-managed configuration can run static B5."""
+
+    return bool(_configured_static_b5_selection_modes(config))
 
 
 def static_b5_ensemble_active(config: Any) -> bool:
@@ -706,15 +728,40 @@ def static_b5_ensemble_active(config: Any) -> bool:
     ``provider`` never imports from ``gateway``, so no cycle) and therefore
     cannot disagree with the turn-time wrap guard.
     """
-    if not static_b5_ensemble_enabled(config):
+    selection_modes = _configured_static_b5_selection_modes(config)
+    if not selection_modes:
         return False
     from opensquilla.provider.ensemble import static_b5_credential_available
 
-    selection_mode = str(
-        getattr(getattr(config, "llm_ensemble", None), "selection_mode", "") or ""
+    return any(
+        static_b5_credential_available(
+            config,
+            getattr(config, "llm", None),
+            selection_mode,
+        )
+        for selection_mode in selection_modes
     )
+
+
+def _global_static_b5_ensemble_active(config: Any) -> bool:
+    """Whether the global ensemble surface will run a static-B5 profile.
+
+    Tier-managed fusion only affects turns routed to that tier, so it must not
+    inflate the gateway-wide stream-idle budget for every other request.
+    """
+
+    ensemble_cfg = getattr(config, "llm_ensemble", None)
+    selection_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
+    if not bool(getattr(ensemble_cfg, "enabled", False)):
+        return False
+    if selection_mode not in STATIC_B5_SELECTION_MODES:
+        return False
+    from opensquilla.provider.ensemble import static_b5_credential_available
+
     return static_b5_credential_available(
-        config, getattr(config, "llm", None), selection_mode
+        config,
+        getattr(config, "llm", None),
+        selection_mode,
     )
 
 
@@ -723,7 +770,7 @@ def effective_agent_stream_idle_timeout_seconds(config: Any) -> float:
         getattr(config, "agent_stream_idle_timeout_seconds", 600.0),
         600.0,
     )
-    if static_b5_ensemble_active(config):
+    if _global_static_b5_ensemble_active(config):
         value = max(value, STATIC_OPENROUTER_B5_MIN_AGENT_STREAM_IDLE_TIMEOUT_SECONDS)
     return value
 
@@ -733,7 +780,7 @@ def effective_webui_stream_idle_grace_seconds(config: Any) -> float:
         getattr(config, "webui_stream_idle_grace_seconds", 630.0),
         630.0,
     )
-    if static_b5_ensemble_active(config):
+    if _global_static_b5_ensemble_active(config):
         server_idle = effective_agent_stream_idle_timeout_seconds(config)
         value = max(
             value,
@@ -1337,6 +1384,20 @@ class SquillaRouterConfig(BaseSettings):
         next_values["tier_profile"] = normalized
         next_values["tiers"] = merged
         return next_values
+
+    @model_validator(mode="after")
+    def _validate_tier_ensemble_selection_modes(self) -> SquillaRouterConfig:
+        allowed = ", ".join(sorted(ROUTER_TIER_ENSEMBLE_SELECTION_MODES))
+        for tier_name in TEXT_TIERS:
+            selection_mode = TierConfig.from_value(
+                self.tiers.get(tier_name) if isinstance(self.tiers, dict) else None
+            ).ensemble_selection_mode
+            if selection_mode and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES:
+                raise ValueError(
+                    f"squilla_router.tiers.{tier_name}.ensemble_selection_mode "
+                    f"must be one of: {allowed}"
+                )
+        return self
 
 
 # Eagerly resolve the ``self_learning: RouterSelfLearningConfig`` forward ref
@@ -2586,7 +2647,8 @@ class GatewayConfig(BaseSettings):
         has_custom_tiers = (
             "tiers" in fields_set and getattr(router, "tiers", {}) != _default_tiers()
         )
-        if "tier_profile" in fields_set or has_custom_tiers:
+        follows_primary_preset = getattr(router, "preset_binding", None) == "follow_primary"
+        if "tier_profile" in fields_set or (has_custom_tiers and not follows_primary_preset):
             return self
         payload = router.model_dump(mode="python")
         if curated_inline_preset is None:

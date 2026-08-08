@@ -588,3 +588,46 @@ def test_llm_ensemble_custom_b5_health_findings_cover_ready_and_blocked() -> Non
         }
     )
     assert "no enabled proposer" in empty[0].detail
+
+
+def test_llm_ensemble_unknown_selection_mode_is_diagnosed() -> None:
+    findings = evaluate_llm_ensemble(
+        {
+            "enabled": True,
+            "selectionMode": "static_tokenrhythm_typo",
+            "blockedReason": "unknown_selection_mode",
+        }
+    )
+
+    assert [finding.id for finding in findings] == [
+        "llm_ensemble.unknown_selection_mode"
+    ]
+    assert findings[0].severity == "warn"
+    assert findings[0].evidence["blockedReason"] == "unknown_selection_mode"
+    assert "static_tokenrhythm_typo" in findings[0].detail
+
+
+def test_tier_managed_ensemble_health_explains_c3_activation_and_fallback() -> None:
+    base_payload = {
+        "enabled": True,
+        "globalEnabled": False,
+        "selectionMode": "static_tokenrhythm_b5",
+        "activationSource": "router_tier",
+        "activationTiers": ["c3"],
+        "activeProvider": "tokenrhythm",
+        "apiKeyEnv": "TOKENRHYTHM_API_KEY",
+    }
+    ready = evaluate_llm_ensemble(
+        {**base_payload, "credentialAvailable": True}
+    )
+    assert ready[0].severity == "ok"
+    assert "router tier C3" in ready[0].detail
+    assert ready[0].evidence["activationSource"] == "router_tier"
+
+    blocked = evaluate_llm_ensemble(
+        {**base_payload, "credentialAvailable": False}
+    )
+    assert blocked[0].severity == "warn"
+    assert "fall back to their configured single-model routes" in blocked[0].detail
+    commands = [step.command for step in blocked[0].fix_steps if step.command]
+    assert "opensquilla config set llm_ensemble.enabled false" not in commands

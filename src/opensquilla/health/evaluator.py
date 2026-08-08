@@ -1759,22 +1759,71 @@ _STATIC_B5_MODE_DETAILS = {
     "static_openrouter_b5": ("OpenRouter", "OPENROUTER_API_KEY"),
     "static_tokenrhythm_b5": ("TokenRhythm", "TOKENRHYTHM_API_KEY"),
 }
+_ENSEMBLE_SELECTION_MODES = frozenset(
+    {"custom_b5", "router_dynamic", *_STATIC_B5_MODE_DETAILS}
+)
 
 
 def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
     enabled = bool(payload.get("enabled"))
     selection_mode = str(payload.get("selectionMode") or "")
+    if not enabled:
+        return []
+    if selection_mode not in _ENSEMBLE_SELECTION_MODES:
+        return [
+            HealthFinding(
+                id="llm_ensemble.unknown_selection_mode",
+                severity="warn",
+                surface="llm_ensemble",
+                title="LLM ensemble selection mode is unsupported",
+                detail=(
+                    f"The configured selection mode {selection_mode or '<empty>'!r} "
+                    "is not supported, so ensemble execution is blocked. Choose a "
+                    "supported mode or disable the ensemble."
+                ),
+                evidence={
+                    "enabled": True,
+                    "selectionMode": selection_mode,
+                    "blockedReason": payload.get("blockedReason")
+                    or "unknown_selection_mode",
+                },
+                fix_steps=[
+                    FixStep(
+                        label="Choose a supported selection mode",
+                        detail=(
+                            "Use custom_b5, router_dynamic, static_openrouter_b5, "
+                            "or static_tokenrhythm_b5."
+                        ),
+                    ),
+                    FixStep(
+                        label="Disable the ensemble",
+                        command="opensquilla config set llm_ensemble.enabled false",
+                    ),
+                ],
+            )
+        ]
     if enabled and selection_mode == "custom_b5":
         return _evaluate_custom_b5_ensemble(payload)
     mode_details = _STATIC_B5_MODE_DETAILS.get(selection_mode)
-    if not enabled or mode_details is None:
+    if mode_details is None:
         return []
     provider_label, env_key_fallback = mode_details
     api_key_env = str(payload.get("apiKeyEnv") or env_key_fallback)
     credential_available = bool(payload.get("credentialAvailable"))
+    activation_source = str(payload.get("activationSource") or "global")
+    activation_tiers = [
+        str(tier).upper()
+        for tier in payload.get("activationTiers", [])
+        if str(tier).strip()
+    ]
+    tier_label = ", ".join(activation_tiers) or "the configured router tier"
+    tier_managed = activation_source == "router_tier"
     evidence = {
         "enabled": enabled,
+        "globalEnabled": bool(payload.get("globalEnabled", enabled)),
         "selectionMode": selection_mode,
+        "activationSource": activation_source,
+        "activationTiers": activation_tiers,
         "activeProvider": payload.get("activeProvider"),
         "apiKeyEnv": api_key_env,
         "credentialAvailable": credential_available,
@@ -1788,24 +1837,48 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
                 title="LLM ensemble ready",
                 detail=(
                     f"The static {provider_label} B5 ensemble resolves a "
+                    f"{provider_label} credential and is active for router tier "
+                    f"{tier_label}."
+                    if tier_managed
+                    else f"The static {provider_label} B5 ensemble resolves a "
                     f"{provider_label} credential and is active for turns."
                 ),
                 evidence=evidence,
             )
         ]
+    if tier_managed:
+        detail = (
+            f"The static {provider_label} B5 ensemble configured for router tier "
+            f"{tier_label} cannot resolve a {provider_label} credential. Those "
+            f"tiers safely fall back to their configured single-model routes. Set "
+            f"{api_key_env}, or change the affected tier's ensemble selection mode."
+        )
+        disable_step = FixStep(
+            label="Review the router tier",
+            detail=(
+                "Open Settings → Model routing and change the affected tier, or "
+                "remove its ensemble_selection_mode override."
+            ),
+        )
+    else:
+        detail = (
+            f"LLM ensemble (static {provider_label} B5) is enabled but no "
+            f"{provider_label} credential resolves — the ensemble is inactive and "
+            f"every turn falls back to the single configured provider. Set "
+            f"{api_key_env}, switch llm_ensemble.selection_mode, or disable the "
+            "ensemble."
+        )
+        disable_step = FixStep(
+            label="Disable the ensemble",
+            command="opensquilla config set llm_ensemble.enabled false",
+        )
     return [
         HealthFinding(
             id=f"llm_ensemble.{selection_mode}.credentials.missing",
             severity="warn",
             surface="llm_ensemble",
             title="LLM ensemble is enabled but cannot run",
-            detail=(
-                f"LLM ensemble (static {provider_label} B5) is enabled but no "
-                f"{provider_label} credential resolves — the ensemble is inactive and "
-                f"every turn falls back to the single configured provider. Set "
-                f"{api_key_env}, switch llm_ensemble.selection_mode, or disable the "
-                "ensemble."
-            ),
+            detail=detail,
             evidence=evidence,
             fix_steps=[
                 FixStep(
@@ -1815,10 +1888,7 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
                         "the gateway."
                     ),
                 ),
-                FixStep(
-                    label="Disable the ensemble",
-                    command="opensquilla config set llm_ensemble.enabled false",
-                ),
+                disable_step,
                 FixStep(label="Restart gateway", command="opensquilla gateway restart"),
             ],
             restart_required=True,

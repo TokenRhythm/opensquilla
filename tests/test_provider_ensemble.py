@@ -401,6 +401,78 @@ async def test_ensemble_emits_heartbeat_while_waiting_for_slow_proposers(
 
 
 @pytest.mark.asyncio
+async def test_ensemble_total_timeout_cancels_inflight_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="late"), DoneEvent(model="p1")],
+                gate=gate,
+                started=started,
+                closed=closed,
+            ),
+            "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="default",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        total_timeout_seconds=0.03,
+        shuffle_candidates=False,
+    )
+
+    events = await asyncio.wait_for(_collect(provider), timeout=0.5)
+
+    assert started.is_set() is True
+    assert closed.is_set() is True
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert errors[-1].code == "ensemble_total_timeout"
+    assert errors[-1].usage_missing_count == 1
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_zero_ensemble_total_timeout_disables_wall_clock_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")],
+                delay=0.04,
+            ),
+            "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="default",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        total_timeout_seconds=0,
+        shuffle_candidates=False,
+    )
+
+    events = await asyncio.wait_for(_collect(provider), timeout=0.5)
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert not any(
+        isinstance(event, ErrorEvent) and event.code == "ensemble_total_timeout"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
 async def test_ensemble_emits_heartbeat_while_waiting_for_slow_aggregator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6030,8 +6102,31 @@ def test_static_b5_credential_gate_agrees_with_config_side_floor_gate(
         )
         assert static_b5_ensemble_active(config) is expected
 
+    tier_managed = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "deepseek-v4-flash-0731",
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_ensemble={"enabled": False},
+    )
+    assert static_b5_ensemble_enabled(tier_managed) is True
+    assert static_b5_ensemble_active(tier_managed) is True
+
 
 def test_ensemble_runtime_status_counts_static_custom_and_dynamic() -> None:
+    tier_managed_cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm", "api_key": "sk_tr_abcdefghijklmnop"},
+        llm_ensemble={"enabled": False},
+    )
+    tier_managed_status = ensemble_runtime_status(tier_managed_cfg)
+    assert tier_managed_status["enabled"] is True
+    assert tier_managed_status["globalEnabled"] is False
+    assert tier_managed_status["activationSource"] == "router_tier"
+    assert tier_managed_status["activationTiers"] == ["c3"]
+    assert tier_managed_status["selectionMode"] == "static_tokenrhythm_b5"
+    assert tier_managed_status["runtimeStatus"] == "ready"
+
     static_cfg = GatewayConfig(
         llm={"provider": "tokenrhythm", "api_key": "sk_tr_abcdefghijklmnop"},
         llm_ensemble={"enabled": True, "selection_mode": "static_tokenrhythm_b5"},

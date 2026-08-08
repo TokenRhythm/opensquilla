@@ -10,6 +10,15 @@ TEXT_TIERS: tuple[str, str, str, str] = ("c0", "c1", "c2", "c3")
 DEFAULT_TEXT_TIER = "c1"
 HIGHEST_TEXT_TIER = "c3"
 IMAGE_TIER = "image_model"
+ROUTER_TIER_ENSEMBLE_SELECTION_MODE_KEY = "ensemble_selection_mode"
+ROUTER_TIER_ENSEMBLE_SELECTION_MODES = frozenset(
+    {
+        "static_openrouter_b5",
+        "static_tokenrhythm_b5",
+        "custom_b5",
+        "router_dynamic",
+    }
+)
 
 LEGACY_TEXT_TIER_ALIASES: dict[str, str] = {
     "t0": "c0",
@@ -108,6 +117,10 @@ class TierConfig:
     thinking_level: str | None = None
     supports_image: bool = False
     image_only: bool = False
+    # Optional execution override for a router tier.  A non-empty value asks
+    # the runtime to wrap that tier in an already-configured Ensemble profile
+    # while keeping ``model`` as the deterministic single-model fallback.
+    ensemble_selection_mode: str = ""
 
     @classmethod
     def from_value(cls, value: object) -> TierConfig:
@@ -119,6 +132,9 @@ class TierConfig:
             return getattr(value, key, default)
 
         thinking = _get("thinking_level")
+        ensemble_selection_mode = _get(ROUTER_TIER_ENSEMBLE_SELECTION_MODE_KEY)
+        if ensemble_selection_mode in (None, ""):
+            ensemble_selection_mode = _get("ensembleSelectionMode")
         return cls(
             provider=str(_get("provider") or "").strip(),
             model=str(_get("model") or "").strip(),
@@ -126,4 +142,31 @@ class TierConfig:
             thinking_level=(str(thinking).strip() if thinking not in (None, "") else None),
             supports_image=bool(_get("supports_image", False)),
             image_only=bool(_get("image_only", False)),
+            ensemble_selection_mode=str(ensemble_selection_mode or "").strip(),
         )
+
+
+def tier_ensemble_selection_mode(
+    tiers: Mapping[str, Any] | None,
+    tier: object,
+) -> str:
+    """Return the configured Ensemble profile for one canonical text tier."""
+
+    if not isinstance(tiers, Mapping):
+        return ""
+    tier_name = normalize_text_tier(tier)
+    if tier_name is None:
+        return ""
+    return TierConfig.from_value(tiers.get(tier_name)).ensemble_selection_mode
+
+
+def configured_tier_ensemble_selection_modes(
+    tiers: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Return text tiers that explicitly select an Ensemble profile."""
+
+    return {
+        tier: selection_mode
+        for tier in TEXT_TIERS
+        if (selection_mode := tier_ensemble_selection_mode(tiers, tier))
+    }

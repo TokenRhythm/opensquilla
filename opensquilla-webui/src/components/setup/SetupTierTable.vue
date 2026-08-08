@@ -43,10 +43,16 @@ const props = withDefaults(defineProps<{
 })
 
 const emit = defineEmits<{
-  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage', value: string | boolean]
+  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleSelectionMode', value: string | boolean]
 }>()
 
 const THINKING_LEVELS = ['', 'off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+const ENSEMBLE_SELECTION_MODES = [
+  'static_tokenrhythm_b5',
+  'static_openrouter_b5',
+  'custom_b5',
+  'router_dynamic',
+] as const
 const EMPTY_CATALOG: DiscoveredModelCatalog = { models: [], source: 'none' }
 
 function catalogFor(row: SetupTierRow): DiscoveredModelCatalog {
@@ -108,6 +114,10 @@ function providerIsConfigured(row: SetupTierRow): boolean {
 
 function dependentFieldsDisabled(row: SetupTierRow): boolean {
   return props.disabled || !providerIsConfigured(row)
+}
+
+function showExecutionMode(row: SetupTierRow): boolean {
+  return row.name === 'c3' || Boolean(row.ensembleSelectionMode)
 }
 
 const showProviderColumn = computed(() => {
@@ -175,20 +185,51 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
         </div>
       </template>
       <template v-if="readonly">
-        <span class="setup-tier-table__readonly" :aria-label="t('setup.router.tierModelAria', { tier: tier.name })" :title="tier.model || undefined">{{ tier.model || '-' }}</span>
+        <div class="setup-tier-table__model-cell">
+          <span class="setup-tier-table__readonly" :aria-label="t('setup.router.tierModelAria', { tier: tier.name })" :title="tier.model || undefined">{{ tier.model || '-' }}</span>
+          <template v-if="showExecutionMode(tier)">
+            <small v-if="tier.ensembleSelectionMode" class="setup-tier-table__execution-summary">
+              {{ t('setup.router.tierFusionProfile', { profile: tier.ensembleSelectionMode }) }}
+            </small>
+            <small v-if="tier.ensembleSelectionMode" class="setup-tier-table__model-note">
+              {{ t('setup.router.tierFallbackModel', { model: tier.model || '-' }) }}
+            </small>
+            <small v-else class="setup-tier-table__model-note">
+              {{ t('setup.router.tierSingleModel') }}
+            </small>
+          </template>
+        </div>
         <span class="setup-tier-table__readonly" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })">{{ tier.thinkingLevel || '-' }}</span>
         <ControlSwitch :checked="tier.supportsImage" :disabled="true" :aria-label="t('setup.router.tierImageAria', { tier: tier.name })" />
       </template>
       <template v-else>
-        <SetupModelCombobox
-          cell
-          :field="{ name: `tier_${tier.name}_model`, label: t('setup.router.tierModelAria', { tier: tier.name }), placeholder: t('setup.router.tierModelAria', { tier: tier.name }) }"
-          :value="tier.model"
-          :models="catalogFor(tier).models"
-          :model-source="catalogFor(tier).source"
-          :disabled="dependentFieldsDisabled(tier)"
-          @update="(val) => emit('updateTierField', tier.name, 'model', val)"
-        />
+        <div class="setup-tier-table__model-cell">
+          <SetupModelCombobox
+            cell
+            :field="{ name: `tier_${tier.name}_model`, label: t('setup.router.tierModelAria', { tier: tier.name }), placeholder: t('setup.router.tierModelAria', { tier: tier.name }) }"
+            :value="tier.model"
+            :models="catalogFor(tier).models"
+            :model-source="catalogFor(tier).source"
+            :disabled="dependentFieldsDisabled(tier)"
+            @update="(val) => emit('updateTierField', tier.name, 'model', val)"
+          />
+          <select
+            v-if="showExecutionMode(tier)"
+            class="setup-tier-table__execution-select"
+            :value="tier.ensembleSelectionMode || ''"
+            :aria-label="t('setup.router.tierExecutionAria', { tier: tier.name })"
+            :disabled="dependentFieldsDisabled(tier)"
+            @change="emit('updateTierField', tier.name, 'ensembleSelectionMode', ($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">{{ t('setup.router.tierSingleModel') }}</option>
+            <option v-for="mode in ENSEMBLE_SELECTION_MODES" :key="mode" :value="mode">
+              {{ mode }}
+            </option>
+          </select>
+          <small v-if="tier.ensembleSelectionMode" class="setup-tier-table__model-note">
+            {{ t('setup.router.tierFallbackModel', { model: tier.model || '-' }) }}
+          </small>
+        </div>
         <select :value="tier.thinkingLevel" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })" :disabled="dependentFieldsDisabled(tier)" @change="emit('updateTierField', tier.name, 'thinkingLevel', ($event.target as HTMLSelectElement).value)">
           <option v-for="v in THINKING_LEVELS" :key="v" :value="v">{{ v || '-' }}</option>
         </select>
@@ -228,6 +269,32 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
   color: var(--danger);
   font-size: 10px;
   line-height: 1.2;
+}
+
+.setup-tier-table__model-cell {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.setup-tier-table__execution-select {
+  min-width: 0;
+  width: 100%;
+  font-size: 11px;
+}
+
+.setup-tier-table__execution-summary {
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.setup-tier-table__model-note {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {

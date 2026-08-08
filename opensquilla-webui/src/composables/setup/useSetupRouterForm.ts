@@ -17,6 +17,7 @@ export interface SetupTierValue {
   model: string
   thinkingLevel: string
   supportsImage: boolean
+  ensembleSelectionMode?: string
 }
 
 export interface SetupTierRow extends SetupTierValue {
@@ -58,12 +59,16 @@ export function buildRouterPayload(
   const tiers: Record<string, Record<string, unknown>> = {}
   Object.entries(tierValues).forEach(([name, tier]) => {
     const tierName = normalizeRouterTier(name) || name
-    tiers[tierName] = {
+    const tierPayload: Record<string, unknown> = {
       provider: tier.provider,
       model: tier.model,
       thinkingLevel: tier.thinkingLevel,
       supportsImage: tier.supportsImage,
     }
+    if (tier.ensembleSelectionMode) {
+      tierPayload.ensembleSelectionMode = tier.ensembleSelectionMode
+    }
+    tiers[tierName] = tierPayload
   })
   return { mode, defaultTier: normalizeRouterTier(defaultTier) || DEFAULT_TEXT_TIER, tiers }
 }
@@ -75,6 +80,8 @@ interface TierConfig {
   thinking_level?: string
   supportsImage?: boolean
   supports_image?: boolean
+  ensembleSelectionMode?: string
+  ensemble_selection_mode?: string
 }
 
 interface RouterConfig {
@@ -199,6 +206,8 @@ export function useSetupRouterForm() {
         model: tier.model || '',
         thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
         supportsImage: tier.supportsImage || tier.supports_image || false,
+        ensembleSelectionMode:
+          tier.ensembleSelectionMode || tier.ensemble_selection_mode || '',
       }
     })
     tierValues.value = next
@@ -218,7 +227,7 @@ export function useSetupRouterForm() {
       // paired with the newly selected provider.
       tierValues.value = {
         ...tierValues.value,
-        [name]: { ...tier, provider, model: '' },
+        [name]: { ...tier, provider, model: '', ensembleSelectionMode: '' },
       }
       return
     }
@@ -238,6 +247,7 @@ export function useSetupRouterForm() {
         model: tier.model,
         thinkingLevel: tier.thinkingLevel,
         supportsImage: tier.supportsImage,
+        ensembleSelectionMode: tier.ensembleSelectionMode,
       }))
   }
 
