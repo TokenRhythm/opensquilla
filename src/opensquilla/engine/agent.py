@@ -2438,7 +2438,7 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         output_json_schema=chat_cfg.output_json_schema,
         output_json_schema_strict=chat_cfg.output_json_schema_strict,
         model_capabilities=chat_cfg.model_capabilities,
-        thinking_level=None,
+        thinking_level=ThinkingLevel.OFF,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
         context_window_tokens_global_override=(
             chat_cfg.context_window_tokens_global_override

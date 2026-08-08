@@ -9,8 +9,9 @@ import math
 import os
 import re
 import sys
+from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -37,6 +38,7 @@ from .compat_policy import (
     TEXT_TOOL_DIALECT_PLAIN_JSON,
     TEXT_TOOL_DIALECT_QWEN_TAG,
     OpenAICompatPolicy,
+    ReasoningModelRule,
     compat_policy_for_kind,
 )
 from .context_capabilities import supports_openrouter_explicit_prompt_cache
@@ -495,8 +497,8 @@ def _openai_reasoning_fragments(payload: Mapping[str, Any]) -> tuple[str, ...]:
             text = detail.get("text")
             if isinstance(text, str) and text:
                 fragments.append(text)
-    for field in _OPENAI_REASONING_TEXT_FIELDS:
-        text = payload.get(field)
+    for reasoning_field in _OPENAI_REASONING_TEXT_FIELDS:
+        text = payload.get(reasoning_field)
         if isinstance(text, str) and text:
             fragments.append(text)
             break
@@ -841,6 +843,7 @@ def _apply_compat_request_constraints(
     payload: dict[str, Any],
     *,
     policy: OpenAICompatPolicy,
+    reasoning_rule: ReasoningModelRule | None,
     model: str,
     cfg: ChatConfig,
     has_tools: bool,
@@ -852,10 +855,32 @@ def _apply_compat_request_constraints(
     if force_thinking:
         payload["enable_thinking"] = True
 
+    thinking_object = payload.get("thinking")
+    thinking_enabled = payload.get("enable_thinking") is True or bool(
+        isinstance(thinking_object, Mapping)
+        and thinking_object.get("type") == "enabled"
+    )
+    thinking_unspecified = bool(
+        reasoning_rule
+        and reasoning_rule.reasoning_format
+        and "thinking" not in payload
+        and "enable_thinking" not in payload
+    )
+    tool_choice_auto_only = policy.thinking_tool_choice_auto_only or bool(
+        reasoning_rule and reasoning_rule.thinking_tool_choice_auto_only
+    )
+    prefer_pinned_over_thinking = (
+        policy.prefer_pinned_tool_choice_over_thinking
+        or bool(
+            reasoning_rule
+            and reasoning_rule.prefer_pinned_tool_choice_over_thinking
+        )
+    )
     if (
-        policy.thinking_tool_choice_auto_only
+        tool_choice_auto_only
         and (
-            payload.get("enable_thinking") is True
+            thinking_enabled
+            or thinking_unspecified
             or model_name in policy.implicit_thinking_tool_choice_model_ids
         )
         and "tool_choice" in payload
@@ -870,17 +895,25 @@ def _apply_compat_request_constraints(
         if tool_choice_type in {"auto", "none"}:
             payload["tool_choice"] = tool_choice_type
         elif (
-            policy.prefer_pinned_tool_choice_over_thinking
+            prefer_pinned_over_thinking
             and pinned_tool_choice
             and not force_thinking
         ):
-            payload["enable_thinking"] = False
+            if reasoning_rule and reasoning_rule.reasoning_format:
+                apply_reasoning_disable(
+                    payload,
+                    reasoning_rule.reasoning_format,
+                    ReasoningDisableArgs(model=model),
+                )
+            else:
+                payload["enable_thinking"] = False
             payload.pop("thinking_budget", None)
             payload.pop("reasoning_effort", None)
             payload.pop("preserve_thinking", None)
-            for message in payload.get("messages", ()):
-                if isinstance(message, dict):
-                    message.pop("reasoning_content", None)
+            if reasoning_rule is None:
+                for message in payload.get("messages", ()):
+                    if isinstance(message, dict):
+                        message.pop("reasoning_content", None)
         else:
             # The endpoint rejects required/pinned choices while thinking.
             # Preserve the requested reasoning mode and degrade the selector
@@ -2600,6 +2633,95 @@ def _attach_reasoning_content(
     return payload
 
 
+@dataclass(slots=True)
+class _ReasoningReplayStats:
+    limit_utf16_units: int | None = None
+    replay_candidates: list[tuple[str, int | None]] = field(
+        default_factory=list
+    )
+
+
+def _retained_reasoning_replay_units(
+    payload: Mapping[str, Any],
+    stats: _ReasoningReplayStats,
+) -> list[int]:
+    """Return only over-limit suppressions still present in the final payload."""
+
+    if not stats.replay_candidates:
+        return []
+    retained_signatures: Counter[str] = Counter()
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return []
+    for message in messages:
+        if (
+            not isinstance(message, Mapping)
+            or message.get("role") != "assistant"
+            or message.get("reasoning_content") != ""
+        ):
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        if any(
+            isinstance(tool_call, Mapping) and tool_call.get("id")
+            for tool_call in tool_calls
+        ):
+            retained_signatures[_reasoning_replay_signature(message)] += 1
+
+    # Count only suppressions that are provably retained. Identical naturally
+    # empty tool messages make provenance ambiguous after context shaping, so
+    # consume those first and conservatively under-count instead of emitting a
+    # false transport metric.
+    candidates_by_signature: dict[str, list[int | None]] = {}
+    for signature, units in stats.replay_candidates:
+        candidates_by_signature.setdefault(signature, []).append(units)
+    retained_units: list[int] = []
+    for signature, final_count in retained_signatures.items():
+        candidates = candidates_by_signature.get(signature, [])
+        natural_count = sum(units is None for units in candidates)
+        guaranteed_suppressed = max(0, final_count - natural_count)
+        if guaranteed_suppressed <= 0:
+            continue
+        suppressed_units = [units for units in candidates if units is not None]
+        if final_count >= len(candidates):
+            retained_units.extend(suppressed_units)
+        elif len(set(suppressed_units)) == 1:
+            retained_units.extend(suppressed_units[:guaranteed_suppressed])
+    return retained_units
+
+
+def _reasoning_replay_signature(message: Mapping[str, Any]) -> str:
+    """Return a full in-memory digest used only for conservative telemetry."""
+
+    raw = json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _reasoning_rule_for_request(
+    policy: OpenAICompatPolicy,
+    *,
+    model: str,
+    base_url: str,
+) -> ReasoningModelRule | None:
+    for rule in policy.reasoning_model_rules:
+        if rule.matches(model, base_url):
+            return rule
+    return None
+
+
+def _utf16_code_units(value: str) -> int:
+    """Count provider-side JavaScript string units without allocating a copy."""
+
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in value)
+
+
+def _message_contains_tool_use(message: Message) -> bool:
+    return not isinstance(message.content, str) and any(
+        block.type == "tool_use" for block in message.content
+    )
+
+
 _REASONING_ECHO_TURNS_ENV = "OPENSQUILLA_REASONING_ECHO_TURNS"
 
 
@@ -2647,7 +2769,10 @@ def _requires_assistant_reasoning_content(
     model: str,
     *,
     thinking: bool = False,
+    reasoning_rule: ReasoningModelRule | None = None,
 ) -> bool:
+    if reasoning_rule is not None:
+        return reasoning_rule.require_reasoning_content
     model_name = model_basename(model)
     return model_name in policy.require_reasoning_content_model_ids or (
         thinking
@@ -2684,7 +2809,10 @@ def _should_replay_reasoning_content(
     model: str,
     caps: ModelCapabilities | None,
     thinking: bool = False,
+    reasoning_rule: ReasoningModelRule | None = None,
 ) -> bool:
+    if reasoning_rule is not None:
+        return reasoning_rule.require_reasoning_content
     model_name = model_basename(model)
     effective_thinking = _effective_policy_thinking(
         policy, model, thinking=thinking
@@ -2856,6 +2984,8 @@ def _build_openai_wire_messages(
     replay_provider_state: bool,
     reasoning_echo_turns: int | None,
     logical_index_map: dict[int, int] | None = None,
+    reasoning_rule: ReasoningModelRule | None = None,
+    reasoning_replay_stats: _ReasoningReplayStats | None = None,
 ) -> list[dict[str, Any]]:
     """Build the exact OpenAI-compatible wire-message array, without I/O."""
     openai_messages: list[dict[str, Any]] = []
@@ -2866,6 +2996,7 @@ def _build_openai_wire_messages(
             model=model,
             caps=caps,
             thinking=cfg.thinking,
+            reasoning_rule=reasoning_rule,
         )
     )
     explicit_cache_supported = False
@@ -2898,27 +3029,69 @@ def _build_openai_wire_messages(
         effective_thinking = _effective_policy_thinking(
             policy, model, thinking=cfg.thinking
         )
-        openai_messages.extend(
-            _build_openai_messages(
-                message,
-                include_reasoning_content=(
-                    include_reasoning_content
-                    if reasoning_echo_allowed is None
-                    else message_index in reasoning_echo_allowed
-                ),
-                require_assistant_reasoning_content=(
-                    _requires_assistant_reasoning_content(
-                        policy, model, thinking=effective_thinking
-                    )
-                ),
-                require_tool_call_reasoning_content=(
-                    _requires_tool_call_reasoning_content(
-                        policy, model, thinking=effective_thinking
-                    )
-                ),
-                replay_provider_state=replay_provider_state,
-            )
+        message_replays_reasoning = (
+            include_reasoning_content
+            if reasoning_echo_allowed is None
+            else message_index in reasoning_echo_allowed
         )
+        if (
+            reasoning_rule is not None
+            and reasoning_rule.replay_scope == "tool_call_assistant"
+            and not _message_contains_tool_use(message)
+        ):
+            message_replays_reasoning = False
+        limit = (
+            reasoning_rule.max_reasoning_content_utf16_units
+            if reasoning_rule is not None
+            else None
+        )
+        suppressed_units: int | None = None
+        if (
+            message_replays_reasoning
+            and limit is not None
+            and message.role == "assistant"
+            and message.reasoning_content
+        ):
+            observed_units = _utf16_code_units(message.reasoning_content)
+            if observed_units > limit:
+                message_replays_reasoning = False
+                if reasoning_replay_stats is not None:
+                    reasoning_replay_stats.limit_utf16_units = limit
+                    suppressed_units = observed_units
+        built_messages = _build_openai_messages(
+            message,
+            include_reasoning_content=message_replays_reasoning,
+            require_assistant_reasoning_content=(
+                _requires_assistant_reasoning_content(
+                    policy,
+                    model,
+                    thinking=effective_thinking,
+                    reasoning_rule=reasoning_rule,
+                )
+            ),
+            require_tool_call_reasoning_content=(
+                _requires_tool_call_reasoning_content(
+                    policy, model, thinking=effective_thinking
+                )
+            ),
+            replay_provider_state=replay_provider_state,
+        )
+        if reasoning_replay_stats is not None and limit is not None:
+            for built_message in built_messages:
+                tool_calls = built_message.get("tool_calls")
+                if (
+                    built_message.get("role") == "assistant"
+                    and built_message.get("reasoning_content") == ""
+                    and isinstance(tool_calls, list)
+                    and any(
+                        isinstance(tool_call, Mapping) and tool_call.get("id")
+                        for tool_call in tool_calls
+                    )
+                ):
+                    reasoning_replay_stats.replay_candidates.append(
+                        (_reasoning_replay_signature(built_message), suppressed_units)
+                    )
+        openai_messages.extend(built_messages)
     if provider_kind == "dashscope" and cfg.cache_mode == "on":
         _attach_cache_control_to_latest_text_messages(
             openai_messages,
@@ -3085,6 +3258,11 @@ class OpenAIProvider:
             raise ValueError("additional_messages must be a non-negative integer")
         cfg = config or ChatConfig()
         wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
+        reasoning_rule = _reasoning_rule_for_request(
+            self._compat,
+            model=self._model,
+            base_url=self._base_url,
+        )
         wire_messages = _build_openai_wire_messages(
             messages,
             wire_cfg,
@@ -3093,6 +3271,7 @@ class OpenAIProvider:
             model=self._model,
             replay_provider_state=self._replay_provider_state,
             reasoning_echo_turns=self._reasoning_echo_turns,
+            reasoning_rule=reasoning_rule,
         )
         return ProviderMessageCountProjection(
             actual_wire_messages=len(wire_messages) + additional_messages,
@@ -3114,16 +3293,28 @@ class OpenAIProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
-    ) -> tuple[dict[str, Any], int | None, str | None]:
+    ) -> tuple[
+        dict[str, Any],
+        int | None,
+        str | None,
+        _ReasoningReplayStats,
+    ]:
         wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         caps = cfg.model_capabilities
+        reasoning_rule = _reasoning_rule_for_request(
+            self._compat,
+            model=self._model,
+            base_url=self._base_url,
+        )
         include_reasoning_content = _should_replay_reasoning_content(
             policy=self._compat,
             model=self._model,
             caps=caps,
             thinking=cfg.thinking,
+            reasoning_rule=reasoning_rule,
         )
         logical_index_map: dict[int, int] = {}
+        reasoning_replay_stats = _ReasoningReplayStats()
         openai_messages = _build_openai_wire_messages(
             messages,
             wire_cfg,
@@ -3133,6 +3324,8 @@ class OpenAIProvider:
             replay_provider_state=self._replay_provider_state,
             reasoning_echo_turns=self._reasoning_echo_turns,
             logical_index_map=logical_index_map,
+            reasoning_rule=reasoning_rule,
+            reasoning_replay_stats=reasoning_replay_stats,
         )
         wire_active_user_index = (
             logical_index_map.get(cfg.active_user_message_index)
@@ -3233,17 +3426,34 @@ class OpenAIProvider:
                         "allow_fallbacks": True,
                     }
 
-        thinking_toggle_model = (
-            self._model.strip().lower() in self._compat.thinking_toggle_model_ids
+        thinking_toggle_model = bool(
+            (reasoning_rule and reasoning_rule.reasoning_format)
+            or self._model.strip().lower()
+            in self._compat.thinking_toggle_model_ids
         )
         if (caps and caps.supports_reasoning and cfg.thinking) or (
             thinking_toggle_model and cfg.thinking
         ):
             reasoning_format = (
-                caps.reasoning_format
-                if caps is not None
-                else self._compat.default_reasoning_format
+                reasoning_rule.reasoning_format
+                if reasoning_rule and reasoning_rule.reasoning_format
+                else (
+                    caps.reasoning_format
+                    if caps is not None
+                    else self._compat.default_reasoning_format
+                )
             )
+            reasoning_effort_override: str | None = None
+            if reasoning_rule and reasoning_rule.reasoning_format:
+                level = getattr(cfg.thinking_level, "value", "")
+                if (
+                    self._model.strip().lower()
+                    in reasoning_rule.low_effort_model_ids
+                    and level in {"minimal", "low"}
+                ):
+                    reasoning_effort_override = "low"
+                else:
+                    reasoning_effort_override = "high"
             apply_reasoning_enable(
                 payload,
                 reasoning_format,
@@ -3254,6 +3464,7 @@ class OpenAIProvider:
                     thinking_budget_explicit=bool(
                         cfg.thinking_budget_explicit
                     ),
+                    reasoning_effort_override=reasoning_effort_override,
                 ),
             )
             if reasoning_format == "dashscope":
@@ -3273,7 +3484,23 @@ class OpenAIProvider:
         ):
             pass
         elif thinking_toggle_model:
-            payload["thinking"] = {"type": "disabled"}
+            if reasoning_rule and reasoning_rule.reasoning_format:
+                configured_level = getattr(
+                    cfg.thinking_level,
+                    "value",
+                    cfg.thinking_level,
+                )
+                if str(configured_level or "").strip().lower() in {
+                    "none",
+                    "off",
+                }:
+                    apply_reasoning_disable(
+                        payload,
+                        reasoning_rule.reasoning_format,
+                        ReasoningDisableArgs(model=self._model),
+                    )
+            else:
+                payload["thinking"] = {"type": "disabled"}
         elif caps and caps.supports_reasoning:
             apply_reasoning_disable(
                 payload,
@@ -3289,6 +3516,7 @@ class OpenAIProvider:
         _apply_compat_request_constraints(
             payload,
             policy=self._compat,
+            reasoning_rule=reasoning_rule,
             model=self._model,
             cfg=cfg,
             has_tools=bool(tools),
@@ -3298,7 +3526,12 @@ class OpenAIProvider:
             if any(message.get("role") == "tool" for message in openai_messages)
             else None
         )
-        return payload, wire_active_user_index, fallback_reason
+        return (
+            payload,
+            wire_active_user_index,
+            fallback_reason,
+            reasoning_replay_stats,
+        )
 
     def project_final_request(
         self,
@@ -3311,7 +3544,12 @@ class OpenAIProvider:
         """Project the exact Chat Completions payload without I/O or shaping."""
 
         cfg = config or ChatConfig()
-        payload, wire_active_user_index, fallback_reason = self._build_payload(
+        (
+            payload,
+            wire_active_user_index,
+            fallback_reason,
+            _reasoning_replay_stats,
+        ) = self._build_payload(
             messages,
             tools,
             cfg,
@@ -3380,7 +3618,12 @@ class OpenAIProvider:
             and cfg.physical_attempt_limit != 1
             and non_stream_fallback_allowed
         )
-        payload, wire_active_user_index, fallback_reason = self._build_payload(
+        (
+            payload,
+            wire_active_user_index,
+            fallback_reason,
+            reasoning_replay_stats,
+        ) = self._build_payload(
             messages,
             tools,
             cfg,
@@ -3469,6 +3712,20 @@ class OpenAIProvider:
                 code="provider_request_budget_exhausted",
             )
             return
+        retained_replay_units = _retained_reasoning_replay_units(
+            payload,
+            reasoning_replay_stats,
+        )
+        if retained_replay_units:
+            log.info(
+                "provider.reasoning_content_withheld",
+                provider=self._provider_kind,
+                model=self._model,
+                reason="reasoning_content_limit",
+                withheld_count=len(retained_replay_units),
+                max_observed_utf16_units=max(retained_replay_units),
+                limit_utf16_units=reasoning_replay_stats.limit_utf16_units,
+            )
 
         headers: dict[str, str] = {
             "Content-Type": "application/json",

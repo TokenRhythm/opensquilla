@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Literal
+from urllib.parse import urlsplit
 
 from .model_identity import DEEPSEEK_V4_MODEL_IDS
 from .qwen_token_plan import (
@@ -31,6 +32,7 @@ from .qwen_token_plan import (
 )
 
 TextToolDialect = Literal["qwen_tag", "minimax_xml", "plain_json", "deepseek_dsml"]
+ReasoningReplayScope = Literal["all_assistant", "tool_call_assistant"]
 
 TEXT_TOOL_DIALECT_QWEN_TAG: TextToolDialect = "qwen_tag"
 TEXT_TOOL_DIALECT_MINIMAX_XML: TextToolDialect = "minimax_xml"
@@ -52,6 +54,24 @@ _TOKENRHYTHM_DSML_MODEL_IDS = (
     "tokenrhythm/deepseek-v4-flash",
     "tokenrhythm/deepseek-v4-flash-0731",
     "tokenrhythm/deepseek-v4-pro",
+)
+_TOKENRHYTHM_V4_MODEL_IDS = frozenset(
+    {
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro",
+        "tokenrhythm/deepseek-v4-flash",
+        "tokenrhythm/deepseek-v4-flash-0731",
+        "tokenrhythm/deepseek-v4-pro",
+    }
+)
+_TOKENRHYTHM_V4_FLASH_MODEL_IDS = frozenset(
+    {
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
+        "tokenrhythm/deepseek-v4-flash",
+        "tokenrhythm/deepseek-v4-flash-0731",
+    }
 )
 _OPENROUTER_DSML_MODEL_IDS = (
     "deepseek/deepseek-v4-flash",
@@ -94,6 +114,52 @@ class TextToolCompatProfile:
     @property
     def enabled(self) -> bool:
         return bool(self.dialects or self.model_rules)
+
+
+@dataclass(frozen=True)
+class ReasoningModelRule:
+    """Exact, endpoint-scoped reasoning request compatibility.
+
+    Reasoning history is provider state, but it is still untrusted request
+    data with provider-specific wire limits.  These rules only shape the
+    physical request view; callers retain the original ``Message`` objects.
+    """
+
+    model_ids: frozenset[str]
+    endpoint_hosts: frozenset[str] = frozenset()
+    endpoint_paths: frozenset[str] = frozenset()
+    replay_scope: ReasoningReplayScope = "all_assistant"
+    require_reasoning_content: bool = False
+    max_reasoning_content_utf16_units: int | None = None
+    reasoning_format: str = ""
+    low_effort_model_ids: frozenset[str] = frozenset()
+    thinking_tool_choice_auto_only: bool = False
+    prefer_pinned_tool_choice_over_thinking: bool = False
+
+    def matches(self, model: str, base_url: str) -> bool:
+        """Match only a trusted raw model id and an exact HTTPS API root."""
+
+        if model.strip().lower() not in self.model_ids:
+            return False
+        if not self.endpoint_hosts:
+            return True
+        try:
+            parsed = urlsplit(str(base_url or "").strip())
+            host = (parsed.hostname or "").lower()
+            port = parsed.port
+        except (UnicodeError, ValueError):
+            return False
+        path = parsed.path.rstrip("/")
+        return bool(
+            parsed.scheme.lower() == "https"
+            and host in self.endpoint_hosts
+            and (port is None or port == 443)
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+            and path in self.endpoint_paths
+        )
 
 
 @dataclass(frozen=True)
@@ -183,6 +249,11 @@ class OpenAICompatPolicy:
     # Reasoning continuity: replay assistant reasoning_content when the model
     # capabilities declare this reasoning format.
     replay_reasoning_format: str = ""
+
+    # Exact model/endpoint rules take precedence over the legacy basename
+    # fields below.  They are used when an aggregator has a narrower replay
+    # contract than the upstream model family it exposes.
+    reasoning_model_rules: tuple[ReasoningModelRule, ...] = ()
 
     # Reasoning format assumed when no model capabilities are available.
     default_reasoning_format: str = ""
@@ -423,14 +494,11 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         replay_reasoning_format="tencent_tokenhub",
         require_reasoning_content_model_ids=_TOKENHUB_HY3_MODEL_IDS,
     ),
-    # TokenRhythm relays the DeepSeek/GLM/MiniMax/Kimi/MiMo/Qwen families
-    # behind one host, and every served model streams DeepSeek-style
-    # reasoning_content unconditionally (the parse side needs no config).
-    # The endpoint rejects unknown request fields — a DeepSeek ``thinking``
-    # toggle is an UNKNOWN_FIELD 400 — so no default_reasoning_format and no
-    # thinking_toggle_model_ids here, and the packaged catalog rows pin
-    # reasoning_format="none" to keep dialect injection off. The V4 ids keep
-    # only the reasoning_content replay requirement (live-verified accepted).
+    # TokenRhythm relays several model families behind one host.  Its V4
+    # request contract is deliberately endpoint- and raw-id-scoped: ordinary
+    # assistant reasoning is withheld, tool-call reasoning is echoed only
+    # within the gateway's field limit, and controls use the DeepSeek-shaped
+    # wire dialect without changing catalog capabilities.
     "tokenrhythm": OpenAICompatPolicy(
         display_name="TokenRhythm",
         official_host="tokenrhythm.studio",
@@ -451,7 +519,26 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                 ),
             ),
         ),
-        require_reasoning_content_model_ids=DEEPSEEK_V4_MODEL_IDS,
+        reasoning_model_rules=(
+            ReasoningModelRule(
+                model_ids=_TOKENRHYTHM_V4_MODEL_IDS,
+                endpoint_hosts=frozenset({"tokenrhythm.studio"}),
+                endpoint_paths=frozenset({"", "/v1"}),
+                replay_scope="tool_call_assistant",
+                require_reasoning_content=True,
+                max_reasoning_content_utf16_units=50_000,
+                reasoning_format="deepseek",
+                low_effort_model_ids=_TOKENRHYTHM_V4_FLASH_MODEL_IDS,
+                thinking_tool_choice_auto_only=True,
+                prefer_pinned_tool_choice_over_thinking=True,
+            ),
+            # Custom endpoints keep the previous exact-id replay behavior but
+            # do not inherit TokenRhythm's official controls or field limit.
+            ReasoningModelRule(
+                model_ids=_TOKENRHYTHM_V4_MODEL_IDS,
+                require_reasoning_content=True,
+            ),
+        ),
         allow_post_terminal_noop_choice=True,
         allow_post_terminal_null_usage_noop_choice=True,
         post_terminal_metadata_keys=frozenset(

@@ -1491,7 +1491,7 @@ def test_openrouter_deepseek_v4_returns_reasoning_content_from_details(
     assert done.reasoning_content == "I considered the request."
 
 
-def test_tokenrhythm_stream_normalizes_reasoning_alias_for_replay(
+def test_tokenrhythm_stream_normalizes_reasoning_alias_but_withholds_text_replay(
     monkeypatch: Any,
 ) -> None:
     captured_payloads: list[dict[str, Any]] = []
@@ -1570,7 +1570,7 @@ def test_tokenrhythm_stream_normalizes_reasoning_alias_for_replay(
     assert captured_payloads[1]["messages"][0] == {
         "role": "assistant",
         "content": "ok",
-        "reasoning_content": "supplier-specific reasoning",
+        "reasoning_content": "",
     }
 
 
