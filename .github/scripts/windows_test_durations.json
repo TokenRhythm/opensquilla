@@ -146,6 +146,7 @@
     "tests/test_cli/test_url_utils.py": 0.01,
     "tests/test_compat/test_aiosqlite.py": 0.01,
     "tests/test_compose_yaml_shape.py": 0.022,
+    "tests/test_context_budget_docs.py": 0.01,
     "tests/test_context_budget_governor.py": 0.01,
     "tests/test_contracts/test_attachment_policy.py": 0.133,
     "tests/test_contracts/test_config_effective_wire.py": 0.109,

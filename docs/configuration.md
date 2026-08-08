@@ -162,6 +162,53 @@ Router-supported provider profiles depend on the installed build and configured
 provider. Read [`features/squilla-router.md`](features/squilla-router.md) before
 using direct model runs for evaluation.
 
+## Context Budget And Compaction
+
+Two independent limits decide when a turn's history is compacted. They are set
+in different places and answer different questions, so a session can be
+compacted by one while the other is nowhere near its threshold.
+
+| Setting | Default | Measured against |
+| --- | --- | --- |
+| `context_budget_tokens` | `100000` | A flat token count. Not derived from the model. |
+| `context_overflow_policy` | `auto_summarize` | What to do once the budget is exceeded. |
+| `preflight_compact_ratio` | `0.85` | A fraction of the **resolved model context window**. |
+
+`context_budget_tokens` is the gateway's cap on the estimated payload of the
+next turn — stored history plus the new message. It is a flat number: the
+gateway compares against it without consulting the model, so the same 100k
+applies whether the session runs on a 32k model or a 1M one.
+
+`preflight_compact_ratio` is the separate, model-aware guard inside the turn
+runner. It compacts once durable history passes that fraction of the window
+the provider and model actually resolved to.
+
+The practical consequences:
+
+- On a model whose window is well above `context_budget_tokens`, the flat cap
+  is what fires first. Raise `context_budget_tokens` to use more of the window;
+  leave it low to hold down per-turn cost.
+- On a model whose window is below `context_budget_tokens`, the flat cap never
+  fires and the model-aware preflight is what protects the turn.
+
+Policies for `context_overflow_policy`:
+
+| Policy | Behaviour |
+| --- | --- |
+| `auto_summarize` | Summarise older history and retry the turn once. Default. |
+| `hard_truncate` | Drop oldest turns until the payload fits. |
+| `refuse` | Fail the turn with a stable error envelope instead of dropping context. |
+
+All three keys are read from the top level of `opensquilla.toml`:
+
+```toml
+context_budget_tokens = 250000
+context_overflow_policy = "auto_summarize"
+preflight_compact_ratio = 0.85
+```
+
+Hand edits are read at boot; run `opensquilla gateway reload` to pick them up.
+
 ## Search Configuration
 
 Inspect search providers:

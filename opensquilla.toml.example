@@ -31,6 +31,26 @@
 # Disabled by default; set a positive value such as 1800.0 to enable the cap.
 # web_chat_runtime_timeout_seconds = 0.0
 
+# Context budget. Two independent limits decide when history is compacted.
+#
+# context_budget_tokens is a flat cap on the estimated next-turn payload
+# (stored history + the new message). It is not derived from the model, so the
+# same number applies on a 32k model and on a 1M one. Raise it to use more of a
+# large window; keep it low to hold down per-turn cost.
+#
+# preflight_compact_ratio is the separate model-aware guard inside the turn
+# runner: it compacts once durable history passes that fraction of the context
+# window the provider and model actually resolved to. Whichever limit is
+# reached first is the one that fires.
+#
+# context_overflow_policy: auto_summarize | hard_truncate | refuse
+#   auto_summarize  summarise older history and retry the turn once (default)
+#   hard_truncate   drop oldest turns until the payload fits
+#   refuse          fail the turn instead of dropping context
+# context_budget_tokens = 100000
+# context_overflow_policy = "auto_summarize"
+# preflight_compact_ratio = 0.85
+
 # WebSocket per-connection outbound writer queue. When enabled (default),
 # each WS connection gets a bounded asyncio queue + dedicated writer task.
 # Producers enqueue and return immediately; slow clients trigger a fast
