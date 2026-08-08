@@ -45,9 +45,11 @@ from opensquilla.router_runtime_diagnostics import (
 )
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
+    HIGHEST_TEXT_TIER,
     TEXT_TIERS,
     TierConfig,
     normalize_text_tier,
+    tier_ensemble_active,
     tier_index,
 )
 from opensquilla.squilla_router.controller import (
@@ -1104,12 +1106,31 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     # for every image turn — which is exactly the gate's no-op default.
     turn_needs_image = current_turn_has_image or history_gate_needs_image
     if turn_needs_image:
-        image_tiers = {k: v for k, v in tiers.items() if v.get("supports_image", False)}
+        c3_fusion_active = tier_ensemble_active(tiers, HIGHEST_TEXT_TIER)
+        image_tiers = {
+            name: tier
+            for name, tier in tiers.items()
+            if tier.get("supports_image", False)
+            and not (
+                c3_fusion_active
+                and (
+                    name == HIGHEST_TEXT_TIER
+                    or bool(tier.get("image_only", False))
+                )
+            )
+        }
         if not image_tiers:
             log.warning(
                 "squilla_router.no_image_tier",
                 note="image detected but no supports_image tier",
+                c3_fusion_active=c3_fusion_active,
             )
+            if c3_fusion_active:
+                raise RuntimeError(
+                    "No image-capable SquillaRouter tier is available for this image "
+                    "request while C3 multi-model fusion is selected. Choose a single "
+                    "C3 model or enable image support on another text tier."
+                )
             raise RuntimeError(
                 "No image-capable SquillaRouter tier is configured for this image request. "
                 "Configure squilla_router.tiers.image_model with supports_image=true."

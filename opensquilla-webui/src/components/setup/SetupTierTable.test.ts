@@ -172,8 +172,48 @@ describe('SetupTierTable — editable routing rows', () => {
     app.unmount()
   })
 
-  it('shows the C3 fusion profile and exposes the single-model fallback', async () => {
+  it('uses one C3 picker for shared fusion and concrete models', async () => {
     const onUpdateTierField = vi.fn()
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        model: 'glm-5.2',
+        ensembleEnabled: true,
+      }],
+      providerOptions: [{ providerId: 'openai', label: 'OpenAI' }],
+      modelsByProvider: {
+        openai: { source: 'live', models: DISCOVERED },
+      },
+    }, { onUpdateTierField })
+
+    const picker = el.querySelector<HTMLInputElement>('input[aria-label="c3 model"]')!
+    expect(picker.value).toBe('Multi-model fusion')
+    expect(el.querySelector('select[aria-label="c3 execution mode"]')).toBeNull()
+    expect(el.textContent).not.toContain('static_tokenrhythm_b5')
+    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+      .toContain('falls back to glm-5.2')
+
+    picker.dispatchEvent(new Event('focus'))
+    await nextTick()
+    const modelOption = Array.from(document.querySelectorAll<HTMLButtonElement>('[role="option"]'))
+      .find(option => option.textContent?.includes('test-vendor/alpha'))!
+    modelOption.click()
+    expect(onUpdateTierField).toHaveBeenCalledWith(
+      'c3',
+      'ensembleEnabled',
+      false,
+    )
+    expect(onUpdateTierField).toHaveBeenCalledWith(
+      'c3',
+      'ensembleSelectionMode',
+      '',
+    )
+    expect(onUpdateTierField).toHaveBeenCalledWith('c3', 'model', 'test-vendor/alpha')
+    app.unmount()
+  })
+
+  it('does not claim a pinned legacy C3 profile follows the current shared plan', async () => {
     const { app, el } = await mountTable({
       rows: [{
         ...ROWS[1],
@@ -182,22 +222,44 @@ describe('SetupTierTable — editable routing rows', () => {
         ensembleSelectionMode: 'static_tokenrhythm_b5',
       }],
       providerOptions: [{ providerId: 'openai', label: 'OpenAI' }],
-    }, { onUpdateTierField })
+    })
 
-    const execution = el.querySelector<HTMLSelectElement>(
-      'select[aria-label="c3 execution mode"]',
-    )!
-    expect(execution.value).toBe('static_tokenrhythm_b5')
-    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
-      .toContain('Fallback: glm-5.2')
+    expect(el.textContent).toContain('previously saved Multi-model fusion plan')
+    expect(el.textContent).not.toContain('static_tokenrhythm_b5')
+    app.unmount()
+  })
 
-    execution.value = ''
-    execution.dispatchEvent(new Event('change', { bubbles: true }))
-    expect(onUpdateTierField).toHaveBeenCalledWith(
-      'c3',
-      'ensembleSelectionMode',
-      '',
-    )
+  it('disables image routing without erasing its saved values while C3 uses fusion', async () => {
+    const { app, el } = await mountTable({
+      rows: [
+        {
+          ...ROWS[1],
+          name: 'c3',
+          model: 'glm-5.2',
+          supportsImage: true,
+          ensembleEnabled: true,
+        },
+        {
+          ...ROWS[1],
+          name: 'image_model',
+          model: 'vision-model',
+          supportsImage: true,
+        },
+      ],
+      providerOptions: [{ providerId: 'openai', label: 'OpenAI' }],
+    })
+
+    const c3Image = el.querySelector<HTMLInputElement>('input[aria-label="c3 supports image"]')!
+    expect(c3Image.checked).toBe(false)
+    expect(c3Image.disabled).toBe(true)
+    const imageModel = el.querySelector<HTMLInputElement>('input[aria-label="image_model model"]')!
+    expect(imageModel.value).toBe('vision-model')
+    expect(imageModel.disabled).toBe(true)
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="image_model thinking level"]')?.disabled).toBe(true)
+    const imageModelSwitch = el.querySelector<HTMLInputElement>('input[aria-label="image_model supports image"]')!
+    expect(imageModelSwitch.checked).toBe(false)
+    expect(imageModelSwitch.disabled).toBe(true)
+    expect(el.textContent).toContain('image model is unavailable')
     app.unmount()
   })
 
@@ -403,21 +465,22 @@ describe('SetupTierTable — readonly preview mode', () => {
     app.unmount()
   })
 
-  it('renders C3 fusion and fallback semantics as read-only text', async () => {
+  it('renders shared C3 fusion semantics without exposing an internal mode', async () => {
     const { app, el } = await mountTable({
       readonly: true,
       rows: [{
         ...ROWS[1],
         name: 'c3',
         model: 'glm-5.2',
-        ensembleSelectionMode: 'static_tokenrhythm_b5',
+        ensembleEnabled: true,
       }],
     })
 
-    expect(el.querySelector('.setup-tier-table__execution-summary')?.textContent)
-      .toContain('Fusion: static_tokenrhythm_b5')
+    expect(el.querySelector('[aria-label="c3 model"]')?.textContent)
+      .toContain('Multi-model fusion')
     expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
-      .toContain('Fallback: glm-5.2')
+      .toContain('falls back to glm-5.2')
+    expect(el.textContent).not.toContain('static_tokenrhythm_b5')
     expect(el.querySelector('select[aria-label="c3 execution mode"]')).toBeNull()
     app.unmount()
   })

@@ -183,12 +183,12 @@ base_url = "https://tokenrhythm.studio/v1"
 "z-ai/glm-5.1" = "z-ai"
 "z-ai/glm-5.2" = "z-ai"
 
-# LLM ensemble routing. The recommended TokenRhythm router invokes the
-# existing static_tokenrhythm_b5 fusion profile only for C3 through
-# squilla_router.tiers.c3.ensemble_selection_mode below. Keep this global
-# switch off when C0-C2 should remain single-model routes. Enabling it wraps
-# every tier that has no explicit tier override; an explicit tier selection
-# (such as C3 below) takes precedence for that tier.
+# LLM ensemble routing. The recommended TokenRhythm router lets C3 reuse this
+# shared plan through squilla_router.tiers.c3.ensemble_enabled below. Keep this
+# global switch off when C0-C2 should remain single-model routes. Enabling it
+# applies the same plan to every request; C3 never stores a second plan.
+# C3 fusion disables the dedicated image_model route; another text tier with
+# supports_image=true can still handle image requests.
 # The static_tokenrhythm_b5 profile is the TokenRhythm mirror of B5
 # (deepseek-v4-pro, glm-5.2, kimi-k2.7-code, qwen3.7-max + glm-5.2
 # aggregator). It needs a TokenRhythm credential: the [llm] api_key when
@@ -447,7 +447,7 @@ provider = "tokenrhythm"
 model = "glm-5.2"
 description = "Highest tier: static TokenRhythm B5 multi-model fusion, with GLM 5.2 as the deterministic single-model fallback"
 supports_image = false
-ensemble_selection_mode = "static_tokenrhythm_b5"
+ensemble_enabled = true
 
 [squilla_router.tiers.image_model]
 provider = "tokenrhythm"

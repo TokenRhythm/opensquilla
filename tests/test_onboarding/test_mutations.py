@@ -23,6 +23,7 @@ from opensquilla.onboarding.mutations import (
     validate_channel_entry,
 )
 from opensquilla.onboarding.redaction import REDACTED_PLACEHOLDER
+from opensquilla.router_tiers import tier_ensemble_execution
 
 
 def test_upsert_provider_persists_fields():
@@ -516,10 +517,8 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
     persisted = res.config.to_toml_dict()["squilla_router"]
     assert "tier_profile" not in persisted
     assert persisted["tiers"]["c3"]["model"] == "glm-5.2"
-    assert (
-        persisted["tiers"]["c3"]["ensemble_selection_mode"]
-        == "static_tokenrhythm_b5"
-    )
+    assert persisted["tiers"]["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in persisted["tiers"]["c3"]
 
 
 def test_provider_default_direct_model_does_not_follow_existing_router_tier():
@@ -1540,6 +1539,81 @@ def test_upsert_router_recommended_writes_profile_without_expanded_tiers():
     assert res.config.squilla_router.tier_profile == "deepseek"
     assert "tiers" not in res.config.to_toml_dict()["squilla_router"]
     assert res.public_payload["mode"] == "recommended"
+
+
+def test_upsert_router_materializes_the_shared_tokenrhythm_plan_without_global_enable():
+    cfg = GatewayConfig()
+
+    res = upsert_router(cfg, mode="recommended")
+
+    assert res.config.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert res.config.llm_ensemble.enabled is False
+    assert res.config.llm_ensemble.selection_mode == "static_tokenrhythm_b5"
+    assert "llm_ensemble.selection_mode" in res.config.force_persist_paths()
+
+
+def test_upsert_router_disabled_does_not_materialize_a_dormant_shared_tier():
+    cfg = GatewayConfig()
+
+    res = upsert_router(cfg, mode="disabled")
+
+    assert res.config.squilla_router.enabled is False
+    assert res.config.llm_ensemble.selection_mode == "static_openrouter_b5"
+    assert "llm_ensemble.selection_mode" not in res.config.force_persist_paths()
+
+
+def test_upsert_router_legacy_mode_does_not_inherit_the_shared_preset_flag():
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "static_openrouter_b5",
+        }
+    )
+
+    res = upsert_router(
+        cfg,
+        mode="custom",
+        tiers={
+            "c3": {
+                "provider": "tokenrhythm",
+                "model": "glm-5.2",
+                "ensembleSelectionMode": "static_tokenrhythm_b5",
+            }
+        },
+    )
+
+    c3 = res.config.squilla_router.tiers["c3"]
+    assert "ensemble_enabled" not in c3
+    assert c3["ensemble_selection_mode"] == "static_tokenrhythm_b5"
+    assert tier_ensemble_execution(
+        res.config.squilla_router.tiers,
+        "c3",
+        shared_selection_mode=res.config.llm_ensemble.selection_mode,
+    ) == ("static_tokenrhythm_b5", "legacy")
+
+
+def test_upsert_router_persists_explicit_single_model_over_the_recommended_c3_default():
+    cfg = GatewayConfig()
+
+    res = upsert_router(
+        cfg,
+        mode="custom",
+        tiers={
+            "c3": {
+                "provider": "tokenrhythm",
+                "model": "glm-5.2",
+                "ensembleEnabled": False,
+                "ensembleSelectionMode": "",
+            }
+        },
+    )
+
+    c3 = res.config.squilla_router.tiers["c3"]
+    assert c3["ensemble_enabled"] is False
+    assert c3["ensemble_selection_mode"] == ""
+    persisted = res.config.to_toml_dict()["squilla_router"]["tiers"]["c3"]
+    assert persisted["ensemble_enabled"] is False
+    assert res.public_payload["mode"] == "custom"
 
 
 def test_upsert_router_forces_image_model_role_invariants():

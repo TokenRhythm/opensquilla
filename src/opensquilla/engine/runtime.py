@@ -187,6 +187,7 @@ from opensquilla.engine.usage_accounting import (
     bind_usage_accounting_scope,
     provider_accounts_physical_usage,
 )
+from opensquilla.ensemble_plan import effective_ensemble_selection_mode
 from opensquilla.execution_status import (
     mark_execution_status_truncated,
     normalize_execution_status,
@@ -255,7 +256,7 @@ from opensquilla.router_control import (
 from opensquilla.router_tiers import (
     HIGHEST_TEXT_TIER,
     normalize_text_tier,
-    tier_ensemble_selection_mode,
+    tier_ensemble_execution,
     tier_index,
 )
 from opensquilla.run_mode import RunMode, display_name, execution_target, normalize_run_mode
@@ -8215,10 +8216,14 @@ class TurnRunner:
         # deliberately leaving the baseline provider in charge; wrapping the
         # observed C3 candidate would otherwise execute routing by stealth.
         tier_ensemble_mode = ""
+        tier_ensemble_binding = "single"
         if bool(turn.metadata.get("routing_applied", False)):
-            tier_ensemble_mode = tier_ensemble_selection_mode(
+            tier_ensemble_mode, tier_ensemble_binding = tier_ensemble_execution(
                 getattr(router_cfg, "tiers", None),
                 turn.metadata.get("routed_tier"),
+                shared_selection_mode=effective_ensemble_selection_mode(
+                    self._turn_config()
+                ),
             )
         ensemble_globally_enabled = bool(getattr(ensemble_cfg, "enabled", False))
         if provider is not None and (ensemble_globally_enabled or tier_ensemble_mode):
@@ -8238,8 +8243,14 @@ class TurnRunner:
                 if cloned_selector is not None
                 else None
             )
-            configured_selection_mode = str(
-                getattr(ensemble_cfg, "selection_mode", "") or ""
+            plan_provider_config = (
+                initial_provider_config
+                if tier_ensemble_binding == "shared"
+                and initial_provider_config is not None
+                else current_provider_config
+            )
+            configured_selection_mode = effective_ensemble_selection_mode(
+                self._turn_config()
             )
             selection_mode = tier_ensemble_mode or configured_selection_mode
             if static_b5_profile(selection_mode) is None and selection_mode not in {
@@ -8287,7 +8298,7 @@ class TurnRunner:
             elif static_b5_profile(selection_mode) is not None and not (
                 static_b5_credential_available(
                     self._turn_config(),
-                    current_provider_config,
+                    plan_provider_config,
                     selection_mode,
                 )
             ):
@@ -8318,6 +8329,8 @@ class TurnRunner:
                 turn.metadata["ensemble_activation_source"] = (
                     "router_tier" if tier_ensemble_mode else "global"
                 )
+                if tier_ensemble_mode:
+                    turn.metadata["ensemble_tier_binding"] = tier_ensemble_binding
                 turn.metadata["ensemble_selection_mode"] = selection_mode
                 turn.metadata["routed_model_before_ensemble"] = (
                     turn.model or getattr(current_provider_config, "model", "")
@@ -8339,6 +8352,7 @@ class TurnRunner:
                     _session_key=turn.session_key,
                     _fallback_selector=cloned_selector,
                     _selection_mode_override=selection_mode,
+                    _plan_provider_config=plan_provider_config,
                 )
 
         return turn, provider

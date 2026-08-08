@@ -881,6 +881,50 @@ def test_custom_b5_resolves_each_non_primary_member_from_its_profile(
     assert by_provider["deepseek"].replay_provider_state is False
 
 
+def test_shared_custom_plan_does_not_use_the_c3_fallback_as_its_aggregator() -> None:
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "plan-aggregator",
+            "api_key": "plan-key",
+        },
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "custom_b5",
+            "candidates": [
+                {"provider": "tokenrhythm", "model": "plan-proposer-1"},
+                {"provider": "tokenrhythm", "model": "plan-proposer-2"},
+            ],
+        },
+    )
+    plan_config = ProviderConfig(
+        provider="tokenrhythm",
+        model="plan-aggregator",
+        api_key="plan-key",
+    )
+    c3_fallback = ProviderConfig(
+        provider="groq",
+        model="groq-c3",
+        api_key="fallback-key",
+    )
+
+    ensemble = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=c3_fallback,
+        fallback_provider=None,
+        _plan_provider_config=plan_config,
+    )
+
+    assert ensemble.aggregator.provider_config.provider == "tokenrhythm"
+    assert ensemble.aggregator.provider_config.model == "plan-aggregator"
+    assert ensemble.aggregator.provider_config.api_key == "plan-key"
+    assert ensemble.fallback_provider_name == "groq"
+    assert ensemble.fallback_model == "groq-c3"
+    assert {
+        member.provider_config.api_key for member in ensemble.proposers
+    } == {"plan-key"}
+
+
 def test_cross_provider_ensemble_disables_replay_on_internal_fallback_adapters() -> None:
     from opensquilla.provider.anthropic import AnthropicProvider
     from opensquilla.provider.openai import OpenAIProvider

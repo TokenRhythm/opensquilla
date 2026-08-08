@@ -1856,8 +1856,8 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
         disable_step = FixStep(
             label="Review the router tier",
             detail=(
-                "Open Settings → Model routing and change the affected tier, or "
-                "remove its ensemble_selection_mode override."
+                "Open Settings → Model routing and switch the affected tier to "
+                "a single model, or configure the shared multi-model plan."
             ),
         )
     else:

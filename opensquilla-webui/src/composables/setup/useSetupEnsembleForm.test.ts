@@ -244,9 +244,9 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
-  it('activateForProvider seeds preset providers into the custom editing path', () => {
+  it('activateForProvider materializes a legacy preset-provider plan as custom', () => {
     const f = useSetupEnsembleForm()
-    f.initFromConfig({})
+    f.initFromConfig({ selection_mode: 'router_dynamic' })
     f.activateForProvider('tokenrhythm')
     expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
     expect(f.candidates.value.filter(c => c.role !== 'aggregator').map(c => c.model))
@@ -257,7 +257,7 @@ describe('useSetupEnsembleForm — scheme switching', () => {
 
   it('activateForProvider gives other providers an explicit custom lineup seeded from tiers', () => {
     const f = useSetupEnsembleForm()
-    f.initFromConfig({})
+    f.initFromConfig({ selection_mode: 'router_dynamic' })
     f.activateForProvider('volcengine', [
       { provider: 'volcengine', model: 'doubao-2.0-pro', tier: 'c3' },
       { provider: 'volcengine', model: 'deepseek-v4-flash', tier: 'c0' },
@@ -270,7 +270,7 @@ describe('useSetupEnsembleForm — scheme switching', () => {
 
   it('activateForProvider seeds mixed-provider tiers into a custom lineup', () => {
     const f = useSetupEnsembleForm()
-    f.initFromConfig({})
+    f.initFromConfig({ selection_mode: 'router_dynamic' })
     f.activateForProvider('volcengine', [
       { provider: 'volcengine', model: 'doubao-2.0-pro', tier: 'c3' },
       { provider: 'openrouter', model: 'z-ai/glm-5.2', tier: 'c2' },
@@ -278,6 +278,25 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     expect(f.candidates.value.map(c => `${c.provider}/${c.model}`)).toEqual([
       'volcengine/doubao-2.0-pro',
       'openrouter/z-ai/glm-5.2',
+    ])
+  })
+
+  it('activateForProvider leaves a configured shared plan unchanged', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({
+      selection_mode: CUSTOM_B5_SELECTION_MODE,
+      candidates: [
+        { provider: 'openai', model: 'draft-model', enabled: true },
+        { provider: 'openai', model: 'fusion-model', enabled: true, role: 'aggregator' },
+      ],
+    })
+
+    f.activateForProvider('tokenrhythm')
+
+    expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.candidates.value.map(candidate => candidate.model)).toEqual([
+      'draft-model',
+      'fusion-model',
     ])
   })
 })

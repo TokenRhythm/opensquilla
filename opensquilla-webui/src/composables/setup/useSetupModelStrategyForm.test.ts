@@ -150,8 +150,9 @@ describe('useSetupModelStrategyForm', () => {
     expect(strategy.activeStrategy.value).toBe('router')
   })
 
-  it('selecting model ensemble gives non-preset providers an explicit custom lineup', () => {
+  it('selecting model ensemble migrates a hidden legacy plan to an explicit custom lineup', () => {
     const { router, ensemble, strategy } = makeForm()
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'router_dynamic' })
 
     strategy.setStrategy('ensemble')
 
@@ -163,11 +164,11 @@ describe('useSetupModelStrategyForm', () => {
     expect(strategy.activeStrategy.value).toBe('ensemble')
   })
 
-  it('selecting model ensemble seeds the custom lineup from the router tiers', () => {
+  it('selecting model ensemble seeds a legacy custom lineup from the router tiers', () => {
     const router = useSetupRouterForm()
     const ensemble = useSetupEnsembleForm()
     router.initFromConfig({ enabled: true, tier_profile: 'openai' }, {}, 'openai')
-    ensemble.initFromConfig({ enabled: false })
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'router_dynamic' })
     const strategy = useSetupModelStrategyForm(
       router,
       ensemble,
@@ -184,26 +185,27 @@ describe('useSetupModelStrategyForm', () => {
     expect(ensemble.candidates.value.map(c => c.model)).toEqual(['gpt-5.5', 'gpt-5.4-mini'])
   })
 
-  it('selecting model ensemble seeds the OpenRouter profile as a custom lineup', () => {
+  it('selecting model ensemble preserves the current OpenRouter preset plan', () => {
     const { router, ensemble, strategy } = makeForm('openrouter')
 
     strategy.setStrategy('ensemble')
 
     expect(router.mode.value).toBe('disabled')
     expect(ensemble.enabled.value).toBe(true)
-    expect(ensemble.selectionMode.value).toBe('custom_b5')
-    expect(ensemble.candidates.value.length).toBe(5)
+    expect(ensemble.selectionMode.value).toBe('static_openrouter_b5')
+    expect(ensemble.candidates.value.length).toBe(0)
   })
 
-  it('selecting model ensemble seeds the TokenRhythm profile as a custom lineup', () => {
+  it('selecting model ensemble preserves the current TokenRhythm preset plan', () => {
     const { router, ensemble, strategy } = makeForm('tokenrhythm')
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'static_tokenrhythm_b5' })
 
     strategy.setStrategy('ensemble')
 
     expect(router.mode.value).toBe('disabled')
     expect(ensemble.enabled.value).toBe(true)
-    expect(ensemble.selectionMode.value).toBe('custom_b5')
-    expect(ensemble.candidates.value.length).toBe(5)
+    expect(ensemble.selectionMode.value).toBe('static_tokenrhythm_b5')
+    expect(ensemble.candidates.value.length).toBe(0)
   })
 
   it('builds the routing choices in progressive order with guidance badges', () => {

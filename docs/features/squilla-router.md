@@ -49,10 +49,14 @@ ladder:
 | C2 | `glm-5.2` |
 | C3 | static TokenRhythm B5 multi-model fusion |
 
-C3 reuses the existing `static_tokenrhythm_b5` profile: four proposer models
-produce candidates and GLM 5.2 aggregates the final answer. The fusion profile
-is activated only for C3; C0–C2 stay single-model routes. If no TokenRhythm
-credential resolves, C3 safely falls back to its configured `glm-5.2` model.
+C3 reuses the plan configured under `llm_ensemble`: four proposer models
+produce candidates and GLM 5.2 aggregates the final answer in the recommended
+TokenRhythm setup. The plan is activated only for C3; C0–C2 stay single-model
+routes. Editing the shared plan also changes what C3 uses, without a second
+tier-specific profile. If no TokenRhythm credential resolves, C3 safely falls
+back to its configured `glm-5.2` model. While C3 fusion is selected, C3 itself
+and the dedicated `image_model` tier are excluded from image routing; another
+text tier with `supports_image = true` may still handle image requests.
 
 Disable routing and use the configured provider/model directly:
 

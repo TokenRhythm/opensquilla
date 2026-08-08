@@ -26,6 +26,7 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from opensquilla import __version__
+from opensquilla.ensemble_plan import effective_ensemble_selection_mode
 from opensquilla.gateway.config_migration import (
     LATEST_CONFIG_VERSION,
     ConfigParseError,
@@ -43,7 +44,7 @@ from opensquilla.router_tiers import (
     ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
     TEXT_TIERS,
     TierConfig,
-    configured_tier_ensemble_selection_modes,
+    effective_tier_ensemble_selection_modes,
     normalize_text_tier,
     normalize_tier_mapping,
 )
@@ -697,14 +698,15 @@ def _non_negative_float(value: Any, default: float) -> float:
 def _configured_static_b5_selection_modes(config: Any) -> tuple[str, ...]:
     modes: list[str] = []
     ensemble_cfg = getattr(config, "llm_ensemble", None)
-    global_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
+    global_mode = effective_ensemble_selection_mode(config)
     if bool(getattr(ensemble_cfg, "enabled", False)) and global_mode in STATIC_B5_SELECTION_MODES:
         modes.append(global_mode)
 
     router = getattr(config, "squilla_router", None)
     if bool(getattr(router, "enabled", False)):
-        tier_modes = configured_tier_ensemble_selection_modes(
-            getattr(router, "tiers", None)
+        tier_modes = effective_tier_ensemble_selection_modes(
+            getattr(router, "tiers", None),
+            shared_selection_mode=global_mode,
         )
         modes.extend(
             mode for mode in tier_modes.values() if mode in STATIC_B5_SELECTION_MODES
@@ -1389,9 +1391,18 @@ class SquillaRouterConfig(BaseSettings):
     def _validate_tier_ensemble_selection_modes(self) -> SquillaRouterConfig:
         allowed = ", ".join(sorted(ROUTER_TIER_ENSEMBLE_SELECTION_MODES))
         for tier_name in TEXT_TIERS:
-            selection_mode = TierConfig.from_value(
-                self.tiers.get(tier_name) if isinstance(self.tiers, dict) else None
-            ).ensemble_selection_mode
+            raw_tier = self.tiers.get(tier_name) if isinstance(self.tiers, dict) else None
+            if isinstance(raw_tier, dict):
+                raw_enabled = raw_tier.get(
+                    "ensemble_enabled",
+                    raw_tier.get("ensembleEnabled"),
+                )
+                if raw_enabled is not None and not isinstance(raw_enabled, bool):
+                    raise ValueError(
+                        f"squilla_router.tiers.{tier_name}.ensemble_enabled "
+                        "must be a boolean"
+                    )
+            selection_mode = TierConfig.from_value(raw_tier).ensemble_selection_mode
             if selection_mode and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES:
                 raise ValueError(
                     f"squilla_router.tiers.{tier_name}.ensemble_selection_mode "

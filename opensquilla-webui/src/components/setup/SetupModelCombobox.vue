@@ -21,6 +21,12 @@ interface FieldSpec {
   [key: string]: unknown
 }
 
+interface LeadingOption {
+  value: string
+  label: string
+  description?: string
+}
+
 const props = defineProps<{
   field: FieldSpec
   value: string
@@ -34,6 +40,9 @@ const props = defineProps<{
   // Embedded form rows can opt into the shared input chrome without changing
   // compact tier-table cells that already provide their own styling.
   inputClass?: string
+  // Optional semantic choice pinned above provider models. Router C3 uses it
+  // for the shared multi-model plan while retaining free-text model entry.
+  leadingOption?: LeadingOption
 }>()
 
 const emit = defineEmits<{
@@ -67,11 +76,24 @@ const fieldName = computed(() => `setup_provider_${String(props.field.name || 'm
 const fieldDescriptionId = computed(() => `${fieldId.value}-description`)
 const fieldTooltipId = computed(() => `${fieldId.value}-info-tooltip`)
 
-const query = computed(() => String(props.value || '').trim().toLowerCase())
+const leadingSelected = computed(() => Boolean(
+  props.leadingOption && props.value === props.leadingOption.value,
+))
+const inputDisplayValue = computed(() => (
+  leadingSelected.value ? props.leadingOption?.label || '' : props.value
+))
+const query = computed(() => (
+  leadingSelected.value ? '' : String(props.value || '').trim().toLowerCase()
+))
 const catalogAvailable = computed(() => (
   !props.disabled
-  && (props.modelSource === 'live' || props.modelSource === 'catalog')
-  && props.models.length > 0
+  && (
+    Boolean(props.leadingOption)
+    || (
+      (props.modelSource === 'live' || props.modelSource === 'catalog')
+      && props.models.length > 0
+    )
+  )
 ))
 const describedBy = computed(() => {
   const ids: string[] = []
@@ -105,17 +127,26 @@ const truncatedCount = computed(() => Math.max(0, matches.value.length - visible
 // The escape hatch: whatever was typed is always usable as-is. Shown whenever
 // there is typed text that is not an exact discovered id.
 const showFreeTextRow = computed(() => {
+  if (leadingSelected.value) return false
   const typed = String(props.value || '').trim()
   if (!typed) return false
   return !selectedId.value
 })
 
-const optionCount = computed(() => visibleModels.value.length + (showFreeTextRow.value ? 1 : 0))
+const leadingOptionCount = computed(() => props.leadingOption ? 1 : 0)
+const optionCount = computed(() => (
+  leadingOptionCount.value
+  + visibleModels.value.length
+  + (showFreeTextRow.value ? 1 : 0)
+))
+const leadingOptionId = computed(() => `${fieldId.value}-option-leading`)
 const freeTextOptionId = computed(() => `${fieldId.value}-option-custom`)
 const activeOptionId = computed(() => {
   if (!open.value || activeIndex.value < 0) return undefined
-  if (activeIndex.value < visibleModels.value.length) {
-    return modelOptionId(activeIndex.value)
+  if (props.leadingOption && activeIndex.value === 0) return leadingOptionId.value
+  const modelIndex = activeIndex.value - leadingOptionCount.value
+  if (modelIndex >= 0 && modelIndex < visibleModels.value.length) {
+    return modelOptionId(modelIndex)
   }
   return showFreeTextRow.value ? freeTextOptionId.value : undefined
 })
@@ -229,6 +260,9 @@ function openList() {
   open.value = true
   typedSinceOpen.value = false
   activeIndex.value = -1
+  if (leadingSelected.value) {
+    void nextTick(() => inputEl.value?.select())
+  }
 }
 
 function onClick() {
@@ -265,7 +299,10 @@ function selectModel(id: string) {
 
 function selectAt(index: number) {
   if (index < 0 || index >= optionCount.value) return
-  if (index < visibleModels.value.length) selectModel(visibleModels.value[index].id)
+  if (props.leadingOption && index === 0) selectModel(props.leadingOption.value)
+  else if (index - leadingOptionCount.value < visibleModels.value.length) {
+    selectModel(visibleModels.value[index - leadingOptionCount.value].id)
+  }
   else close() // free-text row: the typed value is already the field value
 }
 
@@ -404,7 +441,7 @@ function onKeydown(event: KeyboardEvent) {
         data-protonpass-ignore="true"
         spellcheck="false"
         :disabled="disabled"
-        :value="value"
+        :value="inputDisplayValue"
         :placeholder="field.placeholder || t('setup.provider.modelSearchOrCustom')"
         @input="onInput"
         @focus="openList"
@@ -413,7 +450,7 @@ function onKeydown(event: KeyboardEvent) {
         @keydown="onKeydown"
       >
       <span v-if="catalogAvailable" :id="`${fieldId}-catalog-count`" class="setup-model-combobox__sr-only">
-        {{ t('setup.provider.modelOptionsToggle', { count: models.length }) }}
+        {{ t('setup.provider.modelOptionsToggle', { count: models.length + leadingOptionCount }) }}
       </span>
       <button
         v-if="catalogAvailable"
@@ -421,7 +458,7 @@ function onKeydown(event: KeyboardEvent) {
         class="setup-model-combobox__trigger"
         data-testid="setup-model-options-toggle"
         tabindex="-1"
-        :aria-label="t('setup.provider.modelOptionsToggle', { count: models.length })"
+        :aria-label="t('setup.provider.modelOptionsToggle', { count: models.length + leadingOptionCount })"
         :aria-controls="`${fieldId}-listbox`"
         :aria-expanded="open ? 'true' : 'false'"
         @mousedown.prevent
@@ -441,7 +478,7 @@ function onKeydown(event: KeyboardEvent) {
           :style="listStyle"
           @mousedown.prevent
         >
-          <div :id="`${fieldId}-catalog-readout`" class="setup-model-combobox__readout">
+          <div v-if="models.length" :id="`${fieldId}-catalog-readout`" class="setup-model-combobox__readout">
             <span>{{ t('setup.provider.modelListReadout', { count: models.length }) }}</span>
             <span v-if="modelSource === 'live'" class="setup-model-combobox__live-source">
               <span class="setup-model-combobox__live-dot" aria-hidden="true"></span>
@@ -453,15 +490,39 @@ function onKeydown(event: KeyboardEvent) {
             class="setup-model-combobox__list"
             role="listbox"
             :aria-label="t('setup.provider.modelListLabel')"
-            :aria-describedby="`${fieldId}-catalog-readout`"
+            :aria-describedby="models.length ? `${fieldId}-catalog-readout` : undefined"
           >
+            <button
+              v-if="leadingOption"
+              :id="leadingOptionId"
+              type="button"
+              class="setup-model-combobox__row setup-model-combobox__row--leading"
+              :class="{ 'is-active': activeIndex === 0 }"
+              role="option"
+              :aria-selected="leadingSelected ? 'true' : 'false'"
+              @mousedown.prevent
+              @click="selectModel(leadingOption.value)"
+            >
+              <span class="setup-model-combobox__identity">
+                <span class="setup-model-combobox__id">{{ leadingOption.label }}</span>
+                <span v-if="leadingOption.description" class="setup-model-combobox__name">
+                  {{ leadingOption.description }}
+                </span>
+              </span>
+              <span v-if="leadingSelected" class="setup-model-combobox__selected">
+                <Icon name="check" :size="12" aria-hidden="true" />
+                <span class="setup-model-combobox__sr-only">
+                  {{ t('setup.provider.modelSelected') }}
+                </span>
+              </span>
+            </button>
             <button
               v-for="(model, index) in visibleModels"
               :key="model.id"
               :id="modelOptionId(index)"
               type="button"
               class="setup-model-combobox__row"
-              :class="{ 'is-active': index === activeIndex }"
+              :class="{ 'is-active': index + leadingOptionCount === activeIndex }"
               role="option"
               :aria-selected="model.id === selectedId ? 'true' : 'false'"
               @mousedown.prevent
@@ -525,7 +586,7 @@ function onKeydown(event: KeyboardEvent) {
               :id="freeTextOptionId"
               type="button"
               class="setup-model-combobox__row setup-model-combobox__row--freetext"
-              :class="{ 'is-active': activeIndex === visibleModels.length }"
+              :class="{ 'is-active': activeIndex === visibleModels.length + leadingOptionCount }"
               role="option"
               aria-selected="false"
               @mousedown.prevent
@@ -534,7 +595,7 @@ function onKeydown(event: KeyboardEvent) {
               <span class="setup-model-combobox__id" :title="String(value || '').trim()">{{ t('setup.provider.modelUseTyped', { value: String(value || '').trim() }) }}</span>
             </button>
           </div>
-          <div v-if="!visibleModels.length && !showFreeTextRow" class="setup-model-combobox__footer">
+          <div v-if="!leadingOption && !visibleModels.length && !showFreeTextRow" class="setup-model-combobox__footer">
             {{ t('setup.provider.modelNoMatches') }}
           </div>
           <div v-if="truncatedCount" class="setup-model-combobox__footer">

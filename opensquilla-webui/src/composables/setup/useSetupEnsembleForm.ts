@@ -775,11 +775,15 @@ export function useSetupEnsembleForm() {
     }
   }
 
-  // Default activation when the ensemble strategy is switched on: every
-  // provider lands on the single editable custom path. Providers with a
-  // curated static profile use that profile only as the initial seed; other
-  // providers seed from the router tiers the user already configured.
+  // Enabling the ensemble strategy changes its scope, not the shared plan.
+  // Preserve any ready static/custom plan already loaded from the gateway;
+  // only the hidden legacy mode or an empty custom draft needs materializing.
   function activateForProvider(provider: unknown, tierCandidates: readonly EnsembleTierCandidate[] = []) {
+    if (selectionMode.value in STATIC_B5_PROFILES) return
+    if (
+      selectionMode.value === CUSTOM_B5_SELECTION_MODE
+      && candidates.value.some(candidate => candidate.enabled !== false)
+    ) return
     const presetMode = staticB5ModeForProvider(provider)
     selectionMode.value = CUSTOM_B5_SELECTION_MODE
     if (candidates.value.some(candidate => candidate.enabled !== false)) return

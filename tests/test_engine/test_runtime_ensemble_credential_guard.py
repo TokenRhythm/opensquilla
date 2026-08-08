@@ -39,6 +39,10 @@ class _FakeSelector:
     def current_config(self) -> ProviderConfig:
         return self._cfg
 
+    @property
+    def active_provider_id(self) -> str:
+        return self._cfg.provider
+
     def override_model(self, model: str) -> None:
         self._cfg = ProviderConfig(
             provider=self._cfg.provider,
@@ -48,6 +52,12 @@ class _FakeSelector:
             proxy=self._cfg.proxy,
             provider_routing=self._cfg.provider_routing,
         )
+
+    def override_provider_config(self, config: ProviderConfig) -> None:
+        self._cfg = config
+
+    def disable_provider_state_replay(self) -> None:
+        return None
 
     def resolve(self) -> _Provider:
         return _Provider()
@@ -239,9 +249,127 @@ async def test_tokenrhythm_router_uses_ensemble_only_for_c3(
         assert provider.profile_name == "static_tokenrhythm_b5"
         assert provider.fallback_model == "glm-5.2"
         assert turn.metadata["ensemble_activation_source"] == "router_tier"
+        assert turn.metadata["ensemble_tier_binding"] == "shared"
         assert turn.metadata["ensemble_selection_mode"] == "static_tokenrhythm_b5"
     else:
         assert "ensemble_enabled" not in turn.metadata
+
+
+async def test_shared_c3_follows_an_explicit_change_to_the_global_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-synthetic")
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "deepseek-v4-flash-0731",
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "static_openrouter_b5",
+        },
+    )
+    tier = cfg.squilla_router.tiers["c3"]
+
+    async def route_to_c3(turn):
+        turn.model = tier["model"]
+        turn.metadata["routed_tier"] = "c3"
+        turn.metadata["routing_applied"] = True
+        return turn
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.apply_squilla_router",
+        route_to_c3,
+    )
+    runner = TurnRunner(provider_selector=None, config=cfg)
+    selector = _FakeSelector(provider="tokenrhythm", api_key="sk-tr-synthetic")
+
+    turn, provider = await runner._run_pipeline(
+        "use the shared plan",
+        "agent:main:tier-c3-shared-plan",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert isinstance(provider, EnsembleProvider)
+    assert provider.profile_name == "static_openrouter_b5"
+    assert provider.fallback_model == "glm-5.2"
+    assert turn.metadata["ensemble_tier_binding"] == "shared"
+    assert turn.metadata["ensemble_selection_mode"] == "static_openrouter_b5"
+
+
+async def test_shared_c3_keeps_plan_credentials_when_fallback_crosses_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "deepseek-v4-flash-0731",
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_profiles={
+            "groq": {
+                "provider": "groq",
+                "model": "groq-c3",
+                "api_key": "sk-groq-synthetic",
+            }
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+            "tiers": {
+                "c3": {
+                    "provider": "groq",
+                    "model": "groq-c3",
+                    "ensemble_enabled": True,
+                }
+            },
+        },
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "static_tokenrhythm_b5",
+        },
+    )
+
+    async def route_to_cross_provider_c3(turn):
+        turn.model = "groq-c3"
+        turn.metadata["routed_tier"] = "c3"
+        turn.metadata["routed_provider"] = "groq"
+        turn.metadata["routing_applied"] = True
+        return turn
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.apply_squilla_router",
+        route_to_cross_provider_c3,
+    )
+    runner = TurnRunner(provider_selector=None, config=cfg)
+    selector = _FakeSelector(provider="tokenrhythm", api_key="sk-tr-synthetic")
+
+    turn, provider = await runner._run_pipeline(
+        "use the shared plan with a foreign fallback",
+        "agent:main:tier-c3-cross-provider-shared-plan",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert isinstance(provider, EnsembleProvider)
+    assert provider.profile_name == "static_tokenrhythm_b5"
+    assert provider.fallback_provider_name == "groq"
+    assert provider.fallback_model == "groq-c3"
+    assert {
+        member.provider_config.api_key
+        for member in [*provider.proposers, provider.aggregator]
+    } == {"sk-tr-synthetic"}
+    assert turn.metadata["ensemble_tier_binding"] == "shared"
 
 
 async def test_tokenrhythm_c3_falls_back_to_glm_without_ensemble_credential(

@@ -179,6 +179,57 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
     })
   })
 
+  it('round-trips the shared C3 plan without storing an internal profile', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'glm-5.2',
+          ensemble_enabled: true,
+        },
+      },
+    }, {}, 'tokenrhythm', 'follow_primary')
+
+    expect(f.payload()).toMatchObject({
+      tiers: {
+        c3: {
+          ensembleEnabled: true,
+          ensembleSelectionMode: '',
+        },
+      },
+    })
+  })
+
+  it('sends an explicit false when the user switches C3 back to one model', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'glm-5.2',
+          ensemble_enabled: true,
+        },
+      },
+    }, {}, 'tokenrhythm')
+
+    f.updateTierField('c3', 'ensembleEnabled', false)
+    f.updateTierField('c3', 'ensembleSelectionMode', '')
+    f.updateTierField('c3', 'model', 'deepseek-v4-pro')
+
+    expect(f.payload()).toMatchObject({
+      tiers: {
+        c3: {
+          model: 'deepseek-v4-pro',
+          ensembleEnabled: false,
+          ensembleSelectionMode: '',
+        },
+      },
+    })
+  })
+
   it('keeps openrouter-mix internally while exposing the layered UI choice', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({ enabled: true, tier_profile: null }, {}, 'openrouter')

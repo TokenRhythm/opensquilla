@@ -100,7 +100,7 @@ const emit = defineEmits<{
   updateFixedModel: [value: string]
   updateRouterDefaultTier: [value: string]
   updateRouterVisualMode: [value: string]
-  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleSelectionMode', value: string | boolean]
+  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
   updateEnsembleScheme: [value: 'preset' | 'custom']
   addEnsembleCandidate: [provider: string, model: string, role: EnsembleCandidateRole]
   removeEnsembleCandidate: [candidate: EnsembleCandidateView]
@@ -449,19 +449,6 @@ onBeforeUnmount(() => {
 })
 watch(ensembleScheme, closeLineupEditors)
 watch(() => props.panel.activeStrategy, closeLineupEditors)
-watch(
-  [() => props.panel.activeStrategy, ensembleScheme],
-  ([strategy, scheme]) => {
-    // The editor now has one ensemble path: a directly editable custom lineup.
-    // Existing saved static profiles are expanded by the form into an
-    // equivalent custom draft; the normal dirty bar keeps that migration
-    // explicit until the user saves it.
-    if (strategy === 'ensemble' && scheme === 'preset') {
-      emit('updateEnsembleScheme', 'custom')
-    }
-  },
-  { immediate: true },
-)
 
 function submitCandidate() {
   const provider = newCandidateProvider.value
@@ -751,6 +738,34 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
         class="control-section setup-model-strategy__detail setup-model-strategy__ensemble"
         data-testid="ensemble-panel"
       >
+        <div
+          v-if="panel.ensemble.schemeCardsAvailable && ensembleScheme !== 'legacy'"
+          class="setup-model-strategy__schemes"
+          role="group"
+          :aria-label="t('setup.modelStrategy.schemeLabel')"
+        >
+          <button
+            type="button"
+            class="setup-model-strategy__scheme"
+            :class="{ 'is-active': ensembleScheme === 'preset' }"
+            data-testid="ensemble-scheme-preset"
+            :aria-pressed="ensembleScheme === 'preset' ? 'true' : 'false'"
+            @click="emit('updateEnsembleScheme', 'preset')"
+          >
+            {{ t('setup.modelStrategy.schemePresetTitle') }}
+          </button>
+          <button
+            type="button"
+            class="setup-model-strategy__scheme"
+            :class="{ 'is-active': ensembleScheme === 'custom' }"
+            data-testid="ensemble-scheme-custom"
+            :aria-pressed="ensembleScheme === 'custom' ? 'true' : 'false'"
+            @click="emit('updateEnsembleScheme', 'custom')"
+          >
+            {{ t('setup.modelStrategy.schemeCustomTitle') }}
+          </button>
+        </div>
+
         <div
           v-if="ensembleScheme === 'legacy'"
           class="setup-model-strategy__notice setup-model-strategy__notice--legacy"

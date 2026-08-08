@@ -483,15 +483,12 @@ async def test_config_patch_safe_accepts_llm_ensemble_toggle(tmp_path) -> None:
     assert res["patched"] == ["llm_ensemble.enabled"]
     assert res["restartRequired"] is False
     assert ctx.config.llm_ensemble.enabled is True
-    assert ctx.config.llm_ensemble.selection_mode == "custom_b5"
-    assert len(ctx.config.llm_ensemble.candidates) == 5
-    assert {
-        candidate.provider for candidate in ctx.config.llm_ensemble.candidates
-    } == {"tokenrhythm"}
+    assert ctx.config.llm_ensemble.selection_mode == "static_tokenrhythm_b5"
+    assert ctx.config.llm_ensemble.candidates == []
     persisted = tomllib.loads((tmp_path / "config.toml").read_text())
     assert persisted["llm_ensemble"]["enabled"] is True
-    assert persisted["llm_ensemble"]["selection_mode"] == "custom_b5"
-    assert len(persisted["llm_ensemble"]["candidates"]) == 5
+    assert persisted["llm_ensemble"]["selection_mode"] == "static_tokenrhythm_b5"
+    assert "candidates" not in persisted["llm_ensemble"]
 
 
 async def test_config_patch_safe_rejects_session_title_advanced_paths(tmp_path) -> None:

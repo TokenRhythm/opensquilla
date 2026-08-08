@@ -166,6 +166,46 @@ describe('SetupModelCombobox', () => {
     expect(popup()?.textContent).not.toContain('Live')
   })
 
+  it('pins an optional semantic choice above models and supports keyboard selection', async () => {
+    const onUpdate = vi.fn()
+    const leadingOption = {
+      value: '__ensemble__',
+      label: 'Multi-model fusion',
+      description: 'Use the shared plan',
+    }
+    const { el } = await mountCombobox({
+      value: '__ensemble__',
+      leadingOption,
+      onUpdate,
+    })
+
+    const input = await openList(el)
+    expect(input.value).toBe('Multi-model fusion')
+    const rows = optionRows()
+    expect(rows[0]?.textContent).toContain('Multi-model fusion')
+    expect(rows[0]?.getAttribute('aria-selected')).toBe('true')
+    expect(rows[1]?.textContent).toContain('test-vendor/alpha')
+    expect(rows).toHaveLength(3)
+    expect(listbox()?.textContent).not.toContain('__ensemble__')
+
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' }))
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))
+    await nextTick()
+    expect(onUpdate).toHaveBeenCalledWith('__ensemble__')
+  })
+
+  it('keeps the semantic choice available without a discovered model catalog', async () => {
+    const { el } = await mountCombobox({
+      models: [],
+      modelSource: 'none',
+      leadingOption: { value: '__ensemble__', label: 'Multi-model fusion' },
+    })
+
+    await openList(el)
+    expect(optionRows()).toHaveLength(1)
+    expect(optionRows()[0]?.textContent).toContain('Multi-model fusion')
+  })
+
   it('opts out of password-manager field classification', async () => {
     const { el } = await mountCombobox()
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')

@@ -56,6 +56,7 @@ from opensquilla.onboarding.provider_specs import (  # noqa: E402
     list_provider_setup_specs,
     provider_catalog_payload,
 )
+from opensquilla.onboarding.router_specs import _tier_payload  # noqa: E402
 
 # Verified: the full agent stack has been exercised against these providers.
 EXPECTED_VERIFIED = {
@@ -78,6 +79,26 @@ EXPECTED_EXPERIMENTAL = {
     "tencent_token_plan", "tencent_token_plan_anthropic",
 }
 EXPECTED_SUPPORTED = EXPECTED_VERIFIED | EXPECTED_EXPERIMENTAL
+
+
+def test_tokenrhythm_preset_wire_exposes_the_shared_c3_binding():
+    row = next(
+        item
+        for item in provider_catalog_payload()
+        if item["providerId"] == "tokenrhythm"
+    )
+
+    assert row["presets"][0]["tiers"]["c3"]["ensembleEnabled"] is True
+
+
+def test_tier_payload_preserves_a_legacy_ensemble_selection_mode():
+    assert _tier_payload(
+        {
+            "provider": "tokenrhythm",
+            "model": "glm-5.2",
+            "ensemble_selection_mode": "static_tokenrhythm_b5",
+        }
+    )["ensembleSelectionMode"] == "static_tokenrhythm_b5"
 # No runtime support at all: never configurable.
 EXPECTED_DISABLED = {
     "github_copilot",

@@ -8,9 +8,13 @@ surface observes and mutates the same state machine.
 from __future__ import annotations
 
 import copy
-import os
 from dataclasses import dataclass
 from typing import Any, Literal
+
+from opensquilla.ensemble_plan import (
+    effective_ensemble_selection_mode,
+    ensemble_selection_configured,
+)
 
 ModelRoutingMode = Literal["direct", "router", "ensemble"]
 
@@ -53,34 +57,6 @@ class _ModelRoutingConfigSnapshot:
 
 def _clean(value: object) -> str:
     return str(value or "").strip().lower()
-
-
-def ensemble_selection_configured(config: Any) -> bool:
-    """Whether ``selection_mode`` came from an operator-owned config source."""
-
-    ensemble = getattr(config, "llm_ensemble", None)
-    if ensemble is None:
-        return False
-    force_paths = getattr(config, "force_persist_paths", None)
-    if callable(force_paths) and "llm_ensemble.selection_mode" in force_paths():
-        return True
-    raw = getattr(config, "_persist_raw_base", None)
-    if isinstance(raw, dict):
-        raw_ensemble = raw.get("llm_ensemble")
-        if isinstance(raw_ensemble, dict) and "selection_mode" in raw_ensemble:
-            return True
-        # A loaded/persisted raw snapshot is authoritative: rebuilding a
-        # Pydantic section from a partial mutation must not turn omitted
-        # defaults into operator-authored fields.
-        return bool(
-            os.environ.get("OPENSQUILLA_LLM_ENSEMBLE_SELECTION_MODE", "").strip()
-        )
-    fields_set = getattr(ensemble, "model_fields_set", None)
-    if fields_set is None:
-        # Config-like compatibility objects have no provenance channel; an
-        # existing selection value is therefore the only safe interpretation.
-        return bool(str(getattr(ensemble, "selection_mode", "") or "").strip())
-    return "selection_mode" in set(fields_set)
 
 
 def _custom_candidate(
@@ -208,6 +184,9 @@ def ensemble_activation_patches(config: Any) -> dict[str, Any]:
         return {}
     if ensemble_selection_configured(config):
         return {}
+    selection_mode = effective_ensemble_selection_mode(config)
+    if selection_mode != "custom_b5":
+        return {"llm_ensemble.selection_mode": selection_mode}
     return {
         "llm_ensemble.selection_mode": "custom_b5",
         "llm_ensemble.candidates": _provider_ensemble_candidates(config),
@@ -241,6 +220,18 @@ def ensemble_activation_preview(config: Any) -> dict[str, Any]:
         patches.get("llm_ensemble.selection_mode")
         or getattr(ensemble, "selection_mode", "")
     )
+    from opensquilla.provider.ensemble import static_b5_profile
+
+    static_profile = static_b5_profile(selection_mode)
+    if static_profile is not None:
+        return {
+            "selection_mode": selection_mode,
+            "selection_configured": configured,
+            "proposer_count": len(static_profile.proposer_models),
+            "member_providers": [static_profile.provider_id],
+            "candidates": [],
+            "blocked_reason": None,
+        }
     candidates = patches.get("llm_ensemble.candidates")
     if candidates is None:
         candidates = [

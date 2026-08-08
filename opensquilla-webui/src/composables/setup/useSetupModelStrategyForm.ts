@@ -84,9 +84,9 @@ export function useSetupModelStrategyForm(
     if (next === 'ensemble') {
       routerForm.setRouterMode('disabled')
       ensembleForm.setEnabled(true)
-      // Providers with an official preset land on it; every other provider
-      // gets an explicit custom lineup (seeded from the router tiers), never
-      // the hidden legacy dynamic mode.
+      // Activation changes where the one shared plan applies. The ensemble
+      // form preserves an already configured plan and only materializes a
+      // hidden legacy/empty draft when necessary.
       ensembleForm.activateForProvider(
         activeProvider?.value,
         tierCandidates?.value ?? [],

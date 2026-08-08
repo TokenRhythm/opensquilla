@@ -8,7 +8,7 @@ from opensquilla.engine.selector_override import apply_model_override
 from opensquilla.engine.steps.squilla_router import _flag_tier_provider_mismatch
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.mutations import _cross_provider_tier_warnings, upsert_router
-from opensquilla.router_tiers import TierConfig
+from opensquilla.router_tiers import TierConfig, tier_ensemble_execution
 
 # ---------------------------------------------------------------------------
 # TierConfig
@@ -38,6 +38,47 @@ def test_tier_config_from_object_and_none() -> None:
     assert tier.image_only is True
     assert TierConfig.from_value(None) == TierConfig()
     assert TierConfig.from_value({}) == TierConfig()
+
+
+def test_shared_tier_execution_follows_the_current_plan() -> None:
+    tiers = {
+        "c3": {
+            "ensemble_enabled": True,
+            # Retained downgrade metadata cannot override the new contract.
+            "ensemble_selection_mode": "static_tokenrhythm_b5",
+        }
+    }
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c3",
+        shared_selection_mode="custom_b5",
+    ) == ("custom_b5", "shared")
+
+
+def test_explicit_single_model_wins_over_a_legacy_tier_mode() -> None:
+    tiers = {
+        "c3": {
+            "ensemble_enabled": False,
+            "ensemble_selection_mode": "static_tokenrhythm_b5",
+        }
+    }
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c3",
+        shared_selection_mode="custom_b5",
+    ) == ("", "single")
+
+
+def test_missing_shared_flag_preserves_legacy_tier_mode() -> None:
+    tiers = {"c3": {"ensemble_selection_mode": "static_tokenrhythm_b5"}}
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c3",
+        shared_selection_mode="custom_b5",
+    ) == ("static_tokenrhythm_b5", "legacy")
 
 
 # ---------------------------------------------------------------------------

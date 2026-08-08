@@ -84,6 +84,18 @@ def test_squilla_router_rejects_unknown_tier_ensemble_selection_mode() -> None:
         squilla_router_config_cls(tiers=tiers)
 
 
+def test_squilla_router_rejects_non_boolean_tier_ensemble_enabled() -> None:
+    squilla_router_config_cls = _squilla_router_config_cls()
+    tiers = squilla_router_config_cls().tiers
+    tiers["c3"] = {**tiers["c3"], "ensemble_enabled": "true"}
+
+    with pytest.raises(
+        ValueError,
+        match=r"squilla_router\.tiers\.c3\.ensemble_enabled must be a boolean",
+    ):
+        squilla_router_config_cls(tiers=tiers)
+
+
 def test_squilla_router_explicit_openrouter_profile_matches_default_tiers() -> None:
     squilla_router_config_cls = _squilla_router_config_cls()
 
@@ -204,10 +216,8 @@ def test_unset_tier_profile_seeds_tokenrhythm_curated_inline_tiers() -> None:
         assert cfg.squilla_router.tiers[tier]["provider"] == "tokenrhythm"
         assert cfg.squilla_router.tiers[tier]["model"] == model
     assert cfg.squilla_router.tiers["c0"]["supports_image"] is True
-    assert (
-        cfg.squilla_router.tiers["c3"]["ensemble_selection_mode"]
-        == "static_tokenrhythm_b5"
-    )
+    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in cfg.squilla_router.tiers["c3"]
     assert cfg.squilla_router.tiers["image_model"]["model"] == "kimi-k2.6"
 
 
@@ -231,10 +241,8 @@ def test_tokenrhythm_follow_primary_binding_refreshes_managed_inline_tiers() -> 
 
     for tier, model in TOKENRHYTHM_EXPECTED_TIER_MODELS.items():
         assert cfg.squilla_router.tiers[tier]["model"] == model
-    assert (
-        cfg.squilla_router.tiers["c3"]["ensemble_selection_mode"]
-        == "static_tokenrhythm_b5"
-    )
+    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in cfg.squilla_router.tiers["c3"]
 
 
 def test_tokenrhythm_direct_legacy_openrouter_router_defaults_are_migrated() -> None:
@@ -460,7 +468,8 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     assert tiers["c1"]["model"] == "deepseek-v4-flash-0731"
     assert tiers["c2"]["model"] == "glm-5.2"
     assert tiers["c3"]["model"] == "glm-5.2"
-    assert tiers["c3"]["ensemble_selection_mode"] == "static_tokenrhythm_b5"
+    assert tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in tiers["c3"]
     assert tiers["image_model"]["model"] == "kimi-k2.6"
     assert tiers["image_model"]["supports_image"] is True
     assert tiers["image_model"]["image_only"] is True

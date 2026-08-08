@@ -187,7 +187,8 @@ def test_tokenrhythm_default_binds_router_tiers_to_tokenrhythm() -> None:
     for name, model in expected_models.items():
         assert tiers[name]["provider"] == "tokenrhythm"
         assert tiers[name]["model"] == model
-    assert tiers["c3"]["ensemble_selection_mode"] == "static_tokenrhythm_b5"
+    assert tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in tiers["c3"]
     assert cfg.squilla_router.tier_profile is None
 
 

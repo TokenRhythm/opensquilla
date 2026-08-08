@@ -1013,7 +1013,7 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('migrates a saved preset directly into the single custom editing path', async () => {
+  it('keeps a saved preset until the user explicitly chooses the custom editor', async () => {
     const onUpdateEnsembleScheme = vi.fn()
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
@@ -1052,8 +1052,12 @@ describe('SetupModelStrategyPanel', () => {
     expect(preset.querySelector('[data-testid="setup-model-strategy-add-candidate-trigger"]')).toBeNull()
     expect(preset.querySelector('[data-testid="ensemble-replace-aggregator"]')).toBeNull()
     expect(el.querySelector('[data-testid="ensemble-effective-summary"]')?.textContent).toContain('5 model calls')
-    expect(el.querySelector('[data-testid="ensemble-scheme-preset"]')).toBeNull()
-    expect(el.querySelector('[data-testid="ensemble-scheme-custom"]')).toBeNull()
+    const presetScheme = el.querySelector<HTMLButtonElement>('[data-testid="ensemble-scheme-preset"]')!
+    const customScheme = el.querySelector<HTMLButtonElement>('[data-testid="ensemble-scheme-custom"]')!
+    expect(presetScheme.getAttribute('aria-pressed')).toBe('true')
+    expect(customScheme.getAttribute('aria-pressed')).toBe('false')
+    expect(onUpdateEnsembleScheme).not.toHaveBeenCalled()
+    customScheme.click()
     expect(onUpdateEnsembleScheme).toHaveBeenCalledWith('custom')
     expect(preset.querySelector('.setup-model-strategy__step-role')).toBeNull()
     expect(steps[1]?.querySelector('.setup-model-strategy__step-role')).toBeNull()

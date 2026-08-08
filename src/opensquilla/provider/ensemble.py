@@ -13,7 +13,8 @@ from typing import Any, Literal
 import structlog
 
 from opensquilla.context_budget import ContextBudgetGovernor
-from opensquilla.router_tiers import configured_tier_ensemble_selection_modes
+from opensquilla.ensemble_plan import effective_ensemble_selection_mode
+from opensquilla.router_tiers import effective_tier_ensemble_selection_modes
 from opensquilla.safety.injection_guard import wrap_untrusted
 
 from .deployment import (
@@ -4506,10 +4507,13 @@ def ensemble_runtime_status(config: Any) -> dict[str, Any]:
 
     ensemble = getattr(config, "llm_ensemble", None)
     globally_enabled = bool(getattr(ensemble, "enabled", False))
-    configured_selection_mode = str(getattr(ensemble, "selection_mode", "") or "")
+    configured_selection_mode = effective_ensemble_selection_mode(config)
     router = getattr(config, "squilla_router", None)
     tier_selection_modes = (
-        configured_tier_ensemble_selection_modes(getattr(router, "tiers", None))
+        effective_tier_ensemble_selection_modes(
+            getattr(router, "tiers", None),
+            shared_selection_mode=configured_selection_mode,
+        )
         if bool(getattr(router, "enabled", False))
         else {}
     )
@@ -4763,6 +4767,7 @@ def build_ensemble_provider_from_config(
     _session_key: str = "",
     _fallback_selector: Any | None = None,
     _selection_mode_override: str | None = None,
+    _plan_provider_config: ProviderConfig | None = None,
 ) -> EnsembleProvider:
     ensemble_cfg = getattr(config, "llm_ensemble", None)
     if ensemble_cfg is None:
@@ -4772,19 +4777,20 @@ def build_ensemble_provider_from_config(
         or getattr(ensemble_cfg, "selection_mode", "router_dynamic")
         or ""
     )
+    plan_provider_config = _plan_provider_config or inherited_provider_config
     static_profile = static_b5_profile(selection_mode)
     if static_profile is not None:
         profile_name, proposers, aggregator, selection_plan = _build_static_b5_members(
             static_profile,
             config=config,
-            inherited_provider_config=inherited_provider_config,
+            inherited_provider_config=plan_provider_config,
             credential_pool_acquirer=_credential_pool_acquirer,
             session_key=_session_key,
         )
     elif selection_mode == CUSTOM_B5_SELECTION_MODE:
         profile_name, proposers, aggregator, selection_plan = _build_custom_b5_members(
             config=config,
-            inherited_provider_config=inherited_provider_config,
+            inherited_provider_config=plan_provider_config,
             credential_pool_acquirer=_credential_pool_acquirer,
             session_key=_session_key,
         )

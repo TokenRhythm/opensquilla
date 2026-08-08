@@ -260,7 +260,8 @@ def test_full_default_tree_round_trips_via_to_toml_dict(tmp_path: Path) -> None:
     for name, tier in tiers.items():
         assert tier["provider"] == "tokenrhythm"
         assert tier["model"] == expected_models[name]
-    assert tiers["c3"]["ensemble_selection_mode"] == "static_tokenrhythm_b5"
+    assert tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in tiers["c3"]
 
 
 # --- H4: downgrade chokepoint at to_toml_dict --------------------------------

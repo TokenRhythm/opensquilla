@@ -901,6 +901,72 @@ async def test_image_input_routes_directly_to_vision_model_without_prompt_inject
 
 
 @pytest.mark.asyncio
+async def test_c3_fusion_excludes_c3_and_the_dedicated_image_model_from_image_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        squilla_router_step,
+        "_get_strategy",
+        lambda _config: pytest.fail("image routing should not invoke text strategy"),
+    )
+    ctx = make_context(
+        "Describe this screenshot.",
+        attachments=[{"type": "image/png", "data": "abc"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "model": "vision/fast",
+            "supports_image": True,
+        },
+        "c3": {
+            "model": "vision/high-quality",
+            "supports_image": True,
+            "ensemble_enabled": True,
+        },
+        "image_model": {
+            "model": "vision/dedicated",
+            "supports_image": True,
+            "image_only": True,
+        },
+    }
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routed_tier"] == "c0"
+    assert routed.model == "vision/fast"
+
+
+@pytest.mark.asyncio
+async def test_c3_fusion_rejects_image_input_when_no_other_image_tier_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        squilla_router_step,
+        "_get_strategy",
+        lambda _config: pytest.fail("image routing should not invoke text strategy"),
+    )
+    ctx = make_context(
+        "Describe this screenshot.",
+        attachments=[{"type": "image/png", "data": "abc"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "c3": {
+            "model": "vision/high-quality",
+            "supports_image": True,
+            "ensemble_enabled": True,
+        },
+        "image_model": {
+            "model": "vision/dedicated",
+            "supports_image": True,
+            "image_only": True,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="while C3 multi-model fusion is selected"):
+        await apply_squilla_router(ctx)
+
+
+@pytest.mark.asyncio
 async def test_image_route_uses_first_configured_image_tier_without_random_choice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

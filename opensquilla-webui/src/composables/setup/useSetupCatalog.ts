@@ -147,6 +147,10 @@ interface TierConfig {
   thinking_level?: string
   supportsImage?: boolean
   supports_image?: boolean
+  ensembleEnabled?: boolean
+  ensemble_enabled?: boolean
+  ensembleSelectionMode?: string
+  ensemble_selection_mode?: string
 }
 
 interface SectionDetail {
@@ -1848,6 +1852,11 @@ function presetTierRows(preset: ProviderPresetSpec | null): SetupTierRow[] {
       model: tier.model || '',
       thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
       supportsImage: tier.supportsImage || tier.supports_image || false,
+      ensembleEnabled: typeof tier.ensembleEnabled === 'boolean'
+        ? tier.ensembleEnabled
+        : tier.ensemble_enabled,
+      ensembleSelectionMode:
+        tier.ensembleSelectionMode || tier.ensemble_selection_mode || '',
     }))
 }
 
@@ -2862,7 +2871,7 @@ function setRouterVisualMode(value: string) {
 
 function updateTierField(
   name: string,
-  key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleSelectionMode',
+  key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode',
   value: string | boolean,
 ) {
   routerForm.updateTierField(name, key, value)

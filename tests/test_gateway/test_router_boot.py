@@ -872,9 +872,8 @@ def test_tier_managed_static_b5_keeps_default_gateway_stream_timeouts() -> None:
         llm_ensemble={"enabled": False},
     )
 
-    assert config.squilla_router.tiers["c3"]["ensemble_selection_mode"] == (
-        "static_tokenrhythm_b5"
-    )
+    assert config.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in config.squilla_router.tiers["c3"]
     assert effective_agent_stream_idle_timeout_seconds(config) == 600.0
     assert effective_webui_stream_idle_grace_seconds(config) == 630.0
 

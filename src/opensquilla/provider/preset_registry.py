@@ -76,6 +76,7 @@ class ProviderPreset:
     default_model: str
     tiers: Mapping[str, dict]
     synthesized: bool = False
+    default_ensemble_selection_mode: str = ""
 
     @property
     def persistable(self) -> bool:
@@ -266,6 +267,9 @@ def _load_packaged_preset(preset_id: str) -> ProviderPreset | None:
         default_model=str(meta.get("default_model") or ""),
         tiers=normalized_tiers,
         synthesized=False,
+        default_ensemble_selection_mode=str(
+            meta.get("default_ensemble_selection_mode") or ""
+        ).strip(),
     )
 
 

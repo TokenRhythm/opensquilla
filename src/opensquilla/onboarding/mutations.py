@@ -11,6 +11,7 @@ from typing import Any, Literal, cast, get_args
 from pydantic import ValidationError
 
 from opensquilla.channels.registry import discover_all, parse_channel_entry
+from opensquilla.ensemble_plan import ensemble_selection_configured
 from opensquilla.gateway.config import (
     STATIC_B5_SELECTION_MODE_PROVIDERS,
     AudioConfig,
@@ -92,6 +93,7 @@ _TIER_KEY_ALIASES = {
     "supportsImage": "supports_image",
     "imageOnly": "image_only",
     "ensembleSelectionMode": "ensemble_selection_mode",
+    "ensembleEnabled": "ensemble_enabled",
 }
 _REMOTE_MEMORY_EMBEDDING_PROVIDERS = {"openai", "openai-compatible"}
 _DEFAULT_REMOTE_EMBEDDING_BASE_URL = "https://api.openai.com/v1"
@@ -250,6 +252,15 @@ def _merge_router_tiers(
         tier_name = normalize_text_tier(name) or str(name)
         override = _normalize_tier_payload(tier_name, raw_override)
         current = dict(merged.get(tier_name, {}))
+        # A pre-``ensemble_enabled`` client can still submit an explicit
+        # per-tier selection mode.  That legacy field is an ownership
+        # boundary: do not let a managed preset's new shared-plan flag turn
+        # the explicit legacy profile into an inherited global selection.
+        if (
+            "ensemble_selection_mode" in override
+            and "ensemble_enabled" not in override
+        ):
+            current.pop("ensemble_enabled", None)
         current.update(override)
         merged[tier_name] = _enforce_router_tier_role_invariants(tier_name, current)
     return merged
@@ -259,6 +270,16 @@ def _canonical_tier_value(tier: Mapping[str, Any]) -> dict[str, Any]:
     thinking = tier.get("thinking_level")
     if thinking is None:
         thinking = tier.get("thinkingLevel")
+    raw_ensemble_enabled = tier.get(
+        "ensemble_enabled",
+        tier.get("ensembleEnabled"),
+    )
+    ensemble_enabled = (
+        raw_ensemble_enabled if isinstance(raw_ensemble_enabled, bool) else None
+    )
+    legacy_selection_mode = str(
+        tier.get("ensemble_selection_mode", tier.get("ensembleSelectionMode", "")) or ""
+    ).strip()
     return {
         "provider": str(tier.get("provider") or "").strip().lower(),
         "model": str(tier.get("model") or "").strip(),
@@ -266,9 +287,13 @@ def _canonical_tier_value(tier: Mapping[str, Any]) -> dict[str, Any]:
         "thinking_level": (str(thinking or "").strip() or None),
         "supports_image": bool(tier.get("supports_image", tier.get("supportsImage", False))),
         "image_only": bool(tier.get("image_only", tier.get("imageOnly", False))),
-        "ensemble_selection_mode": str(
-            tier.get("ensemble_selection_mode", tier.get("ensembleSelectionMode", "")) or ""
-        ).strip(),
+        "ensemble_enabled": ensemble_enabled,
+        # Once the new tri-state field exists it owns execution. Retained
+        # legacy metadata is intentionally ignored for semantic preset
+        # comparison, while still round-tripping in the actual tier dict.
+        "ensemble_selection_mode": (
+            legacy_selection_mode if ensemble_enabled is None else ""
+        ),
     }
 
 
@@ -349,6 +374,16 @@ def _validate_router_tiers(tiers: dict[str, Any], default_tier: str) -> None:
         if not str(tier.get("model") or "").strip():
             raise ValueError(f"router tier {tier_name!r} requires model")
         selection_mode = TierConfig.from_value(tier).ensemble_selection_mode
+        raw_ensemble_enabled = tier.get(
+            "ensemble_enabled",
+            tier.get("ensembleEnabled"),
+        )
+        if raw_ensemble_enabled is not None and not isinstance(
+            raw_ensemble_enabled, bool
+        ):
+            raise ValueError(
+                f"router tier {tier_name!r} ensembleEnabled must be a boolean"
+            )
         if (
             selection_mode
             and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES
@@ -1119,6 +1154,35 @@ def upsert_router(
         # A genuine enable is a strategy switch: route through the canonical
         # mode patch (ensemble off, rollout_phase full, force-persisted).
         apply_model_routing_mode(new_cfg, "router")
+    shared_tier_enabled = bool(
+        getattr(new_cfg.squilla_router, "enabled", False)
+    ) and any(
+        TierConfig.from_value(tier).ensemble_enabled is True
+        for tier in (getattr(new_cfg.squilla_router, "tiers", {}) or {}).values()
+    )
+    if shared_tier_enabled and not ensemble_selection_configured(new_cfg):
+        activation = ensemble_activation_patches(new_cfg)
+        if activation:
+            ensemble_payload = new_cfg.llm_ensemble.model_dump(mode="python")
+            generated_fields: set[str] = set()
+            if "llm_ensemble.selection_mode" in activation:
+                ensemble_payload["selection_mode"] = activation[
+                    "llm_ensemble.selection_mode"
+                ]
+                generated_fields.add("selection_mode")
+            if "llm_ensemble.candidates" in activation:
+                ensemble_payload["candidates"] = activation[
+                    "llm_ensemble.candidates"
+                ]
+                generated_fields.add("candidates")
+            materialized = LlmEnsembleConfig(**ensemble_payload)
+            fields_set = set(
+                getattr(new_cfg.llm_ensemble, "model_fields_set", set())
+            ) | generated_fields
+            object.__setattr__(materialized, "__pydantic_fields_set__", fields_set)
+            new_cfg.llm_ensemble = materialized
+            for field_name in generated_fields:
+                new_cfg.mark_force_persist(f"llm_ensemble.{field_name}")
     # Otherwise this is ladder/settings maintenance on an already-enabled
     # router (the common Web UI tier-table save and CLI default-tier path).
     # Applying the mode patch here would silently escalate an operator's
@@ -1256,8 +1320,10 @@ def upsert_llm_ensemble(
         activation = ensemble_activation_patches(config)
         if activation:
             merged["selection_mode"] = activation["llm_ensemble.selection_mode"]
-            merged["candidates"] = activation["llm_ensemble.candidates"]
-            generated_fields.update({"selection_mode", "candidates"})
+            generated_fields.add("selection_mode")
+            if "llm_ensemble.candidates" in activation:
+                merged["candidates"] = activation["llm_ensemble.candidates"]
+                generated_fields.add("candidates")
             explicit_fields.update(generated_fields)
 
     try:
