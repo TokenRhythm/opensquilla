@@ -77,12 +77,54 @@
       </div>
       <div class="chat-thread-shell">
         <div
+          v-if="forkTransition"
+          class="chat-fork-transition-overlay"
+          data-testid="chat-fork-transition-overlay"
+        >
+          <div
+            class="chat-fork-transition-status"
+            :class="{ 'chat-fork-transition-status--error': forkTransition.phase === 'error' }"
+            :role="forkTransition.phase === 'error' ? 'alert' : 'status'"
+            :aria-live="forkTransition.phase === 'error' ? 'assertive' : 'polite'"
+            aria-atomic="true"
+            data-testid="chat-fork-transition-status"
+          >
+            <span
+              v-if="forkTransition.phase !== 'error'"
+              class="chat-fork-transition-status__spinner"
+              aria-hidden="true"
+            />
+            <Icon v-else name="info" :size="15" aria-hidden="true" />
+            <span class="chat-fork-transition-status__copy">{{ forkTransition.phase === 'error'
+              ? t('chat.forkOpenFailed')
+              : forkTransition.phase === 'creating'
+                ? t('chat.forkCreating')
+                : forkTransition.phase === 'returning'
+                  ? t('chat.forkReturning')
+                  : t('chat.forkOpening') }}</span>
+            <template v-if="forkTransition.phase === 'error'">
+              <button
+                type="button"
+                class="btn btn--ghost chat-fork-transition-status__action"
+                data-testid="chat-fork-retry"
+                @click="retryForkTransition"
+              >{{ t('chat.reloadSession') }}</button>
+              <button
+                type="button"
+                class="btn btn--ghost chat-fork-transition-status__action"
+                data-testid="chat-fork-return"
+                @click="returnToForkParent"
+              >{{ t('chat.forkReturnOriginal') }}</button>
+            </template>
+          </div>
+        </div>
+        <div
           ref="threadRef"
           class="chat-thread"
           role="region"
           tabindex="0"
           :aria-label="t('chat.conversation')"
-          :aria-busy="isStreaming"
+          :aria-busy="isStreaming || forkInFlight"
           @scroll="onThreadScroll"
           @wheel.passive="onThreadWheel"
           @touchmove.passive="markThreadScrollIntent('either')"
@@ -102,25 +144,25 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="visibleHistoryRecoveryState"
+          v-if="!forkTransition && visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
           :state="visibleHistoryRecoveryState"
           @retry="retryHistory"
         />
         <ChatSessionRecoveryStatus
-          v-if="liveRecoveryState"
+          v-if="!forkTransition && liveRecoveryState"
           :key="`${sessionKey}:live`"
           :state="liveRecoveryState"
           @retry="retryLive"
         />
         <div
-          v-if="showConfirmedEmptySession"
+          v-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
         >
           {{ t('chat.noMessagesYet') }}
         </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding"
+          v-if="!isNewChatLanding && !forkTransition"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
           :loading="historyState.loadingEarlier"
@@ -134,9 +176,16 @@
           @retry="retryHistory"
         />
 
+        <div
+          class="chat-message-surface"
+          :class="{ 'chat-message-surface--preview': forkTransition }"
+          :inert="forkTransition ? true : undefined"
+          :aria-hidden="forkTransition ? 'true' : undefined"
+          :data-preview-session="forkTransition?.parentKey"
+        >
         <ChatMessageList
-          :messages="renderedMessages"
-          :session-key="sessionKey"
+          :messages="forkTransition?.previewMessages || renderedMessages"
+          :session-key="forkTransition?.parentKey || sessionKey"
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
           :workbench-enabled="workbenchEnabled"
@@ -181,6 +230,7 @@
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
         </ChatMessageList>
+        </div>
 
         <!-- Manual or turn-boundary compaction has no assistant turn to own
              it. Keep one quiet transcript maintenance row instead of a
@@ -398,7 +448,7 @@
         </template>
         </div>
         <ConversationMinimap
-          v-if="!isNewChatLanding && !shareMode"
+          v-if="!isNewChatLanding && !shareMode && !forkTransition"
           :messages="renderedMessages"
           :scroll-container="threadRef"
           :strip-time-prefix="stripTimePrefix"
@@ -510,7 +560,7 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
-      :input-disabled="Boolean(dockedPlanQuestionnaire)"
+      :input-disabled="Boolean(dockedPlanQuestionnaire) || Boolean(forkTransition)"
       :run-mode="runMode"
       :allowed-run-modes="composerAllowedRunModes"
       :safe-setup-available="composerSafeSetupAvailable"
@@ -772,6 +822,15 @@ import type {
   HiddenControlDispatchResult,
   ToolResultContext,
 } from '@/types/chat'
+import {
+  createForkTransitionLifetime,
+  forkNavigationPhase,
+  forkRouteHandoffAction,
+  forkRpcRequest,
+  snapshotForkPreviewMessages,
+  validatedForkChildKey,
+  type ForkRpcResponse,
+} from '@/utils/chat/forkTransition'
 import type {
   ArtifactPayload,
   MetaDraftDiscardResponse,
@@ -1017,6 +1076,26 @@ const autoScroll = ref(true)
 const historyNavigationScrollLock = createHistoryNavigationScrollLock(autoScroll)
 const composing = ref(false)
 const messages = ref<Message[]>([])
+
+type ForkTransitionPhase = 'creating' | 'opening' | 'returning' | 'error'
+
+interface ForkTransitionState {
+  generation: number
+  parentKey: string
+  childKey: string
+  targetKey: string
+  throughTurnId?: string
+  phase: ForkTransitionPhase
+  errorReason?: 'navigation' | 'history' | 'live'
+  /** Render-only snapshot; never becomes the child session's canonical messages. */
+  previewMessages: ChatRenderedMessage[]
+}
+
+const forkTransition = ref<ForkTransitionState | null>(null)
+const forkInFlight = computed(() => (
+  forkTransition.value !== null && forkTransition.value.phase !== 'error'
+))
+const forkTransitionLifetime = createForkTransitionLifetime()
 
 // Session / UI
 const lastHeaderRole = ref('')
@@ -1565,6 +1644,7 @@ const {
   isDraftRoute,
   persistSession,
   readProjectFromUrl,
+  readSessionFromUrl,
   resolveInitialSession,
 } = chatSessionRoute
 
@@ -1708,6 +1788,7 @@ const chatHistory = useChatHistory({
   scrollToBottom,
 })
 const {
+  historySessionKey,
   historyState,
   loadHistory,
   loadEarlierHistory,
@@ -3068,7 +3149,18 @@ const activeProjectComposerBlockMessage = computed(() => {
 })
 
 const composerSendBlockedMessage = computed(() =>
-  modelImageSendBlockedMessage.value
+  (forkTransition.value
+    ? t(
+        forkTransition.value.phase === 'error'
+          ? 'chat.forkOpenFailed'
+          : forkTransition.value.phase === 'creating'
+            ? 'chat.forkCreating'
+            : forkTransition.value.phase === 'returning'
+              ? 'chat.forkReturning'
+              : 'chat.forkOpening',
+      )
+    : '')
+  || modelImageSendBlockedMessage.value
   || liveSendBlockedReason.value
   || activeProjectComposerBlockMessage.value,
 )
@@ -3507,26 +3599,167 @@ function closeDeliverables() {
 
 /* ── Fork ──────────────────────────────────────────────────────────── */
 
-// Whole-conversation fork from the tip: the backend copies the transcript
-// into a sibling session, then we navigate there the same way the session
-// switcher does (route query change → switchToSession).
-const forkInFlight = ref(false)
+function clearForkTransition(generation?: number) {
+  if (
+    generation !== undefined
+    && forkTransition.value?.generation !== generation
+  ) return
+  const clearedGeneration = generation ?? forkTransition.value?.generation
+  forkTransition.value = null
+  forkTransitionLifetime.invalidate(clearedGeneration)
+}
 
-async function forkConversation() {
-  const parentKey = sessionKey.value
-  if (!parentKey || forkInFlight.value) return
-  if (pendingSessionIntent.value === 'new_chat') return
-  forkInFlight.value = true
+function isForkTransitionActive(generation: number): boolean {
+  return Boolean(
+    chatViewActive
+    && !chatViewDisposed
+    && forkTransitionLifetime.isCurrent(generation)
+    && forkTransition.value?.generation === generation
+  )
+}
+
+function failForkTransition(
+  generation: number,
+  reason: NonNullable<ForkTransitionState['errorReason']>,
+  error: unknown,
+) {
+  if (!isForkTransitionActive(generation)) return
+  const transition = forkTransition.value!
+  console.warn('Fork child hand-off failed:', error instanceof Error ? error.message : error)
+  const firstFailure = transition.phase !== 'error'
+  forkTransition.value = {
+    ...transition,
+    phase: 'error',
+    errorReason: reason,
+  }
+  if (firstFailure) pushToast(t('chat.toast.forkOpenFailed'), { tone: 'warn' })
+}
+
+async function retryForkTransition() {
+  const transition = forkTransition.value
+  if (
+    !transition?.targetKey
+    || transition.phase !== 'error'
+    || !isForkTransitionActive(transition.generation)
+  ) return
+  const retryPhase = forkNavigationPhase(transition.targetKey, transition.parentKey)
+  forkTransition.value = {
+    ...transition,
+    phase: retryPhase,
+    errorReason: undefined,
+  }
   try {
-    const res = await rpc.call<{ key?: string }>('sessions.fork', { key: parentKey })
-    const childKey = typeof res?.key === 'string' ? res.key : ''
-    if (!childKey) throw new Error('sessions.fork returned no key')
-    router.push({ path: '/chat', query: { session: childKey } }).catch(() => {})
+    if (
+      sessionKey.value !== transition.targetKey
+      || readSessionFromUrl() !== transition.targetKey
+    ) {
+      const navigationFailure = await router.push({
+        path: '/chat',
+        query: { session: transition.targetKey },
+      })
+      if (!isForkTransitionActive(transition.generation)) return
+      if (navigationFailure && readSessionFromUrl() !== transition.targetKey) {
+        throw navigationFailure
+      }
+      return
+    }
+    if (livePhase.value === 'degraded') void retryLive()
+    void retryHistory()
+  } catch (error) {
+    failForkTransition(transition.generation, 'navigation', error)
+  }
+}
+
+async function returnToForkParent() {
+  const transition = forkTransition.value
+  if (!transition || !isForkTransitionActive(transition.generation)) return
+  if (
+    sessionKey.value === transition.parentKey
+    && readSessionFromUrl() === transition.parentKey
+  ) {
+    if (
+      transition.targetKey === transition.parentKey
+      && historySessionKey.value === transition.parentKey
+      && historyState.value.initialLoadStatus !== 'ready'
+    ) {
+      if (transition.phase === 'error') {
+        await retryForkTransition()
+        if (!isForkTransitionActive(transition.generation)) return
+      }
+      return
+    }
+    clearForkTransition(transition.generation)
+    return
+  }
+  forkTransition.value = {
+    ...transition,
+    targetKey: transition.parentKey,
+    phase: 'returning',
+    errorReason: undefined,
+  }
+  try {
+    const navigationFailure = await router.push({
+      path: '/chat',
+      query: { session: transition.parentKey },
+    })
+    if (!isForkTransitionActive(transition.generation)) return
+    if (navigationFailure && readSessionFromUrl() !== transition.parentKey) {
+      throw navigationFailure
+    }
+  } catch (error) {
+    failForkTransition(transition.generation, 'navigation', error)
+  }
+}
+
+async function forkConversation(throughTurnId?: string) {
+  const parentKey = sessionKey.value
+  if (!parentKey || forkTransition.value) return
+  if (pendingSessionIntent.value === 'new_chat' || isStreaming.value) return
+  const normalizedTurnId = throughTurnId?.trim() || undefined
+  const generation = forkTransitionLifetime.begin()
+  if (!generation) return
+  forkTransition.value = {
+    generation,
+    parentKey,
+    childKey: '',
+    targetKey: parentKey,
+    ...(normalizedTurnId ? { throughTurnId: normalizedTurnId } : {}),
+    phase: 'creating',
+    previewMessages: snapshotForkPreviewMessages(renderedMessages.value, normalizedTurnId),
+  }
+  try {
+    const request = forkRpcRequest(parentKey, normalizedTurnId)
+    const res = await rpc.call<ForkRpcResponse>(request.method, request.params)
+    if (!isForkTransitionActive(generation)) return
+    const childKey = validatedForkChildKey(res, normalizedTurnId)
+    if (sessionKey.value !== parentKey) {
+      clearForkTransition(generation)
+      return
+    }
+    forkTransition.value = {
+      ...forkTransition.value,
+      childKey,
+      targetKey: childKey,
+      phase: 'opening',
+    }
+    const navigationFailure = await router.push({
+      path: '/chat',
+      query: { session: childKey },
+    })
+    if (!isForkTransitionActive(generation)) return
+    if (navigationFailure && readSessionFromUrl() !== childKey) {
+      throw navigationFailure
+    }
   } catch (err) {
-    console.warn('Fork failed:', err)
-    pushToast(t('chat.toast.forkFailed'), { tone: 'danger' })
-  } finally {
-    forkInFlight.value = false
+    if (!isForkTransitionActive(generation)) return
+    const childCreated = Boolean(forkTransition.value?.childKey)
+    if (childCreated) {
+      failForkTransition(generation, 'navigation', err)
+    } else if (forkTransition.value?.generation === generation) {
+      console.warn('Fork failed:', err)
+      clearForkTransition(generation)
+      pushToast(t('chat.toast.forkFailed'), { tone: 'danger' })
+    }
   }
 }
 
@@ -4285,6 +4518,8 @@ onMounted(async () => {
 onUnmounted(() => {
   chatViewActive = false
   chatViewDisposed = true
+  forkTransitionLifetime.dispose()
+  forkTransition.value = null
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
   draftProjectHydration.invalidate()
@@ -4327,6 +4562,20 @@ useDocumentEvent('keydown', onDocumentKeydown)
 watch(() => route.query.session, async (newSession) => {
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
+  const transition = forkTransition.value
+  if (transition) {
+    const handoffAction = forkRouteHandoffAction(newSession, transition)
+    if (handoffAction === 'returning') {
+      forkTransition.value = {
+        ...transition,
+        targetKey: transition.parentKey,
+        phase: 'returning',
+        errorReason: undefined,
+      }
+    } else if (handoffAction === 'clear') {
+      clearForkTransition(transition.generation)
+    }
+  }
   if (newSession && typeof newSession === 'string') {
     recordSessionNavigationDiag('route.query.session', {
       from: sessionKey.value,
@@ -4336,6 +4585,54 @@ watch(() => route.query.session, async (newSession) => {
     await switchToSession(newSession)
   }
 })
+
+// A route switch briefly retains the parent's terminal history status. Require
+// the history composable to bind to the child key before treating `ready` as
+// hand-off completion, otherwise the preview would disappear one tick early.
+watch(
+  () => [
+    sessionKey.value,
+    historySessionKey.value,
+    historyState.value.initialLoadStatus,
+  ] as const,
+  ([activeKey, loadedKey, status]) => {
+    const transition = forkTransition.value
+    if (
+      !transition
+      || transition.phase === 'creating'
+      || !transition.targetKey
+      || activeKey !== transition.targetKey
+      || loadedKey !== transition.targetKey
+    ) return
+    if (status === 'ready') {
+      clearForkTransition(transition.generation)
+    } else if (status === 'error') {
+      failForkTransition(
+        transition.generation,
+        'history',
+        new Error('Child history failed to load'),
+      )
+    }
+  },
+)
+
+watch(
+  () => [sessionKey.value, livePhase.value] as const,
+  ([activeKey, phase]) => {
+    const transition = forkTransition.value
+    if (
+      transition?.phase !== 'creating'
+      && transition?.targetKey === activeKey
+      && phase === 'degraded'
+    ) {
+      failForkTransition(
+        transition.generation,
+        'live',
+        new Error('Child live subscription unavailable'),
+      )
+    }
+  },
+)
 
 // Entering the draft route resets to a clean draft for the requested agent.
 watch(() => [route.path, route.query.agent, route.query.project], async () => {

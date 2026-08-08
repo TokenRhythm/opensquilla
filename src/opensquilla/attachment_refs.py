@@ -123,16 +123,23 @@ def copy_transcript_material(
     media_root: Path,
     source_session_id: str,
     target_session_id: str,
+    material_ids: set[str] | frozenset[str] | None = None,
 ) -> int:
     """Duplicate a session's transcript attachment material into a forked child.
 
     When a session is forked the child transcript references the same attachments by
     content hash, but the material store is keyed by session id, so the child would
     otherwise have nothing on disk to serve over the download route or to replay. This
-    copies every material file from the source session's store into the target's. It is
-    idempotent (existing target files are left untouched) and best-effort (individual
-    copy failures are skipped). Returns the count of files materialized.
+    copies every material file from the source session's store into the target's unless
+    ``material_ids`` restricts the copy to a reachable subset. It is idempotent
+    (existing target files are left untouched) and best-effort (individual copy failures
+    are skipped). Returns the count of files materialized.
     """
+    selected_ids = (
+        None
+        if material_ids is None
+        else {_validate_sha256(material_id) for material_id in material_ids}
+    )
     source_dir = transcript_material_dir(media_root, source_session_id)
     native_source_dir = native_io_path(source_dir)
     if not native_source_dir.is_dir():
@@ -146,6 +153,8 @@ def copy_transcript_material(
         # Material files are named by their 64-char sha256 digest; skip atomic-write
         # temp files and anything else that is not a content hash.
         if len(name) != 64 or any(ch not in "0123456789abcdef" for ch in name):
+            continue
+        if selected_ids is not None and name not in selected_ids:
             continue
         target_path = target_dir / name
         if native_io_path(target_path).exists():

@@ -8,8 +8,10 @@ import inspect
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
+import weakref
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -256,6 +258,254 @@ async def _branch_with_session_mutation_lock(
     # not yet expose the mutation-context seam.
     async with lock:
         return await branch(parent_key, child_key, **kwargs)
+
+
+_FORK_TITLE_SUFFIX_RE = re.compile(r"^(?P<base>.+) \((?P<number>[2-9][0-9]*)\)$")
+_FORK_TITLE_SCAN_PAGE_SIZE = 500
+_FORK_TITLE_ALLOCATOR_GUARD = threading.Lock()
+_FORK_TITLE_ALLOCATOR_LOCKS: weakref.WeakValueDictionary[
+    tuple[int, int, str, str],
+    asyncio.Lock,
+] = weakref.WeakValueDictionary()
+
+
+def _fork_title_family(title: str) -> tuple[str, int]:
+    """Parse a possible copy suffix without deciding whether it is system-owned."""
+
+    match = _FORK_TITLE_SUFFIX_RE.fullmatch(title)
+    if match is None:
+        return title, 1
+    try:
+        number = int(match.group("number"))
+    except ValueError:
+        return title, 1
+    return match.group("base"), number
+
+
+def _session_fork_title_family(
+    session: Any,
+    *,
+    titles_by_key: dict[str, str],
+    sessions_by_key: dict[str, Any],
+    memo: dict[str, tuple[str, int]],
+    visiting: set[str],
+) -> tuple[str, int]:
+    """Resolve a title family only when fork lineage proves the suffix is generated."""
+
+    session_key = str(getattr(session, "session_key", "") or "")
+    title = titles_by_key.get(session_key, "")
+    cached = memo.get(session_key)
+    if cached is not None:
+        return cached
+    literal = (title, 1)
+    if not session_key or session_key in visiting:
+        return literal
+    if not getattr(session, "forked_from_parent", False):
+        memo[session_key] = literal
+        return literal
+    parent_key = str(getattr(session, "parent_session_key", "") or "")
+    parent = sessions_by_key.get(parent_key)
+    parsed_base, parsed_number = _fork_title_family(title)
+    if parent is None or parsed_number == 1:
+        memo[session_key] = literal
+        return literal
+
+    visiting.add(session_key)
+    try:
+        parent_base, parent_number = _session_fork_title_family(
+            parent,
+            titles_by_key=titles_by_key,
+            sessions_by_key=sessions_by_key,
+            memo=memo,
+            visiting=visiting,
+        )
+    finally:
+        visiting.discard(session_key)
+    resolved = (
+        (parsed_base, parsed_number)
+        if parsed_base == parent_base and parsed_number > parent_number
+        else literal
+    )
+    memo[session_key] = resolved
+    return resolved
+
+
+def _fork_title_allocator_lock(
+    storage: Any,
+    *,
+    agent_id: str,
+    base_title: str,
+) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    key = (id(loop), id(storage), agent_id, base_title)
+    with _FORK_TITLE_ALLOCATOR_GUARD:
+        lock = _FORK_TITLE_ALLOCATOR_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _FORK_TITLE_ALLOCATOR_LOCKS[key] = lock
+        return lock
+
+
+def _session_sidebar_title(
+    session: Any,
+    *,
+    transcript_title: str,
+    channel_types: dict[str, str],
+) -> str:
+    view = build_session_view_item(
+        session,
+        entry_count=0,
+        task_rows=[],
+        now_ms=int(time.time() * 1000),
+        transcript_title=transcript_title,
+        channel_types=channel_types,
+    )
+    return str(view.get("title") or "")
+
+
+async def _fork_title_state(
+    ctx: RpcContext,
+    storage: Any,
+    parent: Any,
+) -> tuple[str, int]:
+    """Return the lineage-aware title family and current highest copy number."""
+
+    parent_key = str(getattr(parent, "session_key", "") or "")
+    agent_id = _effective_agent_id_for_session(parent, parent_key)
+    sessions: list[Any] = []
+    offset = 0
+    while True:
+        page = await storage.list_sessions(
+            agent_id=agent_id,
+            limit=_FORK_TITLE_SCAN_PAGE_SIZE,
+            offset=offset,
+        )
+        sessions.extend(page)
+        if len(page) < _FORK_TITLE_SCAN_PAGE_SIZE:
+            break
+        offset += len(page)
+
+    if all(getattr(session, "session_key", None) != parent.session_key for session in sessions):
+        sessions.append(parent)
+
+    transcript_titles = await _list_transcript_titles(storage, sessions)
+    channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    sessions_by_key = {
+        str(getattr(session, "session_key", "") or ""): session for session in sessions
+    }
+    titles_by_key = {
+        str(getattr(session, "session_key", "") or ""): _session_sidebar_title(
+            session,
+            transcript_title=transcript_titles.get(getattr(session, "session_id", ""), ""),
+            channel_types=channel_types,
+        )
+        for session in sessions
+    }
+    memo: dict[str, tuple[str, int]] = {}
+    base_title, parent_number = _session_fork_title_family(
+        parent,
+        titles_by_key=titles_by_key,
+        sessions_by_key=sessions_by_key,
+        memo=memo,
+        visiting=set(),
+    )
+    highest_number = parent_number
+    for candidate in sessions:
+        candidate_base, candidate_number = _session_fork_title_family(
+            candidate,
+            titles_by_key=titles_by_key,
+            sessions_by_key=sessions_by_key,
+            memo=memo,
+            visiting=set(),
+        )
+        if candidate_base == base_title:
+            highest_number = max(highest_number, candidate_number)
+    return base_title, highest_number
+
+
+async def _next_fork_display_name(ctx: RpcContext, storage: Any, parent: Any) -> str:
+    """Allocate the next copy-style title using the same title contract as sessions.list."""
+
+    base_title, highest_number = await _fork_title_state(ctx, storage, parent)
+    return f"{base_title} ({highest_number + 1})"
+
+
+@contextlib.asynccontextmanager
+async def _fork_title_allocation_context(
+    ctx: RpcContext,
+    storage: Any,
+    parent: Any,
+):
+    """Serialize one title family while holding the source session mutation lock."""
+
+    parent_key = str(getattr(parent, "session_key", "") or "")
+    parent_lock = get_session_lock(ctx.turn_runner, parent_key)
+
+    @contextlib.asynccontextmanager
+    async def allocation_locked():
+        current_parent = await storage.get_session(parent_key)
+        if current_parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        base_title, _highest_number = await _fork_title_state(ctx, storage, current_parent)
+        agent_id = _effective_agent_id_for_session(current_parent, parent_key)
+        allocator_lock = _fork_title_allocator_lock(
+            storage,
+            agent_id=agent_id,
+            base_title=base_title,
+        )
+        async with allocator_lock:
+            yield
+
+    if parent_lock is None:
+        async with allocation_locked():
+            yield
+        return
+    async with parent_lock:
+        async with allocation_locked():
+            yield
+
+
+async def _fork_with_numbered_title(
+    ctx: RpcContext,
+    storage: Any,
+    parent_key: str,
+    child_key: str,
+    *,
+    explicit_title: str | None,
+    **branch_kwargs: Any,
+) -> Any:
+    """Create and title a fork while holding the parent's mutation lock when available."""
+
+    async def create_with_display_name(display_name: str) -> Any:
+        return await ctx.session_manager.branch(
+            parent_key,
+            child_key,
+            display_name=display_name,
+            **branch_kwargs,
+        )
+
+    async def create_explicit_locked() -> Any:
+        parent = await storage.get_session(parent_key)
+        if parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        assert explicit_title is not None
+        return await create_with_display_name(explicit_title)
+
+    parent = await storage.get_session(parent_key)
+    if parent is None:
+        raise KeyError(f"Session not found: {parent_key}")
+    if explicit_title:
+        lock = get_session_lock(ctx.turn_runner, parent_key)
+        if lock is None:
+            return await create_explicit_locked()
+        async with lock:
+            return await create_explicit_locked()
+    async with _fork_title_allocation_context(ctx, storage, parent):
+        current_parent = await storage.get_session(parent_key)
+        if current_parent is None:
+            raise KeyError(f"Session not found: {parent_key}")
+        display_name = await _next_fork_display_name(ctx, storage, current_parent)
+        return await create_with_display_name(display_name)
 
 
 def _clean_cancel_source(value: Any, default: str) -> str:
@@ -862,6 +1112,32 @@ def _optional_string_param(params: dict | None, *names: str) -> str | None:
         value = value.strip()
         return value or None
     return None
+
+
+def _optional_aliased_non_empty_string_param(
+    params: dict | None,
+    *names: str,
+) -> str | None:
+    """Resolve aliases without allowing a present alias to erase another value."""
+
+    if not isinstance(params, dict):
+        return None
+    present = [(name, params[name]) for name in names if name in params]
+    if not present:
+        return None
+    normalized: list[tuple[str, str]] = []
+    for name, value in present:
+        if not isinstance(value, str):
+            raise ValueError(f"params.{name} must be a string")
+        value = value.strip()
+        if not value:
+            raise ValueError(f"params.{name} must not be empty")
+        normalized.append((name, value))
+    distinct = {value for _, value in normalized}
+    if len(distinct) != 1:
+        joined = " and ".join(f"params.{name}" for name, _ in normalized)
+        raise ValueError(f"{joined} must match when both aliases are provided")
+    return normalized[0][1]
 
 
 def _effective_agent_id_for_session(session: Any | None, session_key: str) -> str:
@@ -1938,9 +2214,14 @@ async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
     return result
 
 
-@_d.method("sessions.fork", scope="operator.write")
-async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
-    """Fork a session into a new webchat-routable child with a copied transcript."""
+async def _fork_session_impl(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    require_through_turn: bool,
+) -> dict:
+    """Fork a session using the legacy or capability-safe through-turn contract."""
+
     key = _require_key(params)
     assert isinstance(params, dict)
     title = params.get("title")
@@ -1951,6 +2232,18 @@ async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
         "beforeMessageId",
         "before_message_id",
     )
+    through_turn_id = _optional_aliased_non_empty_string_param(
+        params,
+        "throughTurnId",
+        "through_turn_id",
+    )
+    if require_through_turn:
+        if any(name in params for name in ("beforeMessageId", "before_message_id")):
+            raise ValueError("sessions.forkThroughTurn does not accept beforeMessageId")
+        if through_turn_id is None:
+            raise ValueError("params.throughTurnId is required")
+    if before_message_id and through_turn_id:
+        raise ValueError("beforeMessageId and throughTurnId are mutually exclusive")
 
     if ctx.session_manager is None:
         raise KeyError("No session manager available")
@@ -1964,19 +2257,17 @@ async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
 
     agent_id = _effective_agent_id_for_session(parent, key)
     child_key = _create_session_key(agent_id, "webchat")
-    child = await _branch_with_session_mutation_lock(
-        ctx.session_manager,
-        ctx.turn_runner,
+    child = await _fork_with_numbered_title(
+        ctx,
+        storage,
         key,
         child_key,
+        explicit_title=title,
         fork_transcript=True,
         status=SessionStatus.DONE,
         fork_before_message_id=before_message_id,
+        fork_through_turn_id=through_turn_id,
     )
-
-    display_name = title or getattr(parent, "display_name", None)
-    if display_name:
-        await ctx.session_manager.update(child.session_key, display_name=display_name)
 
     await _emit_to_subscribers(
         ctx,
@@ -1985,7 +2276,29 @@ async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
         build_sessions_changed_payload(child.session_key, "forked", run_status="idle"),
     )
 
-    return {"key": child.session_key, "parentKey": key}
+    result = {"key": child.session_key, "parentKey": key}
+    if through_turn_id is not None:
+        result.update(
+            {
+                "forkMode": "through_turn",
+                "throughTurnId": through_turn_id,
+            }
+        )
+    return result
+
+
+@_d.method("sessions.fork", scope="operator.write")
+async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
+    """Fork a session using the backwards-compatible full/prefix contract."""
+
+    return await _fork_session_impl(params, ctx, require_through_turn=False)
+
+
+@_d.method("sessions.forkThroughTurn", scope="operator.write")
+async def _handle_sessions_fork_through_turn(params: dict | None, ctx: RpcContext) -> dict:
+    """Fork through one terminal turn without a silent full-fork fallback."""
+
+    return await _fork_session_impl(params, ctx, require_through_turn=True)
 
 
 async def _should_auto_title(
@@ -2483,7 +2796,6 @@ async def _handle_sessions_send(
 
     if fork_before_message_id is not None:
         parent_key = key
-        parent_display_name = getattr(session, "display_name", None)
         agent_id = _effective_agent_id_for_session(session, parent_key)
         child_key = _create_session_key(agent_id, "webchat")
         prepare_prefix_branch = getattr(ctx.session_manager, "prepare_prefix_branch", None)
@@ -2510,18 +2822,17 @@ async def _handle_sessions_send(
             session = atomic_intent_plan.node
             key = child_key
         else:
-            session = await _branch_with_session_mutation_lock(
-                ctx.session_manager,
-                ctx.turn_runner,
+            session = await _fork_with_numbered_title(
+                ctx,
+                storage,
                 parent_key,
                 child_key,
+                explicit_title=None,
                 fork_transcript=True,
                 status=SessionStatus.DONE,
                 fork_before_message_id=fork_before_message_id,
             )
             key = child_key
-            if parent_display_name:
-                session = await ctx.session_manager.update(key, display_name=parent_display_name)
             await _emit_to_subscribers(
                 ctx,
                 key,
@@ -3378,6 +3689,25 @@ async def _handle_sessions_send(
         ):
             message_text = persisted_entry.content
 
+    async def _accept_turn_with_fork_title(
+        *args: Any,
+        **kwargs: Any,
+    ) -> TurnAcceptanceResult:
+        """Persist a prefix edit and its numbered title in one allocation window."""
+
+        if atomic_intent_plan is None or atomic_intent_plan.action != "fork":
+            return await storage.accept_turn(*args, **kwargs)
+        title_parent = atomic_intent_plan.previous_node
+        if title_parent is None:
+            raise RuntimeError("Fork acceptance is missing its parent session")
+        async with _fork_title_allocation_context(ctx, storage, title_parent):
+            atomic_intent_plan.node.display_name = await _next_fork_display_name(
+                ctx,
+                storage,
+                title_parent,
+            )
+            return await storage.accept_turn(*args, **kwargs)
+
     if atomic_runtime_acceptance:
         assert task_runtime is not None
         assert atomic_intent_plan is not None
@@ -3434,7 +3764,7 @@ async def _handle_sessions_send(
                 accepted_session_updates["collaboration_mode"] = (
                     required_collaboration_mode
                 )
-            acceptance = await storage.accept_turn(
+            acceptance = await _accept_turn_with_fork_title(
                 persisted_entry,
                 expected_epoch=expected_epoch,
                 updated_at=int(time.time() * 1000),
@@ -3921,7 +4251,7 @@ async def _handle_sessions_send(
 
         async def _commit_and_schedule_direct() -> TurnAcceptanceResult:
             nonlocal fresh_user_session, user_message_id
-            acceptance = await storage.accept_turn(
+            acceptance = await _accept_turn_with_fork_title(
                 persisted_entry,
                 expected_epoch=expected_epoch,
                 updated_at=int(time.time() * 1000),

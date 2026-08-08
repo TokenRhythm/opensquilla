@@ -33,6 +33,11 @@ from opensquilla.session.storage import (
     StorageBusyError,
     bounded_interactive_storage_reads,
 )
+from opensquilla.turn_outcome_projection import (
+    extract_fork_terminal_outcome_projection,
+    terminal_turn_outcome,
+    turn_id_from_context,
+)
 
 _d = get_dispatcher()
 log = structlog.get_logger(__name__)
@@ -136,41 +141,81 @@ async def _chat_history_turn_outcomes(
 ) -> list[dict[str, Any]]:
     """Return typed outcomes only for explicit turn ids present in this page."""
 
-    turn_ids = {
-        str(turn_id)
+    entry_turns = [
+        (entry, turn_id)
         for entry in entries
-        if isinstance((turn_context := getattr(entry, "turn_context", None)), dict)
-        and isinstance((turn_id := turn_context.get("turn_id")), str)
-        and turn_id
-    }
+        if (turn_id := turn_id_from_context(getattr(entry, "turn_context", None)))
+        is not None
+    ]
+    turn_ids = {turn_id for _entry, turn_id in entry_turns}
     if not turn_ids:
         return []
+
+    outcomes_by_turn: dict[str, dict[str, Any]] = {}
+    conflicting_projections: set[str] = set()
+    for entry, turn_id in entry_turns:
+        entry_session_id = getattr(entry, "session_id", None)
+        entry_session_key = getattr(entry, "session_key", None)
+        if (
+            not isinstance(entry_session_id, str)
+            or entry_session_key != session_key
+            or turn_id in conflicting_projections
+        ):
+            continue
+        projection = extract_fork_terminal_outcome_projection(
+            getattr(entry, "turn_context", None),
+            session_id=entry_session_id,
+            session_key=session_key,
+            turn_id=turn_id,
+        )
+        if projection is None:
+            continue
+        previous = outcomes_by_turn.get(turn_id)
+        if previous is not None and previous != projection:
+            outcomes_by_turn.pop(turn_id, None)
+            conflicting_projections.add(turn_id)
+            continue
+        outcomes_by_turn[turn_id] = projection
+
+    def _sorted_outcomes() -> list[dict[str, Any]]:
+        outcomes = list(outcomes_by_turn.values())
+        outcomes.sort(
+            key=lambda item: (
+                int(item.get("started_at") or 0),
+                str(item.get("task_id") or ""),
+            )
+        )
+        return outcomes
+
+    missing_turn_ids = turn_ids - outcomes_by_turn.keys()
+    if not missing_turn_ids:
+        return _sorted_outcomes()
+
     storage = get_session_storage(getattr(ctx, "session_manager", None))
     exact_tasks = getattr(storage, "get_agent_tasks_by_ids", None)
     get_task = getattr(storage, "get_agent_task", None)
     list_tasks = getattr(storage, "list_agent_tasks", None)
     try:
         if callable(exact_tasks):
-            rows = await exact_tasks(sorted(turn_ids))
+            rows = await exact_tasks(sorted(missing_turn_ids))
         elif callable(get_task):
             rows = [
                 row
-                for turn_id in sorted(turn_ids)
+                for turn_id in sorted(missing_turn_ids)
                 if (row := await get_task(turn_id)) is not None
             ]
         elif callable(list_tasks):
             rows = await list_tasks(session_key=session_key)
         else:
-            return []
+            return _sorted_outcomes()
     except Exception:  # noqa: BLE001 - history remains readable without outcomes.
         log.warning(
             "chat.history.turn_outcomes_failed",
             session_key=session_key,
             exc_info=True,
         )
-        return []
+        return _sorted_outcomes()
 
-    outcomes: list[dict[str, Any]] = []
     for row in rows:
         task_id = getattr(row, "task_id", None)
         details = getattr(row, "details", None)
@@ -178,46 +223,23 @@ async def _chat_history_turn_outcomes(
         turn_id = details.get("turn_id") or task_id
         status = getattr(row, "status", None)
         status = str(getattr(status, "value", status) or "")
-        outcome = details.get("turn_outcome")
-        if not isinstance(outcome, dict):
-            # Upgrade compatibility: older task rows predate typed outcomes.
-            # Derive only from that row's own explicit terminal status; never
-            # inspect neighboring transcript roles or repeated user messages.
-            legacy_kind = {
-                "succeeded": "completed",
-                "failed": "failed",
-                "cancelled": "interrupted",
-                "timeout": "interrupted",
-                "abandoned": "interrupted",
-            }.get(status)
-            if legacy_kind is None:
-                continue
-            outcome = {
-                "kind": legacy_kind,
-                "reason": status,
-            }
+        outcome = terminal_turn_outcome(status, details.get("turn_outcome"))
+        if outcome is None:
+            continue
         if (
             not isinstance(turn_id, str)
-            or turn_id not in turn_ids
+            or turn_id not in missing_turn_ids
         ):
             continue
-        outcomes.append(
-            {
-                "turn_id": turn_id,
-                "task_id": task_id,
-                "status": status,
-                "started_at": getattr(row, "started_at", None),
-                "finished_at": getattr(row, "finished_at", None),
-                "outcome": dict(outcome),
-            }
-        )
-    outcomes.sort(
-        key=lambda item: (
-            int(item.get("started_at") or 0),
-            str(item.get("task_id") or ""),
-        )
-    )
-    return outcomes
+        outcomes_by_turn[turn_id] = {
+            "turn_id": turn_id,
+            "task_id": task_id,
+            "status": status,
+            "started_at": getattr(row, "started_at", None),
+            "finished_at": getattr(row, "finished_at", None),
+            "outcome": outcome,
+        }
+    return _sorted_outcomes()
 
 
 def _chat_history_cursor(entry: object | None) -> str | None:

@@ -314,6 +314,81 @@
   outline: none;
 }
 
+.chat-message-surface {
+  display: contents;
+}
+
+.chat-message-surface--preview {
+  user-select: none;
+}
+
+.chat-fork-transition-overlay {
+  position: absolute;
+  inset-inline: 0;
+  top: var(--sp-2);
+  z-index: 5;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.chat-fork-transition-status {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: fit-content;
+  max-width: min(calc(100% - 2rem), 42.5rem);
+  min-height: 2rem;
+  margin: var(--sp-1) auto 0;
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--bg-elevated) 94%, transparent);
+  box-shadow: var(--shadow-xs);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  pointer-events: auto;
+}
+
+.chat-fork-transition-status__spinner {
+  width: 0.875rem;
+  height: 0.875rem;
+  flex: 0 0 auto;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--text-muted);
+  border-radius: 50%;
+  animation: chat-fork-transition-spin 0.8s linear infinite;
+}
+
+.chat-fork-transition-status--error {
+  flex-wrap: wrap;
+  border-color: color-mix(in srgb, var(--warn) 36%, var(--border));
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg-elevated));
+  color: var(--text);
+}
+
+.chat-fork-transition-status__copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.chat-fork-transition-status--error > svg {
+  color: var(--warn);
+}
+
+.chat-fork-transition-status__action {
+  flex: 0 1 auto;
+  max-width: 100%;
+  min-height: 1.625rem;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-xs);
+  white-space: normal;
+}
+
+@keyframes chat-fork-transition-spin {
+  to { transform: rotate(360deg); }
+}
+
 /* The thread scrollbar now sits at the true screen edge — give it a hit area
    worth flinging a cursor at (the global default is a 6px sliver). */
 .chat-thread::-webkit-scrollbar {
@@ -1092,6 +1167,10 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .chat-fork-transition-status__spinner {
+    animation: none;
+  }
+
   .chat-drop-overlay__beacon {
     animation: none;
   }
@@ -1104,6 +1183,14 @@
 
 /* Mobile */
 @media (max-width: 768px) {
+  .chat-fork-transition-status--error {
+    width: calc(100% - 1rem);
+  }
+
+  .chat-fork-transition-status__action {
+    flex: 1 1 calc(50% - var(--sp-1));
+  }
+
   .chat--new-landing {
     padding: clamp(3.25rem, 13vh, 5.5rem) 0.75rem 1.25rem;
     gap: 0.875rem;

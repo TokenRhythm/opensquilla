@@ -213,6 +213,7 @@ METHOD_SCOPES: dict[str, str] = {
     "search.query": WRITE_SCOPE,
     "sessions.create": WRITE_SCOPE,
     "sessions.fork": WRITE_SCOPE,
+    "sessions.forkThroughTurn": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
     "plans.capabilities": READ_SCOPE,
     "plans.setMode": WRITE_SCOPE,
