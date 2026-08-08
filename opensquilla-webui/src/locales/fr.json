@@ -539,12 +539,30 @@
       "appearance": "Apparence",
       "keyboard": "Clavier",
       "advanced": "Avancé",
+      "pet": "Animal de compagnie",
       "groups": {
         "gateway": "Passerelle",
         "ai": "Configuration IA",
         "preferences": "Préférences",
         "capabilities": "Capacités"
       }
+    },
+    "pet": {
+      "desktopOnly": "Les paramètres du compagnon sont disponibles uniquement dans l'application de bureau.",
+      "loading": "Chargement des paramètres du compagnon…",
+      "visibilityLabel": "Afficher le compagnon",
+      "visibilityDesc": "Afficher ou masquer la fenêtre du compagnon sur le bureau.",
+      "show": "Afficher le compagnon",
+      "hide": "Masquer le compagnon",
+      "mischiefLabel": "Mode espiègle",
+      "mischiefDesc": "Activé, le compagnon vole le curseur et s'accroche aux fenêtres.",
+      "muteLabel": "Son",
+      "muteDesc": "Désactiver les sons de notification du compagnon.",
+      "modeLabel": "Apparence",
+      "modeDesc": "Forme de la fenêtre du compagnon.",
+      "modePet": "Compagnon",
+      "modePanel": "Panneau",
+      "modeMenubar": "Barre de menus"
     }
   },
   "errorBoundary": {

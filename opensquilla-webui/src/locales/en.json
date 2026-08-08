@@ -590,12 +590,30 @@
       "appearance": "Appearance",
       "keyboard": "Keyboard",
       "advanced": "Advanced",
+      "pet": "Pet",
       "groups": {
         "gateway": "Gateway",
         "ai": "AI configuration",
         "preferences": "Preferences",
         "capabilities": "Capabilities"
       }
+    },
+    "pet": {
+      "desktopOnly": "Pet settings are only available in the desktop app.",
+      "loading": "Loading pet settings…",
+      "visibilityLabel": "Show pet",
+      "visibilityDesc": "Show or hide the desktop pet window.",
+      "show": "Show pet",
+      "hide": "Hide pet",
+      "mischiefLabel": "Mischief mode",
+      "mischiefDesc": "When enabled the pet will steal your cursor, perch on windows, and follow the pointer.",
+      "muteLabel": "Sound",
+      "muteDesc": "Disable the pet's notification sounds.",
+      "modeLabel": "Appearance",
+      "modeDesc": "How the pet window is presented.",
+      "modePet": "Pet",
+      "modePanel": "Panel",
+      "modeMenubar": "Menu bar"
     }
   },
   "errorBoundary": {

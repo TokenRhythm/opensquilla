@@ -539,12 +539,30 @@
       "appearance": "Apariencia",
       "keyboard": "Teclado",
       "advanced": "Avanzado",
+      "pet": "Mascota",
       "groups": {
         "gateway": "Puerta de enlace",
         "ai": "Configuración de IA",
         "preferences": "Preferencias",
         "capabilities": "Capacidades"
       }
+    },
+    "pet": {
+      "desktopOnly": "La configuración de la mascota solo está disponible en la aplicación de escritorio.",
+      "loading": "Cargando configuración de la mascota…",
+      "visibilityLabel": "Mostrar mascota",
+      "visibilityDesc": "Mostrar u ocultar la ventana de la mascota en el escritorio.",
+      "show": "Mostrar mascota",
+      "hide": "Ocultar mascota",
+      "mischiefLabel": "Modo travieso",
+      "mischiefDesc": "Cuando está activado, la mascota roba el cursor y se aferra a las ventanas.",
+      "muteLabel": "Sonido",
+      "muteDesc": "Desactivar los sonidos de notificación de la mascota.",
+      "modeLabel": "Apariencia",
+      "modeDesc": "Cómo se muestra la ventana de la mascota.",
+      "modePet": "Mascota",
+      "modePanel": "Panel",
+      "modeMenubar": "Barra de menú"
     }
   },
   "errorBoundary": {

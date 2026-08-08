@@ -539,12 +539,30 @@
       "appearance": "外観",
       "keyboard": "キーボード",
       "advanced": "詳細設定",
+      "pet": "ペット",
       "groups": {
         "gateway": "ゲートウェイ",
         "ai": "AI 設定",
         "preferences": "環境設定",
         "capabilities": "機能"
       }
+    },
+    "pet": {
+      "desktopOnly": "ペット設定はデスクトップ版のみ利用できます。",
+      "loading": "ペット設定を読み込み中…",
+      "visibilityLabel": "ペットを表示",
+      "visibilityDesc": "デスクトップ上のペットウィンドウを表示・非表示にします。",
+      "show": "ペットを表示",
+      "hide": "ペットを隠す",
+      "mischiefLabel": "いたずらモード",
+      "mischiefDesc": "有効にするとペットがカーソルを奪ったり、ウィンドウに張り付いたりします。",
+      "muteLabel": "サウンド",
+      "muteDesc": "ペットの通知音を無効にします。",
+      "modeLabel": "形態",
+      "modeDesc": "ペットウィンドウの表示形態。",
+      "modePet": "ペット",
+      "modePanel": "パネル",
+      "modeMenubar": "メニューバー"
     }
   },
   "errorBoundary": {

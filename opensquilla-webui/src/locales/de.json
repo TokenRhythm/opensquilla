@@ -539,12 +539,30 @@
       "appearance": "Darstellung",
       "keyboard": "Tastatur",
       "advanced": "Erweitert",
+      "pet": "Haustier",
       "groups": {
         "gateway": "Gateway",
         "ai": "AI-Konfiguration",
         "preferences": "Einstellungen",
         "capabilities": "Fähigkeiten"
       }
+    },
+    "pet": {
+      "desktopOnly": "Haustier-Einstellungen sind nur in der Desktop-App verfügbar.",
+      "loading": "Haustier-Einstellungen werden geladen…",
+      "visibilityLabel": "Haustier anzeigen",
+      "visibilityDesc": "Haustierfenster auf dem Desktop anzeigen oder ausblenden.",
+      "show": "Haustier anzeigen",
+      "hide": "Haustier ausblenden",
+      "mischiefLabel": "Frechmodus",
+      "mischiefDesc": "Aktiviert stiehlt das Haustier den Cursor und klammert sich an Fenster.",
+      "muteLabel": "Ton",
+      "muteDesc": "Benachrichtigungstöne des Haustiers deaktivieren.",
+      "modeLabel": "Erscheinung",
+      "modeDesc": "Darstellung des Haustierfensters.",
+      "modePet": "Haustier",
+      "modePanel": "Panel",
+      "modeMenubar": "Menüleiste"
     }
   },
   "errorBoundary": {

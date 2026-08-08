@@ -1,4 +1,5 @@
 import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, protocol, safeStorage, shell, Tray } from 'electron'
+import { createPetBackend, type PetBackend } from './pet/pet-backend.js'
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -370,6 +371,34 @@ const shouldUseNativeApplicationMenu = process.platform === 'darwin'
 let mainWindow: BrowserWindow | null = null
 let onboardingWindow: BrowserWindow | null = null
 let windowsTray: Tray | null = null
+// Embedded desktop pet. Started once the gateway is ready and stopped on
+// will-quit. Guarded so a gateway restart never spawns a second pet.
+let petBackend: PetBackend | null = null
+let petBackendUrl = ''
+
+function startPetBackend(gatewayUrl: string): void {
+  if (petBackend && petBackendUrl === gatewayUrl) return
+  try {
+    if (petBackend) petBackend.stop()
+    petBackend = createPetBackend({
+      gatewayUrl,
+      version: app.getVersion(),
+      getMainWindow: () => mainWindow,
+      onTrayChanged: () => rebuildWindowsTrayMenu(),
+    })
+    petBackendUrl = gatewayUrl
+    petBackend.start()
+    rebuildWindowsTrayMenu()
+  } catch (error) {
+    desktopLog('pet_backend_start_failed', {
+      gatewayUrl,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    petBackend = null
+    petBackendUrl = ''
+  }
+}
+
 let appExitPhase: DesktopExitPhase = 'running'
 let systemSessionEnding = false
 let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
@@ -4250,7 +4279,8 @@ function destroyWindowsTray(): void {
 
 function rebuildWindowsTrayMenu(): void {
   if (!windowsTray) return
-  windowsTray.setContextMenu(Menu.buildFromTemplate([
+  const petItems = petBackend?.getTrayMenuItems() ?? []
+  const template: Electron.MenuItemConstructorOptions[] = [
     {
       label: desktopT('tray.open'),
       enabled: canRevealDesktopApp(appExitPhase),
@@ -4260,12 +4290,18 @@ function rebuildWindowsTrayMenu(): void {
       label: desktopT('tray.running'),
       enabled: false,
     },
+  ]
+  if (petItems.length) {
+    template.push({ type: 'separator' }, ...petItems)
+  }
+  template.push(
     { type: 'separator' },
     {
       label: desktopT('tray.quit'),
       click: () => app.quit(),
     },
-  ]))
+  )
+  windowsTray.setContextMenu(Menu.buildFromTemplate(template))
 }
 
 function createWindowsTray(): boolean {
@@ -8548,6 +8584,9 @@ async function openOrResumeDesktopApp(): Promise<void> {
               : await reuseHealthyGatewayState()
             const gateway = reusableGateway ?? await ensureGatewayStarted()
             if (revision === desktopOpenFlowRevision && requestedProfileKey === desktopProfileKey()) {
+              // Start the pet as soon as the gateway is ready — it does not need
+              // the control UI, so a failed UI load must not block it.
+              startPetBackend(gateway.url)
               await loadControlUiIntoCurrentWindow(gateway.url)
             }
           }
@@ -12747,6 +12786,13 @@ app.on('activate', () => {
 })
 
 app.on('will-quit', destroyWindowsTray)
+app.on('will-quit', () => {
+  if (petBackend) {
+    try { petBackend.stop() } catch {}
+    petBackend = null
+    petBackendUrl = ''
+  }
+})
 
 configureChromiumKeychainPolicy()
 

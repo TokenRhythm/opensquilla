@@ -590,12 +590,30 @@
       "appearance": "外观",
       "keyboard": "键盘",
       "advanced": "高级",
+      "pet": "桌宠",
       "groups": {
         "gateway": "网关",
         "ai": "AI 配置",
         "preferences": "偏好设置",
         "capabilities": "能力"
       }
+    },
+    "pet": {
+      "desktopOnly": "桌宠设置仅桌面版可用。",
+      "loading": "正在读取桌宠设置…",
+      "visibilityLabel": "显示桌宠",
+      "visibilityDesc": "显示或隐藏桌面上的桌宠窗口。",
+      "show": "显示桌宠",
+      "hide": "隐藏桌宠",
+      "mischiefLabel": "调皮模式",
+      "mischiefDesc": "开启后桌宠会偷鼠标、趴窗口、跟随光标等。",
+      "muteLabel": "声音",
+      "muteDesc": "关闭后桌宠不再播放提示音。",
+      "modeLabel": "形态",
+      "modeDesc": "桌宠窗口的显示形态。",
+      "modePet": "桌宠",
+      "modePanel": "面板",
+      "modeMenubar": "菜单栏"
     }
   },
   "errorBoundary": {
