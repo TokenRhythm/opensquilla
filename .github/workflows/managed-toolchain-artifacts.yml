@@ -1,0 +1,111 @@
+name: Managed Toolchain Artifact E2E
+
+"on":
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keep this distinct from the caller's concurrency group. Reusable workflows
+  # inherit github.workflow from their caller and must never cancel that caller.
+  group: ${{ github.workflow }}-managed-toolchain-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x64 real artifacts
+            runner: ubuntu-24.04
+            platform_key: linux-x64
+            paper_platform_key: linux-x64
+          - label: Linux arm64 real artifacts
+            runner: ubuntu-24.04-arm
+            platform_key: linux-arm64
+            paper_platform_key: linux-arm64
+          - label: macOS Apple Silicon real artifacts
+            runner: macos-15
+            platform_key: darwin-arm64
+            paper_platform_key: darwin-universal
+          - label: macOS Intel real artifacts
+            runner: macos-15-intel
+            platform_key: darwin-x64
+            paper_platform_key: darwin-universal
+          - label: Windows x64 real artifacts
+            runner: windows-2022
+            platform_key: windows-x64
+            paper_platform_key: windows-x64
+    env:
+      OPENSQUILLA_REQUIRE_MANAGED_TOOLCHAIN_E2E: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure isolated managed-toolchain state
+        shell: bash
+        run: |
+          printf 'OPENSQUILLA_GATEWAY_STATE_DIR=%s/opensquilla-managed-toolchain-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT=%s/opensquilla-managed-toolchain-state/toolchains/v1\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install runtime dependencies
+        run: uv sync --frozen
+
+      - name: Validate real pinned paper archive and capability smoke
+        run: >-
+          uv run --frozen python scripts/validate_managed_toolchain_artifacts.py
+          --component paper-tex
+          --expect-platform-key ${{ matrix.paper_platform_key }}
+          ${{ matrix.platform_key == 'linux-x64' && '--check-runtime-hot-path' || '' }}
+
+      - name: Validate real pinned media archives and capability smoke
+        run: >-
+          uv run --frozen python scripts/validate_managed_toolchain_artifacts.py
+          --component media-ffmpeg
+          --expect-platform-key ${{ matrix.platform_key }}
+
+      - name: Compile the default four-page paper with the managed toolchain
+        run: >-
+          uv run --frozen pytest -q
+          tests/test_skills/test_meta_paper_skills.py::test_meta_default_compact_contract_compiles_real_content_to_four_pages
+
+  validate-musl-paper:
+    name: Linux musl x64 TinyTeX real artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: python:3.12-alpine
+    env:
+      OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT: /tmp/opensquilla-managed-toolchains
+      PYTHONPATH: ${{ github.workspace }}/src
+
+    steps:
+      - name: Prepare Alpine action runtime
+        run: apk add --no-cache fontconfig git nodejs
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # The full lock includes sqlite-vec, which has no musllinux wheel.
+      # This job therefore uses the fixed source-tree bootstrap below instead
+      # of making a glibc compatibility layer part of the capability proof.
+      - name: Validate native musl TinyTeX archive and capability smoke
+        run: >-
+          python scripts/validate_managed_toolchain_artifacts_stdlib.py
+          --component paper-tex
+          --expect-platform-key linux-musl-x64

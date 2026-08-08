@@ -125,6 +125,8 @@ def test_build_buckets_in_home_and_relocated(monkeypatch, tmp_path: Path) -> Non
     by_name = {b.name: b for b in buckets}
     assert by_name["config.toml"].purge_flag == "config"
     assert by_name["state directory"].purge_flag == "state"
+    assert by_name["managed toolchains"].path == home / "state" / "toolchains"
+    assert by_name["managed toolchains"].purge_flag == "state"
     sched = by_name["scheduler DB"]
     assert sched.outside_home is True
     assert sched.sidecars == ("-wal", "-shm")

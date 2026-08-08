@@ -14,6 +14,7 @@ import {
   useToolDetailPreference,
 } from '@/composables/useToolDetailPreference'
 import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
+import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
 import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
@@ -66,6 +67,10 @@ const {
   enabled: routerVisualEffectsEnabled,
   setEnabled: setRouterVisualEffectsEnabled,
 } = useRouterVisualEffectsPreference()
+const {
+  enabled: composerFxEnabled,
+  setEnabled: setComposerFxEnabled,
+} = useComposerFloatingPreference()
 
 function pickToolDetailDisplay(mode: ToolDetailDisplayMode) {
   setToolDetailDisplayMode(mode)
@@ -344,6 +349,22 @@ onBeforeUnmount(stopCustomStepRepeat)
           name="appearance_visual_effects"
           data-testid="settings-visual-effects-toggle"
           @change="setRouterVisualEffectsEnabled"
+        />
+      </div>
+    </div>
+
+    <div class="control-row control-row--stack">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('settings.appearance.composerFxLabel') }}</span>
+        <span class="control-row__desc">{{ t('settings.appearance.composerFxDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <ControlSwitch
+          :checked="composerFxEnabled"
+          :aria-label="t('settings.appearance.composerFxLabel')"
+          name="appearance_composer_fx"
+          data-testid="settings-composer-fx-toggle"
+          @change="setComposerFxEnabled"
         />
       </div>
     </div>

@@ -10,6 +10,7 @@ what execution will do.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from opensquilla.uninstall import safety
@@ -220,6 +221,7 @@ def _plan_data_purge(inventory: Inventory, options: PlanOptions, plan: Uninstall
             "deleting the whole directory."
         )
 
+    scheduled_removal_roots: list[Path] = []
     for bucket in inventory.buckets:
         existing = bucket.existing_paths()
         if not existing:
@@ -252,13 +254,25 @@ def _plan_data_purge(inventory: Inventory, options: PlanOptions, plan: Uninstall
             or (bucket.purge_flag == PURGE_ALL_ONLY and options.purge_all)
         )
         if enabled:
+            # Inventory may expose a notable child bucket (for example managed
+            # toolchains) alongside its containing state directory. Keep that
+            # visibility in dry-run/keep output, but never schedule overlapping
+            # destructive actions for the same tree.
+            uncovered = [
+                path
+                for path in existing
+                if not any(safety.is_within(path, root) for root in scheduled_removal_roots)
+            ]
+            if not uncovered:
+                continue
             plan.actions.append(
                 Action(
                     "remove-path",
                     f"Delete {bucket.name}",
-                    paths=[str(p) for p in existing],
+                    paths=[str(p) for p in uncovered],
                 )
             )
+            scheduled_removal_roots.extend(uncovered)
         else:
             plan.keep.append(f"{bucket.name} ({existing[0]})")
 

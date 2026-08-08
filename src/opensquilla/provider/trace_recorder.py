@@ -157,6 +157,23 @@ class LLMTraceRecorder:
             }
         )
 
+    def record_response_headers(
+        self,
+        *,
+        response_ids: list[str] | None = None,
+    ) -> None:
+        """Record response identity without retaining arbitrary HTTP headers."""
+
+        safe_ids = _redact(response_ids or [])
+        if not safe_ids:
+            return
+        self._append(
+            {
+                "event": "llm.response_headers",
+                "response_ids": safe_ids,
+            }
+        )
+
     def record_response(
         self,
         *,

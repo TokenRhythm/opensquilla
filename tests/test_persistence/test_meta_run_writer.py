@@ -7,6 +7,7 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from opensquilla.persistence.meta_run_writer import (
     _serialize_plan,
     _truncate,
     open_meta_run_writer,
+    replay_inputs_are_modified,
     summarize_run_record,
 )
 from opensquilla.persistence.migrator import apply_pending
@@ -154,6 +156,40 @@ def test_step_lifecycle(writer: MetaRunWriter) -> None:
     assert steps[0].status == "ok"
     assert steps[0].output_text == "alpha-output"
     assert steps[0].effective_skill == "alpha"
+
+
+def test_step_persistence_drops_current_run_receipt_proofs(writer: MetaRunWriter) -> None:
+    plan = _make_plan()
+    run_id = writer.begin_run_sync(
+        meta_skill_name=plan.name,
+        meta_plan=plan,
+        triggered_by="hard_takeover",
+        inputs={"q": "x"},
+        session_key=None,
+        turn_id=None,
+    )
+    proof = f"sha256:{'a' * 64}"
+    writer.begin_step_sync(
+        run_id=run_id,
+        step=plan.steps[0],
+        effective_skill="alpha",
+        rendered_inputs={
+            "runtime": {
+                "paid_submission_dispositions": '{"shot1":"receipt"}',
+                "paid_submission_receipt_proofs": {"shot1": proof},
+            },
+            "__opensquilla_paid_submission_receipt_proofs_v1__": proof,
+        },
+    )
+
+    [step] = writer.get_steps(run_id)
+    persisted = json.loads(step.rendered_inputs_json)
+    assert persisted == {
+        "runtime": {
+            "paid_submission_dispositions": '{"shot1":"receipt"}',
+        },
+    }
+    assert proof not in step.rendered_inputs_json
 
 
 def test_finish_step_works_after_usage_column_rollback(tmp_path: Path) -> None:
@@ -461,6 +497,65 @@ def test_redactor_total_size_budget() -> None:
     assert len(out.encode("utf-8")) <= 4 * 1024 + 64  # tiny overhead allowed
     parsed = json.loads(out)
     assert parsed.get("_redaction_overflow") is True
+
+
+def test_modified_run_inputs_are_marked_and_marker_survives_finalize(
+    writer: MetaRunWriter,
+) -> None:
+    plan = _make_plan()
+    run_id = writer.begin_run_sync(
+        meta_skill_name=plan.name,
+        meta_plan=plan,
+        triggered_by="manual_command",
+        inputs={"user_message": "write a report", "api_key": "sk-synthetic-secret"},
+        session_key="sess-modified-inputs",
+        turn_id="turn-modified-inputs",
+    )
+    assert run_id is not None
+
+    writer.finish_run_sync(
+        run_id=run_id,
+        status="failed",
+        result=MetaResult(ok=False, error="failed", failed_step_id="s1"),
+    )
+    record = writer.get_run(run_id)
+
+    assert record is not None
+    assert json.loads(record.inputs_json)["api_key"] == "[REDACTED]"
+    assert record.truncated_fields == ("inputs_json_modified",)
+    assert replay_inputs_are_modified(record) is True
+
+
+@pytest.mark.parametrize(
+    "inputs_json",
+    [
+        '{"nested": {"_redaction_overflow": true}}',
+        '{"nested": ["[REDACTED]"]}',
+        '{"user_message": "legacy clipped value…"}',
+        "not-json",
+    ],
+)
+def test_replay_inputs_modified_detects_legacy_redaction_markers(
+    writer: MetaRunWriter,
+    inputs_json: str,
+) -> None:
+    plan = _make_plan()
+    run_id = writer.begin_run_sync(
+        meta_skill_name=plan.name,
+        meta_plan=plan,
+        triggered_by="manual_command",
+        inputs={"user_message": "exact request"},
+        session_key="sess-legacy-inputs",
+        turn_id="turn-legacy-inputs",
+    )
+    assert run_id is not None
+    record = writer.get_run(run_id)
+    assert record is not None
+
+    assert replay_inputs_are_modified(
+        replace(record, inputs_json=inputs_json, truncated_fields=())
+    ) is True
+    assert replay_inputs_are_modified(record) is False
 
 
 def test_ulid_known_vector_length_and_alphabet() -> None:

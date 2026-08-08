@@ -2,38 +2,120 @@
 
 from __future__ import annotations
 
+import math
+import os
+import threading
 from collections.abc import Iterator
 
 import structlog
 
 log = structlog.get_logger(__name__)
 
+_ENCODING_UNAVAILABLE = object()
 _encoding = None
-_tiktoken_available: bool | None = None
 _TOKENIZER_CHUNK_CHARS = 100_000
+_ENCODING_LOAD_TIMEOUT_SECONDS = 5.0
+_ENCODING_LOAD_TIMEOUT_MAX_SECONDS = min(60.0, threading.TIMEOUT_MAX)
+_ENCODING_LOAD_TIMEOUT_ENV = "OPENSQUILLA_TIKTOKEN_LOAD_TIMEOUT_SECONDS"
+_load_lock = threading.Lock()
 
 TokenEstimateSource = str
 
 
+def _reset_load_lock_after_fork() -> None:
+    """Discard a possibly orphaned loader lock in a forked child."""
+
+    global _load_lock
+    _load_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_load_lock_after_fork)
+
+
+def _load_timeout_seconds() -> float:
+    """Return a finite, platform-safe budget for the one-time encoding load."""
+
+    raw = os.environ.get(_ENCODING_LOAD_TIMEOUT_ENV) or ""
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return _ENCODING_LOAD_TIMEOUT_SECONDS
+    if (
+        not math.isfinite(value)
+        or value <= 0
+        or value > _ENCODING_LOAD_TIMEOUT_MAX_SECONDS
+    ):
+        return _ENCODING_LOAD_TIMEOUT_SECONDS
+    return value
+
+
+def _load_encoding():
+    """Import tiktoken and resolve cl100k_base. May block on network I/O."""
+
+    import tiktoken
+
+    return tiktoken.get_encoding("cl100k_base")
+
+
 def _get_encoding():
-    global _encoding, _tiktoken_available
-    if _tiktoken_available is False:
+    global _encoding
+    if _encoding is _ENCODING_UNAVAILABLE:
         return None
     if _encoding is not None:
         return _encoding
-    try:
-        import tiktoken
+    with _load_lock:
+        # Re-check under the lock; a concurrent caller may have settled it.
+        if _encoding is _ENCODING_UNAVAILABLE:
+            return None
+        if _encoding is not None:
+            return _encoding
 
-        _encoding = tiktoken.get_encoding("cl100k_base")
-        _tiktoken_available = True
-        return _encoding
-    except ImportError:
-        _tiktoken_available = False
-        log.info("tiktoken_unavailable_fallback")
-        return None
-    except Exception as exc:  # noqa: BLE001
-        _tiktoken_available = False
-        log.warning("tiktoken_encoding_unavailable_fallback", error=str(exc))
+        outcome: dict[str, object] = {}
+
+        def _work() -> None:
+            try:
+                outcome["encoding"] = _load_encoding()
+            except ImportError as exc:
+                outcome["import_error"] = exc
+            except Exception as exc:  # noqa: BLE001
+                outcome["error"] = exc
+
+        timeout = _load_timeout_seconds()
+        worker = threading.Thread(
+            target=_work,
+            name="opensquilla-tiktoken-load",
+            daemon=True,
+        )
+        try:
+            worker.start()
+            worker.join(timeout)
+        except Exception as exc:  # noqa: BLE001
+            # Thread exhaustion and platform timeout errors must preserve the
+            # estimator's historical fallback contract rather than escape into
+            # request admission or gateway coroutines.
+            _encoding = _ENCODING_UNAVAILABLE
+            log.warning("tiktoken_encoding_load_worker_failed", error=str(exc))
+            return None
+
+        if worker.is_alive():
+            # The daemon may finish later and populate tiktoken's own cache, but
+            # this process keeps a stable fallback verdict until restart.
+            _encoding = _ENCODING_UNAVAILABLE
+            log.warning("tiktoken_encoding_load_timeout", timeout_seconds=timeout)
+            return None
+        if "encoding" in outcome:
+            _encoding = outcome["encoding"]
+            return _encoding
+        if "import_error" in outcome:
+            _encoding = _ENCODING_UNAVAILABLE
+            log.info("tiktoken_unavailable_fallback")
+            return None
+        _encoding = _ENCODING_UNAVAILABLE
+        log.warning(
+            "tiktoken_encoding_unavailable_fallback",
+            error=str(outcome.get("error")),
+        )
         return None
 
 

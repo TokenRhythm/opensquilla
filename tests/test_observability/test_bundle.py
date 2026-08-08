@@ -52,6 +52,12 @@ def _make_home(tmp_path: Path, *, desktop: bool = False) -> tuple[Path, Path]:
         (user_data / "logs" / "desktop.log").write_text(
             '{"at":"2026-07-07T00:00:00Z","event":"launch"}\n', encoding="utf-8"
         )
+        (user_data / "logs" / "desktop.log.1").write_text(
+            '{"at":"2026-07-06T00:00:00Z","event":"previous-launch"}\n', encoding="utf-8"
+        )
+        (user_data / "logs" / "desktop.log.2").write_text(
+            '{"at":"2026-07-05T00:00:00Z","event":"older-launch"}\n', encoding="utf-8"
+        )
         (user_data / "logs" / "gateway.log").write_text("gateway child out\n", encoding="utf-8")
         (user_data / "desktop-credential.json").write_text("{}", encoding="utf-8")
     else:
@@ -99,6 +105,21 @@ def _read_zip(path: Path) -> dict[str, bytes]:
 
 def test_default_bundle_contents_and_redaction(tmp_path) -> None:
     home, log_dir = _make_home(tmp_path)
+    active = home / "state/toolchains/v1/active"
+    active.mkdir(parents=True)
+    (active / "paper-tex.json").write_text(
+        json.dumps(
+            {
+                "component_id": "paper-tex",
+                "version": "2026.05",
+                "platform_key": "test-x64",
+                "install_backend": "archive",
+                "package_relpath": "/private/machine/path",
+                "secret": FAKE_KEY,
+            }
+        ),
+        encoding="utf-8",
+    )
     dest = tmp_path / "bundle.zip"
 
     result = collect_bundle(dest, home_dir=home, log_dir=log_dir)
@@ -108,6 +129,17 @@ def test_default_bundle_contents_and_redaction(tmp_path) -> None:
     assert "manifest.json" in entries
     assert "logs/debug.log" in entries
     assert "errors.jsonl" in entries
+    assert "toolchains.json" in entries
+    assert json.loads(entries["toolchains.json"]) == [
+        {
+            "component_id": "paper-tex",
+            "active": True,
+            "version": "2026.05",
+            "platform_key": "test-x64",
+            "install_backend": "archive",
+        }
+    ]
+    assert b"/private/machine/path" not in entries["toolchains.json"]
     assert any(name.startswith("decisions/") for name in entries)
     assert any(name.startswith("traces/") for name in entries)
     # Default tier: no raw turn-call capture, no transcript content.
@@ -144,6 +176,8 @@ def test_desktop_logs_are_derived_and_credential_excluded(tmp_path) -> None:
 
     entries = _read_zip(dest)
     assert "desktop/desktop.log" in entries
+    assert "desktop/desktop.log.1" in entries
+    assert "desktop/desktop.log.2" in entries
     assert "desktop/gateway.log" in entries
     assert not any("desktop-credential" in name for name in entries)
 

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+import pytest
 
 from tui_real_terminal.driver import TerminalSize
 
@@ -37,6 +41,78 @@ class TuiTarget:
     capability_requirements: tuple[str, ...]
     available: bool = True
     skip_reason: str | None = None
+
+
+def opentui_host_skip_reason(env: Mapping[str, str]) -> str | None:
+    """Reason the OpenTUI host ``env`` selects cannot launch, or None when it can.
+
+    Both backends drive the real fd bridge, so without Bun or an installed
+    ``@opentui/core`` the app never prints its readiness marker and the driver
+    fails on a wait timeout that names neither. These scenarios already skip
+    when tmux or the terminal capabilities are missing; a checkout that has not
+    run ``bun install`` is the same kind of missing precondition, and
+    CONTRIBUTING asks the default path to stay fork-safe.
+
+    The probe has to be asked about the host that will actually launch.
+    ``check_opentui_host_available`` defaults ``use_source_host`` to
+    ``source_host_requested()``, which reads the *pytest* process environment —
+    but the source-host switch lives in the ``env`` handed to the subprocess.
+    Probing without it asks about the packaged companion instead, and this
+    project does not publish one, so the answer is unavailable no matter how
+    the checkout is provisioned. Taking ``env`` keeps the question and the
+    launch pointed at the same host.
+
+    Kept separate from ``TuiTarget.available`` so target construction keeps
+    describing the target rather than the machine it would run on.
+    """
+    from opensquilla.cli.tui.opentui.bridge import (  # type: ignore[import-untyped]
+        DEFAULT_HOST_PACKAGE_DIR,
+        check_opentui_host_available,
+    )
+    from opensquilla.cli.tui.opentui.host_runtime import (  # type: ignore[import-untyped]
+        source_host_requested,
+    )
+    from opensquilla.cli.tui.renderers.selection import (  # type: ignore[import-untyped]
+        RendererBackendUnavailableReason,
+    )
+
+    use_source_host = source_host_requested(env)
+    runtime_bin: str | None = None
+    if use_source_host:
+        main_script = DEFAULT_HOST_PACKAGE_DIR / "src" / "main.mjs"
+        if not main_script.is_file():
+            raise AssertionError(f"OpenTUI source host entrypoint is missing: {main_script}")
+        runtime_bin = shutil.which("bun", path=env.get("PATH", os.defpath))
+        if runtime_bin is None:
+            return "Bun is not installed or is not on PATH"
+
+    availability = check_opentui_host_available(
+        runtime_bin=runtime_bin,
+        use_source_host=use_source_host,
+    )
+    if availability.available:
+        return None
+    if availability.reason_code is not RendererBackendUnavailableReason.MISSING:
+        code = availability.reason_code or RendererBackendUnavailableReason.UNKNOWN
+        raise AssertionError(
+            f"OpenTUI host probe failed with {code.value}: "
+            f"{availability.reason or 'no reason provided'}"
+        )
+    return availability.reason or "OpenTUI host unavailable"
+
+
+def opentui_host_capability_gate(
+    env: Mapping[str, str],
+    *,
+    require_capabilities: bool,
+) -> None:
+    """Skip an optional missing host, or fail when capabilities are required."""
+    reason = opentui_host_skip_reason(env)
+    if reason is None:
+        return
+    if require_capabilities:
+        pytest.fail(f"required real-terminal capability is unavailable: {reason}")
+    pytest.skip(reason)
 
 
 def build_tui_target(backend_id: str, context: TargetContext) -> TuiTarget:

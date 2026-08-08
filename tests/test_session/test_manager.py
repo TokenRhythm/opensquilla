@@ -22,6 +22,8 @@ from opensquilla.session.context_view import (
 )
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
     PlanRunRecord,
     SessionContextState,
     SessionIntent,
@@ -34,6 +36,10 @@ from opensquilla.session.storage import (
     CANONICAL_FORK_PROOF_SCHEMA_VERSION,
     SessionStorage,
     StaleEpochError,
+)
+from opensquilla.turn_outcome_projection import (
+    attach_fork_terminal_outcome_projection,
+    build_fork_terminal_outcome_projection,
 )
 
 
@@ -1196,6 +1202,543 @@ async def test_branch_before_message_missing_id_does_not_create_child(manager):
         )
 
     assert await manager.get_session("agent:main:direct:missing") is None
+
+
+@pytest.mark.asyncio
+async def test_branch_through_terminal_turn_is_inclusive_and_excludes_promoted_future_input(
+    manager,
+):
+    parent = await manager.create("agent:main:main")
+    turn_id = "turn-complete"
+    promoted_turn_id = "turn-promoted-next"
+    entries = [
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="question",
+            turn_context={"turn_id": turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="future promoted input must not leak",
+            turn_context={
+                "disposition": "promoted",
+                "promoted_turn_id": promoted_turn_id,
+                "turn_id": turn_id,
+                "target_turn_id": turn_id,
+            },
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="calling tool",
+            tool_calls=[{"id": "call-1", "name": "lookup", "arguments": {}}],
+            turn_context={"turn_id": turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="tool",
+            content="tool result",
+            tool_call_id="call-1",
+            turn_context={"turn_id": turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="final answer",
+            turn_context={"turn_id": turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="system",
+            content="unscoped trailing system row must not be guessed into the turn",
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="later answer must not leak",
+            turn_context={"turn_id": promoted_turn_id},
+        ),
+    ]
+    for entry in entries:
+        await manager._storage.append_transcript_entry(entry)
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+    parent.compaction_count = 1
+    await manager._storage.upsert_session(parent)
+    await manager._storage.save_summary(
+        SessionSummary(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            compaction_id="zero-row-compaction",
+            summary_text="must not be inherited by a historical prefix",
+        )
+    )
+    await manager.save_context_state(
+        SessionContextState(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            provider="portable",
+            state_kind="structured_summary_v1",
+            payload={"user_goal": "later parent state"},
+            portable=True,
+            cacheable=True,
+        )
+    )
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:direct:through-turn",
+        fork_transcript=True,
+        fork_through_turn_id=turn_id,
+    )
+
+    assert child.forked_from_parent is True
+    assert [
+        (entry.role, entry.content)
+        for entry in await manager.get_transcript(child.session_key)
+    ] == [
+        ("user", "question"),
+        ("assistant", "calling tool"),
+        ("tool", "tool result"),
+        ("assistant", "final answer"),
+    ]
+    assert [entry.content for entry in await manager.get_transcript(parent.session_key)] == [
+        "question",
+        "future promoted input must not leak",
+        "calling tool",
+        "tool result",
+        "final answer",
+        "unscoped trailing system row must not be guessed into the turn",
+        "later answer must not leak",
+    ]
+    assert await manager.get_summaries(child.session_key) == []
+    assert await manager.get_context_states(child.session_key) == []
+
+
+@pytest.mark.asyncio
+async def test_branch_through_promoted_turn_uses_promoted_turn_identity(manager):
+    parent = await manager.create("agent:main:main")
+    first_turn_id = "turn-first"
+    promoted_turn_id = "turn-promoted"
+    entries = [
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="first question",
+            turn_context={"turn_id": first_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="promoted question",
+            turn_context={
+                "disposition": "promoted",
+                "promoted_turn_id": promoted_turn_id,
+                "turn_id": first_turn_id,
+                "target_turn_id": first_turn_id,
+            },
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="first answer finishes after promotion",
+            turn_context={"turn_id": first_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="promoted answer",
+            turn_context={"turn_id": promoted_turn_id},
+        ),
+    ]
+    for entry in entries:
+        await manager._storage.append_transcript_entry(entry)
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=promoted_turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:direct:promoted-turn",
+        fork_transcript=True,
+        fork_through_turn_id=promoted_turn_id,
+    )
+
+    assert [entry.content for entry in await manager.get_transcript(child.session_key)] == [
+        "first question",
+        "promoted question",
+        "first answer finishes after promotion",
+        "promoted answer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_materializes_target_from_canonical_archive(manager):
+    parent = await manager.create("agent:main:main")
+    target_turn_id = "turn-in-archive"
+    later_turn_id = "turn-active-tail"
+    entries = [
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="archived question",
+            turn_context={"turn_id": target_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="archived tool request",
+            tool_calls=[{"id": "archived-call", "name": "lookup", "arguments": {}}],
+            turn_context={"turn_id": target_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="tool",
+            content="archived tool output",
+            tool_call_id="archived-call",
+            turn_context={"turn_id": target_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="archived final answer",
+            turn_context={"turn_id": target_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="active later question",
+            turn_context={"turn_id": later_turn_id},
+        ),
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="active later answer",
+            turn_context={"turn_id": later_turn_id},
+        ),
+    ]
+    for entry in entries:
+        await manager._storage.append_transcript_entry(entry)
+    installed = await manager.persist_compaction_result(
+        parent.session_key,
+        "Archived target turn summary",
+        [
+            {"role": "user", "content": "active later question"},
+            {"role": "assistant", "content": "active later answer"},
+        ],
+        compaction_id="cmp-archived-through-turn",
+    )
+    assert installed is True
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=target_turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+    async with manager._storage.conn.execute(
+        "SELECT COUNT(*) FROM compacted_transcript_entries "
+        "WHERE session_id = ? AND compaction_id = ?",
+        (parent.session_id, "cmp-archived-through-turn"),
+    ) as cursor:
+        archived_target_count = int((await cursor.fetchone())[0])
+    assert archived_target_count == 4
+    assert [entry.content for entry in await manager.get_transcript(parent.session_key)] == [
+        "active later question",
+        "active later answer",
+    ]
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:direct:archived-through-turn",
+        fork_transcript=True,
+        fork_through_turn_id=target_turn_id,
+    )
+
+    assert [entry.content for entry in await manager.get_transcript(child.session_key)] == [
+        "archived question",
+        "archived tool request",
+        "archived tool output",
+        "archived final answer",
+    ]
+    child_page = await manager.get_canonical_transcript_page(child.session_key, limit=20)
+    assert child_page.canonical_complete is True
+    assert child.compaction_count == 0
+    assert await manager.get_summaries(parent.session_key)
+    assert await manager.get_context_states(parent.session_key)
+    assert await manager.get_summaries(child.session_key) == []
+    assert await manager.get_context_states(child.session_key) == []
+
+
+@pytest.mark.asyncio
+async def test_full_fork_rebinds_archived_terminal_outcome_for_later_nested_fork(manager):
+    parent = await manager.create("agent:main:archived-outcome-parent")
+    turn_id = "turn-archived-outcome"
+    later_turn_id = "turn-archived-outcome-later"
+    for role, content, entry_turn_id in (
+        ("user", "archived question", turn_id),
+        ("assistant", "archived answer", turn_id),
+        ("user", "active question", later_turn_id),
+    ):
+        await manager._storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=parent.session_id,
+                session_key=parent.session_key,
+                role=role,
+                content=content,
+                turn_context={"turn_id": entry_turn_id},
+            )
+        )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+    assert await manager.persist_compaction_result(
+        parent.session_key,
+        "archived outcome summary",
+        [
+            {
+                "role": "user",
+                "content": "active question",
+                "turn_context": {"turn_id": later_turn_id},
+            }
+        ],
+        compaction_id="cmp-archived-outcome",
+    )
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:archived-outcome-child",
+        fork_transcript=True,
+    )
+    await manager._storage.delete_session(parent.session_key)
+    assert await manager._storage.get_agent_task(turn_id) is None
+
+    nested = await manager.branch(
+        child.session_key,
+        "agent:main:archived-outcome-grandchild",
+        fork_transcript=True,
+        fork_through_turn_id=turn_id,
+    )
+    assert [entry.content for entry in await manager.get_transcript(nested.session_key)] == [
+        "archived question",
+        "archived answer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_rejects_missing_active_and_incomplete_history(manager):
+    parent = await manager.create("agent:main:main")
+    active_turn_id = "turn-active"
+    await manager._storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="user",
+            content="still running",
+            turn_context={"turn_id": active_turn_id},
+        )
+    )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=active_turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.RUNNING,
+        )
+    )
+
+    with pytest.raises(KeyError, match="Transcript turn not found"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:missing-turn",
+            fork_transcript=True,
+            fork_through_turn_id="turn-without-id",
+        )
+    with pytest.raises(ValueError, match="active transcript turn"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:active-turn",
+            fork_transcript=True,
+            fork_through_turn_id=active_turn_id,
+        )
+
+    active = await manager._storage.get_agent_task(active_turn_id)
+    assert active is not None
+    await manager._storage.update_agent_task(
+        active_turn_id,
+        status=AgentTaskStatus.SUCCEEDED,
+    )
+    parent.compaction_count = 1
+    await manager._storage.upsert_session(parent)
+    with pytest.raises(ValueError, match="canonical transcript history is incomplete"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:incomplete-history",
+            fork_transcript=True,
+            fork_through_turn_id=active_turn_id,
+        )
+
+    for child_key in (
+        "agent:main:direct:missing-turn",
+        "agent:main:direct:active-turn",
+        "agent:main:direct:incomplete-history",
+    ):
+        assert await manager.get_session(child_key) is None
+
+
+@pytest.mark.asyncio
+async def test_branch_rejects_conflicting_history_anchors(manager):
+    await manager.create("agent:main:main")
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        await manager.branch(
+            "agent:main:main",
+            "agent:main:direct:conflicting-anchor",
+            fork_transcript=True,
+            fork_before_message_id="message-1",
+            fork_through_turn_id="turn-1",
+        )
+
+    assert await manager.get_session("agent:main:direct:conflicting-anchor") is None
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_rejects_completion_state_owned_by_another_session(manager):
+    parent = await manager.create("agent:main:main")
+    other = await manager.create("agent:main:other")
+    turn_id = "turn-owned-elsewhere"
+    await manager._storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=parent.session_id,
+            session_key=parent.session_key,
+            role="assistant",
+            content="copied-looking row",
+            turn_context={"turn_id": turn_id},
+        )
+    )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=turn_id,
+            session_key=other.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+
+    with pytest.raises(KeyError, match="Completion state not found"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:wrong-task-owner",
+            fork_transcript=True,
+            fork_through_turn_id=turn_id,
+        )
+
+    assert await manager.get_session("agent:main:direct:wrong-task-owner") is None
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_rejects_forged_projection_on_unrelated_session(manager):
+    unrelated = await manager.create("agent:main:unrelated-projection")
+    turn_id = "turn-forged-projection"
+    forged_projection = build_fork_terminal_outcome_projection(
+        session_id=unrelated.session_id,
+        session_key=unrelated.session_key,
+        turn_id=turn_id,
+        task_id=turn_id,
+        status="succeeded",
+        started_at=10,
+        finished_at=20,
+        outcome={"kind": "completed", "reason": "succeeded"},
+    )
+    await manager._storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=unrelated.session_id,
+            session_key=unrelated.session_key,
+            role="assistant",
+            content="copied projection-shaped row",
+            turn_context=attach_fork_terminal_outcome_projection(
+                {"turn_id": turn_id},
+                forged_projection,
+            ),
+        )
+    )
+
+    with pytest.raises(KeyError, match="Completion state not found"):
+        await manager.branch(
+            unrelated.session_key,
+            "agent:main:direct:forged-projection-child",
+            fork_transcript=True,
+            fork_through_turn_id=turn_id,
+        )
+
+    assert await manager.get_session("agent:main:direct:forged-projection-child") is None
+
+
+@pytest.mark.asyncio
+async def test_branch_through_turn_rejects_unscoped_row_inside_target_turn(manager):
+    parent = await manager.create("agent:main:main")
+    turn_id = "turn-with-ambiguous-middle"
+    for role, content, turn_context in (
+        ("user", "question", {"turn_id": turn_id}),
+        ("tool", "unscoped tool output", None),
+        ("assistant", "answer", {"turn_id": turn_id}),
+    ):
+        await manager._storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=parent.session_id,
+                session_key=parent.session_key,
+                role=role,
+                content=content,
+                turn_context=turn_context,
+            )
+        )
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id=turn_id,
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+
+    with pytest.raises(ValueError, match="unscoped canonical rows"):
+        await manager.branch(
+            parent.session_key,
+            "agent:main:direct:ambiguous-middle",
+            fork_transcript=True,
+            fork_through_turn_id=turn_id,
+        )
+
+    assert await manager.get_session("agent:main:direct:ambiguous-middle") is None
 
 
 @pytest.mark.asyncio

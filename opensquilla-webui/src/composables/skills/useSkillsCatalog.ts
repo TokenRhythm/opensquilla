@@ -294,19 +294,31 @@ export function sortSkillsByReady(list: Skill[]): Skill[] {
   })
 }
 
+export function skillProviderCheckAtLaunch(skill: Skill): boolean {
+  const status = skill.status || (skill.eligible ? 'ready' : 'needs_setup')
+  return skill.provider_check_at_launch === true && (
+    status === 'ready' || status === 'not_declared'
+  )
+}
+
 export function skillStatusDotClass(skill: Skill): string {
   const status = skill.status || (skill.eligible ? 'ready' : 'needs_setup')
+  if (skillProviderCheckAtLaunch(skill)) return 'is-provider-check'
   if (status === 'ready') return 'is-ready'
   if (status === 'needs_setup') return 'is-needs'
   return 'is-unverified'
 }
 
 export function skillStatusDotTitle(skill: Skill): string {
+  if (skillProviderCheckAtLaunch(skill)) {
+    return i18n.global.t('cronSkills.skills.statusProviderAtLaunch')
+  }
   return skill.status_detail || (skill.eligible ? i18n.global.t('cronSkills.skills.dotReady') : i18n.global.t('cronSkills.skills.dotNeedsSetup'))
 }
 
 export function skillStatusChipClass(skill: Skill): string {
   const status = skill.status || (skill.eligible ? 'ready' : 'needs_setup')
+  if (skillProviderCheckAtLaunch(skill)) return 'sk-chip--unverified'
   if (status === 'ready') return 'sk-chip--ok'
   if (status === 'not_declared') return 'sk-chip--unverified'
   return 'sk-chip--warn'
@@ -314,6 +326,9 @@ export function skillStatusChipClass(skill: Skill): string {
 
 export function skillStatusChipText(skill: Skill): string {
   const status = skill.status || (skill.eligible ? 'ready' : 'needs_setup')
+  if (skillProviderCheckAtLaunch(skill)) {
+    return i18n.global.t('cronSkills.skills.statusProviderAtLaunch')
+  }
   if (status === 'ready') return i18n.global.t('cronSkills.skills.statusReady')
   if (status === 'not_declared') return i18n.global.t('cronSkills.skills.statusNoDeps')
   return i18n.global.t('cronSkills.skills.statusNeedsDeps')

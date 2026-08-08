@@ -260,6 +260,101 @@ async def test_run_one_streaming_success_yields_events_then_terminating_result(
 
 
 @pytest.mark.asyncio
+async def test_meta_invoke_rejects_global_provider_alias_for_untrusted_parent(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A non-authorized parent cannot turn a global alias into child auth."""
+    from opensquilla.engine.agent import Agent
+    from opensquilla.engine.types import AgentConfig
+    from opensquilla.skills.types import SkillPlatformMeta, SkillRequires
+    from opensquilla.tool_boundary import ToolCall, ToolResult
+    from opensquilla.tools.builtin import meta_tools  # noqa: F401
+    from opensquilla.tools.registry import get_default_registry
+    from opensquilla.tools.types import ToolContext
+    from tests.test_engine.test_runtime_meta_invoke_surfacing import (
+        _make_loader_with_meta,
+    )
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    secret = "synthetic-config-only-openrouter-key"
+    loader = _make_loader_with_meta(tmp_path)
+    spec = loader.get_by_name("meta-tiny")
+    assert spec is not None
+    spec.metadata = SkillPlatformMeta(
+        requires=SkillRequires(env_any=["OPENROUTER_API_KEY"])
+    )
+
+    class _NullProvider:
+        provider_name = "null"
+
+        async def chat(self, *_args, **_kwargs):
+            raise AssertionError("provider.chat must not be called in this test")
+
+        async def list_models(self):
+            return []
+
+    agent = Agent(
+        provider=_NullProvider(),  # type: ignore[arg-type]
+        config=AgentConfig(
+            model_id="stub",
+            max_iterations=1,
+            metadata={
+                "skill_loader": loader,
+                "bootstrap_workspace_dir": str(tmp_path),
+                "meta_readiness_env_aliases": lambda _parent, _plan: (
+                    "OPENROUTER_API_KEY",
+                ),
+                "meta_skill_runtime_env_provider": lambda _parent, _plan: {
+                    "nano-banana-pro": {"OPENROUTER_API_KEY": secret},
+                },
+            },
+        ),
+        tool_definitions=[],
+        tool_handler=None,
+        tool_registry=get_default_registry(),
+    )
+
+    async def fake_llm_chat(_system: str, _user: str) -> str:
+        return "A"
+
+    agent._test_llm_chat_override = fake_llm_chat  # type: ignore[attr-defined]
+    captured: dict[str, object] = {}
+    original_builder = agent._build_meta_orchestrator
+
+    def capture_builder(**kwargs: object):
+        result = original_builder(**kwargs)
+        captured["skill_runtime_env"] = result[0]._skill_runtime_env
+        captured["triggered_by"] = kwargs.get("triggered_by")
+        return result
+
+    monkeypatch.setattr(agent, "_build_meta_orchestrator", capture_builder)
+    tool_call = ToolCall(
+        tool_use_id="u-config-key",
+        tool_name="meta_invoke",
+        arguments={"name": "meta-tiny"},
+    )
+    final = None
+    events = []
+    async for event in agent._run_one_streaming(
+        tool_call,
+        ToolContext(workspace_dir=str(tmp_path), is_owner=True),
+    ):
+        events.append(event)
+        if isinstance(event, ToolResult):
+            final = event
+
+    assert final is not None
+    assert final.is_error is True
+    assert "requires setup" in final.content
+    assert secret not in final.content
+    assert captured == {}
+    assert secret not in repr(tool_call.arguments)
+    assert secret not in repr(events)
+    assert secret not in repr(agent.config.metadata)
+
+
+@pytest.mark.asyncio
 async def test_meta_invoke_llm_chat_step_records_usage(tmp_path) -> None:
     """Meta-skill llm_chat steps call the provider outside the normal Agent
     loop, but their tokens still belong to the parent session usage."""

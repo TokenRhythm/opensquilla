@@ -403,7 +403,7 @@ const props = defineProps<{
   sessionKey?: string
   authToken?: string
   workbenchEnabled?: boolean
-  /** True on the thread's last assistant message — the only place the whole-conversation fork action renders. */
+  /** True for a durable completed turn tip, or the legacy current-tip fallback. */
   isTip?: boolean
   forkBusy?: boolean
   planActionPending?: PlanCardAction | null

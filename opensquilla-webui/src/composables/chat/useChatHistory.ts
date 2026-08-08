@@ -366,7 +366,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   let historySyncTimer: ReturnType<typeof setTimeout> | null = null
   let historyRequestSeq = 0
   let historySyncPending = false
-  let historySessionKey = ''
+  // Exposed read-only by convention so session hand-offs can distinguish the
+  // prior session's terminal `ready` state from the new session's first load.
+  const historySessionKey = ref('')
   let hasLoadedEarlier = false
   let loadEarlierPending = false
   let failedHistoryRequest: FailedHistoryRequest | null = null
@@ -523,10 +525,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function resetForSession(key: string): boolean {
-    if (historySessionKey === key) return false
+    if (historySessionKey.value === key) return false
     cancelAnchorStabilization()
-    const crossedSession = Boolean(historySessionKey)
-    historySessionKey = key
+    const crossedSession = Boolean(historySessionKey.value)
+    historySessionKey.value = key
     hasLoadedEarlier = false
     loadEarlierPending = false
     failedHistoryRequest = null
@@ -861,7 +863,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           restoreMessageAnchor(prependAnchor)
           stopAnchorStabilization = stabilizeMessageAnchor(prependAnchor, {
             isCurrent: () => options.sessionKey.value === key
-              && historySessionKey === key
+              && historySessionKey.value === key
               && historyRequestSeq === requestSeq,
           })
         } else if (prependContainer) {
@@ -1034,6 +1036,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   return {
+    historySessionKey,
     historyState,
     loadHistory,
     loadEarlierHistory,

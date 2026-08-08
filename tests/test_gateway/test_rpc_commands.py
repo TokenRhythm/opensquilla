@@ -213,5 +213,14 @@ def test_dynamic_meta_choices_refresh_once_then_use_one_snapshot() -> None:
 
     assert loader.refresh_calls == ["rpc:commands.list_for_surface"]
     assert meta["argument_choices"] == [
-        {"value": "fresh-meta", "description": "Fresh command choice"}
+        {
+            "value": "fresh-meta",
+            "description": "Fresh command choice",
+            "status": "ready",
+            "missing_bins": [],
+            "missing_env": [],
+            "missing_env_any": [],
+            "missing_skills": [],
+            "missing_capabilities": [],
+        }
     ]

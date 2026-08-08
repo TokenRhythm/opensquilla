@@ -28,9 +28,9 @@ export function messageDate(ts: string | number | null | undefined): Date | null
 // from the i18n runtime.
 export type TimeTranslator = (key: string, named?: Record<string, string | number>) => string
 
-// Compact English forms for one-shot callers that don't carry a translator
-// (e.g. markdown export) and for tests. UI bubbles always inject vue-i18n's t,
-// so their labels follow the active locale instead of being hardcoded.
+// Compact English forms preserve existing non-UI callers and tests that don't
+// carry a translator. Chat UI projections and bubbles inject vue-i18n's t, so
+// their labels follow the active locale instead of being hardcoded.
 const DEFAULT_TRANSLATOR: TimeTranslator = (key, named = {}) => {
   if (key === 'chat.time.justNow') return 'just now'
   if (key === 'chat.time.minutesAgo') return `${named.n}m ago`

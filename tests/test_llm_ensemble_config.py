@@ -21,6 +21,8 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.selection_mode == "static_openrouter_b5"
     assert ensemble.proposer_tools is False
     assert ensemble.min_successful_proposers == 1
+    assert ensemble.target_successful_proposers is None
+    assert ensemble.proposer_max_retries == 0
     assert ensemble.model_options == []
     assert ensemble.candidates == []
     assert ensemble.candidate_max_chars == 24_000
@@ -51,6 +53,8 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     ]
     assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
     assert provider.min_successful_proposers == 3
+    assert provider.target_successful_proposers == 3
+    assert provider.proposer_max_retries == 0
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
@@ -531,6 +535,57 @@ def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> No
     assert provider.proposer_timeout_seconds == 180.0
     assert provider.aggregator_timeout_seconds == 900.0
     assert provider.shuffle_candidates is False
+
+
+def test_static_b5_supports_score_target_above_resilient_floor() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+            "min_successful_proposers": 3,
+            "target_successful_proposers": 4,
+            "proposer_max_retries": 2,
+            "all_failed_policy": "error",
+        }
+    )
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="routed/model",
+            api_key="fake",
+            base_url="https://openrouter.example/api/v1",
+        ),
+        fallback_provider=None,
+    )
+
+    assert provider.min_successful_proposers == 3
+    assert provider.target_successful_proposers == 4
+    assert provider.proposer_max_retries == 2
+    assert provider.all_failed_policy == "error"
+    assert provider.selection_plan["configured_target_successful_proposers"] == 4
+    assert provider.selection_plan["effective_target_successful_proposers"] == 4
+    assert provider.selection_plan["proposer_max_retries"] == 2
+
+
+def test_success_target_cannot_be_below_floor() -> None:
+    with pytest.raises(Exception, match="target_successful_proposers"):
+        GatewayConfig(
+            llm_ensemble={
+                "min_successful_proposers": 3,
+                "target_successful_proposers": 2,
+            }
+        )
+
+
+def test_static_success_target_cannot_exceed_fixed_lineup() -> None:
+    with pytest.raises(Exception, match="static B5 proposer count"):
+        GatewayConfig(
+            llm_ensemble={
+                "selection_mode": "static_openrouter_b5",
+                "target_successful_proposers": 5,
+            }
+        )
 
 
 def _custom_b5_config(**overrides: object) -> GatewayConfig:

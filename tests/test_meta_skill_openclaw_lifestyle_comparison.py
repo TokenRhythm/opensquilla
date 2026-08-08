@@ -7,6 +7,7 @@ from opensquilla.skills.meta.parser import parse_meta_plan
 from opensquilla.skills.meta.templating import evaluate_when
 from scripts.compare_meta_skill_openclaw import EndpointResult, JudgeResult, OpenSquillaRunner
 from scripts.compare_meta_skill_openclaw_lifestyle import (
+    ARCHIVED_COMPATIBILITY_BENCHMARK,
     LIFESTYLE_COMPARISON_CASES,
     OPENCLAW_T3_MODEL,
     _apply_lifestyle_judge_result,
@@ -26,7 +27,10 @@ SELECTED_SKILLS = [
 ]
 
 
-def test_lifestyle_catalog_covers_selected_meta_skills_without_exclusions() -> None:
+def test_lifestyle_catalog_covers_selected_meta_skills_without_exclusions(
+    tmp_path: Path,
+) -> None:
+    assert ARCHIVED_COMPATIBILITY_BENCHMARK is True
     assert [case.skill_name for case in LIFESTYLE_COMPARISON_CASES] == SELECTED_SKILLS
     assert {case.case_id for case in LIFESTYLE_COMPARISON_CASES} == {
         "kid_project_balcony_plants",
@@ -34,6 +38,15 @@ def test_lifestyle_catalog_covers_selected_meta_skills_without_exclusions() -> N
     assert all(case.scenario == "lifestyle_primary" for case in LIFESTYLE_COMPARISON_CASES)
     assert "meta-paper-write" not in {case.skill_name for case in LIFESTYLE_COMPARISON_CASES}
     assert "meta-skill-creator" not in {case.skill_name for case in LIFESTYLE_COMPARISON_CASES}
+
+    loader = SkillLoader(
+        bundled_dir=Path("src/opensquilla/skills/bundled"),
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+    retired = loader.get_by_name("meta-kid-project-planner")
+    assert retired is not None
+    assert retired.disable_model_invocation is True
+    assert retired.name not in {spec.name for spec in loader.list_meta_specs()}
 
 
 def test_selected_meta_skills_are_grounded_in_clawhub_top100_components() -> None:

@@ -2169,6 +2169,7 @@ class TestSessionsSend:
                 "key": session.session_key,
                 "message": "first",
                 "queueMode": "collect",
+                "clientRequestId": "request-collect-1",
                 "clientMessageId": "client-collect-1",
             },
             ctx,
@@ -2180,6 +2181,7 @@ class TestSessionsSend:
                 "key": session.session_key,
                 "message": "second",
                 "queueMode": "collect",
+                "clientRequestId": "request-collect-2",
                 "clientMessageId": "client-collect-2",
             },
             ctx,
@@ -2192,6 +2194,7 @@ class TestSessionsSend:
         assert second.payload["turn_id"] == first.payload["turn_id"]
         assert runtime_storage.turn_context_updates[-1][2] == {
             "turn_id": first.payload["turn_id"],
+            "client_request_id": "request-collect-2",
             "client_message_id": "client-collect-2",
             "surface_id": "web:test-conn",
             "intent": "send",

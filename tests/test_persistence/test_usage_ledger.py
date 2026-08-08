@@ -89,8 +89,8 @@ def test_nano_usd_conversion_is_decimal_and_bounded() -> None:
         usd_to_nanos("10000000000")
 
 
-def test_session_schema_version_includes_project_workspaces_and_collaboration_plans() -> None:
-    assert SCHEMA_VERSION == 16
+def test_session_schema_version_includes_plans_and_meta_launch_storage() -> None:
+    assert SCHEMA_VERSION == 18
 
 
 async def test_initialize_cutover_snapshots_legacy_totals_once(tmp_path: Path) -> None:
@@ -461,6 +461,89 @@ async def test_unknown_never_downgrades_finalized_and_survives_session_delete(
 
         await storage.delete_session(session.session_key)
         assert await storage.query_usage_events(None, None) == [finalized]
+    finally:
+        await storage.close()
+
+
+async def test_session_boundaries_clean_meta_state_but_preserve_billing_audit(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        session = SessionNode(
+            session_key="agent:main:webchat:combined-storage",
+            session_id="combined-storage-session",
+        )
+        await storage.upsert_session(session)
+        await storage.start_usage_event(_start(session_id=session.session_id))
+        item = _item()
+        receipt = UsageItemBillingReceipt(
+            event_id="event-1",
+            ordinal=0,
+            currency="CNY",
+            status="pending",
+            amount_nanos=None,
+            usd_equivalent_nanos=None,
+            fx_native_per_usd_nanos=6_975_000_000,
+        )
+        finalized = await storage.finalize_usage_event(
+            "event-1",
+            _completion(),
+            items=(item,),
+            receipts=(receipt,),
+        )
+
+        async def stage(client_request_id: str) -> None:
+            launch_text = f"/meta meta-paper-write -- {client_request_id}"
+            await storage.stage_meta_launch_draft(
+                session_key=session.session_key,
+                client_request_id=client_request_id,
+                meta_skill_name="meta-paper-write",
+                launch_text=launch_text,
+            )
+            await storage.promote_meta_launch_draft(
+                session_key=session.session_key,
+                client_request_id=client_request_id,
+                meta_skill_name="meta-paper-write",
+                launch_text=launch_text,
+            )
+
+        async def assert_billing_audit_survives() -> None:
+            assert await storage.query_usage_events(None, None) == [finalized]
+            assert await storage.query_usage_event_items(["event-1"]) == [item]
+            assert await storage.query_usage_item_billing_receipts(["event-1"]) == [receipt]
+
+        await stage("before-reset")
+        assert await storage.advance_reset_epoch(session.session_key) == 1
+        assert await storage.list_meta_launch_drafts(session_key=session.session_key) == []
+        assert await storage.get_meta_control_intent(
+            session_key=session.session_key,
+            control_kind="manual",
+            correlation_id="request:before-reset",
+        ) is None
+        await assert_billing_audit_survives()
+
+        await stage("before-delete")
+        await storage.delete_session(session.session_key)
+        assert await storage.list_meta_launch_drafts(session_key=session.session_key) == []
+        assert await storage.get_meta_control_intent(
+            session_key=session.session_key,
+            control_kind="manual",
+            correlation_id="request:before-delete",
+        ) is None
+        async with storage.conn.execute(
+            """
+            SELECT client_request_id
+            FROM meta_launch_discard_tombstones
+            WHERE session_key = ?
+            """,
+            (session.session_key,),
+        ) as cur:
+            assert {str(row[0]) for row in await cur.fetchall()} == {
+                "before-reset",
+                "before-delete",
+            }
+        await assert_billing_audit_survives()
     finally:
         await storage.close()
 

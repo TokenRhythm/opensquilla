@@ -2,7 +2,7 @@ import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, prot
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { appendFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
+import { createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
 import { access, constants, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
@@ -108,6 +108,13 @@ import {
   NativeWorkbenchSurfaceManager,
 } from './native-workbench-surface.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import {
+  buildRendererConsoleLogEntry,
+  buildRendererGoneLogEntry,
+  buildRendererStateLogEntry,
+  RendererConsoleLogLimiter,
+} from './desktop-renderer-log.js'
+import { appendDesktopLogRecord } from './desktop-log-file.js'
 import {
   ArtifactPreviewLeaseBroker,
 } from './artifact-preview-lease-broker.js'
@@ -426,14 +433,16 @@ let allowGracefulShutdownWhileQuitting = false
 // Main-process lifecycle log (distinct from the gateway child's gateway.log).
 // Records launch, single-instance-lock acquisition, and quit phases so a
 // "second launch does nothing" report (issue #446) is diagnosable from a user
-// machine. Synchronous append: these events are rare and must survive an
-// imminent app.exit().
+// machine. Synchronous append: lifecycle events are rare, renderer events are
+// rate-limited, and every record must survive an imminent app.exit(). The file
+// sink caps individual records and rotates a bounded backup set.
 function desktopLog(event: string, detail?: Record<string, unknown>): void {
   try {
-    const logDir = join(app.getPath('userData'), 'logs')
-    mkdirSync(logDir, { recursive: true })
-    const line = JSON.stringify({ at: new Date().toISOString(), event, ...detail }) + '\n'
-    appendFileSync(join(logDir, 'desktop.log'), line, 'utf-8')
+    appendDesktopLogRecord(
+      join(app.getPath('userData'), 'logs', 'desktop.log'),
+      event,
+      detail,
+    )
   } catch {
     // Logging must never break the lifecycle it observes.
   }
@@ -8154,6 +8163,63 @@ async function createMainWindow(): Promise<BrowserWindow> {
     () => nativeWorkbenchSurfaces.refreshBounds(window),
   )
   installEditingContextMenu(window)
+
+  const rendererConsoleLogLimiter = new RendererConsoleLogLimiter()
+  let rendererUnresponsiveAt: number | null = null
+  const flushRendererConsoleSuppression = (): void => {
+    for (const entry of rendererConsoleLogLimiter.flush()) {
+      desktopLog(entry.event, entry.detail)
+    }
+  }
+
+  // Forward renderer console errors to desktop.log. The Control UI runs
+  // in the renderer, so a purely front-end failure (a thrown error, an unhandled
+  // rejection) otherwise leaves no trace: it
+  // never reaches the gateway log, and DevTools is disabled on Windows. Persisting
+  // error messages makes those front-end problems diagnosable from a user's log
+  // folder without a reproduction. Only the trusted main frame is accepted: an
+  // artifact or other child frame must not be able to write to the lifecycle log.
+  window.webContents.on('console-message', (details) => {
+    if (details.frame !== window.webContents.mainFrame) return
+    const entry = buildRendererConsoleLogEntry({
+      level: details.level,
+      message: details.message,
+      sourceId: details.sourceId,
+      lineNumber: details.lineNumber,
+    }, { homeDir: app.getPath('home') })
+    if (!entry) return
+    for (const accepted of rendererConsoleLogLimiter.accept(entry)) {
+      desktopLog(accepted.event, accepted.detail)
+    }
+  })
+
+  // Record renderer crashes. A gone render process is the most opaque
+  // failure of all — the whole UI freezes with nothing in any log — so stamping
+  // the reason and exit code gives a first, always-present breadcrumb.
+  window.webContents.on('render-process-gone', (_event, details) => {
+    flushRendererConsoleSuppression()
+    const entry = buildRendererGoneLogEntry({
+      reason: details.reason,
+      exitCode: details.exitCode,
+    })
+    desktopLog(entry.event, entry.detail)
+  })
+
+  window.webContents.on('unresponsive', () => {
+    flushRendererConsoleSuppression()
+    if (rendererUnresponsiveAt !== null) return
+    rendererUnresponsiveAt = Date.now()
+    const entry = buildRendererStateLogEntry('unresponsive')
+    desktopLog(entry.event, entry.detail)
+  })
+
+  window.webContents.on('responsive', () => {
+    if (rendererUnresponsiveAt === null) return
+    const durationMs = Date.now() - rendererUnresponsiveAt
+    rendererUnresponsiveAt = null
+    const entry = buildRendererStateLogEntry('responsive', durationMs)
+    desktopLog(entry.event, entry.detail)
+  })
 
   window.webContents.setWindowOpenHandler(({ url }) => {
     // Forward real outbound links to the system browser; deny everything else.

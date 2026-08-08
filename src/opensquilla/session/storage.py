@@ -28,12 +28,14 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
-from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
+from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
     CollaborationMode,
     MemoryDurableReceipt,
+    MetaControlIntent,
+    MetaLaunchDraft,
     PlanRevisionRecord,
     PlanRunRecord,
     PlanRunStatus,
@@ -76,6 +78,10 @@ from opensquilla.session.usage_ledger import (
     validate_usage_completion,
     validate_usage_event_start,
     validate_usage_item,
+)
+from opensquilla.turn_outcome_projection import (
+    attach_fork_terminal_outcome_projection,
+    turn_id_from_context,
 )
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
@@ -125,6 +131,26 @@ class StorageConnectionPoisonedError(RuntimeError):
 
 class TurnIngressConflictError(ValueError):
     """Raised when a client request id is reused for a different turn payload."""
+
+
+class MetaControlIntentConflictError(ValueError):
+    """Raised when a durable MetaSkill control identity is reused incompatibly."""
+
+
+class MetaLaunchDraftConflictError(ValueError):
+    """Raised when a durable MetaSkill draft identity is reused incompatibly."""
+
+
+class MetaLaunchDraftCapacityError(RuntimeError):
+    """Raised when the bounded durable MetaSkill draft outbox is full."""
+
+
+class MetaLaunchDraftUnavailableError(RuntimeError):
+    """Raised when a draft expired before control promotion."""
+
+
+class MetaLaunchDraftDiscardedError(RuntimeError):
+    """Raised when a cancelled draft identity is reused before its tombstone expires."""
 
 
 class TaskCollectionUnavailableError(RuntimeError):
@@ -250,10 +276,71 @@ async def _next_project_workspace_order_value(
     return max(now_ms, int(previous) + 1) if previous is not None else now_ms
 
 
+@dataclass(frozen=True)
+class RecoverableMetaControlTask:
+    """A never-started accepted control task claimed for restart recovery."""
+
+    task: AgentTaskRecord
+    entry: TranscriptEntry
+
+
 _SQLITE_BUSY_TIMEOUT_MS = 100
 _INTERACTIVE_BUSY_BUDGET_SECONDS = 2.0
 _BUSY_RETRY_INITIAL_SECONDS = 0.025
 _BUSY_RETRY_MAX_SECONDS = 0.250
+_META_CONTROL_STAGED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+_META_CONTROL_STAGED_GC_BATCH = 128
+_META_CONTROL_RECOVERY_INVALID_REASON = "meta_control_recovery_invalid"
+_META_LAUNCH_DRAFT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+_META_LAUNCH_DRAFT_PER_SESSION_LIMIT = 20
+_META_LAUNCH_DRAFT_GLOBAL_LIMIT = 512
+_META_LAUNCH_DRAFT_GC_BATCH = 512
+_META_LAUNCH_DRAFT_GC_INTERVAL_SECONDS = 60.0
+_META_LAUNCH_DISCARD_PER_SESSION_LIMIT = 64
+_META_LAUNCH_DISCARD_GLOBAL_LIMIT = 2048
+_META_LAUNCH_ACCEPTED_PER_SESSION_LIMIT = 20
+_META_LAUNCH_SESSION_KEY_MAX_LENGTH = 512
+_META_LAUNCH_REQUEST_ID_MAX_LENGTH = 256
+
+
+def normalize_meta_launch_coordinates(
+    session_key: object,
+    client_request_id: object,
+) -> tuple[str, str]:
+    """Validate bounded, content-free coordinates for draft and tombstone rows."""
+
+    if not isinstance(session_key, str) or not isinstance(client_request_id, str):
+        raise ValueError("meta launch draft coordinates must be strings")
+    if len(session_key.strip()) > _META_LAUNCH_SESSION_KEY_MAX_LENGTH:
+        raise ValueError("meta launch draft session is invalid")
+    normalized_session = canonicalize_session_key(session_key)
+    normalized_request_id = client_request_id.strip()
+    if not normalized_session or len(normalized_session) > _META_LAUNCH_SESSION_KEY_MAX_LENGTH:
+        raise ValueError("meta launch draft session is invalid")
+    if (
+        not normalized_request_id
+        or len(normalized_request_id) > _META_LAUNCH_REQUEST_ID_MAX_LENGTH
+        or any(character.isspace() for character in normalized_request_id)
+    ):
+        raise ValueError("meta launch draft request identity is invalid")
+    return normalized_session, normalized_request_id
+
+
+def _clear_pending_meta_launch_boundary(
+    session_key: str,
+    *,
+    preserve_client_request_id: str | None = None,
+    preserve_message: object = None,
+) -> int:
+    """Clear the process compatibility cache after a committed session boundary."""
+
+    from opensquilla.engine.steps.meta_command import pending_meta_launch_clear_session
+
+    return pending_meta_launch_clear_session(
+        session_key,
+        preserve_client_request_id=preserve_client_request_id,
+        preserve_message=preserve_message,
+    )
 _BOUNDED_INTERACTIVE_READS: ContextVar[bool] = ContextVar(
     "opensquilla_bounded_interactive_storage_reads",
     default=False,
@@ -328,8 +415,10 @@ def _serialized_read[**P, R](
 # Version 12 added persistent project workspaces and optional session bindings.
 # Version 13 added backend-owned runtime preferences. Version 14 added durable
 # collaboration-mode state. Version 15 added immutable plan revisions. Version
-# 16 added mutable, compare-and-set plan runs.
-SCHEMA_VERSION = 16
+# 16 added mutable, compare-and-set plan runs. Version 17 added durable hidden
+# MetaSkill control intents. Version 18 added the bounded MetaSkill launch outbox
+# and discard tombstones.
+SCHEMA_VERSION = 18
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -763,6 +852,80 @@ ON turn_ingress_receipts(source_scope, request_session_key, client_request_id)
 _CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION = """
 CREATE INDEX IF NOT EXISTS idx_turn_ingress_receipts_accepted_session
 ON turn_ingress_receipts(accepted_session_key, accepted_at)
+"""
+
+_CREATE_META_CONTROL_INTENTS = """
+CREATE TABLE IF NOT EXISTS meta_control_intents (
+    intent_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    control_kind TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    meta_skill_name TEXT NOT NULL,
+    replay_run_id TEXT,
+    replay_mode TEXT,
+    status TEXT NOT NULL DEFAULT 'staged',
+    accepted_source_scope TEXT,
+    accepted_request_session_key TEXT,
+    accepted_client_request_id TEXT,
+    accepted_request_fingerprint TEXT,
+    accepted_message_id TEXT,
+    accepted_task_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    CHECK (control_kind IN ('manual', 'replay')),
+    CHECK (status IN ('staged', 'accepted'))
+)
+"""
+
+_CREATE_IDX_META_CONTROL_CORRELATION = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_control_intents_correlation
+ON meta_control_intents(session_key, control_kind, correlation_id)
+"""
+
+_CREATE_IDX_META_CONTROL_SESSION_STATUS = """
+CREATE INDEX IF NOT EXISTS idx_meta_control_intents_session_status
+ON meta_control_intents(session_key, status, created_at)
+"""
+
+_CREATE_META_LAUNCH_DRAFTS = """
+CREATE TABLE IF NOT EXISTS meta_launch_drafts (
+    draft_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    client_request_id TEXT NOT NULL,
+    meta_skill_name TEXT NOT NULL,
+    launch_text TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1
+)
+"""
+
+_CREATE_IDX_META_LAUNCH_DRAFT_REQUEST = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_launch_drafts_request
+ON meta_launch_drafts(session_key, client_request_id)
+"""
+
+_CREATE_IDX_META_LAUNCH_DRAFT_SESSION_EXPIRY = """
+CREATE INDEX IF NOT EXISTS idx_meta_launch_drafts_session_expiry
+ON meta_launch_drafts(session_key, expires_at, created_at)
+"""
+
+_CREATE_META_LAUNCH_DISCARD_TOMBSTONES = """
+CREATE TABLE IF NOT EXISTS meta_launch_discard_tombstones (
+    session_key TEXT NOT NULL,
+    client_request_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (session_key, client_request_id)
+)
+"""
+
+_CREATE_IDX_META_LAUNCH_DISCARD_TOMBSTONES_EXPIRY = """
+CREATE INDEX IF NOT EXISTS idx_meta_launch_discard_tombstones_expiry
+ON meta_launch_discard_tombstones(expires_at, created_at)
 """
 
 _CREATE_MEMORY_DURABLE_RECEIPTS = """
@@ -1287,6 +1450,7 @@ class SessionStorage:
         self._sleep = asyncio.sleep
         self._monotonic = time.monotonic
         self._random = random.random
+        self._meta_launch_draft_gc_task: asyncio.Task[None] | None = None
         self._restart_abandoned_session_keys: tuple[str, ...] = ()
 
     @property
@@ -1351,6 +1515,10 @@ class SessionStorage:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
         await self._initialize_schema()
+        self._meta_launch_draft_gc_task = asyncio.create_task(
+            self._run_meta_launch_draft_gc(),
+            name="session-storage-meta-launch-draft-gc",
+        )
 
     @classmethod
     async def open(cls, db_path: str) -> SessionStorage:
@@ -1359,10 +1527,32 @@ class SessionStorage:
         return storage
 
     async def close(self) -> None:
+        gc_task, self._meta_launch_draft_gc_task = self._meta_launch_draft_gc_task, None
+        if gc_task is not None:
+            gc_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await gc_task
         async with self._operation_lock:
             if self._conn:
                 await self._conn.close()
                 self._conn = None
+
+    async def _run_meta_launch_draft_gc(self) -> None:
+        """Physically enforce raw-draft retention while the Gateway stays up."""
+
+        while True:
+            await asyncio.sleep(_META_LAUNCH_DRAFT_GC_INTERVAL_SECONDS)
+            try:
+                async with self._write_transaction("meta_launch_draft_periodic_gc") as conn:
+                    await self._purge_expired_meta_launch_drafts(
+                        conn,
+                        now_ms=_now_ms(),
+                        limit=_META_LAUNCH_DRAFT_GC_BATCH,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("Periodic MetaSkill draft retention cleanup failed", exc_info=True)
 
     def _raise_if_poisoned(self) -> None:
         if self._poisoned:
@@ -1574,6 +1764,14 @@ class SessionStorage:
         await self._conn.execute(_CREATE_TURN_INGRESS_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_REQUEST)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION)
+        await self._conn.execute(_CREATE_META_CONTROL_INTENTS)
+        await self._conn.execute(_CREATE_IDX_META_CONTROL_CORRELATION)
+        await self._conn.execute(_CREATE_IDX_META_CONTROL_SESSION_STATUS)
+        await self._conn.execute(_CREATE_META_LAUNCH_DRAFTS)
+        await self._conn.execute(_CREATE_IDX_META_LAUNCH_DRAFT_REQUEST)
+        await self._conn.execute(_CREATE_IDX_META_LAUNCH_DRAFT_SESSION_EXPIRY)
+        await self._conn.execute(_CREATE_META_LAUNCH_DISCARD_TOMBSTONES)
+        await self._conn.execute(_CREATE_IDX_META_LAUNCH_DISCARD_TOMBSTONES_EXPIRY)
         await self._conn.execute(_CREATE_MEMORY_DURABLE_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_MEMORY_DURABLE_RECEIPTS_SESSION)
         await self._conn.execute(_CREATE_TELEMETRY_DAILY_USAGE)
@@ -1625,6 +1823,14 @@ class SessionStorage:
             session_columns = {row[1] for row in await cur.fetchall()}
         if "updated_at" in session_columns:
             await self._conn.execute(_CREATE_IDX_SESSIONS_UPDATED)
+        # Launch drafts contain raw user prompts. Enforce their seven-day
+        # retention at every process start even when nobody stages or lists a
+        # new draft after the old rows expire.
+        await self._purge_expired_meta_launch_drafts(
+            self._conn,
+            now_ms=_now_ms(),
+            limit=_META_LAUNCH_DRAFT_GC_BATCH,
+        )
         if "workspace_id" in session_columns:
             await self._conn.execute(_CREATE_IDX_SESSIONS_WORKSPACE)
         await self._conn.commit()
@@ -3854,16 +4060,34 @@ class SessionStorage:
         session_key = canonicalize_session_key(session_key)
         session: SessionNode | None = None
         async with self._write_transaction("delete_session") as conn:
+            # Controls and drafts can exist on a provisional key before the
+            # first accepted turn creates a sessions row. Fence those request
+            # identities even when there is no session left to delete.
+            await self._tombstone_meta_launches_for_boundary(
+                conn,
+                session_key=session_key,
+                now_ms=_now_ms(),
+                intent_statuses=("staged", "accepted"),
+            )
+            await conn.execute(
+                "DELETE FROM meta_launch_drafts WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM meta_control_intents WHERE session_key = ?",
+                (session_key,),
+            )
             async with conn.execute(
                 "SELECT * FROM sessions WHERE session_key = ?", (session_key,)
             ) as cursor:
                 row = await cursor.fetchone()
-            if row is None:
-                return
-            session = SessionNode(**_deserialize_row(dict(row)))
-            await self._delete_session_rows(conn, session)
+            if row is not None:
+                session = SessionNode(**_deserialize_row(dict(row)))
+                await self._delete_session_rows(conn, session)
 
-        assert session is not None
+        _clear_pending_meta_launch_boundary(session_key)
+        if session is None:
+            return
         await self._cleanup_deleted_session(session)
 
     async def prune_stale_sessions(self, before_ms: int) -> int:
@@ -3904,6 +4128,46 @@ class SessionStorage:
             if row is None:
                 raise KeyError(f"Session not found: {session_key}")
             return int(row[0])
+
+    async def advance_reset_epoch(self, session_key: str) -> int:
+        """Fence a same-key reset and invalidate its unaccepted MetaSkill controls.
+
+        The epoch transition and staged-control deletion share one transaction,
+        so another client retaining an old hidden control can never observe the
+        new epoch while its pre-reset authorization is still consumable. Recent
+        accepted browser coordinates are also fenced against stale outbox
+        retries; their intent rows remain immutable history.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("advance_reset_epoch") as conn:
+            await conn.execute(
+                "UPDATE sessions SET epoch = epoch + 1 WHERE session_key = ?",
+                (session_key,),
+            )
+            async with conn.execute(
+                "SELECT epoch FROM sessions WHERE session_key = ?", (session_key,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_key}")
+            await self._tombstone_meta_launches_for_boundary(
+                conn,
+                session_key=session_key,
+                now_ms=_now_ms(),
+                intent_statuses=("staged", "accepted"),
+            )
+            await conn.execute(
+                "DELETE FROM meta_control_intents WHERE session_key = ? AND status = 'staged'",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM meta_launch_drafts WHERE session_key = ?",
+                (session_key,),
+            )
+            new_epoch = int(row[0])
+        _clear_pending_meta_launch_boundary(session_key)
+        return new_epoch
 
     @_serialized_read
     async def get_epoch(self, session_key: str) -> int:
@@ -5608,13 +5872,26 @@ class SessionStorage:
                 SET status = ?,
                     updated_at = ?,
                     finished_at = COALESCE(finished_at, ?),
-                    terminal_reason = COALESCE(terminal_reason, ?)
+                    terminal_reason = CASE
+                        WHEN status = ? AND EXISTS (
+                            SELECT 1 FROM meta_control_intents AS intent
+                            WHERE intent.accepted_task_id = agent_tasks.task_id
+                              AND intent.status = 'accepted'
+                        ) AND EXISTS (
+                            SELECT 1 FROM sessions AS owner
+                            WHERE owner.session_key = agent_tasks.session_key
+                              AND owner.status NOT IN (?, ?, ?, ?)
+                        ) THEN 'meta_control_restart_before_start'
+                        ELSE COALESCE(terminal_reason, ?)
+                    END
                 WHERE status IN (?, ?)
                 """,
                 (
                     AgentTaskStatus.ABANDONED,
                     ts,
                     ts,
+                    AgentTaskStatus.QUEUED,
+                    *terminal_session_statuses,
                     "process_restart",
                     AgentTaskStatus.QUEUED,
                     AgentTaskStatus.RUNNING,
@@ -5850,6 +6127,12 @@ class SessionStorage:
                     END
                 WHERE session_key IN ({placeholders})
                   AND status NOT IN (?, ?, ?, ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_tasks AS recoverable
+                      WHERE recoverable.session_key = sessions.session_key
+                        AND recoverable.status = ?
+                        AND recoverable.terminal_reason = 'meta_control_restart_before_start'
+                  )
                 """,
                 (
                     SessionStatus.FAILED,
@@ -5859,6 +6142,7 @@ class SessionStorage:
                     ts,
                     *chunk,
                     *terminal_session_statuses,
+                    AgentTaskStatus.ABANDONED,
                 ),
             )
         if any(plan_run_reconciliation.values()):
@@ -5867,6 +6151,150 @@ class SessionStorage:
                 extra=plan_run_reconciliation,
             )
         return count
+
+    async def claim_recoverable_meta_control_tasks(
+        self,
+        *,
+        limit: int = 64,
+    ) -> list[RecoverableMetaControlTask]:
+        """Claim accepted control tasks proven not to have started before restart.
+
+        Running tasks are deliberately excluded: provider side effects may have
+        occurred before the crash, so replaying them automatically would be
+        unsafe. A claimed queued task is returned with its original transcript
+        row and task identity; another crash marks it recoverable again.
+        """
+
+        bounded_limit = max(1, min(int(limit), 256))
+        recovered: list[RecoverableMetaControlTask] = []
+        now_ms = _now_ms()
+        terminal_session_statuses = (
+            SessionStatus.DONE,
+            SessionStatus.FAILED,
+            SessionStatus.KILLED,
+            SessionStatus.TIMEOUT,
+        )
+        async with self._write_transaction("claim_meta_control_recovery") as conn:
+            async def quarantine_invalid(task_id: str) -> None:
+                await conn.execute(
+                    """
+                    UPDATE agent_tasks
+                    SET terminal_reason = ?, updated_at = ?,
+                        error_class = 'MetaControlRecoveryInvalid',
+                        error_message = 'Durable MetaSkill control recovery data is invalid.'
+                    WHERE task_id = ? AND status = ?
+                      AND terminal_reason = 'meta_control_restart_before_start'
+                    """,
+                    (
+                        _META_CONTROL_RECOVERY_INVALID_REASON,
+                        now_ms,
+                        task_id,
+                        AgentTaskStatus.ABANDONED,
+                    ),
+                )
+
+            # Invalid rows must not permanently head-of-line block later valid
+            # controls when callers use a small limit. Every selected row is
+            # either claimed or quarantined before the next bounded read.
+            while len(recovered) < bounded_limit:
+                remaining = bounded_limit - len(recovered)
+                async with conn.execute(
+                    """
+                    SELECT task.*
+                    FROM agent_tasks AS task
+                    JOIN meta_control_intents AS intent
+                      ON intent.accepted_task_id = task.task_id
+                    JOIN sessions AS owner
+                      ON owner.session_key = task.session_key
+                    WHERE task.status = ?
+                      AND task.terminal_reason = 'meta_control_restart_before_start'
+                      AND intent.status = 'accepted'
+                      AND owner.status NOT IN (?, ?, ?, ?)
+                    ORDER BY task.created_at ASC, task.task_id ASC
+                    LIMIT ?
+                    """,
+                    (
+                        AgentTaskStatus.ABANDONED,
+                        *terminal_session_statuses,
+                        remaining,
+                    ),
+                ) as cur:
+                    task_rows = await cur.fetchall()
+                if not task_rows:
+                    break
+
+                for raw_task in task_rows:
+                    task = AgentTaskRecord(**_deserialize_row(dict(raw_task)))
+                    details = task.details if isinstance(task.details, dict) else {}
+                    metadata = details.get("metadata")
+                    message_id = details.get("persisted_user_message_id")
+                    if not isinstance(metadata, dict) or not isinstance(message_id, str):
+                        await quarantine_invalid(task.task_id)
+                        continue
+                    control = metadata.get("meta_control")
+                    if not isinstance(control, dict):
+                        await quarantine_invalid(task.task_id)
+                        continue
+                    async with conn.execute(
+                        """
+                        SELECT * FROM transcript_entries
+                        WHERE session_key = ? AND message_id = ? AND role = 'user'
+                        """,
+                        (task.session_key, message_id),
+                    ) as entry_cur:
+                        entry_row = await entry_cur.fetchone()
+                    if entry_row is None:
+                        await quarantine_invalid(task.task_id)
+                        continue
+                    entry = TranscriptEntry(**_deserialize_row(dict(entry_row)))
+                    if (
+                        not isinstance(entry.turn_context, dict)
+                        or entry.turn_context.get("meta_control") != control
+                    ):
+                        await quarantine_invalid(task.task_id)
+                        continue
+                    async with conn.execute(
+                        """
+                        UPDATE agent_tasks
+                        SET status = ?, updated_at = ?, finished_at = NULL,
+                            terminal_reason = NULL, error_class = NULL, error_message = NULL
+                        WHERE task_id = ? AND status = ?
+                          AND terminal_reason = 'meta_control_restart_before_start'
+                        """,
+                        (
+                            AgentTaskStatus.QUEUED,
+                            now_ms,
+                            task.task_id,
+                            AgentTaskStatus.ABANDONED,
+                        ),
+                    ) as update_cur:
+                        if int(update_cur.rowcount or 0) != 1:
+                            continue
+                    task.status = AgentTaskStatus.QUEUED
+                    task.updated_at = now_ms
+                    task.finished_at = None
+                    task.terminal_reason = None
+                    task.error_class = None
+                    task.error_message = None
+                    recovered.append(RecoverableMetaControlTask(task=task, entry=entry))
+
+            recovered_keys = sorted({item.task.session_key for item in recovered})
+            for session_key in recovered_keys:
+                await conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, updated_at = ?, ended_at = NULL, runtime_ms = NULL
+                    WHERE session_key = ?
+                      AND status NOT IN (?, ?, ?, ?)
+                    """,
+                    (
+                        SessionStatus.RUNNING,
+                        now_ms,
+                        session_key,
+                        *terminal_session_statuses,
+                    ),
+                )
+        return recovered
 
     # ── Transcript CRUD ──────────────────────────────────────────────────────
 
@@ -6127,6 +6555,875 @@ class SessionStorage:
             task_status=task_status,
         )
 
+    async def replay_turn_ingress_receipt(
+        self,
+        *,
+        source_scope: str,
+        request_session_key: str,
+        client_request_id: str,
+    ) -> TurnAcceptanceResult | None:
+        """Replay accepted ingress and consume an obsolete Meta launch draft.
+
+        Older builds could commit the ingress receipt before removing the
+        browser-recovery draft. Keep the fast replay lookup transactional with
+        that repair so the RPC shortcut preserves the same cleanup contract as
+        :meth:`accept_turn`.
+        """
+
+        canonical_session_key = canonicalize_session_key(request_session_key)
+        # Keep the common miss path read-only. Besides avoiding unnecessary
+        # writer contention, this preserves the ingress admission contract: a
+        # locked database is reported by the later atomic accept, where the RPC
+        # layer can classify whether any write was accepted.
+        previous = await self.get_turn_ingress_receipt(
+            source_scope=source_scope,
+            request_session_key=canonical_session_key,
+            client_request_id=client_request_id,
+        )
+        if previous is None:
+            return None
+        async with self._write_transaction("replay_turn_ingress_receipt") as conn:
+            selected = await self._select_turn_ingress_receipt(
+                conn,
+                source_scope=source_scope,
+                request_session_key=canonical_session_key,
+                client_request_id=client_request_id,
+            )
+            if selected is None:
+                return None
+            receipt, task_status, fresh_user_session = selected
+            await conn.execute(
+                """
+                DELETE FROM meta_launch_drafts
+                WHERE session_key = ? AND client_request_id = ?
+                """,
+                (canonical_session_key, client_request_id),
+            )
+            return TurnAcceptanceResult(
+                receipt=receipt,
+                replayed=True,
+                fresh_user_session=fresh_user_session,
+                task_status=task_status,
+            )
+
+    @staticmethod
+    async def _select_meta_control_intent(
+        conn: Any,
+        *,
+        session_key: str,
+        control_kind: str,
+        correlation_id: str,
+    ) -> MetaControlIntent | None:
+        async with conn.execute(
+            """
+            SELECT * FROM meta_control_intents
+            WHERE session_key = ? AND control_kind = ? AND correlation_id = ?
+            """,
+            (session_key, control_kind, correlation_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return MetaControlIntent(**_deserialize_row(dict(row))) if row is not None else None
+
+    async def stage_meta_control_intent(
+        self,
+        *,
+        session_key: str,
+        control_kind: str,
+        correlation_id: str,
+        meta_skill_name: str,
+        replay_run_id: str | None = None,
+        replay_mode: str | None = None,
+    ) -> tuple[MetaControlIntent, str]:
+        """Durably stage one manual launch or committed replay authorization.
+
+        Repeating the same coordinates is idempotent even after acceptance.
+        Reusing their correlation identity for a different skill/run/mode is a
+        hard conflict. Staged rows have a 30-day recovery window, far longer
+        than the browser outbox, so long turns and restarts remain safe without
+        allowing abandoned pre-send authorizations to grow forever.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        control_kind = control_kind.strip()
+        correlation_id = correlation_id.strip()
+        meta_skill_name = meta_skill_name.strip()
+        replay_run_id = replay_run_id.strip() if isinstance(replay_run_id, str) else None
+        replay_mode = replay_mode.strip() if isinstance(replay_mode, str) else None
+        if not session_key or not correlation_id or not meta_skill_name:
+            raise ValueError("meta control session, correlation, and skill are required")
+        if control_kind not in {"manual", "replay"}:
+            raise ValueError("meta control kind must be manual or replay")
+        if len(correlation_id) > 272:
+            raise ValueError("meta control correlation exceeds 272 characters")
+        if control_kind == "manual":
+            if not correlation_id.startswith("request:"):
+                raise ValueError("manual meta control requires a request correlation")
+            if replay_run_id is not None or replay_mode is not None:
+                raise ValueError("manual meta control cannot carry replay coordinates")
+            session_key, request_id = normalize_meta_launch_coordinates(
+                session_key,
+                correlation_id.removeprefix("request:"),
+            )
+            correlation_id = f"request:{request_id}"
+        elif (
+            not correlation_id.startswith("nonce:")
+            or replay_run_id is None
+            or replay_mode not in {"failed-step", "partial-context"}
+        ):
+            raise ValueError("replay meta control requires nonce, run, and live mode")
+
+        async with self._write_transaction("stage_meta_control_intent") as conn:
+            return await self._stage_meta_control_intent_in_transaction(
+                conn,
+                session_key=session_key,
+                control_kind=control_kind,
+                correlation_id=correlation_id,
+                meta_skill_name=meta_skill_name,
+                replay_run_id=replay_run_id,
+                replay_mode=replay_mode,
+            )
+
+    async def _stage_meta_control_intent_in_transaction(
+        self,
+        conn: Any,
+        *,
+        session_key: str,
+        control_kind: str,
+        correlation_id: str,
+        meta_skill_name: str,
+        replay_run_id: str | None,
+        replay_mode: str | None,
+    ) -> tuple[MetaControlIntent, str]:
+        """Insert or replay a validated control on an existing write transaction."""
+
+        now_ms = _now_ms()
+        cutoff_ms = now_ms - _META_CONTROL_STAGED_RETENTION_MS
+        await conn.execute(
+            """
+            DELETE FROM meta_control_intents
+            WHERE intent_id IN (
+                SELECT intent_id FROM meta_control_intents
+                WHERE status = 'staged' AND created_at < ?
+                ORDER BY created_at ASC, intent_id ASC
+                LIMIT ?
+            )
+            """,
+            (cutoff_ms, _META_CONTROL_STAGED_GC_BATCH),
+        )
+        if control_kind == "manual":
+            request_id = correlation_id.removeprefix("request:")
+            await conn.execute(
+                """
+                DELETE FROM meta_launch_discard_tombstones
+                WHERE session_key = ? AND client_request_id = ? AND expires_at <= ?
+                """,
+                (session_key, request_id, now_ms),
+            )
+            async with conn.execute(
+                """
+                SELECT 1 FROM meta_launch_discard_tombstones
+                WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
+                """,
+                (session_key, request_id, now_ms),
+            ) as cur:
+                discarded = await cur.fetchone()
+            if discarded is not None:
+                raise MetaLaunchDraftDiscardedError(
+                    "meta launch draft identity was explicitly discarded"
+                )
+        existing = await self._select_meta_control_intent(
+            conn,
+            session_key=session_key,
+            control_kind=control_kind,
+            correlation_id=correlation_id,
+        )
+        if existing is not None:
+            if (
+                existing.meta_skill_name != meta_skill_name
+                or existing.replay_run_id != replay_run_id
+                or existing.replay_mode != replay_mode
+            ):
+                raise MetaControlIntentConflictError(
+                    "meta control identity was already used for another launch"
+                )
+            return existing, "replayed"
+
+        if control_kind == "manual":
+            await self._ensure_meta_launch_coordinate_capacity(
+                conn,
+                now_ms=now_ms,
+                session_key=session_key,
+                client_request_id=correlation_id.removeprefix("request:"),
+            )
+
+        intent = MetaControlIntent(
+            session_key=session_key,
+            control_kind=control_kind,
+            correlation_id=correlation_id,
+            meta_skill_name=meta_skill_name,
+            replay_run_id=replay_run_id,
+            replay_mode=replay_mode,
+        )
+        data = intent.model_dump()
+        columns = list(data)
+        await conn.execute(
+            f"INSERT INTO meta_control_intents ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            [_serialize(data[column]) for column in columns],
+        )
+        return intent, "stamped"
+
+    @_serialized_read
+    async def get_meta_control_intent(
+        self,
+        *,
+        session_key: str,
+        control_kind: str,
+        correlation_id: str,
+    ) -> MetaControlIntent | None:
+        """Return the exact durable control authorization, if one exists."""
+
+        return await self._select_meta_control_intent(
+            self.conn,
+            session_key=canonicalize_session_key(session_key),
+            control_kind=control_kind,
+            correlation_id=correlation_id,
+        )
+
+    @staticmethod
+    async def _select_meta_launch_draft(
+        conn: Any,
+        *,
+        session_key: str,
+        client_request_id: str,
+    ) -> MetaLaunchDraft | None:
+        async with conn.execute(
+            """
+            SELECT * FROM meta_launch_drafts
+            WHERE session_key = ? AND client_request_id = ?
+            """,
+            (session_key, client_request_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return MetaLaunchDraft(**_deserialize_row(dict(row))) if row is not None else None
+
+    async def _select_live_meta_launch_coordinates(
+        self,
+        conn: Any,
+        *,
+        now_ms: int,
+        session_key: str | None = None,
+        include_drafts: bool = True,
+        include_tombstones: bool = True,
+        include_staged: bool = True,
+        include_accepted: bool = True,
+        exclude_intent_id: str | None = None,
+    ) -> set[tuple[str, str]]:
+        """Return the bounded live launch identities represented across ledgers.
+
+        One browser request may briefly exist as both a raw draft and a staged
+        control. Capacity is therefore defined over exact coordinates, not row
+        counts. Accepted controls contribute only the newest browser-outbox
+        window per session; older accepted history is not a live resend source.
+        """
+
+        canonical_session = canonicalize_session_key(session_key) if session_key else ""
+        coordinates: set[tuple[str, str]] = set()
+
+        def append_coordinate(raw_session: object, raw_request: object) -> None:
+            try:
+                coordinate = normalize_meta_launch_coordinates(
+                    raw_session,
+                    raw_request,
+                )
+            except ValueError:
+                # Older ledgers may contain identifiers that current ingress no
+                # longer accepts. They cannot be replayed through the bounded RPC.
+                return
+            if canonical_session and coordinate[0] != canonical_session:
+                return
+            coordinates.add(coordinate)
+
+        async def append_rows(sql: str, params: tuple[Any, ...]) -> None:
+            async with conn.execute(sql, params) as cur:
+                for row in await cur.fetchall():
+                    append_coordinate(row[0], row[1])
+
+        session_clause = " AND session_key = ?" if canonical_session else ""
+        session_params: tuple[Any, ...] = (canonical_session,) if canonical_session else ()
+        if include_drafts:
+            await append_rows(
+                "SELECT session_key, client_request_id FROM meta_launch_drafts "
+                f"WHERE expires_at > ?{session_clause}",
+                (now_ms, *session_params),
+            )
+        if include_tombstones:
+            await append_rows(
+                "SELECT session_key, client_request_id "
+                "FROM meta_launch_discard_tombstones "
+                f"WHERE expires_at > ?{session_clause}",
+                (now_ms, *session_params),
+            )
+        if include_staged:
+            exclude_clause = " AND intent_id <> ?" if exclude_intent_id else ""
+            exclude_params: tuple[Any, ...] = (
+                (exclude_intent_id,) if exclude_intent_id else ()
+            )
+            await append_rows(
+                "SELECT session_key, substr(correlation_id, 9) "
+                "FROM meta_control_intents "
+                "WHERE control_kind = 'manual' AND status = 'staged' "
+                "AND correlation_id LIKE 'request:%' AND created_at > ?"
+                f"{session_clause}{exclude_clause}",
+                (
+                    now_ms - _META_CONTROL_STAGED_RETENTION_MS,
+                    *session_params,
+                    *exclude_params,
+                ),
+            )
+        if include_accepted:
+            exclude_clause = " AND intent_id <> ?" if exclude_intent_id else ""
+            exclude_params = (exclude_intent_id,) if exclude_intent_id else ()
+            if canonical_session:
+                accepted_sql = (
+                    "SELECT session_key, substr(correlation_id, 9) "
+                    "FROM meta_control_intents "
+                    "WHERE control_kind = 'manual' AND status = 'accepted' "
+                    "AND correlation_id LIKE 'request:%' AND updated_at > ?"
+                    f"{session_clause}{exclude_clause} "
+                    "ORDER BY updated_at DESC, intent_id DESC LIMIT ?"
+                )
+                accepted_params = (
+                    now_ms - _META_LAUNCH_DRAFT_RETENTION_MS,
+                    *session_params,
+                    *exclude_params,
+                    _META_LAUNCH_ACCEPTED_PER_SESSION_LIMIT,
+                )
+            else:
+                # Rank in SQLite so the selector never materializes the full
+                # seven-day acceptance history in Python. The outer allowance
+                # covers every coordinate already selected plus one decisive
+                # row beyond the global capacity bound, even when ledgers
+                # temporarily overlap during an atomic hand-off.
+                accepted_sql = (
+                    "SELECT session_key, client_request_id FROM ("
+                    "SELECT session_key, substr(correlation_id, 9) AS client_request_id, "
+                    "updated_at, intent_id, "
+                    "ROW_NUMBER() OVER (PARTITION BY session_key "
+                    "ORDER BY updated_at DESC, intent_id DESC) AS accepted_rank "
+                    "FROM meta_control_intents "
+                    "WHERE control_kind = 'manual' AND status = 'accepted' "
+                    "AND correlation_id LIKE 'request:%' AND updated_at > ?"
+                    f"{exclude_clause}"
+                    ") WHERE accepted_rank <= ? "
+                    "ORDER BY session_key ASC, updated_at DESC, intent_id DESC LIMIT ?"
+                )
+                accepted_params = (
+                    now_ms - _META_LAUNCH_DRAFT_RETENTION_MS,
+                    *exclude_params,
+                    _META_LAUNCH_ACCEPTED_PER_SESSION_LIMIT,
+                    _META_LAUNCH_DISCARD_GLOBAL_LIMIT + len(coordinates) + 1,
+                )
+            async with conn.execute(accepted_sql, accepted_params) as cur:
+                accepted_counts: dict[str, int] = {}
+                for row in await cur.fetchall():
+                    row_session = canonicalize_session_key(str(row[0]))
+                    seen = accepted_counts.get(row_session, 0)
+                    if seen >= _META_LAUNCH_ACCEPTED_PER_SESSION_LIMIT:
+                        continue
+                    accepted_counts[row_session] = seen + 1
+                    append_coordinate(row[0], row[1])
+
+        return coordinates
+
+    async def _ensure_meta_launch_coordinate_capacity(
+        self,
+        conn: Any,
+        *,
+        now_ms: int,
+        session_key: str,
+        client_request_id: str,
+    ) -> None:
+        """Reserve one exact live coordinate without exceeding either bound."""
+
+        coordinate = normalize_meta_launch_coordinates(session_key, client_request_id)
+        live = await self._select_live_meta_launch_coordinates(conn, now_ms=now_ms)
+        if coordinate in live:
+            return
+        if sum(1 for item in live if item[0] == coordinate[0]) >= (
+            _META_LAUNCH_DISCARD_PER_SESSION_LIMIT
+        ):
+            raise MetaLaunchDraftCapacityError(
+                "MetaSkill cancellation retention is full for this session"
+            )
+        if len(live) >= _META_LAUNCH_DISCARD_GLOBAL_LIMIT:
+            raise MetaLaunchDraftCapacityError("MetaSkill cancellation retention is full")
+
+    @_serialized_read
+    async def is_meta_launch_discarded(
+        self,
+        *,
+        session_key: str,
+        client_request_id: str,
+    ) -> bool:
+        """Return whether a live terminal marker fences this request identity."""
+
+        session_key, client_request_id = normalize_meta_launch_coordinates(
+            session_key,
+            client_request_id,
+        )
+        async with self.conn.execute(
+            """
+            SELECT 1 FROM meta_launch_discard_tombstones
+            WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
+            """,
+            (session_key, client_request_id, _now_ms()),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    @staticmethod
+    async def _purge_expired_meta_launch_drafts(
+        conn: Any,
+        *,
+        now_ms: int,
+        limit: int,
+    ) -> int:
+        """Delete bounded pages of expired raw prompts and cancellation markers."""
+
+        bounded_limit = max(1, min(int(limit), _META_LAUNCH_DRAFT_GLOBAL_LIMIT))
+        await conn.execute(
+            """
+            DELETE FROM meta_launch_discard_tombstones
+            WHERE rowid IN (
+                SELECT rowid
+                FROM meta_launch_discard_tombstones
+                WHERE expires_at <= ?
+                ORDER BY expires_at ASC, created_at ASC
+                LIMIT ?
+            )
+            """,
+            (now_ms, bounded_limit),
+        )
+        async with conn.execute(
+            """
+            SELECT draft_id, session_key, client_request_id
+            FROM meta_launch_drafts
+            WHERE expires_at <= ?
+            ORDER BY expires_at ASC, draft_id ASC
+            LIMIT ?
+            """,
+            (now_ms, bounded_limit),
+        ) as cur:
+            expired = await cur.fetchall()
+        if not expired:
+            return 0
+
+        # Revoke the one-shot authorization before deleting the only row that
+        # correlates it to the expiring raw request.
+        for row in expired:
+            await conn.execute(
+                """
+                DELETE FROM meta_control_intents
+                WHERE session_key = ? AND control_kind = 'manual'
+                  AND correlation_id = ? AND status = 'staged'
+                """,
+                (str(row["session_key"]), f"request:{row['client_request_id']}"),
+            )
+        placeholders = ", ".join("?" for _ in expired)
+        await conn.execute(
+            f"DELETE FROM meta_launch_drafts WHERE draft_id IN ({placeholders})",
+            [str(row["draft_id"]) for row in expired],
+        )
+        return len(expired)
+
+    async def _tombstone_meta_launches_for_boundary(
+        self,
+        conn: Any,
+        *,
+        session_key: str,
+        now_ms: int,
+        intent_statuses: tuple[str, ...],
+        exclude_intent_id: str | None = None,
+        exclude_client_request_id: str | None = None,
+    ) -> int:
+        """Fence stale MetaSkill identities while erasing their raw content."""
+
+        statuses = tuple(
+            status for status in intent_statuses if status in {"staged", "accepted"}
+        )
+        if not statuses:
+            return 0
+        await self._purge_expired_meta_launch_drafts(
+            conn,
+            now_ms=now_ms,
+            limit=_META_LAUNCH_DRAFT_GC_BATCH,
+        )
+        coordinates = await self._select_live_meta_launch_coordinates(
+            conn,
+            now_ms=now_ms,
+            session_key=session_key,
+            include_tombstones=False,
+            include_staged="staged" in statuses,
+            include_accepted="accepted" in statuses,
+            exclude_intent_id=exclude_intent_id,
+        )
+        request_ids = {
+            request_id
+            for _coordinate_session, request_id in coordinates
+            if request_id != exclude_client_request_id
+        }
+
+        for request_id in sorted(request_ids):
+            await conn.execute(
+                """
+                INSERT INTO meta_launch_discard_tombstones (
+                    session_key, client_request_id, created_at, expires_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_key, client_request_id) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at
+                WHERE meta_launch_discard_tombstones.expires_at <= excluded.created_at
+                """,
+                (
+                    session_key,
+                    request_id,
+                    now_ms,
+                    now_ms + _META_LAUNCH_DRAFT_RETENTION_MS,
+                ),
+            )
+        return len(request_ids)
+
+    async def stage_meta_launch_draft(
+        self,
+        *,
+        session_key: str,
+        client_request_id: str,
+        meta_skill_name: str,
+        launch_text: str,
+    ) -> tuple[MetaLaunchDraft, str]:
+        """Retain one exact manual request until its hidden turn is accepted.
+
+        The outbox is deliberately small and short-lived because ``launch_text``
+        is user content.  Stable request identities are immutable, making
+        retries safe after an RPC response loss or application restart.
+        """
+
+        session_key, client_request_id = normalize_meta_launch_coordinates(
+            session_key,
+            client_request_id,
+        )
+        meta_skill_name = meta_skill_name.strip()
+        if (
+            not meta_skill_name
+            or len(meta_skill_name) > 256
+            or any(character.isspace() for character in meta_skill_name)
+        ):
+            raise ValueError("meta launch draft skill is invalid")
+        if not isinstance(launch_text, str) or not launch_text or len(launch_text) > 128_000:
+            raise ValueError("meta launch draft content is invalid")
+        prefix = f"/meta {meta_skill_name}"
+        suffix = launch_text[len(prefix) :] if launch_text.startswith(prefix) else ""
+        if launch_text != prefix:
+            if not suffix.startswith(" --") or (len(suffix) > 3 and not suffix[3].isspace()):
+                raise ValueError("meta launch draft does not match its skill")
+
+        now_ms = _now_ms()
+        async with self._write_transaction("stage_meta_launch_draft") as conn:
+            await self._purge_expired_meta_launch_drafts(
+                conn,
+                now_ms=now_ms,
+                limit=_META_LAUNCH_DRAFT_GC_BATCH,
+            )
+            # The bounded global GC page may not include this coordinate when
+            # many markers expire together. Remove its own expired marker so a
+            # legitimate reuse after the retention window is deterministic.
+            await conn.execute(
+                """
+                DELETE FROM meta_launch_discard_tombstones
+                WHERE session_key = ? AND client_request_id = ? AND expires_at <= ?
+                """,
+                (session_key, client_request_id, now_ms),
+            )
+            async with conn.execute(
+                """
+                SELECT 1
+                FROM meta_launch_discard_tombstones
+                WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
+                """,
+                (session_key, client_request_id, now_ms),
+            ) as cur:
+                discarded = await cur.fetchone()
+            if discarded is not None:
+                raise MetaLaunchDraftDiscardedError(
+                    "meta launch draft identity was explicitly discarded"
+                )
+            existing = await self._select_meta_launch_draft(
+                conn,
+                session_key=session_key,
+                client_request_id=client_request_id,
+            )
+            if existing is not None:
+                if (
+                    existing.meta_skill_name != meta_skill_name
+                    or existing.launch_text != launch_text
+                ):
+                    raise MetaLaunchDraftConflictError(
+                        "meta launch draft identity was already used for another request"
+                    )
+                return existing, "replayed"
+
+            async with conn.execute(
+                "SELECT COUNT(*) FROM meta_launch_drafts WHERE session_key = ?",
+                (session_key,),
+            ) as cur:
+                per_session_row = await cur.fetchone()
+            per_session_count = int(per_session_row[0] if per_session_row else 0)
+            if per_session_count >= _META_LAUNCH_DRAFT_PER_SESSION_LIMIT:
+                raise MetaLaunchDraftCapacityError("MetaSkill draft outbox is full")
+            async with conn.execute("SELECT COUNT(*) FROM meta_launch_drafts") as cur:
+                global_row = await cur.fetchone()
+            global_drafts = int(global_row[0] if global_row else 0)
+            if global_drafts >= _META_LAUNCH_DRAFT_GLOBAL_LIMIT:
+                raise MetaLaunchDraftCapacityError("MetaSkill draft outbox is full")
+            await self._ensure_meta_launch_coordinate_capacity(
+                conn,
+                now_ms=now_ms,
+                session_key=session_key,
+                client_request_id=client_request_id,
+            )
+
+            draft = MetaLaunchDraft(
+                session_key=session_key,
+                client_request_id=client_request_id,
+                meta_skill_name=meta_skill_name,
+                launch_text=launch_text,
+                created_at=now_ms,
+                updated_at=now_ms,
+                expires_at=now_ms + _META_LAUNCH_DRAFT_RETENTION_MS,
+            )
+            data = draft.model_dump()
+            columns = list(data)
+            await conn.execute(
+                f"INSERT INTO meta_launch_drafts ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                [_serialize(data[column]) for column in columns],
+            )
+            return draft, "stamped"
+
+    async def promote_meta_launch_draft(
+        self,
+        *,
+        session_key: str,
+        client_request_id: str,
+        meta_skill_name: str,
+        launch_text: str,
+    ) -> tuple[MetaControlIntent, str]:
+        """Atomically verify a live draft and stage its manual authorization.
+
+        Readiness checks intentionally run outside SQLite. This compare-and-set
+        closes the later boundary: if another tab discarded or expiry removed
+        the raw request while readiness was running, no consumable control is
+        created and the caller receives a retry-safe failure.
+        """
+
+        session_key, client_request_id = normalize_meta_launch_coordinates(
+            session_key,
+            client_request_id,
+        )
+        meta_skill_name = meta_skill_name.strip()
+        if not meta_skill_name or not launch_text:
+            raise ValueError("meta launch draft promotion coordinates are required")
+
+        now_ms = _now_ms()
+        async with self._write_transaction("promote_meta_launch_draft") as conn:
+            await self._purge_expired_meta_launch_drafts(
+                conn,
+                now_ms=now_ms,
+                limit=_META_LAUNCH_DRAFT_GC_BATCH,
+            )
+            async with conn.execute(
+                """
+                SELECT 1 FROM meta_launch_discard_tombstones
+                WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
+                """,
+                (session_key, client_request_id, now_ms),
+            ) as cur:
+                discarded = await cur.fetchone()
+            if discarded is not None:
+                raise MetaLaunchDraftDiscardedError(
+                    "meta launch draft identity was explicitly discarded"
+                )
+            draft = await self._select_meta_launch_draft(
+                conn,
+                session_key=session_key,
+                client_request_id=client_request_id,
+            )
+            if draft is None:
+                raise MetaLaunchDraftUnavailableError(
+                    "meta launch draft was discarded or expired"
+                )
+            if (
+                draft.meta_skill_name != meta_skill_name
+                or draft.launch_text != launch_text
+            ):
+                raise MetaLaunchDraftConflictError(
+                    "meta launch draft identity was already used for another request"
+                )
+            return await self._stage_meta_control_intent_in_transaction(
+                conn,
+                session_key=session_key,
+                control_kind="manual",
+                correlation_id=f"request:{client_request_id}",
+                meta_skill_name=meta_skill_name,
+                replay_run_id=None,
+                replay_mode=None,
+            )
+
+    async def list_meta_launch_drafts(
+        self,
+        *,
+        session_key: str | None = None,
+        agent_id: str | None = None,
+        provisional_only: bool = False,
+        limit: int = _META_LAUNCH_DRAFT_PER_SESSION_LIMIT,
+    ) -> list[MetaLaunchDraft]:
+        """List live drafts for one session or one agent without consuming them."""
+
+        canonical_session = canonicalize_session_key(session_key) if session_key else ""
+        normalized_agent = normalize_agent_id(agent_id) if agent_id else ""
+        if not canonical_session and not normalized_agent:
+            raise ValueError("meta launch draft session or agent is required")
+        bounded_limit = max(1, min(int(limit), _META_LAUNCH_DRAFT_PER_SESSION_LIMIT))
+        now_ms = _now_ms()
+        async with self._write_transaction("list_meta_launch_drafts") as conn:
+            await self._purge_expired_meta_launch_drafts(
+                conn,
+                now_ms=now_ms,
+                limit=_META_LAUNCH_DRAFT_GC_BATCH,
+            )
+            if canonical_session:
+                sql = (
+                    "SELECT * FROM meta_launch_drafts "
+                    "WHERE session_key = ? AND expires_at > ? "
+                    "ORDER BY created_at ASC, draft_id ASC LIMIT ?"
+                )
+                params: tuple[Any, ...] = (canonical_session, now_ms, bounded_limit)
+            else:
+                session_prefix = f"agent:{normalized_agent}:"
+                provisional_clause = (
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM sessions "
+                    "WHERE sessions.session_key = meta_launch_drafts.session_key"
+                    ") "
+                    if provisional_only
+                    else ""
+                )
+                sql = (
+                    "SELECT * FROM meta_launch_drafts "
+                    "WHERE substr(session_key, 1, length(?)) = ? AND expires_at > ? "
+                    f"{provisional_clause}"
+                    "ORDER BY created_at ASC, draft_id ASC LIMIT ?"
+                )
+                params = (session_prefix, session_prefix, now_ms, bounded_limit)
+            async with conn.execute(sql, params) as cur:
+                rows = await cur.fetchall()
+        drafts = [MetaLaunchDraft(**_deserialize_row(dict(row))) for row in rows]
+        if normalized_agent:
+            # Keep the parser authoritative if session-key formats expand; the
+            # SQL prefix is only the bounded query accelerator.
+            drafts = [
+                draft
+                for draft in drafts
+                if parse_agent_id(draft.session_key) == normalized_agent
+            ]
+        return drafts
+
+    async def discard_meta_launch_draft(
+        self,
+        *,
+        session_key: str,
+        client_request_id: str,
+    ) -> bool:
+        """Make an explicit user discard terminal for a bounded retention window."""
+
+        try:
+            session_key, client_request_id = normalize_meta_launch_coordinates(
+                session_key,
+                client_request_id,
+            )
+        except ValueError:
+            return False
+        now_ms = _now_ms()
+        async with self._write_transaction("discard_meta_launch_draft") as conn:
+            intent = await self._select_meta_control_intent(
+                conn,
+                session_key=session_key,
+                control_kind="manual",
+                correlation_id=f"request:{client_request_id}",
+            )
+            # Acceptance is the irreversible boundary: the task may already be
+            # invoking a paid provider even if the browser lost the send
+            # response. Never report that request as cancelled or let the UI
+            # restore it as a newly sendable composer draft.
+            if intent is not None and intent.status == "accepted":
+                return False
+            await self._purge_expired_meta_launch_drafts(
+                conn,
+                now_ms=now_ms,
+                limit=_META_LAUNCH_DRAFT_GC_BATCH,
+            )
+            async with conn.execute(
+                """
+                SELECT 1 FROM meta_launch_discard_tombstones
+                WHERE session_key = ? AND client_request_id = ? AND expires_at > ?
+                """,
+                (session_key, client_request_id, now_ms),
+            ) as cur:
+                existing_tombstone = await cur.fetchone()
+            if existing_tombstone is None:
+                await self._ensure_meta_launch_coordinate_capacity(
+                    conn,
+                    now_ms=now_ms,
+                    session_key=session_key,
+                    client_request_id=client_request_id,
+                )
+            # Keep only the request coordinates, never the raw launch text or
+            # skill name. Repeated response-loss retries do not extend the
+            # finite retention window established by the first discard.
+            await conn.execute(
+                """
+                INSERT INTO meta_launch_discard_tombstones (
+                    session_key, client_request_id, created_at, expires_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_key, client_request_id) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at
+                WHERE meta_launch_discard_tombstones.expires_at <= excluded.created_at
+                """,
+                (
+                    session_key,
+                    client_request_id,
+                    now_ms,
+                    now_ms + _META_LAUNCH_DRAFT_RETENTION_MS,
+                ),
+            )
+            await conn.execute(
+                "DELETE FROM meta_launch_drafts WHERE session_key = ? AND client_request_id = ?",
+                (session_key, client_request_id),
+            )
+            await conn.execute(
+                """
+                DELETE FROM meta_control_intents
+                WHERE session_key = ? AND control_kind = 'manual'
+                  AND correlation_id = ? AND status = 'staged'
+                """,
+                (session_key, f"request:{client_request_id}"),
+            )
+            # Idempotent cancellation: a retry after a committed discard
+            # response loss must confirm the same terminal intent instead of
+            # resurrecting a launch in the browser.
+            return True
+
     @staticmethod
     async def _delete_reset_history(conn: Any, session_id: str) -> None:
         """Delete reset-owned history on an existing write transaction."""
@@ -6229,6 +7526,21 @@ class SessionStorage:
                 """,
                 (node.session_key,),
             )
+            await self._tombstone_meta_launches_for_boundary(
+                conn,
+                session_key=node.session_key,
+                now_ms=_now_ms(),
+                intent_statuses=("staged", "accepted"),
+            )
+            await conn.execute(
+                "DELETE FROM meta_control_intents "
+                "WHERE session_key = ? AND status = 'staged'",
+                (node.session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM meta_launch_drafts WHERE session_key = ?",
+                (node.session_key,),
+            )
             timestamp = _now_ms()
             active_placeholders = ", ".join(
                 "?" for _ in PLAN_RUN_ACTIVE_STATUSES
@@ -6252,6 +7564,8 @@ class SessionStorage:
                 ],
             )
 
+        _clear_pending_meta_launch_boundary(node.session_key)
+
     async def accept_turn(
         self,
         entry: TranscriptEntry,
@@ -6272,6 +7586,7 @@ class SessionStorage:
         plan_revision: PlanRevisionRecord | None = None,
         plan_run: PlanRunRecord | None = None,
         merge_into_task: bool = False,
+        meta_control_intent_id: str | None = None,
         workspace_guard: ProjectWorkspaceGuard | None = None,
         expected_collaboration_revision: int | None = None,
         expected_active_plan_revision_id: str | None = None,
@@ -6343,6 +7658,8 @@ class SessionStorage:
             raise ValueError("reset_archive_writer requires reset_from_session_id")
         if merge_into_task and session_node is not None:
             raise ValueError("task collection cannot create, reset, or fork a session")
+        if merge_into_task and meta_control_intent_id is not None:
+            raise ValueError("a MetaSkill control turn cannot merge into another task")
         if plan_run is not None:
             if merge_into_task:
                 raise ValueError("a plan implementation turn cannot merge into a task")
@@ -6431,12 +7748,74 @@ class SessionStorage:
                     raise TurnIngressConflictError(
                         "client_request_id was already used for a different turn"
                     )
+                # Repair an outbox left by an older build that committed the
+                # receipt before learning to consume drafts atomically.
+                await conn.execute(
+                    """
+                    DELETE FROM meta_launch_drafts
+                    WHERE session_key = ? AND client_request_id = ?
+                    """,
+                    (request_session_key, client_request_id),
+                )
                 return TurnAcceptanceResult(
                     receipt=receipt,
                     replayed=True,
                     fresh_user_session=fresh_user_session,
                     task_status=task_status,
                 )
+
+            if meta_control_intent_id is not None:
+                if task_record is None:
+                    raise ValueError(
+                        "a MetaSkill control turn requires a runtime task"
+                    )
+                async with conn.execute(
+                    "SELECT * FROM meta_control_intents WHERE intent_id = ?",
+                    (meta_control_intent_id,),
+                ) as cur:
+                    control_row = await cur.fetchone()
+                if control_row is None:
+                    raise MetaControlIntentConflictError(
+                        "MetaSkill control authorization is missing"
+                    )
+                control = MetaControlIntent(**_deserialize_row(dict(control_row)))
+                if control.session_key != request_session_key:
+                    raise MetaControlIntentConflictError(
+                        "MetaSkill control authorization belongs to another session"
+                    )
+                if control.status != "staged":
+                    raise MetaControlIntentConflictError(
+                        "MetaSkill control authorization was already accepted"
+                    )
+                embedded = (
+                    entry.turn_context.get("meta_control")
+                    if isinstance(entry.turn_context, dict)
+                    else None
+                )
+                expected_embedded: dict[str, Any] = {
+                    "version": 1,
+                    "intent_id": control.intent_id,
+                    "kind": control.control_kind,
+                    "name": control.meta_skill_name,
+                    "correlation_id": control.correlation_id,
+                }
+                if control.control_kind == "replay":
+                    expected_embedded.update({
+                        "run_id": control.replay_run_id,
+                        "mode": control.replay_mode,
+                    })
+                if embedded != expected_embedded:
+                    raise MetaControlIntentConflictError(
+                        "MetaSkill control payload does not match its authorization"
+                    )
+                task_metadata = (task_record.details or {}).get("metadata")
+                if (
+                    not isinstance(task_metadata, dict)
+                    or task_metadata.get("meta_control") != expected_embedded
+                ):
+                    raise MetaControlIntentConflictError(
+                        "MetaSkill control task lost its authorized payload"
+                    )
 
             # Existing-session Plan operations require compare-and-set guards
             # before *any* transcript, session, task, receipt, or PlanRun write.
@@ -6605,6 +7984,48 @@ class SessionStorage:
                         """,
                         (session_node.session_key,),
                     )
+                    await self._tombstone_meta_launches_for_boundary(
+                        conn,
+                        session_key=session_node.session_key,
+                        now_ms=_now_ms(),
+                        intent_statuses=("staged", "accepted"),
+                        exclude_intent_id=meta_control_intent_id,
+                        exclude_client_request_id=(
+                            client_request_id
+                            if meta_control_intent_id is not None
+                            and request_session_key == session_node.session_key
+                            else None
+                        ),
+                    )
+                    if meta_control_intent_id is None:
+                        await conn.execute(
+                            """
+                            DELETE FROM meta_control_intents
+                            WHERE session_key = ? AND status = 'staged'
+                            """,
+                            (session_node.session_key,),
+                        )
+                    else:
+                        # The currently accepted hidden control belongs to this
+                        # atomic reset turn. Preserve only that validated row;
+                        # every other staged authorization belongs to the old
+                        # session identity and must be invalidated.
+                        await conn.execute(
+                            """
+                            DELETE FROM meta_control_intents
+                            WHERE session_key = ? AND status = 'staged'
+                              AND intent_id <> ?
+                            """,
+                            (session_node.session_key, meta_control_intent_id),
+                        )
+                    # A reset discards every unaccepted request owned by the old
+                    # session identity. If this transaction is itself accepting
+                    # one of them, rollback restores it on any later failure.
+                    await conn.execute(
+                        "DELETE FROM meta_launch_drafts WHERE session_key = ?",
+                        (session_node.session_key,),
+                    )
+
                     timestamp = _now_ms()
                     active_placeholders = ", ".join(
                         "?" for _ in PLAN_RUN_ACTIVE_STATUSES
@@ -6890,7 +8311,43 @@ class SessionStorage:
                 f"VALUES ({placeholders})",
                 [_serialize(data[col]) for col in cols],
             )
-            return TurnAcceptanceResult(
+            await conn.execute(
+                """
+                DELETE FROM meta_launch_drafts
+                WHERE session_key = ? AND client_request_id = ?
+                """,
+                (request_session_key, client_request_id),
+            )
+            if meta_control_intent_id is not None:
+                if task_record is None:
+                    raise AssertionError(
+                        "validated MetaSkill control turn lost its runtime task"
+                    )
+                async with conn.execute(
+                    """
+                    UPDATE meta_control_intents
+                    SET status = 'accepted', accepted_source_scope = ?,
+                        accepted_request_session_key = ?, accepted_client_request_id = ?,
+                        accepted_request_fingerprint = ?, accepted_message_id = ?,
+                        accepted_task_id = ?, updated_at = ?
+                    WHERE intent_id = ? AND status = 'staged'
+                    """,
+                    (
+                        source_scope,
+                        request_session_key,
+                        client_request_id,
+                        request_fingerprint,
+                        entry.message_id,
+                        task_record.task_id,
+                        updated_at,
+                        meta_control_intent_id,
+                    ),
+                ) as cur:
+                    if int(cur.rowcount or 0) != 1:
+                        raise MetaControlIntentConflictError(
+                            "MetaSkill control authorization changed during acceptance"
+                        )
+            acceptance_result = TurnAcceptanceResult(
                 receipt=receipt,
                 replayed=False,
                 fresh_user_session=fresh_user_session,
@@ -6908,6 +8365,13 @@ class SessionStorage:
                     else None
                 ),
             )
+        if reset_from_session_id is not None:
+            _clear_pending_meta_launch_boundary(
+                entry.session_key,
+                preserve_client_request_id=client_request_id,
+                preserve_message=entry.content,
+            )
+        return acceptance_result
 
     @_serialized_read
     async def get_transcript(
@@ -7681,6 +9145,7 @@ class SessionStorage:
         source_session_id: str,
         target_session_id: str,
         target_session_key: str,
+        terminal_outcome_projections: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         """Copy archived compacted transcript rows into a forked session."""
         async with self._write_transaction("copy_compacted_transcript_entries") as conn:
@@ -7739,6 +9204,27 @@ class SessionStorage:
                 """,
                 (target_session_id, target_session_key, source_session_id),
             )
+            if terminal_outcome_projections is None:
+                return
+            async with conn.execute(
+                "SELECT id, turn_context FROM compacted_transcript_entries "
+                "WHERE session_id = ?",
+                (target_session_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                context = _json_object_or_none(row["turn_context"])
+                turn_id = turn_id_from_context(context)
+                rebound_context = attach_fork_terminal_outcome_projection(
+                    context,
+                    terminal_outcome_projections.get(turn_id or ""),
+                )
+                if rebound_context == context:
+                    continue
+                await conn.execute(
+                    "UPDATE compacted_transcript_entries SET turn_context = ? WHERE id = ?",
+                    (_serialize(rebound_context), row["id"]),
+                )
 
     @_serialized_read
     async def count_transcript_entries(self, session_id: str) -> int:
