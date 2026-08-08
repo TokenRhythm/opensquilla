@@ -220,6 +220,8 @@ def test_selection_mode_only_upsert_keeps_all_other_keys() -> None:
             "selection_mode": "router_dynamic",
             "model_options": ["custom/model-a"],
             "min_successful_proposers": 2,
+            "target_successful_proposers": 3,
+            "proposer_max_retries": 2,
             "all_failed_policy": "error",
         }
     )
@@ -231,6 +233,8 @@ def test_selection_mode_only_upsert_keeps_all_other_keys() -> None:
     assert ensemble.enabled is False
     assert ensemble.model_options == ["custom/model-a"]
     assert ensemble.min_successful_proposers == 2
+    assert ensemble.target_successful_proposers == 3
+    assert ensemble.proposer_max_retries == 2
     assert ensemble.all_failed_policy == "error"
     assert res.restart_required is False
 

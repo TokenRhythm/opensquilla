@@ -27,6 +27,7 @@ from opensquilla.provider import (
     ToolInputSchema,
 )
 from opensquilla.provider import DoneEvent as ProviderDone
+from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import ReasoningDeltaEvent as ProviderReasoning
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
@@ -193,6 +194,56 @@ async def test_reasoning_only_fallback_restores_thinking_after_retry_call() -> N
     assert provider.calls[0]["config"].thinking is True
     assert provider.calls[1]["config"].thinking is False
     assert provider.calls[2]["config"].thinking is True
+
+
+@pytest.mark.asyncio
+async def test_provider_error_thinking_fallback_default_on_disables_retry() -> None:
+    provider = _SequenceProvider(
+        [
+            [ProviderError(message="reasoning is unavailable", code="400")],
+            _final_text(),
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert any(event.kind == "done" for event in events)
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["config"].thinking is True
+    assert provider.calls[1]["config"].thinking is False
+
+
+@pytest.mark.asyncio
+async def test_provider_error_thinking_fallback_strict_off_never_disables() -> None:
+    provider = _SequenceProvider(
+        [
+            [ProviderError(message="reasoning is unavailable", code="400")],
+            _final_text(),
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            provider_error_thinking_fallback=False,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert any(event.kind == "error" for event in events)
+    assert provider.calls
+    assert all(call["config"].thinking is True for call in provider.calls)
 
 
 @pytest.mark.asyncio
@@ -808,5 +859,23 @@ def test_agent_config_defaults_keep_both_levers_off() -> None:
     config = AgentConfig()
 
     assert config.reasoning_only_thinking_fallback is False
+    assert config.provider_error_thinking_fallback is True
     assert config.deadline_thinking_off_margin_seconds == 0
     assert config.reasoning_stream_char_cap == 0
+
+
+def test_provider_error_thinking_fallback_env_is_strict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
+        _strict_bool_from_env,
+    )
+
+    name = "OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK"
+    monkeypatch.delenv(name, raising=False)
+    assert _strict_bool_from_env(name, True) is True
+    monkeypatch.setenv(name, "off")
+    assert _strict_bool_from_env(name, True) is False
+    monkeypatch.setenv(name, "of")
+    with pytest.raises(ValueError, match=name):
+        _strict_bool_from_env(name, True)

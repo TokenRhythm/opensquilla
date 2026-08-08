@@ -292,6 +292,8 @@
       "toolDetailsExpanded": "Expandido",
       "visualEffectsLabel": "Efectos visuales",
       "visualEffectsDesc": "Anima las decisiones de enrutamiento de modelos y las transiciones de respuestas.",
+      "composerFxLabel": "Compositor flotante",
+      "composerFxDesc": "Flota el campo de entrada sobre la conversación y lo colapsa a una sola línea al desplazarse hacia arriba.",
       "bgmLabel": "Música de fondo",
       "bgmDesc": "Muestra el control de música de fondo en la barra superior. Desactivado por defecto; también se puede alternar desde la paleta de comandos.",
       "sidebarWidthLabel": "Ancho de la barra lateral",
@@ -549,7 +551,14 @@
     "title": "Algo salió mal",
     "defaultMessage": "Se produjo un error inesperado.",
     "reload": "Recargar página",
-    "dismiss": "Descartar"
+    "dismiss": "Descartar",
+    "detailsLabel": "Detalles del error",
+    "copyDetails": "Copiar detalles",
+    "copied": "Copiado",
+    "openLogs": "Abrir carpeta de registros",
+    "privacyHint": "Revise el contenido antes de compartirlo. Los detalles pueden contener rutas, URL o información de la cuenta.",
+    "copyFailed": "No se pudo copiar. Seleccione los detalles y cópielos manualmente.",
+    "openLogsFailed": "No se pudo abrir la carpeta de registros."
   },
   "errors": {
     "saveFailed": "Error al guardar",

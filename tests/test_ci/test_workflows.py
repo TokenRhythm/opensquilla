@@ -1322,10 +1322,12 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     steps = job["steps"]
 
     assert job["strategy"]["fail-fast"] is False
-    assert job["strategy"]["matrix"]["os"] == [
-        "ubuntu-latest",
-        "macos-latest",
-        "windows-latest",
+    assert job["strategy"]["matrix"]["include"] == [
+        {"os": "ubuntu-latest", "shard": "all"},
+        {"os": "macos-latest", "shard": "all"},
+        {"os": "windows-latest", "shard": "profiles"},
+        {"os": "windows-latest", "shard": "ownership"},
+        {"os": "windows-latest", "shard": "workbench"},
     ]
     download = next(
         step for step in steps if step.get("name") == "Download verified frontend artifact"
@@ -1369,9 +1371,13 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "test-desktop-cleanup-flow.mjs" in run["run"]
     assert "test-desktop-gateway-ownership.mjs" in run["run"]
     assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
+    assert 'case "${{ matrix.shard }}" in' in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
-    assert "github.run_attempt" in upload["with"]["name"]
+    assert upload["with"]["name"] == (
+        "desktop-recovery-e2e-${{ matrix.os }}-${{ matrix.shard }}"
+        "-attempt-${{ github.run_attempt }}"
+    )
 
 
 def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:

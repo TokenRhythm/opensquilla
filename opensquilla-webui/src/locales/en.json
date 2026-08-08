@@ -292,6 +292,8 @@
       "toolDetailsExpanded": "Expanded",
       "visualEffectsLabel": "Visual effects",
       "visualEffectsDesc": "Animate model-routing decisions and answer transitions in conversations.",
+      "composerFxLabel": "Floating composer",
+      "composerFxDesc": "Float the input over the transcript and collapse it to a single line while scrolling up.",
       "bgmLabel": "Background music",
       "bgmDesc": "Show the background-music control in the top bar. Off by default; also toggleable from the command palette.",
       "sidebarWidthLabel": "Sidebar width",
@@ -600,7 +602,14 @@
     "title": "Something went wrong",
     "defaultMessage": "An unexpected error occurred.",
     "reload": "Reload page",
-    "dismiss": "Dismiss"
+    "dismiss": "Dismiss",
+    "detailsLabel": "Error details",
+    "copyDetails": "Copy details",
+    "copied": "Copied",
+    "openLogs": "Open logs folder",
+    "privacyHint": "Review before sharing. Error details may contain paths, URLs, or account information.",
+    "copyFailed": "Copy failed. Select the details and copy them manually.",
+    "openLogsFailed": "Could not open the logs folder."
   },
   "errors": {
     "saveFailed": "Save failed",

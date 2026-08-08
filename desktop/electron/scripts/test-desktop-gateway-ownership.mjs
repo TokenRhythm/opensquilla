@@ -314,17 +314,26 @@ assert.equal(
   'unknown schemes are never comparable',
 )
 
-// The live probe answers for this very process with a comparable scheme, is
-// stable across calls, and never conflicts with itself.
+// The live probe is comparable and stable when the platform can answer. The
+// production API deliberately returns null when an OS probe is unavailable,
+// and its callers must remain fail-open in that case (notably on a saturated
+// Windows CI runner while PowerShell is starting).
 {
   const own = desktopProcessStartIdentity(process.pid)
-  assert.ok(own, 'the platform probe should answer for the current process')
-  assert.match(
-    own,
-    /^(linux-proc-start-ticks|windows-creation-filetime|posix-ps-lstart):/,
-  )
-  assert.equal(desktopProcessStartIdentity(process.pid), own)
-  assert.equal(desktopGatewayStartIdentityConflict(own, own), false)
+  if (own) {
+    assert.match(
+      own,
+      /^(linux-proc-start-ticks|windows-creation-filetime|posix-ps-lstart):/,
+    )
+    assert.equal(desktopProcessStartIdentity(process.pid), own)
+    assert.equal(desktopGatewayStartIdentityConflict(own, own), false)
+  } else {
+    assert.equal(
+      desktopGatewayStartIdentityConflict('windows-creation-filetime:1', own),
+      false,
+      'an unavailable platform probe must preserve the conservative path',
+    )
+  }
 }
 assert.equal(desktopProcessStartIdentity(0), null)
 assert.equal(desktopProcessStartIdentity(-1), null)

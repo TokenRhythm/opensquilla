@@ -292,6 +292,8 @@
       "toolDetailsExpanded": "展开",
       "visualEffectsLabel": "动画效果",
       "visualEffectsDesc": "在对话中显示模型路由决策和回答切换动画。",
+      "composerFxLabel": "悬浮输入栏",
+      "composerFxDesc": "输入栏悬浮于对话之上，向上滚动时收起为单行。",
       "bgmLabel": "背景音乐",
       "bgmDesc": "在顶栏显示背景音乐控件。默认关闭；也可通过命令面板切换。",
       "sidebarWidthLabel": "侧边栏宽度",
@@ -600,7 +602,14 @@
     "title": "出错了",
     "defaultMessage": "发生意外错误。",
     "reload": "重新加载页面",
-    "dismiss": "关闭"
+    "dismiss": "关闭",
+    "detailsLabel": "错误详情",
+    "copyDetails": "复制详情",
+    "copied": "已复制",
+    "openLogs": "打开日志文件夹",
+    "privacyHint": "分享前请先检查。错误详情可能包含文件路径、网址或账户信息。",
+    "copyFailed": "复制失败。请展开详情后手动复制。",
+    "openLogsFailed": "无法打开日志文件夹。"
   },
   "errors": {
     "saveFailed": "保存失败",

@@ -292,6 +292,8 @@
       "toolDetailsExpanded": "Développé",
       "visualEffectsLabel": "Effets visuels",
       "visualEffectsDesc": "Anime les décisions de routage des modèles et les transitions des réponses.",
+      "composerFxLabel": "Composeur flottant",
+      "composerFxDesc": "Fait flotter la saisie au-dessus de la conversation et la réduit à une seule ligne en faisant défiler vers le haut.",
       "bgmLabel": "Musique de fond",
       "bgmDesc": "Affiche la commande de musique de fond dans la barre supérieure. Désactivé par défaut ; modifiable aussi depuis la palette de commandes.",
       "sidebarWidthLabel": "Largeur de la barre latérale",
@@ -549,7 +551,14 @@
     "title": "Une erreur s'est produite",
     "defaultMessage": "Une erreur inattendue s'est produite.",
     "reload": "Recharger la page",
-    "dismiss": "Ignorer"
+    "dismiss": "Ignorer",
+    "detailsLabel": "Détails de l'erreur",
+    "copyDetails": "Copier les détails",
+    "copied": "Copié",
+    "openLogs": "Ouvrir le dossier des journaux",
+    "privacyHint": "Vérifiez le contenu avant de le partager. Les détails peuvent contenir des chemins, des URL ou des informations de compte.",
+    "copyFailed": "La copie a échoué. Sélectionnez les détails et copiez-les manuellement.",
+    "openLogsFailed": "Impossible d’ouvrir le dossier des journaux."
   },
   "errors": {
     "saveFailed": "Échec de l'enregistrement",

@@ -300,6 +300,15 @@
   scrollbar-gutter: stable;
 }
 
+/* Floating composer (existing conversation, toggle on): the dock leaves the
+   document flow and pins to the chat container's bottom edge, so the last
+   messages can scroll underneath the glass panel and the backdrop blur reads
+   through them. ResizeObserver publishes the entire dock's natural height, so
+   attachments, a growing draft, and pending work cannot cover the live edge. */
+.chat.chat--composer-floating .chat-thread {
+  padding-bottom: calc(var(--composer-dock-h, 12.5rem) + 0.5rem);
+}
+
 .chat-thread:focus-visible {
   box-shadow: inset 0 0 0 2px var(--border-focus);
   outline: none;
@@ -543,6 +552,18 @@
   flex-shrink: 0;
 }
 
+/* Floating composer (existing conversation, toggle on): the dock leaves the
+   document flow and pins to the chat container's bottom edge, so the last
+   messages can scroll underneath the glass panel and the backdrop blur reads
+   through them. The new-chat landing keeps the centered (relative) layout. */
+.chat.chat--composer-floating .chat-composer-dock {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+}
+
 .chat-composer-dock > .chat-composer {
   position: relative;
   z-index: 2;
@@ -700,10 +721,6 @@
      padding), so the input panel's edges line up with the thread content. */
   width: min(100%, calc(var(--chat-col) + 3rem));
   margin: 0 auto;
-  padding: 0.75rem 1.5rem 1.875rem;
-  border-top: 0;
-  background: var(--bg-surface);
-  flex-shrink: 0;
 }
 
 .chat--new-landing .chat-composer {
@@ -1121,11 +1138,12 @@
   }
 
   .chat-thread {
-    padding: 0.75rem;
+    padding: 0.75rem 0.75rem 1.5rem;
   }
 
-  .chat-composer {
-    padding: 0.5rem 0.75rem;
+  .chat.chat--composer-floating .chat-thread {
+    padding: 0.75rem;
+    padding-bottom: calc(var(--composer-dock-h, 12.5rem) + 0.5rem);
   }
 
 }
