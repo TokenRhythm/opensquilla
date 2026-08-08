@@ -16,6 +16,19 @@ from opensquilla.observability import network_policy
 TEST_ENDPOINT = "https://telemetry.example.test/v1/install"
 PRODUCTION_ENDPOINT = "https://telemetry.opensquilla.ai/v1/install"
 
+# Every bound below is a failure deadline, not a delay. The waits return the
+# moment their condition holds, so a healthy run never spends this budget and a
+# broken one still fails — only later, and on the assertion that actually
+# describes the defect.
+#
+# The previous one- and ten-second bounds were tight enough to lose that
+# property on a loaded Windows runner: starting a daemon thread, creating two
+# interpreters, and importing this package in each of them are all far slower
+# there than on Linux, so the deadline could expire while the code under test
+# was working. That reports a stall the product does not have, on a shard whose
+# other 7000 tests are unrelated.
+_BARRIER_TIMEOUT_S = 60.0
+
 
 def _load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -462,7 +475,7 @@ def test_background_collection_does_not_wait_for_blocked_post_and_preserves_stat
     ) -> tuple[bool, str | None]:
         payloads.append(payload)
         post_started.set()
-        if not release_post.wait(timeout=2):
+        if not release_post.wait(timeout=_BARRIER_TIMEOUT_S):
             return False, "test_release_timeout"
         return True, None
 
@@ -475,7 +488,7 @@ def test_background_collection_does_not_wait_for_blocked_post_and_preserves_stat
     try:
         assert thread is not None
         assert thread.daemon is True
-        assert post_started.wait(timeout=1)
+        assert post_started.wait(timeout=_BARRIER_TIMEOUT_S)
         assert thread.is_alive()
 
         # The worker persisted its install id before entering network I/O, so a
@@ -486,7 +499,7 @@ def test_background_collection_does_not_wait_for_blocked_post_and_preserves_stat
     finally:
         release_post.set()
         if thread is not None:
-            thread.join(timeout=2)
+            thread.join(timeout=_BARRIER_TIMEOUT_S)
 
     assert thread is not None and not thread.is_alive()
     assert len(results) == 1
@@ -576,10 +589,11 @@ state_path = Path(sys.argv[1])
 ready_path = Path(sys.argv[2])
 go_path = Path(sys.argv[3])
 version = sys.argv[4]
+barrier_timeout = float(sys.argv[5])
 
 def blocked_post(endpoint, payload, *, timeout):
     ready_path.write_text("ready", encoding="utf-8")
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + barrier_timeout
     while not go_path.exists():
         if time.monotonic() >= deadline:
             return False, "barrier_timeout"
@@ -605,6 +619,7 @@ print(json.dumps({"uploaded": result.uploaded, "error": result.error}))
                 str(ready_path),
                 str(go_path),
                 version,
+                str(_BARRIER_TIMEOUT_S),
             ],
             cwd=str(Path(__file__).resolve().parents[2]),
             env=env,
@@ -620,7 +635,7 @@ print(json.dumps({"uploaded": result.uploaded, "error": result.error}))
     ]
     outputs: list[tuple[str, str]] = []
     try:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _BARRIER_TIMEOUT_S
         while not all(path.exists() for path in ready_paths):
             for worker in workers:
                 if worker.poll() is not None:
@@ -635,12 +650,14 @@ print(json.dumps({"uploaded": result.uploaded, "error": result.error}))
         # Both workers reaching this barrier proves the process lock is not held
         # across the simulated network operation.
         go_path.write_text("go", encoding="utf-8")
-        outputs = [worker.communicate(timeout=10) for worker in workers]
+        outputs = [
+            worker.communicate(timeout=_BARRIER_TIMEOUT_S) for worker in workers
+        ]
     finally:
         for worker in workers:
             if worker.poll() is None:
                 worker.terminate()
-                worker.wait(timeout=5)
+                worker.wait(timeout=_BARRIER_TIMEOUT_S)
 
     for worker, (stdout, stderr) in zip(workers, outputs, strict=True):
         assert worker.returncode == 0, stderr
