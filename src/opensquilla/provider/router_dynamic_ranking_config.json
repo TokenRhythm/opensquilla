@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-ranking-config-v4",
-  "config_version": "step2-ranking-2026-08-02.2",
+  "config_version": "step2-ranking-2026-08-05.1",
   "validation": {
     "weight_sum_tolerance": 1e-9,
     "task_profile_sum_tolerance": 0.02
@@ -217,6 +217,11 @@
   "quality": {
     "task_match_weight": 0.85,
     "user_score_weight": 0.15
+  },
+  "role_reliability": {
+    "penalty_weight": 0.40,
+    "prior_success": 9,
+    "prior_failure": 1
   },
   "penalties": {
     "task_cost_weights": {

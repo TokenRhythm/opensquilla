@@ -17081,11 +17081,18 @@ def _build_router_dynamic_members(
         pass
     registry_allowlist = inputs.get("registry_allowlist")
     contract_source_snapshot: Mapping[str, Any] | None = None
-    if thinking_assignment_enabled and isinstance(registry_allowlist, Mapping):
-        # f39 has one canonical packaged registry and intentionally exposes a
-        # no-argument loader. Freeze that exact source payload; do not depend
-        # on the later profile-manifest/versioned-loader overlay.
-        contract_source_snapshot = load_model_registry_snapshot()
+    if isinstance(registry_allowlist, Mapping):
+        source_version = str(
+            registry_allowlist.get("source_registry_snapshot_version") or ""
+        ).strip()
+        if source_version:
+            contract_source_snapshot = load_model_registry_snapshot(
+                base_version=source_version
+            )
+            if not thinking_assignment_enabled:
+                contract_source_snapshot = _legacy_registry_snapshot_projection(
+                    contract_source_snapshot
+                )
     snapshot = build_model_registry_snapshot(
         inherited_provider=inherited_provider_config.provider,
         inherited_model=inherited_provider_config.model,

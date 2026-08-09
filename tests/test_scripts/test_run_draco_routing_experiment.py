@@ -1043,9 +1043,13 @@ def _resolved_g1_registry_contract(module, experiment, config: GatewayConfig) ->
         task_analyzer_policy,
     )
 
+    assert experiment.g1_routing is not None
+    base_version = experiment.g1_routing.expected_ranking_config_version
     resolution = ranking_config_resolution(
         override=(experiment.router_dynamic_ranking_override or None),
+        base_version=base_version,
     )
+    config.llm_ensemble.freeze_ranking_config(base_version=base_version)
     analyzer_policy = task_analyzer_policy(resolution["effective_config"])
     config.llm.provider_routing[str(analyzer_policy["model"])] = str(
         analyzer_policy["upstream_provider"]
@@ -14839,6 +14843,40 @@ def test_g1_registry_all_contract_does_not_require_runtime_pins(module) -> None:
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_formal_g1_refreezes_allowlisted_historical_assets(module) -> None:
+    experiment = _experiment_config()
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+    assert "role_reliability" in (
+        config.llm_ensemble.ranking_config_effective_snapshot()
+    )
+
+    module.enforce_formal_draco_runtime_config(config, experiment, ["G1"])
+    resolution = config.llm_ensemble.ranking_config_resolution_snapshot()
+    contract = module.validate_g1_registry_contract(experiment, config)
+
+    assert resolution["base_config"]["config_version"] == (
+        "step2-ranking-2026-08-02.2"
+    )
+    assert resolution["base_sha256"] == (
+        "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
+    )
+    assert "role_reliability" not in resolution["base_config"]
+    assert contract["source_registry_snapshot_version"] == (
+        "curated-openrouter-step2-2026-07-31.1"
+    )
+    assert contract["expected_source_registry_snapshot_sha256"] == (
+        "9f76c7f96e5cb22c05b615f69b71ca633965e5039fbec9673f0a5edf9b45078a"
+    )
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
 def test_g1_runtime_ranking_override_rebinds_effective_contract(module) -> None:
     experiment = _experiment_with_current_g1_contract(
         module,
@@ -15467,6 +15505,10 @@ def test_g1_exact_routes_contract_rejects_runtime_pin_drift(module) -> None:
             "api_key": "fake",
             "provider_routing": {"x-ai/grok-4.5": "wrong-provider"},
         }
+    )
+    assert experiment.g1_routing is not None
+    config.llm_ensemble.freeze_ranking_config(
+        base_version=experiment.g1_routing.expected_ranking_config_version
     )
 
     with pytest.raises(ValueError, match="provider pin"):

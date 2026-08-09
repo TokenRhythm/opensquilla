@@ -37,10 +37,24 @@ RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-02.2"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-02.2"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-05.1"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-05.1"
 _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-27.1"
 _PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-22.1"
+_PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
+    {
+        "step2-ranking-2026-08-02.2",
+        "step2-ranking-2026-08-02.1",
+        _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION,
+        _PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION,
+    }
+)
+_HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
+    {"step2-ranking-2026-08-02.2"}
+)
+_HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset(
+    {"curated-openrouter-step2-2026-07-31.1"}
+)
 _PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-27.1"
 _LEGACY_PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-24.3"
 TASK_ANALYZER_PROVIDER_ID = "openrouter"
@@ -147,6 +161,7 @@ _ROUTER_TIERS = {"c0", "c1", "c2", "c3"}
 _USER_COST_SENSITIVITIES = {"low", "medium", "high", "hard_limit"}
 _USER_TRADEOFFS = {"balanced", "latency_first", "quality_first"}
 _MODEL_ROLES = {"proposer", "aggregator"}
+ROLE_RELIABILITY_WINDOW_SIZE = 50
 
 
 class DynamicRankingError(ValueError):
@@ -420,6 +435,13 @@ def _is_pre_task_analyzer_policy_config_version(value: Any) -> bool:
         _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION,
         _PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION,
     }
+
+
+def _is_pre_role_reliability_config_version(value: Any) -> bool:
+    """Return whether an archived config predates stability penalties."""
+
+    version = str(value or "").strip().split("+override.", 1)[0]
+    return version in _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS
 
 
 def _legacy_registry_snapshot_projection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -950,6 +972,14 @@ def _validate_ranking_config(
         raise DynamicRankingError(
             "router_dynamic legacy ranking config cannot declare thinking_assignment"
         )
+    config_version = _ranking_string(config, "config_version")
+    has_role_reliability = "role_reliability" in config
+    if not has_role_reliability and not _is_pre_role_reliability_config_version(
+        config_version
+    ):
+        raise DynamicRankingError(
+            "router_dynamic ranking config lacks the versioned role_reliability policy"
+        )
     base_required_sections = (
         "validation",
         "trace",
@@ -966,6 +996,7 @@ def _validate_ranking_config(
         "task_match",
         "user_score",
         "quality",
+        *(("role_reliability",) if has_role_reliability else ()),
         "penalties",
         "session",
         "proposer_count",
@@ -983,7 +1014,6 @@ def _validate_ranking_config(
         raise DynamicRankingError(
             "router_dynamic ranking config has unknown or missing top-level keys"
         )
-    config_version = _ranking_string(config, "config_version")
     proposer_count_config = _ranking_mapping(config, "proposer_count")
     aggregator_config = _ranking_mapping(config, "aggregator")
     has_backup_count = "backup_count" in proposer_count_config
@@ -1178,6 +1208,17 @@ def _validate_ranking_config(
             "feedback_saturation_count",
         },
         ("quality",): {"task_match_weight", "user_score_weight"},
+        **(
+            {
+                ("role_reliability",): {
+                    "penalty_weight",
+                    "prior_success",
+                    "prior_failure",
+                }
+            }
+            if has_role_reliability
+            else {}
+        ),
         ("penalties",): {
             "task_cost_weights",
             "task_latency_weights",
@@ -1663,6 +1704,7 @@ def _validate_ranking_config(
         ("task_match", "missing_role_fit_default"),
         ("user_score", "neutral_score"),
         ("user_score", "history_signal_weight"),
+        *((("role_reliability", "penalty_weight"),) if has_role_reliability else ()),
         ("session", "intent_confidence_threshold"),
         ("session", "default_quality_feedback"),
         ("session", "score_delta"),
@@ -1689,6 +1731,18 @@ def _validate_ranking_config(
         raise DynamicRankingError(
             "router_dynamic exploration is reserved and must remain disabled with propensity 1"
         )
+
+    if has_role_reliability:
+        prior_success = _ranking_int(config, "role_reliability", "prior_success")
+        prior_failure = _ranking_int(config, "role_reliability", "prior_failure")
+        if prior_success < 0 or prior_failure < 0:
+            raise DynamicRankingError(
+                "router_dynamic role_reliability priors must be non-negative integers"
+            )
+        if prior_success + prior_failure <= 0:
+            raise DynamicRankingError(
+                "router_dynamic role_reliability priors must have a positive total"
+            )
 
     nonnegative_paths = (
         ("penalties", "default_cost_weight"),
@@ -1917,10 +1971,36 @@ def _deep_merge_ranking_config_override(
     return merged
 
 
-def load_ranking_config() -> dict[str, Any]:
-    """Return an isolated copy of the versioned Step2 ranking parameters."""
+def _ranking_config_for_base_version(
+    base_version: str | None,
+) -> _ValidatedRankingConfig:
+    """Select the packaged policy or one exact allowlisted historical base."""
 
-    return copy.deepcopy(dict(_packaged_ranking_config()))
+    packaged = _packaged_ranking_config()
+    if base_version is None:
+        return packaged
+    if not isinstance(base_version, str) or not base_version.strip():
+        raise DynamicRankingError(
+            "router_dynamic ranking config base_version must be a non-empty string"
+        )
+    requested = base_version.strip()
+    packaged_version = _ranking_string(packaged, "config_version")
+    if requested == packaged_version:
+        return packaged
+    if requested not in _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS:
+        raise DynamicRankingError(
+            f"router_dynamic ranking config base_version {requested!r} is not available"
+        )
+    historical = copy.deepcopy(dict(packaged))
+    historical["config_version"] = requested
+    historical.pop("role_reliability", None)
+    return _validate_ranking_config(historical)
+
+
+def load_ranking_config(*, base_version: str | None = None) -> dict[str, Any]:
+    """Return an isolated copy of the selected Step2 ranking parameters."""
+
+    return copy.deepcopy(dict(_ranking_config_for_base_version(base_version)))
 
 
 @cache
@@ -1941,6 +2021,7 @@ def ranking_config_resolution(
     *,
     thinking_assignment_enabled: bool | None = None,
     override: Mapping[str, Any] | None = None,
+    base_version: str | None = None,
 ) -> dict[str, Any]:
     """Resolve and fingerprint one immutable runtime ranking configuration.
 
@@ -1957,8 +2038,9 @@ def ranking_config_resolution(
         raise DynamicRankingError(
             "router_dynamic legacy thinking assignment switch must be a boolean"
         )
+    packaged_base = _ranking_config_for_base_version(base_version)
     packaged_default_enabled = _ranking_bool(
-        _packaged_ranking_config(),
+        packaged_base,
         "thinking_assignment",
         "enabled",
     )
@@ -1967,10 +2049,12 @@ def ranking_config_resolution(
         if thinking_assignment_enabled is not None
         else packaged_default_enabled
     )
-    base = (
-        _packaged_enabled_ranking_config()
+    full_base = copy.deepcopy(dict(packaged_base))
+    full_base["thinking_assignment"]["enabled"] = compatibility_enabled
+    base = _validate_ranking_config(
+        full_base
         if compatibility_enabled
-        else _packaged_legacy_ranking_config()
+        else _legacy_ranking_config_projection(full_base)
     )
     base_config = copy.deepcopy(dict(base))
     base_sha256 = _canonical_hash(base_config)
@@ -2029,8 +2113,6 @@ def ranking_config_resolution(
             "conflicts with the legacy ranking_thinking_assignment_enabled switch"
         )
     override_sha256 = _canonical_hash(normalized_override)
-    full_base = copy.deepcopy(dict(_packaged_ranking_config()))
-    full_base["thinking_assignment"]["enabled"] = compatibility_enabled
     effective_full = _deep_merge_ranking_config_override(
         full_base,
         normalized_override,
@@ -2066,6 +2148,7 @@ def ranking_config_snapshot(
     *,
     thinking_assignment_enabled: bool | None = None,
     override: Mapping[str, Any] | None = None,
+    base_version: str | None = None,
 ) -> Mapping[str, Any]:
     """Return the validated effective packaged policy plus any sparse override.
 
@@ -2078,6 +2161,7 @@ def ranking_config_snapshot(
     resolution = ranking_config_resolution(
         thinking_assignment_enabled=thinking_assignment_enabled,
         override=override,
+        base_version=base_version,
     )
     return _ValidatedRankingConfig(resolution["effective_config"])
 
@@ -4442,10 +4526,56 @@ def _packaged_registry_snapshot() -> dict[str, Any]:
     return _validate_registry_snapshot(payload)
 
 
-def load_model_registry_snapshot() -> dict[str, Any]:
-    """Return an isolated copy of the packaged versioned registry snapshot."""
+def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, Any]:
+    """Select the packaged registry or reconstruct an allowlisted base snapshot."""
 
-    return copy.deepcopy(_packaged_registry_snapshot())
+    packaged = _packaged_registry_snapshot()
+    if base_version is None:
+        return packaged
+    if not isinstance(base_version, str) or not base_version.strip():
+        raise DynamicRankingError(
+            "router_dynamic model registry base_version must be a non-empty string"
+        )
+    requested = base_version.strip()
+    packaged_version = str(packaged.get("snapshot_version") or "").strip()
+    if requested == packaged_version:
+        return packaged
+    if requested not in _HISTORICAL_REGISTRY_BASE_VERSIONS:
+        raise DynamicRankingError(
+            f"router_dynamic model registry base_version {requested!r} is not available"
+        )
+    provenance = packaged.get("role_reliability_snapshot")
+    if (
+        not packaged_version.startswith(f"{requested}-reliability-")
+        or not isinstance(provenance, Mapping)
+    ):
+        raise DynamicRankingError(
+            "router_dynamic model registry cannot reconstruct the requested base snapshot"
+        )
+    recorded_base = str(provenance.get("base_snapshot_version") or "").strip()
+    if recorded_base and recorded_base != requested:
+        raise DynamicRankingError(
+            "router_dynamic model registry reliability provenance has a different base"
+        )
+    historical = copy.deepcopy(dict(packaged))
+    historical["snapshot_version"] = requested
+    historical.pop("role_reliability_snapshot", None)
+    rows = historical.get("models")
+    if not isinstance(rows, list):
+        raise DynamicRankingError("router_dynamic model registry snapshot is malformed")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise DynamicRankingError("router_dynamic model registry snapshot is malformed")
+        online_profile = row.get("online_profile")
+        if isinstance(online_profile, dict):
+            online_profile.pop("role_reliability", None)
+    return _validate_registry_snapshot(historical)
+
+
+def load_model_registry_snapshot(*, base_version: str | None = None) -> dict[str, Any]:
+    """Return an isolated copy of the selected versioned registry snapshot."""
+
+    return copy.deepcopy(_registry_snapshot_for_base_version(base_version))
 
 
 def _split_model_identity(
@@ -4861,6 +4991,76 @@ def _validate_registry_profile(
             )
 
 
+def _registry_nonnegative_int(
+    value: Any,
+    *,
+    identity: str,
+    field_name: str,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DynamicRankingError(
+            f"router_dynamic model registry {identity} has invalid {field_name}"
+        )
+    return value
+
+
+def _validate_role_reliability(
+    online_profile: Mapping[str, Any],
+    *,
+    identity: str,
+) -> None:
+    raw = online_profile.get("role_reliability")
+    if raw is None:
+        return
+    if not isinstance(raw, Mapping) or set(raw) != {
+        "window_size",
+        "proposer",
+        "aggregator",
+        "source",
+    }:
+        raise DynamicRankingError(
+            f"router_dynamic model registry {identity} has invalid role_reliability"
+        )
+    window_size = _registry_nonnegative_int(
+        raw.get("window_size"),
+        identity=identity,
+        field_name="role_reliability.window_size",
+    )
+    if window_size != ROLE_RELIABILITY_WINDOW_SIZE:
+        raise DynamicRankingError(
+            "router_dynamic model registry "
+            f"{identity} role_reliability.window_size must be "
+            f"{ROLE_RELIABILITY_WINDOW_SIZE}"
+        )
+    source = raw.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise DynamicRankingError(
+            f"router_dynamic model registry {identity} has invalid role_reliability.source"
+        )
+    for role in sorted(_MODEL_ROLES):
+        counts = raw.get(role)
+        if not isinstance(counts, Mapping) or set(counts) != {"success", "failure"}:
+            raise DynamicRankingError(
+                "router_dynamic model registry "
+                f"{identity} has invalid role_reliability.{role}"
+            )
+        success = _registry_nonnegative_int(
+            counts.get("success"),
+            identity=identity,
+            field_name=f"role_reliability.{role}.success",
+        )
+        failure = _registry_nonnegative_int(
+            counts.get("failure"),
+            identity=identity,
+            field_name=f"role_reliability.{role}.failure",
+        )
+        if success + failure > window_size:
+            raise DynamicRankingError(
+                "router_dynamic model registry "
+                f"{identity} role_reliability.{role} exceeds window_size"
+            )
+
+
 def _validate_registry_model(
     *,
     identity: str,
@@ -5001,6 +5201,7 @@ def _validate_registry_model(
             raise DynamicRankingError(
                 f"router_dynamic model registry {identity} has out-of-range error_rates.{dimension}"
             )
+    _validate_role_reliability(online_profile, identity=identity)
 
 
 def _normalize_model(
@@ -5306,6 +5507,87 @@ def _role_fit(model: RankedModel, role: str, ranking_config: Mapping[str, Any]) 
     return _clamp(_as_float(values.get(role), default))
 
 
+def _role_reliability_score(
+    model: RankedModel,
+    role: str,
+    ranking_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    if "role_reliability" not in ranking_config:
+        return {
+            "role": role,
+            "success": 0,
+            "failure": 0,
+            "observed": 0,
+            "window_size": ROLE_RELIABILITY_WINDOW_SIZE,
+            "source": "",
+            "failure_rate": 0.0,
+            "penalty_weight": 0.0,
+            "penalty": 0.0,
+        }
+    raw = model.online_profile.get("role_reliability")
+    profile = raw if isinstance(raw, Mapping) else {}
+    raw_counts = profile.get(role)
+    counts = raw_counts if isinstance(raw_counts, Mapping) else {}
+    success = _as_int(counts.get("success"), 0)
+    failure = _as_int(counts.get("failure"), 0)
+    observed = success + failure
+    prior_success = _ranking_int(ranking_config, "role_reliability", "prior_success")
+    prior_failure = _ranking_int(ranking_config, "role_reliability", "prior_failure")
+    failure_rate = (
+        0.0
+        if observed == 0
+        else (failure + prior_failure)
+        / (observed + prior_success + prior_failure)
+    )
+    penalty_weight = _ranking_number(
+        ranking_config,
+        "role_reliability",
+        "penalty_weight",
+    )
+    return {
+        "role": role,
+        "success": success,
+        "failure": failure,
+        "observed": observed,
+        "window_size": _as_int(profile.get("window_size"), ROLE_RELIABILITY_WINDOW_SIZE),
+        "source": str(profile.get("source") or ""),
+        "failure_rate": failure_rate,
+        "penalty_weight": penalty_weight,
+        "penalty": penalty_weight * failure_rate,
+    }
+
+
+def _role_reliability_trace(
+    value: Any,
+    ranking_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    reliability = value if isinstance(value, Mapping) else {}
+    decimal_places = _ranking_int(ranking_config, "trace", "score_decimal_places")
+    return {
+        "role": str(reliability.get("role") or ""),
+        "success": _as_int(reliability.get("success"), 0),
+        "failure": _as_int(reliability.get("failure"), 0),
+        "observed": _as_int(reliability.get("observed"), 0),
+        "failure_rate": round(
+            _as_float(reliability.get("failure_rate")),
+            decimal_places,
+        ),
+        "penalty_weight": round(
+            _as_float(reliability.get("penalty_weight")),
+            decimal_places,
+        ),
+        "penalty": round(
+            _as_float(reliability.get("penalty")),
+            decimal_places,
+        ),
+        "window_size": _as_int(
+            reliability.get("window_size"),
+            ROLE_RELIABILITY_WINDOW_SIZE,
+        ),
+        "source": str(reliability.get("source") or ""),
+    }
+
+
 def _task_match(
     model: RankedModel,
     task_profile: Mapping[str, Any],
@@ -5507,12 +5789,14 @@ def _base_score_row(
         _user_score(model, user_profile, ranking_config) if user_profile is not None else 0.0
     )
     session_score = _session_score(model, task_profile, request_context, ranking_config)
-    quality_clean = task_match
+    quality_before_reliability = task_match
     if user_profile is not None:
-        quality_clean = (
+        quality_before_reliability = (
             _ranking_number(ranking_config, "quality", "task_match_weight") * task_match
             + _ranking_number(ranking_config, "quality", "user_score_weight") * user_score
         )
+    reliability = _role_reliability_score(model, "proposer", ranking_config)
+    quality_clean = quality_before_reliability - _as_float(reliability["penalty"])
     quality = _clamp(quality_clean + session_score)
     price_reference = _ranking_number(
         ranking_config, "normalization", "price_reference_usd_per_million"
@@ -5530,8 +5814,10 @@ def _base_score_row(
         "task_match": task_match,
         "user_score": user_score,
         "session_score": session_score,
+        "quality_before_reliability": quality_before_reliability,
         "quality_clean": quality_clean,
         "quality": quality,
+        "reliability": reliability,
         "cost_normalized": cost_normalized,
         "latency_normalized": latency_normalized,
         "cost_weight": cost_weight,
@@ -5546,7 +5832,7 @@ def _base_score_row(
 def _score_trace(row: Mapping[str, Any], ranking_config: Mapping[str, Any]) -> dict[str, Any]:
     model = row["model"]
     decimal_places = _ranking_int(ranking_config, "trace", "score_decimal_places")
-    return {
+    trace = {
         "identity": model.identity,
         "model": model.model_id,
         "provider": model.provider,
@@ -5562,6 +5848,20 @@ def _score_trace(row: Mapping[str, Any], ranking_config: Mapping[str, Any]) -> d
         "S_base_clean": round(_as_float(row.get("base_clean")), decimal_places),
         "S_base": round(_as_float(row.get("base")), decimal_places),
     }
+    if "role_reliability" in ranking_config:
+        trace.update(
+            {
+                "S_qual_before_reliability": round(
+                    _as_float(row.get("quality_before_reliability")),
+                    decimal_places,
+                ),
+                "role_reliability": _role_reliability_trace(
+                    row.get("reliability"),
+                    ranking_config,
+                ),
+            }
+        )
+    return trace
 
 
 def _shift_tier_distribution(
@@ -6171,7 +6471,9 @@ def _aggregator_rows(
         context_need = context_need_by_identity[model.identity]
         task_match = _task_match(model, task_profile, ranking_config, role=None)
         role_fit = _role_fit(model, "aggregator", ranking_config)
-        quality = task_weight * task_match + role_weight * role_fit
+        quality_before_reliability = task_weight * task_match + role_weight * role_fit
+        reliability = _role_reliability_score(model, "aggregator", ranking_config)
+        quality = quality_before_reliability - _as_float(reliability["penalty"])
         session_score = _session_score(model, task_profile, request_context, ranking_config)
         self_overlap = any(model.identity == proposer.identity for proposer in proposers)
         family_overlap = any(model.family == proposer.family for proposer in proposers)
@@ -6192,6 +6494,8 @@ def _aggregator_rows(
                 "model": model,
                 "score": score,
                 "quality": quality,
+                "quality_before_reliability": quality_before_reliability,
+                "reliability": reliability,
                 "task_match": task_match,
                 "role_fit": role_fit,
                 "session_score": session_score,
@@ -6221,7 +6525,7 @@ def _aggregator_score_trace(
 ) -> dict[str, Any]:
     model = row["model"]
     decimal_places = _ranking_int(ranking_config, "trace", "score_decimal_places")
-    return {
+    trace = {
         "identity": model.identity,
         "model": model.model_id,
         "provider": model.provider,
@@ -6240,6 +6544,20 @@ def _aggregator_score_trace(
         "family_overlap": bool(row.get("family_overlap")),
         "vendor_overlap": bool(row.get("vendor_overlap")),
     }
+    if "role_reliability" in ranking_config:
+        trace.update(
+            {
+                "S_agg_qual_before_reliability": round(
+                    _as_float(row.get("quality_before_reliability")),
+                    decimal_places,
+                ),
+                "role_reliability": _role_reliability_trace(
+                    row.get("reliability"),
+                    ranking_config,
+                ),
+            }
+        )
+    return trace
 
 
 def _selection_roster_counts(
@@ -6416,6 +6734,7 @@ def rank_models(
         effective_ranking_config, "trace", "profile_decimal_places"
     )
     score_decimal_places = _ranking_int(effective_ranking_config, "trace", "score_decimal_places")
+    role_reliability_enabled = "role_reliability" in effective_ranking_config
     session_nonzero_epsilon = _ranking_number(
         effective_ranking_config, "trace", "session_nonzero_epsilon"
     )
@@ -6598,6 +6917,24 @@ def rank_models(
             {
                 "base_rank": base_rank,
                 "identity": row["model"].identity,
+                **(
+                    {
+                        "quality_before_reliability": round(
+                            _as_float(row["quality_before_reliability"]),
+                            score_decimal_places,
+                        ),
+                        "reliability_failure_rate": round(
+                            _as_float(row["reliability"]["failure_rate"]),
+                            score_decimal_places,
+                        ),
+                        "reliability_penalty": round(
+                            _as_float(row["reliability"]["penalty"]),
+                            score_decimal_places,
+                        ),
+                    }
+                    if role_reliability_enabled
+                    else {}
+                ),
                 "base_clean": round(_as_float(row["base_clean"]), score_decimal_places),
                 "passes_quality_floor": passes_quality_floor,
             }
@@ -6682,6 +7019,7 @@ def rank_models(
                     "max_similarity": similarity,
                     "error_complementarity": error_complementarity,
                     "base_clean": row["base_clean"],
+                    "reliability": row["reliability"],
                 }
             )
         marginal_rows.sort(
@@ -6708,6 +7046,20 @@ def rank_models(
                 "selected": best["model"].identity,
                 "marginal_gain": round(_as_float(best["marginal"]), score_decimal_places),
                 "quality": round(_as_float(best["quality"]), score_decimal_places),
+                **(
+                    {
+                        "reliability_failure_rate": round(
+                            _as_float(best["reliability"]["failure_rate"]),
+                            score_decimal_places,
+                        ),
+                        "reliability_penalty": round(
+                            _as_float(best["reliability"]["penalty"]),
+                            score_decimal_places,
+                        ),
+                    }
+                    if role_reliability_enabled
+                    else {}
+                ),
                 "coverage_gain": round(_as_float(best["coverage_gain"]), score_decimal_places),
                 "max_similarity": round(_as_float(best["max_similarity"]), score_decimal_places),
                 "error_complementarity": round(
@@ -6722,6 +7074,20 @@ def rank_models(
                             _as_float(candidate["marginal"]), score_decimal_places
                         ),
                         "quality": round(_as_float(candidate["quality"]), score_decimal_places),
+                        **(
+                            {
+                                "reliability_failure_rate": round(
+                                    _as_float(candidate["reliability"]["failure_rate"]),
+                                    score_decimal_places,
+                                ),
+                                "reliability_penalty": round(
+                                    _as_float(candidate["reliability"]["penalty"]),
+                                    score_decimal_places,
+                                ),
+                            }
+                            if role_reliability_enabled
+                            else {}
+                        ),
                         "coverage_gain": round(
                             _as_float(candidate["coverage_gain"]), score_decimal_places
                         ),

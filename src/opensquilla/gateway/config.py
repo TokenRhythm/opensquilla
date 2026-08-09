@@ -628,8 +628,12 @@ class LlmEnsembleConfig(BaseSettings):
             self.freeze_ranking_config()
         return self
 
-    def freeze_ranking_config(self) -> dict[str, Any]:
-        """Validate and detach the effective router policy for this config."""
+    def freeze_ranking_config(
+        self,
+        *,
+        base_version: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate and detach the selected router policy for this config."""
 
         from opensquilla.provider.ranking_router import ranking_config_resolution
 
@@ -641,6 +645,7 @@ class LlmEnsembleConfig(BaseSettings):
         resolution = ranking_config_resolution(
             thinking_assignment_enabled=legacy_thinking_switch,
             override=(self.ranking_config_override or None),
+            base_version=base_version,
         )
         if "proposer_backup_count" in self.model_fields_set:
             effective = resolution.get("effective_config")

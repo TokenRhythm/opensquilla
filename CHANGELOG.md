@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Dynamic routing now records frozen proposer/aggregator reliability observations,
+  includes an offline updater for audited experiment artifacts, and can replay the
+  exact versioned ranking configuration and model-registry snapshot used by a
+  historical DRACO contract.
+
+### Changed
+
+- Proposer and aggregator ranking now subtract a role-specific reliability
+  penalty (configured at `0.40`) while preserving the pre-reliability behavior
+  for historical routing snapshots.
+
 ## [0.5.0] - 2026-07-23
 
 OpenSquilla 0.5.0 is the first stable release of the 0.5 line, collecting the

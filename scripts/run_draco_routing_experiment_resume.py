@@ -553,8 +553,11 @@ def validate_g1_registry_contract(
         ranking_resolution = ranking_config_resolution(
             thinking_assignment_enabled=thinking_assignment_enabled,
             override=(config.llm_ensemble.ranking_config_override or None),
+            base_version=contract.expected_ranking_config_version,
         )
-    snapshot = load_model_registry_snapshot()
+    snapshot = load_model_registry_snapshot(
+        base_version=contract.source_registry_snapshot_version
+    )
     if not thinking_assignment_enabled:
         snapshot = _legacy_registry_snapshot_projection(snapshot)
     actual_version = str(snapshot.get("snapshot_version") or "").strip()
@@ -804,7 +807,15 @@ def enforce_formal_draco_runtime_config(
     config.llm_ensemble.ranking_config_override = copy.deepcopy(
         experiment.router_dynamic_ranking_override
     )
-    ranking_resolution = config.llm_ensemble.freeze_ranking_config()
+    if "G1" in groups:
+        g1_routing = experiment.g1_routing
+        if g1_routing is None:
+            raise ValueError("G1 requires a versioned g1_routing experiment contract")
+        ranking_resolution = config.llm_ensemble.freeze_ranking_config(
+            base_version=g1_routing.expected_ranking_config_version
+        )
+    else:
+        ranking_resolution = config.llm_ensemble.freeze_ranking_config()
     proposer_policy = proposer_recovery_policy(
         experiment,
         ranking_config=ranking_resolution["effective_config"],

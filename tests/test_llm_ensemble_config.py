@@ -298,6 +298,25 @@ def test_llm_ensemble_ranking_override_enables_thinking_and_freezes_resolution()
     assert resolution["effective_config"]["thinking_assignment"]["enabled"] is True
 
 
+def test_llm_ensemble_can_refreeze_an_allowlisted_historical_ranking_base() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={"selection_mode": "router_dynamic"}
+    )
+
+    historical = cfg.llm_ensemble.freeze_ranking_config(
+        base_version="step2-ranking-2026-08-02.2"
+    )
+
+    assert historical["base_config"]["config_version"] == (
+        "step2-ranking-2026-08-02.2"
+    )
+    assert historical["base_sha256"] == (
+        "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
+    )
+    assert "role_reliability" not in historical["base_config"]
+    assert cfg.llm_ensemble.ranking_config_resolution_snapshot() == historical
+
+
 def test_llm_ensemble_explicit_legacy_thinking_switch_conflict_fails_closed() -> None:
     with pytest.raises(ValueError, match="conflicts with the legacy"):
         GatewayConfig(
