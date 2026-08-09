@@ -3204,7 +3204,9 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
 def _test_ranking_config(module) -> dict[str, object]:
     from opensquilla.provider.ranking_router import ranking_config_snapshot
 
-    config = deepcopy(ranking_config_snapshot())
+    config = deepcopy(
+        ranking_config_snapshot(base_version=module.FORMAL_G1_RANKING_CONFIG_VERSION)
+    )
     # Make this tiny three-model fixture select all three proposers while still
     # exercising the complete production ranking configuration.
     config["proposer_count"]["by_tier"]["3"] = {"min": 3, "max": 3}
@@ -3229,6 +3231,7 @@ def _runtime_override_ranking_contract(
             else False
         ),
         override=override,
+        base_version=module.FORMAL_G1_RANKING_CONFIG_VERSION,
     )
     effective = resolution["effective_config"]
     proposer_count = effective["proposer_count"]
