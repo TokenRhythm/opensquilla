@@ -46,6 +46,7 @@ from opensquilla.router_runtime_diagnostics import (
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
     HIGHEST_TEXT_TIER,
+    IMAGE_TIER,
     TEXT_TIERS,
     TierConfig,
     normalize_text_tier,
@@ -1111,13 +1112,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             name: tier
             for name, tier in tiers.items()
             if tier.get("supports_image", False)
-            and not (
-                c3_fusion_active
-                and (
-                    name == HIGHEST_TEXT_TIER
-                    or bool(tier.get("image_only", False))
-                )
-            )
+            and not (c3_fusion_active and name == HIGHEST_TEXT_TIER)
         }
         if not image_tiers:
             log.warning(
@@ -1128,14 +1123,18 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             if c3_fusion_active:
                 raise RuntimeError(
                     "No image-capable SquillaRouter tier is available for this image "
-                    "request while C3 multi-model fusion is selected. Choose a single "
-                    "C3 model or enable image support on another text tier."
+                    "request while C3 multi-model fusion is selected. Configure "
+                    "squilla_router.tiers.image_model with supports_image=true or enable "
+                    "image support on another non-C3 tier."
                 )
             raise RuntimeError(
                 "No image-capable SquillaRouter tier is configured for this image request. "
                 "Configure squilla_router.tiers.image_model with supports_image=true."
             )
-        tier_name = next(iter(image_tiers))
+        # The dedicated image tier owns image requests regardless of TOML
+        # declaration order. Other image-capable tiers remain deterministic
+        # fallbacks, while an active C3 fusion tier is never one of them.
+        tier_name = IMAGE_TIER if IMAGE_TIER in image_tiers else next(iter(image_tiers))
         decision = RoutingDecision(
             tier=tier_name,
             model=image_tiers[tier_name].get("model", ctx.model),
