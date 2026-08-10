@@ -70,6 +70,10 @@
       <div v-if="message.text" class="msg-user-bubble">
         {{ stripTimePrefix(message.text) }}
       </div>
+      <span v-if="isGoalSource" class="msg-user-goal-origin" role="status">
+        <Icon name="target" :size="14" aria-hidden="true" />
+        {{ t('chat.goal.sentAsGoal') }}
+      </span>
       <span
         v-if="steerStatusLabel"
         class="msg-user-steer-status"
@@ -137,6 +141,7 @@ const props = defineProps<{
   downloadAttachment: (attachment: DisplayAttachment) => Promise<boolean>
   showTurnOutcome?: boolean
   isStreaming?: boolean
+  isGoalSource?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -341,6 +346,17 @@ function attachmentMeta(attachment: DisplayAttachment): string {
 .msg-user-steer-status {
   display: inline-flex;
   align-items: center;
+  min-height: 1.25rem;
+  padding-inline: 0.25rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
+}
+
+.msg-user-goal-origin {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
   min-height: 1.25rem;
   padding-inline: 0.25rem;
   color: var(--text-dim);

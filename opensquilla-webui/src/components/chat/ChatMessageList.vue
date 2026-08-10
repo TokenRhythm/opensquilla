@@ -20,6 +20,7 @@
       :download-attachment="downloadAttachment"
       :show-turn-outcome="isTurnTip(index)"
       :is-streaming="isStreaming"
+      :is-goal-source="isGoalSource(message)"
       @edit="$emit('editMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
     />
@@ -52,6 +53,8 @@
       :plan-action-pending="planActionPending"
       :plan-actions-disabled="planActionsDisabled"
       :show-turn-outcome="isTurnTip(index)"
+      :goal-outcome="goalOutcomeFor(message, index)"
+      :goal-elapsed="goalElapsed"
       @fork="$emit('forkConversation', forkThroughTurnId(index))"
       @regenerate="$emit('regenerateMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
@@ -92,6 +95,10 @@ import type {
   ToolResultContext,
 } from '@/types/chat'
 import type { ArtifactPayload } from '@/types/rpc'
+import {
+  goalHasSettledTerminalOutcome,
+  type GoalSnapshot,
+} from '@/composables/chat/useChatGoals'
 import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 
@@ -120,6 +127,8 @@ const props = defineProps<{
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
   isStreaming?: boolean
+  goal?: GoalSnapshot | null
+  goalElapsed?: string
 }>()
 
 defineEmits<{
@@ -183,5 +192,34 @@ function isTurnTip(index: number): boolean {
     if (next.displayRole === 'user') break
   }
   return true
+}
+
+function isGoalSource(message: ChatRenderedMessage): boolean {
+  const sourceMessageId = String(props.goal?.sourceMessageId || '').trim()
+  return Boolean(sourceMessageId && message.messageId === sourceMessageId)
+}
+
+function goalOutcomeFor(message: ChatRenderedMessage, index: number): GoalSnapshot | null {
+  const goal = props.goal
+  const terminalTurnId = String(goal?.terminalTurnId || '').trim()
+  if (
+    !goalHasSettledTerminalOutcome(goal)
+    || !terminalTurnId
+    || message.stopNotice
+    || message.turnId !== terminalTurnId
+  ) return null
+
+  // A turn may persist more than one assistant row while tools execute. Bind
+  // the durable outcome to the final visible assistant row in that turn so it
+  // is rendered exactly once beside the actual final response.
+  for (let nextIndex = index + 1; nextIndex < props.messages.length; nextIndex += 1) {
+    const next = props.messages[nextIndex]
+    if (
+      next.displayRole === 'assistant'
+      && !next.stopNotice
+      && next.turnId === terminalTurnId
+    ) return null
+  }
+  return goal ?? null
 }
 </script>

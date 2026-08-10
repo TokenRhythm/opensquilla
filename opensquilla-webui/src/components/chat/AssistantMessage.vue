@@ -177,6 +177,13 @@
       </div>
 
       <div v-if="showFooter" class="msg-ai-footer">
+        <GoalOutcomeNotice
+          v-if="goalOutcome"
+          class="msg-goal-outcome"
+          :goal="goalOutcome"
+          :elapsed="goalElapsed || '0s'"
+          inline
+        />
         <span
           v-if="isCronMessage"
           class="msg-provenance-chip"
@@ -345,6 +352,7 @@ import Icon from '@/components/Icon.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
+import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
 import SourcesRow from '@/components/chat/SourcesRow.vue'
 import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
@@ -364,6 +372,7 @@ import type {
   ChatToolCallRenderItem,
   ToolResultContext,
 } from '@/types/chat'
+import type { GoalSnapshot } from '@/composables/chat/useChatGoals'
 import type { ChatPart } from '@/types/parts'
 import type { ArtifactPayload } from '@/types/rpc'
 import type {
@@ -409,6 +418,8 @@ const props = defineProps<{
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
   showTurnOutcome?: boolean
+  goalOutcome?: GoalSnapshot | null
+  goalElapsed?: string
 }>()
 
 const emit = defineEmits<{
@@ -529,7 +540,11 @@ const cronBadgeTitle = computed(() => safeCronSourceTool.value
   : t('chat.provenance.cron'))
 const showFooter = computed(() =>
   planParts.value.length === 0
-  && (!!props.message.meta || (!props.shareMode && !props.message.stopNotice)),
+  && (
+    !!props.goalOutcome
+    || !!props.message.meta
+    || (!props.shareMode && !props.message.stopNotice)
+  ),
 )
 
 // A citation pill in the body asks the paired SourcesRow to reveal + highlight

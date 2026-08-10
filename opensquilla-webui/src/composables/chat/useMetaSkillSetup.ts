@@ -514,6 +514,9 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
         jobId: persistedJobId,
         sessionKey: originatingSessionKey,
       })
+      if (options.currentSessionKey.value !== originatingSessionKey) {
+        return 'deferred' as const
+      }
       if (!isCurrent(token)) return
       if (!result?.job) {
         const unavailable = result?.error || 'Setup status is unavailable'
@@ -577,6 +580,9 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       if (setupState.value) persistSetupCheckpoint(setupState.value)
       await applyJob(result.job, token)
     } catch (error) {
+      if (options.currentSessionKey.value !== originatingSessionKey) {
+        return 'deferred' as const
+      }
       if (!isCurrent(token)) return
       if (isMissingJobError(error)) {
         setupState.value = recoverFromMissingJob(originatingSessionKey, next)
@@ -966,10 +972,10 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
 
   const stopSessionWatch = watch(options.currentSessionKey, (nextSessionKey) => {
     const current = setupState.value
-    if (current && current.sessionKey !== nextSessionKey) {
+    if (!current || current.sessionKey !== nextSessionKey) {
       beginOperation()
       installInFlight = false
-      setupState.value = null
+      if (current) setupState.value = null
     }
     if (options.autoRestore !== false) void restoreSetupJob(nextSessionKey)
   })
