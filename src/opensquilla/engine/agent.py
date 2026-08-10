@@ -128,6 +128,7 @@ from opensquilla.engine.tool_token_estimate import estimate_tokens as get_approx
 from opensquilla.engine.usage import model_usage_cost_fields
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
+    UsageCallResult,
     UsageCallStart,
     UsageEventSink,
     UsageExecutionContext,
@@ -843,6 +844,51 @@ def _usage_float(value: Any) -> float:
         return max(0.0, float(value or 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _normalized_usage_breakdown_rows(
+    event: object,
+    usage: UsageCallResult,
+) -> list[dict[str, Any]]:
+    """Preserve provider metadata while replacing additive usage with canonical values."""
+
+    raw_breakdown = getattr(event, "model_usage_breakdown", None)
+    raw_rows = raw_breakdown if isinstance(raw_breakdown, list) else []
+    rows: list[dict[str, Any]] = []
+    for item in usage.items:
+        row = (
+            dict(raw_rows[item.ordinal])
+            if item.ordinal < len(raw_rows) and isinstance(raw_rows[item.ordinal], dict)
+            else {}
+        )
+        billed_cost = item.billed_cost_nanos / 1_000_000_000
+        model = item.model or "unknown"
+        row.update(
+            {
+                "provider": item.provider,
+                "model": model,
+                "input_tokens": item.input_tokens,
+                "inputTokens": item.input_tokens,
+                "output_tokens": item.output_tokens,
+                "outputTokens": item.output_tokens,
+                "reasoning_tokens": item.reasoning_tokens,
+                "reasoningTokens": item.reasoning_tokens,
+                "cache_read_tokens": item.cache_read_tokens,
+                "cacheReadTokens": item.cache_read_tokens,
+                "cached_tokens": item.cache_read_tokens,
+                "cachedTokens": item.cache_read_tokens,
+                "cache_write_tokens": item.cache_write_tokens,
+                "cacheWriteTokens": item.cache_write_tokens,
+                "billed_cost": billed_cost,
+                "billedCost": billed_cost,
+                "billed_cost_usd": billed_cost,
+                "billedCostUsd": billed_cost,
+                "cost_source": item.cost_source,
+                "costSource": item.cost_source,
+            }
+        )
+        rows.append(row)
+    return rows
 
 
 def _subagent_usage_breakdown_rows(usage: SubagentUsage) -> list[dict[str, Any]]:
@@ -5878,17 +5924,21 @@ class Agent:
         self,
         call: UsageCallStart,
         provider_done: object,
+        *,
+        normalized_result: UsageCallResult | None = None,
     ) -> None:
         scope = current_usage_accounting_scope()
         sink = scope.sink if scope is not None else self._usage_event_sink
         if sink is None:
             return
-        result = normalize_provider_usage(
-            provider_done,
-            default_provider=call.provider,
-            default_model=call.model,
-            completed_at_ms=time.time_ns() // 1_000_000,
-        )
+        result = normalized_result
+        if result is None:
+            result = normalize_provider_usage(
+                provider_done,
+                default_provider=call.provider,
+                default_model=call.model,
+                completed_at_ms=time.time_ns() // 1_000_000,
+            )
         finalize_task = asyncio.create_task(sink.finalize(call, result))
         try:
             await asyncio.shield(finalize_task)
@@ -6252,6 +6302,7 @@ class Agent:
         total_provider_billed_entries = 0
         total_unbilled_entries = 0
         total_missing_cost_entries = 0
+        turn_has_error_usage_receipt = False
         # Estimate-backed accumulator for max_turn_cost_usd: billed cost when a
         # call reported one, otherwise the layered-resolver estimate — unlike
         # total_billed_cost, this never sits at 0.0 for a cost-blind provider.
@@ -8209,57 +8260,106 @@ class Agent:
                                     raw_ev.code
                                 )
                                 known_usage_receipt = has_known_provider_usage_receipt(raw_ev)
+                                error_usage: UsageCallResult | None = None
+                                if known_usage_receipt and not cost_receipt_counted:
+                                    usage_default_provider = (
+                                        usage_call.provider
+                                        if usage_call is not None
+                                        else str(
+                                            self.config.provider_id
+                                            or getattr(
+                                                self.provider,
+                                                "provider_name",
+                                                "",
+                                            )
+                                            or ""
+                                        )
+                                    )
+                                    usage_default_model = (
+                                        usage_call.model
+                                        if usage_call is not None
+                                        else str(self.config.model_id or "")
+                                    )
+                                    error_usage = normalize_provider_usage(
+                                        raw_ev,
+                                        default_provider=usage_default_provider,
+                                        default_model=usage_default_model,
+                                        completed_at_ms=time.time_ns() // 1_000_000,
+                                        resolve_estimates=False,
+                                    )
                                 if (
                                     usage_call is not None
                                     and not usage_call_terminal
                                     and known_usage_receipt
                                 ):
                                     usage_call_terminal = True
-                                    await self._usage_call_finalize(usage_call, raw_ev)
-                                if known_usage_receipt and not cost_receipt_counted:
+                                    await self._usage_call_finalize(
+                                        usage_call,
+                                        raw_ev,
+                                        normalized_result=error_usage,
+                                    )
+                                if error_usage is not None:
+                                    total_billed_cost += (
+                                        error_usage.billed_cost_nanos / 1_000_000_000
+                                    )
+                                    total_input_tokens += error_usage.input_tokens
+                                    total_output_tokens += error_usage.output_tokens
+                                    total_reasoning_tokens += error_usage.reasoning_tokens
+                                    total_cached_tokens += error_usage.cache_read_tokens
+                                    total_cache_write_tokens += (
+                                        error_usage.cache_write_tokens
+                                    )
+                                    total_missing_cost_entries += (
+                                        error_usage.missing_usage_entries
+                                    )
+                                    canonical_error_rows = (
+                                        _normalized_usage_breakdown_rows(
+                                            raw_ev,
+                                            error_usage,
+                                        )
+                                    )
+                                    turn_model_usage_breakdown.extend(
+                                        canonical_error_rows
+                                    )
+                                    for usage_item in error_usage.items:
+                                        usage_model = usage_item.model or "unknown"
+                                        if usage_item.cost_source == "mixed":
+                                            total_provider_billed_entries += 1
+                                            total_unbilled_entries += 1
+                                        elif usage_item.cost_source == "provider_billed":
+                                            total_provider_billed_entries += 1
+                                        else:
+                                            total_unbilled_entries += 1
+                                        if self._usage_tracker and self._session_key:
+                                            self._usage_tracker.add(
+                                                self._session_key,
+                                                input_tokens=usage_item.input_tokens,
+                                                output_tokens=usage_item.output_tokens,
+                                                model_id=usage_model,
+                                                cache_read_tokens=(
+                                                    usage_item.cache_read_tokens
+                                                ),
+                                                cache_write_tokens=(
+                                                    usage_item.cache_write_tokens
+                                                ),
+                                                billed_cost=(
+                                                    usage_item.billed_cost_nanos
+                                                    / 1_000_000_000
+                                                ),
+                                                provider=usage_item.provider,
+                                                cost_source=usage_item.cost_source,
+                                            )
                                     _accumulate_turn_cost(
                                         raw_ev,
-                                        default_provider=(
-                                            usage_call.provider
-                                            if usage_call is not None
-                                            else str(
-                                                self.config.provider_id
-                                                or getattr(
-                                                    self.provider,
-                                                    "provider_name",
-                                                    "",
-                                                )
-                                                or ""
-                                            )
-                                        ),
-                                        default_model=(
-                                            usage_call.model
-                                            if usage_call is not None
-                                            else str(self.config.model_id or "")
-                                        ),
+                                        default_provider=usage_default_provider,
+                                        default_model=usage_default_model,
                                     )
-                                    # Done-path adds raw_ev.billed_cost to the
-                                    # turn gate accumulator; ErrorEvent has no
-                                    # billed_cost field, so sum provider_billed
-                                    # breakdown rows or the gate never fires.
-                                    for usage_row in raw_ev.model_usage_breakdown:
-                                        if not isinstance(usage_row, dict):
-                                            continue
-                                        if (
-                                            str(
-                                                usage_row.get("cost_source")
-                                                or usage_row.get("costSource")
-                                                or ""
-                                            )
-                                            != "provider_billed"
-                                        ):
-                                            continue
-                                        total_billed_cost += _usage_float(
-                                            usage_row.get("billed_cost")
-                                            or usage_row.get("billed_cost_usd")
-                                            or 0.0
-                                        )
+                                    if usage_default_model:
+                                        last_actual_model = usage_default_model
+                                    if usage_default_provider:
+                                        last_actual_provider = usage_default_provider
                                     cost_receipt_counted = True
+                                    turn_has_error_usage_receipt = True
                                 # One-shot thinking/reasoning fallback
                                 _err_lower = raw_ev.message.lower()
                                 if (
@@ -12920,6 +13020,15 @@ class Agent:
                 done_model = su.model_id
         if not done_model:
             done_model = self.config.model_id or ""
+        if not done_model and turn_has_error_usage_receipt:
+            done_model = next(
+                (
+                    str(row.get("model") or "")
+                    for row in turn_model_usage_breakdown
+                    if isinstance(row, dict) and row.get("model")
+                ),
+                "",
+            )
         done_provider = (
             last_actual_provider
             or self.config.provider_id
@@ -12964,6 +13073,18 @@ class Agent:
             )
             estimate_basis = "free" if turn_estimate.basis == "free" and has_turn_tokens else None
 
+        error_usage_report_rows: list[dict[str, Any]] = []
+        if turn_has_error_usage_receipt and turn_model_usage_breakdown:
+            error_usage_report_rows = _with_model_usage_cost_fields(
+                turn_model_usage_breakdown
+            )
+            # Reuse the per-member price resolution below instead of resolving
+            # the same rows again during final summarization.
+            turn_model_usage_breakdown = [
+                {**row, "_opensquilla_reported_cost": True}
+                for row in error_usage_report_rows
+            ]
+
         turn_usage_delta = (
             self._usage_tracker.session_delta_snapshot(self._session_key, usage_turn_baseline)
             if self._usage_tracker and self._session_key
@@ -13002,6 +13123,55 @@ class Agent:
             elif estimate_basis != "free":
                 # "unavailable": no estimated dollars in the reported cost.
                 estimate_basis = None
+        elif error_usage_report_rows:
+            # UsageTracker is optional.  Error receipts still retain their
+            # member deployment identities, so estimate any unbilled rows with
+            # those models instead of pricing the whole turn as the outer
+            # ensemble/default model.
+            report_components: list[tuple[bool, bool, int]] = []
+            report_estimated_cost = 0.0
+            report_estimate_bases: set[str] = set()
+            for row in error_usage_report_rows:
+                row_cost = _usage_float(row.get("cost_usd") or row.get("costUsd"))
+                row_billed = _usage_float(
+                    row.get("billed_cost_usd")
+                    or row.get("billedCostUsd")
+                    or row.get("billed_cost")
+                    or row.get("billedCost")
+                )
+                report_estimated_cost += max(0.0, row_cost - row_billed)
+                row_basis = str(
+                    row.get("estimate_basis") or row.get("estimateBasis") or ""
+                ).strip()
+                if row_basis:
+                    report_estimate_bases.add(row_basis)
+                report_components.append(
+                    _cost_component_flags(
+                        cost_source=str(
+                            row.get("cost_source") or row.get("costSource") or "none"
+                        ),
+                        cost_usd=row_cost,
+                        billed_cost=row_billed,
+                        missing_cost_entries=_usage_int(
+                            row.get("missing_cost_entries") or 0
+                        ),
+                        estimate_basis=row_basis or None,
+                    )
+                )
+            if total_missing_cost_entries:
+                report_components.append((False, False, total_missing_cost_entries))
+            done_cost = total_billed_cost + report_estimated_cost
+            done_billed_cost = total_billed_cost
+            cost_source = _model_usage_row_cost_source(report_components)
+            estimate_basis = (
+                "cache_blind"
+                if "cache_blind" in report_estimate_bases
+                else "cache_aware"
+                if "cache_aware" in report_estimate_bases
+                else "free"
+                if "free" in report_estimate_bases
+                else None
+            )
 
         # Freeze the parent delta before any completed child usage is added to
         # the shared tracker. This keeps the current turn from counting its own
