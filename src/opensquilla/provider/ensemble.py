@@ -1301,12 +1301,17 @@ def _overwrite_candidate_result(
 
     for descriptor in fields(_CandidateResult):
         setattr(target, descriptor.name, getattr(source, descriptor.name))
+    source_buffer = _candidate_text_buffer(source)
+    if source_buffer is not None:
+        _attach_candidate_text_buffer(target, source_buffer)
+    elif hasattr(target, _CANDIDATE_TEXT_BUFFER_ATTRIBUTE):
+        delattr(target, _CANDIDATE_TEXT_BUFFER_ATTRIBUTE)
 
 
 def _candidate_result_snapshot(candidate: _CandidateResult) -> _CandidateResult:
     """Copy one terminal attempt before cancellation-resistant cleanup."""
 
-    return replace(
+    snapshot = replace(
         candidate,
         execution=deepcopy(candidate.execution),
         provider_usage=dict(candidate.provider_usage),
@@ -1315,6 +1320,11 @@ def _candidate_result_snapshot(candidate: _CandidateResult) -> _CandidateResult:
         ],
         model_usage_breakdown=[dict(row) for row in candidate.model_usage_breakdown],
     )
+    text_buffer = _candidate_text_buffer(candidate)
+    if text_buffer is not None:
+        snapshot.text = text_buffer.render()
+        snapshot.execution["text_buffer"] = text_buffer.trace()
+    return snapshot
 
 
 def _candidate_physical_attempt_id(candidate: _CandidateResult) -> str:
@@ -2239,11 +2249,132 @@ def _build_provider(cfg: ProviderConfig) -> LLMProvider:
     return selector.resolve()
 
 
+_TRUNCATED_TEXT_MARKER = "\n\n[truncated]"
+_BOUNDED_TEXT_BUFFER_CHUNK_CHARS = 1_024
+_BOUNDED_TEXT_BUFFER_TRACE_SCHEMA = "opensquilla.ensemble-bounded-text-buffer/v1"
+_CANDIDATE_TEXT_BUFFER_ATTRIBUTE = "_opensquilla_ensemble_text_buffer"
+
+
+class _BoundedTextBuffer:
+    """Retain a bounded text prefix while auditing the complete source stream."""
+
+    def __init__(self, max_chars: int) -> None:
+        self._max_chars = max(0, int(max_chars or 0))
+        self._parts: list[str] = []
+        self._buffered_chars = 0
+        self._total_chars = 0
+        self._truncated = False
+        self._has_non_whitespace = False
+        self._digest = hashlib.sha256()
+
+    @property
+    def truncated(self) -> bool:
+        return self._truncated
+
+    @property
+    def has_non_whitespace(self) -> bool:
+        return self._has_non_whitespace
+
+    def _append_buffered(self, value: str) -> None:
+        if not value:
+            return
+        cursor = 0
+        if self._parts and len(self._parts[-1]) < _BOUNDED_TEXT_BUFFER_CHUNK_CHARS:
+            available = _BOUNDED_TEXT_BUFFER_CHUNK_CHARS - len(self._parts[-1])
+            addition = value[:available]
+            self._parts[-1] += addition
+            cursor = len(addition)
+            self._buffered_chars += len(addition)
+        while cursor < len(value):
+            part = value[cursor : cursor + _BOUNDED_TEXT_BUFFER_CHUNK_CHARS]
+            self._parts.append(part)
+            self._buffered_chars += len(part)
+            cursor += len(part)
+
+    def _trim_buffered(self, max_chars: int) -> None:
+        while self._buffered_chars > max_chars and self._parts:
+            excess = self._buffered_chars - max_chars
+            last = self._parts[-1]
+            if len(last) <= excess:
+                self._parts.pop()
+                self._buffered_chars -= len(last)
+                continue
+            self._parts[-1] = last[:-excess]
+            self._buffered_chars -= excess
+
+    def append(self, value: str) -> None:
+        if not value:
+            return
+        self._total_chars += len(value)
+        self._digest.update(value.encode("utf-8"))
+        if not self._has_non_whitespace and value.strip():
+            self._has_non_whitespace = True
+
+        if self._max_chars <= 0:
+            self._append_buffered(value)
+            return
+        if self._truncated:
+            return
+
+        remaining = max(0, self._max_chars - self._buffered_chars)
+        self._append_buffered(value[:remaining])
+        if self._total_chars > self._max_chars:
+            self._truncated = True
+            retained_prefix_chars = max(
+                0,
+                self._max_chars - len(_TRUNCATED_TEXT_MARKER),
+            )
+            self._trim_buffered(retained_prefix_chars)
+
+    def render(self) -> str:
+        text = "".join(self._parts)
+        if self._truncated:
+            return text + _TRUNCATED_TEXT_MARKER
+        return text
+
+    def trace(self) -> dict[str, Any]:
+        return {
+            "schema": _BOUNDED_TEXT_BUFFER_TRACE_SCHEMA,
+            "max_chars": self._max_chars,
+            "buffered_chars": self._buffered_chars,
+            "buffered_chunks": len(self._parts),
+            "rendered_chars": len(self.render()),
+            "total_chars": self._total_chars,
+            "truncated": self._truncated,
+            "sha256": self._digest.hexdigest(),
+        }
+
+
+def _candidate_text_buffer(result: _CandidateResult) -> _BoundedTextBuffer | None:
+    value = getattr(result, _CANDIDATE_TEXT_BUFFER_ATTRIBUTE, None)
+    return value if isinstance(value, _BoundedTextBuffer) else None
+
+
+def _attach_candidate_text_buffer(
+    result: _CandidateResult,
+    text_buffer: _BoundedTextBuffer,
+) -> None:
+    setattr(result, _CANDIDATE_TEXT_BUFFER_ATTRIBUTE, text_buffer)
+
+
+def _finalize_candidate_text_buffer(result: _CandidateResult) -> None:
+    """Publish bounded text metadata on every normal or exceptional exit."""
+
+    text_buffer = _candidate_text_buffer(result)
+    if text_buffer is None:
+        return
+    result.text = text_buffer.render()
+    result.execution["text_buffer"] = text_buffer.trace()
+    delattr(result, _CANDIDATE_TEXT_BUFFER_ATTRIBUTE)
+
+
 def _truncate_text(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
-    marker = "\n\n[truncated]"
-    return text[: max(0, max_chars - len(marker))] + marker
+    return (
+        text[: max(0, max_chars - len(_TRUNCATED_TEXT_MARKER))]
+        + _TRUNCATED_TEXT_MARKER
+    )
 
 
 _CONTINUATION_DEDUP_MIN_BOUNDARY_OVERLAP_CHARS = 3
@@ -10272,6 +10403,7 @@ class EnsembleProvider:
                         # The provider may ignore cancellation while unwinding.
                         # Return an immutable snapshot so that a detached child
                         # cannot mutate the candidate later.
+                        _finalize_candidate_text_buffer(result)
                         result = replace(result)
                         result.error = (
                             f"proposer timed out after {self.proposer_timeout_seconds:g}s"
@@ -10342,6 +10474,7 @@ class EnsembleProvider:
                 api_key=cfg.api_key,
             )
         finally:
+            _finalize_candidate_text_buffer(result)
             if (
                 member.thinking_policy_managed
                 or self._router_dynamic_selection()
@@ -10499,7 +10632,8 @@ class EnsembleProvider:
             result.error = f"proposer deployment is not ready: {reason}"
             result.error_code = reason
             return result
-        text_parts: list[str] = []
+        text_buffer = _BoundedTextBuffer(self.candidate_max_chars)
+        _attach_candidate_text_buffer(result, text_buffer)
         got_done = False
         response_observed = False
         reasoning_observed = False
@@ -10612,14 +10746,19 @@ class EnsembleProvider:
                     response_observed = response_observed or bool(event.text)
                     if result.ttft_ms is None and event.text:
                         result.ttft_ms = int((time.monotonic() - started) * 1000)
-                    text_parts.append(event.text)
+                    was_truncated = text_buffer.truncated
+                    text_buffer.append(event.text)
                     # Publish text incrementally to the outer cleanup owner.
                     # If iterator close later times out, `_collect_candidate`
                     # still has the useful prefix instead of an empty result.
-                    result.text = _truncate_text(
-                        result.text + event.text,
-                        self.candidate_max_chars,
-                    )
+                    # Once the cap is crossed the rendered prefix is immutable,
+                    # so avoid rebuilding it for every remaining source delta.
+                    if not was_truncated:
+                        result.text = (
+                            text_buffer.render()
+                            if text_buffer.truncated
+                            else result.text + event.text
+                        )
                 elif isinstance(event, ReasoningDeltaEvent):
                     response_observed = response_observed or bool(event.text)
                     reasoning_observed = reasoning_observed or bool(event.text)
@@ -10878,7 +11017,7 @@ class EnsembleProvider:
         result.stream_closed = True
         if current_physical_attempt is not None:
             current_physical_attempt["stream_closed"] = True
-        candidate_text = "".join(text_parts)
+        _finalize_candidate_text_buffer(result)
         rejected_thinking_level = (
             result.error
             and not response_observed
@@ -10897,7 +11036,7 @@ class EnsembleProvider:
             and lower_fallback is not None
             and str(result.stop_reason or "").strip().casefold()
             in REASONING_ONLY_LENGTH_STOP_REASONS
-            and not candidate_text.strip()
+            and not text_buffer.has_non_whitespace
             and (reasoning_observed or result.reasoning_tokens > 0)
         )
         fallback_trigger = (
@@ -11098,7 +11237,6 @@ class EnsembleProvider:
             )
             finalize_retry_attempt(attempt_result)
             return retry_result
-        result.text = _truncate_text(candidate_text, self.candidate_max_chars)
         if not got_done and not result.error:
             result.error = "proposer stream ended before DoneEvent"
             result.error_code = "stream_incomplete"

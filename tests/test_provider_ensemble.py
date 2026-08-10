@@ -1818,6 +1818,202 @@ def test_unmanaged_candidate_trace_row_preserves_reasoning_usage_evidence() -> N
 
 
 @pytest.mark.asyncio
+async def test_proposer_text_buffer_is_bounded_for_100k_single_character_deltas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delta_count = 100_000
+    candidate_max_chars = 64
+    marker = "\n\n[truncated]"
+    delta = TextDeltaEvent(text="x")
+
+    class _SingleCharacterDeltaProvider:
+        provider_name = "fake"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+
+            async def stream() -> AsyncIterator[StreamEvent]:
+                for _ in range(delta_count):
+                    yield delta
+                yield DoneEvent(
+                    input_tokens=7,
+                    output_tokens=delta_count,
+                    billed_cost=0.125,
+                    cost_source="provider_billed",
+                    provider="fake",
+                    model="p1",
+                )
+
+            return stream()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda cfg: _SingleCharacterDeltaProvider(),
+    )
+    member = _member("p1", thinking=None)
+    provider = EnsembleProvider(
+        profile_name="bounded-proposer-buffer",
+        proposers=[member],
+        aggregator=_member("agg", thinking=None),
+        candidate_max_chars=candidate_max_chars,
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+    candidate = _CandidateResult(
+        index=0,
+        sample_index=0,
+        label="p1",
+        provider="fake",
+        model="p1",
+        requested_provider="fake",
+        requested_model="p1",
+    )
+
+    candidate = await provider._collect_candidate_inner(  # noqa: SLF001
+        result=candidate,
+        member=member,
+        messages=[Message(role="user", content="answer this")],
+        tools=None,
+        config=ChatConfig(),
+        started=time.monotonic(),
+        request_task=None,
+        physical_attempts=[],
+        thinking_fallback_bindings=[],
+    )
+
+    expected_text = ("x" * (candidate_max_chars - len(marker))) + marker
+    source_sha256 = hashlib.sha256(b"x" * delta_count).hexdigest()
+    assert candidate.text == expected_text
+    assert candidate.input_tokens == 7
+    assert candidate.output_tokens == delta_count
+    assert candidate.billed_cost == pytest.approx(0.125)
+    assert candidate.usage_reported is True
+    assert candidate.request_started is True
+    assert candidate.stream_closed is True
+    assert candidate.execution["text_buffer"] == {
+        "schema": "opensquilla.ensemble-bounded-text-buffer/v1",
+        "max_chars": candidate_max_chars,
+        "buffered_chars": candidate_max_chars - len(marker),
+        "buffered_chunks": 1,
+        "rendered_chars": candidate_max_chars,
+        "total_chars": delta_count,
+        "truncated": True,
+        "sha256": source_sha256,
+    }
+    usage = candidate.usage_row(
+        role="proposer",
+        profile="bounded-proposer-buffer",
+    )
+    assert usage["input_tokens"] == 7
+    assert usage["output_tokens"] == delta_count
+    assert usage["billed_cost"] == pytest.approx(0.125)
+    trace = candidate.trace_row(include_text=True, content_max_chars=8_000)
+    assert trace["text"] == expected_text
+    assert trace["content"] == {
+        "text": expected_text,
+        "chars": candidate_max_chars,
+        "truncated": False,
+        "sha256": hashlib.sha256(expected_text.encode("utf-8")).hexdigest(),
+    }
+    assert trace["execution"]["text_buffer"]["sha256"] == source_sha256
+
+
+@pytest.mark.asyncio
+async def test_proposer_text_buffer_preserves_ordinary_output_and_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(text="ordinary "),
+                    TextDeltaEvent(text="draft"),
+                    DoneEvent(
+                        input_tokens=3,
+                        output_tokens=2,
+                        billed_cost=0.05,
+                        cost_source="provider_billed",
+                        model="p1",
+                    ),
+                ]
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    member = _member("p1", thinking=None)
+    provider = EnsembleProvider(
+        profile_name="ordinary-proposer-buffer",
+        proposers=[member],
+        aggregator=_member("agg", thinking=None),
+        candidate_max_chars=64,
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+    candidate = _CandidateResult(
+        index=0,
+        sample_index=0,
+        label="p1",
+        provider="fake",
+        model="p1",
+        requested_provider="fake",
+        requested_model="p1",
+    )
+
+    candidate = await provider._collect_candidate_inner(  # noqa: SLF001
+        result=candidate,
+        member=member,
+        messages=[Message(role="user", content="answer this")],
+        tools=None,
+        config=ChatConfig(),
+        started=time.monotonic(),
+        request_task=None,
+        physical_attempts=[],
+        thinking_fallback_bindings=[],
+    )
+
+    expected_text = "ordinary draft"
+    expected_sha256 = hashlib.sha256(expected_text.encode("utf-8")).hexdigest()
+    assert candidate.text == expected_text
+    assert candidate.input_tokens == 3
+    assert candidate.output_tokens == 2
+    assert candidate.billed_cost == pytest.approx(0.05)
+    assert candidate.execution["text_buffer"] == {
+        "schema": "opensquilla.ensemble-bounded-text-buffer/v1",
+        "max_chars": 64,
+        "buffered_chars": len(expected_text),
+        "buffered_chunks": 1,
+        "rendered_chars": len(expected_text),
+        "total_chars": len(expected_text),
+        "truncated": False,
+        "sha256": expected_sha256,
+    }
+    usage = candidate.usage_row(
+        role="proposer",
+        profile="ordinary-proposer-buffer",
+    )
+    assert usage["input_tokens"] == 3
+    assert usage["output_tokens"] == 2
+    assert usage["billed_cost"] == pytest.approx(0.05)
+    assert candidate.trace_row(
+        include_text=False,
+        content_max_chars=8_000,
+    )["content"] == {
+        "text": expected_text,
+        "chars": len(expected_text),
+        "truncated": False,
+        "sha256": expected_sha256,
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "messages",
     [
