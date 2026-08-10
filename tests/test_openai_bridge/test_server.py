@@ -6,7 +6,10 @@ from fastapi.testclient import TestClient
 
 from opensquilla.openai_bridge import server as bridge_server
 from opensquilla.openai_bridge.server import (
+    _collect_terminal_error,
+    _event_error_message,
     _filter_stream_delta,
+    _map_error_event,
     _resolve_agent_id,
     _strip_reply_tags,
     create_app,
@@ -126,6 +129,44 @@ def test_filter_stream_delta_passthrough_cases() -> None:
     assert _filter_stream_delta("", "plain text") == ("plain text", "")
     assert _filter_stream_delta("", "keep [[bold]]") == ("keep [[bold]]", "")
     assert _filter_stream_delta("", "a[[reply_to_current]]b") == ("ab", "")
+
+
+def test_event_error_message_extraction() -> None:
+    """错误描述提取优先级：error_message > message > 兑底。"""
+    assert _event_error_message({"message": "boom", "code": "x"}) == "boom"
+    assert (
+        _event_error_message({"error_message": "raw", "message": "terminal", "code": "x"})
+        == "raw"
+    )
+    assert _event_error_message({"code": "abc"}) == "Agent error (abc)"
+    assert _event_error_message({}) == "Agent error"
+
+
+def test_map_error_event_timeout_and_generic() -> None:
+    """timeout 类错误映射为 type=timeout，其余为 server_error 并透传 code。"""
+    mapped = _map_error_event(
+        {"message": "Stream idle timeout", "code": "stream_idle_timeout", "terminal_reason": "timeout"}
+    )
+    assert mapped["type"] == "timeout"
+    assert mapped["code"] == "stream_idle_timeout"
+    mapped = _map_error_event({"message": "llm ensemble had 3 successful proposer(s)", "code": "agent_error"})
+    assert mapped["type"] == "server_error"
+    assert mapped["code"] == "agent_error"
+    assert "llm ensemble" in str(mapped["message"])
+
+
+def test_collect_terminal_error() -> None:
+    """仅失败终止事件返回错误描述；正常 done 不误报。"""
+    ok = [
+        {"event": "session.event.text_delta", "payload": {"text": "hi"}},
+        {"event": "session.event.done", "payload": {}},
+    ]
+    assert _collect_terminal_error(ok) is None
+    failed = [
+        {"event": "session.event.text_delta", "payload": {"text": "hi"}},
+        {"event": "session.event.error", "payload": {"message": "boom", "code": "x"}},
+    ]
+    assert _collect_terminal_error(failed) == "boom"
 
 
 def test_error_body_follows_openai_envelope() -> None:

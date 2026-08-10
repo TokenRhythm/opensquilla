@@ -78,6 +78,9 @@ _TERMINAL_EVENTS = {
     "task.timeout",
     "task.abandoned",
 }
+# 正常完成的终止事件；其余终止事件视为失败，必须透传错误而不是伪装成功
+_SUCCESS_TERMINAL_EVENTS = {"session.event.done"}
+_FAILURE_TERMINAL_EVENTS = _TERMINAL_EVENTS - _SUCCESS_TERMINAL_EVENTS
 _TEXT_DELTA = "session.event.text_delta"
 _STREAM_FRAME_TIMEOUT_S = 300.0
 
@@ -274,6 +277,45 @@ def _extract_final_text(events: list[dict[str, Any]]) -> str:
             if isinstance(t, str) and t:
                 parts.append(t)
     return _strip_reply_tags("".join(parts))
+
+
+def _event_error_message(payload: dict[str, Any]) -> str:
+    """从终止事件 payload 提取可透传的错误描述。
+
+    优先级 error_message > message > 兑底（附 code）。gateway 的
+    _normalize_terminal_event_payload 会同时产出这两个字段，前者是
+    净化后的原始错误，后者是给用户看的 terminal 消息。
+    """
+    if not isinstance(payload, dict):
+        return "Agent error"
+    for field in ("error_message", "message"):
+        val = payload.get(field)
+        if isinstance(val, str) and val:
+            return val
+    code = payload.get("code")
+    return f"Agent error ({code})" if code else "Agent error"
+
+
+def _map_error_event(payload: dict[str, Any]) -> dict[str, str | None]:
+    """把失败终止事件映射为 OpenAI 错误信封字段。
+
+    gateway 侧 code 形如 agent_error / stream_idle_timeout /
+    provider_request_too_large；terminal_reason 为 timeout/failed/error。
+    """
+    message = _event_error_message(payload)
+    code = str(payload.get("code") or payload.get("error_class") or "agent_error")
+    reason = str(payload.get("terminal_reason") or "")
+    if reason == "timeout" or "timeout" in code.lower():
+        return {"message": message, "type": "timeout", "code": code}
+    return {"message": message, "type": "server_error", "code": code}
+
+
+def _collect_terminal_error(events: list[dict[str, Any]]) -> str | None:
+    """返回非流式事件序列中的失败描述；无失败返回 None。"""
+    for ev in events:
+        if ev.get("event") in _FAILURE_TERMINAL_EVENTS:
+            return _event_error_message(ev.get("payload") or {})
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -548,7 +590,15 @@ async def chat_completions(
                                 tail = _strip_reply_tags(carry)
                                 if tail:
                                     yield _chunk(chat_id, created, model, {"content": tail}, None)
-                            yield _chunk(chat_id, created, model, {}, "stop")
+                            if name in _SUCCESS_TERMINAL_EVENTS:
+                                yield _chunk(chat_id, created, model, {}, "stop")
+                            else:
+                                # 失败终止：发错误 chunk（OpenAI SSE 错误形状）而非伪装 stop
+                                yield (
+                                    "data: "
+                                    + json_dumps({"error": _map_error_event(payload)})
+                                    + "\n\n"
+                                )
                             yield "data: [DONE]\n\n"
                             return
                 finally:
@@ -565,6 +615,18 @@ async def chat_completions(
             )
         except asyncio.TimeoutError as exc:
             raise HTTPException(504, f"agent 响应超时（>{TIMEOUT_S:g}s）") from exc
+        error_text = _collect_terminal_error(events)
+        if error_text:
+            raise HTTPException(
+                502,
+                detail={
+                    "error": {
+                        "message": error_text,
+                        "type": "server_error",
+                        "code": "agent_error",
+                    }
+                },
+            )
         content = _extract_final_text(events)
         return _chat_completion(chat_id, created, model, content)
 
