@@ -16,6 +16,7 @@ import pytest
 from opensquilla.eval.draco_artifact_integrity import (
     trace_row_from_result as canonical_trace_row_from_result,
 )
+from opensquilla.eval.draco_artifact_io import DurableDracoArtifactWriter
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -11078,6 +11079,301 @@ def test_manifest_resume_schedule_accepts_legacy_missing_reserved_zero(
             result_paths=args.result,
             groups=module.GROUPS,
         )
+    finally:
+        os.close(lock_fd)
+
+
+def _install_durable_artifact_binding(
+    module,
+    result_path: Path,
+    manifest_path: Path,
+    *,
+    durable_v2: bool = False,
+):
+    rows = [
+        json.loads(line)
+        for line in result_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if durable_v2:
+        stamp = "20260811-010203"
+        durable_result_path = result_path.parent / f"draco_ensemble_{stamp}.jsonl"
+        durable_manifest_path = manifest_path.parent / (
+            f"draco_run_{stamp}.manifest.json"
+        )
+        result_path.rename(durable_result_path)
+        manifest_path.rename(durable_manifest_path)
+        result_path = durable_result_path
+        manifest_path = durable_manifest_path
+        capability = module.durable_artifact_capability_contract()
+        manifest["schema"] = module.DRACO_RUN_MANIFEST_SCHEMA_V2
+        manifest["stamp"] = stamp
+        manifest["durable_artifact_capability"] = capability
+        for group, contract in manifest["run_compatibility"]["contracts"].items():
+            contract["durable_artifact_capability"] = capability
+            manifest["run_compatibility"]["fingerprints"][group] = (
+                module.canonical_sha256(contract, prefix=True)
+            )
+        rows = [
+            module.seal_result_row(
+                {
+                    **row,
+                    "run_compatibility_fingerprint": manifest[
+                        "run_compatibility"
+                    ]["fingerprints"][str(row["group"])],
+                    module.DRACO_DURABLE_RESULT_ROW_FIELD: capability,
+                }
+            )
+            for row in rows
+        ]
+    result_path.unlink()
+    trace_path = (
+        result_path.parent / f"draco_run_{stamp}.trace.jsonl"
+        if durable_v2
+        else result_path.with_suffix(".trace.jsonl")
+    )
+    checkpoint_path = (
+        result_path.parent / f"draco_run_{stamp}.checkpoint.json"
+        if durable_v2
+        else result_path.with_suffix(".checkpoint.json")
+    )
+    with DurableDracoArtifactWriter(
+        results_path=result_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        for row in rows:
+            assert writer.append(row, canonical_trace_row_from_result(row)) is True
+    for path in (result_path, trace_path, checkpoint_path):
+        path.chmod(0o600)
+    manifest["artifacts"].update(
+        {
+            "results_jsonl": str(result_path.resolve()),
+            "trace_jsonl": str(trace_path.resolve()),
+            "checkpoint_json": str(checkpoint_path.resolve()),
+            "manifest_json": str(manifest_path.resolve()),
+        }
+    )
+    _owner_json(manifest_path, manifest)
+    return result_path, manifest_path, trace_path, checkpoint_path
+
+
+def test_manifest_checkpoint_binding_accepts_new_artifacts_and_preserves_legacy(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    try:
+        legacy_records, _ = module.read_source_rows(args.result)
+        module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=module.GROUPS,
+        )
+        (
+            args.result[0],
+            args.manifest[0],
+            trace_path,
+            checkpoint_path,
+        ) = _install_durable_artifact_binding(
+            module,
+            args.result[0],
+            args.manifest[0],
+            durable_v2=True,
+        )
+        _, _, _, sources = module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=module.GROUPS,
+        )
+        durable = sources[0]["durable_artifacts"]
+        assert durable["rows_written"] == len(legacy_records)
+        assert durable["trace_sha256"] == module.file_sha256(trace_path)
+        assert durable["checkpoint_sha256"] == module.file_sha256(checkpoint_path)
+        prior_manifest = json.loads(args.manifest[0].read_text(encoding="utf-8"))
+        prior_manifest["status"] = "running"
+        _owner_json(args.manifest[0], prior_manifest)
+        prior_manifest_path = args.manifest[0].with_name(
+            f"{args.manifest[0].name}.pre-recovery"
+        )
+        prior_manifest_path.write_bytes(args.manifest[0].read_bytes())
+        prior_manifest_path.chmod(0o600)
+        manifest = json.loads(args.manifest[0].read_text(encoding="utf-8"))
+        manifest["status"] = "result_incomplete"
+        manifest["artifacts"]["pre_recovery_manifest_json"] = str(
+            prior_manifest_path.resolve()
+        )
+        manifest["artifact_recovery"] = {
+            "schema": "opensquilla.draco-artifact-recovery/v1",
+            "status": "sealed_after_unclean_exit",
+            "prior_status": "running",
+            "prior_manifest_sha256": module.file_sha256(prior_manifest_path),
+            "prior_manifest_path": str(prior_manifest_path.resolve()),
+            "rows_written": durable["rows_written"],
+            "results_sha256": durable["results_sha256"],
+            "trace_sha256": durable["trace_sha256"],
+            "checkpoint_sha256": durable["checkpoint_sha256"],
+            "ambiguous_pair_count": 0,
+            "ambiguous_pairs": [],
+            "durable_scheduled_pairs": [],
+            "physical_request_policy": "no_model_or_provider_calls",
+            "automatic_rerun_allowed": False,
+        }
+        _owner_json(args.manifest[0], manifest)
+        _, _, _, recovered_sources = module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=module.GROUPS,
+        )
+        assert recovered_sources[0]["artifact_recovery"]["prior_status"] == "running"
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.parametrize(
+    "downgrade",
+    ["missing_checkpoint", "missing_top_capability", "missing_contract_capability", "row_only"],
+)
+def test_manifest_v2_durable_capability_cannot_be_downgraded(
+    module,
+    tmp_path: Path,
+    downgrade: str,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    try:
+        (
+            args.result[0],
+            args.manifest[0],
+            _,
+            _,
+        ) = _install_durable_artifact_binding(
+            module,
+            args.result[0],
+            args.manifest[0],
+            durable_v2=True,
+        )
+        manifest = json.loads(args.manifest[0].read_text(encoding="utf-8"))
+        if downgrade == "missing_checkpoint":
+            manifest["artifacts"].pop("checkpoint_json")
+        elif downgrade == "missing_top_capability":
+            manifest.pop("durable_artifact_capability")
+        elif downgrade == "missing_contract_capability":
+            contract = manifest["run_compatibility"]["contracts"][module.GROUPS[0]]
+            contract.pop("durable_artifact_capability")
+            manifest["run_compatibility"]["fingerprints"][module.GROUPS[0]] = (
+                module.canonical_sha256(contract, prefix=True)
+            )
+        else:
+            manifest.pop("schema")
+            manifest.pop("durable_artifact_capability")
+            for group, contract in manifest["run_compatibility"]["contracts"].items():
+                contract.pop("durable_artifact_capability")
+                manifest["run_compatibility"]["fingerprints"][group] = (
+                    module.canonical_sha256(contract, prefix=True)
+                )
+        _owner_json(args.manifest[0], manifest)
+
+        with pytest.raises(
+            module.FinalizationError,
+            match="durable capability|stripped from sealed rows",
+        ):
+            module.load_manifest_contracts(
+                args.manifest,
+                result_paths=args.result,
+                groups=module.GROUPS,
+            )
+    finally:
+        os.close(lock_fd)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["trace", "checkpoint_count", "recovery_hash", "recovery_policy", "ambiguity"],
+)
+def test_manifest_checkpoint_or_recovery_mismatch_fails_closed(
+    module,
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    try:
+        (
+            args.result[0],
+            args.manifest[0],
+            trace_path,
+            checkpoint_path,
+        ) = _install_durable_artifact_binding(
+            module,
+            args.result[0],
+            args.manifest[0],
+            durable_v2=True,
+        )
+        manifest = json.loads(args.manifest[0].read_text(encoding="utf-8"))
+        verification = module.verify_durable_draco_artifacts(
+            results_path=args.result[0],
+            trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
+        )
+        if tamper == "trace":
+            trace_rows = trace_path.read_text(encoding="utf-8").splitlines()
+            value = json.loads(trace_rows[0])
+            value["error"] = "forged"
+            trace_rows[0] = json.dumps(value)
+            trace_path.write_text("\n".join(trace_rows) + "\n", encoding="utf-8")
+        elif tamper == "checkpoint_count":
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            checkpoint["rows_written"] -= 1
+            _owner_json(checkpoint_path, checkpoint)
+        else:
+            prior_manifest = json.loads(args.manifest[0].read_text(encoding="utf-8"))
+            prior_manifest["status"] = "running"
+            _owner_json(args.manifest[0], prior_manifest)
+            prior_manifest_path = args.manifest[0].with_name(
+                f"{args.manifest[0].name}.pre-recovery"
+            )
+            prior_manifest_path.write_bytes(args.manifest[0].read_bytes())
+            prior_manifest_path.chmod(0o600)
+            manifest["status"] = "result_incomplete"
+            manifest["artifacts"]["pre_recovery_manifest_json"] = str(
+                prior_manifest_path.resolve()
+            )
+            manifest["artifact_recovery"] = {
+                "schema": "opensquilla.draco-artifact-recovery/v1",
+                "status": "sealed_after_unclean_exit",
+                "prior_status": "running",
+                "prior_manifest_sha256": module.file_sha256(prior_manifest_path),
+                "prior_manifest_path": str(prior_manifest_path.resolve()),
+                "rows_written": verification["rows_written"],
+                "results_sha256": verification["results_sha256"],
+                "trace_sha256": "0" * 64,
+                "checkpoint_sha256": verification["checkpoint_sha256"],
+                "ambiguous_pair_count": 0,
+                "ambiguous_pairs": [],
+                "durable_scheduled_pairs": [],
+                "physical_request_policy": "no_model_or_provider_calls",
+                "automatic_rerun_allowed": False,
+            }
+            if tamper == "recovery_policy":
+                manifest["artifact_recovery"]["automatic_rerun_allowed"] = True
+                manifest["artifact_recovery"]["trace_sha256"] = verification[
+                    "trace_sha256"
+                ]
+            elif tamper == "ambiguity":
+                manifest["artifact_recovery"]["ambiguous_pair_count"] = 1
+                manifest["artifact_recovery"]["ambiguous_pairs"] = [
+                    {"group": "B0", "task_id": "forged"}
+                ]
+                manifest["artifact_recovery"]["trace_sha256"] = verification[
+                    "trace_sha256"
+                ]
+            _owner_json(args.manifest[0], manifest)
+        with pytest.raises(module.FinalizationError, match="durable|recovery"):
+            module.load_manifest_contracts(
+                args.manifest,
+                result_paths=args.result,
+                groups=module.GROUPS,
+            )
     finally:
         os.close(lock_fd)
 

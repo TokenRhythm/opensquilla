@@ -7414,8 +7414,131 @@ async def test_worker_failure_cancels_siblings_and_publishes_aborted_manifest(
     assert "sensitive provider detail" not in manifest_text
     result_path = next(output_dir.glob("draco_ensemble_*.jsonl"))
     trace_path = next(output_dir.glob("draco_run_*.trace.jsonl"))
+    checkpoint_path = next(output_dir.glob("draco_run_*.checkpoint.json"))
     assert result_path.read_text(encoding="utf-8") == ""
     assert trace_path.read_text(encoding="utf-8") == ""
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["rows_written"] == 0
+    assert manifest["artifacts"]["checkpoint_json"] == str(checkpoint_path)
+
+
+@pytest.mark.asyncio
+async def test_aborted_manifest_uses_authoritative_count_after_commit_boundary_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+        ]
+    )
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    real_append = runner.AsyncDurableDracoArtifactWriter.append
+
+    async def commit_then_fail(self, result, trace):
+        await real_append(self, result, trace)
+        raise RuntimeError("synthetic failure after durable commit")
+
+    monkeypatch.setattr(
+        runner.AsyncDurableDracoArtifactWriter,
+        "append",
+        commit_then_fail,
+    )
+
+    with pytest.raises(RuntimeError, match="after durable commit"):
+        await runner.amain(args)
+
+    manifest_path = next(output_dir.glob("draco_run_*.manifest.json"))
+    checkpoint_path = next(output_dir.glob("draco_run_*.checkpoint.json"))
+    result_path = next(output_dir.glob("draco_ensemble_*.jsonl"))
+    trace_path = next(output_dir.glob("draco_run_*.trace.jsonl"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    capability = runner.durable_artifact_capability_contract()
+    assert manifest["schema"] == runner.DRACO_RUN_MANIFEST_SCHEMA_V2
+    assert manifest["durable_artifact_capability"] == capability
+    assert manifest["status"] == "aborted"
+    assert manifest["rows_written"] == 1
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["rows_written"] == 1
+    assert len(result_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(trace_path.read_text(encoding="utf-8").splitlines()) == 1
+    durable_row = json.loads(result_path.read_text(encoding="utf-8"))
+    assert durable_row[runner.DRACO_DURABLE_RESULT_ROW_FIELD] == capability
+
+
+@pytest.mark.asyncio
+async def test_summary_failure_explicitly_releases_durable_run_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+        ]
+    )
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    monkeypatch.setattr(
+        runner,
+        "summarize",
+        lambda _rows: (_ for _ in ()).throw(RuntimeError("synthetic summary failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="summary failure"):
+        await runner.amain(args)
+
+    checkpoint_path = next(output_dir.glob("draco_run_*.checkpoint.json"))
+    lock_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".lock")
+    with runner.DracoArtifactRunLock(lock_path):
+        pass
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.asyncio
+async def test_amain_outer_guard_releases_run_lock_after_cleanup_base_exception(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = tmp_path / "cleanup-failure.lock"
+
+    class SyntheticCleanupAbort(BaseException):
+        pass
+
+    async def fail_after_acquire(_args, *, run_lock_holder) -> int:
+        run_lock = module.DracoArtifactRunLock(lock_path)
+        run_lock.acquire()
+        run_lock_holder[0] = run_lock
+        raise SyntheticCleanupAbort
+
+    monkeypatch.setattr(module, "_amain_with_run_lock", fail_after_acquire)
+
+    with pytest.raises(SyntheticCleanupAbort):
+        await module.amain(SimpleNamespace())
+
+    with module.DracoArtifactRunLock(lock_path):
+        pass
 
 
 @pytest.mark.asyncio
@@ -7514,8 +7637,12 @@ async def test_strict_non_byok_dry_run_skips_receipt_audit_but_keeps_contract(
 
     assert status == 0
     result_paths = list(output_dir.glob("draco_ensemble_*.jsonl"))
+    trace_paths = list(output_dir.glob("draco_run_*.trace.jsonl"))
+    checkpoint_paths = list(output_dir.glob("draco_run_*.checkpoint.json"))
     manifest_paths = list(output_dir.glob("draco_run_*.manifest.json"))
     assert len(result_paths) == 1
+    assert len(trace_paths) == 1
+    assert len(checkpoint_paths) == 1
     assert len(manifest_paths) == 1
     rows = [
         json.loads(line)
@@ -7523,8 +7650,17 @@ async def test_strict_non_byok_dry_run_skips_receipt_audit_but_keeps_contract(
         if line.strip()
     ]
     manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
+    trace_rows = [
+        json.loads(line)
+        for line in trace_paths[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    checkpoint = json.loads(checkpoint_paths[0].read_text(encoding="utf-8"))
     assert len(rows) == expected_rows
+    assert len(trace_rows) == expected_rows
+    assert checkpoint["rows_written"] == expected_rows
     assert manifest["rows_written"] == expected_rows
+    assert manifest["artifacts"]["checkpoint_json"] == str(checkpoint_paths[0])
     assert manifest["status"] == "complete"
     assert (
         manifest["run_compatibility"]["contracts"]["B0"]["cost_policy"][
@@ -10320,7 +10456,11 @@ async def test_resume_source_byok_history_does_not_abort_or_schedule_new_calls(
         "judge": 0,
     }
     result_paths = list(output_dir.glob("draco_ensemble_*.jsonl"))
+    trace_paths = list(output_dir.glob("draco_run_*.trace.jsonl"))
+    checkpoint_paths = list(output_dir.glob("draco_run_*.checkpoint.json"))
     assert len(result_paths) == 1
+    assert len(trace_paths) == 1
+    assert len(checkpoint_paths) == 1
     repaired = json.loads(
         next(
             line
@@ -10343,6 +10483,8 @@ async def test_resume_source_byok_history_does_not_abort_or_schedule_new_calls(
     assert repaired["completion_status"]["status"] == "complete"
     assert repaired["audit_status"]["policy"]["compliant"] is False
     assert repaired["openrouter_non_byok_audit"]["status"] == "policy_violation"
+    assert len(trace_paths[0].read_text(encoding="utf-8").splitlines()) == 1
+    assert json.loads(checkpoint_paths[0].read_text(encoding="utf-8"))["rows_written"] == 1
     assert not list(output_dir.glob("*.policy-violation.manifest.json"))
 
 
@@ -11544,7 +11686,7 @@ def test_resume_blocks_automatic_resend_after_paid_postprocessing_failure() -> N
         "automatic_generation_retry_allowed": False,
     }
 
-    tree = ast.parse(inspect.getsource(resume_runner.amain))
+    tree = ast.parse(inspect.getsource(resume_runner._amain_with_run_lock))
     guarded = next(
         node
         for node in ast.walk(tree)
@@ -13672,7 +13814,7 @@ def test_resume_strict_attempt_source_rows_are_bound_before_aggregation(
 
 
 def test_resume_budget_exhaustion_returns_before_provider_construction() -> None:
-    tree = ast.parse(inspect.getsource(resume_runner.amain))
+    tree = ast.parse(inspect.getsource(resume_runner._amain_with_run_lock))
     guarded = next(
         node
         for node in ast.walk(tree)
@@ -16605,6 +16747,13 @@ def test_run_compatibility_is_shared_by_main_and_resume_and_excludes_concurrency
     resume_contract = _compatibility_for(resume_runner, concurrency=5)
 
     assert main_contract["fingerprints"] == resume_contract["fingerprints"]
+    expected_capability = runner.durable_artifact_capability_contract()
+    assert main_contract["contracts"]["B1"]["durable_artifact_capability"] == (
+        expected_capability
+    )
+    assert resume_contract["contracts"]["B1"]["durable_artifact_capability"] == (
+        expected_capability
+    )
     assert "benchmark-key-secret" not in json.dumps(main_contract)
     changed_key = _compatibility_for(runner, api_key="different-benchmark-key")
     assert changed_key["fingerprints"]["B1"] != main_contract["fingerprints"]["B1"]

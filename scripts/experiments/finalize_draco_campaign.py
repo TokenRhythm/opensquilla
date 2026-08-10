@@ -32,6 +32,13 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from opensquilla.eval.draco_artifact_io import (
+    DRACO_DURABLE_RESULT_ROW_FIELD,
+    DRACO_RUN_MANIFEST_SCHEMA_V2,
+    DracoArtifactDurabilityError,
+    durable_artifact_capability_contract,
+    verify_durable_draco_artifacts,
+)
 from opensquilla.provider.protocol import (
     provider_retry_expanded_proposer_identities,
 )
@@ -83,6 +90,15 @@ JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
 FINALIZER_VERSION = 9
+RESUME_SCHEDULE_ACTIONS = frozenset(
+    {
+        "regenerate",
+        "model_regenerate",
+        "judge_only",
+        "metadata_only",
+        "audit_only",
+    }
+)
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -1936,6 +1952,241 @@ def load_manifest_contracts(
             raise FinalizationError(
                 f"manifest results_jsonl is not bound to its result shard: {path}"
             )
+        artifact_verification: dict[str, Any] | None = None
+        declared_checkpoint = (
+            artifacts.get("checkpoint_json") if isinstance(artifacts, Mapping) else None
+        )
+        artifact_recovery = payload.get("artifact_recovery")
+        expected_durability = durable_artifact_capability_contract()
+        manifest_schema = payload.get("schema")
+        top_level_durability = payload.get("durable_artifact_capability")
+        compatibility_preview = payload.get("run_compatibility")
+        contracts_preview = (
+            compatibility_preview.get("contracts")
+            if isinstance(compatibility_preview, Mapping)
+            else None
+        )
+        contract_durability = [
+            (
+                contracts_preview[group].get("durable_artifact_capability")
+                if isinstance(contracts_preview, Mapping)
+                and isinstance(contracts_preview.get(group), Mapping)
+                else None
+            )
+            for group in groups
+        ]
+        durable_v2 = bool(
+            manifest_schema == DRACO_RUN_MANIFEST_SCHEMA_V2
+            or top_level_durability is not None
+            or any(value is not None for value in contract_durability)
+            or artifact_recovery is not None
+        )
+        if manifest_schema not in {None, DRACO_RUN_MANIFEST_SCHEMA_V2}:
+            raise FinalizationError(
+                f"source manifest uses an unsupported schema: {path}"
+            )
+        if durable_v2 and (
+            manifest_schema != DRACO_RUN_MANIFEST_SCHEMA_V2
+            or top_level_durability != expected_durability
+            or any(value != expected_durability for value in contract_durability)
+            or declared_checkpoint is None
+        ):
+            raise FinalizationError(
+                f"manifest durable capability was downgraded or is incomplete: {path}"
+            )
+        if durable_v2:
+            stamp = payload.get("stamp")
+            if not isinstance(stamp, str) or not re.fullmatch(
+                r"[0-9]{8}-[0-9]{6}", stamp
+            ):
+                raise FinalizationError(f"manifest durable stamp is malformed: {path}")
+            expected_paths = {
+                "results_jsonl": path.parent / f"draco_ensemble_{stamp}.jsonl",
+                "trace_jsonl": path.parent / f"draco_run_{stamp}.trace.jsonl",
+                "checkpoint_json": path.parent / f"draco_run_{stamp}.checkpoint.json",
+                "manifest_json": path.parent / f"draco_run_{stamp}.manifest.json",
+            }
+            for artifact_key, expected_path in expected_paths.items():
+                raw_artifact_path = (
+                    artifacts.get(artifact_key)
+                    if isinstance(artifacts, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(raw_artifact_path, str)
+                    or not Path(raw_artifact_path).is_absolute()
+                    or Path(os.path.abspath(raw_artifact_path)) != expected_path
+                ):
+                    raise FinalizationError(
+                        f"manifest durable artifact path is not stamp-bound: {path}"
+                    )
+        recovered_resume_scheduled_pairs: list[dict[str, str]] | None = None
+        recovery_prior_manifest: Mapping[str, Any] | None = None
+        if declared_checkpoint is not None:
+            declared_trace = (
+                artifacts.get("trace_jsonl") if isinstance(artifacts, Mapping) else None
+            )
+            if not isinstance(declared_trace, str) or not isinstance(
+                declared_checkpoint, str
+            ):
+                raise FinalizationError(
+                    f"manifest durable artifact paths are malformed: {path}"
+                )
+            trace_path = require_regular_file(Path(declared_trace), owner_only=True)
+            checkpoint_path = require_regular_file(
+                Path(declared_checkpoint), owner_only=True
+            )
+            try:
+                artifact_verification = verify_durable_draco_artifacts(
+                    results_path=result_path,
+                    trace_path=trace_path,
+                    checkpoint_path=checkpoint_path,
+                )
+            except (OSError, UnicodeError, DracoArtifactDurabilityError) as exc:
+                raise FinalizationError(
+                    f"manifest durable artifact binding failed: {path}: {exc}"
+                ) from exc
+        if artifact_recovery is not None:
+            if artifact_verification is None:
+                raise FinalizationError(
+                    f"recovered manifest lacks a durable checkpoint binding: {path}"
+                )
+            if (
+                not isinstance(artifact_recovery, Mapping)
+                or artifact_recovery.get("schema")
+                != "opensquilla.draco-artifact-recovery/v1"
+                or status != "result_incomplete"
+                or artifact_recovery.get("status") != "sealed_after_unclean_exit"
+                or artifact_recovery.get("prior_status") not in {"running", "aborted"}
+                or artifact_recovery.get("physical_request_policy")
+                != "no_model_or_provider_calls"
+                or artifact_recovery.get("automatic_rerun_allowed") is not False
+                or artifact_recovery.get("rows_written")
+                != artifact_verification["rows_written"]
+                or artifact_recovery.get("results_sha256")
+                != artifact_verification["results_sha256"]
+                or artifact_recovery.get("trace_sha256")
+                != artifact_verification["trace_sha256"]
+                or artifact_recovery.get("checkpoint_sha256")
+                != artifact_verification["checkpoint_sha256"]
+                or not HEX64.fullmatch(
+                    str(artifact_recovery.get("prior_manifest_sha256") or "")
+                )
+                or not isinstance(artifact_recovery.get("prior_manifest_path"), str)
+            ):
+                raise FinalizationError(
+                    f"manifest artifact recovery contract is malformed: {path}"
+                )
+            declared_prior_manifest = artifacts.get("pre_recovery_manifest_json")
+            declared_recovery_prior_manifest = artifact_recovery[
+                "prior_manifest_path"
+            ]
+            expected_prior_manifest_path = path.with_name(
+                f"{path.name}.pre-recovery"
+            )
+            if (
+                not isinstance(declared_prior_manifest, str)
+                or Path(declared_prior_manifest).resolve(strict=False)
+                != Path(declared_recovery_prior_manifest).resolve(strict=False)
+                or Path(declared_prior_manifest).resolve(strict=False)
+                != expected_prior_manifest_path.resolve(strict=False)
+            ):
+                raise FinalizationError(
+                    f"manifest recovery sidecar path is not bound: {path}"
+                )
+            prior_manifest_path = require_regular_file(
+                Path(declared_prior_manifest), owner_only=True
+            )
+            prior_manifest = load_json(prior_manifest_path)
+            recovery_prior_manifest = prior_manifest
+            prior_artifacts = prior_manifest.get("artifacts")
+            if (
+                file_sha256(prior_manifest_path)
+                != artifact_recovery["prior_manifest_sha256"]
+                or prior_manifest.get("status") != artifact_recovery["prior_status"]
+                or prior_manifest.get("artifact_recovery") is not None
+                or prior_manifest.get("schema") != DRACO_RUN_MANIFEST_SCHEMA_V2
+                or prior_manifest.get("durable_artifact_capability")
+                != expected_durability
+                or prior_manifest.get("run_compatibility")
+                != payload.get("run_compatibility")
+                or not isinstance(prior_artifacts, Mapping)
+                or Path(str(prior_artifacts.get("results_jsonl") or "")).resolve(
+                    strict=False
+                )
+                != result_path
+                or Path(str(prior_artifacts.get("trace_jsonl") or "")).resolve(
+                    strict=False
+                )
+                != trace_path
+                or Path(str(prior_artifacts.get("checkpoint_json") or "")).resolve(
+                    strict=False
+                )
+                != checkpoint_path
+                or Path(str(prior_artifacts.get("manifest_json") or "")).resolve(
+                    strict=False
+                )
+                != path
+            ):
+                raise FinalizationError(
+                    f"manifest recovery sidecar evidence is invalid: {path}"
+                )
+            raw_recovered_schedule = artifact_recovery.get(
+                "durable_scheduled_pairs"
+            )
+            prior_resume = prior_manifest.get("resume_selection")
+            prior_schedule = (
+                prior_resume.get("scheduled_pairs", [])
+                if isinstance(prior_resume, Mapping)
+                else []
+            )
+            if not isinstance(raw_recovered_schedule, list) or not isinstance(
+                prior_schedule, list
+            ):
+                raise FinalizationError(
+                    f"manifest recovered resume schedule is malformed: {path}"
+                )
+            if not isinstance(prior_resume, Mapping):
+                if raw_recovered_schedule:
+                    raise FinalizationError(
+                        f"manifest recovered a schedule absent from its prior manifest: {path}"
+                    )
+                recovered_resume_scheduled_pairs = None
+                raw_recovered_schedule = []
+            prior_schedule_values = {
+                (
+                    str(item.get("group") or ""),
+                    str(item.get("task_id") or ""),
+                    str(item.get("action") or ""),
+                )
+                for item in prior_schedule
+                if isinstance(item, Mapping)
+            }
+            if isinstance(prior_resume, Mapping):
+                recovered_resume_scheduled_pairs = []
+            seen_recovered_keys: set[tuple[str, str]] = set()
+            for item in raw_recovered_schedule:
+                if not isinstance(item, Mapping):
+                    raise FinalizationError(
+                        f"manifest recovered scheduled pair is malformed: {path}"
+                    )
+                normalized = {
+                    "group": str(item.get("group") or ""),
+                    "task_id": str(item.get("task_id") or ""),
+                    "action": str(item.get("action") or ""),
+                }
+                key = (normalized["group"], normalized["task_id"])
+                if (
+                    (*key, normalized["action"]) not in prior_schedule_values
+                    or normalized["action"] not in RESUME_SCHEDULE_ACTIONS
+                    or key in seen_recovered_keys
+                ):
+                    raise FinalizationError(
+                        f"manifest recovered schedule is not a unique prior subset: {path}"
+                    )
+                seen_recovered_keys.add(key)
+                assert recovered_resume_scheduled_pairs is not None
+                recovered_resume_scheduled_pairs.append(normalized)
         result_rows = [
             value
             for _, value in load_jsonl_rows(
@@ -1944,6 +2195,89 @@ def load_manifest_contracts(
                 source_label="result JSONL",
             )
         ]
+        durable_row_markers = [
+            row.get(DRACO_DURABLE_RESULT_ROW_FIELD)
+            for row in result_rows
+            if isinstance(row, Mapping)
+            and DRACO_DURABLE_RESULT_ROW_FIELD in row
+        ]
+        if durable_v2:
+            if len(durable_row_markers) != len(result_rows) or any(
+                marker != expected_durability for marker in durable_row_markers
+            ):
+                raise FinalizationError(
+                    f"manifest durable row marker is missing or invalid: {path}"
+                )
+        elif durable_row_markers:
+            raise FinalizationError(
+                f"manifest durable capability was stripped from sealed rows: {path}"
+            )
+        if isinstance(artifact_recovery, Mapping):
+            assert recovery_prior_manifest is not None
+            prior_resume = recovery_prior_manifest.get("resume_selection")
+            prior_scheduled = (
+                prior_resume.get("scheduled_pairs")
+                if isinstance(prior_resume, Mapping)
+                else None
+            )
+            expected_pairs: set[tuple[str, str]] = set()
+            if isinstance(prior_resume, Mapping) and not isinstance(
+                prior_scheduled, list
+            ):
+                raise FinalizationError(
+                    f"recovery prior schedule is malformed: {path}"
+                )
+            if isinstance(prior_scheduled, list):
+                for item in prior_scheduled:
+                    if (
+                        not isinstance(item, Mapping)
+                        or not isinstance(item.get("group"), str)
+                        or not isinstance(item.get("task_id"), str)
+                    ):
+                        raise FinalizationError(
+                            f"recovery prior schedule is malformed: {path}"
+                        )
+                    key = (item["group"], item["task_id"])
+                    if key in expected_pairs:
+                        raise FinalizationError(
+                            f"recovery prior schedule contains duplicate pairs: {path}"
+                        )
+                    expected_pairs.add(key)
+            else:
+                prior_groups = recovery_prior_manifest.get("groups")
+                prior_task_ids = recovery_prior_manifest.get("task_ids")
+                if not isinstance(prior_groups, list) or not isinstance(
+                    prior_task_ids, list
+                ):
+                    raise FinalizationError(
+                        f"recovery prior manifest lacks its original schedule: {path}"
+                    )
+                expected_pairs = {
+                    (str(group), str(task_id))
+                    for group in prior_groups
+                    for task_id in prior_task_ids
+                }
+            durable_pairs = {
+                (str(row.get("group") or ""), str(row.get("task_id") or ""))
+                for row in result_rows
+                if isinstance(row, Mapping)
+            }
+            expected_ambiguous = [
+                {"group": group, "task_id": task_id}
+                for group, task_id in sorted(expected_pairs - durable_pairs)
+            ]
+            raw_ambiguous = artifact_recovery.get("ambiguous_pairs")
+            ambiguous_count = artifact_recovery.get("ambiguous_pair_count")
+            if (
+                not durable_pairs <= expected_pairs
+                or not isinstance(raw_ambiguous, list)
+                or isinstance(ambiguous_count, bool)
+                or ambiguous_count != len(raw_ambiguous)
+                or raw_ambiguous != expected_ambiguous
+            ):
+                raise FinalizationError(
+                    f"manifest recovery ambiguity ledger is not bound to its durable prefix: {path}"
+                )
         shard_attempt_ids = {
             str(attempt.get("attempt_id") or "")
             for row in result_rows
@@ -1959,6 +2293,8 @@ def load_manifest_contracts(
         new_attempt_ids = shard_attempt_ids - prior_manifest_attempt_ids
         if preflight_status == "skipped_not_required":
             resume_selection = payload.get("resume_selection")
+            if resume_selection is None and isinstance(artifact_recovery, Mapping):
+                resume_selection = prior_manifest.get("resume_selection")
             if (
                 any(
                     int(preflight_calls[tool_name]) != 0
@@ -2014,6 +2350,13 @@ def load_manifest_contracts(
         prior_manifest_attempt_ids.update(shard_attempt_ids)
         if nonnegative_int(payload.get("rows_written")) != len(result_rows):
             raise FinalizationError(f"manifest rows_written differs from its result shard: {path}")
+        if (
+            artifact_verification is not None
+            and artifact_verification["rows_written"] != len(result_rows)
+        ):
+            raise FinalizationError(
+                f"manifest checkpoint rows differ from its result shard: {path}"
+            )
         manifest_groups = payload.get("groups")
         manifest_task_ids = payload.get("task_ids")
         if (
@@ -2054,13 +2397,7 @@ def load_manifest_contracts(
                 scheduled_group not in manifest_groups
                 or scheduled_task not in manifest_task_ids
                 or scheduled_action
-                not in {
-                    "regenerate",
-                    "model_regenerate",
-                    "judge_only",
-                    "metadata_only",
-                    "audit_only",
-                }
+                not in RESUME_SCHEDULE_ACTIONS
                 or scheduled_key in seen_scheduled_pairs
             ):
                 raise FinalizationError(
@@ -2217,6 +2554,22 @@ def load_manifest_contracts(
                     f"manifest resume schedule counters differ from its result shard: {path}"
                 )
             resume_schedule_contract_verified = True
+        if recovered_resume_scheduled_pairs is not None:
+            result_pairs = {
+                (str(row.get("group") or ""), str(row.get("task_id") or ""))
+                for row in result_rows
+                if isinstance(row, Mapping)
+            }
+            recovered_pairs = {
+                (item["group"], item["task_id"])
+                for item in recovered_resume_scheduled_pairs
+            }
+            if resume_scheduled_pairs or recovered_pairs != result_pairs:
+                raise FinalizationError(
+                    f"manifest recovered schedule differs from its result shard: {path}"
+                )
+            resume_scheduled_pairs = recovered_resume_scheduled_pairs
+            resume_schedule_contract_verified = bool(resume_scheduled_pairs)
         compatibility = payload.get("run_compatibility")
         if not isinstance(compatibility, dict):
             raise FinalizationError(f"manifest lacks run compatibility: {path}")
@@ -2262,29 +2615,32 @@ def load_manifest_contracts(
             authoritative_contracts = contracts
         elif authoritative_fingerprints != fingerprints or authoritative_contracts != contracts:
             raise FinalizationError("source manifests use different run contracts")
-        source_evidence.append(
-            {
-                "path": str(path),
-                "sha256": file_sha256(path),
-                "status": status,
-                "started_at": payload.get("started_at"),
-                "finished_at": payload.get("finished_at"),
-                "result_path": str(result_path),
-                "result_sha256": file_sha256(result_path),
-                "rows_written": len(result_rows),
-                "execution_scheduling": execution_scheduling,
-                "live_web_preflight": {
-                    "status": preflight_status,
-                    "preflight_calls": {
-                        tool_name: int(preflight_calls[tool_name])
-                        for tool_name in ("web_search", "web_fetch")
-                    },
+        source_record = {
+            "path": str(path),
+            "sha256": file_sha256(path),
+            "status": status,
+            "started_at": payload.get("started_at"),
+            "finished_at": payload.get("finished_at"),
+            "result_path": str(result_path),
+            "result_sha256": file_sha256(result_path),
+            "rows_written": len(result_rows),
+            "execution_scheduling": execution_scheduling,
+            "live_web_preflight": {
+                "status": preflight_status,
+                "preflight_calls": {
+                    tool_name: int(preflight_calls[tool_name])
+                    for tool_name in ("web_search", "web_fetch")
                 },
-                "resume_scheduled_pairs": resume_scheduled_pairs,
-                "resume_schedule_contract_verified": (resume_schedule_contract_verified),
-                "audit_warnings": manifest_audit_warnings,
-            }
-        )
+            },
+            "resume_scheduled_pairs": resume_scheduled_pairs,
+            "resume_schedule_contract_verified": (resume_schedule_contract_verified),
+            "audit_warnings": manifest_audit_warnings,
+        }
+        if artifact_verification is not None:
+            source_record["durable_artifacts"] = artifact_verification
+        if isinstance(artifact_recovery, Mapping):
+            source_record["artifact_recovery"] = dict(artifact_recovery)
+        source_evidence.append(source_record)
     assert authoritative_fingerprints is not None
     assert authoritative_contracts is not None
     return (

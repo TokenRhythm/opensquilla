@@ -83,6 +83,16 @@ from opensquilla.eval.draco_artifact_integrity import (
     seal_result_row,
     trace_row_from_result,
 )
+from opensquilla.eval.draco_artifact_io import (
+    DRACO_DURABLE_RESULT_ROW_FIELD,
+    DRACO_RUN_MANIFEST_SCHEMA_V2,
+    AsyncDurableDracoArtifactWriter,
+    DracoArtifactRunLock,
+    DurableDracoArtifactWriter,
+    atomic_write_text,
+    durable_artifact_capability_contract,
+    fsync_directory,
+)
 from opensquilla.eval.draco_experiment_config import (
     DracoEnsembleMemberConfig,
     DracoExperimentConfig,
@@ -15512,6 +15522,7 @@ def build_run_compatibility(
         contract = {
             "schema": RUN_COMPATIBILITY_SCHEMA,
             "benchmark": "DRACO",
+            "durable_artifact_capability": durable_artifact_capability_contract(),
             "group": group,
             "group_spec": GROUP_SPECS[group],
             "source_identity": source_identity,
@@ -15599,7 +15610,7 @@ def write_command_file(
             "",
         ]
     )
-    path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines))
     return payload
 
 
@@ -15719,6 +15730,7 @@ def write_experiment_config_artifacts(
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
+        fsync_directory(output_dir)
 
     args._effective_experiment_config_path = effective_resolved_path
     return artifacts
@@ -15744,7 +15756,9 @@ def write_manifest(
     policy = tool_policy or benchmark_tool_policy(args)
     generation_policy = generation_thinking_policy(args)
     payload: dict[str, Any] = {
+        "schema": DRACO_RUN_MANIFEST_SCHEMA_V2,
         "benchmark": "DRACO",
+        "durable_artifact_capability": durable_artifact_capability_contract(),
         "runner": f"scripts/{Path(__file__).name}",
         "runner_mode": getattr(args, "runner_mode", DEFAULT_DRACO_RUNNER_MODE),
         "agent_max_iterations": getattr(
@@ -15791,10 +15805,17 @@ def write_manifest(
         payload["summary"] = summary
     if failure is not None:
         payload["failure"] = failure
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    )
 
 
-async def amain(args: argparse.Namespace) -> int:
+async def _amain_with_run_lock(
+    args: argparse.Namespace,
+    *,
+    run_lock_holder: list[DracoArtifactRunLock | None],
+) -> int:
     # Freeze source identity once. A long-running benchmark must not attribute
     # its final manifest to files modified after this process started.
     args._source_provenance = source_provenance()
@@ -16018,38 +16039,78 @@ async def amain(args: argparse.Namespace) -> int:
         )
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir.resolve(strict=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     run_started_at = time.time()
     jsonl_path = output_dir / f"draco_ensemble_{stamp}.jsonl"
     trace_path = output_dir / f"draco_run_{stamp}.trace.jsonl"
+    checkpoint_path = output_dir / f"draco_run_{stamp}.checkpoint.json"
     manifest_path = output_dir / f"draco_run_{stamp}.manifest.json"
     command_path = output_dir / f"draco_run_{stamp}.command.txt"
     summary_json_path = jsonl_path.with_suffix(".summary.json")
+    run_lock = DracoArtifactRunLock(
+        checkpoint_path.with_suffix(checkpoint_path.suffix + ".lock")
+    )
+    run_lock_holder[0] = run_lock
+    run_lock.acquire()
+    protected_paths = (
+        jsonl_path,
+        trace_path,
+        checkpoint_path,
+        manifest_path,
+        command_path,
+        summary_json_path,
+        jsonl_path.with_suffix(".md"),
+    )
+    if any(path.exists() for path in protected_paths):
+        run_lock.close()
+        raise FileExistsError("DRACO artifact stamp already exists")
     semaphore = asyncio.Semaphore(max(1, args.concurrency))
     judge_semaphore = asyncio.Semaphore(max(1, int(getattr(args, "judge_concurrency", 1) or 1)))
     rows: list[dict[str, Any]] = []
     artifacts = {
         "results_jsonl": str(jsonl_path),
         "trace_jsonl": str(trace_path),
+        "checkpoint_json": str(checkpoint_path),
         "manifest_json": str(manifest_path),
         "command_txt": str(command_path),
         "summary_json": str(summary_json_path),
         "summary_markdown": str(jsonl_path.with_suffix(".md")),
     }
-    artifacts.update(write_experiment_config_artifacts(output_dir, args=args, stamp=stamp))
-    command = write_command_file(command_path, args=args, stamp=stamp)
-    write_manifest(
-        manifest_path,
-        args=args,
-        stamp=stamp,
-        status="running",
-        started_at=run_started_at,
-        tasks=tasks,
-        groups=groups,
-        artifacts=artifacts,
-        tool_policy=manifest_tool_policy,
-        command=command,
-    )
+    try:
+        artifacts.update(write_experiment_config_artifacts(output_dir, args=args, stamp=stamp))
+        command = write_command_file(command_path, args=args, stamp=stamp)
+    except BaseException:
+        run_lock.close()
+        raise
+    try:
+        artifact_writer = AsyncDurableDracoArtifactWriter(
+            DurableDracoArtifactWriter(
+                results_path=jsonl_path,
+                trace_path=trace_path,
+                checkpoint_path=checkpoint_path,
+            )
+        )
+    except BaseException:
+        run_lock.close()
+        raise
+    try:
+        write_manifest(
+            manifest_path,
+            args=args,
+            stamp=stamp,
+            status="running",
+            started_at=run_started_at,
+            tasks=tasks,
+            groups=groups,
+            artifacts=artifacts,
+            tool_policy=manifest_tool_policy,
+            command=command,
+        )
+    except BaseException:
+        await artifact_writer.aclose()
+        run_lock.close()
+        raise
 
     async def _guarded(task: dict[str, Any], group: str) -> dict[str, Any]:
         group_tool_policy = group_tool_policies[group]
@@ -16116,10 +16177,7 @@ async def amain(args: argparse.Namespace) -> int:
     supervisor = DracoTaskSupervisor(pending)
     rows_persisted = 0
     try:
-        with (
-            jsonl_path.open("w", encoding="utf-8") as fh,
-            trace_path.open("w", encoding="utf-8") as trace_fh,
-        ):
+        async with artifact_writer:
             for row_index, coro in enumerate(asyncio.as_completed(pending), start=1):
                 row = await coro
                 row["row_index"] = row_index
@@ -16144,22 +16202,23 @@ async def amain(args: argparse.Namespace) -> int:
                         row,
                         non_byok_audit=audit,
                     )
+                row[DRACO_DURABLE_RESULT_ROW_FIELD] = (
+                    durable_artifact_capability_contract()
+                )
                 row = seal_result_row(row)
                 trace_value = trace_row(row)
-                result_line = json.dumps(row, ensure_ascii=False, allow_nan=False)
-                trace_line = json.dumps(trace_value, ensure_ascii=False, allow_nan=False)
+                append_outcome = await artifact_writer.append(row, trace_value)
+                rows_persisted = append_outcome.paired_row_count
+                if not append_outcome.committed:
+                    raise RuntimeError("new DRACO run produced duplicate sealed evidence")
                 rows.append(row)
-                fh.write(result_line + "\n")
-                fh.flush()
-                trace_fh.write(trace_line + "\n")
-                trace_fh.flush()
-                rows_persisted += 1
                 print(
                     f"{row['group']} {row['task_id']} error={bool(row['error'])}",
                     flush=True,
                 )
     except BaseException as exc:
         await supervisor.cancel_and_wait()
+        rows_persisted = artifact_writer.paired_row_count
         failure = supervisor.failure_payload(exc, rows_written=rows_persisted)
         try:
             write_manifest(
@@ -16184,6 +16243,7 @@ async def amain(args: argparse.Namespace) -> int:
                 file=sys.stderr,
                 flush=True,
             )
+        run_lock.close()
         raise
     result_failures: list[dict[str, Any]] = []
     for row in rows:
@@ -16262,50 +16322,64 @@ async def amain(args: argparse.Namespace) -> int:
             if flattened_reasons and flattened_reasons <= {"judge_incomplete"}
             else "result_incomplete"
         )
-    summary = summarize(rows)
-    summary_path = jsonl_path.with_suffix(".md")
-    summary_path.write_text(
-        render_markdown(
-            summary,
-            jsonl_path,
+    try:
+        summary = summarize(rows)
+        summary_path = jsonl_path.with_suffix(".md")
+        atomic_write_text(
+            summary_path,
+            render_markdown(
+                summary,
+                jsonl_path,
+                tool_policy=manifest_tool_policy,
+                generation_policy=generation_policy,
+                runner_mode=args.runner_mode,
+                agent_max_iterations=args.agent_max_iterations,
+                agent_finalization_policy=agent_finalization_policy,
+            ),
+        )
+        atomic_write_text(
+            summary_json_path,
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        )
+        write_manifest(
+            manifest_path,
+            args=args,
+            stamp=stamp,
+            status=run_status,
+            started_at=run_started_at,
+            finished_at=time.time(),
+            tasks=tasks,
+            groups=groups,
+            rows_written=len(rows),
+            artifacts=artifacts,
+            summary=summary,
             tool_policy=manifest_tool_policy,
-            generation_policy=generation_policy,
-            runner_mode=args.runner_mode,
-            agent_max_iterations=args.agent_max_iterations,
-            agent_finalization_policy=agent_finalization_policy,
-        ),
-        encoding="utf-8",
-    )
-    summary_json_path.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    write_manifest(
-        manifest_path,
-        args=args,
-        stamp=stamp,
-        status=run_status,
-        started_at=run_started_at,
-        finished_at=time.time(),
-        tasks=tasks,
-        groups=groups,
-        rows_written=len(rows),
-        artifacts=artifacts,
-        summary=summary,
-        tool_policy=manifest_tool_policy,
-        command=command,
-        failure=manifest_failure,
-    )
-    print(f"wrote {jsonl_path}")
-    print(f"wrote {trace_path}")
-    print(f"wrote {manifest_path}")
-    print(f"wrote {command_path}")
-    print(f"wrote {summary_json_path}")
-    print(f"wrote {summary_path}")
-    for key, path in artifacts.items():
-        if key.startswith("experiment_config_"):
-            print(f"wrote {path}")
-    return 2 if manifest_failure is not None else 0
+            command=command,
+            failure=manifest_failure,
+        )
+        print(f"wrote {jsonl_path}")
+        print(f"wrote {trace_path}")
+        print(f"wrote {checkpoint_path}")
+        print(f"wrote {manifest_path}")
+        print(f"wrote {command_path}")
+        print(f"wrote {summary_json_path}")
+        print(f"wrote {summary_path}")
+        for key, path in artifacts.items():
+            if key.startswith("experiment_config_"):
+                print(f"wrote {path}")
+        return 2 if manifest_failure is not None else 0
+    finally:
+        run_lock.close()
+
+
+async def amain(args: argparse.Namespace) -> int:
+    run_lock_holder: list[DracoArtifactRunLock | None] = [None]
+    try:
+        return await _amain_with_run_lock(args, run_lock_holder=run_lock_holder)
+    finally:
+        run_lock = run_lock_holder[0]
+        if run_lock is not None:
+            run_lock.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
