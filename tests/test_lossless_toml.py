@@ -143,6 +143,72 @@ def test_crlf_config_with_a_multi_line_array_keeps_its_line_endings() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Configs with no multi-line value must come through untouched
+# ---------------------------------------------------------------------------
+
+
+# The shape the Desktop profile-import E2E writes, including the Windows spelling
+# of its paths: `json.dumps(str(path))` produces doubled backslashes, so the value
+# scanner has to walk string escapes correctly on a line it must not consume.
+DESKTOP_PROFILE_CONFIG = (
+    'workspace_dir = "C:\\\\Users\\\\RUNNER~1\\\\AppData\\\\Local\\\\Temp\\\\p1\\\\workspace"\n'
+    'state_dir = "C:\\\\Users\\\\RUNNER~1\\\\AppData\\\\Local\\\\Temp\\\\p1\\\\state"\n'
+    'search_provider = "duckduckgo"\n'
+    'search_api_key_env = ""\n'
+    "\n"
+    "[llm]\n"
+    'provider = "ollama"\n'
+    'model = "synthetic-source-model"\n'
+    'base_url = "http://127.0.0.1:11434/v1"  # local only\n'
+    'api_key_env = ""\n'
+    "\n"
+    "[squilla_router]\n"
+    "enabled = false\n"
+    'default_tier = "c2"\n'
+    "confidence_threshold = 0.77\n"
+    "\n"
+    "[squilla_router.tiers.c0]\n"
+    'provider = "ollama"\n'
+    'model = "synthetic-source-tier-model"\n'
+    "\n"
+    "[control_ui]\n"
+    "enabled = true\n"
+    'base_path = "/control"\n'
+)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_boot_stamp_rewrites_one_line_and_no_other_byte(newline: str) -> None:
+    raw = DESKTOP_PROFILE_CONFIG.replace("\n", newline).encode("utf-8")
+    original = tomllib.loads(raw.decode("utf-8"))
+    transformed = tomllib.loads(raw.decode("utf-8"))
+    transformed["squilla_router"]["default_tier"] = "c1"
+
+    patched = patch_import_config(raw, original, transformed).decode("utf-8")
+
+    before = raw.decode("utf-8").split(newline)
+    after = patched.split(newline)
+    assert len(before) == len(after)
+    differing = [i for i, (a, b) in enumerate(zip(before, after)) if a != b]
+    assert differing == [before.index('default_tier = "c2"')]
+    assert after[differing[0]] == 'default_tier = "c1"'
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_escaped_windows_paths_survive_an_insertion(newline: str) -> None:
+    raw = DESKTOP_PROFILE_CONFIG.replace("\n", newline).encode("utf-8")
+    original = tomllib.loads(raw.decode("utf-8"))
+    transformed = tomllib.loads(raw.decode("utf-8"))
+    transformed.setdefault("sandbox", {})["run_mode"] = "full"
+
+    patched = patch_import_config(raw, original, transformed).decode("utf-8")
+
+    for line in raw.decode("utf-8").split(newline):
+        assert line in patched.split(newline)
+    assert tomllib.loads(patched) == transformed
+
+
+# ---------------------------------------------------------------------------
 # Triple-quoted strings: their bodies are not TOML
 # ---------------------------------------------------------------------------
 
