@@ -6533,6 +6533,13 @@ class TurnRunner:
                 else None
             )
             selection_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
+            provider_health_ledger = None
+            if selection_mode == "router_dynamic":
+                from opensquilla.engine.routing.health import (
+                    get_provider_health_ledger,
+                )
+
+                provider_health_ledger = get_provider_health_ledger()
             dynamic_cleanup_errors: tuple[type[Exception], ...] = ()
             dynamic_selection_errors: tuple[type[Exception], ...] = ()
             if selection_mode == "router_dynamic":
@@ -6837,6 +6844,7 @@ class TurnRunner:
                         ),
                         _session_key=turn.session_key,
                         _fallback_selector=cloned_selector,
+                        _provider_health_ledger=provider_health_ledger,
                     )
                 except dynamic_cleanup_errors as exc:
                     log_ensemble_decision_failed(

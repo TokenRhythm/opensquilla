@@ -89,6 +89,45 @@ def test_terminal_evidence_codes_are_retryable_with_provider_fallback(
     assert not [e for e in captured if e["event"] == "provider_failure.unclassified"]
 
 
+@pytest.mark.parametrize(
+    "raw_code",
+    ["provider_protocol_error", "invalid_response"],
+)
+def test_provider_protocol_codes_are_malformed_response(raw_code: str) -> None:
+    assert (
+        classify_provider_error(
+            provider_name="openrouter",
+            status_code=None,
+            raw_code=raw_code,
+            message="provider returned an invalid response envelope",
+        )
+        is ProviderFailureKind.MALFORMED_RESPONSE
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_code", "message"),
+    [
+        ("ConnectionResetError", "connection reset by peer"),
+        ("gaierror", "temporary failure in name resolution"),
+        ("", "DNS resolution failed for upstream host"),
+    ],
+)
+def test_network_boundary_failures_are_transport_transient(
+    raw_code: str,
+    message: str,
+) -> None:
+    assert (
+        classify_provider_error(
+            provider_name="openrouter",
+            status_code=None,
+            raw_code=raw_code,
+            message=message,
+        )
+        is ProviderFailureKind.TRANSPORT_TRANSIENT
+    )
+
+
 def test_unknown_classification_emits_redacted_fingerprint_event() -> None:
     with structlog.testing.capture_logs() as captured:
         kind = classify_provider_error(

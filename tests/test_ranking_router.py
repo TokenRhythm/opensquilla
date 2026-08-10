@@ -3267,6 +3267,39 @@ def test_runtime_generation_policy_reason_excludes_before_ranking() -> None:
     assert aggregator_row["reasons"] == ["generation_policy_reasoning_unsupported"]
 
 
+def test_runtime_deployment_reason_is_hard_filtered_only_for_bound_role() -> None:
+    primary = _model("primary", capability=0.95)
+    backup = _model("backup", capability=0.90)
+    blocked = _model("blocked", capability=1.0, aggregator_fit=1.0)
+    blocked["registry_facts"]["runtime_hard_filter_reasons_by_role"] = {
+        "proposer": ["runtime_deployment_benched"],
+    }
+
+    decision = _decision(
+        primary,
+        backup,
+        blocked,
+        analysis=_analysis(tier=2, latency="interactive"),
+        user_profile_enabled=False,
+    )
+    proposer_row = next(
+        row
+        for row in decision.trace["hard_filter"]["proposer_results"]
+        if row["model"] == "blocked"
+    )
+    aggregator_row = next(
+        row
+        for row in decision.trace["hard_filter"]["aggregator_results"]
+        if row["model"] == "blocked"
+    )
+
+    assert proposer_row["eligible"] is False
+    assert proposer_row["reasons"] == ["runtime_deployment_benched"]
+    assert aggregator_row["eligible"] is True
+    assert "runtime_deployment_benched" not in aggregator_row["reasons"]
+    assert ranking_trace_replay_reasons(decision.trace) == []
+
+
 def test_generation_policy_filter_fails_clearly_when_below_n_min() -> None:
     eligible = _model("eligible", capability=0.95)
     blocked_one = _model("blocked-one", capability=0.90)

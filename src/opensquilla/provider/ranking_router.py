@@ -5765,6 +5765,18 @@ def _availability_reasons(
     runtime_reasons = facts.get("runtime_hard_filter_reasons")
     if isinstance(runtime_reasons, Sequence) and not isinstance(runtime_reasons, (str, bytes)):
         reasons.extend(str(reason).strip() for reason in runtime_reasons if str(reason).strip())
+    runtime_reasons_by_role = facts.get("runtime_hard_filter_reasons_by_role")
+    if isinstance(runtime_reasons_by_role, Mapping):
+        role_reasons = runtime_reasons_by_role.get(role.strip().lower())
+        if isinstance(role_reasons, Sequence) and not isinstance(
+            role_reasons,
+            (str, bytes),
+        ):
+            reasons.extend(
+                str(reason).strip()
+                for reason in role_reasons
+                if str(reason).strip()
+            )
     if (
         role.strip().lower() == "proposer"
         and facts.get("retry_excluded_proposer") is True
@@ -7020,8 +7032,16 @@ def rank_models(
     proposer_max_tokens_cap: int = 65_536,
     proposer_visible_answer_reserve_tokens: int = 4_096,
     proposer_recovery_quorum: int | None = None,
+    _emit_logs: bool = True,
 ) -> RankingDecision:
     """Select ``(P, A)`` using the Step2 chapter-6 ranking pipeline."""
+
+    if not isinstance(_emit_logs, bool):
+        raise DynamicRankingError("router_dynamic _emit_logs must be a boolean")
+
+    def emit_info(event: str, **fields: Any) -> None:
+        if _emit_logs:
+            log.info(event, **fields)
 
     if not isinstance(ranking_thinking_assignment_enabled, bool):
         raise DynamicRankingError(
@@ -7854,7 +7874,7 @@ def rank_models(
                 },
             }
         )
-        log.info(
+        emit_info(
             "llm_ensemble.router_dynamic.thinking_assignment_recorded",
             decision_id=decision_id,
             thinking_assignment=trace["thinking_assignment"],
@@ -7862,7 +7882,7 @@ def rank_models(
             unsupported_level_fallbacks=trace["unsupported_level_fallbacks"],
             policy_versions=trace["policy_versions"],
         )
-    log.info(
+    emit_info(
         "llm_ensemble.router_dynamic.candidate_pool_recorded",
         decision_id=decision_id,
         user_profile_enabled=user_profile_enabled,
@@ -7873,7 +7893,7 @@ def rank_models(
         eligible_aggregator_count=len(aggregator_rows),
         filter_reason_counts=reason_counts,
     )
-    log.info(
+    emit_info(
         "llm_ensemble.router_dynamic.model_scores_recorded",
         decision_id=decision_id,
         ranking_version=effective_ranking_version,
@@ -7881,7 +7901,7 @@ def rank_models(
         top_l=top_l,
         quality_floor=round(quality_floor, score_decimal_places),
     )
-    log.info(
+    emit_info(
         "llm_ensemble.router_dynamic.proposer_selection_recorded",
         decision_id=decision_id,
         selected_P=selected_ids,
@@ -7890,7 +7910,7 @@ def rank_models(
         stop_reason=stop_reason,
         coverage_shortfall=coverage_shortfall,
     )
-    log.info(
+    emit_info(
         "llm_ensemble.router_dynamic.aggregator_selection_recorded",
         decision_id=decision_id,
         selected_A=aggregator.identity,
@@ -7919,7 +7939,7 @@ def rank_models(
                 "policy_versions": trace["policy_versions"],
             }
         )
-    log.info(
+    emit_info(
         "llm_ensemble.router_dynamic.router_decision_recorded",
         **router_decision_log_fields,
     )

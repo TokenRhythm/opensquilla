@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -102,6 +103,19 @@ def test_benches_are_per_deployment() -> None:
     assert not ledger.is_benched("anthropic", MODEL)
 
 
+def test_benches_are_isolated_by_upstream_deployment() -> None:
+    ledger = _ledger()
+    ledger.record_failure(
+        PROVIDER,
+        MODEL,
+        ProviderFailureKind.RATE_LIMITED,
+        upstream="anthropic",
+    )
+    assert ledger.is_benched(PROVIDER, MODEL, upstream="anthropic")
+    assert not ledger.is_benched(PROVIDER, MODEL, upstream="google")
+    assert not ledger.is_benched(PROVIDER, MODEL)
+
+
 # ---------------------------------------------------------------------------
 # Cooldown expiry (injected clock)
 # ---------------------------------------------------------------------------
@@ -117,18 +131,135 @@ def test_default_cooldown_expires_after_thirty_seconds() -> None:
     assert not ledger.is_benched(PROVIDER, MODEL)
 
 
-def test_strikes_reset_when_bench_triggers() -> None:
-    """After a bench expires the deployment starts from a clean slate."""
+def test_failed_half_open_probe_rebenches_immediately() -> None:
+    """Cooldown expiry permits one probe; its failure reopens the circuit."""
     clock = FakeClock()
     ledger = _ledger(clock)
     for _ in range(DEFAULT_FAILURE_THRESHOLD):
         ledger.record_failure(PROVIDER, MODEL, ProviderFailureKind.PROVIDER_OVERLOADED)
     clock.advance(DEFAULT_COOLDOWN_S + 1)
     assert not ledger.is_benched(PROVIDER, MODEL)
-    # One post-cooldown failure must not instantly re-bench.
-    assert not ledger.record_failure(
-        PROVIDER, MODEL, ProviderFailureKind.PROVIDER_OVERLOADED
+    admission = ledger.begin_attempt(PROVIDER, MODEL)
+    assert admission["allowed"] is True
+    assert admission["probe"] is True
+    assert ledger.record_failure(
+        PROVIDER,
+        MODEL,
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+        lease_token=str(admission["lease_token"]),
     )
+    assert ledger.is_benched(PROVIDER, MODEL)
+
+
+def test_half_open_allows_only_one_probe_then_success_recovers() -> None:
+    clock = FakeClock()
+    ledger = _ledger(clock)
+    ledger.record_failure(PROVIDER, MODEL, ProviderFailureKind.RATE_LIMITED)
+    clock.advance(DEFAULT_COOLDOWN_S + 0.1)
+
+    first = ledger.begin_attempt(PROVIDER, MODEL)
+    second = ledger.begin_attempt(PROVIDER, MODEL)
+    assert first["allowed"] is True
+    assert first["probe"] is True
+    assert second == {
+        "allowed": False,
+        "state": "half_open",
+        "reason": "runtime_deployment_half_open_busy",
+        "probe": True,
+        "started_at": clock.now,
+    }
+
+    ledger.record_success(
+        PROVIDER,
+        MODEL,
+        attempt_started_at=float(first["started_at"]),
+        lease_token=str(first["lease_token"]),
+        latency_ms=125,
+    )
+    facts = ledger.runtime_facts(PROVIDER, MODEL)
+    assert facts["state"] == "healthy"
+    assert facts["recent_successes"] == 1
+    assert facts["ewma_p95_ms"] == 125.0
+
+
+def test_busy_rejection_cannot_cancel_the_probe_owner() -> None:
+    clock = FakeClock()
+    ledger = _ledger(clock)
+    ledger.record_failure(PROVIDER, MODEL, ProviderFailureKind.RATE_LIMITED)
+    clock.advance(DEFAULT_COOLDOWN_S + 0.1)
+
+    owner = ledger.begin_attempt(PROVIDER, MODEL)
+    busy = ledger.begin_attempt(PROVIDER, MODEL)
+    assert owner["allowed"] is True
+    assert "lease_token" in owner
+    assert busy["allowed"] is False
+    assert "lease_token" not in busy
+
+    # The rejected caller's cleanup has no ownership and must be a no-op.
+    ledger.cancel_attempt(
+        PROVIDER,
+        MODEL,
+        lease_token=busy.get("lease_token"),
+    )
+    assert ledger.begin_attempt(PROVIDER, MODEL)["allowed"] is False
+
+    ledger.cancel_attempt(
+        PROVIDER,
+        MODEL,
+        lease_token=str(owner["lease_token"]),
+    )
+    replacement = ledger.begin_attempt(PROVIDER, MODEL)
+    assert replacement["allowed"] is True
+    assert replacement["lease_token"] != owner["lease_token"]
+
+
+def test_stale_pre_bench_results_cannot_release_a_new_probe() -> None:
+    clock = FakeClock()
+    ledger = _ledger(clock)
+    old_started_at = clock.now
+    ledger.record_failure(PROVIDER, MODEL, ProviderFailureKind.RATE_LIMITED)
+    clock.advance(DEFAULT_COOLDOWN_S + 0.1)
+    owner = ledger.begin_attempt(PROVIDER, MODEL)
+
+    ledger.record_success(
+        PROVIDER,
+        MODEL,
+        attempt_started_at=old_started_at,
+    )
+    assert ledger.begin_attempt(PROVIDER, MODEL)["allowed"] is False
+
+    ledger.record_failure(
+        PROVIDER,
+        MODEL,
+        ProviderFailureKind.TRANSPORT_TRANSIENT,
+    )
+    assert ledger.begin_attempt(PROVIDER, MODEL)["allowed"] is False
+
+    ledger.cancel_attempt(
+        PROVIDER,
+        MODEL,
+        lease_token=str(owner["lease_token"]),
+    )
+    assert ledger.runtime_facts(PROVIDER, MODEL)["half_open_inflight"] is False
+
+
+def test_concurrent_turns_admit_at_most_one_half_open_probe() -> None:
+    clock = FakeClock()
+    ledger = _ledger(clock)
+    ledger.record_failure(PROVIDER, MODEL, ProviderFailureKind.RATE_LIMITED)
+    clock.advance(DEFAULT_COOLDOWN_S + 0.1)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        admissions = list(
+            pool.map(
+                lambda _: ledger.begin_attempt(PROVIDER, MODEL),
+                range(32),
+            )
+        )
+
+    allowed = [row for row in admissions if row["allowed"] is True]
+    assert len(allowed) == 1
+    assert "lease_token" in allowed[0]
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +315,68 @@ def test_retry_after_is_clamped_to_max_cooldown() -> None:
     assert not ledger.is_benched(PROVIDER, MODEL)
 
 
+def test_non_finite_retry_after_falls_back_to_default_cooldown() -> None:
+    for invalid_retry_after in (float("nan"), float("inf"), float("-inf")):
+        clock = FakeClock()
+        ledger = _ledger(clock)
+        ledger.record_failure(
+            PROVIDER,
+            MODEL,
+            ProviderFailureKind.RATE_LIMITED,
+            retry_after_s=invalid_retry_after,
+        )
+        clock.advance(DEFAULT_COOLDOWN_S - 0.1)
+        assert ledger.is_benched(PROVIDER, MODEL)
+        clock.advance(0.2)
+        assert not ledger.is_benched(PROVIDER, MODEL)
+
+
+def test_stale_runtime_telemetry_never_blocks_routing() -> None:
+    clock = FakeClock()
+    ledger = ProviderHealthLedger(
+        clock=clock,
+        cooldown_s=30,
+        max_cooldown_s=900,
+        telemetry_ttl_s=10,
+    )
+    ledger.record_failure(
+        PROVIDER,
+        MODEL,
+        ProviderFailureKind.RATE_LIMITED,
+        retry_after_s=300,
+    )
+    assert ledger.is_benched(PROVIDER, MODEL)
+    clock.advance(10.1)
+    facts = ledger.runtime_facts(
+        PROVIDER,
+        MODEL,
+        candidate_deployments=[
+            (PROVIDER, MODEL),
+            (PROVIDER, "backup-model"),
+        ],
+    )
+    assert facts["fresh"] is False
+    assert facts["state"] == "healthy"
+    assert facts["eligible"] is True
+
+
+def test_auth_and_business_quality_do_not_bench_deployment() -> None:
+    ledger = _ledger()
+    for _ in range(DEFAULT_FAILURE_THRESHOLD + 2):
+        ledger.record_failure(
+            PROVIDER,
+            MODEL,
+            ProviderFailureKind.AUTH_INVALID,
+        )
+    # Low judge/business quality never calls record_failure at all; an auth
+    # failure is recorded for telemetry but remains credential-scoped.
+    facts = ledger.runtime_facts(PROVIDER, MODEL)
+    assert facts["last_failure_kind"] == "auth_invalid"
+    assert facts["recent_failures"] == DEFAULT_FAILURE_THRESHOLD + 2
+    assert facts["state"] == "healthy"
+    assert not ledger.is_benched(PROVIDER, MODEL)
+
+
 # ---------------------------------------------------------------------------
 # Single-deployment exemption: NEVER bench the only viable deployment
 # ---------------------------------------------------------------------------
@@ -222,6 +415,35 @@ def test_unbenched_deployment_is_always_eligible() -> None:
     assert ledger.eligible(PROVIDER, MODEL, [(PROVIDER, MODEL)])
 
 
+def test_runtime_facts_preserve_never_strand_and_gate_early_probe() -> None:
+    ledger = _ledger()
+    ledger.record_failure(PROVIDER, MODEL, ProviderFailureKind.RATE_LIMITED)
+    candidates = [(PROVIDER, MODEL), (PROVIDER, "healthy-backup")]
+    filtered = ledger.runtime_facts(
+        PROVIDER,
+        MODEL,
+        candidate_deployments=candidates,
+    )
+    assert filtered["eligible"] is False
+    assert filtered["never_strand_exempt"] is False
+    assert ledger.begin_attempt(PROVIDER, MODEL)["allowed"] is False
+
+    sole = ledger.runtime_facts(
+        PROVIDER,
+        MODEL,
+        candidate_deployments=[(PROVIDER, MODEL)],
+    )
+    assert sole["eligible"] is True
+    assert sole["never_strand_exempt"] is True
+    admission = ledger.begin_attempt(
+        PROVIDER,
+        MODEL,
+        never_strand_exempt=True,
+    )
+    assert admission["allowed"] is True
+    assert admission["probe"] is True
+
+
 # ---------------------------------------------------------------------------
 # record_success resets strikes
 # ---------------------------------------------------------------------------
@@ -246,6 +468,68 @@ def test_success_clears_an_active_bench() -> None:
     assert ledger.is_benched(PROVIDER, MODEL)
     ledger.record_success(PROVIDER, MODEL)
     assert not ledger.is_benched(PROVIDER, MODEL)
+
+
+def test_success_started_before_new_bench_cannot_clear_it() -> None:
+    clock = FakeClock()
+    ledger = _ledger(clock)
+    old_started_at = clock.now
+    clock.advance(1)
+    ledger.record_failure(PROVIDER, MODEL, ProviderFailureKind.RATE_LIMITED)
+    ledger.record_success(
+        PROVIDER,
+        MODEL,
+        attempt_started_at=old_started_at,
+    )
+    assert ledger.is_benched(PROVIDER, MODEL)
+
+
+def test_new_failure_refreshes_recovery_barrier_without_extending_deadline() -> None:
+    clock = FakeClock()
+    ledger = _ledger(clock)
+    ledger.record_failure(
+        PROVIDER,
+        MODEL,
+        ProviderFailureKind.RATE_LIMITED,
+        retry_after_s=90,
+    )
+    clock.advance(1)
+    sibling_started_at = clock.now
+    clock.advance(1)
+    ledger.record_failure(
+        PROVIDER,
+        MODEL,
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+        retry_after_s=5,
+    )
+
+    ledger.record_success(
+        PROVIDER,
+        MODEL,
+        attempt_started_at=sibling_started_at,
+    )
+
+    assert ledger.is_benched(PROVIDER, MODEL)
+
+
+def test_old_success_cannot_skip_half_open_after_cooldown() -> None:
+    clock = FakeClock()
+    ledger = _ledger(clock)
+    old_started_at = clock.now
+    clock.advance(1)
+    ledger.record_failure(PROVIDER, MODEL, ProviderFailureKind.RATE_LIMITED)
+    clock.advance(DEFAULT_COOLDOWN_S + 0.1)
+    assert not ledger.is_benched(PROVIDER, MODEL)
+
+    ledger.record_success(
+        PROVIDER,
+        MODEL,
+        attempt_started_at=old_started_at,
+    )
+
+    facts = ledger.runtime_facts(PROVIDER, MODEL)
+    assert facts["state"] == "half_open"
+    assert ledger.begin_attempt(PROVIDER, MODEL)["probe"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,9 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal
 
 import pytest
+import structlog.testing
 
+from opensquilla.engine.routing.health import ProviderHealthLedger
 from opensquilla.engine.usage_accounting import normalize_provider_usage
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import (
@@ -42,6 +44,7 @@ from opensquilla.provider import (
 from opensquilla.provider.ensemble import (
     EnsembleMemberConfig,
     EnsembleProvider,
+    _apply_runtime_health_candidate_filter,
     _attach_final_request_output,
     _bind_managed_usage_rows,
     _CandidateResult,
@@ -3359,10 +3362,100 @@ async def test_ensemble_serving_chain_timeout_caps_full_aggregator(
     ]
 
     assert [call["model"] for call in registry.calls] == ["p1", "agg"]
-    assert registry.calls[1]["config"].timeout == 0.01
+    assert 0 < registry.calls[1]["config"].timeout <= 0.01
     error = next(event for event in events if isinstance(event, ErrorEvent))
     assert error.code == "ensemble_aggregator_timeout"
-    assert "timed out after 0.01s" in error.message
+    assert error.message.startswith("ensemble aggregator timed out after ")
+
+
+@pytest.mark.asyncio
+async def test_aggregator_deadline_after_admission_releases_exact_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")]
+            ),
+            "agg": _FakePlan([DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+
+    class SlowAggregatorAdmissionLedger:
+        def __init__(self) -> None:
+            self.cancelled: list[tuple[str, str | None]] = []
+
+        def begin_attempt(
+            self,
+            _provider: str,
+            model: str,
+            **_kwargs: Any,
+        ) -> dict[str, object]:
+            if model == "agg":
+                time.sleep(0.08)
+                return {
+                    "allowed": True,
+                    "state": "half_open",
+                    "reason": "",
+                    "probe": True,
+                    "started_at": time.monotonic(),
+                    "lease_token": "opaque-aggregator-lease",
+                }
+            return {
+                "allowed": True,
+                "state": "healthy",
+                "reason": "",
+                "probe": False,
+                "started_at": time.monotonic(),
+            }
+
+        def cancel_attempt(
+            self,
+            _provider: str,
+            model: str,
+            *,
+            lease_token: str | None = None,
+            **_kwargs: Any,
+        ) -> None:
+            self.cancelled.append((model, lease_token))
+
+        def record_success(self, *_args: Any, **_kwargs: Any) -> None:
+            return
+
+        def record_failure(self, *_args: Any, **_kwargs: Any) -> None:
+            return
+
+    ledger = SlowAggregatorAdmissionLedger()
+    provider = EnsembleProvider(
+        profile_name="deadline-after-health-admission",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        aggregator_timeout_seconds=1,
+        aggregator_serving_chain_timeout_seconds=0.05,
+        aggregator_recovery_mode="serving",
+        selection_plan={"strategy": "router_dynamic"},
+        _provider_health_ledger=ledger,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer")],
+            config=ChatConfig(timeout=1),
+        )
+    ]
+
+    assert [call["model"] for call in registry.calls] == ["p1"]
+    assert ledger.cancelled == [
+        ("agg", "opaque-aggregator-lease")
+    ]
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_aggregator_timeout"
 
 
 @pytest.mark.asyncio
@@ -4199,6 +4292,7 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
             "analyzer_failure_fallback": fallback,
             "registry_allowlist": registry_allowlist,
         },
+        _provider_health_ledger=object(),
     )
     legacy_provider = build_ensemble_provider_from_config(
         config=config,
@@ -4237,6 +4331,7 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
     assert provider.min_successful_proposers == 1
     assert provider.all_failed_policy == "error"
     assert provider.selection_plan["analyzer_failure_fallback"] is True
+    assert provider._provider_health_ledger is None
     assert provider.selection_plan["analyzer_failure_fallback_schema"] == (
         "opensquilla.router-dynamic-analyzer-failure-fallback/v1"
     )
@@ -18568,3 +18663,858 @@ async def test_experiment_continues_after_provider_error_with_visible_text(
     assert registry.call_counts["agg"] == 2
     assert done.billed_cost == pytest.approx(0.6)
     assert done.usage_missing_count == 0
+
+
+def _runtime_health_snapshot(
+    *models: str,
+) -> dict[str, Any]:
+    model_ids = models or ("unhealthy", "healthy")
+    return {
+        "models": [
+            {
+                "registry_facts": {
+                    "provider": "fake",
+                    "model_id": model,
+                    "status": "enabled",
+                    "roles": ["proposer", "aggregator"],
+                    "health": "healthy",
+                    "quota": "available",
+                    "rate_limit": "available",
+                    "credential_available": True,
+                }
+            }
+            for model in model_ids
+        ]
+    }
+
+
+def test_runtime_health_overlay_filters_fresh_bench_and_never_strands() -> None:
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    ledger.record_failure(
+        "fake",
+        "unhealthy",
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+    )
+    snapshot = _runtime_health_snapshot()
+    trace = _apply_runtime_health_candidate_filter(
+        snapshot,
+        health_ledger=ledger,
+        inherited_provider_config=ProviderConfig("fake", "anchor"),
+        eligible_identities_by_role={
+            "proposer": ["fake:unhealthy", "fake:healthy"],
+            "aggregator": ["fake:unhealthy", "fake:healthy"],
+        },
+        preferred_identities_by_role={
+            "proposer": ["fake:healthy", "fake:unhealthy"],
+            "aggregator": ["fake:healthy", "fake:unhealthy"],
+        },
+        minimum_by_role={"proposer": 1, "aggregator": 1},
+    )
+    assert trace is not None
+    assert trace["filtered_by_role"] == {"proposer": 1, "aggregator": 1}
+    unhealthy = snapshot["models"][0]["registry_facts"]
+    assert unhealthy["runtime_hard_filter_reasons_by_role"] == {
+        "proposer": ["runtime_deployment_benched"],
+        "aggregator": ["runtime_deployment_benched"],
+    }
+    assert unhealthy["runtime_health"]["roles"]["proposer"]["fresh"] is True
+
+    # When every statically viable deployment is benched, the overlay keeps
+    # them eligible and lets physical admission serialize the exempt probe.
+    ledger.record_failure(
+        "fake",
+        "healthy",
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+    )
+    all_benched_snapshot = _runtime_health_snapshot()
+    all_benched_trace = _apply_runtime_health_candidate_filter(
+        all_benched_snapshot,
+        health_ledger=ledger,
+        inherited_provider_config=ProviderConfig("fake", "anchor"),
+        eligible_identities_by_role={
+            "proposer": ["fake:unhealthy", "fake:healthy"],
+            "aggregator": ["fake:unhealthy", "fake:healthy"],
+        },
+        preferred_identities_by_role={
+            "proposer": ["fake:healthy", "fake:unhealthy"],
+            "aggregator": ["fake:healthy", "fake:unhealthy"],
+        },
+        minimum_by_role={"proposer": 1, "aggregator": 1},
+    )
+    assert all_benched_trace is not None
+    assert all_benched_trace["filtered_by_role"] == {
+        "proposer": 1,
+        "aggregator": 1,
+    }
+    assert all_benched_trace[
+        "never_strand_exempt_identities_by_role"
+    ] == {
+        "proposer": ["fake:healthy"],
+        "aggregator": ["fake:healthy"],
+    }
+    healthy = all_benched_snapshot["models"][1]["registry_facts"]
+    assert healthy["runtime_health"]["roles"]["proposer"][
+        "never_strand_exempt"
+    ] is True
+
+
+def test_runtime_health_never_strand_preserves_proposer_quorum() -> None:
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    for model in ("bad-one", "bad-two"):
+        ledger.record_failure(
+            "fake",
+            model,
+            ProviderFailureKind.PROVIDER_OVERLOADED,
+        )
+    snapshot = _runtime_health_snapshot("bad-one", "bad-two", "good")
+
+    trace = _apply_runtime_health_candidate_filter(
+        snapshot,
+        health_ledger=ledger,
+        inherited_provider_config=ProviderConfig("fake", "anchor"),
+        eligible_identities_by_role={
+            "proposer": ["fake:bad-one", "fake:bad-two", "fake:good"],
+            "aggregator": ["fake:bad-one", "fake:bad-two", "fake:good"],
+        },
+        preferred_identities_by_role={
+            "proposer": ["fake:bad-one", "fake:bad-two", "fake:good"],
+            "aggregator": ["fake:good", "fake:bad-one", "fake:bad-two"],
+        },
+        minimum_by_role={"proposer": 2, "aggregator": 1},
+    )
+
+    assert trace is not None
+    assert trace["filtered_by_role"] == {
+        "proposer": 1,
+        "aggregator": 2,
+    }
+    assert trace["never_strand_exempt_identities_by_role"] == {
+        "proposer": ["fake:bad-one"],
+        "aggregator": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw_pin", "canonical_pin"),
+    [
+        ("google-ai-studio", "googleaistudio"),
+        ("z-ai", "zai"),
+    ],
+)
+def test_runtime_health_upstream_pin_matches_across_turns(
+    raw_pin: str,
+    canonical_pin: str,
+) -> None:
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    ledger.record_failure(
+        "openrouter",
+        "pinned-model",
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+        upstream=raw_pin,
+    )
+    snapshot = {
+        "models": [
+            {
+                "registry_facts": {
+                    "provider": "openrouter",
+                    "model_id": "pinned-model",
+                    "endpoint_provider_pin": canonical_pin,
+                }
+            },
+            {
+                "registry_facts": {
+                    "provider": "openrouter",
+                    "model_id": "healthy-backup",
+                }
+            },
+        ]
+    }
+
+    _apply_runtime_health_candidate_filter(
+        snapshot,
+        health_ledger=ledger,
+        inherited_provider_config=ProviderConfig(
+            "openrouter",
+            "anchor",
+            provider_routing={"pinned-model": raw_pin},
+        ),
+        eligible_identities_by_role={
+            "proposer": [
+                "openrouter:pinned-model",
+                "openrouter:healthy-backup",
+            ],
+            "aggregator": [
+                "openrouter:pinned-model",
+                "openrouter:healthy-backup",
+            ],
+        },
+        preferred_identities_by_role={
+            "proposer": ["openrouter:healthy-backup"],
+            "aggregator": ["openrouter:healthy-backup"],
+        },
+        minimum_by_role={"proposer": 1, "aggregator": 1},
+    )
+
+    pinned = snapshot["models"][0]["registry_facts"]
+    assert pinned["runtime_health"]["upstream"] == canonical_pin
+    assert pinned["runtime_hard_filter_reasons_by_role"] == {
+        "proposer": ["runtime_deployment_benched"],
+        "aggregator": ["runtime_deployment_benched"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_ensemble_members_feed_shared_health_across_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = ProviderHealthLedger(failure_threshold=3)
+    registry = _FakeRegistry(
+        {
+            "bad": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="upstream gateway overloaded",
+                        code="503",
+                        retry_after_s=45,
+                    )
+                ]
+            ),
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final answer"),
+                    DoneEvent(model="agg", stop_reason="end_turn"),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="runtime-health",
+        proposers=[
+            _member("bad"),
+            _member("bad"),
+            _member("bad"),
+            _member("good"),
+        ],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        selection_plan={"strategy": "router_dynamic"},
+        _provider_health_ledger=ledger,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="test")],
+            config=ChatConfig(),
+        )
+    ]
+
+    assert isinstance(events[-1], DoneEvent)
+    assert [call["model"] for call in registry.calls].count("bad") == 3
+    assert ledger.is_benched("fake", "bad")
+    assert ledger.runtime_facts("fake", "good")["recent_successes"] == 1
+    assert ledger.runtime_facts("fake", "agg")["recent_successes"] == 1
+
+    next_turn_snapshot = _runtime_health_snapshot()
+    next_turn_snapshot["models"][0]["registry_facts"]["model_id"] = "bad"
+    next_turn_snapshot["models"][1]["registry_facts"]["model_id"] = "good"
+    _apply_runtime_health_candidate_filter(
+        next_turn_snapshot,
+        health_ledger=ledger,
+        inherited_provider_config=ProviderConfig("fake", "anchor"),
+        eligible_identities_by_role={
+            "proposer": ["fake:bad", "fake:good"],
+            "aggregator": ["fake:bad", "fake:good"],
+        },
+        preferred_identities_by_role={
+            "proposer": ["fake:good", "fake:bad"],
+            "aggregator": ["fake:good", "fake:bad"],
+        },
+        minimum_by_role={"proposer": 1, "aggregator": 1},
+    )
+    assert next_turn_snapshot["models"][0]["registry_facts"][
+        "runtime_hard_filter_reasons_by_role"
+    ]["proposer"] == ["runtime_deployment_benched"]
+
+
+@pytest.mark.asyncio
+async def test_proposer_natural_eof_benches_and_filters_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = ProviderHealthLedger(failure_threshold=3)
+    registry = _FakeRegistry(
+        {
+            "bad": _FakePlan([]),
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final answer"),
+                    DoneEvent(model="agg", stop_reason="end_turn"),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="runtime-health",
+        proposers=[
+            _member("bad"),
+            _member("bad"),
+            _member("bad"),
+            _member("good"),
+        ],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        selection_plan={"strategy": "router_dynamic"},
+        _provider_health_ledger=ledger,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="test")],
+            config=ChatConfig(),
+        )
+    ]
+
+    assert isinstance(events[-1], DoneEvent)
+    assert [call["model"] for call in registry.calls].count("bad") == 3
+    facts = ledger.runtime_facts("fake", "bad")
+    assert facts["last_failure_kind"] == "transport_transient"
+    assert facts["state"] == "benched"
+
+    next_turn_snapshot = _runtime_health_snapshot("bad", "good")
+    _apply_runtime_health_candidate_filter(
+        next_turn_snapshot,
+        health_ledger=ledger,
+        inherited_provider_config=ProviderConfig("fake", "anchor"),
+        eligible_identities_by_role={
+            "proposer": ["fake:bad", "fake:good"],
+            "aggregator": ["fake:bad", "fake:good"],
+        },
+        preferred_identities_by_role={
+            "proposer": ["fake:good", "fake:bad"],
+            "aggregator": ["fake:good", "fake:bad"],
+        },
+        minimum_by_role={"proposer": 1, "aggregator": 1},
+    )
+    assert next_turn_snapshot["models"][0]["registry_facts"][
+        "runtime_hard_filter_reasons_by_role"
+    ]["proposer"] == ["runtime_deployment_benched"]
+
+
+@pytest.mark.asyncio
+async def test_aggregator_natural_eof_benches_and_filters_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = ProviderHealthLedger(failure_threshold=3)
+    registry = _FakeRegistry(
+        {
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan([]),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="runtime-health",
+        proposers=[_member("good")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        aggregator_recovery_mode="experiment",
+        selection_plan={"strategy": "router_dynamic"},
+        _provider_health_ledger=ledger,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="test")],
+            config=ChatConfig(),
+        )
+    ]
+
+    assert isinstance(events[-1], ErrorEvent)
+    assert [call["model"] for call in registry.calls].count("agg") == 3
+    facts = ledger.runtime_facts("fake", "agg")
+    assert facts["last_failure_kind"] == "transport_transient"
+    assert facts["state"] == "benched"
+
+    next_turn_snapshot = _runtime_health_snapshot("agg", "healthy")
+    _apply_runtime_health_candidate_filter(
+        next_turn_snapshot,
+        health_ledger=ledger,
+        inherited_provider_config=ProviderConfig("fake", "anchor"),
+        eligible_identities_by_role={
+            "proposer": ["fake:healthy"],
+            "aggregator": ["fake:agg", "fake:healthy"],
+        },
+        preferred_identities_by_role={
+            "proposer": ["fake:healthy"],
+            "aggregator": ["fake:healthy", "fake:agg"],
+        },
+        minimum_by_role={"proposer": 1, "aggregator": 1},
+    )
+    assert next_turn_snapshot["models"][0]["registry_facts"][
+        "runtime_hard_filter_reasons_by_role"
+    ]["aggregator"] == ["runtime_deployment_benched"]
+
+
+@pytest.mark.asyncio
+async def test_benched_aggregator_records_one_deferred_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    ledger.record_failure(
+        "fake",
+        "agg",
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+    )
+    registry = _FakeRegistry(
+        {
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan([DoneEvent(model="agg", stop_reason="end_turn")]),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="runtime-health",
+        proposers=[_member("good")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        aggregator_recovery_mode="experiment",
+        selection_plan={"strategy": "router_dynamic"},
+        _provider_health_ledger=ledger,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="test")],
+            config=ChatConfig(),
+        )
+    ]
+
+    assert isinstance(events[-1], ErrorEvent)
+    assert [call["model"] for call in registry.calls] == ["good"]
+    deferred_attempts = [
+        row
+        for row in events[-1].ensemble_trace["aggregator_recovery"]["attempts"]
+        if row.get("outcome") == "runtime_health_deferred"
+    ]
+    assert len(deferred_attempts) == 1
+    assert deferred_attempts[0]["request_started"] is False
+    assert deferred_attempts[0]["physical_request_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_event", "expected_kind", "expected_recent_failures"),
+    [
+        (ErrorEvent(message="unauthorized", code="401"), "auth_invalid", 1),
+        (
+            ErrorEvent(
+                message="blocked by content policy",
+                code="provider_content_filter",
+            ),
+            "policy_refusal",
+            1,
+        ),
+        (
+            ErrorEvent(
+                message="request rejected before dispatch",
+                code="400",
+                request_started=False,
+                physical_request_count=0,
+            ),
+            "",
+            0,
+        ),
+    ],
+)
+async def test_non_deployment_proposer_failures_do_not_bench(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_event: ErrorEvent,
+    expected_kind: str,
+    expected_recent_failures: int,
+) -> None:
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    registry = _FakeRegistry(
+        {
+            "bad": _FakePlan([failure_event]),
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final answer"),
+                    DoneEvent(model="agg", stop_reason="end_turn"),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="runtime-health",
+        proposers=[
+            replace(
+                _member("bad"),
+                provider_config=ProviderConfig("openrouter", "bad"),
+            ),
+            _member("good"),
+        ],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        selection_plan={"strategy": "router_dynamic"},
+        _provider_health_ledger=ledger,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="test")],
+            config=ChatConfig(),
+        )
+    ]
+
+    assert isinstance(events[-1], DoneEvent)
+    assert not ledger.is_benched("openrouter", "bad")
+    facts = ledger.runtime_facts("openrouter", "bad")
+    assert facts["recent_failures"] == expected_recent_failures
+    assert facts["last_failure_kind"] == expected_kind
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "code", "expected_kind"),
+    [
+        (
+            "Provider returned an empty response",
+            "empty_response",
+            "empty_response",
+        ),
+        (
+            "connection reset by peer",
+            "ConnectionResetError",
+            "transport_transient",
+        ),
+        (
+            "temporary failure in name resolution",
+            "gaierror",
+            "transport_transient",
+        ),
+        (
+            "provider returned an invalid protocol frame",
+            "provider_protocol_error",
+            "malformed_response",
+        ),
+        (
+            "provider returned an invalid response envelope",
+            "invalid_response",
+            "malformed_response",
+        ),
+    ],
+)
+async def test_physical_proposer_failures_feed_deployment_health(
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    code: str,
+    expected_kind: str,
+) -> None:
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    registry = _FakeRegistry(
+        {
+            "bad": _FakePlan([ErrorEvent(message=message, code=code)]),
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final answer"),
+                    DoneEvent(model="agg", stop_reason="end_turn"),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="runtime-health",
+        proposers=[_member("bad"), _member("good")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        selection_plan={"strategy": "router_dynamic"},
+        _provider_health_ledger=ledger,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="test")],
+            config=ChatConfig(),
+        )
+    ]
+
+    assert isinstance(events[-1], DoneEvent)
+    facts = ledger.runtime_facts("fake", "bad")
+    assert facts["last_failure_kind"] == expected_kind
+    assert facts["state"] == "benched"
+
+
+@pytest.mark.asyncio
+async def test_half_open_lease_token_never_enters_trace_plan_or_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    ledger.record_failure(
+        "fake",
+        "probe",
+        ProviderFailureKind.RATE_LIMITED,
+    )
+    issued_tokens: list[str] = []
+    original_begin_attempt = ledger.begin_attempt
+
+    def capture_begin_attempt(
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, object]:
+        admission = original_begin_attempt(*args, **kwargs)
+        token = admission.get("lease_token")
+        if isinstance(token, str):
+            issued_tokens.append(token)
+        return admission
+
+    monkeypatch.setattr(ledger, "begin_attempt", capture_begin_attempt)
+    registry = _FakeRegistry(
+        {
+            "probe": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="probe", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final answer"),
+                    DoneEvent(model="agg", stop_reason="end_turn"),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="runtime-health",
+        proposers=[
+            replace(
+                _member("probe"),
+                runtime_health_never_strand=True,
+            )
+        ],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        selection_plan={"strategy": "router_dynamic"},
+        _provider_health_ledger=ledger,
+    )
+
+    with structlog.testing.capture_logs() as captured:
+        events = [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="test")],
+                config=ChatConfig(),
+            )
+        ]
+
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert issued_tokens
+    serialized_evidence = json.dumps(
+        {
+            "ensemble_trace": done.ensemble_trace,
+            "selection_plan": provider.selection_plan,
+            "logs": captured,
+        },
+        default=str,
+        sort_keys=True,
+    )
+    assert "lease_token" not in serialized_evidence
+    assert all(token not in serialized_evidence for token in issued_tokens)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ensemble_turns_start_only_one_physical_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_gate = asyncio.Event()
+    probe_started = asyncio.Event()
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    ledger.record_failure(
+        "fake",
+        "probe",
+        ProviderFailureKind.RATE_LIMITED,
+    )
+    registry = _FakeRegistry(
+        {
+            "probe": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="probe", stop_reason="end_turn"),
+                ],
+                gate=probe_gate,
+                started=probe_started,
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final answer"),
+                    DoneEvent(model="agg", stop_reason="end_turn"),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+
+    def turn_provider() -> EnsembleProvider:
+        return EnsembleProvider(
+            profile_name="runtime-health",
+            proposers=[
+                replace(
+                    _member("probe"),
+                    runtime_health_never_strand=True,
+                )
+            ],
+            aggregator=_member("agg"),
+            min_successful_proposers=1,
+            all_failed_policy="error",
+            selection_plan={"strategy": "router_dynamic"},
+            _provider_health_ledger=ledger,
+        )
+
+    async def run_turn() -> list[StreamEvent]:
+        return [
+            event
+            async for event in turn_provider().chat(
+                [Message(role="user", content="test")],
+                config=ChatConfig(),
+            )
+        ]
+
+    first_turn = asyncio.create_task(run_turn())
+    await asyncio.wait_for(probe_started.wait(), timeout=1)
+    second_turn = asyncio.create_task(run_turn())
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert [call["model"] for call in registry.calls].count("probe") == 1
+    probe_gate.set()
+    first_events, second_events = await asyncio.gather(
+        first_turn,
+        second_turn,
+    )
+
+    assert isinstance(first_events[-1], DoneEvent)
+    assert isinstance(second_events[-1], ErrorEvent)
+    assert [call["model"] for call in registry.calls].count("probe") == 1
+
+
+@pytest.mark.asyncio
+async def test_aggregator_429_bench_prevents_same_upstream_retry_storm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = ProviderHealthLedger(failure_threshold=3)
+    registry = _FakeRegistry(
+        {
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="rate limited",
+                        code="429",
+                        retry_after_s=90,
+                    )
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="runtime-health",
+        proposers=[_member("good")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        aggregator_recovery_mode="experiment",
+        selection_plan={"strategy": "router_dynamic"},
+        _provider_health_ledger=ledger,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="test")],
+            config=ChatConfig(),
+        )
+    ]
+
+    assert isinstance(events[-1], ErrorEvent)
+    assert ledger.is_benched("fake", "agg")
+    assert ledger.runtime_facts("fake", "agg")[
+        "benched_remaining_s"
+    ] == pytest.approx(90, abs=0.1)
+    assert [call["model"] for call in registry.calls].count("agg") == 1

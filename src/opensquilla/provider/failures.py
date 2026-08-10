@@ -322,7 +322,14 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
     FailureMatcher(ProviderFailureKind.PROVIDER_OVERLOADED, predicate=_is_gateway_transient),
     FailureMatcher(
         ProviderFailureKind.MALFORMED_RESPONSE,
-        raw_codes=frozenset({"invalid_stream_frame", "invalid_stream_order"}),
+        raw_codes=frozenset(
+            {
+                "invalid_stream_frame",
+                "invalid_stream_order",
+                "provider_protocol_error",
+                "invalid_response",
+            }
+        ),
     ),
     # Adapter-synthesized terminal-evidence codes: the stream ended without a
     # finish signal, or a native tool call arrived without usable arguments.
@@ -336,12 +343,31 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
         raw_codes=frozenset({"incomplete_stream", "incomplete_tool_call"}),
     ),
     FailureMatcher(
+        ProviderFailureKind.TRANSPORT_TRANSIENT,
+        raw_codes=frozenset(
+            {
+                "connectionreseterror",
+                "gaierror",
+                "socket.gaierror",
+            }
+        ),
+    ),
+    FailureMatcher(
         ProviderFailureKind.MALFORMED_RESPONSE,
         message_substrings=("malformed", "invalid json"),
     ),
     FailureMatcher(
         ProviderFailureKind.TRANSPORT_TRANSIENT,
-        message_substrings=("timeout", "request error"),
+        message_substrings=(
+            "timeout",
+            "request error",
+            "connection reset",
+            "dns resolution failed",
+            "name resolution failed",
+            "temporary failure in name resolution",
+            "getaddrinfo failed",
+            "nodename nor servname",
+        ),
     ),
 )
 

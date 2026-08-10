@@ -36,6 +36,7 @@ from .anthropic import uses_adaptive_thinking
 from .deployment import (
     CredentialPoolAcquirer,
     ProviderDeploymentResolution,
+    canonicalize_provider_routing_upstream,
     resolve_provider_deployment,
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
@@ -127,6 +128,14 @@ ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
 )
 _GENERATION_POLICY_FILTER_REASON = "generation_policy_reasoning_unsupported"
 _RUNTIME_HARD_FILTER_REASONS_FIELD = "runtime_hard_filter_reasons"
+_RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD = (
+    "runtime_hard_filter_reasons_by_role"
+)
+_RUNTIME_HEALTH_FACTS_FIELD = "runtime_health"
+_RUNTIME_HEALTH_BENCHED_REASON = "runtime_deployment_benched"
+_RUNTIME_HEALTH_HALF_OPEN_BUSY_REASON = (
+    "runtime_deployment_half_open_busy"
+)
 _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE = "ensemble_proposer_close_timeout"
 _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE = "proposer_recovery_budget_overrun"
 _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE = (
@@ -980,6 +989,11 @@ class EnsembleMemberConfig:
     # fallback semantics can account for it without attempting network I/O.
     ready: bool = True
     unavailable_reason: str = ""
+    # Runtime-health routing facts are non-secret execution metadata. They
+    # are populated only for live router_dynamic decisions; static/frozen
+    # lineups retain the defaults and never consult the shared ledger.
+    runtime_health_upstream: str = ""
+    runtime_health_never_strand: bool = False
 
 
 def _detached_ensemble_member(
@@ -1030,6 +1044,8 @@ def _ensemble_member_runtime_guard_row(
         member.k,
         member.ready,
         member.unavailable_reason,
+        member.runtime_health_upstream,
+        member.runtime_health_never_strand,
     )
 
 
@@ -1196,6 +1212,13 @@ class _CandidateResult:
     retry_after_s: float | None = None
     message_limit_proof: ProviderMessageLimitProof | None = None
     execution: dict[str, Any] = field(default_factory=dict)
+    # Runtime-only ownership capability for a half-open deployment probe.
+    # Never include this in execution/trace/log evidence: it exists solely so
+    # the physical-call finalizer can release the exact lease it acquired.
+    runtime_health_admission: dict[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+    )
     usage_reported: bool = False
     request_started: bool = False
     stream_closed: bool = False
@@ -1834,6 +1857,259 @@ def resolve_effective_generation_request_parameters(
             )
         max_tokens = policy_max_tokens
     return max_tokens, temperature
+
+
+def _normalized_runtime_health_upstream(
+    _provider: object,
+    model: object,
+    provider_routing: Mapping[str, str] | None,
+) -> str:
+    """Return a secret-free upstream/deployment discriminator."""
+
+    model_id = str(model or "").strip()
+    routing = provider_routing if isinstance(provider_routing, Mapping) else {}
+    return canonicalize_provider_routing_upstream(
+        routing.get(model_id) or ""
+    )
+
+
+def _apply_runtime_health_candidate_filter(
+    snapshot: Mapping[str, Any],
+    *,
+    health_ledger: Any | None,
+    inherited_provider_config: ProviderConfig,
+    eligible_identities_by_role: Mapping[str, Sequence[str]],
+    preferred_identities_by_role: Mapping[str, Sequence[str]],
+    minimum_by_role: Mapping[str, int],
+) -> dict[str, Any] | None:
+    """Overlay fresh deployment health before router_dynamic hard filtering.
+
+    ``eligible_identities_by_role`` comes from an unmodified ranking
+    preflight, so never-strand is evaluated against every other hard filter
+    (permission, modality, context, risk and request parameters) rather than
+    an incomplete local approximation. For proposer quorums, the best
+    unavailable deployments are exempted only until ``N_min`` is reachable.
+
+    The ledger is explicitly injected by the production runtime. Frozen
+    experiment/replay builders pass no ledger, so their registry hash and
+    selected roster stay reproducible.
+    """
+
+    runtime_facts = getattr(health_ledger, "runtime_facts", None)
+    if not callable(runtime_facts):
+        return None
+    rows = snapshot.get("models")
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return None
+
+    row_bindings: list[
+        tuple[dict[str, Any], str, tuple[str, str, str]]
+    ] = []
+    bindings_by_identity: dict[str, tuple[str, str, str]] = {}
+    provider_routing = dict(inherited_provider_config.provider_routing)
+    for row in rows:
+        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+        if not isinstance(facts, dict):
+            continue
+        provider = str(facts.get("provider") or "").strip().casefold()
+        model = str(facts.get("model_id") or "").strip()
+        if not provider or not model:
+            continue
+        upstream = canonicalize_provider_routing_upstream(
+            facts.get("endpoint_provider_pin") or ""
+        )
+        if not upstream:
+            upstream = _normalized_runtime_health_upstream(
+                provider,
+                model,
+                provider_routing,
+            )
+        binding = (provider, model, upstream)
+        identity = f"{provider}:{model}".casefold()
+        row_bindings.append((facts, identity, binding))
+        bindings_by_identity[identity] = binding
+
+    candidates_by_role: dict[str, list[tuple[str, str, str]]] = {}
+    for role in ("proposer", "aggregator"):
+        ordered_identities = [
+            *preferred_identities_by_role.get(role, ()),
+            *eligible_identities_by_role.get(role, ()),
+        ]
+        seen: set[tuple[str, str, str]] = set()
+        candidates: list[tuple[str, str, str]] = []
+        for raw_identity in ordered_identities:
+            binding = bindings_by_identity.get(
+                str(raw_identity or "").strip().casefold()
+            )
+            if binding is None or binding in seen:
+                continue
+            seen.add(binding)
+            candidates.append(binding)
+        candidates_by_role[role] = candidates
+
+    base_snapshots: dict[tuple[str, str, str], dict[str, Any]] = {}
+    fresh_deployments: set[tuple[str, str, str]] = set()
+    for _, _, binding in row_bindings:
+        provider, model, upstream = binding
+        try:
+            snapshot_row = runtime_facts(
+                provider,
+                model,
+                upstream=upstream,
+            )
+        except Exception:  # noqa: BLE001 - routing telemetry fails open
+            log.debug(
+                "llm_ensemble.runtime_health_snapshot_failed",
+                provider=provider,
+                model=model,
+                exc_info=True,
+            )
+            continue
+        if not isinstance(snapshot_row, Mapping):
+            continue
+        normalized = _json_safe(dict(snapshot_row))
+        base_snapshots[binding] = normalized
+        if normalized.get("fresh") is True:
+            fresh_deployments.add(binding)
+
+    unavailable_by_role: dict[str, set[tuple[str, str, str]]] = {}
+    exempt_by_role: dict[str, set[tuple[str, str, str]]] = {}
+    for role, candidates in candidates_by_role.items():
+        unavailable = {
+            binding
+            for binding in candidates
+            if (
+                base_snapshots.get(binding, {}).get("fresh") is True
+                and (
+                    base_snapshots.get(binding, {}).get("state") == "benched"
+                    or base_snapshots.get(binding, {}).get(
+                        "half_open_inflight"
+                    )
+                    is True
+                )
+            )
+        }
+        unavailable_by_role[role] = unavailable
+        required = max(1, int(minimum_by_role.get(role, 1) or 1))
+        available_count = len(candidates) - len(unavailable)
+        exemption_count = min(
+            len(unavailable),
+            max(0, required - available_count),
+        )
+        # ``candidates`` is already ordered by the baseline rank. Prefer a
+        # benched deployment over a half-open-busy deployment because the
+        # latter cannot legally accept another physical probe yet.
+        unavailable_in_preference_order = [
+            binding for binding in candidates if binding in unavailable
+        ]
+        unavailable_in_preference_order.sort(
+            key=lambda binding: (
+                base_snapshots.get(binding, {}).get("half_open_inflight")
+                is True,
+                candidates.index(binding),
+            )
+        )
+        exempt_by_role[role] = set(
+            unavailable_in_preference_order[:exemption_count]
+        )
+
+    filtered_by_role = {"proposer": 0, "aggregator": 0}
+    half_open_by_role = {"proposer": 0, "aggregator": 0}
+    pending_overlays: list[
+        tuple[dict[str, Any], dict[str, Any], dict[str, list[str]]]
+    ] = []
+    requires_rerank = any(unavailable_by_role.values())
+    for facts, _, binding in row_bindings:
+        _, _, upstream = binding
+        role_snapshots: dict[str, Any] = {}
+        reasons_by_role_raw = facts.get(
+            _RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD
+        )
+        reasons_by_role = (
+            {
+                str(role): [str(reason) for reason in reasons]
+                for role, reasons in reasons_by_role_raw.items()
+                if isinstance(reasons, Sequence)
+                and not isinstance(reasons, (str, bytes))
+            }
+            if isinstance(reasons_by_role_raw, Mapping)
+            else {}
+        )
+        for role, candidates in candidates_by_role.items():
+            base_snapshot = base_snapshots.get(binding)
+            if base_snapshot is None:
+                continue
+            role_snapshot = deepcopy(base_snapshot)
+            candidate = binding in candidates
+            unavailable = binding in unavailable_by_role[role]
+            exempt = binding in exempt_by_role[role]
+            role_snapshot["eligible"] = (
+                (not unavailable or exempt) if candidate else None
+            )
+            role_snapshot["never_strand_exempt"] = bool(exempt)
+            role_snapshots[role] = role_snapshot
+            if candidate and role_snapshot.get("state") == "half_open":
+                half_open_by_role[role] += 1
+            if not candidate or not unavailable or exempt:
+                continue
+            reason = (
+                _RUNTIME_HEALTH_HALF_OPEN_BUSY_REASON
+                if role_snapshot.get("half_open_inflight") is True
+                else _RUNTIME_HEALTH_BENCHED_REASON
+            )
+            role_reasons = reasons_by_role.setdefault(role, [])
+            if reason not in role_reasons:
+                role_reasons.append(reason)
+            filtered_by_role[role] += 1
+        pending_overlays.append(
+            (
+                facts,
+                {
+                    "schema": "opensquilla.ensemble-runtime-health-overlay/v1",
+                    "upstream": upstream,
+                    "roles": role_snapshots,
+                },
+                reasons_by_role,
+            )
+        )
+
+    if requires_rerank:
+        for facts, overlay, reasons_by_role in pending_overlays:
+            facts[_RUNTIME_HEALTH_FACTS_FIELD] = overlay
+            if reasons_by_role:
+                facts[_RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD] = (
+                    reasons_by_role
+                )
+
+    exempt_identities_by_role: dict[str, list[str]] = {}
+    for role, bindings in exempt_by_role.items():
+        exempt_identities_by_role[role] = [
+            f"{provider}:{model}"
+            for provider, model, upstream in candidates_by_role[role]
+            if (provider, model, upstream) in bindings
+        ]
+
+    return {
+        "schema": "opensquilla.ensemble-runtime-health-filter/v1",
+        "enabled": True,
+        "input_candidate_count": len(row_bindings),
+        "fresh_deployment_count": len(fresh_deployments),
+        "requires_rerank": requires_rerank,
+        "active_unavailable_by_role": {
+            role: len(bindings)
+            for role, bindings in unavailable_by_role.items()
+        },
+        "filtered_by_role": filtered_by_role,
+        "half_open_by_role": half_open_by_role,
+        "never_strand_minimum_by_role": {
+            role: max(1, int(minimum_by_role.get(role, 1) or 1))
+            for role in candidates_by_role
+        },
+        "never_strand_exempt_identities_by_role": (
+            exempt_identities_by_role
+        ),
+        "never_strand": True,
+    }
 
 
 def _apply_strict_generation_policy_candidate_filter(
@@ -3762,6 +4038,7 @@ class EnsembleProvider:
         _member_request_budget_bindings: Mapping[tuple[str, str, str], _MemberRequestBudgetBinding]
         | None = None,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
+        _provider_health_ledger: Any | None = None,
     ) -> None:
         self.profile_name = profile_name
         self.proposers = [
@@ -3982,6 +4259,7 @@ class EnsembleProvider:
         self._retry_transition_prepared = False
         self._member_request_budget_bindings = dict(_member_request_budget_bindings or {})
         self._credential_pool_failure_reporter = _credential_pool_failure_reporter
+        self._provider_health_ledger = _provider_health_ledger
         self._active_chat = False
         self._proposer_retry_scope: _ProposerRecoveryScopeState | None = None
         self._current_proposer_recovery_trace: dict[str, Any] | None = None
@@ -5023,6 +5301,205 @@ class EnsembleProvider:
                 "llm_ensemble.credential_pool_report_failed",
                 provider=member.credential_pool_provider,
             )
+
+    @staticmethod
+    def _member_runtime_health_upstream(
+        member: EnsembleMemberConfig,
+    ) -> str:
+        if member.runtime_health_upstream:
+            return canonicalize_provider_routing_upstream(
+                member.runtime_health_upstream
+            )
+        cfg = member.provider_config
+        return _normalized_runtime_health_upstream(
+            cfg.provider,
+            cfg.model,
+            cfg.provider_routing,
+        )
+
+    def _begin_member_runtime_health_attempt(
+        self,
+        member: EnsembleMemberConfig,
+    ) -> dict[str, Any]:
+        ledger = self._provider_health_ledger
+        begin_attempt = getattr(ledger, "begin_attempt", None)
+        if not callable(begin_attempt):
+            return {"allowed": True, "tracked": False}
+        cfg = member.provider_config
+        try:
+            admission = begin_attempt(
+                cfg.provider,
+                cfg.model,
+                upstream=self._member_runtime_health_upstream(member),
+                never_strand_exempt=member.runtime_health_never_strand,
+            )
+        except Exception:  # noqa: BLE001 - health telemetry must fail open
+            log.debug(
+                "llm_ensemble.runtime_health_admission_failed",
+                provider=cfg.provider,
+                model=cfg.model,
+                exc_info=True,
+            )
+            return {"allowed": True, "tracked": False}
+        if not isinstance(admission, Mapping):
+            return {"allowed": True, "tracked": False}
+        return {**dict(admission), "tracked": True}
+
+    def _cancel_member_runtime_health_attempt(
+        self,
+        member: EnsembleMemberConfig,
+        admission: Mapping[str, Any] | None,
+    ) -> None:
+        if not isinstance(admission, Mapping):
+            return
+        cancel_attempt = getattr(
+            self._provider_health_ledger,
+            "cancel_attempt",
+            None,
+        )
+        if not callable(cancel_attempt):
+            return
+        cfg = member.provider_config
+        try:
+            cancel_attempt(
+                cfg.provider,
+                cfg.model,
+                upstream=self._member_runtime_health_upstream(member),
+                lease_token=admission.get("lease_token"),
+            )
+        except Exception:  # noqa: BLE001 - health telemetry only
+            log.debug(
+                "llm_ensemble.runtime_health_cancel_failed",
+                provider=cfg.provider,
+                model=cfg.model,
+                exc_info=True,
+            )
+
+    def _member_runtime_health_is_benched(
+        self,
+        member: EnsembleMemberConfig,
+    ) -> bool:
+        """Return raw circuit state; telemetry failures remain fail-open."""
+
+        is_benched = getattr(
+            self._provider_health_ledger,
+            "is_benched",
+            None,
+        )
+        if not callable(is_benched):
+            return False
+        cfg = member.provider_config
+        try:
+            return bool(
+                is_benched(
+                    cfg.provider,
+                    cfg.model,
+                    upstream=self._member_runtime_health_upstream(member),
+                )
+            )
+        except Exception:  # noqa: BLE001 - health telemetry only
+            return False
+
+    def _record_member_runtime_health(
+        self,
+        member: EnsembleMemberConfig,
+        admission: Mapping[str, Any] | None,
+        *,
+        success: bool,
+        message: str = "",
+        code: str = "",
+        retry_after_s: float | None = None,
+        latency_ms: float | None = None,
+    ) -> None:
+        if not isinstance(admission, Mapping) or admission.get("tracked") is not True:
+            return
+        if admission.get("allowed") is not True:
+            return
+        cfg = member.provider_config
+        upstream = self._member_runtime_health_upstream(member)
+        ledger = self._provider_health_ledger
+        try:
+            if success:
+                record_success = getattr(ledger, "record_success", None)
+                if callable(record_success):
+                    record_success(
+                        cfg.provider,
+                        cfg.model,
+                        upstream=upstream,
+                        latency_ms=latency_ms,
+                        attempt_started_at=admission.get("started_at"),
+                        lease_token=admission.get("lease_token"),
+                    )
+                return
+            record_failure = getattr(ledger, "record_failure", None)
+            if not callable(record_failure):
+                return
+            kind = classify_provider_error(
+                provider_name=cfg.provider,
+                status_code=int(code) if str(code).isdigit() else None,
+                raw_code=code,
+                message=message,
+            )
+            record_failure(
+                cfg.provider,
+                cfg.model,
+                kind,
+                retry_after_s=retry_after_s,
+                upstream=upstream,
+                latency_ms=latency_ms,
+                lease_token=admission.get("lease_token"),
+            )
+        except Exception:  # noqa: BLE001 - health telemetry only
+            log.debug(
+                "llm_ensemble.runtime_health_record_failed",
+                provider=cfg.provider,
+                model=cfg.model,
+                exc_info=True,
+            )
+
+    def _record_candidate_runtime_health(
+        self,
+        member: EnsembleMemberConfig,
+        result: _CandidateResult,
+    ) -> None:
+        admission = result.runtime_health_admission
+        if not isinstance(admission, Mapping) or admission.get("tracked") is not True:
+            return
+        local_failure = bool(
+            result.execution.get("scheduler_cancellation") is True
+            or result.error_code
+            in {
+                "candidate_mode_contract_violation",
+                _ROUTER_DYNAMIC_RECOVERY_PLAN_DRIFT_CODE,
+                _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE,
+                _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE,
+                _RUNTIME_HEALTH_BENCHED_REASON,
+                _RUNTIME_HEALTH_HALF_OPEN_BUSY_REASON,
+                *_PROPOSER_LOCAL_SCHEDULING_CANCELLATION_CODES,
+            }
+        )
+        if not result.request_started or local_failure:
+            self._cancel_member_runtime_health_attempt(member, admission)
+            return
+        if not result.error and result.stream_closed:
+            self._record_member_runtime_health(
+                member,
+                admission,
+                success=True,
+                latency_ms=result.elapsed_ms,
+            )
+            return
+        message = result.error or "provider stream cleanup did not complete"
+        code = result.error_code or _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
+        self._record_member_runtime_health(
+            member,
+            admission,
+            success=False,
+            message=message,
+            code=code,
+            retry_after_s=result.retry_after_s,
+            latency_ms=result.elapsed_ms,
+        )
 
     def _member_request_budget_binding(
         self,
@@ -11130,6 +11607,7 @@ class EnsembleProvider:
                     deepcopy(thinking_fallback_bindings),
                 )
             result.elapsed_ms = int((time.monotonic() - started) * 1000)
+            self._record_candidate_runtime_health(member, result)
             if progress is not None:
                 progress(
                     EnsembleProgressEvent(
@@ -11299,6 +11777,27 @@ class EnsembleProvider:
         if not member.ready:
             reason = member.unavailable_reason or "deployment_unavailable"
             result.error = f"proposer deployment is not ready: {reason}"
+            result.error_code = reason
+            return result
+        runtime_health_admission = self._begin_member_runtime_health_attempt(
+            member
+        )
+        result.runtime_health_admission = dict(runtime_health_admission)
+        # The opaque lease token is an in-process ownership capability, not
+        # routing evidence.  Persist only the non-sensitive admission state.
+        result.execution["runtime_health_admission"] = {
+            key: _json_safe(runtime_health_admission.get(key))
+            for key in ("state", "reason", "probe", "tracked")
+            if key in runtime_health_admission
+        }
+        if runtime_health_admission.get("allowed") is not True:
+            reason = str(
+                runtime_health_admission.get("reason")
+                or _RUNTIME_HEALTH_BENCHED_REASON
+            )
+            result.error = (
+                "proposer deployment was deferred by fresh runtime health"
+            )
             result.error_code = reason
             return result
         text_buffer = _BoundedTextBuffer(self.candidate_max_chars)
@@ -11924,7 +12423,7 @@ class EnsembleProvider:
             return retry_result
         if not got_done and not result.error:
             result.error = "proposer stream ended before DoneEvent"
-            result.error_code = "stream_incomplete"
+            result.error_code = "incomplete_stream"
         if current_physical_attempt is not None and not result.ok:
             if current_physical_attempt.get("outcome") == "interrupted":
                 current_physical_attempt["outcome"] = "failed"
@@ -13802,6 +14301,8 @@ class EnsembleProvider:
                     deadline_error = ErrorEvent(
                         message="ensemble aggregator reached its absolute deadline",
                         code="ensemble_aggregator_timeout",
+                        request_started=False,
+                        physical_request_count=0,
                     )
                     yield aggregator_progress(
                         "aggregator_finish",
@@ -13814,6 +14315,11 @@ class EnsembleProvider:
                     if attempt_timeout_seconds <= 0
                     else min(attempt_timeout_seconds, remaining_to_deadline)
                 )
+            attempt_deadline = (
+                time.monotonic() + attempt_timeout_seconds
+                if attempt_timeout_seconds > 0
+                else None
+            )
             if attempt_timeout_seconds > 0:
                 active_config = active_config.model_copy(
                     update={"timeout": attempt_timeout_seconds}
@@ -13835,6 +14341,96 @@ class EnsembleProvider:
                     execution.update(refreshed_execution)
                 else:
                     final_request["execution"] = refreshed_execution
+            runtime_health_attempt_started_at = time.monotonic()
+            runtime_health_admission = (
+                self._begin_member_runtime_health_attempt(active_member)
+            )
+            if runtime_health_admission.get("allowed") is not True:
+                health_reason = str(
+                    runtime_health_admission.get("reason")
+                    or _RUNTIME_HEALTH_BENCHED_REASON
+                )
+                health_error = ErrorEvent(
+                    message=(
+                        "aggregator deployment was deferred by fresh runtime "
+                        "health"
+                    ),
+                    code=health_reason,
+                    request_started=False,
+                    physical_request_count=0,
+                )
+                current_attempt_recorded_sequence = append_recovery_attempt(
+                    {
+                        "kind": attempt_kind,
+                        "fallback_index": active_fallback_index,
+                        "trigger": attempt_trigger,
+                        "request_started": False,
+                        "outcome": "runtime_health_deferred",
+                        "code": health_reason,
+                        "requested_provider": (
+                            active_member.provider_config.provider
+                        ),
+                        "requested_model": active_member.provider_config.model,
+                    }
+                )
+                if activate_next_fallback(trigger=health_reason):
+                    attempt += 1
+                    trace.setdefault("final_request", {})["retry_count"] = attempt
+                    continue
+                yield aggregator_progress(
+                    "aggregator_finish",
+                    error=health_error.message,
+                )
+                yield partial_error(health_error)
+                return
+            # Admission can take the sole half-open lease.  Re-check the
+            # absolute deadline immediately afterwards so integration with
+            # deadline/backpressure guards cannot strand that lease without
+            # ever crossing the physical provider boundary.
+            post_admission_deadline = absolute_deadline
+            if attempt_deadline is not None and (
+                post_admission_deadline is None
+                or attempt_deadline < post_admission_deadline
+            ):
+                post_admission_deadline = attempt_deadline
+            if post_admission_deadline is not None:
+                remaining_to_deadline = (
+                    post_admission_deadline - time.monotonic()
+                )
+                if remaining_to_deadline <= 0:
+                    self._cancel_member_runtime_health_attempt(
+                        active_member,
+                        runtime_health_admission,
+                    )
+                    if (
+                        absolute_deadline_kind == "hard"
+                        and absolute_deadline is not None
+                        and absolute_deadline <= time.monotonic()
+                    ):
+                        self._mark_deadline_triggered("aggregator")
+                        trace["deadline"] = self._deadline_trace_snapshot()
+                    deadline_error = ErrorEvent(
+                        message=(
+                            "ensemble aggregator reached its absolute deadline"
+                        ),
+                        code="ensemble_aggregator_timeout",
+                        request_started=False,
+                        physical_request_count=0,
+                    )
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=deadline_error.message,
+                    )
+                    yield partial_error(deadline_error)
+                    return
+                attempt_timeout_seconds = (
+                    remaining_to_deadline
+                    if attempt_timeout_seconds <= 0
+                    else min(
+                        attempt_timeout_seconds,
+                        remaining_to_deadline,
+                    )
+                )
             content_streamed = False
             attempt_text_parts: list[str] = []
             pending_visible_events: list[TextDeltaEvent] = []
@@ -13855,10 +14451,26 @@ class EnsembleProvider:
             # boundary.  Trace construction and progress delivery above are
             # synchronous today, but callers may instrument either path; an
             # expired budget must never start another billable request.
-            if absolute_deadline is not None:
-                remaining_to_deadline = absolute_deadline - time.monotonic()
+            physical_dispatch_deadline = absolute_deadline
+            if attempt_deadline is not None and (
+                physical_dispatch_deadline is None
+                or attempt_deadline < physical_dispatch_deadline
+            ):
+                physical_dispatch_deadline = attempt_deadline
+            if physical_dispatch_deadline is not None:
+                remaining_to_deadline = (
+                    physical_dispatch_deadline - time.monotonic()
+                )
                 if remaining_to_deadline <= 0:
-                    if absolute_deadline_kind == "hard":
+                    self._cancel_member_runtime_health_attempt(
+                        active_member,
+                        runtime_health_admission,
+                    )
+                    if (
+                        absolute_deadline_kind == "hard"
+                        and absolute_deadline is not None
+                        and absolute_deadline <= time.monotonic()
+                    ):
                         self._mark_deadline_triggered("aggregator")
                         trace["deadline"] = self._deadline_trace_snapshot()
                     deadline_error = ErrorEvent(
@@ -14162,8 +14774,69 @@ class EnsembleProvider:
                     )
                 if not stream_closed:
                     self._mark_cleanup_unproven("ensemble_aggregator_close_unproven")
+                if external_close_requested:
+                    self._cancel_member_runtime_health_attempt(
+                        active_member,
+                        runtime_health_admission,
+                    )
                 if external_close_requested and not stream_closed:
                     raise _EnsembleStreamCloseError("ensemble_aggregator_external_close")
+            if attempt_request_started:
+                if completed_provider_event is not None and stream_closed:
+                    self._record_member_runtime_health(
+                        active_member,
+                        runtime_health_admission,
+                        success=True,
+                        latency_ms=(
+                            (time.monotonic() - runtime_health_attempt_started_at)
+                            * 1000
+                        ),
+                    )
+                else:
+                    health_error = retry_error or terminal_stream_error
+                    if health_error is None:
+                        # A request-started stream that naturally reaches EOF
+                        # without DoneEvent or ErrorEvent is a physical
+                        # deployment failure even though the iterator closed
+                        # cleanly. Keep the existing recovery/delivery path
+                        # below, but classify this attempt before health
+                        # accounting so a repeatedly incomplete deployment is
+                        # benched across turns.
+                        health_error = ErrorEvent(
+                            message="aggregator provider stream ended before DoneEvent",
+                            code="incomplete_stream",
+                            request_started=True,
+                            physical_request_count=1,
+                        )
+                    self._record_member_runtime_health(
+                        active_member,
+                        runtime_health_admission,
+                        success=False,
+                        message=(
+                            "aggregator provider stream did not close"
+                            if not stream_closed
+                            else str(getattr(health_error, "message", "") or "")
+                        ),
+                        code=(
+                            "ensemble_aggregator_close_timeout"
+                            if not stream_closed
+                            else str(getattr(health_error, "code", "") or "")
+                        ),
+                        retry_after_s=getattr(
+                            health_error,
+                            "retry_after_s",
+                            None,
+                        ),
+                        latency_ms=(
+                            (time.monotonic() - runtime_health_attempt_started_at)
+                            * 1000
+                        ),
+                    )
+            else:
+                self._cancel_member_runtime_health_attempt(
+                    active_member,
+                    runtime_health_admission,
+                )
             if completed_provider_event is not None:
                 aggregator_elapsed_ms = int((time.monotonic() - aggregator_started) * 1000)
                 attempt_visible_text = "".join(attempt_text_parts)
@@ -15470,6 +16143,19 @@ class EnsembleProvider:
                     return
             rejected_attempt = record_abandoned_attempt(retry_error)
             final_request = trace.get("final_request")
+            runtime_health_benched = self._member_runtime_health_is_benched(
+                active_member
+            )
+            if runtime_health_benched:
+                # A failure from this same request just opened the circuit.
+                # Do not sleep through Retry-After only to replay the same
+                # deployment, and do not let its stale never-strand flag turn
+                # the retry into an immediate probe. The next loop iteration
+                # will switch to a backup or return the original error.
+                active_member = replace(
+                    active_member,
+                    runtime_health_never_strand=False,
+                )
             if (
                 recovery_mode == "serving"
                 or self._analyzer_failure_fallback_selection()
@@ -15514,9 +16200,13 @@ class EnsembleProvider:
                         f"({attempt}/{max_transient_retries})"
                     ),
                 )
-                delay = max(
-                    _aggregator_retry_backoff_seconds(attempt),
-                    max(0.0, float(retry_error.retry_after_s or 0.0)),
+                delay = (
+                    0.0
+                    if runtime_health_benched
+                    else max(
+                        _aggregator_retry_backoff_seconds(attempt),
+                        max(0.0, float(retry_error.retry_after_s or 0.0)),
+                    )
                 )
             if absolute_deadline is not None and time.monotonic() + delay >= absolute_deadline:
                 if absolute_deadline_kind == "hard":
@@ -17410,6 +18100,8 @@ class _EnsembleModelRef:
     thinking_policy_managed: bool = False
     thinking_fallbacks: tuple[tuple[str, str], ...] = ()
     k: int = 1
+    runtime_health_upstream: str = ""
+    runtime_health_never_strand: bool = False
 
 
 @dataclass(frozen=True)
@@ -18170,6 +18862,7 @@ def _build_router_dynamic_members(
     aggregator_fallbacks_out: list[EnsembleMemberConfig] | None = None,
     proposer_backups_out: list[EnsembleMemberConfig] | None = None,
     retry_context_inputs_out: dict[str, Any] | None = None,
+    provider_health_ledger: Any | None = None,
 ) -> tuple[str, list[EnsembleMemberConfig], EnsembleMemberConfig, dict[str, Any]]:
     """Build members from the profile-driven Step2 ranking decision."""
 
@@ -18998,14 +19691,11 @@ def _build_router_dynamic_members(
             raw_provider_pin = str(
                 inherited_provider_config.provider_routing.get(model_id) or ""
             ).strip()
-            if raw_provider_pin and raw_provider_pin.casefold() != "auto":
-                endpoint_provider_pin = "".join(
-                    character
-                    for character in raw_provider_pin.casefold()
-                    if character.isalnum()
-                )
-                if endpoint_provider_pin:
-                    facts["endpoint_provider_pin"] = endpoint_provider_pin
+            endpoint_provider_pin = canonicalize_provider_routing_upstream(
+                raw_provider_pin
+            )
+            if endpoint_provider_pin:
+                facts["endpoint_provider_pin"] = endpoint_provider_pin
             sends_temperature = configured_temperature is not None
             if (
                 sends_temperature
@@ -19052,40 +19742,100 @@ def _build_router_dynamic_members(
         snapshot,
         generation_policy,
     )
-    decision = rank_models(
-        task_analysis=task_analysis,
-        user_profile=user_profile,
-        request_context=request_context,
-        registry_snapshot=snapshot,
-        routed_tier=routed_tier,
-        routing_confidence=routing_confidence,
-        ranking_config=ranking_config,
-        decision_id=decision_id,
-        ranking_thinking_assignment_enabled=thinking_assignment_enabled,
-        proposer_recovery_max_additional_calls=int(
-            getattr(
-                ensemble_cfg,
-                "proposer_recovery_max_additional_calls",
-                3,
-            )
-            or 0
-        ),
-        proposer_max_tokens_cap=int(
-            getattr(ensemble_cfg, "proposer_max_tokens_cap", 65_536)
-            or 65_536
-        ),
-        proposer_visible_answer_reserve_tokens=int(
-            getattr(
-                ensemble_cfg,
-                "proposer_visible_answer_reserve_tokens",
-                4_096,
-            )
-            or 4_096
-        ),
-        proposer_recovery_quorum=configured_min_success if min_success_explicit else None,
+    proposer_recovery_max_additional_calls = int(
+        getattr(
+            ensemble_cfg,
+            "proposer_recovery_max_additional_calls",
+            3,
+        )
+        or 0
     )
+    proposer_max_tokens_cap = int(
+        getattr(ensemble_cfg, "proposer_max_tokens_cap", 65_536)
+        or 65_536
+    )
+    proposer_visible_answer_reserve_tokens = int(
+        getattr(
+            ensemble_cfg,
+            "proposer_visible_answer_reserve_tokens",
+            4_096,
+        )
+        or 4_096
+    )
+
+    def rank_snapshot(*, emit_logs: bool) -> Any:
+        return rank_models(
+            task_analysis=task_analysis,
+            user_profile=user_profile,
+            request_context=request_context,
+            registry_snapshot=snapshot,
+            routed_tier=routed_tier,
+            routing_confidence=routing_confidence,
+            ranking_config=ranking_config,
+            decision_id=decision_id,
+            ranking_thinking_assignment_enabled=(
+                thinking_assignment_enabled
+            ),
+            proposer_recovery_max_additional_calls=(
+                proposer_recovery_max_additional_calls
+            ),
+            proposer_max_tokens_cap=proposer_max_tokens_cap,
+            proposer_visible_answer_reserve_tokens=(
+                proposer_visible_answer_reserve_tokens
+            ),
+            proposer_recovery_quorum=(
+                configured_min_success if min_success_explicit else None
+            ),
+            _emit_logs=emit_logs,
+        )
+
+    runtime_health_filter_trace = None
+    runtime_health_enabled = bool(
+        not isinstance(registry_allowlist, Mapping)
+        and callable(getattr(provider_health_ledger, "runtime_facts", None))
+    )
+    if runtime_health_enabled:
+        baseline_decision = rank_snapshot(emit_logs=False)
+        hard_filter = baseline_decision.trace.get("hard_filter")
+        hard_filter_map = (
+            hard_filter if isinstance(hard_filter, Mapping) else {}
+        )
+        runtime_health_filter_trace = (
+            _apply_runtime_health_candidate_filter(
+                snapshot,
+                health_ledger=provider_health_ledger,
+                inherited_provider_config=inherited_provider_config,
+                eligible_identities_by_role={
+                    "proposer": list(
+                        hard_filter_map.get("eligible_proposer_ids") or []
+                    ),
+                    "aggregator": list(
+                        hard_filter_map.get("eligible_aggregator_ids") or []
+                    ),
+                },
+                preferred_identities_by_role={
+                    "proposer": [
+                        *(baseline_decision.trace.get("selected_P") or []),
+                        *(baseline_decision.trace.get("backup_P") or []),
+                    ],
+                    "aggregator": list(
+                        baseline_decision.trace.get("aggregator_candidates")
+                        or []
+                    ),
+                },
+                minimum_by_role={
+                    "proposer": int(
+                        baseline_decision.trace.get("N_min") or 1
+                    ),
+                    "aggregator": 1,
+                },
+            )
+        )
+    decision = rank_snapshot(emit_logs=True)
     if generation_filter_trace is not None:
         decision.trace["generation_policy_filter"] = generation_filter_trace
+    if runtime_health_filter_trace is not None:
+        decision.trace["runtime_health_filter"] = runtime_health_filter_trace
     if allowlist_trace is not None:
         decision.trace["candidate_allowlist"] = allowlist_trace
     if retry_exclusions:
@@ -19200,6 +19950,22 @@ def _build_router_dynamic_members(
                 fallback_levels = [
                     (level, str(mapping_map[level]).strip()) for level in ordered_candidates
                 ]
+        runtime_health = facts.get(_RUNTIME_HEALTH_FACTS_FIELD)
+        runtime_health_map = (
+            runtime_health if isinstance(runtime_health, Mapping) else {}
+        )
+        runtime_health_roles = runtime_health_map.get("roles")
+        runtime_health_role_map = (
+            runtime_health_roles
+            if isinstance(runtime_health_roles, Mapping)
+            else {}
+        )
+        runtime_role_facts = runtime_health_role_map.get(role)
+        runtime_role_map = (
+            runtime_role_facts
+            if isinstance(runtime_role_facts, Mapping)
+            else {}
+        )
         return _EnsembleModelRef(
             provider=model.provider,
             model=model.model_id,
@@ -19210,6 +19976,12 @@ def _build_router_dynamic_members(
             thinking_policy_version=policy_version,
             thinking_policy_managed=thinking_assignment_enabled,
             thinking_fallbacks=tuple(fallback_levels),
+            runtime_health_upstream=str(
+                runtime_health_map.get("upstream") or ""
+            ),
+            runtime_health_never_strand=(
+                runtime_role_map.get("never_strand_exempt") is True
+            ),
         )
 
     proposers = [
@@ -19719,6 +20491,12 @@ def _member_from_ref(
         ),
         ready=resolution.ready,
         unavailable_reason=resolution.reason,
+        runtime_health_upstream=str(
+            getattr(ref, "runtime_health_upstream", "") or ""
+        ),
+        runtime_health_never_strand=bool(
+            getattr(ref, "runtime_health_never_strand", False)
+        ),
     )
 
 
@@ -19829,6 +20607,11 @@ class _DefaultRouterDynamicRetryFactory:
         repr=False,
         compare=False,
     )
+    provider_health_ledger: Any | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __call__(
         self,
@@ -19852,6 +20635,7 @@ class _DefaultRouterDynamicRetryFactory:
             ),
             _session_key=self.session_key,
             _fallback_selector=self.fallback_selector,
+            _provider_health_ledger=self.provider_health_ledger,
         )
 
 
@@ -19870,6 +20654,7 @@ def build_ensemble_provider_from_config(
     _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
     _session_key: str = "",
     _fallback_selector: Any | None = None,
+    _provider_health_ledger: Any | None = None,
 ) -> EnsembleProvider:
     ensemble_cfg = getattr(config, "llm_ensemble", None)
     if ensemble_cfg is None:
@@ -19919,6 +20704,7 @@ def build_ensemble_provider_from_config(
             aggregator_fallbacks_out=aggregator_fallbacks,
             proposer_backups_out=proposer_backups,
             retry_context_inputs_out=materialized_retry_inputs,
+            provider_health_ledger=_provider_health_ledger,
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
@@ -20216,6 +21002,16 @@ def build_ensemble_provider_from_config(
         if _enable_member_request_budget_rebinding
         else {}
     )
+    live_provider_health_ledger = (
+        _provider_health_ledger
+        if selection_mode == "router_dynamic"
+        and not is_analyzer_failure_fallback
+        and not isinstance(
+            materialized_retry_inputs.get("registry_allowlist"),
+            Mapping,
+        )
+        else None
+    )
     provider = EnsembleProvider(
         profile_name=profile_name,
         proposers=proposers,
@@ -20274,6 +21070,7 @@ def build_ensemble_provider_from_config(
         selection_plan=selection_plan,
         _member_request_budget_bindings=request_budget_bindings,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
+        _provider_health_ledger=live_provider_health_ledger,
     )
     if selection_mode == "router_dynamic":
         if router_dynamic_retry_factory is None:
@@ -20311,6 +21108,7 @@ def build_ensemble_provider_from_config(
                     ),
                     session_key=_session_key,
                     fallback_selector=_fallback_selector,
+                    provider_health_ledger=_provider_health_ledger,
                 )
             )
         initial_plan = provider.selection_plan_execution_snapshot()

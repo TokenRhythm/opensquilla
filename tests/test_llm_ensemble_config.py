@@ -63,6 +63,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
         ),
         fallback_provider=None,
         turn_metadata={"routed_tier": "c0"},
+        _provider_health_ledger=object(),
     )
     assert provider.profile_name == "static_openrouter_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
@@ -80,6 +81,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.shuffle_candidates is False
     assert provider.candidate_order_seed is None
     assert provider.quorum_grace_seconds == 10.0
+    assert provider._provider_health_ledger is None
 
 
 @pytest.mark.parametrize("seed", [0, (1 << 64) - 1])
@@ -637,9 +639,12 @@ def test_router_dynamic_registry_all_uses_every_packaged_model_by_default() -> N
         fallback_provider=None,
         turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
         ranking_inputs={"registry_allowlist": experiment.g1_routing.model_dump(mode="json")},
+        _provider_health_ledger=object(),
     )
 
     plan = provider.selection_plan
+    assert provider._provider_health_ledger is None
+    assert "runtime_health_filter" not in plan
     expected = {
         f"openrouter:{row['registry_facts']['model_id']}"
         for row in load_model_registry_snapshot()["models"]

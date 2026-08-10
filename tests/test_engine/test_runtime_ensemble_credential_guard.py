@@ -9,6 +9,7 @@ import pytest
 import structlog.testing
 
 from opensquilla.engine.pipeline import TurnContext
+from opensquilla.engine.routing.health import get_provider_health_ledger
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import DoneEvent
 from opensquilla.gateway.config import GatewayConfig, SquillaRouterConfig
@@ -466,6 +467,7 @@ async def test_router_dynamic_wrap_is_not_credential_gated(
     )
 
     assert isinstance(provider, EnsembleProvider)
+    assert provider._provider_health_ledger is get_provider_health_ledger()
     assert turn.metadata["ensemble_enabled"] is True
     assert "ensemble_wrap_skipped_reason" not in turn.metadata
     assert turn.metadata["router_dynamic_task_analyzer"]["source"] == "router_fallback"
