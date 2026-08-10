@@ -604,6 +604,36 @@ def _usage_field(value: object, *names: str, default: Any = None) -> Any:
     return default
 
 
+_CANONICAL_USAGE_ALIAS_GROUPS = (
+    (("input_tokens",), ("inputTokens",)),
+    (("output_tokens",), ("outputTokens",)),
+    (("reasoning_tokens",), ("reasoningTokens",)),
+    (
+        ("cache_read_tokens", "cached_tokens"),
+        ("cacheReadTokens", "cachedTokens"),
+    ),
+    (("cache_write_tokens",), ("cacheWriteTokens",)),
+    (
+        ("billed_cost", "billed_cost_usd"),
+        ("billedCost", "billedCostUsd"),
+    ),
+    (("cost_usd",), ("costUsd",)),
+    (("estimated_cost_usd",), ("estimatedCostUsd",)),
+    (("cost_source",), ("costSource",)),
+    (("billing_receipt",), ("billingReceipt",)),
+)
+
+
+def _shadowed_usage_aliases(value: Mapping[str, Any]) -> set[str]:
+    """Return conflicting aliases hidden by a canonical input key."""
+
+    shadowed: set[str] = set()
+    for canonical_names, alias_names in _CANONICAL_USAGE_ALIAS_GROUPS:
+        if any(name in value for name in canonical_names):
+            shadowed.update(name for name in alias_names if name in value)
+    return shadowed
+
+
 def _canonical_provider_billed_cost(value: object) -> tuple[float, bool]:
     """Return canonical USD and whether one exact provider receipt proves it."""
 
@@ -615,8 +645,8 @@ def _canonical_provider_billed_cost(value: object) -> tuple[float, bool]:
         _usage_field(
             value,
             "billed_cost",
-            "billedCost",
             "billed_cost_usd",
+            "billedCost",
             "billedCostUsd",
             default=0.0,
         )
@@ -686,26 +716,41 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
     enriched: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
+        shadowed_aliases = _shadowed_usage_aliases(item)
         actual_model_id = str(item.get("model") or "")
         requested_model_id = str(item.get("requested_model") or "")
         pricing_model_id = actual_model_id or requested_model_id
         if pricing_model_id:
             provider_cost_source = (
-                str(item.get("cost_source") or item.get("costSource") or "none").strip().lower()
+                str(
+                    _usage_field(
+                        item, "cost_source", "costSource", default="none"
+                    )
+                    or "none"
+                )
+                .strip()
+                .lower()
             )
             reported_billed_cost = _usage_float(
-                item.get("billed_cost")
-                or item.get("billedCost")
-                or item.get("billed_cost_usd")
-                or item.get("billedCostUsd")
+                _usage_field(
+                    item,
+                    "billed_cost",
+                    "billed_cost_usd",
+                    "billedCost",
+                    "billedCostUsd",
+                    default=0.0,
+                )
             )
             trusted_billed_cost, has_billed_receipt = (
                 _canonical_provider_billed_cost(item)
             )
-            cache_read = (
-                item.get("cache_read_tokens")
-                if "cache_read_tokens" in item
-                else item.get("cached_tokens")
+            cache_read = _usage_field(
+                item,
+                "cache_read_tokens",
+                "cached_tokens",
+                "cacheReadTokens",
+                "cachedTokens",
+                default=0,
             )
             cost_fields = model_usage_cost_fields(
                 model_id=pricing_model_id,
@@ -714,15 +759,23 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                     or item.get("requested_provider")
                     or ""
                 ),
-                input_tokens=_usage_int(item.get("input_tokens") or item.get("inputTokens")),
-                output_tokens=_usage_int(item.get("output_tokens") or item.get("outputTokens")),
+                input_tokens=_usage_int(
+                    _usage_field(item, "input_tokens", "inputTokens", default=0)
+                ),
+                output_tokens=_usage_int(
+                    _usage_field(item, "output_tokens", "outputTokens", default=0)
+                ),
                 billed_cost=trusted_billed_cost,
                 # Unbilled rows must be priced with their own cache counts,
                 # not cache-blind — otherwise the legacy-inference path in
                 # model_usage_cost_fields treats every cache token as fresh
                 # input while still labeling the estimate "cache_aware".
-                cache_read_tokens=_usage_int(cache_read or 0),
-                cache_write_tokens=_usage_int(item.get("cache_write_tokens") or 0),
+                cache_read_tokens=_usage_int(cache_read),
+                cache_write_tokens=_usage_int(
+                    _usage_field(
+                        item, "cache_write_tokens", "cacheWriteTokens", default=0
+                    )
+                ),
                 has_billed_receipt=True if has_billed_receipt else None,
             )
             if has_billed_receipt and trusted_billed_cost <= 0.0:
@@ -766,6 +819,8 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                     else "unavailable"
                 )
                 item["costSource"] = item["cost_source"]
+        for alias in shadowed_aliases:
+            item.pop(alias, None)
         enriched.append(item)
     return enriched
 
@@ -871,19 +926,48 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
             "cached_tokens",
             "cache_write_tokens",
         ):
-            target[usage_field] += _usage_int(
-                row.get(usage_field) or row.get(_camel_usage_key(usage_field))
+            usage_field_names = (
+                (
+                    "cached_tokens",
+                    "cache_read_tokens",
+                    "cachedTokens",
+                    "cacheReadTokens",
+                )
+                if usage_field == "cached_tokens"
+                else (usage_field, _camel_usage_key(usage_field))
             )
-        target["billed_cost"] += _usage_float(row.get("billed_cost") or row.get("billedCost"))
-        target["cost_usd"] += _usage_float(row.get("cost_usd") or row.get("costUsd"))
+            target[usage_field] += _usage_int(
+                _usage_field(row, *usage_field_names, default=0)
+            )
+        target["billed_cost"] += _usage_float(
+            _usage_field(row, "billed_cost", "billedCost", default=0.0)
+        )
+        target["cost_usd"] += _usage_float(
+            _usage_field(row, "cost_usd", "costUsd", default=0.0)
+        )
         target["billed_cost_usd"] += _usage_float(
-            row.get("billed_cost_usd") or row.get("billedCostUsd")
+            _usage_field(row, "billed_cost_usd", "billedCostUsd", default=0.0)
         )
         target["estimated_cost_usd"] += _usage_float(
-            row.get("estimated_cost_usd") or row.get("estimatedCostUsd")
+            _usage_field(
+                row,
+                "estimated_cost_usd",
+                "estimatedCostUsd",
+                default=0.0,
+            )
         )
-        target["request_count"] += max(1, _usage_int(row.get("request_count") or 1))
-        sources_by_key[key].append(str(row.get("cost_source") or row.get("costSource") or "none"))
+        target["request_count"] += max(
+            1,
+            _usage_int(
+                _usage_field(row, "request_count", default=1)
+            ),
+        )
+        sources_by_key[key].append(
+            str(
+                _usage_field(row, "cost_source", "costSource", default="none")
+                or "none"
+            )
+        )
 
     summarized: list[dict[str, Any]] = []
     for key, row in aggregated.items():
@@ -914,14 +998,20 @@ def _model_usage_ledger(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ledger: list[dict[str, Any]] = []
     for raw_row in rows:
         row = copy.deepcopy(raw_row)
+        shadowed_aliases = _shadowed_usage_aliases(row)
         provider_cost_source = str(
-            row.get("cost_source") or row.get("costSource") or "none"
+            _usage_field(row, "cost_source", "costSource", default="none")
+            or "none"
         ).strip().lower()
         reported_billed_cost = _usage_float(
-            row.get("billed_cost")
-            or row.get("billedCost")
-            or row.get("billed_cost_usd")
-            or row.get("billedCostUsd")
+            _usage_field(
+                row,
+                "billed_cost",
+                "billed_cost_usd",
+                "billedCost",
+                "billedCostUsd",
+                default=0.0,
+            )
         )
         trusted_billed_cost, billed_is_trusted = (
             _canonical_provider_billed_cost(row)
@@ -967,6 +1057,8 @@ def _model_usage_ledger(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # engine silently choosing one receipt identity.
             row["physical_attempt_id_conflict"] = True
         row["physical_attempt_id"] = row_attempt_id or provider_attempt_id or None
+        for alias in shadowed_aliases:
+            row.pop(alias, None)
         ledger.append(row)
     return ledger
 

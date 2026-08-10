@@ -27,7 +27,11 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult
-from opensquilla.engine.agent import _model_usage_ledger
+from opensquilla.engine.agent import (
+    _model_usage_ledger,
+    _summarize_model_usage_breakdown,
+    _with_model_usage_cost_fields,
+)
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
 from opensquilla.engine.types import ToolCall
 from opensquilla.engine.usage import UsageTracker
@@ -36,6 +40,7 @@ from opensquilla.provider import DoneEvent as ProviderDoneEvent
 from opensquilla.provider import TextDeltaEvent as ProviderTextDeltaEvent
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEndEvent
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStartEvent
+from opensquilla.provider.types import ProviderBillingReceipt
 
 
 @dataclass
@@ -615,3 +620,124 @@ def test_mock_tracker_receives_billed_cost_kwarg() -> None:
     _args, kwargs = mock_tracker.add.call_args
     assert "billed_cost" in kwargs, "agent must pass billed_cost as kwarg"
     assert kwargs["billed_cost"] == 0.0042
+
+
+def test_usage_normalization_prefers_present_canonical_zero_over_legacy_aliases() -> None:
+    receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=0,
+        usd_equivalent_nanos=0,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    row = {
+        "role": "proposer",
+        "label": "proposer_1",
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-pro-20260423",
+        "input_tokens": 0,
+        "inputTokens": 91,
+        "output_tokens": 0,
+        "outputTokens": 92,
+        "reasoning_tokens": 0,
+        "reasoningTokens": 93,
+        "cached_tokens": 0,
+        "cachedTokens": 94,
+        "cache_read_tokens": 0,
+        "cacheReadTokens": 96,
+        "cache_write_tokens": 0,
+        "cacheWriteTokens": 95,
+        "billed_cost": 0.0,
+        "billedCost": 0.25,
+        "cost_usd": 0.0,
+        "costUsd": 0.75,
+        "billed_cost_usd": 0.0,
+        "billedCostUsd": 0.5,
+        "estimated_cost_usd": 0.0,
+        "estimatedCostUsd": 1.0,
+        "cost_source": "provider_billed",
+        "costSource": "mixed",
+        "billing_receipt": receipt,
+    }
+
+    enriched = _with_model_usage_cost_fields([row])[0]
+    ledger_row = _model_usage_ledger([row])[0]
+    summarized = _summarize_model_usage_breakdown([row])[0]
+
+    assert enriched["provider_reported_billed_cost"] == 0.0
+    assert ledger_row["provider_reported_billed_cost"] == 0.0
+    conflicting_aliases = {
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "cachedTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "billedCost",
+        "costUsd",
+        "billedCostUsd",
+        "estimatedCostUsd",
+        "costSource",
+    }
+    assert conflicting_aliases.isdisjoint(enriched)
+    assert conflicting_aliases.isdisjoint(ledger_row)
+    assert {
+        field: summarized[field]
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+        )
+    } == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+    assert summarized["billed_cost"] == 0.0
+    assert summarized["cost_usd"] == 0.0
+    assert summarized["billed_cost_usd"] == 0.0
+    assert summarized["estimated_cost_usd"] == 0.0
+    assert summarized["cost_source"] == "provider_billed"
+
+
+def test_usage_normalization_keeps_legacy_alias_fallback_when_canonical_is_absent() -> None:
+    row = {
+        "role": "proposer",
+        "label": "proposer_1",
+        "provider": "openrouter",
+        "model": "legacy/model",
+        "inputTokens": 11,
+        "outputTokens": 12,
+        "reasoningTokens": 13,
+        "cachedTokens": 14,
+        "cacheWriteTokens": 15,
+        "billedCost": 0.25,
+        "costSource": "provider_billed",
+    }
+
+    enriched = _with_model_usage_cost_fields([row])[0]
+    ledger_row = _model_usage_ledger([row])[0]
+    summarized = _summarize_model_usage_breakdown([row])[0]
+
+    assert summarized["input_tokens"] == 11
+    assert summarized["output_tokens"] == 12
+    assert summarized["reasoning_tokens"] == 13
+    assert summarized["cached_tokens"] == 14
+    assert summarized["cache_write_tokens"] == 15
+    assert summarized["billed_cost"] == 0.25
+    assert summarized["cost_source"] == "provider_billed"
+    legacy_aliases = {
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "cachedTokens",
+        "cacheWriteTokens",
+        "billedCost",
+        "costSource",
+    }
+    assert legacy_aliases.issubset(enriched)
+    assert legacy_aliases.issubset(ledger_row)
