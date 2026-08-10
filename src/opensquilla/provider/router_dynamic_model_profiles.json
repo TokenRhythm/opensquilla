@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-07-31.1-reliability-20260809T173647Z-2032e23bdc3a",
+  "snapshot_version": "curated-openrouter-step2-2026-07-31.1-reliability-20260810T093908Z-7514379532e9",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -987,14 +987,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
-            "failure": 0
+            "success": 42,
+            "failure": 8
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -1119,14 +1119,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
-            "failure": 0
+            "success": 42,
+            "failure": 8
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -2217,14 +2217,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
-            "failure": 0
+            "success": 27,
+            "failure": 23
           },
           "aggregator": {
-            "success": 0,
-            "failure": 0
+            "success": 48,
+            "failure": 2
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -2345,14 +2345,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
-            "failure": 0
+            "success": 49,
+            "failure": 1
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -2475,14 +2475,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
-            "failure": 0
+            "success": 49,
+            "failure": 1
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -2870,14 +2870,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
-            "failure": 0
+            "success": 46,
+            "failure": 4
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -3135,14 +3135,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
-            "failure": 0
+            "success": 41,
+            "failure": 9
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -3769,14 +3769,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
+            "success": 50,
             "failure": 0
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -9730,28 +9730,11 @@
   ],
   "role_reliability_snapshot": {
     "schema_version": "role-reliability-snapshot-v2",
-    "generated_at": "2026-08-09T17:36:47+00:00",
+    "generated_at": "2026-08-10T09:39:08+00:00",
     "base_snapshot_version": "curated-openrouter-step2-2026-07-31.1",
     "window_size": 50,
-    "source_artifacts": [],
-    "source_output_files": [],
-    "source_output_file_hashes": [],
-    "source_evidence_file_hashes": [],
-    "observation_policy": "legacy-statistics-invalidated-v1",
-    "completion_gate": "legacy_statistics_invalidated",
-    "allowed_audit_issue_codes": [],
-    "ordering_granularity": "task_aggregate",
-    "raw_physical_calls": 0,
-    "framework_neutral_calls": 0,
-    "attributable_calls": 0,
-    "unknown_outcome_calls": 0,
-    "max_unknown_outcome_rate": 0.0,
-    "window_calls": 0,
-    "duplicate_attempts_excluded": 0,
-    "unclassified_requests": 0,
-    "invalidated_snapshot_version": "curated-openrouter-step2-2026-07-31.1-reliability-20260805T103209Z",
-    "invalidated_observation_policy": "aef-physical-model-calls-v3",
-    "invalidation_reason": "residual_ledger_rows_lacked_authenticated_outcomes",
-    "content_sha256": "2032e23bdc3a937d0225700cf81e4ac8e0dd0afaa58a683decb100bd0d930a08"
+    "observation_policy": "aef-physical-model-calls-v5",
+    "completion_gate": "manual_thresholded_draco_audit",
+    "content_sha256": "7514379532e93edce91d589c97da9f314ea68412a1cfc83f134206860534631b"
   }
 }

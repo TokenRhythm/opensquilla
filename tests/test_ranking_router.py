@@ -1145,24 +1145,50 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     assert "role_reliability_snapshot" in current
     provenance = current["role_reliability_snapshot"]
     assert provenance["schema_version"] == "role-reliability-snapshot-v2"
-    assert provenance["observation_policy"] == "legacy-statistics-invalidated-v1"
-    assert provenance["completion_gate"] == "legacy_statistics_invalidated"
-    assert provenance["invalidated_observation_policy"] == (
-        "aef-physical-model-calls-v3"
+    assert provenance["observation_policy"] == "aef-physical-model-calls-v5"
+    assert provenance["completion_gate"] == "manual_thresholded_draco_audit"
+    assert set(provenance) == {
+        "schema_version",
+        "generated_at",
+        "base_snapshot_version",
+        "window_size",
+        "observation_policy",
+        "completion_gate",
+        "content_sha256",
+    }
+    assert provenance["content_sha256"] == (
+        ranking_router._role_reliability_snapshot_content_sha256(
+            current["models"], provenance
+        )
     )
     assert all(
         "role_reliability" in row["online_profile"] for row in current["models"]
     )
-    assert all(
-        row["online_profile"]["role_reliability"]
-        == {
-            "window_size": 50,
-            "proposer": {"success": 0, "failure": 0},
-            "aggregator": {"success": 0, "failure": 0},
-            "source": "legacy_statistics_invalidated",
-        }
+    selected_rows = {
+        row["registry_facts"]["model_id"]: row["online_profile"]["role_reliability"]
         for row in current["models"]
-    )
+        if any(
+            row["online_profile"]["role_reliability"][role]["success"]
+            or row["online_profile"]["role_reliability"][role]["failure"]
+            for role in ("proposer", "aggregator")
+        )
+    }
+    assert set(selected_rows) == {
+        "anthropic/claude-fable-5",
+        "anthropic/claude-opus-4.8",
+        "anthropic/claude-sonnet-5",
+        "google/gemini-3.1-pro-preview",
+        "openai/gpt-5.3-codex",
+        "openai/gpt-5.5",
+        "openai/gpt-5.6-sol",
+        "x-ai/grok-4.5",
+    }
+    assert selected_rows["anthropic/claude-sonnet-5"] == {
+        "window_size": 50,
+        "proposer": {"success": 27, "failure": 23},
+        "aggregator": {"success": 48, "failure": 2},
+        "source": "aef_experiment_artifacts_thresholded",
+    }
     current_model = ranking_router._normalize_model(
         current["models"][0],
         load_ranking_config(),
@@ -1184,7 +1210,7 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     )
 
 
-def test_packaged_registry_rejects_obsolete_or_nonzero_invalidated_statistics() -> None:
+def test_packaged_registry_rejects_obsolete_or_tampered_statistics() -> None:
     current = load_model_registry_snapshot()
     obsolete = deepcopy(current)
     obsolete["role_reliability_snapshot"]["observation_policy"] = (
@@ -1197,8 +1223,40 @@ def test_packaged_registry_rejects_obsolete_or_nonzero_invalidated_statistics() 
     nonzero["models"][0]["online_profile"]["role_reliability"]["proposer"][
         "success"
     ] = 1
-    with pytest.raises(DynamicRankingError, match="nonzero counts"):
+    with pytest.raises(DynamicRankingError, match="content_sha256 differs"):
         ranking_router._validate_packaged_role_reliability_provenance(nonzero)
+
+
+def test_packaged_registry_rejects_nonzero_invalidated_statistics() -> None:
+    invalidated = load_model_registry_snapshot()
+    for row in invalidated["models"]:
+        row["online_profile"]["role_reliability"] = {
+            "window_size": 50,
+            "proposer": {"success": 0, "failure": 0},
+            "aggregator": {"success": 0, "failure": 0},
+            "source": "legacy_statistics_invalidated",
+        }
+    provenance = invalidated["role_reliability_snapshot"]
+    provenance.clear()
+    provenance.update(
+        {
+            "schema_version": "role-reliability-snapshot-v2",
+            "observation_policy": "legacy-statistics-invalidated-v1",
+            "completion_gate": "legacy_statistics_invalidated",
+        }
+    )
+    provenance["content_sha256"] = (
+        ranking_router._role_reliability_snapshot_content_sha256(
+            invalidated["models"], provenance
+        )
+    )
+    ranking_router._validate_packaged_role_reliability_provenance(invalidated)
+
+    invalidated["models"][0]["online_profile"]["role_reliability"]["proposer"][
+        "success"
+    ] = 1
+    with pytest.raises(DynamicRankingError, match="nonzero counts"):
+        ranking_router._validate_packaged_role_reliability_provenance(invalidated)
 
 
 def test_packaged_v5_reliability_statistics_are_content_bound() -> None:
