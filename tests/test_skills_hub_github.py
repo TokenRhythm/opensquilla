@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+import structlog.testing
 
 from opensquilla.skills.hub.github import GitHubSource
 
@@ -109,6 +110,94 @@ async def test_fetch_legacy_identifier_keeps_support_and_downloads_directory(mon
     assert bundle is not None
     assert bundle.name == "demo"
     assert set(bundle.files) == {"SKILL.md", "scripts/run.py", "assets/logo.bin"}
+
+
+class _ExplodingClient(_AsyncClient):
+    """Any HTTP call at all is the failure this guards against."""
+
+    async def get(self, url: str, **kwargs: Any) -> _Response:
+        raise AssertionError(f"unauthenticated search must not reach the network: {url}")
+
+
+@pytest.mark.asyncio
+async def test_search_without_a_token_makes_no_request_and_logs_no_warning(monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _ExplodingClient)
+
+    with structlog.testing.capture_logs() as captured:
+        results = await GitHubSource().search("pdf")
+
+    assert results == []
+    assert [entry for entry in captured if entry["log_level"] == "warning"] == []
+    assert [entry["event"] for entry in captured] == ["github.search_skipped_unauthenticated"]
+
+
+@pytest.mark.asyncio
+async def test_search_with_a_token_still_queries_code_search(monkeypatch) -> None:
+    import httpx
+
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    class _SearchClient(_AsyncClient):
+        async def get(self, url: str, **kwargs: Any) -> _Response:
+            seen.append((url, kwargs))
+            return _Response(
+                json_data={
+                    "items": [
+                        {
+                            "path": "skills/demo/SKILL.md",
+                            "repository": {
+                                "full_name": "acme/skillpack",
+                                "description": "Demo skill.",
+                                "html_url": "https://github.com/acme/skillpack",
+                            },
+                        }
+                    ]
+                }
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _SearchClient)
+
+    results = await GitHubSource(token="t0ken").search("pdf")
+
+    assert [meta.name for meta in results] == ["demo"]
+    assert len(seen) == 1
+    url, kwargs = seen[0]
+    assert url == "https://api.github.com/search/code"
+    assert kwargs["headers"]["Authorization"] == "token t0ken"
+
+
+@pytest.mark.asyncio
+async def test_search_with_a_token_still_warns_when_the_request_fails(monkeypatch) -> None:
+    import httpx
+
+    class _UnauthorizedClient(_AsyncClient):
+        async def get(self, url: str, **kwargs: Any) -> _Response:
+            return _Response(status_code=401)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _UnauthorizedClient)
+
+    with structlog.testing.capture_logs() as captured:
+        results = await GitHubSource(token="expired").search("pdf")
+
+    assert results == []
+    assert [
+        entry["event"] for entry in captured if entry["log_level"] == "warning"
+    ] == ["github.search_failed"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_stays_available_without_a_token(monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
+    _AsyncClient.requests = []
+
+    bundle = await GitHubSource().fetch("https://github.com/acme/skillpack/tree/main/skills/demo")
+
+    assert bundle is not None
+    assert bundle.name == "demo"
 
 
 def test_default_gateway_router_exposes_github_without_token(monkeypatch) -> None:
