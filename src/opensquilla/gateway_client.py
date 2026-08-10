@@ -82,7 +82,12 @@ class GatewayRPCClient:
         self._connection_error: ConnectionError | None = None
         self._closing = False
 
-    async def connect(self, url: str = "ws://localhost:18791/ws") -> None:
+    async def connect(
+        self,
+        url: str = "ws://localhost:18791/ws",
+        *,
+        token: str | None = None,
+    ) -> None:
         if self._ws is not None:
             await self.close()
         self._closing = False
@@ -105,18 +110,21 @@ class GatewayRPCClient:
                 raise RuntimeError(f"Unexpected gateway handshake frame: {challenge}")
 
             req_id = str(uuid.uuid4())
+            connect_params: dict[str, Any] = {
+                "minProtocol": 1,
+                "maxProtocol": 3,
+                "role": "operator",
+                "scopes": self.scopes,
+            }
+            if token:
+                connect_params["auth"] = {"token": token}
             await self._ws.send(
                 json.dumps(
                     {
                         "type": "req",
                         "id": req_id,
                         "method": "connect",
-                        "params": {
-                            "minProtocol": 1,
-                            "maxProtocol": 3,
-                            "role": "operator",
-                            "scopes": self.scopes,
-                        },
+                        "params": connect_params,
                     }
                 )
             )

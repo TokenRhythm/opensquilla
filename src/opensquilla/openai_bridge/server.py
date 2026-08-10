@@ -100,7 +100,7 @@ def _gateway_token() -> str:
 async def _new_client() -> GatewayRPCClient:
     client = GatewayRPCClient()
     token = _gateway_token()
-    await client.connect(GATEWAY_URL, auth={"token": token} if token else None)
+    await client.connect(GATEWAY_URL, token=token or None)
     return client
 
 
