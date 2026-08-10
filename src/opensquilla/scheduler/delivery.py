@@ -425,6 +425,7 @@ class DeliveryChain:
         payload = {
             "jobId": job.id,
             "jobName": job.name,
+            "handlerKey": job.handler_key,
             "success": success,
             "summary": summary,
             "error": error,

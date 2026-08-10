@@ -2662,6 +2662,7 @@
       "toastConnectionRecovered": "Connection restored and task status refreshed",
       "toastConnectionRetry": "Connection is not restored yet. Refresh the page shortly.",
       "toastBackgroundComplete": "Task “{name}” completed. View the result in run history.",
+      "toastBackgroundReminder": "Reminder “{name}”: {text}",
       "toastBackgroundFailed": "Task “{name}” failed. Use the retry button on its card.",
       "unnamedTask": "Unnamed task",
       "toastDeleted": "Job deleted",
