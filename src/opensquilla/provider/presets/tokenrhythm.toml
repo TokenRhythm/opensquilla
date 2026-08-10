@@ -35,7 +35,7 @@ supports_image = false
 [tiers.c3]
 provider = "tokenrhythm"
 model = "glm-5.2"
-description = "Highest tier: static TokenRhythm B5 multi-model fusion, with GLM 5.2 as the deterministic single-model fallback"
+description = "Highest tier: shared multi-model fusion using the current plan, with the configured direct/fallback model as its single-model fallback"
 supports_image = false
 ensemble_enabled = true
 

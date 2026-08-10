@@ -355,6 +355,62 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     })
   })
 
+  it('ignores the dormant shared C3 provider in panel state and save policy', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tier_profile: null,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash' },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'sleeping-single-model-draft',
+          ensemble_enabled: true,
+        },
+      },
+    }, {}, 'openrouter')
+
+    expect(f.hasMixedTierProviders.value).toBe(false)
+    expect(makePanel(f, true).value.hasMixedTierProviders).toBe(false)
+    expect(f.payload()).toMatchObject({
+      tiers: {
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'sleeping-single-model-draft',
+          ensembleEnabled: true,
+        },
+      },
+    })
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
+    expect(f.payload()).not.toHaveProperty('tierProviderMismatch')
+  })
+
+  it.each([
+    ['single-model C3', { ensemble_enabled: false }],
+    ['legacy C3 fusion', { ensemble_selection_mode: 'static_tokenrhythm_b5' }],
+  ])('keeps the %s provider in mixed-provider policy', (_label, c3Mode) => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tier_profile: null,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash' },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'tier-owned-model',
+          ...c3Mode,
+        },
+      },
+    }, {}, 'openrouter')
+
+    expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(makePanel(f, true).value.hasMixedTierProviders).toBe(true)
+    expect(f.payload()).toMatchObject({
+      crossProviderTiers: true,
+      tierProviderMismatch: 'veto',
+    })
+  })
+
   it('atomically clears provider-scoped model and ensemble when provider changes', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({

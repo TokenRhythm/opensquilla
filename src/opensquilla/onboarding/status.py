@@ -56,6 +56,7 @@ from opensquilla.provider.image_generation_credentials import (
     resolve_image_generation_credential,
 )
 from opensquilla.provider.preset_registry import get_preset
+from opensquilla.router_tiers import tier_provider_is_dormant
 
 
 @dataclass(frozen=True)
@@ -798,8 +799,10 @@ def _router_provider_conflicts(cfg: GatewayConfig) -> tuple[str, ...]:
     conflicts: set[str] = set()
     tiers = getattr(router, "tiers", {}) or {}
     if isinstance(tiers, dict):
-        for tier in tiers.values():
+        for tier_name, tier in tiers.items():
             if not isinstance(tier, dict):
+                continue
+            if tier_provider_is_dormant(tier_name, tier):
                 continue
             provider = str(tier.get("provider") or "").strip().lower()
             if provider and provider != active:

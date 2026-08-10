@@ -181,18 +181,36 @@ describe('SetupTierTable — editable routing rows', () => {
         model: 'glm-5.2',
         ensembleEnabled: true,
       }],
-      providerOptions: [{ providerId: 'openai', label: 'OpenAI' }],
+      providerOptions: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'openrouter', label: 'OpenRouter' },
+      ],
       modelsByProvider: {
         openai: { source: 'live', models: DISCOVERED },
       },
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'deepseek/deepseek-v4-pro',
+      ensembleAllFailedPolicy: 'fallback_single',
     }, { onUpdateTierField })
 
-    const picker = el.querySelector<HTMLInputElement>('input[aria-label="c3 model"]')!
+    const picker = el.querySelector<HTMLInputElement>(
+      'input[aria-label="C3 processing mode or model"]',
+    )!
     expect(picker.value).toBe('Multi-model fusion')
+    expect(picker.getAttribute('aria-describedby'))
+      .toContain('setup-tier-c3-ensemble-summary')
     expect(el.querySelector('select[aria-label="c3 execution mode"]')).toBeNull()
+    expect(el.querySelector('select[aria-label="c3 request entry"]')).toBeNull()
+    expect(el.querySelector('[aria-label="c3 request entry is determined by the Multi-model fusion plan"]')
+      ?.textContent).toContain('Determined by Multi-model fusion')
     expect(el.textContent).not.toContain('static_tokenrhythm_b5')
     expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
-      .toContain('falls back to glm-5.2')
+      .toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
+    expect(el.textContent).not.toContain('glm-5.2')
+    const liveStatus = el.querySelector<HTMLElement>('[role="status"][aria-live="polite"]')
+    expect(liveStatus?.getAttribute('aria-atomic')).toBe('true')
+    expect(liveStatus?.textContent)
+      .toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
 
     picker.dispatchEvent(new Event('focus'))
     await nextTick()
@@ -221,11 +239,64 @@ describe('SetupTierTable — editable routing rows', () => {
         model: 'glm-5.2',
         ensembleSelectionMode: 'static_tokenrhythm_b5',
       }],
-      providerOptions: [{ providerId: 'openai', label: 'OpenAI' }],
+      providerOptions: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'openrouter', label: 'OpenRouter' },
+      ],
     })
 
     expect(el.textContent).toContain('previously saved Multi-model fusion plan')
+    expect(el.textContent).toContain('Falls back to glm-5.2')
     expect(el.textContent).not.toContain('static_tokenrhythm_b5')
+    const provider = el.querySelector<HTMLSelectElement>('[aria-label="c3 request entry"]')
+    expect(provider?.value).toBe('openai')
+    expect(el.textContent).not.toContain('Determined by Multi-model fusion')
+    app.unmount()
+  })
+
+  it('does not claim a fallback when shared fusion is configured to return errors', async () => {
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        model: 'sleeping-single-model',
+        ensembleEnabled: true,
+      }],
+      providerOptions: [{ providerId: 'openai', label: 'OpenAI' }],
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'deepseek/deepseek-v4-pro',
+      ensembleAllFailedPolicy: 'error',
+    })
+
+    const summary = el.querySelector('.setup-tier-table__model-note')?.textContent || ''
+    expect(summary).toContain('returns an error if fusion cannot complete')
+    expect(summary).not.toContain('uses the Fixed and fallback model')
+    expect(summary).not.toContain('sleeping-single-model')
+    app.unmount()
+  })
+
+  it('keeps the legacy provider visible without claiming its fallback under error policy', async () => {
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        model: 'legacy-fallback-model',
+        ensembleSelectionMode: 'static_tokenrhythm_b5',
+      }],
+      providerOptions: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'openrouter', label: 'OpenRouter' },
+      ],
+      ensembleAllFailedPolicy: 'error',
+    })
+
+    const summary = el.querySelector('.setup-tier-table__model-note')?.textContent || ''
+    expect(summary).toContain('previously saved Multi-model fusion plan')
+    expect(summary).toContain('returns an error if fusion cannot complete')
+    expect(summary).not.toContain('legacy-fallback-model')
+    expect(el.querySelector<HTMLSelectElement>('[aria-label="c3 request entry"]')?.value)
+      .toBe('openai')
+    expect(el.textContent).not.toContain('Determined by Multi-model fusion')
     app.unmount()
   })
 
@@ -274,6 +345,7 @@ describe('SetupTierTable — editable routing rows', () => {
 
     const provider = el.querySelector<HTMLSelectElement>('[aria-label="c0 request entry"]')!
     expect(provider.value).toBe('private-gateway')
+    expect(provider.disabled).toBe(false)
     expect(Array.from(provider.options).map(option => option.value)).toEqual([
       'openrouter',
       'private-gateway',
@@ -283,6 +355,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(provider.options[0]?.disabled).toBe(false)
     expect(el.querySelector('[role="table"]')?.classList.contains('setup-tier-table--without-provider'))
       .toBe(false)
+    expect(provider.closest('[role="row"]')?.getAttribute('aria-disabled')).toBeNull()
     expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 model"]')?.disabled).toBe(true)
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c0 thinking level"]')?.disabled).toBe(true)
     expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 supports image"]')?.disabled).toBe(true)
@@ -476,10 +549,11 @@ describe('SetupTierTable — readonly preview mode', () => {
       }],
     })
 
-    expect(el.querySelector('[aria-label="c3 model"]')?.textContent)
+    expect(el.querySelector('[aria-label="C3 processing mode or model"]')?.textContent)
       .toContain('Multi-model fusion')
     expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
-      .toContain('falls back to glm-5.2')
+      .toContain('uses the Fixed and fallback model')
+    expect(el.textContent).not.toContain('glm-5.2')
     expect(el.textContent).not.toContain('static_tokenrhythm_b5')
     expect(el.querySelector('select[aria-label="c3 execution mode"]')).toBeNull()
     app.unmount()

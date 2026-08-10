@@ -4797,7 +4797,7 @@ def build_ensemble_provider_from_config(
     elif selection_mode == "router_dynamic":
         profile_name, proposers, aggregator, selection_plan = _build_router_dynamic_members(
             config=config,
-            inherited_provider_config=inherited_provider_config,
+            inherited_provider_config=plan_provider_config,
             turn_metadata=turn_metadata,
             credential_pool_acquirer=_credential_pool_acquirer,
             session_key=_session_key,

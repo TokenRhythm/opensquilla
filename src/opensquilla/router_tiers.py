@@ -157,6 +157,22 @@ class TierConfig:
         )
 
 
+def tier_provider_is_dormant(tier: object, value: object) -> bool:
+    """Whether a stored tier provider is only the inactive C3 single-model draft.
+
+    Shared fusion owns C3's physical deployment and falls back through the
+    global direct/fallback model.  The provider/model retained on that tier is
+    therefore not an execution dependency until the user explicitly switches
+    C3 back to one model.  Legacy tier-local fusion still owns its provider as
+    a fallback, and C0-C2 remain ordinary provider-backed tiers.
+    """
+
+    return (
+        normalize_text_tier(tier) == HIGHEST_TEXT_TIER
+        and TierConfig.from_value(value).ensemble_enabled is True
+    )
+
+
 def tier_ensemble_selection_mode(
     tiers: Mapping[str, Any] | None,
     tier: object,

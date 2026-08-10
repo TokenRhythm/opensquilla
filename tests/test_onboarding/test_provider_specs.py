@@ -88,7 +88,9 @@ def test_tokenrhythm_preset_wire_exposes_the_shared_c3_binding():
         if item["providerId"] == "tokenrhythm"
     )
 
-    assert row["presets"][0]["tiers"]["c3"]["ensembleEnabled"] is True
+    c3 = row["presets"][0]["tiers"]["c3"]
+    assert c3["ensembleEnabled"] is True
+    assert "configured direct/fallback model" in c3["description"]
 
 
 def test_tier_payload_preserves_a_legacy_ensemble_selection_mode():

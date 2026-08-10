@@ -225,13 +225,14 @@ describe('SetupModelCombobox', () => {
   it('associates field help and live catalog context with the input', async () => {
     const { el } = await mountCombobox({
       field: { ...FIELD, description: 'Used for direct requests and fallback.' },
+      externalDescriptionId: 'external-model-status',
     })
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')
     const description = el.querySelector<HTMLElement>('#setup-provider-model-description')
 
     expect(description?.textContent).toBe('Used for direct requests and fallback.')
     expect(input?.getAttribute('aria-describedby'))
-      .toBe('setup-provider-model-description setup-provider-model-catalog-count')
+      .toBe('setup-provider-model-description external-model-status setup-provider-model-catalog-count')
   })
 
   it('keeps field help associated when no live catalog is available', async () => {

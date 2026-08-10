@@ -40,6 +40,9 @@ const props = defineProps<{
   // Embedded form rows can opt into the shared input chrome without changing
   // compact tier-table cells that already provide their own styling.
   inputClass?: string
+  // Optional status/help text rendered by the parent outside this component.
+  // This keeps compact table cells accessible without duplicating visible copy.
+  externalDescriptionId?: string
   // Optional semantic choice pinned above provider models. Router C3 uses it
   // for the shared multi-model plan while retaining free-text model entry.
   leadingOption?: LeadingOption
@@ -98,6 +101,7 @@ const catalogAvailable = computed(() => (
 const describedBy = computed(() => {
   const ids: string[] = []
   if (!props.cell && props.field.description) ids.push(fieldDescriptionId.value)
+  if (props.externalDescriptionId) ids.push(props.externalDescriptionId)
   if (catalogAvailable.value) ids.push(`${fieldId.value}-catalog-count`)
   return ids.join(' ') || undefined
 })

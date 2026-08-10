@@ -103,6 +103,10 @@ interface RouterConfig {
 
 export type RouterBinding = 'follow_primary' | 'custom' | 'legacy'
 
+function tierProviderIsDormant(name: string, tier: SetupTierValue): boolean {
+  return normalizeRouterTier(name) === 'c3' && tier.ensembleEnabled === true
+}
+
 interface RouterPanelContext {
   routerSummary: ComputedRef<string>
   ensembleProfileActive: ComputedRef<boolean>
@@ -138,7 +142,11 @@ export function useSetupRouterForm() {
   )
   const tierProviderIds = computed(() => {
     const ids = new Set<string>()
-    Object.values(tierValues.value).forEach((tier) => {
+    Object.entries(tierValues.value).forEach(([name, tier]) => {
+      // Shared C3 fusion is owned by the global ensemble plan. Its saved tier
+      // provider belongs only to the sleeping single-model draft, so it must
+      // not opt the active router into cross-provider execution or vetoes.
+      if (tierProviderIsDormant(name, tier)) return
       const provider = String(tier.provider || '').trim().toLowerCase()
       if (provider) ids.add(provider)
     })

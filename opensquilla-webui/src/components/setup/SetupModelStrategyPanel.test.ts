@@ -348,6 +348,60 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
+  it('binds shared C3 fusion to the global fixed and fallback target', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        tierRows: [{
+          name: 'c3',
+          provider: 'tokenrhythm',
+          model: 'sleeping-c3-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      single: {
+        providerId: 'deepseek',
+        providerLabel: 'DeepSeek',
+        model: 'deepseek-chat',
+      },
+      ensemble: { allFailedPolicy: 'fallback_single' },
+    })
+
+    const picker = el.querySelector<HTMLInputElement>(
+      'input[aria-label="C3 processing mode or model"]',
+    )
+    expect(picker?.value).toBe('Multi-model fusion')
+    expect(picker?.getAttribute('aria-describedby'))
+      .toContain('setup-tier-c3-ensemble-summary')
+    const summary = el.querySelector('.setup-tier-table__model-note')?.textContent || ''
+    expect(summary).toContain('Fixed and fallback model: DeepSeek · deepseek-chat')
+    expect(summary).not.toContain('sleeping-c3-model')
+    expect(el.textContent).toContain('Determined by Multi-model fusion')
+    app.unmount()
+  })
+
+  it('describes shared C3 fusion as error-only when fallback is disabled', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        tierRows: [{
+          name: 'c3',
+          provider: 'openrouter',
+          model: 'sleeping-c3-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: { allFailedPolicy: 'error' },
+    })
+
+    const summary = el.querySelector('.setup-tier-table__model-note')?.textContent || ''
+    expect(summary).toContain('returns an error if fusion cannot complete')
+    expect(summary).not.toContain('uses the Fixed and fallback model')
+    app.unmount()
+  })
+
   it('keeps router tier editing enabled after leaving an enabled ensemble strategy', async () => {
     const { app, el } = await mountPanel({
       activeStrategy: 'router',
@@ -957,11 +1011,32 @@ describe('SetupModelStrategyPanel', () => {
     expect(onUpdateEnsembleMinSuccessful).toHaveBeenCalledWith(2)
 
     const failure = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_all_failed_policy"]')
+    expect(failure?.closest('label')?.textContent)
+      .toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
     failure!.value = 'error'
     failure!.dispatchEvent(new Event('change', { bubbles: true }))
     await nextTick()
     expect(onUpdateEnsembleAllFailedPolicy).toHaveBeenCalledWith('error')
 
+    app.unmount()
+  })
+
+  it('does not describe a fallback target when ensemble failure policy returns errors', async () => {
+    const { app, el } = await mountPanel({
+      activeStrategy: 'ensemble',
+      ensemble: {
+        enabled: true,
+        scheme: 'custom',
+        allFailedPolicy: 'error',
+      },
+    })
+
+    const failure = el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_all_failed_policy"]',
+    )
+    const copy = failure?.closest('label')?.textContent || ''
+    expect(copy).toContain('return an error without using a fallback model')
+    expect(copy).not.toContain('Fixed and fallback model:')
     app.unmount()
   })
 

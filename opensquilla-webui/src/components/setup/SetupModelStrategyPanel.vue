@@ -697,6 +697,9 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           :provider-options="panel.router.providerOptions"
           :provider-credential-status="panel.router.providerCredentialStatus"
           :models-by-provider="panel.router.discoveredModelsByProvider || {}"
+          :fixed-fallback-provider="panel.single.providerLabel"
+          :fixed-fallback-model="panel.single.model"
+          :ensemble-all-failed-policy="panel.ensemble.allFailedPolicy"
           @update-tier-field="(name, key, value) => emit('updateTierField', name, key, value)"
         />
 
@@ -1369,7 +1372,12 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.failurePolicyLabel') }}</span>
                 <span class="control-row__desc">
-                  {{ t('setup.modelStrategy.ensembleFailure', { provider: currentProvider, model: currentModel }) }}
+                  {{ panel.ensemble.allFailedPolicy === 'error'
+                    ? t('setup.modelStrategy.ensembleFailureError')
+                    : t('setup.modelStrategy.ensembleFailure', {
+                      provider: panel.single.providerLabel,
+                      model: panel.single.model,
+                    }) }}
                 </span>
               </div>
               <div class="control-row__control">

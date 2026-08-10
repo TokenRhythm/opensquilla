@@ -8189,8 +8189,97 @@ class TurnRunner:
             pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
 
-        # Apply routed model back to cloned selector (local, not shared)
-        if turn.model and cloned_selector is not None:
+        ensemble_cfg = getattr(self._turn_config(), "llm_ensemble", None)
+        # Resolve the tier's execution contract before changing the selector.
+        # A shared tier uses C3 only as the logical trigger for the one global
+        # ``llm_ensemble`` plan. Its physical baseline remains the configured
+        # direct/fallback deployment, so wrapper skips and Ensemble's internal
+        # single-model fallback cannot accidentally run the tier-local model.
+        tier_ensemble_mode = ""
+        tier_ensemble_binding = "single"
+        configured_selection_mode = effective_ensemble_selection_mode(
+            self._turn_config()
+        )
+        if bool(turn.metadata.get("routing_applied", False)):
+            tier_ensemble_mode, tier_ensemble_binding = tier_ensemble_execution(
+                getattr(router_cfg, "tiers", None),
+                turn.metadata.get("routed_tier"),
+                shared_selection_mode=configured_selection_mode,
+            )
+        shared_tier_ensemble = tier_ensemble_binding == "shared"
+        ensemble_globally_enabled = bool(getattr(ensemble_cfg, "enabled", False))
+        selection_mode = tier_ensemble_mode or configured_selection_mode
+        # A globally enabled Ensemble owns every request's physical baseline,
+        # including the legitimate router_dynamic state where Router remains
+        # enabled to choose the lineup. Retained tier-local selection modes are
+        # the compatibility exception: those old configs continue to use the
+        # routed tier as their fallback deployment.
+        fixed_baseline_ensemble = shared_tier_ensemble or (
+            ensemble_globally_enabled and tier_ensemble_binding != "legacy"
+        )
+        dynamic_plan_provider_config = None
+        if (
+            fixed_baseline_ensemble
+            and selection_mode == "router_dynamic"
+            and turn.metadata.get("routing_applied") is True
+            and turn.model
+            and initial_provider_config is not None
+            and cloned_selector is not None
+        ):
+            from opensquilla.engine.selector_override import (
+                cross_provider_tier_config,
+            )
+
+            routed_plan_config = cross_provider_tier_config(
+                self._turn_config(),
+                turn.metadata,
+                turn.model,
+                active_provider_id=getattr(cloned_selector, "active_provider_id", ""),
+                session_key=turn.session_key,
+            )
+            if turn.metadata.get("routed_provider_blocked"):
+                # Match apply_model_override's fail-closed boundary: an
+                # unresolved/vetoed foreign route keeps both the configured
+                # provider and its fixed model as the dynamic anchor.
+                dynamic_plan_provider_config = initial_provider_config
+                turn.metadata["routed_provider_fallback_provider"] = str(
+                    getattr(initial_provider_config, "provider", "") or ""
+                )
+                turn.metadata["routed_provider_fallback_model"] = str(
+                    getattr(initial_provider_config, "model", "") or ""
+                )
+            elif routed_plan_config is not None:
+                dynamic_plan_provider_config = routed_plan_config
+            else:
+                # Same-provider and the default cross-provider flag-only
+                # policy execute the final routed model on the active
+                # deployment. Build that plan identity without mutating the
+                # selector, whose head remains the global fixed fallback.
+                dynamic_plan_provider_config = replace(
+                    initial_provider_config,
+                    model=str(turn.model),
+                    provider_routing=dict(initial_provider_config.provider_routing),
+                )
+        if fixed_baseline_ensemble:
+            routed_model = str(turn.model or "").strip()
+            if routed_model:
+                turn.metadata.setdefault("routed_model", routed_model)
+                turn.metadata["routed_model_before_ensemble"] = routed_model
+            if initial_provider_config is not None:
+                # ``turn.model`` feeds AgentConfig and request-budget/catalog
+                # resolution after this method returns. Keep that physical
+                # identity aligned with the selector/provider that will really
+                # serve the direct fallback; ``routed_model`` above preserves
+                # the logical Router decision for RouterDecisionEvent.
+                turn.model = str(
+                    getattr(initial_provider_config, "model", "") or turn.model
+                )
+
+        # Apply a routed model back to the cloned selector only when the tier
+        # owns a physical single-model deployment. Shared and globally enabled
+        # Ensemble turns leave the configured global head and fallback chain
+        # untouched.
+        if turn.model and cloned_selector is not None and not fixed_baseline_ensemble:
             from opensquilla.engine.selector_override import (
                 apply_model_override,
                 cross_provider_tier_config,
@@ -8210,22 +8299,10 @@ class TurnRunner:
                 ),
             )
 
-        ensemble_cfg = getattr(self._turn_config(), "llm_ensemble", None)
         # A tier execution override is part of routing, not observation.  In
         # observe rollout the router records the candidate tier/model while
         # deliberately leaving the baseline provider in charge; wrapping the
         # observed C3 candidate would otherwise execute routing by stealth.
-        tier_ensemble_mode = ""
-        tier_ensemble_binding = "single"
-        if bool(turn.metadata.get("routing_applied", False)):
-            tier_ensemble_mode, tier_ensemble_binding = tier_ensemble_execution(
-                getattr(router_cfg, "tiers", None),
-                turn.metadata.get("routed_tier"),
-                shared_selection_mode=effective_ensemble_selection_mode(
-                    self._turn_config()
-                ),
-            )
-        ensemble_globally_enabled = bool(getattr(ensemble_cfg, "enabled", False))
         if provider is not None and (ensemble_globally_enabled or tier_ensemble_mode):
             from opensquilla.engine.selector_override import (
                 acquire_profile_credential,
@@ -8249,10 +8326,8 @@ class TurnRunner:
                 and initial_provider_config is not None
                 else current_provider_config
             )
-            configured_selection_mode = effective_ensemble_selection_mode(
-                self._turn_config()
-            )
-            selection_mode = tier_ensemble_mode or configured_selection_mode
+            if dynamic_plan_provider_config is not None:
+                plan_provider_config = dynamic_plan_provider_config
             if static_b5_profile(selection_mode) is None and selection_mode not in {
                 CUSTOM_B5_SELECTION_MODE,
                 "router_dynamic",
@@ -8332,8 +8407,9 @@ class TurnRunner:
                 if tier_ensemble_mode:
                     turn.metadata["ensemble_tier_binding"] = tier_ensemble_binding
                 turn.metadata["ensemble_selection_mode"] = selection_mode
-                turn.metadata["routed_model_before_ensemble"] = (
-                    turn.model or getattr(current_provider_config, "model", "")
+                turn.metadata.setdefault(
+                    "routed_model_before_ensemble",
+                    turn.model or getattr(current_provider_config, "model", ""),
                 )
                 provider = build_ensemble_provider_from_config(
                     config=self._turn_config(),

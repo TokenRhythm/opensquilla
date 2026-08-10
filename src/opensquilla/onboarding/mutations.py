@@ -74,6 +74,7 @@ from opensquilla.router_tiers import (
     TEXT_TIERS,
     TierConfig,
     normalize_text_tier,
+    tier_provider_is_dormant,
 )
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS, MAX_SEARCH_RESULTS
 from opensquilla.secrets import clean_header_secret
@@ -591,8 +592,10 @@ def _router_provider_conflicts(
     conflicts: set[str] = set()
     tiers = getattr(router, "tiers", {}) or {}
     if isinstance(tiers, Mapping):
-        for tier in tiers.values():
+        for tier_name, tier in tiers.items():
             if not isinstance(tier, Mapping):
+                continue
+            if tier_provider_is_dormant(tier_name, tier):
                 continue
             provider = str(tier.get("provider") or "").strip().lower()
             if provider and provider != target:

@@ -305,6 +305,34 @@ async def test_router_section_carries_an_explicit_router_mode(tmp_path) -> None:
     )
 
 
+async def test_router_provider_conflicts_ignore_only_dormant_shared_c3(tmp_path) -> None:
+    cfg = _synthetic_config(
+        tmp_path,
+        llm=LlmProviderConfig(provider="deepseek", model="deepseek-chat"),
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": False,
+            "tiers": {
+                "c0": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c1": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c2": {"provider": "openai", "model": "gpt-test"},
+                "c3": {
+                    "provider": "openrouter",
+                    "model": "synthetic/model",
+                    "ensemble_enabled": True,
+                },
+            },
+        },
+    )
+
+    payload = _status_payload(RpcContext(conn_id="contract", config=cfg))
+
+    assert payload["sectionDetails"]["router"]["routerProviderConflicts"] == [
+        "openai"
+    ]
+
+
 async def test_sparse_disabled_router_follows_primary_without_claiming_explicit_tiers(
     tmp_path,
 ) -> None:
