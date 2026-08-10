@@ -316,7 +316,7 @@
         "task_analysis_execution"
       ],
       "artifact_projection_key": "replay_payload",
-      "schema": "opensquilla.draco.frozen-task-analysis/v1",
+      "schema": "opensquilla.draco.frozen-task-analysis/v3",
       "expected_physical_analyzer_requests": 0
     },
     "live_analyzer": {

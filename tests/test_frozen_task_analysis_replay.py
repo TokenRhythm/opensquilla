@@ -12,12 +12,17 @@ import pytest
 from opensquilla.eval.draco_experiment_config import (
     DracoFrozenTaskAnalysisExecutionConfig,
     DracoFrozenTaskAnalysisExecutionV2Config,
+    DracoFrozenTaskAnalysisExecutionV3Config,
+)
+from opensquilla.eval.draco_task_analyzer_execution import (
+    build_task_analyzer_execution_contract,
 )
 from opensquilla.provider.ranking_router import (
     FROZEN_TASK_ANALYSIS_MODE,
     FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK,
     FROZEN_TASK_ANALYSIS_SCHEMA,
     FROZEN_TASK_ANALYSIS_SCHEMA_V2,
+    FROZEN_TASK_ANALYSIS_SCHEMA_V3,
     TASK_ANALYZER_VERSION,
     DynamicRankingError,
     _assert_public_ranking_trace_payload,
@@ -210,6 +215,31 @@ def test_replay_contract_materializes_bound_profile_with_zero_usage() -> None:
     )
 
 
+def test_replay_accepts_selected_fallback_route_with_zero_usage() -> None:
+    contract, _, request_context, task_id, input_sha, prompt_sha = _fixture()
+    selected = contract["source_task_analyzer_config"]["fallback_chain"][0]
+    entry = contract["entries"][task_id]
+    entry["task_analyzer"]["provider"] = selected["provider"]
+    entry["task_analyzer"]["model"] = selected["model"]
+    contract["entries_sha256"] = canonical_json_sha256(contract["entries"])
+
+    assert frozen_task_analysis_contract_reasons(contract) == []
+    result = frozen_task_analysis_result(
+        contract,
+        task_id=task_id,
+        task_input_sha256=input_sha,
+        prompt_sha256=prompt_sha,
+        routed_tier="c1",
+        request_context=request_context,
+        ranking_config=ranking_config_resolution()["effective_config"],
+    )
+
+    assert result.provider_id == selected["provider"]
+    assert result.model_id == selected["model"]
+    assert result.usage == {}
+    assert result.replay["physical_request_count"] == 0
+
+
 def test_v2_replay_preserves_deterministic_router_fallback_outcome() -> None:
     contract, plan, _, task_id, input_sha, prompt_sha = _fallback_fixture()
 
@@ -232,6 +262,117 @@ def test_v2_replay_preserves_deterministic_router_fallback_outcome() -> None:
     assert (
         analyzer["replay"]["origin_outcome"]
         == FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK
+    )
+
+
+@pytest.mark.parametrize("selected_index", [1, 2], ids=["gpt", "gemini"])
+def test_v3_replay_authorizes_live_chain_fallback_with_zero_requests(
+    selected_index: int,
+) -> None:
+    contract, _, request_context, task_id, input_sha, prompt_sha = _fixture()
+    source_config = copy.deepcopy(contract["source_task_analyzer_config"])
+    source_config.pop("fallback_chain", None)
+    source_config.pop("schema_repair_max_retries", None)
+    source_config.pop("total_timeout_seconds", None)
+    source_config.pop("payload_max_chars", None)
+    source_config.pop("payload_max_bytes", None)
+    source_config.pop("payload_max_estimated_tokens", None)
+    routes = [
+        {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "upstream_provider": "anthropic",
+            "max_attempts": 1,
+        },
+        {
+            "provider": "openrouter",
+            "model": "openai/gpt-5.6-sol",
+            "upstream_provider": "azure",
+            "max_attempts": 1,
+        },
+        {
+            "provider": "openrouter",
+            "model": "google/gemini-3.1-pro-preview",
+            "upstream_provider": "google-ai-studio",
+            "max_attempts": 1,
+        },
+    ]
+    execution_contract = build_task_analyzer_execution_contract(
+        routes=routes,
+        schema_repair_max_retries=0,
+        total_timeout_seconds=float(source_config["timeout_seconds"]) * len(routes),
+        route_source="g1_registry_contract.live_task_analyzer_chain",
+        source_payload={
+            "task_analyzer": copy.deepcopy(source_config),
+            "live_task_analyzer_chain": copy.deepcopy(routes),
+        },
+    )
+    contract.update(
+        {
+            "schema": FROZEN_TASK_ANALYSIS_SCHEMA_V3,
+            "source_task_analyzer_config": source_config,
+            "source_task_analyzer_config_sha256": canonical_json_sha256(source_config),
+            "source_task_analyzer_execution_contract": execution_contract,
+            "source_task_analyzer_execution_contract_sha256": canonical_json_sha256(
+                execution_contract
+            ),
+        }
+    )
+    selected = routes[selected_index]
+    for entry in contract["entries"].values():
+        entry["origin_outcome"] = "live_success"
+        entry["task_analyzer"]["provider"] = selected["provider"]
+        entry["task_analyzer"]["model"] = selected["model"]
+    contract["entries_sha256"] = canonical_json_sha256(contract["entries"])
+    historical_ranking = copy.deepcopy(ranking_config_resolution()["effective_config"])
+    historical_ranking["task_analyzer"] = copy.deepcopy(source_config)
+
+    assert frozen_task_analysis_contract_reasons(contract) == []
+    validated = DracoFrozenTaskAnalysisExecutionV3Config.model_validate(contract)
+    assert validated.model_dump(mode="json")["schema"] == FROZEN_TASK_ANALYSIS_SCHEMA_V3
+    result = frozen_task_analysis_result(
+        contract,
+        task_id=task_id,
+        task_input_sha256=input_sha,
+        prompt_sha256=prompt_sha,
+        routed_tier="c1",
+        request_context=request_context,
+        ranking_config=historical_ranking,
+    )
+    plan = {
+        "task_analyzer": result.trace(historical_ranking),
+        "task_profile_pre_escalation": copy.deepcopy(
+            contract["entries"][task_id]["task_profile_pre_escalation"]
+        ),
+        "ranking_parameters": {"task_analyzer": copy.deepcopy(source_config)},
+    }
+
+    assert frozen_task_analysis_plan_reasons(
+        plan,
+        contract,
+        expected_task_id=task_id,
+        expected_task_input_sha256=input_sha,
+        expected_prompt_sha256=prompt_sha,
+    ) == []
+    assert result.model_id == selected["model"]
+    assert result.usage == {}
+    assert result.replay["physical_request_count"] == 0
+    assert (
+        result.replay["source_task_analyzer_execution_contract_sha256"]
+        == contract["source_task_analyzer_execution_contract_sha256"]
+    )
+
+    forged = copy.deepcopy(contract)
+    forged_execution = forged["source_task_analyzer_execution_contract"]
+    forged_execution["source_sha256"] = "0" * 64
+    unsigned = dict(forged_execution)
+    unsigned.pop("contract_sha256")
+    forged_execution["contract_sha256"] = canonical_json_sha256(unsigned)
+    forged["source_task_analyzer_execution_contract_sha256"] = canonical_json_sha256(
+        forged_execution
+    )
+    assert "invalid_frozen_task_analyzer_execution_contract" in (
+        frozen_task_analysis_contract_reasons(forged)
     )
 
 
@@ -334,6 +475,23 @@ def test_contract_and_plan_reject_profile_or_identity_tampering() -> None:
     )
     assert "wrong_frozen_task_analyzer_identity" in (
         frozen_task_analysis_contract_reasons(tampered_identity)
+    )
+
+    duplicated_route = copy.deepcopy(contract)
+    duplicated_route["source_task_analyzer_config"]["fallback_chain"].append(
+        {
+            "provider": duplicated_route["source_task_analyzer_config"]["provider"],
+            "model": duplicated_route["source_task_analyzer_config"]["model"],
+            "upstream_provider": duplicated_route["source_task_analyzer_config"][
+                "upstream_provider"
+            ],
+        }
+    )
+    duplicated_route["source_task_analyzer_config_sha256"] = canonical_json_sha256(
+        duplicated_route["source_task_analyzer_config"]
+    )
+    assert "invalid_frozen_task_analysis_source_analyzer_identity" in (
+        frozen_task_analysis_contract_reasons(duplicated_route)
     )
 
     tampered_plan = copy.deepcopy(plan)

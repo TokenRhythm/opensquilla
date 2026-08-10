@@ -16,6 +16,7 @@ from unittest import mock
 from opensquilla.provider.ranking_router import (
     build_request_context,
     fallback_task_profile,
+    frozen_task_analysis_result,
     ranking_config_resolution,
 )
 
@@ -312,15 +313,15 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
         }
         with self.assertRaises(controller.ControllerError):
             controller.make_replay_overlay(plan, artifact)
-        artifact["replay_payload"]["schema"] = controller.FROZEN_TASK_ANALYSIS_SCHEMA_V1
+        artifact["replay_payload"]["schema"] = controller.FROZEN_TASK_ANALYSIS_SCHEMA_V3
         overlay = controller.make_replay_overlay(plan, artifact)
         self.assertEqual(
             overlay["g1_routing"]["task_analysis_execution"]["schema"],
-            controller.FROZEN_TASK_ANALYSIS_SCHEMA_V1,
+            controller.FROZEN_TASK_ANALYSIS_SCHEMA_V3,
         )
         controller.validate_frozen_replay_runtime_support(
             plan,
-            {"frozen_task_analysis_schemas": {controller.FROZEN_TASK_ANALYSIS_SCHEMA_V1}},
+            {"frozen_task_analysis_schemas": {controller.FROZEN_TASK_ANALYSIS_SCHEMA_V3}},
         )
         with self.assertRaises(controller.ControllerError):
             controller.validate_frozen_replay_runtime_support(
@@ -340,6 +341,9 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
             "schema": controller.ANALYZER_SOURCE_POLICY_SCHEMA,
             "allow_deterministic_router_fallback": True,
         }
+        opted_in["runtime_contract"]["frozen_replay"]["schema"] = (
+            controller.FROZEN_TASK_ANALYSIS_SCHEMA_V1
+        )
         with self.assertRaises(controller.ControllerError):
             controller.validate_plan(opted_in, allow_placeholders=True)
         opted_in["runtime_contract"]["frozen_replay"]["schema"] = (
@@ -763,6 +767,7 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
         expected = {
             "provider": "openrouter",
             "model": "anthropic/claude-opus-4.8",
+            "upstream_provider": "anthropic",
         }
         attempt = {
             "attempt": 1,
@@ -785,6 +790,9 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
         }
         analyzer = {
             **expected,
+            "source": "llm_provider",
+            "schema_valid": True,
+            "fallback_reason": "",
             "normalization_warnings": [],
             "usage": {
                 "attempt_count": 1,
@@ -866,6 +874,267 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
                 allow_zero_attempts=False,
             )
 
+    def test_analyzer_chain_ledger_authenticates_order_and_selected_route(self) -> None:
+        expected = copy.deepcopy(
+            ranking_config_resolution()["effective_config"]["task_analyzer"]
+        )
+        routes = [
+            {
+                key: str(expected[key])
+                for key in ("provider", "model", "upstream_provider")
+            },
+            *copy.deepcopy(expected["fallback_chain"]),
+        ]
+
+        def attempt(
+            ordinal: int,
+            route: dict[str, str],
+            *,
+            known: bool,
+        ) -> dict[str, object]:
+            physical_id = f"{ordinal:032x}"
+            row: dict[str, object] = {
+                "attempt": ordinal,
+                "physical_attempt_id": physical_id,
+                "requested_provider": route["provider"],
+                "requested_model": route["model"],
+                "input_tokens": 10 if known else 0,
+                "output_tokens": 2 if known else 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "billed_cost": 0.01 if known else 0.0,
+                "cost_source": "provider_billed" if known else "none",
+                "provider_usage": {"physical_attempt_id": physical_id},
+            }
+            if known:
+                row.update(
+                    {
+                        "provider": route["provider"],
+                        "model": route["model"],
+                        "usage_unknown": False,
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "provider": "",
+                        "model": "",
+                        "usage_unknown": True,
+                        "unknown_reason": "transient",
+                        "provider_usage": {
+                            "physical_attempt_id": physical_id,
+                            "usage_unknown": True,
+                            "unknown_reason": "transient",
+                        },
+                    }
+                )
+            return row
+
+        attempts = [attempt(1, routes[0], known=False), attempt(2, routes[1], known=True)]
+        analyzer = {
+            "source": "llm_provider",
+            "schema_valid": True,
+            "fallback_reason": "",
+            "provider": routes[1]["provider"],
+            "model": routes[1]["model"],
+            "normalization_warnings": [],
+            "chain": {
+                "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+                "configured_routes": routes,
+                "attempt_outcomes": [
+                    {
+                        "candidate_index": 0,
+                        **routes[0],
+                        "outcome": "failed",
+                        "reason": "transient",
+                        "physical_request_count": 1,
+                    },
+                    {
+                        "candidate_index": 1,
+                        **routes[1],
+                        "outcome": "success",
+                        "reason": "",
+                        "physical_request_count": 1,
+                    },
+                ],
+                "selected_index": 1,
+                "exhausted": False,
+                "schema_repair_max_retries": 1,
+                "deadline": {
+                    "configured_seconds": float(expected["total_timeout_seconds"]),
+                    "elapsed_seconds": 1.0,
+                    "remaining_seconds": float(expected["total_timeout_seconds"]) - 1.0,
+                    "expired": False,
+                },
+            },
+            "usage": {
+                "attempt_count": 2,
+                "usage_unknown_count": 1,
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "billed_cost": 0.01,
+                "physical_attempts": attempts,
+            },
+        }
+
+        usage, observed, unknown_count = controller._validated_analyzer_attempt_ledger(
+            task_id="task-chain",
+            analyzer=analyzer,
+            expected_config=expected,
+            allow_zero_attempts=False,
+        )
+        self.assertEqual(usage["attempt_count"], 2)
+        self.assertEqual(len(observed), 2)
+        self.assertEqual(unknown_count, 1)
+
+        repaired = copy.deepcopy(analyzer)
+        repaired_attempts = [
+            attempt(1, routes[0], known=False),
+            attempt(2, routes[0], known=False),
+            attempt(3, routes[1], known=True),
+        ]
+        repaired["usage"].update(
+            {
+                "attempt_count": 3,
+                "usage_unknown_count": 2,
+                "physical_attempts": repaired_attempts,
+            }
+        )
+        repaired["chain"]["attempt_outcomes"][0]["physical_request_count"] = 2
+        controller._validated_analyzer_attempt_ledger(
+            task_id="task-chain-repair",
+            analyzer=repaired,
+            expected_config=expected,
+            allow_zero_attempts=False,
+        )
+        repair_disabled = copy.deepcopy(expected)
+        repair_disabled["schema_repair_max_retries"] = 0
+        repaired["chain"]["schema_repair_max_retries"] = 0
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-chain-repair",
+                analyzer=repaired,
+                expected_config=repair_disabled,
+                allow_zero_attempts=False,
+            )
+
+        outside = copy.deepcopy(analyzer)
+        outside["usage"]["physical_attempts"][1]["requested_model"] = "other/model"
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-chain",
+                analyzer=outside,
+                expected_config=expected,
+                allow_zero_attempts=False,
+            )
+
+        out_of_order = copy.deepcopy(analyzer)
+        out_of_order["usage"]["physical_attempts"].reverse()
+        for ordinal, row in enumerate(
+            out_of_order["usage"]["physical_attempts"], start=1
+        ):
+            row["attempt"] = ordinal
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-chain",
+                analyzer=out_of_order,
+                expected_config=expected,
+                allow_zero_attempts=False,
+            )
+
+        wrong_result = copy.deepcopy(analyzer)
+        wrong_result["model"] = routes[0]["model"]
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-chain",
+                analyzer=wrong_result,
+                expected_config=expected,
+                allow_zero_attempts=False,
+            )
+
+        undeclared_attempt = copy.deepcopy(analyzer)
+        undeclared_attempt.update(
+            {
+                "source": "router_fallback",
+                "schema_valid": False,
+                "fallback_reason": "transient",
+                "provider": routes[0]["provider"],
+                "model": routes[0]["model"],
+            }
+        )
+        undeclared_attempt["chain"].update(
+            {
+                "attempt_outcomes": [
+                    {
+                        "candidate_index": 0,
+                        **routes[0],
+                        "outcome": "failed",
+                        "reason": "transient",
+                        "physical_request_count": 0,
+                    }
+                ],
+                "selected_index": None,
+                "exhausted": True,
+            }
+        )
+        undeclared_attempt["usage"].update(
+            {
+                "attempt_count": 1,
+                "usage_unknown_count": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "billed_cost": 0.0,
+                "physical_attempts": [attempt(1, routes[0], known=False)],
+            }
+        )
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-chain-undeclared-attempt",
+                analyzer=undeclared_attempt,
+                expected_config=expected,
+                allow_zero_attempts=False,
+            )
+
+        wrong_exhaustion_reason = copy.deepcopy(undeclared_attempt)
+        wrong_exhaustion_reason["chain"]["attempt_outcomes"][0][
+            "physical_request_count"
+        ] = 1
+        wrong_exhaustion_reason["fallback_reason"] = "unsupported"
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-chain-wrong-exhaustion-reason",
+                analyzer=wrong_exhaustion_reason,
+                expected_config=expected,
+                allow_zero_attempts=False,
+            )
+
+        unsafe_reason = copy.deepcopy(wrong_exhaustion_reason)
+        unsafe_reason["fallback_reason"] = "unsafe reason with spaces"
+        unsafe_reason["chain"]["attempt_outcomes"][0]["reason"] = (
+            "unsafe reason with spaces"
+        )
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-chain-unsafe-reason",
+                analyzer=unsafe_reason,
+                expected_config=expected,
+                allow_zero_attempts=False,
+            )
+
+        duplicate_config = copy.deepcopy(expected)
+        duplicate_config["fallback_chain"].append(copy.deepcopy(routes[0]))
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-chain",
+                analyzer=analyzer,
+                expected_config=duplicate_config,
+                allow_zero_attempts=False,
+            )
+
     def test_authenticated_analyzer_extract_uses_terminal_physical_attempt(self) -> None:
         task_ids = [f"task-{index}" for index in range(10)]
         ranking_config = ranking_config_resolution()["effective_config"]
@@ -886,6 +1155,61 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
                 "".join(json.dumps(row, sort_keys=True) + "\n" for row in result_rows),
                 encoding="utf-8",
             )
+            analyzer_config = ranking_config["task_analyzer"]
+            analyzer_routes = [
+                {
+                    key: str(analyzer_config[key])
+                    for key in ("provider", "model", "upstream_provider")
+                },
+                *copy.deepcopy(analyzer_config["fallback_chain"]),
+            ]
+
+            def analyzer_attempt(
+                *,
+                index: int,
+                ordinal: int,
+                route: dict[str, str],
+                output_tokens: int = 0,
+            ) -> dict[str, object]:
+                physical_id = f"{index * 10 + ordinal + 1:032x}"
+                attempt: dict[str, object] = {
+                    "attempt": ordinal,
+                    "physical_attempt_id": physical_id,
+                    "requested_provider": route["provider"],
+                    "requested_model": route["model"],
+                    "input_tokens": 0,
+                    "output_tokens": output_tokens,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "billed_cost": 0.0,
+                    "provider_usage": {"physical_attempt_id": physical_id},
+                }
+                if output_tokens > 0:
+                    attempt.update(
+                        {
+                            "provider": route["provider"],
+                            "model": route["model"],
+                            "usage_unknown": False,
+                        }
+                    )
+                else:
+                    attempt.update(
+                        {
+                            "provider": "",
+                            "model": "",
+                            "usage_unknown": True,
+                            "unknown_reason": "transient",
+                            "cost_source": "none",
+                            "provider_usage": {
+                                "physical_attempt_id": physical_id,
+                                "usage_unknown": True,
+                                "unknown_reason": "transient",
+                            },
+                        }
+                    )
+                return attempt
+
             trace_rows = []
             for index, (task_id, result) in enumerate(zip(task_ids, result_rows)):
                 profile = (
@@ -894,84 +1218,136 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
                         request_context=request_context,
                         ranking_config=ranking_config,
                     )
-                    if index == 0
+                    if index in {0, 1}
                     else {"index": index, "constraints": {"risk": "medium"}}
                 )
-                attempts = [
-                    {
-                        "attempt": 1,
-                        "physical_attempt_id": f"{index + 1:032x}",
-                        "requested_provider": "openrouter",
-                        "requested_model": "anthropic/claude-opus-4.8",
-                        "usage_unknown": True,
-                        "unknown_reason": "TimeoutError",
-                        "output_tokens": 0,
-                        "provider_usage": {
-                            "usage_unknown": True,
-                            "unknown_reason": "TimeoutError",
-                            "physical_attempt_id": f"{index + 1:032x}",
+                selected_route_index = 0 if index >= 2 else 1 if index == 1 else None
+                if index == 0:
+                    attempts = [
+                        analyzer_attempt(
+                            index=index,
+                            ordinal=ordinal,
+                            route=route,
+                        )
+                        for ordinal, route in enumerate(analyzer_routes, start=1)
+                    ]
+                    outcomes = [
+                        {
+                            "candidate_index": route_index,
+                            **route,
+                            "outcome": "failed",
+                            "reason": "transient",
+                            "physical_request_count": 1,
+                        }
+                        for route_index, route in enumerate(analyzer_routes)
+                    ]
+                elif index == 1:
+                    attempts = [
+                        analyzer_attempt(
+                            index=index,
+                            ordinal=1,
+                            route=analyzer_routes[0],
+                        ),
+                        analyzer_attempt(
+                            index=index,
+                            ordinal=2,
+                            route=analyzer_routes[1],
+                            output_tokens=100 + index,
+                        ),
+                    ]
+                    outcomes = [
+                        {
+                            "candidate_index": 0,
+                            **analyzer_routes[0],
+                            "outcome": "failed",
+                            "reason": "transient",
+                            "physical_request_count": 1,
                         },
-                    },
-                    {
-                        "attempt": 2,
-                        "physical_attempt_id": f"{index + 101:032x}",
-                        "requested_provider": "openrouter",
-                        "requested_model": "anthropic/claude-opus-4.8",
-                        "provider": "openrouter",
-                        "model": "anthropic/claude-opus-4.8",
-                        "output_tokens": 100 + index,
-                        "provider_usage": {
-                            "completion_tokens": 100 + index,
-                            "physical_attempt_id": f"{index + 101:032x}",
+                        {
+                            "candidate_index": 1,
+                            **analyzer_routes[1],
+                            "outcome": "success",
+                            "reason": "",
+                            "physical_request_count": 1,
                         },
-                    },
-                ]
+                    ]
+                else:
+                    attempts = [
+                        analyzer_attempt(
+                            index=index,
+                            ordinal=1,
+                            route=analyzer_routes[0],
+                        ),
+                        analyzer_attempt(
+                            index=index,
+                            ordinal=2,
+                            route=analyzer_routes[0],
+                            output_tokens=100 + index,
+                        ),
+                    ]
+                    outcomes = [
+                        {
+                            "candidate_index": 0,
+                            **analyzer_routes[0],
+                            "outcome": "success",
+                            "reason": "",
+                            "physical_request_count": 2,
+                        }
+                    ]
+                result_route = (
+                    analyzer_routes[selected_route_index]
+                    if selected_route_index is not None
+                    else analyzer_routes[-1]
+                )
                 analyzer = {
                     "source": "llm_provider",
                     "schema_valid": True,
                     "confidence": 0.8,
                     "analyzer_version": "opus-4.8-json-v3",
-                    "provider": "openrouter",
-                    "model": "anthropic/claude-opus-4.8",
+                    "provider": result_route["provider"],
+                    "model": result_route["model"],
                     "fallback_reason": "",
                     "normalization_warnings": [f"warning-{index}"],
+                    "chain": {
+                        "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+                        "configured_routes": analyzer_routes,
+                        "attempt_outcomes": outcomes,
+                        "selected_index": selected_route_index,
+                        "exhausted": selected_route_index is None,
+                        "schema_repair_max_retries": 1,
+                        "deadline": {
+                            "configured_seconds": float(
+                                analyzer_config["total_timeout_seconds"]
+                            ),
+                            "elapsed_seconds": 1.0,
+                            "remaining_seconds": float(
+                                analyzer_config["total_timeout_seconds"]
+                            )
+                            - 1.0,
+                            "expired": False,
+                        },
+                    },
                     "usage": {
-                        "attempt_count": 2,
-                        "output_tokens": 100 + index,
+                        "attempt_count": len(attempts),
+                        "usage_unknown_count": sum(
+                            attempt.get("usage_unknown") is True
+                            for attempt in attempts
+                        ),
+                        "input_tokens": 0,
+                        "output_tokens": 0 if index == 0 else 100 + index,
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "billed_cost": 0.0,
                         "physical_attempts": attempts,
                     },
                 }
                 if index == 0:
-                    for attempt in attempts:
-                        attempt.update(
-                            {
-                                "provider": "",
-                                "model": "",
-                                "usage_unknown": True,
-                                "unknown_reason": "TimeoutError",
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "reasoning_tokens": 0,
-                                "cached_tokens": 0,
-                                "cache_write_tokens": 0,
-                                "billed_cost": 0.0,
-                                "provider_usage": {
-                                    "usage_unknown": True,
-                                    "unknown_reason": "TimeoutError",
-                                    "physical_attempt_id": attempt["physical_attempt_id"],
-                                },
-                            }
-                        )
                     analyzer.update(
                         {
                             "source": "router_fallback",
                             "schema_valid": False,
-                            "fallback_reason": "TimeoutError",
-                            "usage": {
-                                "attempt_count": 2,
-                                "output_tokens": 0,
-                                "physical_attempts": attempts,
-                            },
+                            "fallback_reason": "transient",
                         }
                     )
                 selection = {
@@ -1075,9 +1451,125 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
             replay = artifact["replay_payload"]["entries"]["task-0"]
             self.assertEqual(replay["task_analyzer"]["normalization_warnings"], ["warning-0"])
             self.assertIs(replay["task_analyzer"]["schema_valid"], False)
-            self.assertEqual(replay["task_analyzer"]["fallback_reason"], "TimeoutError")
+            self.assertEqual(replay["task_analyzer"]["fallback_reason"], "transient")
             self.assertEqual(replay["origin_outcome"], "deterministic_router_fallback")
             self.assertIn("task_profile_pre_escalation", replay)
+            selected_replay = artifact["replay_payload"]["entries"]["task-1"]
+            self.assertEqual(
+                selected_replay["task_analyzer"]["model"],
+                analyzer_routes[1]["model"],
+            )
+            replay_result = frozen_task_analysis_result(
+                artifact["replay_payload"],
+                task_id="task-1",
+                task_input_sha256=selected_replay["task_input_sha256"],
+                prompt_sha256=selected_replay["prompt_sha256"],
+                routed_tier="c1",
+                request_context=request_context,
+                ranking_config=ranking_config,
+            )
+            self.assertEqual(replay_result.model_id, analyzer_routes[1]["model"])
+            self.assertEqual(replay_result.usage, {})
+            self.assertEqual(replay_result.replay["physical_request_count"], 0)
+
+            from opensquilla.eval.draco_task_analyzer_execution import (
+                task_analyzer_execution_contract_from_g1_registry,
+            )
+
+            original_trace_rows = copy.deepcopy(trace_rows)
+            original_manifest = copy.deepcopy(manifest)
+            live_routes = [
+                {**copy.deepcopy(route), "max_attempts": 1}
+                for route in analyzer_routes
+            ]
+            g1_registry_contract = {
+                "task_analyzer": copy.deepcopy(analyzer_config),
+                "live_task_analyzer_chain": live_routes,
+            }
+            execution_contract = (
+                task_analyzer_execution_contract_from_g1_registry(
+                    g1_registry_contract
+                )
+            )
+            for index, trace_row in enumerate(trace_rows):
+                selection = trace_row["routing_trace"]["selection_plan"]
+                analyzer = selection["task_analyzer"]
+                analyzer["chain"]["schema_repair_max_retries"] = 0
+                selection["task_analyzer_execution_contract"] = copy.deepcopy(
+                    execution_contract
+                )
+                if index >= 2:
+                    terminal_attempt = copy.deepcopy(
+                        analyzer["usage"]["physical_attempts"][-1]
+                    )
+                    terminal_attempt["attempt"] = 1
+                    analyzer["usage"].update(
+                        {
+                            "attempt_count": 1,
+                            "usage_unknown_count": 0,
+                            "physical_attempts": [terminal_attempt],
+                        }
+                    )
+                    analyzer["chain"]["attempt_outcomes"][0][
+                        "physical_request_count"
+                    ] = 1
+            trace_path.write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in trace_rows),
+                encoding="utf-8",
+            )
+            manifest["artifacts"]["trace.jsonl"].update(
+                {
+                    "size_bytes": trace_path.stat().st_size,
+                    "sha256": controller.file_sha256(trace_path),
+                }
+            )
+            manifest.update(
+                {
+                    "g1_registry_contract": g1_registry_contract,
+                    "task_analyzer_execution_contract": execution_contract,
+                    "run_compatibility": {
+                        "contracts": {
+                            "G1": {
+                                "g1_registry_contract": g1_registry_contract,
+                                "task_analyzer_execution_contract": execution_contract,
+                            }
+                        }
+                    },
+                }
+            )
+            manifest.pop("manifest_sha256", None)
+            manifest["manifest_sha256"] = "sha256:" + controller.canonical_sha256(
+                manifest
+            )
+            write_json(root / "manifest.json", manifest)
+            v3_artifact = controller.extract_analyzer_artifact(
+                **{
+                    **extract_kwargs,
+                    "destination": root / "artifact-v3.json",
+                    "replay_schema": controller.FROZEN_TASK_ANALYSIS_SCHEMA_V3,
+                },
+                allow_deterministic_router_fallback=True,
+            )
+            selected_v3 = v3_artifact["replay_payload"]["entries"]["task-1"]
+            v3_result = frozen_task_analysis_result(
+                v3_artifact["replay_payload"],
+                task_id="task-1",
+                task_input_sha256=selected_v3["task_input_sha256"],
+                prompt_sha256=selected_v3["prompt_sha256"],
+                routed_tier="c1",
+                request_context=request_context,
+                ranking_config=ranking_config,
+            )
+            self.assertEqual(v3_result.model_id, analyzer_routes[1]["model"])
+            self.assertEqual(v3_result.usage, {})
+            self.assertEqual(v3_result.replay["physical_request_count"], 0)
+            trace_rows = original_trace_rows
+            trace_path.write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in trace_rows),
+                encoding="utf-8",
+            )
+            manifest = original_manifest
+            write_json(root / "manifest.json", manifest)
 
             def isolated_validation(snapshot: Path, **kwargs: object) -> dict[str, object]:
                 return {

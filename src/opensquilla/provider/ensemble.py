@@ -4128,6 +4128,7 @@ class EnsembleProvider:
         _admission_controller: ProviderAdmissionController | None = None,
         _admission_settings: ProviderAdmissionSettings | None = None,
         _admission_before_release: Callable[[str], None] | None = None,
+        _absolute_deadline: float | None = None,
     ) -> None:
         self.profile_name = profile_name
         self.proposers = [
@@ -4158,6 +4159,15 @@ class EnsembleProvider:
             )
         self.latency_class = normalized_latency_class
         self._current_deadline_trace: dict[str, Any] | None = None
+        if _absolute_deadline is not None and not math.isfinite(
+            float(_absolute_deadline)
+        ):
+            raise ValueError("ensemble absolute deadline must be finite")
+        self._turn_absolute_deadline = (
+            float(_absolute_deadline)
+            if _absolute_deadline is not None
+            else None
+        )
         self._current_absolute_deadline: float | None = None
         self._current_proposer_phase_deadline: float | None = None
         self._current_proposer_dispatch_deadline: float | None = None
@@ -4394,7 +4404,17 @@ class EnsembleProvider:
             caller_timeout = float(raw_timeout)
         except (TypeError, ValueError):
             caller_timeout = 0.0
-        if not math.isfinite(caller_timeout) or caller_timeout <= 0:
+        caller_deadline = (
+            chat_started + caller_timeout
+            if math.isfinite(caller_timeout) and caller_timeout > 0
+            else None
+        )
+        available_deadlines = [
+            deadline
+            for deadline in (caller_deadline, self._turn_absolute_deadline)
+            if deadline is not None
+        ]
+        if not available_deadlines:
             self._current_absolute_deadline = None
             self._current_proposer_phase_deadline = None
             self._current_proposer_dispatch_deadline = None
@@ -4407,7 +4427,8 @@ class EnsembleProvider:
             }
             return None, None
 
-        absolute_deadline = chat_started + caller_timeout
+        absolute_deadline = min(available_deadlines)
+        effective_budget = max(0.0, absolute_deadline - chat_started)
         reserve_ratio = _ENSEMBLE_AGGREGATOR_RESERVE_RATIO[
             self.latency_class
         ]
@@ -4423,14 +4444,14 @@ class EnsembleProvider:
                     float(self.aggregator_serving_chain_timeout_seconds),
                 ),
             )
-        aggregator_reserve = caller_timeout * reserve_ratio
+        aggregator_reserve = effective_budget * reserve_ratio
         if configured_aggregator_cap > 0:
             aggregator_reserve = min(
                 aggregator_reserve,
                 configured_aggregator_cap,
             )
-        aggregator_reserve = min(caller_timeout, max(0.0, aggregator_reserve))
-        proposer_budget = max(0.0, caller_timeout - aggregator_reserve)
+        aggregator_reserve = min(effective_budget, max(0.0, aggregator_reserve))
+        proposer_budget = max(0.0, effective_budget - aggregator_reserve)
         proposer_phase_deadline = chat_started + proposer_budget
         self._current_absolute_deadline = absolute_deadline
         self._current_proposer_phase_deadline = proposer_phase_deadline
@@ -4438,6 +4459,11 @@ class EnsembleProvider:
             "schema": "opensquilla.ensemble-deadline/v1",
             "latency_class": self.latency_class,
             "caller_timeout_seconds": caller_timeout,
+            "turn_absolute_deadline_applied": (
+                self._turn_absolute_deadline is not None
+                and self._turn_absolute_deadline <= (caller_deadline or math.inf)
+            ),
+            "effective_budget_seconds": effective_budget,
             "absolute_deadline_enabled": True,
             "aggregator_reserve_ratio": reserve_ratio,
             "aggregator_reserve_seconds": aggregator_reserve,
@@ -19283,7 +19309,6 @@ def _build_router_dynamic_members(
     """Build members from the profile-driven Step2 ranking decision."""
 
     from .ranking_router import (
-        TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL,
         DynamicRankingError,
         TaskAnalysisResult,
         _canonical_hash,
@@ -19479,7 +19504,8 @@ def _build_router_dynamic_members(
         )
     decision_id = str(inputs.get("decision_id") or "")
     task_analysis = inputs.get("task_analysis")
-    if not isinstance(task_analysis, TaskAnalysisResult):
+    task_analysis_supplied = isinstance(task_analysis, TaskAnalysisResult)
+    if not task_analysis_supplied:
         fallback_profile = fallback_task_profile(
             routed_tier=routed_tier,
             request_context=request_context,
@@ -19492,6 +19518,39 @@ def _build_router_dynamic_members(
             confidence=max(0.0, min(1.0, routing_confidence)),
             fallback_reason="task_analysis_not_supplied",
         )
+
+    analyzer_execution_contract: dict[str, Any] | None = None
+    analyzer_execution_validation: dict[str, Any] | None = None
+    if task_analysis_supplied and task_analysis.source != "frozen_replay":
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            task_analyzer_execution_contract_from_ranking_config,
+            validate_task_analyzer_execution_trace,
+            validated_task_analyzer_execution_contract,
+        )
+
+        declared_execution_contract = inputs.get(
+            "task_analyzer_execution_contract"
+        )
+        analyzer_execution_contract = validated_task_analyzer_execution_contract(
+            declared_execution_contract
+        )
+        if analyzer_execution_contract is None:
+            analyzer_execution_contract = (
+                task_analyzer_execution_contract_from_ranking_config(
+                    ranking_config
+                )
+            )
+        analyzer_execution_validation, execution_reasons = (
+            validate_task_analyzer_execution_trace(
+                execution_contract=analyzer_execution_contract,
+                analyzer_trace=task_analysis.trace(ranking_config),
+            )
+        )
+        if execution_reasons:
+            raise DynamicRankingError(
+                "router_dynamic task-analyzer execution evidence is invalid: "
+                + ",".join(execution_reasons)
+            )
 
     raw_analyzer_failure_fallback = inputs.get(
         "analyzer_failure_fallback"
@@ -19718,11 +19777,16 @@ def _build_router_dynamic_members(
             retry_context_inputs_out.update(deepcopy(inputs))
             retry_context_inputs_out.update(
                 {
-                    "task_analysis": deepcopy(task_analysis),
                     "request_context": deepcopy(trace_request_context),
                     "ranking_config": deepcopy(dict(ranking_config)),
                 }
             )
+            if task_analysis_supplied:
+                retry_context_inputs_out["task_analysis"] = deepcopy(
+                    task_analysis
+                )
+            else:
+                retry_context_inputs_out.pop("task_analysis", None)
             if user_profile is not None:
                 retry_context_inputs_out["user_profile"] = deepcopy(
                     dict(user_profile)
@@ -19751,11 +19815,6 @@ def _build_router_dynamic_members(
         )
         configured_analyzer_routes = (
             task_analyzer_chain.get("configured_routes")
-            if isinstance(task_analyzer_chain, Mapping)
-            else None
-        )
-        analyzer_attempt_outcomes = (
-            task_analyzer_chain.get("attempt_outcomes")
             if isinstance(task_analyzer_chain, Mapping)
             else None
         )
@@ -19844,58 +19903,10 @@ def _build_router_dynamic_members(
                 == expected_analyzer_routes
             )
         )
-        routes_for_outcome_validation = (
-            expected_analyzer_routes
-            if registry_analyzer_chain_declared
-            else (
-                configured_analyzer_routes
-                if isinstance(configured_analyzer_routes, list)
-                else []
-            )
-        )
         analyzer_chain_evidence_valid = bool(
-            isinstance(task_analyzer_chain, Mapping)
-            and task_analyzer_chain.get("protocol")
-            == TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL
-            and task_analyzer_chain.get("selected_index") is None
-            and task_analyzer_chain.get("exhausted") is True
-            and isinstance(configured_analyzer_routes, list)
-            and bool(configured_analyzer_routes)
+            analyzer_execution_validation is not None
+            and analyzer_execution_validation.get("exhausted") is True
             and analyzer_routes_match_registry
-            and isinstance(analyzer_attempt_outcomes, list)
-            and len(analyzer_attempt_outcomes)
-            == len(routes_for_outcome_validation)
-            and all(
-                isinstance(route, Mapping)
-                and isinstance(outcome, Mapping)
-                and outcome.get("candidate_index") == index
-                and (
-                    normalized_analyzer_route(
-                        outcome,
-                        require_single_attempt=False,
-                    )
-                    == route
-                    if registry_analyzer_chain_declared
-                    else (
-                        outcome.get("provider")
-                        == route.get("provider")
-                        and outcome.get("model") == route.get("model")
-                        and outcome.get("upstream_provider")
-                        == route.get("upstream_provider")
-                    )
-                )
-                and outcome.get("outcome") == "failed"
-                and isinstance(outcome.get("physical_request_count"), int)
-                and not isinstance(outcome.get("physical_request_count"), bool)
-                and outcome.get("physical_request_count") in {0, 1}
-                for index, (route, outcome) in enumerate(
-                    zip(
-                        routes_for_outcome_validation,
-                        analyzer_attempt_outcomes,
-                        strict=True,
-                    )
-                )
-            )
         )
         if (
             not analyzer_chain_evidence_valid
@@ -19923,6 +19934,9 @@ def _build_router_dynamic_members(
             "ranking_config_hash": _canonical_hash(ranking_config),
             "ranking_parameters": deepcopy(dict(ranking_config)),
             "task_analyzer": task_analyzer_trace,
+            "task_analyzer_execution_contract": deepcopy(
+                analyzer_execution_contract
+            ),
             "task_profile": trace_task_profile,
             "task_profile_hash": _canonical_hash(trace_task_profile),
             "task_profile_pre_escalation": deepcopy(trace_task_profile),
@@ -20254,6 +20268,10 @@ def _build_router_dynamic_members(
         decision.trace["runtime_health_filter"] = runtime_health_filter_trace
     if allowlist_trace is not None:
         decision.trace["candidate_allowlist"] = allowlist_trace
+    if analyzer_execution_contract is not None:
+        decision.trace["task_analyzer_execution_contract"] = deepcopy(
+            analyzer_execution_contract
+        )
     if retry_exclusions:
         decision.trace["retry_parent_decision_id"] = retry_parent_decision_id
         decision.trace["retry_excluded_proposer_identities"] = sorted(retry_exclusions)
@@ -20452,11 +20470,16 @@ def _build_router_dynamic_members(
         retry_context_inputs_out.update(deepcopy(inputs))
         retry_context_inputs_out.update(
             {
-                "task_analysis": deepcopy(task_analysis),
                 "request_context": deepcopy(dict(request_context)),
                 "ranking_config": deepcopy(dict(ranking_config)),
             }
         )
+        if task_analysis_supplied:
+            retry_context_inputs_out["task_analysis"] = deepcopy(
+                task_analysis
+            )
+        else:
+            retry_context_inputs_out.pop("task_analysis", None)
         if user_profile is not None:
             retry_context_inputs_out["user_profile"] = deepcopy(
                 dict(user_profile)
@@ -21028,6 +21051,7 @@ class _DefaultRouterDynamicRetryFactory:
         repr=False,
         compare=False,
     )
+    absolute_deadline: float | None = None
 
     def __call__(
         self,
@@ -21052,6 +21076,7 @@ class _DefaultRouterDynamicRetryFactory:
             _session_key=self.session_key,
             _fallback_selector=self.fallback_selector,
             _provider_health_ledger=self.provider_health_ledger,
+            _absolute_deadline=self.absolute_deadline,
         )
 
 
@@ -21071,6 +21096,7 @@ def build_ensemble_provider_from_config(
     _session_key: str = "",
     _fallback_selector: Any | None = None,
     _provider_health_ledger: Any | None = None,
+    _absolute_deadline: float | None = None,
 ) -> EnsembleProvider:
     ensemble_cfg = getattr(config, "llm_ensemble", None)
     if ensemble_cfg is None:
@@ -21500,6 +21526,7 @@ def build_ensemble_provider_from_config(
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
         _provider_health_ledger=live_provider_health_ledger,
         _admission_settings=admission_settings,
+        _absolute_deadline=_absolute_deadline,
     )
     if selection_mode == "router_dynamic":
         if router_dynamic_retry_factory is None:
@@ -21538,6 +21565,7 @@ def build_ensemble_provider_from_config(
                     session_key=_session_key,
                     fallback_selector=_fallback_selector,
                     provider_health_ledger=_provider_health_ledger,
+                    absolute_deadline=_absolute_deadline,
                 )
             )
         initial_plan = provider.selection_plan_execution_snapshot()

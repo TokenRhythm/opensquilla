@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-ranking-config-v4",
-  "config_version": "step2-ranking-2026-08-10.1",
+  "config_version": "step2-ranking-2026-08-11.1",
   "validation": {
     "weight_sum_tolerance": 1e-9,
     "task_profile_sum_tolerance": 0.02
@@ -91,15 +91,32 @@
     "provider": "openrouter",
     "model": "anthropic/claude-opus-4.8",
     "upstream_provider": "anthropic",
+    "fallback_chain": [
+      {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.6-sol",
+        "upstream_provider": "azure"
+      },
+      {
+        "provider": "openrouter",
+        "model": "google/gemini-3.1-pro-preview",
+        "upstream_provider": "google-ai-studio"
+      }
+    ],
     "timeout_seconds": 20.0,
+    "total_timeout_seconds": 60.0,
     "stream_close_timeout_seconds": 1.0,
     "input_max_chars": 24000,
+    "payload_max_chars": 48000,
+    "payload_max_bytes": 96000,
+    "payload_max_estimated_tokens": 32000,
     "response_max_chars": 48000,
     "max_output_tokens": 1200,
     "temperature": 0.0,
     "thinking": false,
     "default_confidence": 0.80,
     "max_retries": 3,
+    "schema_repair_max_retries": 1,
     "truncation_head_fraction": 0.50
   },
   "fallback_task_profile": {

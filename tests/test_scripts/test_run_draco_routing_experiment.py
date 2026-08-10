@@ -220,14 +220,14 @@ def _with_g1_task_analysis_invariants(
         },
         "thinking_assignment_details": thinking_details,
         "task_analyzer": {
-            "source": "test_analyzer",
+            "source": "llm_provider",
             "schema_valid": True,
             "confidence": 0.9,
             "analyzer_version": "test-v1",
             "provider": "openrouter",
             "model": "anthropic/claude-opus-4.8",
             "fallback_reason": "",
-            "usage": {},
+            "usage": _task_analyzer_usage([_task_analyzer_unit()]),
             "normalization_warnings": [],
         },
         "task_profile": task_profile,
@@ -5186,9 +5186,16 @@ async def test_managed_g1_audits_success_before_judge_or_acceptance(
     [True, False],
     ids=["managed", "default-off-missing"],
 )
+@pytest.mark.parametrize(
+    ("explicit_analyzer_chain", "common_single_route"),
+    [(True, False), (False, False), (False, True)],
+    ids=["explicit-chain", "common-chain", "common-single-chain"],
+)
 async def test_g1_provider_native_recovery_runs_task_analysis_once(
     module,
     thinking_assignment_enabled: bool,
+    explicit_analyzer_chain: bool,
+    common_single_route: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.provider.ranking_router import (
@@ -5207,6 +5214,13 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
         thinking_assignment_enabled=thinking_assignment_enabled,
     )
     experiment_payload = experiment.model_dump(mode="json")
+    if not explicit_analyzer_chain:
+        experiment_payload["g1_routing"].pop("live_task_analyzer_chain")
+        experiment_payload["g1_routing"].pop("analyzer_failure_fallback_ensemble")
+    if common_single_route:
+        experiment_payload["router_dynamic_ranking_override"] = {
+            "task_analyzer": {"fallback_chain": []}
+        }
     experiment_payload["ensemble"].update(
         {
             "shuffle_candidates": True,
@@ -5231,6 +5245,10 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
         "enabled": True,
         "selection_mode": "router_dynamic",
     }
+    if common_single_route:
+        ensemble_config["ranking_config_override"] = {
+            "task_analyzer": {"fallback_chain": []}
+        }
     if thinking_assignment_enabled:
         ensemble_config["ranking_thinking_assignment_enabled"] = True
     config = GatewayConfig(
@@ -5248,6 +5266,8 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
     )
     contract = _resolved_g1_registry_contract(module, experiment, config)
     analyzer_calls = 0
+    captured_analyzer_routes: list[tuple[str, str, str]] = []
+    captured_schema_repair_max_retries: list[int | None] = []
 
     async def fake_run_pipeline(turn, _steps):
         turn.model = inherited.model
@@ -5264,7 +5284,16 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
     async def fake_analyze_task_with_fallback_chain(**kwargs):
         nonlocal analyzer_calls
         analyzer_calls += 1
+        captured_schema_repair_max_retries.append(kwargs["schema_repair_max_retries"])
         candidates = kwargs["candidates"]
+        captured_analyzer_routes.extend(
+            (
+                candidate.provider_id,
+                candidate.model_id,
+                candidate.upstream_provider,
+            )
+            for candidate in candidates
+        )
         analyzer_provider = candidates[0].provider_id
         analyzer_model = candidates[0].model_id
         return TaskAnalysisResult(
@@ -5273,7 +5302,7 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
                 request_context=kwargs["request_context"],
                 ranking_config=kwargs["ranking_config"],
             ),
-            source="test_analyzer",
+            source="llm_provider",
             schema_valid=True,
             confidence=0.9,
             usage={
@@ -5284,6 +5313,27 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
                 "input_tokens": 5,
                 "output_tokens": 2,
                 "attempt_count": 1,
+                "physical_attempts": [
+                    {
+                        "attempt": 1,
+                        "physical_attempt_id": "d" * 32,
+                        "provider": analyzer_provider,
+                        "model": analyzer_model,
+                        "requested_provider": analyzer_provider,
+                        "requested_model": analyzer_model,
+                        "input_tokens": 5,
+                        "output_tokens": 2,
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "billed_cost": 0.0,
+                        "provider_usage": {
+                            "provider": analyzer_provider,
+                            "model": analyzer_model,
+                            "physical_attempt_id": "d" * 32,
+                        },
+                    }
+                ],
             },
             provider_id=str(analyzer_provider),
             model_id=str(analyzer_model),
@@ -5348,6 +5398,21 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
         assert all(field not in plan for field in managed_fields)
 
     assert analyzer_calls == 1
+    expected_analyzer_routes = [
+        ("openrouter", "anthropic/claude-opus-4.8", "anthropic"),
+        ("openrouter", "openai/gpt-5.6-sol", "azure"),
+        (
+            "openrouter",
+            "google/gemini-3.1-pro-preview",
+            "google-ai-studio",
+        ),
+    ]
+    if common_single_route:
+        expected_analyzer_routes = expected_analyzer_routes[:1]
+    assert captured_analyzer_routes == expected_analyzer_routes
+    assert captured_schema_repair_max_retries == [
+        0 if explicit_analyzer_chain else None
+    ]
     assert not hasattr(
         build.provider,
         "_draco_reasoning_only_retry_factory",
@@ -5438,7 +5503,15 @@ async def test_g1_exhausted_analyzer_chain_materializes_fixed_complete_only_fall
                 "requested_model": candidate.model_id,
                 "input_tokens": 5,
                 "output_tokens": 2,
-                "provider_usage": {"physical_attempt_id": f"{index:032x}"},
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "billed_cost": 0.0,
+                "provider_usage": {
+                    "provider": candidate.provider_id,
+                    "model": candidate.model_id,
+                    "physical_attempt_id": f"{index:032x}",
+                },
             }
             for index, candidate in enumerate(candidates, start=1)
         ]
@@ -5451,7 +5524,7 @@ async def test_g1_exhausted_analyzer_chain_materializes_fixed_complete_only_fall
             source="router_fallback",
             schema_valid=False,
             confidence=0.0,
-            fallback_reason="analyzer_chain_exhausted",
+            fallback_reason="TimeoutError",
             usage={
                 "attempt_count": len(physical_attempts),
                 "physical_attempts": physical_attempts,
@@ -12226,9 +12299,36 @@ def _task_analyzer_unit(
         "cost_source": "provider_billed",
         "request_count": 1,
         "provider_usage": {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
             "physical_attempt_id": physical_attempt_id,
         },
     }
+
+
+def _task_analyzer_usage(
+    units: list[dict[str, object]],
+) -> dict[str, object]:
+    attempts = deepcopy(units)
+    usage: dict[str, object] = {
+        "attempt_count": len(attempts),
+        "physical_attempts": attempts,
+    }
+    for field in (
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+    ):
+        usage[field] = sum(int(unit.get(field) or 0) for unit in attempts)
+    usage["billed_cost"] = sum(
+        float(unit.get("billed_cost") or 0.0) for unit in attempts
+    )
+    unknown_count = sum(unit.get("usage_unknown") is True for unit in attempts)
+    if unknown_count:
+        usage["usage_unknown_count"] = unknown_count
+    return usage
 
 
 def _unknown_task_analyzer_unit(
@@ -12252,9 +12352,12 @@ def _unknown_task_analyzer_unit(
         "cache_write_tokens": 0,
         "billed_cost": 0.0,
         "cost_source": "none",
+        "usage_unknown": True,
+        "unknown_reason": "physical_receipt_unavailable",
         "request_count": 1,
         "provider_usage": {
             "usage_unknown": True,
+            "unknown_reason": "physical_receipt_unavailable",
             "physical_attempt_id": physical_attempt_id,
         },
     }
@@ -12276,7 +12379,11 @@ def _frozen_g1_plan(
         }
     )
     ranking_parameters = load_ranking_config()
-    ranking_parameters["task_analyzer"]["max_retries"] = 2
+    analyzer = ranking_parameters["task_analyzer"]
+    analyzer.pop("fallback_chain", None)
+    analyzer.pop("schema_repair_max_retries", None)
+    analyzer.pop("total_timeout_seconds", None)
+    analyzer["max_retries"] = 2
     plan["ranking_parameters"] = ranking_parameters
     return plan
 
@@ -12837,7 +12944,7 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
                 request_context=kwargs["request_context"],
                 ranking_config=kwargs["ranking_config"],
             ),
-            source="test_analyzer",
+            source="llm_provider",
             schema_valid=True,
             confidence=0.9,
             usage={
@@ -12848,6 +12955,27 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
                 "input_tokens": 5,
                 "output_tokens": 2,
                 "attempt_count": 1,
+                "physical_attempts": [
+                    {
+                        "attempt": 1,
+                        "physical_attempt_id": "d" * 32,
+                        "provider": analyzer_provider,
+                        "model": analyzer_model,
+                        "requested_provider": analyzer_provider,
+                        "requested_model": analyzer_model,
+                        "input_tokens": 5,
+                        "output_tokens": 2,
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "billed_cost": 0.0,
+                        "provider_usage": {
+                            "provider": analyzer_provider,
+                            "model": analyzer_model,
+                            "physical_attempt_id": "d" * 32,
+                        },
+                    }
+                ],
             },
             provider_id=str(analyzer_provider),
             model_id=str(analyzer_model),
@@ -13454,6 +13582,7 @@ def test_resume_frozen_g1_accepts_unknown_then_successful_analyzer(
             physical_attempt_id="b" * 32,
         ),
     ]
+    plan["task_analyzer"]["usage"] = _task_analyzer_usage(analyzer_units)
     run, failures = _frozen_g1_failure_run(
         resume_runner,
         plan=plan,
@@ -20927,6 +21056,11 @@ def _exhausted_live_analyzer_chain_lifecycle_row() -> tuple[
     ]
     plan = {
         "task_analyzer": {
+            "source": "router_fallback",
+            "schema_valid": False,
+            "provider": routes[-1]["provider"],
+            "model": routes[-1]["model"],
+            "fallback_reason": "TimeoutError",
             "chain": {
                 "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
                 "configured_routes": configured_routes,
@@ -20953,7 +21087,9 @@ def _exhausted_live_analyzer_chain_lifecycle_row() -> tuple[
         )
         unit["model"] = route["model"]
         unit["requested_model"] = route["model"]
+        unit["provider_usage"]["model"] = route["model"]
         analyzer_units.append(unit)
+    plan["task_analyzer"]["usage"] = _task_analyzer_usage(analyzer_units)
     run = {
         "llm_request_count": len(analyzer_units),
         "routing_trace": {"selection_plan": deepcopy(plan)},
@@ -21010,10 +21146,22 @@ def test_resume_provider_lifecycle_accepts_later_live_analyzer_success(
     chain["attempt_outcomes"] = outcomes
     chain["selected_index"] = selected_index
     chain["exhausted"] = False
+    plan["task_analyzer"].update(
+        {
+            "source": "llm_provider",
+            "schema_valid": True,
+            "provider": chain["configured_routes"][selected_index]["provider"],
+            "model": chain["configured_routes"][selected_index]["model"],
+            "fallback_reason": "",
+        }
+    )
     run["setup_usage"] = run["setup_usage"][: selected_index + 1]
     run["usage"]["model_usage_breakdown"] = run["usage"][
         "model_usage_breakdown"
     ][: selected_index + 1]
+    plan["task_analyzer"]["usage"] = _task_analyzer_usage(
+        run["setup_usage"]
+    )
     run["llm_request_count"] = selected_index + 1
 
     assert resume_runner.g1_provider_lifecycle_analyzer_reasons(

@@ -82,10 +82,13 @@ from opensquilla.provider.protocol import (
 from opensquilla.provider.ranking_router import (
     DynamicRankingError,
     TaskAnalysisResult,
+    TaskAnalyzerCandidate,
+    analyze_task_with_fallback_chain,
     build_request_context,
     build_router_dynamic_task_analysis_reuse_binding,
     fallback_task_profile,
     load_model_registry_snapshot,
+    ranking_config_resolution,
 )
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import (
@@ -4208,6 +4211,9 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
         llm_ensemble={
             "enabled": True,
             "selection_mode": "router_dynamic",
+            "ranking_config_override": {
+                "task_analyzer": {"fallback_chain": []}
+            },
             "min_successful_proposers": 3,
             "shuffle_candidates": False,
             "aggregator_recovery_mode": "experiment",
@@ -4302,7 +4308,35 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
                 source="router_fallback",
                 schema_valid=False,
                 confidence=0.0,
-                fallback_reason="analyzer_chain_exhausted",
+                fallback_reason="TimeoutError",
+                usage={
+                    "physical_attempts": [
+                        {
+                            "attempt": 1,
+                            "physical_attempt_id": "1" * 32,
+                            "provider": "openrouter",
+                            "model": "anthropic/claude-opus-4.8",
+                            "requested_provider": "openrouter",
+                            "requested_model": (
+                                "anthropic/claude-opus-4.8"
+                            ),
+                            "input_tokens": 10,
+                            "output_tokens": 1,
+                            "reasoning_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "billed_cost": 0.0,
+                            "provider_usage": {
+                                "provider": "openrouter",
+                                "model": "anthropic/claude-opus-4.8",
+                                "physical_attempt_id": "1" * 32,
+                            },
+                        }
+                    ],
+                    "attempt_count": 1,
+                },
+                provider_id="openrouter",
+                model_id="anthropic/claude-opus-4.8",
                 chain_trace=deepcopy(exhausted_chain_trace),
             ),
             "analyzer_failure_fallback": fallback,
@@ -4325,7 +4359,35 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
                 source="router_fallback",
                 schema_valid=False,
                 confidence=0.0,
-                fallback_reason="analyzer_chain_exhausted",
+                fallback_reason="TimeoutError",
+                usage={
+                    "physical_attempts": [
+                        {
+                            "attempt": 1,
+                            "physical_attempt_id": "2" * 32,
+                            "provider": "openrouter",
+                            "model": "anthropic/claude-opus-4.8",
+                            "requested_provider": "openrouter",
+                            "requested_model": (
+                                "anthropic/claude-opus-4.8"
+                            ),
+                            "input_tokens": 10,
+                            "output_tokens": 1,
+                            "reasoning_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "billed_cost": 0.0,
+                            "provider_usage": {
+                                "provider": "openrouter",
+                                "model": "anthropic/claude-opus-4.8",
+                                "physical_attempt_id": "2" * 32,
+                            },
+                        }
+                    ],
+                    "attempt_count": 1,
+                },
+                provider_id="openrouter",
+                model_id="anthropic/claude-opus-4.8",
                 chain_trace=deepcopy(exhausted_chain_trace),
             ),
             "analyzer_failure_fallback": fallback,
@@ -4430,7 +4492,7 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
     for invalid_trace in [mismatched_chain_trace, overcounted_chain_trace]:
         with pytest.raises(
             DynamicRankingError,
-            match="authenticated exhausted task-analyzer chain trace",
+            match="task-analyzer execution evidence is invalid",
         ):
             build_ensemble_provider_from_config(
                 config=config,
@@ -4465,6 +4527,40 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
     fallback_with_conflicting_shared_model_pin["aggregator"][
         "upstream_provider"
     ] = "other-z-ai"
+    valid_exhausted_task_analysis = TaskAnalysisResult(
+        profile={},
+        source="router_fallback",
+        schema_valid=False,
+        confidence=0.0,
+        fallback_reason="TimeoutError",
+        usage={
+            "physical_attempts": [
+                {
+                    "attempt": 1,
+                    "physical_attempt_id": "3" * 32,
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-opus-4.8",
+                    "requested_provider": "openrouter",
+                    "requested_model": "anthropic/claude-opus-4.8",
+                    "input_tokens": 10,
+                    "output_tokens": 1,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "billed_cost": 0.0,
+                    "provider_usage": {
+                        "provider": "openrouter",
+                        "model": "anthropic/claude-opus-4.8",
+                        "physical_attempt_id": "3" * 32,
+                    },
+                }
+            ],
+            "attempt_count": 1,
+        },
+        provider_id="openrouter",
+        model_id="anthropic/claude-opus-4.8",
+        chain_trace=deepcopy(exhausted_chain_trace),
+    )
     for invalid_fallback, error_match in [
         (fallback_with_unknown_key, "unsupported keys"),
         (route_with_unknown_key, "unsupported keys"),
@@ -4482,13 +4578,8 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
                 fallback_provider=None,
                 turn_metadata={"routed_tier": "c2"},
                 ranking_inputs={
-                    "task_analysis": TaskAnalysisResult(
-                        profile={},
-                        source="router_fallback",
-                        schema_valid=False,
-                        confidence=0.0,
-                        fallback_reason="analyzer_chain_exhausted",
-                        chain_trace=deepcopy(exhausted_chain_trace),
+                    "task_analysis": deepcopy(
+                        valid_exhausted_task_analysis
                     ),
                     "analyzer_failure_fallback": invalid_fallback,
                 },
@@ -4503,6 +4594,9 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
         llm_ensemble={
             "enabled": True,
             "selection_mode": "router_dynamic",
+            "ranking_config_override": {
+                "task_analyzer": {"fallback_chain": []}
+            },
             "shuffle_candidates": False,
         },
     )
@@ -4524,9 +4618,60 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
                         "input_modalities": ["text"],
                     },
                 ),
-                source="test",
+                source="llm_provider",
                 schema_valid=True,
                 confidence=1.0,
+                usage={
+                    "physical_attempts": [
+                        {
+                            "attempt": 1,
+                            "physical_attempt_id": "4" * 32,
+                            "provider": "openrouter",
+                            "model": "anthropic/claude-opus-4.8",
+                            "requested_provider": "openrouter",
+                            "requested_model": (
+                                "anthropic/claude-opus-4.8"
+                            ),
+                            "input_tokens": 10,
+                            "output_tokens": 1,
+                            "reasoning_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "billed_cost": 0.0,
+                            "provider_usage": {
+                                "provider": "openrouter",
+                                "model": "anthropic/claude-opus-4.8",
+                                "physical_attempt_id": "4" * 32,
+                            },
+                        }
+                    ],
+                    "attempt_count": 1,
+                },
+                provider_id="openrouter",
+                model_id="anthropic/claude-opus-4.8",
+                chain_trace={
+                    "protocol": (
+                        "opensquilla.task-analyzer-fallback-chain/v1"
+                    ),
+                    "configured_routes": deepcopy(
+                        exhausted_chain_trace["configured_routes"]
+                    ),
+                    "attempt_outcomes": [
+                        {
+                            "candidate_index": 0,
+                            **deepcopy(
+                                exhausted_chain_trace[
+                                    "configured_routes"
+                                ][0]
+                            ),
+                            "outcome": "success",
+                            "reason": "",
+                            "physical_request_count": 1,
+                        }
+                    ],
+                    "selected_index": 0,
+                    "exhausted": False,
+                },
             ),
             "analyzer_failure_fallback": fallback,
         },
@@ -7828,6 +7973,89 @@ async def test_fallback_stream_cannot_reset_the_ensemble_absolute_deadline(
         [event for event in events if isinstance(event, TextDeltaEvent)]
     ) < 6
     assert error.ensemble_trace["deadline"]["triggered_stage"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_analyzer_exhausted_turn_deadline_starts_no_proposer_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _AnalyzerThatMustNotStart:
+        calls = 0
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            self.calls += 1
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                yield DoneEvent(model="analyzer")
+
+            return _stream()
+
+    ranking_config = ranking_config_resolution()["effective_config"]
+    analyzer_policy = ranking_config["task_analyzer"]
+    analyzer_provider = _AnalyzerThatMustNotStart()
+    deadline = time.monotonic() - 0.001
+    request_context = build_request_context(
+        message="shared deadline",
+        turn_metadata={},
+        attachments=[],
+        candidate_output_tokens=8192,
+        aggregator_output_tokens=8192,
+        ranking_config=ranking_config,
+    )
+    analysis = await analyze_task_with_fallback_chain(
+        candidates=[
+            TaskAnalyzerCandidate(
+                provider=analyzer_provider,
+                provider_id=str(analyzer_policy["provider"]),
+                model_id=str(analyzer_policy["model"]),
+                upstream_provider=str(analyzer_policy["upstream_provider"]),
+            )
+        ],
+        message="shared deadline",
+        user_profile_enabled=False,
+        request_context=request_context,
+        routed_tier="c1",
+        routing_confidence=0.5,
+        absolute_deadline=deadline,
+        ranking_config=ranking_config,
+    )
+    assert analysis.schema_valid is False
+    assert analysis.chain_trace["deadline"]["expired"] is True
+    assert analysis.usage["attempt_count"] == 0
+    assert analyzer_provider.calls == 0
+
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([DoneEvent(model="p1")]),
+            "agg": _FakePlan([DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="shared-turn-deadline",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        _absolute_deadline=deadline,
+    )
+
+    events = await _collect(provider)
+
+    assert registry.calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.ensemble_trace is not None
+    assert error.ensemble_trace["llm_request_count"] == 0
+    assert error.ensemble_trace["physical_request_count"] == 0
 
 
 @pytest.mark.asyncio

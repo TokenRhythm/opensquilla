@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time as stdlib_time
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from typing import Any
@@ -73,6 +74,89 @@ def _static_b5_config(**ensemble_overrides: Any) -> GatewayConfig:
     return GatewayConfig(
         squilla_router=SquillaRouterConfig(enabled=False),
         llm_ensemble={"enabled": True, **ensemble_overrides},
+    )
+
+
+def _successful_chain_analysis(
+    kwargs: dict[str, Any],
+    *,
+    profile_override: dict[str, Any] | None = None,
+) -> TaskAnalysisResult:
+    candidates = list(kwargs["candidates"])
+    selected = candidates[0]
+    profile = fallback_task_profile(
+        routed_tier=str(kwargs["routed_tier"]),
+        request_context=kwargs["request_context"],
+    )
+    configured_routes = [
+        {
+            "provider": candidate.provider_id,
+            "model": candidate.model_id,
+            "upstream_provider": candidate.upstream_provider,
+        }
+        for candidate in candidates
+    ]
+    physical_attempt = {
+        "attempt": 1,
+        "physical_attempt_id": "1" * 32,
+        "provider": selected.provider_id,
+        "model": selected.model_id,
+        "requested_provider": selected.provider_id,
+        "requested_model": selected.model_id,
+        "input_tokens": 10,
+        "output_tokens": 1,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "billed_cost": 0.0,
+        "provider_usage": {
+            "provider": selected.provider_id,
+            "model": selected.model_id,
+            "physical_attempt_id": "1" * 32,
+        },
+    }
+    return TaskAnalysisResult(
+        profile=profile_override or profile,
+        source="llm_provider",
+        schema_valid=True,
+        confidence=1.0,
+        usage={
+            "physical_attempts": [physical_attempt],
+            "attempt_count": 1,
+            "input_tokens": 10,
+            "output_tokens": 1,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.0,
+        },
+        provider_id=selected.provider_id,
+        model_id=selected.model_id,
+        chain_trace={
+            "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+            "configured_routes": configured_routes,
+            "attempt_outcomes": [
+                {
+                    "candidate_index": 0,
+                    **configured_routes[0],
+                    "outcome": "success",
+                    "reason": "",
+                    "physical_request_count": 1,
+                }
+            ],
+            "selected_index": 0,
+            "exhausted": False,
+            "schema_repair_max_retries": kwargs.get(
+                "schema_repair_max_retries",
+                1,
+            ),
+            "deadline": {
+                "configured_seconds": 1.0,
+                "elapsed_seconds": 0.0,
+                "remaining_seconds": 1.0,
+                "expired": False,
+            },
+        },
     )
 
 
@@ -476,7 +560,7 @@ async def test_router_dynamic_wrap_is_not_credential_gated(
         TASK_ANALYZER_PROVIDER_ID
     )
     assert turn.metadata["router_dynamic_task_analyzer"]["model"] == (
-        TASK_ANALYZER_MODEL_ID
+        "google/gemini-3.1-pro-preview"
     )
     assert turn.metadata["router_dynamic_task_analyzer"]["fallback_reason"] == (
         "provider_unavailable"
@@ -542,45 +626,43 @@ async def test_router_dynamic_wraps_with_pinned_skill_loader_metadata(
     assert "skill_loader" not in retry_factory.turn_metadata
 
 
-async def test_router_dynamic_uses_fixed_opus_task_analyzer(
+@pytest.mark.parametrize("single_route", [False, True], ids=["fallbacks", "single"])
+async def test_router_dynamic_uses_ordered_task_analyzer_chain(
     monkeypatch: pytest.MonkeyPatch,
+    single_route: bool,
 ) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-synthetic")
-    fixed_analyzer_provider = object()
+    fixed_analyzer_provider = _Provider()
     provider_builds: list[ProviderConfig] = []
     analyzer_calls: list[dict[str, Any]] = []
 
-    def fake_resolve(selector: Any) -> object:
+    def fake_resolve(selector: Any) -> _Provider:
         provider_builds.append(selector.current_config)
         return fixed_analyzer_provider
 
-    async def fake_analyze_task_with_provider(**kwargs: Any) -> TaskAnalysisResult:
+    async def fake_analyze_task_with_fallback_chain(**kwargs: Any) -> TaskAnalysisResult:
         analyzer_calls.append(kwargs)
-        profile = fallback_task_profile(
-            routed_tier=str(kwargs["routed_tier"]),
-            request_context=kwargs["request_context"],
-        )
-        return TaskAnalysisResult(
-            profile=profile,
-            source="test",
-            schema_valid=True,
-            confidence=1.0,
-            provider_id=str(kwargs["analyzer_provider_id"]),
-            model_id=str(kwargs["analyzer_model_id"]),
-        )
+        return _successful_chain_analysis(kwargs)
 
     monkeypatch.setattr(
         "opensquilla.provider.selector.ModelSelector.resolve",
         fake_resolve,
     )
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
-        fake_analyze_task_with_provider,
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        fake_analyze_task_with_fallback_chain,
     )
+    ensemble_overrides: dict[str, Any] = {
+        "selection_mode": "router_dynamic",
+        "ranking_user_profile_generation_enabled": False,
+        "ranking_user_profile_enabled": True,
+    }
+    if single_route:
+        ensemble_overrides["ranking_config_override"] = {
+            "task_analyzer": {"fallback_chain": []}
+        }
     config = _static_b5_config(
-        selection_mode="router_dynamic",
-        ranking_user_profile_generation_enabled=False,
-        ranking_user_profile_enabled=True,
+        **ensemble_overrides,
     )
     config.llm.provider_routing = {TASK_ANALYZER_MODEL_ID: "anthropic"}
     runner = TurnRunner(provider_selector=None, config=config)
@@ -597,20 +679,35 @@ async def test_router_dynamic_uses_fixed_opus_task_analyzer(
     )
 
     assert isinstance(provider, EnsembleProvider)
-    assert len(provider_builds) == 1
-    analyzer_config = provider_builds[0]
-    assert analyzer_config.provider == TASK_ANALYZER_PROVIDER_ID
-    assert analyzer_config.model == TASK_ANALYZER_MODEL_ID
-    assert analyzer_config.api_key == "sk-or-synthetic"
-    assert analyzer_config.base_url == "https://openrouter.ai/api/v1"
-    assert analyzer_config.provider_routing == {
-        TASK_ANALYZER_MODEL_ID: "anthropic"
-    }
-    assert analyzer_config.replay_provider_state is False
+    expected_models = [
+        TASK_ANALYZER_MODEL_ID,
+        "openai/gpt-5.6-sol",
+        "google/gemini-3.1-pro-preview",
+    ]
+    expected_upstreams = ["anthropic", "azure", "google-ai-studio"]
+    if single_route:
+        expected_models = expected_models[:1]
+        expected_upstreams = expected_upstreams[:1]
+    assert [analyzer_config.model for analyzer_config in provider_builds] == expected_models
+    assert [
+        analyzer_config.provider_routing[analyzer_config.model]
+        for analyzer_config in provider_builds
+    ] == expected_upstreams
+    assert all(
+        analyzer_config.provider == TASK_ANALYZER_PROVIDER_ID
+        and analyzer_config.api_key == "sk-or-synthetic"
+        and analyzer_config.base_url == "https://openrouter.ai/api/v1"
+        and analyzer_config.replay_provider_state is False
+        for analyzer_config in provider_builds
+    )
     assert len(analyzer_calls) == 1
-    assert analyzer_calls[0]["provider"] is fixed_analyzer_provider
-    assert analyzer_calls[0]["analyzer_provider_id"] == TASK_ANALYZER_PROVIDER_ID
-    assert analyzer_calls[0]["analyzer_model_id"] == TASK_ANALYZER_MODEL_ID
+    candidates = analyzer_calls[0]["candidates"]
+    assert [candidate.provider for candidate in candidates] == [
+        fixed_analyzer_provider
+    ] * len(expected_models)
+    assert [candidate.model_id for candidate in candidates] == [
+        analyzer_config.model for analyzer_config in provider_builds
+    ]
     assert analyzer_calls[0]["user_profile_enabled"] is True
     assert "user_profile" not in analyzer_calls[0]
     assert turn.metadata["routed_model_before_ensemble"] != TASK_ANALYZER_MODEL_ID
@@ -622,28 +719,176 @@ async def test_router_dynamic_uses_fixed_opus_task_analyzer(
     )
 
 
+@pytest.mark.parametrize(
+    ("configured_chain", "expected_admission_seconds"),
+    [(True, 60.0), (False, 20.0)],
+    ids=["configured-chain", "legacy-single"],
+)
+async def test_router_dynamic_analyzer_admission_deadline_matches_execution_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_chain: bool,
+    expected_admission_seconds: float,
+) -> None:
+    from opensquilla.eval.draco_task_analyzer_execution import (
+        task_analyzer_execution_contract_from_ranking_config,
+    )
+    from opensquilla.provider.ranking_router import (
+        TaskAnalysisResult,
+        task_analyzer_chain_policy,
+        task_analyzer_policy,
+    )
+
+    fixed_now = 1_000_000_000.0
+
+    class FixedRuntimeTime:
+        @staticmethod
+        def monotonic() -> float:
+            return fixed_now
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(stdlib_time, name)
+
+    config = _static_b5_config(selection_mode="router_dynamic")
+    resolution = config.llm_ensemble.ranking_config_resolution_snapshot()
+    ranking_config = deepcopy(resolution["effective_config"])
+    if not configured_chain:
+        analyzer_config = ranking_config["task_analyzer"]
+        for field in (
+            "fallback_chain",
+            "schema_repair_max_retries",
+            "total_timeout_seconds",
+            "payload_max_chars",
+            "payload_max_bytes",
+            "payload_max_estimated_tokens",
+        ):
+            analyzer_config.pop(field)
+    resolution["effective_config"] = ranking_config
+    monkeypatch.setattr(
+        type(config.llm_ensemble),
+        "ranking_config_resolution_snapshot",
+        lambda _self: deepcopy(resolution),
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime.time",
+        FixedRuntimeTime(),
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-synthetic")
+
+    captured: dict[str, Any] = {}
+
+    async def fake_chain(**kwargs: Any) -> TaskAnalysisResult:
+        captured.update(kwargs)
+        captured["executor"] = "chain"
+        return _successful_chain_analysis(kwargs)
+
+    async def fake_legacy(**kwargs: Any) -> TaskAnalysisResult:
+        captured.update(kwargs)
+        captured["executor"] = "legacy"
+        provider_id = str(kwargs["analyzer_provider_id"])
+        model_id = str(kwargs["analyzer_model_id"])
+        attempt_id = "2" * 32
+        physical_attempt = {
+            "attempt": 1,
+            "physical_attempt_id": attempt_id,
+            "provider": provider_id,
+            "model": model_id,
+            "requested_provider": provider_id,
+            "requested_model": model_id,
+            "input_tokens": 10,
+            "output_tokens": 1,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.0,
+            "provider_usage": {
+                "provider": provider_id,
+                "model": model_id,
+                "physical_attempt_id": attempt_id,
+            },
+        }
+        return TaskAnalysisResult(
+            profile=fallback_task_profile(
+                routed_tier=str(kwargs["routed_tier"]),
+                request_context=kwargs["request_context"],
+            ),
+            source="llm_provider",
+            schema_valid=True,
+            confidence=1.0,
+            usage={
+                "physical_attempts": [physical_attempt],
+                "attempt_count": 1,
+                "input_tokens": 10,
+                "output_tokens": 1,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "billed_cost": 0.0,
+            },
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        fake_chain,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        fake_legacy,
+    )
+    runner = TurnRunner(provider_selector=None, config=config)
+    selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
+    turn_deadline = fixed_now + 1_000.0
+
+    turn, provider = await runner._run_pipeline(
+        "capture analyzer deadline",
+        f"agent:main:analyzer-deadline-{configured_chain}",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+        turn_absolute_deadline=turn_deadline,
+    )
+
+    assert isinstance(provider, EnsembleProvider), turn.metadata.get(
+        "router_dynamic_ranking_error"
+    )
+    assert captured["executor"] == ("chain" if configured_chain else "legacy")
+    assert captured["admission_deadline"] == (
+        fixed_now + expected_admission_seconds
+    )
+    absolute_key = "absolute_deadline" if configured_chain else "_absolute_deadline"
+    assert captured[absolute_key] == turn_deadline
+    execution_contract = task_analyzer_execution_contract_from_ranking_config(
+        ranking_config
+    )
+    assert execution_contract["total_timeout_seconds"] == (
+        expected_admission_seconds
+    )
+    if configured_chain:
+        assert task_analyzer_chain_policy(ranking_config)[
+            "total_timeout_seconds"
+        ] == expected_admission_seconds
+    else:
+        assert task_analyzer_policy(ranking_config)["timeout_seconds"] == (
+            expected_admission_seconds
+        )
+
+
 async def test_router_dynamic_profile_application_defaults_off_independently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     analyzer_calls: list[dict[str, Any]] = []
 
-    async def fake_analyze_task_with_provider(**kwargs: Any) -> TaskAnalysisResult:
+    async def fake_analyze_task_with_fallback_chain(**kwargs: Any) -> TaskAnalysisResult:
         analyzer_calls.append(kwargs)
-        profile = fallback_task_profile(
-            routed_tier=str(kwargs["routed_tier"]),
-            request_context=kwargs["request_context"],
-        )
-        return TaskAnalysisResult(
-            profile=profile,
-            source="test",
-            schema_valid=True,
-            confidence=1.0,
-        )
+        return _successful_chain_analysis(kwargs)
 
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
-        fake_analyze_task_with_provider,
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        fake_analyze_task_with_fallback_chain,
     )
     runner = TurnRunner(
         provider_selector=None,
@@ -916,7 +1161,7 @@ async def test_router_dynamic_carries_the_previous_route_into_the_next_turn(
 ) -> None:
     seen_last_routes: list[dict[str, Any]] = []
 
-    async def fake_analyze_task_with_provider(**kwargs: Any) -> TaskAnalysisResult:
+    async def fake_analyze_task_with_fallback_chain(**kwargs: Any) -> TaskAnalysisResult:
         request_context = kwargs["request_context"]
         last_route = dict(request_context.get("last_route") or {})
         seen_last_routes.append(last_route)
@@ -926,16 +1171,14 @@ async def test_router_dynamic_carries_the_previous_route_into_the_next_turn(
         )
         if last_route:
             profile["session_intent"] = {"type": "continue", "confidence": 1.0}
-        return TaskAnalysisResult(
-            profile=profile,
-            source="test",
-            schema_valid=True,
-            confidence=1.0,
+        return _successful_chain_analysis(
+            kwargs,
+            profile_override=profile,
         )
 
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
-        fake_analyze_task_with_provider,
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        fake_analyze_task_with_fallback_chain,
     )
     runner = TurnRunner(
         provider_selector=None,
@@ -988,18 +1231,10 @@ async def test_router_dynamic_failed_turn_does_not_replace_previous_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def analyzed_task(**kwargs: Any) -> TaskAnalysisResult:
-        return TaskAnalysisResult(
-            profile=fallback_task_profile(
-                routed_tier=str(kwargs["routed_tier"]),
-                request_context=kwargs["request_context"],
-            ),
-            source="test",
-            schema_valid=True,
-            confidence=1.0,
-        )
+        return _successful_chain_analysis(kwargs)
 
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
         analyzed_task,
     )
     runner = TurnRunner(
@@ -1037,18 +1272,10 @@ async def test_router_dynamic_fallback_turn_does_not_replace_previous_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def analyzed_task(**kwargs: Any) -> TaskAnalysisResult:
-        return TaskAnalysisResult(
-            profile=fallback_task_profile(
-                routed_tier=str(kwargs["routed_tier"]),
-                request_context=kwargs["request_context"],
-            ),
-            source="test",
-            schema_valid=True,
-            confidence=1.0,
-        )
+        return _successful_chain_analysis(kwargs)
 
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
         analyzed_task,
     )
     runner = TurnRunner(
@@ -1092,19 +1319,10 @@ async def test_router_dynamic_selection_failure_fails_open_to_the_single_provide
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
     async def analyzed_task(**kwargs: Any) -> TaskAnalysisResult:
-        profile = fallback_task_profile(
-            routed_tier=str(kwargs["routed_tier"]),
-            request_context=kwargs["request_context"],
-        )
-        return TaskAnalysisResult(
-            profile=profile,
-            source="test",
-            schema_valid=True,
-            confidence=1.0,
-        )
+        return _successful_chain_analysis(kwargs)
 
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
         analyzed_task,
     )
 
@@ -1144,18 +1362,10 @@ async def test_router_dynamic_thinking_unavailable_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def analyzed_task(**kwargs: Any) -> TaskAnalysisResult:
-        return TaskAnalysisResult(
-            profile=fallback_task_profile(
-                routed_tier=str(kwargs["routed_tier"]),
-                request_context=kwargs["request_context"],
-            ),
-            source="test",
-            schema_valid=True,
-            confidence=1.0,
-        )
+        return _successful_chain_analysis(kwargs)
 
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
         analyzed_task,
     )
 
@@ -1198,7 +1408,7 @@ async def test_router_dynamic_analyzer_cleanup_failure_aborts_the_turn(
         raise TaskAnalyzerStreamCleanupError("cleanup not proven")
 
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
         fail_analysis,
     )
     runner = TurnRunner(

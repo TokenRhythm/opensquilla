@@ -17,6 +17,7 @@ FORMAL_DRACO_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 FORMAL_DRACO_OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 FROZEN_TASK_ANALYSIS_SCHEMA = "opensquilla.draco.frozen-task-analysis/v1"
 FROZEN_TASK_ANALYSIS_SCHEMA_V2 = "opensquilla.draco.frozen-task-analysis/v2"
+FROZEN_TASK_ANALYSIS_SCHEMA_V3 = "opensquilla.draco.frozen-task-analysis/v3"
 FROZEN_TASK_ANALYSIS_MODE = "frozen_replay"
 FORMAL_DRACO_WEB_SEARCH_API_KEY_ENVS = {
     "brave": "BRAVE_SEARCH_API_KEY",
@@ -262,6 +263,48 @@ class DracoFrozenTaskAnalysisExecutionV2Config(_StrictConfig):
         return self
 
 
+class DracoFrozenTaskAnalysisExecutionV3Config(
+    DracoFrozenTaskAnalysisExecutionV2Config
+):
+    """V3 additionally authenticates the live Analyzer execution chain."""
+
+    schema_id: Literal["opensquilla.draco.frozen-task-analysis/v3"] = Field(
+        alias="schema"
+    )
+    source_task_analyzer_execution_contract: dict[str, Any]
+    source_task_analyzer_execution_contract_sha256: str = Field(
+        pattern=r"^[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def _validate_execution_contract(
+        self,
+    ) -> DracoFrozenTaskAnalysisExecutionV3Config:
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            task_analyzer_execution_contract_matches_source,
+            validated_task_analyzer_execution_contract,
+        )
+
+        if (
+            validated_task_analyzer_execution_contract(
+                self.source_task_analyzer_execution_contract
+            )
+            is None
+            or not task_analyzer_execution_contract_matches_source(
+                self.source_task_analyzer_execution_contract,
+                self.source_task_analyzer_config,
+            )
+            or _canonical_json_sha256(
+                self.source_task_analyzer_execution_contract
+            )
+            != self.source_task_analyzer_execution_contract_sha256
+        ):
+            raise ValueError(
+                "source_task_analyzer_execution_contract is invalid"
+            )
+        return self
+
+
 class DracoTaskAnalyzerRouteConfig(_StrictConfig):
     """One explicitly pinned OpenRouter route in the live Analyzer chain."""
 
@@ -315,7 +358,10 @@ class DracoG1RoutingConfig(_StrictConfig):
     expected_routes: dict[str, str] | None = None
     expected_routes_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     task_analysis_execution: (
-        DracoFrozenTaskAnalysisExecutionConfig | DracoFrozenTaskAnalysisExecutionV2Config | None
+        DracoFrozenTaskAnalysisExecutionConfig
+        | DracoFrozenTaskAnalysisExecutionV2Config
+        | DracoFrozenTaskAnalysisExecutionV3Config
+        | None
     ) = None
     live_task_analyzer_chain: list[DracoTaskAnalyzerRouteConfig] | None = Field(
         default=None,
@@ -618,11 +664,21 @@ class DracoExperimentConfig(_StrictConfig):
                 "effective ranking config"
             )
         policy = task_analyzer_policy(effective)
+        authorized_identities = {
+            (str(policy["provider"]), str(policy["model"]))
+        }
+        if isinstance(replay, DracoFrozenTaskAnalysisExecutionV3Config):
+            authorized_identities = {
+                (str(route["provider"]), str(route["model"]))
+                for route in replay.source_task_analyzer_execution_contract[
+                    "routes"
+                ]
+            }
         for task_id, entry in replay.entries.items():
             analyzer = entry.task_analyzer
             if (
-                analyzer.provider != str(policy["provider"])
-                or analyzer.model != str(policy["model"])
+                (analyzer.provider, analyzer.model)
+                not in authorized_identities
                 or analyzer.analyzer_version != TASK_ANALYZER_VERSION
             ):
                 raise ValueError(

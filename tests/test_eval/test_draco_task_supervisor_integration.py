@@ -20,26 +20,33 @@ def test_runner_cancels_workers_before_publishing_aborted_manifest(
 ) -> None:
     script_path = REPO_ROOT / "scripts" / script_name
     module = ast.parse(script_path.read_text(encoding="utf-8"))
-    amain = next(
+    supervised_main = next(
         node
         for node in module.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "amain"
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_amain_with_run_lock"
     )
+    def is_cancel_and_wait(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "cancel_and_wait"
+        )
+
     handler = next(
         node
-        for node in ast.walk(amain)
+        for node in ast.walk(supervised_main)
         if isinstance(node, ast.ExceptHandler)
         and isinstance(node.type, ast.Name)
         and node.type.id == "BaseException"
+        and any(is_cancel_and_wait(child) for child in ast.walk(node))
     )
 
     cancel_call = next(
         node
         for node in ast.walk(handler)
-        if isinstance(node, ast.Await)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Attribute)
-        and node.value.func.attr == "cancel_and_wait"
+        if is_cancel_and_wait(node)
     )
     manifest_call = next(
         node

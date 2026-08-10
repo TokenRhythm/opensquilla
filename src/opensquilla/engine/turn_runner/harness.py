@@ -258,6 +258,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "input_provenance": request.input_provenance,
             "skill_catalog": request.skill_catalog,
             "usage_execution_context": request.usage_execution_context,
+            "turn_absolute_deadline": request.turn_absolute_deadline,
         }
         accepted_kwargs = {
             name: value

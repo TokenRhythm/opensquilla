@@ -48,6 +48,7 @@ from opensquilla.provider.ranking_router import (
     ranking_config_resolution,
     ranking_config_snapshot,
     ranking_trace_replay_reasons,
+    task_analyzer_chain_policy,
     task_analyzer_policy,
 )
 from opensquilla.provider.types import (
@@ -625,14 +626,14 @@ def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(
         (
             False,
             "step2-ranking-config-v3",
-            "step2-ranking-2026-08-10.1",
-            "4dbefbec7ebae151e68937b73acef8b8e173862e84af474e143a6b013264879e",
+            "step2-ranking-2026-08-11.1",
+            "8e78140419906b29c5c8e4e80e5057ee5a87d308c950e36b49e7d9995b2e338f",
         ),
         (
             True,
             "step2-ranking-config-v4",
-            "step2-ranking-2026-08-10.1",
-            "d1fbd224d7a1d4ffb100122d63623370cd73dee0b1dd341c10aa6f6cc8fe940a",
+            "step2-ranking-2026-08-11.1",
+            "44085643f6272e143a6200fe222462ac8e3943c9eb381de121bf1ca9d3ffc132",
         ),
     ],
 )
@@ -668,6 +669,47 @@ def test_ranking_config_resolution_without_override_preserves_packaged_identity(
     ) == snapshot
 
 
+def test_task_analyzer_chain_policy_preserves_historical_single_route() -> None:
+    current = task_analyzer_chain_policy()
+    historical_config = ranking_config_snapshot(
+        base_version="step2-ranking-2026-08-10.1"
+    )
+    historical = task_analyzer_chain_policy(historical_config)
+    sparse_primary_override = task_analyzer_chain_policy(
+        ranking_config_snapshot(
+            override={
+                "task_analyzer": {
+                    "model": "openai/gpt-5.6-sol",
+                    "upstream_provider": "azure",
+                }
+            }
+        )
+    )
+
+    assert current["configured"] is True
+    assert current["routes"] == [
+        {
+            "provider": provider,
+            "model": model,
+            "upstream_provider": upstream,
+        }
+        for provider, model, upstream in _TASK_ANALYZER_CHAIN_ROUTES
+    ]
+    assert current["total_timeout_seconds"] == 60.0
+    assert current["schema_repair_max_retries"] == 1
+    assert historical["configured"] is False
+    assert historical["routes"] == current["routes"][:1]
+    assert historical["total_timeout_seconds"] == 20.0
+    assert historical["schema_repair_max_retries"] == 0
+    assert canonical_json_sha256(historical_config) == (
+        "4dbefbec7ebae151e68937b73acef8b8e173862e84af474e143a6b013264879e"
+    )
+    assert [route["model"] for route in sparse_primary_override["routes"]] == [
+        "openai/gpt-5.6-sol",
+        "google/gemini-3.1-pro-preview",
+    ]
+
+
 def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     historical = ranking_config_resolution(
         thinking_assignment_enabled=False,
@@ -684,7 +726,7 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert historical["base_sha256"] == (
         "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
-    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-10.1"
+    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-11.1"
     assert "role_reliability" in default["base_config"]
 
     previous_reliability = ranking_config_resolution(
@@ -718,7 +760,7 @@ def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
     }
     assert snapshot == resolution["effective_config"]
     assert resolution["effective_config"]["config_version"] == (
-        "step2-ranking-2026-08-10.1+override."
+        "step2-ranking-2026-08-11.1+override."
         f"{resolution['override_sha256'][:12]}"
     )
     assert resolution["effective_sha256"] != resolution["base_sha256"]
@@ -890,10 +932,10 @@ def test_ranking_config_override_resolves_against_selected_thinking_base() -> No
     assert "thinking_assignment" in thinking["effective_config"]
     suffix = legacy["override_sha256"][:12]
     assert legacy["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-10.1+override.{suffix}"
+        f"step2-ranking-2026-08-11.1+override.{suffix}"
     )
     assert thinking["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-10.1+override.{suffix}"
+        f"step2-ranking-2026-08-11.1+override.{suffix}"
     )
 
 
@@ -2091,27 +2133,32 @@ async def test_task_analyzer_fallback_chain_selects_first_valid_candidate(
     assert result.schema_valid is True
     assert result.provider_id == _TASK_ANALYZER_CHAIN_ROUTES[success_index][0]
     assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[success_index][1]
-    assert [len(provider.calls) for provider in providers] == [
-        1 if index <= success_index else 0 for index in range(3)
-    ]
+    expected_call_counts = (
+        [1, 0, 0]
+        if success_index == 0
+        else [2, *[1 if index <= success_index else 0 for index in range(1, 3)]]
+    )
+    assert [len(provider.calls) for provider in providers] == expected_call_counts
     assert all(
         config is not None and config.allow_provider_stream_fallback is False
         for provider in providers
         for _, config in provider.calls
     )
-    assert result.usage["attempt_count"] == success_index + 1
+    expected_models = (
+        [_TASK_ANALYZER_CHAIN_ROUTES[0][1]]
+        if success_index == 0
+        else [
+            _TASK_ANALYZER_CHAIN_ROUTES[0][1],
+            *[route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES[: success_index + 1]],
+        ]
+    )
+    assert result.usage["attempt_count"] == len(expected_models)
     attempts = result.usage["physical_attempts"]
-    assert [attempt["attempt"] for attempt in attempts] == list(
-        range(1, success_index + 2)
-    )
-    assert [attempt["requested_model"] for attempt in attempts] == [
-        route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES[: success_index + 1]
-    ]
-    assert len({attempt["physical_attempt_id"] for attempt in attempts}) == (
-        success_index + 1
-    )
-    assert result.usage["input_tokens"] == 11 * (success_index + 1)
-    assert result.usage["billed_cost"] == pytest.approx(0.012 * (success_index + 1))
+    assert [attempt["attempt"] for attempt in attempts] == list(range(1, len(attempts) + 1))
+    assert [attempt["requested_model"] for attempt in attempts] == expected_models
+    assert len({attempt["physical_attempt_id"] for attempt in attempts}) == len(attempts)
+    assert result.usage["input_tokens"] == 11 * len(attempts)
+    assert result.usage["billed_cost"] == pytest.approx(0.012 * len(attempts))
     chain = result.trace()["chain"]
     assert chain["protocol"] == TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL
     assert chain["configured_routes"] == [
@@ -2124,10 +2171,61 @@ async def test_task_analyzer_fallback_chain_selects_first_valid_candidate(
     ]
     assert chain["selected_index"] == success_index
     assert chain["exhausted"] is False
+    assert chain["schema_repair_max_retries"] == 1
     assert [attempt["outcome"] for attempt in chain["attempt_outcomes"]] == [
         *(["failed"] * success_index),
         "success",
     ]
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_fallback_chain_can_disable_schema_repair() -> None:
+    first = _AnalyzerProvider("not-json")
+    second = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    third = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates([first, second, third]),
+        message="implement a parser",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+        schema_repair_max_retries=0,
+        decision_id="3" * 32,
+    )
+
+    assert [len(provider.calls) for provider in (first, second, third)] == [1, 1, 0]
+    assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[1][1]
+    chain = result.trace()["chain"]
+    assert chain["schema_repair_max_retries"] == 0
+    assert [outcome["outcome"] for outcome in chain["attempt_outcomes"]] == [
+        "failed",
+        "success",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_historical_explicit_analyzer_chain_keeps_per_route_total_budget() -> None:
+    providers = [_AnalyzerProvider(json.dumps(_task_profile(tier=2))) for _ in range(3)]
+    historical_config = ranking_config_snapshot(
+        base_version="step2-ranking-2026-08-10.1"
+    )
+
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates(providers),
+        message="implement a parser",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+        ranking_config=historical_config,
+    )
+
+    chain = result.trace()["chain"]
+    assert chain["deadline"]["configured_seconds"] == 60.0
+    assert chain["schema_repair_max_retries"] == 0
+    assert [len(provider.calls) for provider in providers] == [1, 0, 0]
 
 
 @pytest.mark.asyncio
@@ -2229,8 +2327,203 @@ async def test_task_analyzer_fallback_chain_advances_after_closed_timeout() -> N
     assert third.calls == []
     assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[1][1]
     chain_attempts = result.trace()["chain"]["attempt_outcomes"]
-    assert chain_attempts[0]["reason"] == "TimeoutError"
+    assert chain_attempts[0]["reason"] == "transient"
     assert chain_attempts[1]["outcome"] == "success"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "public_reason"),
+    [
+        ("unauthorized", "auth"),
+        ("unsupported", "unsupported"),
+        ("401", "auth"),
+        ("403", "auth"),
+        ("404", "unsupported"),
+        ("429", "transient"),
+        ("503", "transient"),
+    ],
+)
+async def test_task_analyzer_fallback_chain_classifies_provider_errors(
+    error_code: str,
+    public_reason: str,
+) -> None:
+    first = _AnalyzerTerminalProvider(
+        [
+            ErrorEvent(
+                message=error_code,
+                code=error_code,
+                request_started=True,
+                physical_request_count=1,
+            )
+        ]
+    )
+    second = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    third = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates([first, second, third]),
+        message="classify this task",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+    )
+
+    assert len(first.calls) == 1
+    assert len(second.calls) == 1
+    assert third.calls == []
+    assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[1][1]
+    assert result.usage["attempt_count"] == 2
+    assert result.trace()["chain"]["attempt_outcomes"][0]["reason"] == public_reason
+    assert [
+        outcome["physical_request_count"]
+        for outcome in result.trace()["chain"]["attempt_outcomes"]
+    ] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_fallback_chain_uses_one_total_deadline() -> None:
+    class _SlowProvider:
+        accounts_physical_usage = True
+
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+
+        async def _stream(self) -> AsyncIterator[Any]:
+            await asyncio.Event().wait()
+            yield  # pragma: no cover
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            assert config is not None and config.timeout is not None
+            self.timeouts.append(float(config.timeout))
+            return self._stream()
+
+    providers = [_SlowProvider() for _ in range(3)]
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates(providers),
+        message="classify this task",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        timeout_seconds=0.03,
+    )
+    elapsed = loop.time() - started_at
+
+    observed_timeouts = [timeout for provider in providers for timeout in provider.timeouts]
+    assert elapsed < 0.15
+    assert observed_timeouts
+    assert observed_timeouts == sorted(observed_timeouts, reverse=True)
+    assert sum(observed_timeouts) <= 0.031
+    assert result.trace()["chain"]["deadline"]["expired"] is True
+    assert result.usage["attempt_count"] == len(observed_timeouts)
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_rechecks_deadline_immediately_before_provider_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    original_serialize = ranking_router._serialize_task_analyzer_input
+
+    def delayed_serialize(*args: Any, **kwargs: Any):
+        payload = original_serialize(*args, **kwargs)
+        time.sleep(0.02)
+        return payload
+
+    monkeypatch.setattr(
+        ranking_router,
+        "_serialize_task_analyzer_input",
+        delayed_serialize,
+    )
+    result = await analyze_task_with_fallback_chain(
+        candidates=[
+            {
+                "provider": provider,
+                "provider_id": _TASK_ANALYZER_CHAIN_ROUTES[0][0],
+                "model_id": _TASK_ANALYZER_CHAIN_ROUTES[0][1],
+                "upstream_provider": _TASK_ANALYZER_CHAIN_ROUTES[0][2],
+            }
+        ],
+        message="classify this task",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        timeout_seconds=0.01,
+    )
+
+    assert provider.calls == []
+    assert result.usage["attempt_count"] == 0
+    outcome = result.trace()["chain"]["attempt_outcomes"][0]
+    assert outcome["reason"] == "transient"
+    assert outcome["physical_request_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_schema_repair_reuses_chain_deadline() -> None:
+    class _SchemaThenSlowProvider:
+        accounts_physical_usage = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.timeouts: list[float] = []
+
+        async def _stream(self, attempt: int) -> AsyncIterator[Any]:
+            if attempt == 1:
+                await asyncio.sleep(0.01)
+                yield TextDeltaEvent(text="not-json")
+                yield DoneEvent(
+                    model="analyzer-test",
+                    input_tokens=11,
+                    output_tokens=7,
+                    billed_cost=0.012,
+                    cost_source="provider_billed",
+                )
+                return
+            await asyncio.Event().wait()
+            yield  # pragma: no cover
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            assert config is not None and config.timeout is not None
+            self.calls += 1
+            self.timeouts.append(float(config.timeout))
+            return self._stream(self.calls)
+
+    primary = _SchemaThenSlowProvider()
+    second = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    third = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    result = await asyncio.wait_for(
+        analyze_task_with_fallback_chain(
+            candidates=_task_analyzer_chain_candidates([primary, second, third]),
+            message="classify this task",
+            user_profile_enabled=False,
+            request_context=_context(),
+            routed_tier="c2",
+            routing_confidence=0.77,
+            timeout_seconds=0.05,
+        ),
+        timeout=0.2,
+    )
+
+    assert primary.calls == 2
+    assert len(primary.timeouts) == 2
+    assert 0.0 < primary.timeouts[1] < primary.timeouts[0] <= 0.05
+    assert result.trace()["chain"]["deadline"]["configured_seconds"] == 0.05
+    assert result.usage["attempt_count"] >= 2
 
 
 @pytest.mark.asyncio
@@ -2250,12 +2543,14 @@ async def test_task_analyzer_fallback_chain_returns_fallback_after_exhaustion() 
     assert result.source == "router_fallback"
     assert result.schema_valid is False
     assert result.profile["tier_dist"] == {"3": 1.0}
-    assert [len(provider.calls) for provider in providers] == [1, 1, 1]
-    assert result.usage["attempt_count"] == 3
+    assert result.provider_id == _TASK_ANALYZER_CHAIN_ROUTES[0][0]
+    assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[-1][1]
+    assert [len(provider.calls) for provider in providers] == [2, 1, 1]
+    assert result.usage["attempt_count"] == 4
     assert [
         attempt["requested_model"]
         for attempt in result.usage["physical_attempts"]
-    ] == [route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES]
+    ] == [_TASK_ANALYZER_CHAIN_ROUTES[0][1], *[route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES]]
     chain = result.trace()["chain"]
     assert chain["selected_index"] is None
     assert chain["exhausted"] is True
@@ -2265,9 +2560,9 @@ async def test_task_analyzer_fallback_chain_returns_fallback_after_exhaustion() 
         "failed",
     ]
     assert [attempt["reason"] for attempt in chain["attempt_outcomes"]] == [
-        "ValueError",
-        "ValueError",
-        "ValueError",
+        "invalid_json",
+        "invalid_json",
+        "invalid_json",
     ]
 
 
@@ -2673,10 +2968,12 @@ async def test_task_analyzer_absolute_deadline_covers_queue_stream_and_chain() -
     assert second.calls == []
     assert third.calls == []
     assert result.source == "router_fallback"
-    assert result.fallback_reason == "TaskAnalyzerAbsoluteDeadlineError"
+    assert result.fallback_reason == "transient"
     assert result.usage["attempt_count"] == 1
     assert len(result.usage["physical_attempts"]) == 1
-    assert result.trace()["chain"]["exhausted"] is False
+    chain = result.trace()["chain"]
+    assert chain["exhausted"] is True
+    assert chain["deadline"]["expired"] is True
     for _ in range(10):
         await asyncio.sleep(0)
         if controller.active_leases == 0:
@@ -2731,6 +3028,148 @@ async def test_task_analyzer_pre_stream_retry_releases_admission(
     assert controller.active_leases == 0
     assert controller.snapshot()["total_acquired"] == 2
     assert controller.snapshot()["total_released"] == 2
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_payload_keeps_unicode_without_ascii_expansion() -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    message = "请分析这个中文任务：实现可靠的解析器。" * 20
+    config = load_ranking_config()
+
+    result = await analyze_task_with_provider(
+        provider=provider,
+        message=message,
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+        ranking_config=config,
+    )
+
+    assert result.schema_valid is True
+    payload = str(provider.calls[0][0][0].content)
+    assert "中文任务" in payload
+    assert "\\u4e2d" not in payload
+    assert len(payload) <= config["task_analyzer"]["payload_max_chars"]
+    assert len(payload.encode("utf-8")) <= config["task_analyzer"]["payload_max_bytes"]
+    assert ranking_router._estimated_tokens_from_text(payload, config) <= (
+        config["task_analyzer"]["payload_max_estimated_tokens"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_payload_compacts_full_oversized_context() -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    config = load_ranking_config()
+    config["task_analyzer"].update(
+        {
+            "payload_max_chars": 2200,
+            "payload_max_bytes": 5000,
+            "payload_max_estimated_tokens": 1500,
+        }
+    )
+    request_context = {
+        **_context(input_tokens=90_000),
+        "large_nested_context": {"中文材料": "非常长" * 100_000},
+    }
+    message = "中文任务正文" * 10_000
+
+    with structlog.testing.capture_logs() as captured:
+        result = await analyze_task_with_provider(
+            provider=provider,
+            message=message,
+            user_profile_enabled=False,
+            request_context=request_context,
+            routed_tier="c1",
+            routing_confidence=0.8,
+            ranking_config=config,
+        )
+
+    assert result.schema_valid is True
+    payload = str(provider.calls[0][0][0].content)
+    decoded = json.loads(payload)
+    compact_context = decoded["request_context"]
+    assert compact_context["payload_context_truncated"] is True
+    assert compact_context["routing_budget"]["estimated_input_tokens"] == 90_000
+    assert "large_nested_context" not in compact_context
+    assert "中文" in decoded["task"]
+    assert len(decoded["task"]) < 24_000
+    assert len(payload) <= 2200
+    assert len(payload.encode("utf-8")) <= 5000
+    assert ranking_router._estimated_tokens_from_text(payload, config) <= 1500
+    started = next(
+        row
+        for row in captured
+        if row["event"] == "llm_ensemble.router_dynamic.task_analyzer_started"
+    )
+    assert started["input_truncated"] is True
+    assert started["payload_task_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_impossible_payload_budget_starts_no_request() -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    config = load_ranking_config()
+    config["task_analyzer"].update(
+        {
+            "payload_max_chars": 1,
+            "payload_max_bytes": 1,
+            "payload_max_estimated_tokens": 1,
+        }
+    )
+
+    result = await analyze_task_with_provider(
+        provider=provider,
+        message="中文任务",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+        ranking_config=config,
+    )
+
+    assert result.source == "router_fallback"
+    assert result.fallback_reason == "DynamicRankingError"
+    assert result.usage == {"physical_attempts": [], "attempt_count": 0}
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_historical_task_analyzer_keeps_single_route_serialization() -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    invalid_provider = _AnalyzerProvider("not-json")
+    historical_config = ranking_config_snapshot(
+        base_version="step2-ranking-2026-08-10.1"
+    )
+
+    result = await analyze_task_with_provider(
+        provider=provider,
+        message="中文任务",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+        ranking_config=historical_config,
+    )
+    invalid_result = await analyze_task_with_provider(
+        provider=invalid_provider,
+        message="中文任务",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+        ranking_config=historical_config,
+    )
+
+    assert result.schema_valid is True
+    assert len(provider.calls) == 1
+    payload = str(provider.calls[0][0][0].content)
+    assert "\\u4e2d" in payload
+    assert provider.calls[0][1] is not None
+    assert provider.calls[0][1].allow_provider_stream_fallback is True
+    assert invalid_result.schema_valid is False
+    assert invalid_result.fallback_reason == "ValueError"
+    assert len(invalid_provider.calls) == 4
 
 
 @pytest.mark.asyncio
@@ -2940,6 +3379,34 @@ async def test_task_analyzer_incomplete_stream_falls_back_even_with_valid_json()
     assert result.source == "router_fallback"
     assert result.schema_valid is False
     assert result.fallback_reason == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_legacy_provider_error_keeps_runtime_error_reason() -> None:
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 0
+    result = await analyze_task_with_provider(
+        provider=_AnalyzerTerminalProvider(
+            [
+                ErrorEvent(
+                    message="legacy preflight failure",
+                    code="unauthorized",
+                    request_started=False,
+                    physical_request_count=0,
+                )
+            ]
+        ),
+        message="hello",
+        user_profile_enabled=True,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        ranking_config=config,
+    )
+
+    assert result.source == "router_fallback"
+    assert result.fallback_reason == "RuntimeError"
+    assert result.usage["attempt_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -4739,7 +5206,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     assert disabled.trace["ranking_version"] == "step2-ranking-v2"
     assert (
         disabled.trace["ranking_config_hash"]
-        == "4dbefbec7ebae151e68937b73acef8b8e173862e84af474e143a6b013264879e"
+        == "8e78140419906b29c5c8e4e80e5057ee5a87d308c950e36b49e7d9995b2e338f"
     )
     for field in (
         "ranking_thinking_assignment_enabled",

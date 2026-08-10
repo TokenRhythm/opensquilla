@@ -1163,146 +1163,87 @@ def g1_task_analyzer_execution_policy(
     return policy
 
 
-def g1_task_analyzer_execution_chain(
+def g1_task_analyzer_execution_contract(
     contract: Mapping[str, Any] | None,
-) -> list[dict[str, Any]] | None:
-    """Return the authenticated ordered live Analyzer route chain."""
+    declared_execution_contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return the canonical execution contract shared by every audit path."""
 
     primary = g1_task_analyzer_execution_policy(contract)
     if primary is None or not isinstance(contract, Mapping):
         return None
-    raw_chain = contract.get("live_task_analyzer_chain")
-    if raw_chain is None:
-        return [
-            {
-                "provider": str(primary["provider"]),
-                "model": str(primary["model"]),
-                "upstream_provider": str(primary["upstream_provider"]),
-                "max_attempts": int(primary["max_retries"]) + 1,
-            }
-        ]
-    if not isinstance(raw_chain, list) or not raw_chain:
+    from opensquilla.eval.draco_task_analyzer_execution import (
+        task_analyzer_execution_contract_from_g1_registry,
+        validated_task_analyzer_execution_contract,
+    )
+
+    source_contract = copy.deepcopy(dict(contract))
+    source_contract.setdefault("task_analyzer", copy.deepcopy(primary))
+    try:
+        derived = task_analyzer_execution_contract_from_g1_registry(
+            source_contract
+        )
+    except (TypeError, ValueError):
         return None
-    chain: list[dict[str, Any]] = []
-    identities: set[tuple[str, str]] = set()
-    for raw_route in raw_chain:
-        if not isinstance(raw_route, Mapping) or set(raw_route) != {
-            "provider",
-            "model",
-            "upstream_provider",
-            "max_attempts",
-        }:
-            return None
-        provider = str(raw_route.get("provider") or "").strip().casefold()
-        model = str(raw_route.get("model") or "").strip()
-        upstream = str(raw_route.get("upstream_provider") or "").strip().casefold()
-        max_attempts = raw_route.get("max_attempts")
-        identity = (provider, model)
-        if (
-            provider != "openrouter"
-            or not model
-            or not upstream
-            or upstream == "auto"
-            or max_attempts != 1
-            or identity in identities
-        ):
-            return None
-        identities.add(identity)
-        chain.append(
-            {
-                "provider": provider,
-                "model": model,
-                "upstream_provider": upstream,
-                "max_attempts": 1,
-            }
-        )
-    first = chain[0]
-    if (
-        first["provider"] != str(primary["provider"]).casefold()
-        or not _formal_openrouter_models_equivalent(
-            first["model"],
-            primary["model"],
-        )
-        or first["upstream_provider"] != str(primary["upstream_provider"]).casefold()
+    validated = validated_task_analyzer_execution_contract(derived)
+    declared = declared_execution_contract
+    if validated is None or (
+        declared is not None
+        and validated_task_analyzer_execution_contract(declared) != validated
     ):
         return None
-    return chain
+    return validated
+
+
+def g1_task_analyzer_execution_chain(
+    contract: Mapping[str, Any] | None,
+    declared_execution_contract: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return the authenticated ordered live Analyzer route chain."""
+
+    execution_contract = g1_task_analyzer_execution_contract(
+        contract,
+        declared_execution_contract,
+    )
+    return (
+        copy.deepcopy(execution_contract["routes"])
+        if execution_contract is not None
+        else None
+    )
 
 
 def g1_task_analyzer_physical_routes_from_trace(
     plan: Mapping[str, Any],
-    analyzer_chain: Sequence[Mapping[str, Any]],
+    execution_contract: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Derive paid Analyzer routes, allowing chain candidates that made no request."""
+    """Derive paid Analyzer routes through the shared fail-closed validator."""
 
-    expanded_legacy_routes = [
-        dict(route) for route in analyzer_chain for _ in range(int(route["max_attempts"]))
-    ]
     analyzer_trace = plan.get("task_analyzer")
-    chain_trace = analyzer_trace.get("chain") if isinstance(analyzer_trace, Mapping) else None
-    if chain_trace is None:
-        if len(analyzer_chain) != 1:
-            return [], ["missing_g1_task_analyzer_chain_trace"]
-        return expanded_legacy_routes, []
-    if not isinstance(chain_trace, Mapping):
-        return [], ["invalid_g1_task_analyzer_chain_trace"]
-    configured_routes = chain_trace.get("configured_routes")
-    outcomes = chain_trace.get("attempt_outcomes")
-    expected_routes = [
-        {
-            "provider": str(route["provider"]),
-            "model": str(route["model"]),
-            "upstream_provider": str(route["upstream_provider"]),
-        }
-        for route in analyzer_chain
-    ]
-    if (
-        any(int(route["max_attempts"]) != 1 for route in analyzer_chain)
-        or chain_trace.get("protocol") != "opensquilla.task-analyzer-fallback-chain/v1"
-        or configured_routes != expected_routes
-        or not isinstance(outcomes, list)
-        or not outcomes
-        or len(outcomes) > len(expected_routes)
-    ):
-        return [], ["invalid_g1_task_analyzer_chain_trace"]
-    physical_routes: list[dict[str, Any]] = []
-    success_indexes: list[int] = []
-    for index, outcome in enumerate(outcomes):
-        route = expected_routes[index]
-        if (
-            not isinstance(outcome, Mapping)
-            or outcome.get("candidate_index") != index
-            or str(outcome.get("provider") or "").strip().casefold()
-            != str(route["provider"]).casefold()
-            or not _formal_openrouter_models_equivalent(
-                outcome.get("model"),
-                route["model"],
-            )
-            or str(outcome.get("upstream_provider") or "").strip().casefold()
-            != str(route["upstream_provider"]).casefold()
-            or outcome.get("outcome") not in {"success", "failed"}
-            or type(outcome.get("physical_request_count")) is not int
-            or outcome.get("physical_request_count") not in {0, 1}
-        ):
-            return [], ["invalid_g1_task_analyzer_chain_trace"]
-        if outcome.get("outcome") == "success":
-            success_indexes.append(index)
-        if outcome.get("physical_request_count") == 1:
-            physical_routes.append(route)
-    selected_index = chain_trace.get("selected_index")
-    exhausted = chain_trace.get("exhausted")
-    if success_indexes:
-        if (
-            success_indexes != [len(outcomes) - 1]
-            or selected_index != success_indexes[0]
-            or exhausted is not False
-        ):
-            return [], ["invalid_g1_task_analyzer_chain_trace"]
-    elif (
-        len(outcomes) != len(expected_routes) or selected_index is not None or exhausted is not True
-    ):
-        return [], ["invalid_g1_task_analyzer_chain_trace"]
-    return physical_routes, []
+    if not isinstance(analyzer_trace, Mapping):
+        return [], ["missing_g1_task_analyzer_trace"]
+    from opensquilla.eval.draco_task_analyzer_execution import (
+        validate_task_analyzer_execution_trace,
+    )
+
+    validated, reasons = validate_task_analyzer_execution_trace(
+        execution_contract=execution_contract,
+        analyzer_trace=analyzer_trace,
+        models_equivalent=_formal_openrouter_models_equivalent,
+    )
+    reason_aliases = {
+        "invalid_task_analyzer_chain_trace": (
+            "invalid_g1_task_analyzer_chain_trace"
+        ),
+        "invalid_task_analyzer_physical_attempts": (
+            "invalid_g1_task_analyzer_attempt_sequence"
+        ),
+    }
+    return (
+        copy.deepcopy(validated["physical_routes"])
+        if validated is not None
+        else [],
+        [reason_aliases.get(reason, reason) for reason in reasons],
+    )
 
 
 def g1_analyzer_failure_fallback_policy(
@@ -3307,7 +3248,18 @@ def validate_formal_campaign_contracts(
             g1_task_analyzer_execution_policy(registry) if isinstance(registry, Mapping) else None
         ) or {}
         g1_analyzer_chain = (
-            g1_task_analyzer_execution_chain(registry) if isinstance(registry, Mapping) else None
+            g1_task_analyzer_execution_chain(
+                registry,
+                g1.get("task_analyzer_execution_contract")
+                if isinstance(g1, Mapping)
+                and isinstance(
+                    g1.get("task_analyzer_execution_contract"),
+                    Mapping,
+                )
+                else None,
+            )
+            if isinstance(registry, Mapping)
+            else None
         )
         g1_analyzer_fallback = (
             g1_analyzer_failure_fallback_policy(registry) if isinstance(registry, Mapping) else None
@@ -8779,9 +8731,27 @@ def validate_g1_paid_attempt_plan_history(
     analyzer_policy = g1_task_analyzer_execution_policy(registry)
     if analyzer_policy is None:
         raise FinalizationError("G1 paid-attempt audit lacks an authenticated analyzer policy")
-    analyzer_chain = g1_task_analyzer_execution_chain(registry)
+    declared_analyzer_execution_contract = group_contract.get(
+        "task_analyzer_execution_contract"
+    )
+    analyzer_chain = g1_task_analyzer_execution_chain(
+        registry,
+        declared_analyzer_execution_contract
+        if isinstance(declared_analyzer_execution_contract, Mapping)
+        else None,
+    )
     if analyzer_chain is None:
         raise FinalizationError("G1 paid-attempt audit lacks an authenticated analyzer chain")
+    analyzer_execution_contract = g1_task_analyzer_execution_contract(
+        registry,
+        declared_analyzer_execution_contract
+        if isinstance(declared_analyzer_execution_contract, Mapping)
+        else None,
+    )
+    if analyzer_execution_contract is None:
+        raise FinalizationError(
+            "G1 paid-attempt audit lacks an authenticated analyzer execution contract"
+        )
     replay_contract = registry.get("task_analysis_execution")
     if replay_contract is not None:
         from opensquilla.provider.ranking_router import (
@@ -9002,7 +8972,7 @@ def validate_g1_paid_attempt_plan_history(
             analyzer_attempt_routes, chain_trace_reasons = (
                 g1_task_analyzer_physical_routes_from_trace(
                     first_plan if isinstance(first_plan, Mapping) else {},
-                    analyzer_chain,
+                    analyzer_execution_contract,
                 )
             )
             analyzer_reasons.extend(chain_trace_reasons)
@@ -9344,7 +9314,15 @@ def route_reasons(
         routes = registry.get("expected_routes")
         allowed = set(routes) if isinstance(routes, Mapping) else set()
         analyzer_policy = g1_task_analyzer_execution_policy(registry)
-        analyzer_chain = g1_task_analyzer_execution_chain(registry)
+        declared_analyzer_execution_contract = contract.get(
+            "task_analyzer_execution_contract"
+        )
+        analyzer_chain = g1_task_analyzer_execution_chain(
+            registry,
+            declared_analyzer_execution_contract
+            if isinstance(declared_analyzer_execution_contract, Mapping)
+            else None,
+        )
         analyzer_fallback = g1_analyzer_failure_fallback_policy(registry)
         if analyzer_chain is not None:
             allowed.update(str(route["model"]) for route in analyzer_chain)

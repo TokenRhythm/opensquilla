@@ -5284,7 +5284,43 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     }
     request_context["snapshot_hash"] = module.canonical_sha256(request_context)
     analysis_fields = {
-        "task_analyzer": {"source": "test_analyzer", "schema_valid": True},
+        "task_analyzer": {
+            "source": "llm_provider",
+            "schema_valid": True,
+            "fallback_reason": "",
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "usage": {
+                "physical_attempts": [
+                    {
+                        "attempt": 1,
+                        "physical_attempt_id": "a" * 32,
+                        "provider": "openrouter",
+                        "model": "anthropic/claude-opus-4.8",
+                        "requested_provider": "openrouter",
+                        "requested_model": "anthropic/claude-opus-4.8",
+                        "input_tokens": 10,
+                        "output_tokens": 1,
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "billed_cost": 0.0,
+                        "provider_usage": {
+                            "provider": "openrouter",
+                            "model": "anthropic/claude-opus-4.8",
+                            "physical_attempt_id": "a" * 32,
+                        },
+                    }
+                ],
+                "attempt_count": 1,
+                "input_tokens": 10,
+                "output_tokens": 1,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "billed_cost": 0.0,
+            },
+        },
         "task_profile": task_profile,
         "task_profile_hash": module.canonical_sha256(task_profile),
         "request_context": request_context,
@@ -5483,6 +5519,17 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                                 "requested_provider": "openrouter",
                                 "model": "anthropic/claude-opus-4.8",
                                 "requested_model": "anthropic/claude-opus-4.8",
+                                "input_tokens": 10,
+                                "output_tokens": 1,
+                                "reasoning_tokens": 0,
+                                "cached_tokens": 0,
+                                "cache_write_tokens": 0,
+                                "billed_cost": 0.0,
+                                "provider_usage": {
+                                    "provider": "openrouter",
+                                    "model": "anthropic/claude-opus-4.8",
+                                    "physical_attempt_id": "a" * 32,
+                                },
                                 "request_count": 1,
                             }
                         ],
@@ -5496,6 +5543,17 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
                                     "requested_provider": "openrouter",
                                     "model": "anthropic/claude-opus-4.8",
                                     "requested_model": "anthropic/claude-opus-4.8",
+                                    "input_tokens": 10,
+                                    "output_tokens": 1,
+                                    "reasoning_tokens": 0,
+                                    "cached_tokens": 0,
+                                    "cache_write_tokens": 0,
+                                    "billed_cost": 0.0,
+                                    "provider_usage": {
+                                        "provider": "openrouter",
+                                        "model": "anthropic/claude-opus-4.8",
+                                        "physical_attempt_id": "a" * 32,
+                                    },
                                     "request_count": 1,
                                 }
                             ]
@@ -5986,6 +6044,17 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
             "requested_provider": "openrouter",
             "model": "anthropic/claude-opus-4.8",
             "requested_model": "anthropic/claude-opus-4.8",
+            "input_tokens": 10,
+            "output_tokens": 1,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.0,
+            "provider_usage": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-opus-4.8",
+                "physical_attempt_id": str(attempt) * 32,
+            },
             "request_count": 1,
         }
         for attempt in (1, 2)
@@ -5993,6 +6062,98 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     analyzer_retry_run["llm_request_count"] = 2
     analyzer_retry_run["setup_usage"] = deepcopy(analyzer_retry_rows)
     analyzer_retry_run["usage"] = {"model_usage_breakdown": deepcopy(analyzer_retry_rows)}
+
+    def replace_analyzer_trace_usage(value: object) -> None:
+        if isinstance(value, dict):
+            analyzer_trace = value.get("task_analyzer")
+            if isinstance(analyzer_trace, dict):
+                analyzer_trace["usage"] = {
+                    "physical_attempts": [
+                        {
+                            "attempt": row["attempt"],
+                            "physical_attempt_id": row[
+                                "physical_attempt_id"
+                            ],
+                            "requested_provider": row[
+                                "requested_provider"
+                            ],
+                            "requested_model": row["requested_model"],
+                            "provider": row["provider"],
+                            "model": row["model"],
+                            "input_tokens": row["input_tokens"],
+                            "output_tokens": row["output_tokens"],
+                            "reasoning_tokens": row["reasoning_tokens"],
+                            "cached_tokens": row["cached_tokens"],
+                            "cache_write_tokens": row["cache_write_tokens"],
+                            "billed_cost": row["billed_cost"],
+                            "provider_usage": deepcopy(row["provider_usage"]),
+                        }
+                        for row in analyzer_retry_rows
+                    ],
+                    "attempt_count": len(analyzer_retry_rows),
+                }
+            for child in value.values():
+                replace_analyzer_trace_usage(child)
+        elif isinstance(value, list):
+            for child in value:
+                replace_analyzer_trace_usage(child)
+
+    replace_analyzer_trace_usage(analyzer_retry)
+    analyzer_retry_attempts = analyzer_retry["execution"][
+        "generation_attempts"
+    ]
+    analyzer_retry_source_plan = analyzer_retry_attempts[0][
+        "selection_plan"
+    ]
+    analyzer_retry_target_plan = deepcopy(
+        analyzer_retry_attempts[1]["selection_plan"]
+    )
+    analyzer_retry_binding = build_router_dynamic_task_analysis_reuse_binding(
+        analyzer_retry_source_plan
+    )
+    analyzer_retry_target_plan["task_analysis_reuse"] = (
+        analyzer_retry_binding
+    )
+    analyzer_retry_target_plan["retry_routing"].update(
+        {
+            "task_analysis_source_decision_id": analyzer_retry_source_plan[
+                "decision_id"
+            ],
+            "task_analysis_reuse_sha256": analyzer_retry_binding[
+                "projection_sha256"
+            ],
+        }
+    )
+    (
+        analyzer_retry_target_plan,
+        analyzer_retry_projection,
+        analyzer_retry_projection_reason,
+    ) = project_thinking_execution_history(
+        [analyzer_retry_source_plan],
+        analyzer_retry_target_plan,
+    )
+    assert analyzer_retry_projection_reason == ""
+    analyzer_retry_attempts[0]["retry_selection_plan"] = deepcopy(
+        analyzer_retry_target_plan
+    )
+    analyzer_retry_attempts[0]["thinking_execution_projection"] = deepcopy(
+        analyzer_retry_projection
+    )
+    analyzer_retry_attempts[1]["selection_plan"] = deepcopy(
+        analyzer_retry_target_plan
+    )
+    analyzer_retry_attempts[1]["run"]["routing_trace"][
+        "selection_plan"
+    ] = deepcopy(analyzer_retry_target_plan)
+    analyzer_retry_attempts[1]["run"]["ensemble_trace"][
+        "selection_plan"
+    ] = deepcopy(analyzer_retry_target_plan)
+    analyzer_retry["routing_trace"]["selection_plan"] = deepcopy(
+        analyzer_retry_target_plan
+    )
+    analyzer_retry["ensemble_trace"]["selection_plan"] = deepcopy(
+        analyzer_retry_target_plan
+    )
     module.validate_g1_paid_attempt_plan_history(
         [
             module.SourceRecord(
@@ -6016,6 +6177,10 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
             **deepcopy(analyzer_retry_rows[0]),
             "attempt": attempt,
             "physical_attempt_id": f"{attempt:x}" * 32,
+            "provider_usage": {
+                **deepcopy(analyzer_retry_rows[0]["provider_usage"]),
+                "physical_attempt_id": f"{attempt:x}" * 32,
+            },
         }
         for attempt in range(1, 6)
     ]
@@ -6048,7 +6213,13 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     changed_analyzer_identity = deepcopy(analyzer_attempt)
     changed_analyzer_run = changed_analyzer_identity["run"]
     changed_analyzer_run["setup_usage"][0]["physical_attempt_id"] = "f" * 32
+    changed_analyzer_run["setup_usage"][0]["provider_usage"][
+        "physical_attempt_id"
+    ] = "f" * 32
     changed_analyzer_run["usage"]["model_usage_breakdown"][0]["physical_attempt_id"] = "f" * 32
+    changed_analyzer_run["usage"]["model_usage_breakdown"][0]["provider_usage"][
+        "physical_attempt_id"
+    ] = "f" * 32
     assert module.immutable_attempt_payload(changed_analyzer_identity) != analyzer_immutable
 
     wave_1 = deepcopy(serialized)
@@ -8581,6 +8752,15 @@ def test_analyzer_chain_trace_derives_only_physical_request_routes(
         )
     plan = {
         "task_analyzer": {
+            "source": "llm_provider" if selected_index is not None else "router_fallback",
+            "schema_valid": selected_index is not None,
+            "provider": chain[
+                selected_index if selected_index is not None else len(outcomes) - 1
+            ]["provider"],
+            "model": chain[
+                selected_index if selected_index is not None else len(outcomes) - 1
+            ]["model"],
+            "fallback_reason": "" if selected_index is not None else "provider_unavailable",
             "chain": {
                 "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
                 "configured_routes": [
@@ -8590,13 +8770,56 @@ def test_analyzer_chain_trace_derives_only_physical_request_routes(
                 "attempt_outcomes": outcomes,
                 "selected_index": selected_index,
                 "exhausted": exhausted,
-            }
+            },
+            "usage": {
+                "attempt_count": sum(physical_counts),
+                "physical_attempts": [
+                    {
+                        "attempt": ordinal,
+                        "physical_attempt_id": f"{ordinal:032x}",
+                        "provider": chain[index]["provider"],
+                        "model": chain[index]["model"],
+                        "requested_provider": chain[index]["provider"],
+                        "requested_model": chain[index]["model"],
+                        "input_tokens": 10,
+                        "output_tokens": 1,
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "billed_cost": 0.0,
+                        "provider_usage": {
+                            "provider": chain[index]["provider"],
+                            "model": chain[index]["model"],
+                            "physical_attempt_id": f"{ordinal:032x}",
+                        },
+                    }
+                    for ordinal, index in enumerate(
+                        (
+                            index
+                            for index, count in enumerate(physical_counts)
+                            for _ in range(count)
+                        ),
+                        start=1,
+                    )
+                ],
+            },
         }
     }
+    from opensquilla.eval.draco_task_analyzer_execution import (
+        build_task_analyzer_execution_contract,
+    )
+
+    execution_contract = build_task_analyzer_execution_contract(
+        routes=chain,
+        schema_repair_max_retries=0,
+        total_timeout_seconds=60.0,
+        route_source="test.live_task_analyzer_chain",
+        source_payload={"live_task_analyzer_chain": chain},
+    )
 
     routes, reasons = module.g1_task_analyzer_physical_routes_from_trace(
         plan,
-        chain,
+        execution_contract,
     )
 
     assert reasons == []
@@ -8620,6 +8843,11 @@ def test_analyzer_chain_trace_rejects_boolean_physical_request_count(
     }
     plan = {
         "task_analyzer": {
+            "source": "router_fallback",
+            "schema_valid": False,
+            "provider": route["provider"],
+            "model": route["model"],
+            "fallback_reason": "provider_unavailable",
             "chain": {
                 "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
                 "configured_routes": [route],
@@ -8634,13 +8862,25 @@ def test_analyzer_chain_trace_rejects_boolean_physical_request_count(
                 ],
                 "selected_index": None,
                 "exhausted": True,
-            }
+            },
+            "usage": {"attempt_count": 0, "physical_attempts": []},
         }
     }
+    from opensquilla.eval.draco_task_analyzer_execution import (
+        build_task_analyzer_execution_contract,
+    )
+
+    execution_contract = build_task_analyzer_execution_contract(
+        routes=chain,
+        schema_repair_max_retries=0,
+        total_timeout_seconds=60.0,
+        route_source="test.live_task_analyzer_chain",
+        source_payload={"live_task_analyzer_chain": chain},
+    )
 
     routes, reasons = module.g1_task_analyzer_physical_routes_from_trace(
         plan,
-        chain,
+        execution_contract,
     )
 
     assert routes == []

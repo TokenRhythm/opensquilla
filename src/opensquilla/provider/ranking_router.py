@@ -32,6 +32,7 @@ from .admission import (
     ProviderAdmissionLeaseGuard,
     ProviderAdmissionTimeoutError,
 )
+from .failures import ProviderFailureKind, classify_provider_error
 from .protocol import LLMProvider
 from .thinking_execution import THINKING_PHYSICAL_EVIDENCE_SCHEMA
 from .types import ChatConfig, DoneEvent, ErrorEvent, Message, TextDeltaEvent
@@ -45,8 +46,9 @@ RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-10.1"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-10.1"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.1"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.1"
+_PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-10.1"
 _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-05.1"
 _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-27.1"
 _PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-22.1"
@@ -60,13 +62,12 @@ _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
 )
 _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
     {
+        _PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION,
         "step2-ranking-2026-08-02.2",
         _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION,
     }
 )
-_HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset(
-    {"curated-openrouter-step2-2026-07-31.1"}
-)
+_HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset({"curated-openrouter-step2-2026-07-31.1"})
 _POST_BASE_DISABLED_MODEL_IDS = frozenset(
     {
         "anthropic/claude-fable-5",
@@ -108,8 +109,13 @@ TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL = (
 )
 FROZEN_TASK_ANALYSIS_SCHEMA = "opensquilla.draco.frozen-task-analysis/v1"
 FROZEN_TASK_ANALYSIS_SCHEMA_V2 = "opensquilla.draco.frozen-task-analysis/v2"
+FROZEN_TASK_ANALYSIS_SCHEMA_V3 = "opensquilla.draco.frozen-task-analysis/v3"
 FROZEN_TASK_ANALYSIS_SCHEMAS = frozenset(
-    {FROZEN_TASK_ANALYSIS_SCHEMA, FROZEN_TASK_ANALYSIS_SCHEMA_V2}
+    {
+        FROZEN_TASK_ANALYSIS_SCHEMA,
+        FROZEN_TASK_ANALYSIS_SCHEMA_V2,
+        FROZEN_TASK_ANALYSIS_SCHEMA_V3,
+    }
 )
 FROZEN_TASK_ANALYSIS_MODE = "frozen_replay"
 FROZEN_TASK_ANALYZER_SOURCE = "frozen_replay"
@@ -237,6 +243,27 @@ class TaskAnalyzerPhysicalEvidenceError(TaskAnalyzerStreamCleanupError):
 _TASK_ANALYZER_ABSOLUTE_DEADLINE_REASON = (
     "TaskAnalyzerAbsoluteDeadlineError"
 )
+
+
+class TaskAnalyzerSchemaError(ValueError):
+    """A safe, structured Analyzer response error eligible for one repair."""
+
+    def __init__(self, code: str, feedback: str = "") -> None:
+        super().__init__(code)
+        self.code = code
+        self.feedback = feedback or code
+
+
+class TaskAnalyzerProviderError(RuntimeError):
+    """A provider failure with a stable, public chain-trace classification."""
+
+    def __init__(self, public_reason: str) -> None:
+        super().__init__(public_reason)
+        self.public_reason = public_reason
+
+
+class TaskAnalyzerDeadlineError(TimeoutError):
+    """The shared Analyzer-chain deadline elapsed before another request."""
 
 
 class _ValidatedRankingConfig(dict[str, Any]):
@@ -1145,13 +1172,28 @@ def _validate_ranking_config(
             "upstream_provider, and stream_close_timeout_seconds together"
         )
     has_task_analyzer_policy = present_analyzer_policy_keys == analyzer_policy_keys
-    if (
-        not has_task_analyzer_policy
-        and not _is_pre_task_analyzer_policy_config_version(config_version)
+    if not has_task_analyzer_policy and not _is_pre_task_analyzer_policy_config_version(
+        config_version
     ):
         raise DynamicRankingError(
             "router_dynamic ranking config lacks the versioned task_analyzer identity policy"
         )
+    analyzer_chain_policy_keys = {
+        "fallback_chain",
+        "total_timeout_seconds",
+        "payload_max_chars",
+        "payload_max_bytes",
+        "payload_max_estimated_tokens",
+        "schema_repair_max_retries",
+    }
+    present_analyzer_chain_policy_keys = set(task_analyzer_config) & analyzer_chain_policy_keys
+    if present_analyzer_chain_policy_keys and (
+        present_analyzer_chain_policy_keys != analyzer_chain_policy_keys
+    ):
+        raise DynamicRankingError(
+            "router_dynamic task_analyzer chain and payload policy must be declared together"
+        )
+    has_analyzer_chain_policy = present_analyzer_chain_policy_keys == analyzer_chain_policy_keys
     fixed_object_keys = {
         ("validation",): {
             "weight_sum_tolerance",
@@ -1215,6 +1257,7 @@ def _validate_ranking_config(
         },
         ("task_analyzer",): {
             *(analyzer_policy_keys if has_task_analyzer_policy else set()),
+            *(analyzer_chain_policy_keys if has_analyzer_chain_policy else set()),
             "timeout_seconds",
             "input_max_chars",
             "response_max_chars",
@@ -1578,6 +1621,78 @@ def _validate_ranking_config(
             raise DynamicRankingError(f"router_dynamic task_analyzer.{key} must be positive")
     if _ranking_number(config, "task_analyzer", "timeout_seconds") <= 0.0:
         raise DynamicRankingError("router_dynamic task_analyzer.timeout_seconds must be positive")
+    if has_analyzer_chain_policy:
+        total_timeout = _ranking_number(
+            config,
+            "task_analyzer",
+            "total_timeout_seconds",
+        )
+        if total_timeout <= 0.0:
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.total_timeout_seconds must be positive"
+            )
+        for key in (
+            "payload_max_chars",
+            "payload_max_bytes",
+            "payload_max_estimated_tokens",
+        ):
+            if _ranking_int(config, "task_analyzer", key) <= 0:
+                raise DynamicRankingError(f"router_dynamic task_analyzer.{key} must be positive")
+        schema_repair_max_retries = _ranking_int(
+            config,
+            "task_analyzer",
+            "schema_repair_max_retries",
+        )
+        if not 0 <= schema_repair_max_retries <= 1:
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.schema_repair_max_retries must be 0 or 1"
+            )
+        fallback_chain = task_analyzer_config.get("fallback_chain")
+        if not isinstance(fallback_chain, list):
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.fallback_chain must be a JSON array"
+            )
+        normalized_routes: list[tuple[str, str, str]] = []
+        for index, route in enumerate(fallback_chain):
+            if not isinstance(route, Mapping) or set(route) != {
+                "provider",
+                "model",
+                "upstream_provider",
+            }:
+                raise DynamicRankingError(
+                    "router_dynamic task_analyzer fallback route at index "
+                    f"{index} must contain exactly provider, model, and upstream_provider"
+                )
+            try:
+                candidate = TaskAnalyzerCandidate(
+                    provider_id=str(route["provider"]),
+                    model_id=str(route["model"]),
+                    upstream_provider=str(route["upstream_provider"]),
+                )
+            except ValueError as exc:
+                raise DynamicRankingError(
+                    f"router_dynamic task_analyzer fallback route at index {index} is invalid"
+                ) from exc
+            if candidate.provider_id != TASK_ANALYZER_PROVIDER_ID:
+                raise DynamicRankingError(
+                    "router_dynamic task_analyzer fallback providers currently must be openrouter"
+                )
+            normalized_routes.append(
+                (
+                    candidate.provider_id,
+                    candidate.model_id,
+                    candidate.upstream_provider,
+                )
+            )
+        primary_route = (
+            str(task_analyzer_config.get("provider") or ""),
+            str(task_analyzer_config.get("model") or ""),
+            str(task_analyzer_config.get("upstream_provider") or ""),
+        )
+        if len({primary_route, *normalized_routes}) != len(normalized_routes) + 1:
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer chain cannot contain duplicate routes"
+            )
     if has_task_analyzer_policy:
         analyzer_provider = _ranking_string(config, "task_analyzer", "provider")
         if (
@@ -2096,7 +2211,20 @@ def _ranking_config_for_base_version(
         )
     historical = copy.deepcopy(dict(packaged))
     historical["config_version"] = requested
-    if requested == _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION:
+    analyzer = historical.get("task_analyzer")
+    if isinstance(analyzer, dict):
+        for key in (
+            "fallback_chain",
+            "total_timeout_seconds",
+            "payload_max_chars",
+            "payload_max_bytes",
+            "payload_max_estimated_tokens",
+            "schema_repair_max_retries",
+        ):
+            analyzer.pop(key, None)
+    if requested == _PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION:
+        pass
+    elif requested == _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION:
         historical["role_reliability"] = {
             "penalty_weight": 0.40,
             "prior_success": 9,
@@ -2227,6 +2355,39 @@ def ranking_config_resolution(
         full_base,
         normalized_override,
     )
+    analyzer_override = normalized_override.get("task_analyzer")
+    if (
+        isinstance(analyzer_override, Mapping)
+        and "fallback_chain" not in analyzer_override
+        and any(
+            key in analyzer_override
+            for key in ("provider", "model", "upstream_provider")
+        )
+    ):
+        # Sparse overrides historically changed only the single Analyzer route.
+        # With the packaged chain, retain the remaining backups but never replay
+        # the newly selected primary as its own fallback. An explicitly supplied
+        # fallback_chain remains strict and is validated without normalization.
+        analyzer_config = effective_full.get("task_analyzer")
+        if isinstance(analyzer_config, dict):
+            primary_route = (
+                str(analyzer_config.get("provider") or ""),
+                str(analyzer_config.get("model") or ""),
+                str(analyzer_config.get("upstream_provider") or ""),
+            )
+            fallback_chain = analyzer_config.get("fallback_chain")
+            if isinstance(fallback_chain, list):
+                analyzer_config["fallback_chain"] = [
+                    route
+                    for route in fallback_chain
+                    if not isinstance(route, Mapping)
+                    or (
+                        str(route.get("provider") or ""),
+                        str(route.get("model") or ""),
+                        str(route.get("upstream_provider") or ""),
+                    )
+                    != primary_route
+                ]
     effective_full["config_version"] = (
         f"{base_config['config_version']}+override.{override_sha256[:12]}"
     )
@@ -2344,6 +2505,55 @@ def task_analyzer_policy(
             effective,
             "task_analyzer",
             "max_retries",
+        ),
+    }
+
+
+def task_analyzer_chain_policy(
+    ranking_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the optional ordered Analyzer chain and its shared budget.
+
+    Historical configs have no chain policy. Their single route and retry
+    settings remain intact; callers can distinguish that path through
+    ``configured`` rather than silently changing replay semantics.
+    """
+
+    effective = _resolve_ranking_config(ranking_config)
+    analyzer = _ranking_mapping(effective, "task_analyzer")
+    primary = task_analyzer_policy(effective)
+    configured = all(
+        key in analyzer
+        for key in (
+            "fallback_chain",
+            "total_timeout_seconds",
+            "payload_max_chars",
+            "payload_max_bytes",
+            "payload_max_estimated_tokens",
+            "schema_repair_max_retries",
+        )
+    )
+    fallback_routes = analyzer.get("fallback_chain") if configured else []
+    assert isinstance(fallback_routes, list)
+    return {
+        "configured": configured,
+        "routes": [
+            {
+                "provider": str(primary["provider"]),
+                "model": str(primary["model"]),
+                "upstream_provider": str(primary["upstream_provider"]),
+            },
+            *copy.deepcopy(fallback_routes),
+        ],
+        "total_timeout_seconds": (
+            _ranking_number(effective, "task_analyzer", "total_timeout_seconds")
+            if configured
+            else _ranking_number(effective, "task_analyzer", "timeout_seconds")
+        ),
+        "schema_repair_max_retries": (
+            _ranking_int(effective, "task_analyzer", "schema_repair_max_retries")
+            if configured
+            else 0
         ),
     }
 
@@ -3588,6 +3798,13 @@ _FROZEN_TASK_ANALYSIS_FIELDS = frozenset(
         "entries_sha256",
     }
 )
+_FROZEN_TASK_ANALYSIS_V3_FIELDS = frozenset(
+    {
+        *_FROZEN_TASK_ANALYSIS_FIELDS,
+        "source_task_analyzer_execution_contract",
+        "source_task_analyzer_execution_contract_sha256",
+    }
+)
 _FROZEN_TASK_ANALYSIS_ENTRY_FIELDS = frozenset(
     {
         "task_input_sha256",
@@ -3615,6 +3832,54 @@ _FROZEN_TASK_ANALYZER_TRACE_FIELDS = frozenset(
 )
 
 
+def _frozen_task_analyzer_routes(
+    source_config: Mapping[str, Any],
+) -> list[dict[str, str]] | None:
+    """Return the exact ordered Analyzer routes authorized by a frozen config."""
+
+    raw_routes: list[Any] = [
+        {
+            "provider": source_config.get("provider"),
+            "model": source_config.get("model"),
+            "upstream_provider": source_config.get("upstream_provider"),
+        }
+    ]
+    if "fallback_chain" in source_config:
+        fallback_chain = source_config.get("fallback_chain")
+        if not isinstance(fallback_chain, list):
+            return None
+        raw_routes.extend(fallback_chain)
+    routes: list[dict[str, str]] = []
+    identities: set[tuple[str, str]] = set()
+    for raw_route in raw_routes:
+        if not isinstance(raw_route, Mapping) or set(raw_route) != {
+            "provider",
+            "model",
+            "upstream_provider",
+        }:
+            return None
+        try:
+            route = TaskAnalyzerCandidate(
+                provider_id=str(raw_route["provider"]),
+                model_id=str(raw_route["model"]),
+                upstream_provider=str(raw_route["upstream_provider"]),
+            )
+        except (KeyError, ValueError):
+            return None
+        identity = (route.provider_id, route.model_id)
+        if identity in identities:
+            return None
+        identities.add(identity)
+        routes.append(
+            {
+                "provider": route.provider_id,
+                "model": route.model_id,
+                "upstream_provider": route.upstream_provider,
+            }
+        )
+    return routes
+
+
 def frozen_task_analysis_contract_reasons(
     value: Any,
     *,
@@ -3623,9 +3888,16 @@ def frozen_task_analysis_contract_reasons(
     """Authenticate an inline ten-task Analyzer replay bundle."""
 
     reasons: list[str] = []
-    if not isinstance(value, Mapping) or set(value) != _FROZEN_TASK_ANALYSIS_FIELDS:
+    if not isinstance(value, Mapping):
         return ["invalid_frozen_task_analysis_contract"]
     schema = value.get("schema")
+    expected_contract_fields = (
+        _FROZEN_TASK_ANALYSIS_V3_FIELDS
+        if schema == FROZEN_TASK_ANALYSIS_SCHEMA_V3
+        else _FROZEN_TASK_ANALYSIS_FIELDS
+    )
+    if set(value) != expected_contract_fields:
+        return ["invalid_frozen_task_analysis_contract"]
     if (
         schema not in FROZEN_TASK_ANALYSIS_SCHEMAS
         or value.get("mode") != FROZEN_TASK_ANALYSIS_MODE
@@ -3642,6 +3914,7 @@ def frozen_task_analysis_contract_reasons(
         if len(raw_hash) != 64 or any(char not in "0123456789abcdef" for char in raw_hash):
             reasons.append(f"invalid_frozen_task_analysis_{field_name}")
     source_config = value.get("source_task_analyzer_config")
+    authorized_routes: list[dict[str, str]] | None = None
     if (
         not isinstance(source_config, Mapping)
         or not source_config
@@ -3649,11 +3922,46 @@ def frozen_task_analysis_contract_reasons(
         != str(value.get("source_task_analyzer_config_sha256") or "")
     ):
         reasons.append("invalid_frozen_task_analysis_source_analyzer_config")
-    elif any(
-        not str(source_config.get(field_name) or "").strip()
-        for field_name in ("provider", "model", "upstream_provider")
-    ):
+    elif (authorized_routes := _frozen_task_analyzer_routes(source_config)) is None:
         reasons.append("invalid_frozen_task_analysis_source_analyzer_identity")
+    if schema == FROZEN_TASK_ANALYSIS_SCHEMA_V3:
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            task_analyzer_execution_contract_matches_source,
+            validated_task_analyzer_execution_contract,
+        )
+
+        execution_contract = value.get(
+            "source_task_analyzer_execution_contract"
+        )
+        validated_execution_contract = (
+            validated_task_analyzer_execution_contract(execution_contract)
+        )
+        if (
+            validated_execution_contract is None
+            or not task_analyzer_execution_contract_matches_source(
+                execution_contract,
+                source_config if isinstance(source_config, Mapping) else {},
+            )
+            or _canonical_hash(execution_contract)
+            != str(
+                value.get(
+                    "source_task_analyzer_execution_contract_sha256"
+                )
+                or ""
+            )
+        ):
+            reasons.append(
+                "invalid_frozen_task_analyzer_execution_contract"
+            )
+            authorized_routes = None
+        else:
+            authorized_routes = [
+                {
+                    key: str(route[key])
+                    for key in ("provider", "model", "upstream_provider")
+                }
+                for route in validated_execution_contract["routes"]
+            ]
     entries = value.get("entries")
     if not isinstance(entries, Mapping) or len(entries) != 10:
         reasons.append("invalid_frozen_task_analysis_entries")
@@ -3669,7 +3977,8 @@ def frozen_task_analysis_contract_reasons(
         reasons.append("wrong_frozen_task_analysis_task_set")
     expected_entry_fields = (
         _FROZEN_TASK_ANALYSIS_V2_ENTRY_FIELDS
-        if schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2
+        if schema
+        in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
         else _FROZEN_TASK_ANALYSIS_ENTRY_FIELDS
     )
     for raw_entry in entries.values():
@@ -3710,7 +4019,8 @@ def frozen_task_analysis_contract_reasons(
         warnings = analyzer.get("normalization_warnings")
         origin_outcome = (
             raw_entry.get("origin_outcome")
-            if schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2
+            if schema
+            in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
             else FROZEN_TASK_ANALYSIS_LIVE_SUCCESS
         )
         outcome_valid = (
@@ -3718,7 +4028,8 @@ def frozen_task_analysis_contract_reasons(
             and analyzer.get("schema_valid") is True
             and analyzer.get("fallback_reason") == ""
         ) or (
-            schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2
+            schema
+            in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
             and origin_outcome == FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK
             and analyzer.get("schema_valid") is False
             and bool(str(analyzer.get("fallback_reason") or "").strip())
@@ -3739,11 +4050,16 @@ def frozen_task_analysis_contract_reasons(
             or len(warnings) != len(set(warnings))
         ):
             reasons.append("invalid_frozen_task_analyzer_trace")
-        elif isinstance(source_config, Mapping) and (
-            str(analyzer.get("provider") or "")
-            != str(source_config.get("provider") or "")
-            or str(analyzer.get("model") or "")
-            != str(source_config.get("model") or "")
+        elif (
+            authorized_routes is None
+            or (
+                str(analyzer.get("provider") or ""),
+                str(analyzer.get("model") or ""),
+            )
+            not in {
+                (route["provider"], route["model"])
+                for route in authorized_routes
+            }
             or str(analyzer.get("analyzer_version") or "") != TASK_ANALYZER_VERSION
         ):
             reasons.append("wrong_frozen_task_analyzer_identity")
@@ -3814,8 +4130,15 @@ def frozen_task_analysis_plan_reasons(
         ],
         "physical_request_count": 0,
     }
-    if contract_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2:
+    if contract_schema in {
+        FROZEN_TASK_ANALYSIS_SCHEMA_V2,
+        FROZEN_TASK_ANALYSIS_SCHEMA_V3,
+    }:
         expected_proof["origin_outcome"] = entry["origin_outcome"]
+    if contract_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V3:
+        expected_proof[
+            "source_task_analyzer_execution_contract_sha256"
+        ] = contract["source_task_analyzer_execution_contract_sha256"]
     if dict(proof) != expected_proof:
         reasons.append("wrong_frozen_task_analysis_replay_proof")
     expected_analyzer = copy.deepcopy(dict(entry["task_analyzer"]))
@@ -3878,7 +4201,8 @@ def frozen_task_analysis_result(
     )
     origin_outcome = (
         entry.get("origin_outcome")
-        if contract.get("schema") == FROZEN_TASK_ANALYSIS_SCHEMA_V2
+        if contract.get("schema")
+        in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
         else FROZEN_TASK_ANALYSIS_LIVE_SUCCESS
     )
     if (
@@ -3920,8 +4244,15 @@ def frozen_task_analysis_result(
         ],
         "physical_request_count": 0,
     }
-    if contract.get("schema") == FROZEN_TASK_ANALYSIS_SCHEMA_V2:
+    if contract.get("schema") in {
+        FROZEN_TASK_ANALYSIS_SCHEMA_V2,
+        FROZEN_TASK_ANALYSIS_SCHEMA_V3,
+    }:
         proof["origin_outcome"] = origin_outcome
+    if contract.get("schema") == FROZEN_TASK_ANALYSIS_SCHEMA_V3:
+        proof[
+            "source_task_analyzer_execution_contract_sha256"
+        ] = contract["source_task_analyzer_execution_contract_sha256"]
     return TaskAnalysisResult(
         profile=copy.deepcopy(normalized),
         source=FROZEN_TASK_ANALYZER_SOURCE,
@@ -3995,6 +4326,179 @@ async def _bounded_close_task_analyzer_stream(
     return False
 
 
+def _truncate_task_analyzer_text(
+    value: str,
+    *,
+    max_chars: int,
+    head_fraction: float,
+) -> str:
+    if len(value) <= max_chars:
+        return value
+    marker = "\n[task input truncated for classification]\n"[:max_chars]
+    retained_chars = max(0, max_chars - len(marker))
+    head_chars = math.floor(retained_chars * head_fraction)
+    tail_chars = retained_chars - head_chars
+    tail = value[-tail_chars:] if tail_chars else ""
+    return value[:head_chars] + marker + tail
+
+
+def _compact_task_analyzer_request_context(
+    request_context: Mapping[str, Any],
+    ranking_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep routing-critical facts when the full context exceeds the payload cap."""
+
+    routing_budget_raw = request_context.get("routing_budget")
+    routing_budget = (
+        {
+            key: max(0, _as_int(routing_budget_raw.get(key), 0))
+            for key in (
+                "estimated_input_tokens",
+                "tool_log_tokens",
+                "candidate_output_tokens",
+                "aggregator_output_tokens",
+            )
+        }
+        if isinstance(routing_budget_raw, Mapping)
+        else {}
+    )
+    modalities_raw = request_context.get("input_modalities")
+    modalities = (
+        [str(value) for value in modalities_raw if isinstance(value, str) and value in MODALITIES][
+            : len(MODALITIES)
+        ]
+        if isinstance(modalities_raw, Sequence) and not isinstance(modalities_raw, (str, bytes))
+        else []
+    )
+    snapshot_hash = str(request_context.get("snapshot_hash") or "")[:128]
+    compact: dict[str, Any] = {
+        "routing_budget": routing_budget,
+        "input_modalities": modalities,
+        "last_route": _sanitize_last_route(
+            request_context.get("last_route"),
+            ranking_config,
+        ),
+        "payload_context_truncated": True,
+    }
+    if snapshot_hash:
+        compact["snapshot_hash"] = snapshot_hash
+    with contextlib.suppress(TypeError, ValueError):
+        compact["full_context_sha256"] = canonical_json_sha256(request_context)
+    return compact
+
+
+def _task_analyzer_payload_metrics(
+    payload: str,
+    ranking_config: Mapping[str, Any],
+) -> dict[str, int]:
+    return {
+        "chars": len(payload),
+        "bytes": len(payload.encode("utf-8")),
+        "estimated_tokens": _estimated_tokens_from_text(payload, ranking_config),
+    }
+
+
+def _serialize_task_analyzer_input(
+    analyzer_input: Mapping[str, Any],
+    *,
+    message: str,
+    request_context: Mapping[str, Any],
+    ranking_config: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Serialize one complete Analyzer payload under all configured budgets."""
+
+    analyzer = _ranking_mapping(ranking_config, "task_analyzer")
+    budget_keys = (
+        "payload_max_chars",
+        "payload_max_bytes",
+        "payload_max_estimated_tokens",
+    )
+    if not all(key in analyzer for key in budget_keys):
+        payload = json.dumps(analyzer_input, ensure_ascii=True)
+        return payload, {
+            **_task_analyzer_payload_metrics(payload, ranking_config),
+            "context_truncated": False,
+            "task_truncated": False,
+            "legacy_serialization": True,
+        }
+
+    limits = {
+        "chars": _ranking_int(ranking_config, "task_analyzer", "payload_max_chars"),
+        "bytes": _ranking_int(ranking_config, "task_analyzer", "payload_max_bytes"),
+        "estimated_tokens": _ranking_int(
+            ranking_config,
+            "task_analyzer",
+            "payload_max_estimated_tokens",
+        ),
+    }
+
+    def serialize(candidate: Mapping[str, Any]) -> tuple[str, dict[str, int]]:
+        payload = json.dumps(
+            candidate,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return payload, _task_analyzer_payload_metrics(payload, ranking_config)
+
+    def fits(metrics: Mapping[str, int]) -> bool:
+        return all(metrics[key] <= limits[key] for key in limits)
+
+    full_input = copy.deepcopy(dict(analyzer_input))
+    payload, metrics = serialize(full_input)
+    if fits(metrics):
+        return payload, {
+            **metrics,
+            "context_truncated": False,
+            "task_truncated": False,
+            "legacy_serialization": False,
+        }
+
+    compact_input = copy.deepcopy(full_input)
+    compact_input["request_context"] = _compact_task_analyzer_request_context(
+        request_context,
+        ranking_config,
+    )
+    payload, metrics = serialize(compact_input)
+    if fits(metrics):
+        return payload, {
+            **metrics,
+            "context_truncated": True,
+            "task_truncated": False,
+            "legacy_serialization": False,
+        }
+
+    head_fraction = _ranking_number(
+        ranking_config,
+        "task_analyzer",
+        "truncation_head_fraction",
+    )
+    low = 0
+    high = len(message)
+    best: tuple[str, dict[str, int], str] | None = None
+    while low <= high:
+        candidate_chars = (low + high) // 2
+        candidate_task = _truncate_task_analyzer_text(
+            message,
+            max_chars=candidate_chars,
+            head_fraction=head_fraction,
+        )
+        compact_input["task"] = candidate_task
+        candidate_payload, candidate_metrics = serialize(compact_input)
+        if fits(candidate_metrics):
+            best = candidate_payload, candidate_metrics, candidate_task
+            low = candidate_chars + 1
+        else:
+            high = candidate_chars - 1
+    if best is None:
+        raise DynamicRankingError("task analyzer payload budget is smaller than its fixed schema")
+    return best[0], {
+        **best[1],
+        "context_truncated": True,
+        "task_truncated": best[2] != message,
+        "legacy_serialization": False,
+    }
+
+
 async def analyze_task_with_provider(
     *,
     provider: LLMProvider | None,
@@ -4017,6 +4521,8 @@ async def analyze_task_with_provider(
     _retry_feedback: str = "",
     _accumulated_usage: Mapping[str, Any] | None = None,
     _allow_provider_stream_fallback: bool = True,
+    _absolute_deadline: float | None = None,
+    _schema_repair_only: bool = False,
 ) -> TaskAnalysisResult:
     """Use the caller-supplied dedicated provider as the task analyzer."""
 
@@ -4046,11 +4552,17 @@ async def analyze_task_with_provider(
     analyzer_temperature = _ranking_number(effective_config, "task_analyzer", "temperature")
     analyzer_thinking = _ranking_bool(effective_config, "task_analyzer", "thinking")
     analyzer_max_retries = _ranking_int(effective_config, "task_analyzer", "max_retries")
-    effective_timeout = (
+    configured_timeout = (
         _ranking_number(effective_config, "task_analyzer", "timeout_seconds")
         if timeout_seconds is None
         else timeout_seconds
     )
+    deadline_remaining = (
+        max(0.0, _absolute_deadline - asyncio.get_running_loop().time())
+        if _absolute_deadline is not None
+        else configured_timeout
+    )
+    effective_timeout = min(configured_timeout, deadline_remaining)
     profile_decimal_places = _ranking_int(effective_config, "trace", "profile_decimal_places")
     fallback = fallback_task_profile(
         routed_tier=routed_tier,
@@ -4076,6 +4588,17 @@ async def analyze_task_with_provider(
             schema_valid=False,
             confidence=_clamp(routing_confidence),
             fallback_reason="provider_unavailable",
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+    if effective_timeout <= 0.0:
+        return TaskAnalysisResult(
+            profile=fallback,
+            source="router_fallback",
+            schema_valid=False,
+            confidence=_clamp(routing_confidence),
+            fallback_reason=TaskAnalyzerDeadlineError.__name__,
+            usage=_task_analyzer_zero_request_usage(_accumulated_usage),
             provider_id=provider_id,
             model_id=model_id,
         )
@@ -4105,19 +4628,15 @@ async def analyze_task_with_provider(
         "work with capabilities such as retrieval, reasoning, summarization, or "
         "data_analysis as appropriate."
     )
-    analysis_message = message
-    if len(analysis_message) > analyzer_input_max_chars:
-        truncation_marker = "\n[task input truncated for classification]\n"[
-            :analyzer_input_max_chars
-        ]
-        retained_chars = analyzer_input_max_chars - len(truncation_marker)
-        head_fraction = _ranking_number(
-            effective_config, "task_analyzer", "truncation_head_fraction"
-        )
-        head_chars = math.floor(retained_chars * head_fraction)
-        tail_chars = retained_chars - head_chars
-        tail = analysis_message[-tail_chars:] if tail_chars else ""
-        analysis_message = analysis_message[:head_chars] + truncation_marker + tail
+    analysis_message = _truncate_task_analyzer_text(
+        message,
+        max_chars=analyzer_input_max_chars,
+        head_fraction=_ranking_number(
+            effective_config,
+            "task_analyzer",
+            "truncation_head_fraction",
+        ),
+    )
     constraint_values = _ranking_mapping(
         effective_config, "task_profile_schema", "constraint_values"
     )
@@ -4143,6 +4662,36 @@ async def analyze_task_with_provider(
         analyzer_input["retry_feedback"] = (
             "The previous attempt failed. Correct this validation error: " + _retry_feedback[:500]
         )
+    try:
+        analyzer_payload, payload_metrics = _serialize_task_analyzer_input(
+            analyzer_input,
+            message=analysis_message,
+            request_context=request_context,
+            ranking_config=effective_config,
+        )
+    except (TypeError, ValueError, DynamicRankingError) as exc:
+        reason = type(exc).__name__
+        log.warning(
+            "llm_ensemble.router_dynamic.task_analyzer_fallback",
+            decision_id=decision_id,
+            analyzer_version=TASK_ANALYZER_VERSION,
+            reason=reason,
+            provider=provider_id or "unknown",
+            model=model_id,
+            routed_tier=_router_tier(routed_tier, effective_config),
+            user_profile_enabled=user_profile_enabled,
+            physical_request_count=0,
+        )
+        return TaskAnalysisResult(
+            profile=fallback,
+            source="router_fallback",
+            schema_valid=False,
+            confidence=_clamp(routing_confidence),
+            fallback_reason=reason,
+            usage=_task_analyzer_zero_request_usage(_accumulated_usage),
+            provider_id=provider_id,
+            model_id=model_id,
+        )
     log.info(
         "llm_ensemble.router_dynamic.task_analyzer_started",
         decision_id=decision_id,
@@ -4150,15 +4699,21 @@ async def analyze_task_with_provider(
         provider=provider_id or "unknown",
         model=model_id,
         input_chars=len(message),
-        input_truncated=len(analysis_message) < len(message),
+        input_truncated=(
+            len(analysis_message) < len(message)
+            or payload_metrics["task_truncated"]
+        ),
         request_context_hash=request_context.get("snapshot_hash"),
         user_profile_enabled=user_profile_enabled,
         attempt=_attempt,
         max_attempts=analyzer_max_retries + 1,
+        payload_chars=payload_metrics["chars"],
+        payload_bytes=payload_metrics["bytes"],
+        payload_estimated_tokens=payload_metrics["estimated_tokens"],
+        payload_context_truncated=payload_metrics["context_truncated"],
+        payload_task_truncated=payload_metrics["task_truncated"],
     )
-    physical_attempt_ordinal = _task_analyzer_physical_attempt_count(
-        _accumulated_usage
-    ) + 1
+    physical_attempt_ordinal = _task_analyzer_physical_attempt_count(_accumulated_usage) + 1
     physical_attempt_id = _task_analyzer_physical_attempt_id(
         decision_id=decision_id,
         request_context=request_context,
@@ -4173,15 +4728,21 @@ async def analyze_task_with_provider(
     admission_guard: ProviderAdmissionLeaseGuard | None = None
     attempt_timeout = effective_timeout
     try:
-        analyzer_messages = [
-            Message(role="user", content=json.dumps(analyzer_input, ensure_ascii=True))
-        ]
+        analyzer_messages = [Message(role="user", content=analyzer_payload)]
+        request_timeout = effective_timeout
+        if _absolute_deadline is not None:
+            cleanup_reserve = min(
+                float(configured_policy["stream_close_timeout_seconds"]),
+                effective_timeout * 0.5,
+                max(0.005, effective_timeout * 0.10),
+            )
+            request_timeout = max(0.000001, effective_timeout - cleanup_reserve)
         analyzer_config = ChatConfig(
             max_tokens=analyzer_max_output_tokens,
             temperature=analyzer_temperature,
             system=system_prompt,
             thinking=analyzer_thinking,
-            timeout=effective_timeout,
+            timeout=request_timeout,
             allow_provider_stream_fallback=_allow_provider_stream_fallback,
             output_json_schema=copy.deepcopy(_task_analyzer_output_schema()),
             output_json_schema_strict=True,
@@ -4255,10 +4816,24 @@ async def analyze_task_with_provider(
                     model=model_id,
                     wait_ms=(admission_lease.wait_ms if admission_lease else 0),
                 )
-            attempt_timeout = min(effective_timeout, remaining_to_deadline)
-            analyzer_config = analyzer_config.model_copy(
-                update={"timeout": attempt_timeout}
+            request_timeout = min(request_timeout, remaining_to_deadline)
+        if _absolute_deadline is not None:
+            final_deadline_remaining = (
+                _absolute_deadline - asyncio.get_running_loop().time()
             )
+            if final_deadline_remaining <= cleanup_reserve:
+                count_current_request = False
+                raise TaskAnalyzerDeadlineError(
+                    "task analyzer deadline elapsed before provider request"
+                )
+            request_timeout = min(
+                request_timeout,
+                max(0.000001, final_deadline_remaining - cleanup_reserve),
+            )
+        attempt_timeout = request_timeout
+        analyzer_config = analyzer_config.model_copy(
+            update={"timeout": request_timeout}
+        )
         try:
             stream = (
                 provider.chat(analyzer_messages, tools=None, config=analyzer_config)
@@ -4288,7 +4863,7 @@ async def analyze_task_with_provider(
         terminal_observed = False
         stream_exhausted = False
         try:
-            iteration_timeout = attempt_timeout
+            iteration_timeout = request_timeout
             if admission_deadline is not None:
                 remaining_to_deadline = (
                     admission_deadline - time.monotonic()
@@ -4476,16 +5051,27 @@ async def analyze_task_with_provider(
                         if explicit_zero:
                             count_current_request = False
                         elif receipt_rows:
-                            usage = _task_analyzer_usage_from_receipt_row(
-                                receipt_rows[0]
+                            usage = _task_analyzer_usage_from_receipt_row(receipt_rows[0])
+                        if _schema_repair_only:
+                            raise TaskAnalyzerProviderError(
+                                _task_analyzer_provider_failure_reason(
+                                    provider_id=provider_id,
+                                    event=event,
+                                )
                             )
                         raise RuntimeError(f"provider_error:{event.code or 'unknown'}")
                 else:
                     stream_exhausted = True
         finally:
+            cleanup_remaining = (
+                max(0.0, _absolute_deadline - asyncio.get_running_loop().time())
+                if _absolute_deadline is not None
+                else effective_timeout
+            )
             close_timeout = min(
                 float(configured_policy["stream_close_timeout_seconds"]),
                 max(0.0, attempt_timeout),
+                cleanup_remaining,
             )
             if admission_deadline is not None:
                 close_timeout = min(
@@ -4524,7 +5110,10 @@ async def analyze_task_with_provider(
                 raise TaskAnalyzerStreamCleanupError("task analyzer stream cleanup was not proven")
         if not got_done:
             raise RuntimeError("task analyzer stream ended before DoneEvent")
-        payload = _extract_json_object("".join(text_parts))
+        try:
+            payload = _extract_json_object("".join(text_parts))
+        except ValueError as exc:
+            raise TaskAnalyzerSchemaError("invalid_json") from exc
         profile, schema_valid, normalization_issues = normalize_task_profile(
             payload,
             routed_tier=routed_tier,
@@ -4532,7 +5121,10 @@ async def analyze_task_with_provider(
             ranking_config=effective_config,
         )
         if not schema_valid:
-            raise ValueError(";".join(normalization_issues) or "invalid task profile")
+            raise TaskAnalyzerSchemaError(
+                "invalid_schema",
+                ";".join(normalization_issues) or "invalid task profile",
+            )
     except TaskAnalyzerStreamCleanupError as exc:
         # A replacement request must not begin while the previous physical
         # provider stream may still be billed in the background.
@@ -4563,13 +5155,29 @@ async def analyze_task_with_provider(
         if admission_lease is not None:
             admission_lease = None
         absolute_deadline_exhausted = bool(
-            admission_deadline is not None
-            and time.monotonic() >= admission_deadline
+            (
+                admission_deadline is not None
+                and time.monotonic() >= admission_deadline
+            )
+            or (
+                _absolute_deadline is not None
+                and asyncio.get_running_loop().time() >= _absolute_deadline
+            )
         )
+        schema_error = isinstance(exc, TaskAnalyzerSchemaError)
         reason = (
             _TASK_ANALYZER_ABSOLUTE_DEADLINE_REASON
             if absolute_deadline_exhausted
             and not isinstance(exc, ProviderAdmissionError)
+            else
+            exc.code
+            if schema_error and _schema_repair_only
+            else exc.public_reason
+            if isinstance(exc, TaskAnalyzerProviderError) and _schema_repair_only
+            else "transient"
+            if isinstance(exc, TimeoutError) and _schema_repair_only
+            else "ValueError"
+            if schema_error
             else type(exc).__name__
         )
         accumulated_usage = (
@@ -4585,11 +5193,13 @@ async def analyze_task_with_provider(
                 unknown_reason=reason,
             )
         )
-        if (
+        should_retry = (
             _attempt <= analyzer_max_retries
             and not isinstance(exc, ProviderAdmissionError)
             and not absolute_deadline_exhausted
-        ):
+            and (not _schema_repair_only or schema_error)
+        )
+        if should_retry:
             log.warning(
                 "llm_ensemble.router_dynamic.task_analyzer_retry",
                 decision_id=decision_id,
@@ -4621,11 +5231,13 @@ async def analyze_task_with_provider(
                 admission_deadline=admission_deadline,
                 admission_before_release=admission_before_release,
                 _attempt=_attempt + 1,
-                _retry_feedback=reason,
-                _accumulated_usage=accumulated_usage,
-                _allow_provider_stream_fallback=(
-                    _allow_provider_stream_fallback
+                _retry_feedback=(
+                    exc.feedback if schema_error and _schema_repair_only else reason
                 ),
+                _accumulated_usage=accumulated_usage,
+                _allow_provider_stream_fallback=(_allow_provider_stream_fallback),
+                _absolute_deadline=_absolute_deadline,
+                _schema_repair_only=_schema_repair_only,
             )
         log.warning(
             "llm_ensemble.router_dynamic.task_analyzer_fallback",
@@ -4752,6 +5364,8 @@ def _normalize_task_analyzer_chain_candidates(
 def _task_analyzer_candidate_ranking_config(
     ranking_config: Mapping[str, Any],
     candidate: TaskAnalyzerCandidate,
+    *,
+    schema_repair_max_retries: int,
 ) -> _ValidatedRankingConfig:
     temporary = copy.deepcopy(dict(ranking_config))
     analyzer = temporary.get("task_analyzer")
@@ -4762,17 +5376,50 @@ def _task_analyzer_candidate_ranking_config(
             "provider": candidate.provider_id,
             "model": candidate.model_id,
             "upstream_provider": candidate.upstream_provider,
-            "max_retries": 0,
+            "max_retries": schema_repair_max_retries,
         }
     )
+    if "fallback_chain" in analyzer:
+        analyzer["fallback_chain"] = []
     return _validate_ranking_config(temporary)
 
 
 def _public_task_analyzer_chain_failure_reason(value: Any) -> str:
     reason = str(value or "").strip()
+    if reason in {
+        TaskAnalyzerDeadlineError.__name__,
+        _TASK_ANALYZER_ABSOLUTE_DEADLINE_REASON,
+    }:
+        return "transient"
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", reason):
         return reason
     return "analyzer_failed"
+
+
+def _task_analyzer_provider_failure_reason(
+    *, provider_id: str, event: ErrorEvent
+) -> str:
+    raw_code = str(event.code or "")
+    kind = classify_provider_error(
+        provider_id,
+        int(raw_code) if raw_code.isdigit() else None,
+        raw_code=raw_code,
+        message=str(event.message or ""),
+    )
+    if kind is ProviderFailureKind.AUTH_INVALID:
+        return "auth"
+    if kind in {
+        ProviderFailureKind.UNSUPPORTED_FEATURE,
+        ProviderFailureKind.MODEL_NOT_FOUND,
+    }:
+        return "unsupported"
+    if kind in {
+        ProviderFailureKind.RATE_LIMITED,
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+        ProviderFailureKind.TRANSPORT_TRANSIENT,
+    }:
+        return "transient"
+    return kind.value
 
 
 async def analyze_task_with_fallback_chain(
@@ -4784,6 +5431,8 @@ async def analyze_task_with_fallback_chain(
     routed_tier: str,
     routing_confidence: float,
     timeout_seconds: float | None = None,
+    absolute_deadline: float | None = None,
+    schema_repair_max_retries: int | None = None,
     usage_tracker: Any | None = None,
     session_key: str | None = None,
     ranking_config: Mapping[str, Any] | None = None,
@@ -4792,16 +5441,64 @@ async def analyze_task_with_fallback_chain(
     admission_deadline: float | None = None,
     admission_before_release: Callable[[str], None] | None = None,
 ) -> TaskAnalysisResult:
-    """Try each resolved Analyzer candidate once, in caller-declared order.
+    """Try an ordered Analyzer chain under one absolute deadline.
 
-    Ordinary request or validation failures advance to the next candidate. A
-    stream-cleanup or physical-evidence failure remains fail-closed because a
-    replacement request cannot safely start while the previous request may
-    still be running or its billing identity is contradictory.
+    The chain may repair one schema error at most once. Other ordinary failures
+    advance directly to the next candidate. Stream-cleanup or physical-evidence
+    failures remain fail-closed because a replacement request cannot safely
+    start while the previous request may still be running or its billing
+    identity is contradictory.
     """
 
     normalized_candidates = _normalize_task_analyzer_chain_candidates(candidates)
     effective_config = _resolve_ranking_config(ranking_config)
+    chain_policy = task_analyzer_chain_policy(effective_config)
+    total_timeout = (
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else (
+            float(chain_policy["total_timeout_seconds"])
+            if chain_policy["configured"]
+            else float(chain_policy["total_timeout_seconds"])
+            * len(normalized_candidates)
+        )
+    )
+    if not math.isfinite(total_timeout) or total_timeout <= 0.0:
+        raise ValueError("task analyzer fallback chain timeout must be positive")
+    configured_schema_repairs = (
+        int(chain_policy["schema_repair_max_retries"])
+        if schema_repair_max_retries is None
+        else schema_repair_max_retries
+    )
+    if (
+        isinstance(configured_schema_repairs, bool)
+        or not isinstance(configured_schema_repairs, int)
+        or not 0 <= configured_schema_repairs <= 1
+    ):
+        raise ValueError(
+            "task analyzer fallback chain schema repair retries must be 0 or 1"
+        )
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    chain_absolute_deadline = started_at + total_timeout
+    if absolute_deadline is not None:
+        if not math.isfinite(float(absolute_deadline)):
+            raise ValueError("task analyzer absolute deadline must be finite")
+        chain_absolute_deadline = min(
+            chain_absolute_deadline,
+            float(absolute_deadline),
+        )
+    if admission_deadline is not None:
+        if not math.isfinite(float(admission_deadline)):
+            raise ValueError("task analyzer admission deadline must be finite")
+        chain_absolute_deadline = min(
+            chain_absolute_deadline,
+            float(admission_deadline),
+        )
+    configured_deadline_seconds = round(
+        max(0.0, chain_absolute_deadline - started_at),
+        6,
+    )
     configured_routes = [
         {
             "provider": candidate.provider_id,
@@ -4815,22 +5512,36 @@ async def analyze_task_with_fallback_chain(
     last_result: TaskAnalysisResult | None = None
 
     def chain_trace(*, selected_index: int | None, exhausted: bool) -> dict[str, Any]:
+        now = loop.time()
         return {
             "protocol": TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL,
             "configured_routes": copy.deepcopy(configured_routes),
             "attempt_outcomes": copy.deepcopy(outcomes),
             "selected_index": selected_index,
             "exhausted": exhausted,
+            "schema_repair_max_retries": configured_schema_repairs,
+            "deadline": {
+                "configured_seconds": configured_deadline_seconds,
+                "elapsed_seconds": round(max(0.0, now - started_at), 6),
+                "remaining_seconds": round(
+                    max(0.0, chain_absolute_deadline - now),
+                    6,
+                ),
+                "expired": now >= chain_absolute_deadline,
+            },
         }
 
+    schema_repairs_remaining = configured_schema_repairs
+    chain_cleanup_reserve = float(
+        task_analyzer_policy(effective_config)["stream_close_timeout_seconds"]
+    )
     for candidate_index, candidate in enumerate(normalized_candidates):
         candidate_config = _task_analyzer_candidate_ranking_config(
             effective_config,
             candidate,
+            schema_repair_max_retries=schema_repairs_remaining,
         )
-        physical_attempts_before = _task_analyzer_physical_attempt_count(
-            accumulated_usage
-        )
+        physical_attempts_before = _task_analyzer_physical_attempt_count(accumulated_usage)
         result = await analyze_task_with_provider(
             provider=candidate.provider,
             message=message,
@@ -4838,7 +5549,7 @@ async def analyze_task_with_fallback_chain(
             request_context=request_context,
             routed_tier=routed_tier,
             routing_confidence=routing_confidence,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=None,
             usage_tracker=usage_tracker,
             session_key=session_key,
             analyzer_provider_id=candidate.provider_id,
@@ -4850,12 +5561,14 @@ async def analyze_task_with_fallback_chain(
             admission_before_release=admission_before_release,
             _accumulated_usage=accumulated_usage,
             _allow_provider_stream_fallback=False,
+            _absolute_deadline=chain_absolute_deadline,
+            _schema_repair_only=True,
         )
         if result.usage:
             accumulated_usage = copy.deepcopy(result.usage)
-        physical_attempts_after = _task_analyzer_physical_attempt_count(
-            accumulated_usage
-        )
+        physical_attempts_after = _task_analyzer_physical_attempt_count(accumulated_usage)
+        if physical_attempts_after - physical_attempts_before > 1:
+            schema_repairs_remaining = 0
         outcome = {
             "candidate_index": candidate_index,
             "provider": candidate.provider_id,
@@ -4885,18 +5598,24 @@ async def analyze_task_with_fallback_chain(
                     exhausted=False,
                 ),
             )
+        deadline_remaining = chain_absolute_deadline - loop.time()
         if (
             admission_deadline is not None
-            and time.monotonic() >= admission_deadline
+            and 0.0 < deadline_remaining <= chain_cleanup_reserve
         ):
-            return replace(
-                result,
-                usage=copy.deepcopy(accumulated_usage),
-                chain_trace=chain_trace(
-                    selected_index=None,
-                    exhausted=False,
-                ),
+            # The remaining slice is reserved for proving the just-finished
+            # stream closed.  Do not spend it on a replacement physical
+            # request; wait out the authenticated Analyzer deadline instead
+            # of claiming an early prefix exhaustion.
+            await asyncio.sleep(deadline_remaining)
+        if (
+            loop.time() >= chain_absolute_deadline
+            or (
+                admission_deadline is not None
+                and time.monotonic() >= admission_deadline
             )
+        ):
+            break
 
     assert last_result is not None
     return replace(

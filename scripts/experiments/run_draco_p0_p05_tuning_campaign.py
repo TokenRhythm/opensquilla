@@ -51,8 +51,13 @@ STATUS_SCHEMA = "opensquilla.draco-p0-p05-controller-status/v1"
 ANALYZER_ARTIFACT_SCHEMA = "opensquilla.draco-frozen-task-analysis-source/v2"
 FROZEN_TASK_ANALYSIS_SCHEMA_V1 = "opensquilla.draco.frozen-task-analysis/v1"
 FROZEN_TASK_ANALYSIS_SCHEMA_V2 = "opensquilla.draco.frozen-task-analysis/v2"
+FROZEN_TASK_ANALYSIS_SCHEMA_V3 = "opensquilla.draco.frozen-task-analysis/v3"
 FROZEN_TASK_ANALYSIS_SCHEMAS = frozenset(
-    {FROZEN_TASK_ANALYSIS_SCHEMA_V1, FROZEN_TASK_ANALYSIS_SCHEMA_V2}
+    {
+        FROZEN_TASK_ANALYSIS_SCHEMA_V1,
+        FROZEN_TASK_ANALYSIS_SCHEMA_V2,
+        FROZEN_TASK_ANALYSIS_SCHEMA_V3,
+    }
 )
 ANALYZER_SOURCE_POLICY_SCHEMA = "opensquilla.draco-analyzer-source-policy/v1"
 PREEXISTING_SOURCE_SCHEMA = "opensquilla.draco-preexisting-analyzer-source/v1"
@@ -74,6 +79,7 @@ SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PLACEHOLDER_PREFIX = "TODO_"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PHYSICAL_ATTEMPT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+PUBLIC_ANALYZER_FAILURE_REASON_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 PRODUCTION_BUDGET_GATE_EXPERIMENTS = frozenset({"P0.5-10", "P0.5-38", "P0.5-39"})
 REQUIRED_REPLICATE_ARMS = frozenset(
     {
@@ -749,10 +755,11 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
     replay_contract = frozen_replay_contract(plan)
     if (
         source_policy["allow_deterministic_router_fallback"] is True
-        and replay_contract["schema"] != FROZEN_TASK_ANALYSIS_SCHEMA_V2
+        and replay_contract["schema"]
+        not in {FROZEN_TASK_ANALYSIS_SCHEMA_V2, FROZEN_TASK_ANALYSIS_SCHEMA_V3}
     ):
         raise ControllerError(
-            "deterministic Analyzer fallback replay requires frozen replay schema v2"
+            "deterministic Analyzer fallback replay requires frozen replay schema v2+"
         )
     imported_source = preexisting_source_contract(plan)
     if imported_source is not None:
@@ -1647,22 +1654,116 @@ def _analyzer_metadata_without_usage(analyzer: Mapping[str, Any]) -> dict[str, A
     return result
 
 
+def _authorized_analyzer_routes(
+    expected_config: Mapping[str, Any],
+) -> tuple[list[dict[str, str]], bool, int]:
+    """Return the ordered routes and repair budget authenticated by the config."""
+
+    raw_routes: list[Any] = [
+        {
+            "provider": expected_config.get("provider"),
+            "model": expected_config.get("model"),
+            "upstream_provider": expected_config.get("upstream_provider"),
+        }
+    ]
+    chain_configured = "fallback_chain" in expected_config
+    if chain_configured:
+        fallback_chain = expected_config.get("fallback_chain")
+        if not isinstance(fallback_chain, list):
+            raise ControllerError("E0 Analyzer fallback chain is malformed")
+        raw_routes.extend(fallback_chain)
+    routes: list[dict[str, str]] = []
+    identities: set[tuple[str, str]] = set()
+    for raw_route in raw_routes:
+        if not isinstance(raw_route, Mapping) or set(raw_route) != {
+            "provider",
+            "model",
+            "upstream_provider",
+        }:
+            raise ControllerError("E0 Analyzer route is malformed")
+        route = {
+            key: str(raw_route.get(key) or "").strip().lower()
+            for key in ("provider", "model", "upstream_provider")
+        }
+        identity = (route["provider"], route["model"])
+        if (
+            not all(route.values())
+            or identity in identities
+            or any(any(character.isspace() for character in value) for value in route.values())
+        ):
+            raise ControllerError("E0 Analyzer route identity is invalid or duplicated")
+        identities.add(identity)
+        routes.append(route)
+    schema_repairs = expected_config.get("schema_repair_max_retries", 0)
+    if (
+        isinstance(schema_repairs, bool)
+        or not isinstance(schema_repairs, int)
+        or schema_repairs not in {0, 1}
+        or (not chain_configured and schema_repairs != 0)
+    ):
+        raise ControllerError("E0 Analyzer schema repair budget is invalid")
+    return routes, chain_configured, schema_repairs
+
+
 def _validated_analyzer_attempt_ledger(
     *,
     task_id: str,
     analyzer: Mapping[str, Any],
-    expected_config: Mapping[str, Any],
+    execution_contract: Mapping[str, Any] | None = None,
+    expected_config: Mapping[str, Any] | None = None,
     allow_zero_attempts: bool,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
     """Authenticate every known/unknown physical Analyzer attempt."""
 
-    expected_provider = str(expected_config.get("provider") or "").strip().lower()
-    expected_model = str(expected_config.get("model") or "").strip().lower()
-    if (
-        str(analyzer.get("provider") or "").strip().lower() != expected_provider
-        or str(analyzer.get("model") or "").strip().lower() != expected_model
-    ):
-        raise ControllerError(f"E0 task {task_id} Analyzer identity differs from config")
+    from opensquilla.eval.draco_task_analyzer_execution import (
+        build_task_analyzer_execution_contract,
+        validate_task_analyzer_execution_trace,
+        validated_task_analyzer_execution_contract,
+    )
+
+    if execution_contract is None:
+        if not isinstance(expected_config, Mapping):
+            raise ControllerError("E0 Analyzer execution contract is missing")
+        routes, chain_configured, repair_budget = _authorized_analyzer_routes(
+            expected_config
+        )
+        max_retries = expected_config.get("max_retries", 0)
+        if (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or max_retries < 0
+        ):
+            raise ControllerError("E0 Analyzer retry budget is invalid")
+        frozen_routes = [
+            {
+                **route,
+                "max_attempts": 1 if chain_configured else max_retries + 1,
+            }
+            for route in routes
+        ]
+        raw_timeout = expected_config.get(
+            "total_timeout_seconds" if chain_configured else "timeout_seconds",
+            30.0,
+        )
+        try:
+            execution_contract = build_task_analyzer_execution_contract(
+                routes=frozen_routes,
+                schema_repair_max_retries=repair_budget,
+                total_timeout_seconds=float(raw_timeout),
+                route_source="legacy.expected_task_analyzer_config",
+                source_payload={"task_analyzer": copy.deepcopy(dict(expected_config))},
+            )
+        except (TypeError, ValueError) as exc:
+            raise ControllerError("E0 Analyzer execution contract is invalid") from exc
+    validated_contract = validated_task_analyzer_execution_contract(
+        execution_contract
+    )
+    if validated_contract is None:
+        raise ControllerError("E0 Analyzer execution contract is invalid")
+    authorized_routes = validated_contract["routes"]
+    authorized_identities = {
+        (route["provider"], route["model"]) for route in authorized_routes
+    }
     warnings = analyzer.get("normalization_warnings")
     if (
         not isinstance(warnings, list)
@@ -1720,10 +1821,11 @@ def _validated_analyzer_attempt_ledger(
         if PHYSICAL_ATTEMPT_ID_RE.fullmatch(attempt_id) is None or attempt_id in seen_ids:
             raise ControllerError(f"E0 task {task_id} Analyzer attempt identity is invalid")
         seen_ids.add(attempt_id)
-        if (
-            str(attempt.get("requested_provider") or "").strip().lower() != expected_provider
-            or str(attempt.get("requested_model") or "").strip().lower() != expected_model
-        ):
+        requested_identity = (
+            str(attempt.get("requested_provider") or "").strip().lower(),
+            str(attempt.get("requested_model") or "").strip().lower(),
+        )
+        if requested_identity not in authorized_identities:
             raise ControllerError(f"E0 task {task_id} Analyzer physical request identity differs")
         provider_usage = attempt.get("provider_usage")
         if not isinstance(provider_usage, Mapping):
@@ -1794,12 +1896,22 @@ def _validated_analyzer_attempt_ledger(
                 raise ControllerError(
                     f"E0 task {task_id} Analyzer unknown attempt is contradictory"
                 )
-        elif (
-            provider_usage.get("usage_unknown") is True
-            or str(attempt.get("provider") or "").strip().lower() != expected_provider
-            or str(attempt.get("model") or "").strip().lower() != expected_model
-        ):
-            raise ControllerError(f"E0 task {task_id} Analyzer physical response identity differs")
+        else:
+            response_identity = (
+                str(attempt.get("provider") or "").strip().lower(),
+                str(attempt.get("model") or "").strip().lower(),
+            )
+            nested_provider = str(provider_usage.get("provider") or "").strip().lower()
+            nested_model = str(provider_usage.get("model") or "").strip().lower()
+            if (
+                provider_usage.get("usage_unknown") is True
+                or response_identity != requested_identity
+                or (nested_provider and nested_provider != requested_identity[0])
+                or (nested_model and nested_model != requested_identity[1])
+            ):
+                raise ControllerError(
+                    f"E0 task {task_id} Analyzer physical response identity differs"
+                )
         attempts.append(attempt)
 
     if "usage_unknown_count" in usage_copy:
@@ -1828,6 +1940,16 @@ def _validated_analyzer_attempt_ledger(
             or not math.isclose(float(aggregate_cost), cost_total, rel_tol=0.0, abs_tol=1e-12)
         ):
             raise ControllerError(f"E0 task {task_id} Analyzer aggregate cost differs")
+    _, trace_reasons = validate_task_analyzer_execution_trace(
+        execution_contract=validated_contract,
+        analyzer_trace=analyzer,
+        physical_attempts=attempts,
+    )
+    if trace_reasons:
+        raise ControllerError(
+            f"E0 task {task_id} Analyzer execution evidence differs: "
+            + ",".join(trace_reasons)
+        )
     return usage_copy, attempts, unknown_count
 
 
@@ -1835,7 +1957,7 @@ def _validated_live_analyzer_evidence(
     *,
     task_id: str,
     analyzer: Mapping[str, Any],
-    expected_config: Mapping[str, Any],
+    execution_contract: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], int, int]:
     """Return usage, terminal successful attempt, tokens, and unknown count."""
 
@@ -1848,7 +1970,7 @@ def _validated_live_analyzer_evidence(
     usage, attempts, unknown_count = _validated_analyzer_attempt_ledger(
         task_id=task_id,
         analyzer=analyzer,
-        expected_config=expected_config,
+        execution_contract=execution_contract,
         allow_zero_attempts=False,
     )
     final_attempt = attempts[-1]
@@ -1869,7 +1991,7 @@ def _validated_router_fallback_evidence(
     *,
     task_id: str,
     analyzer: Mapping[str, Any],
-    expected_config: Mapping[str, Any],
+    execution_contract: Mapping[str, Any],
 ) -> tuple[dict[str, Any], int]:
     if (
         analyzer.get("source") != "router_fallback"
@@ -1880,7 +2002,7 @@ def _validated_router_fallback_evidence(
     usage, _, unknown_count = _validated_analyzer_attempt_ledger(
         task_id=task_id,
         analyzer=analyzer,
-        expected_config=expected_config,
+        execution_contract=execution_contract,
         allow_zero_attempts=True,
     )
     return usage, unknown_count
@@ -1923,6 +2045,65 @@ def extract_analyzer_artifact(
     if replay_schema not in FROZEN_TASK_ANALYSIS_SCHEMAS:
         raise ControllerError("unsupported frozen Analyzer replay schema")
     manifest, _, _, bound_paths = authenticate_published_arm_artifacts(source_dir)
+    source_task_analyzer_execution_contract: dict[str, Any] | None = None
+    if replay_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V3:
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            task_analyzer_execution_contract_from_g1_registry,
+            validated_task_analyzer_execution_contract,
+        )
+
+        registry_contract = manifest.get("g1_registry_contract")
+        if not isinstance(registry_contract, Mapping):
+            raise ControllerError(
+                "frozen Analyzer v3 source manifest lacks authenticated G1 registry"
+            )
+        run_compatibility = manifest.get("run_compatibility")
+        compatibility_contracts = (
+            run_compatibility.get("contracts")
+            if isinstance(run_compatibility, Mapping)
+            else None
+        )
+        compatibility_g1 = (
+            compatibility_contracts.get("G1")
+            if isinstance(compatibility_contracts, Mapping)
+            else None
+        )
+        declared_execution_contract = manifest.get(
+            "task_analyzer_execution_contract"
+        )
+        if (
+            not isinstance(compatibility_g1, Mapping)
+            or compatibility_g1.get("g1_registry_contract")
+            != registry_contract
+            or compatibility_g1.get("task_analyzer_execution_contract")
+            != declared_execution_contract
+        ):
+            raise ControllerError(
+                "frozen Analyzer v3 source compatibility contract differs"
+            )
+        try:
+            derived_execution_contract = (
+                task_analyzer_execution_contract_from_g1_registry(
+                    registry_contract
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ControllerError(
+                "frozen Analyzer v3 source G1 execution chain is invalid"
+            ) from exc
+        source_task_analyzer_execution_contract = (
+            validated_task_analyzer_execution_contract(
+                declared_execution_contract
+            )
+        )
+        if (
+            source_task_analyzer_execution_contract is None
+            or source_task_analyzer_execution_contract
+            != derived_execution_contract
+        ):
+            raise ControllerError(
+                "frozen Analyzer v3 source execution contract is invalid"
+            )
     manifest_path = bound_paths["manifest.json"]
     trace_path = bound_paths["trace.jsonl"]
     results_path = bound_paths["results.jsonl"]
@@ -1998,6 +2179,25 @@ def extract_analyzer_artifact(
                 source_task_analyzer_config = current_config_copy
             elif source_task_analyzer_config != current_config_copy:
                 raise ControllerError("E0 rows do not share one effective Analyzer config")
+            if source_task_analyzer_execution_contract is None:
+                from opensquilla.eval.draco_task_analyzer_execution import (
+                    task_analyzer_execution_contract_from_ranking_config,
+                )
+
+                row_execution_contract = (
+                    task_analyzer_execution_contract_from_ranking_config(
+                        {"task_analyzer": current_config_copy}
+                    )
+                )
+            else:
+                row_execution_contract = source_task_analyzer_execution_contract
+                declared_execution_contract = selection.get(
+                    "task_analyzer_execution_contract"
+                )
+                if declared_execution_contract != row_execution_contract:
+                    raise ControllerError(
+                        f"E0 task {task_id} Analyzer execution contract differs"
+                    )
             origin_outcome: str
             final_attempt: dict[str, Any] | None = None
             output_tokens: int | None = None
@@ -2011,7 +2211,7 @@ def extract_analyzer_artifact(
                     _validated_live_analyzer_evidence(
                         task_id=task_id,
                         analyzer=analyzer,
-                        expected_config=current_config_copy,
+                        execution_contract=row_execution_contract,
                     )
                 )
                 origin_outcome = "live_success"
@@ -2019,7 +2219,7 @@ def extract_analyzer_artifact(
                 usage, unknown_count = _validated_router_fallback_evidence(
                     task_id=task_id,
                     analyzer=analyzer,
-                    expected_config=current_config_copy,
+                    execution_contract=row_execution_contract,
                 )
                 request_context = selection.get("request_context")
                 routed_tier = str(selection.get("routed_tier") or "")
@@ -2098,6 +2298,14 @@ def extract_analyzer_artifact(
                     or canonical_sha256(repeated_analyzer) != expected_analyzer_hash
                 ):
                     raise ControllerError(f"E0 task {task_id} Analyzer provenance drifted")
+                if (
+                    replay_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V3
+                    and repeated_plan.get("task_analyzer_execution_contract")
+                    != row_execution_contract
+                ):
+                    raise ControllerError(
+                        f"E0 task {task_id} Analyzer execution contract drifted"
+                    )
             profile_row: dict[str, Any] = {
                 "task_id": task_id,
                 "task_input_sha256": task_input_sha256,
@@ -2160,7 +2368,10 @@ def extract_analyzer_artifact(
                 ),
             },
         }
-        if replay_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2:
+        if replay_schema in {
+            FROZEN_TASK_ANALYSIS_SCHEMA_V2,
+            FROZEN_TASK_ANALYSIS_SCHEMA_V3,
+        }:
             replay_entry["origin_outcome"] = row["origin_outcome"]
         replay_entries[task_id] = replay_entry
     replay_payload = {
@@ -2174,6 +2385,18 @@ def extract_analyzer_artifact(
         "entries": replay_entries,
         "entries_sha256": canonical_sha256(replay_entries),
     }
+    if replay_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V3:
+        assert source_task_analyzer_execution_contract is not None
+        replay_payload.update(
+            {
+                "source_task_analyzer_execution_contract": (
+                    source_task_analyzer_execution_contract
+                ),
+                "source_task_analyzer_execution_contract_sha256": canonical_sha256(
+                    source_task_analyzer_execution_contract
+                ),
+            }
+        )
     artifact: dict[str, Any] = {
         "schema": ANALYZER_ARTIFACT_SCHEMA,
         "created_at": utc_now(),

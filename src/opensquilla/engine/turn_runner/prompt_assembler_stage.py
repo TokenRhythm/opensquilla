@@ -78,6 +78,7 @@ class RunPipelineRequest:
     input_provenance: dict[str, Any] | str | None = None
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
+    turn_absolute_deadline: float | None = None
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -246,6 +247,7 @@ class PromptAssemblerStageInput:
     input_provenance: dict[str, Any] | str | None = None
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
+    turn_absolute_deadline: float | None = None
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -440,6 +442,7 @@ class PromptAssemblerStage:
             input_provenance=inp.input_provenance,
             skill_catalog=inp.skill_catalog,
             usage_execution_context=inp.usage_execution_context,
+            turn_absolute_deadline=inp.turn_absolute_deadline,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 

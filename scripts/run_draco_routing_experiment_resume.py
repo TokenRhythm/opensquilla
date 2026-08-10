@@ -4109,9 +4109,11 @@ async def build_experiment_provider(
     ensemble_aggregator_timeout: float | None,
     experiment_config: DracoExperimentConfig | None = None,
     g1_registry_contract: Mapping[str, Any] | None = None,
+    task_analyzer_execution_contract: Mapping[str, Any] | None = None,
     generation_policy: dict[str, Any] | None = None,
     tools: Sequence[ToolDefinition] | None = None,
     frozen_g1_lifecycle: Mapping[str, Any] | None = None,
+    turn_absolute_deadline: float | None = None,
 ) -> ProviderBuildResult:
     """Build one DRACO provider through the same routing primitives as runtime.py."""
 
@@ -4143,6 +4145,30 @@ async def build_experiment_provider(
         if g1_routing is not None
         else None
     )
+    if (
+        group == "G1"
+        and task_analyzer_execution_contract is None
+        and isinstance(resolved_g1_registry_contract, Mapping)
+    ):
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            task_analyzer_execution_contract_from_g1_registry,
+            task_analyzer_execution_contract_from_ranking_config,
+        )
+
+        live_chain = resolved_g1_registry_contract.get(
+            "live_task_analyzer_chain"
+        )
+        task_analyzer_execution_contract = (
+            task_analyzer_execution_contract_from_g1_registry(
+                resolved_g1_registry_contract
+            )
+            if isinstance(live_chain, list) and live_chain
+            else task_analyzer_execution_contract_from_ranking_config(
+                config.llm_ensemble.ranking_config_resolution_snapshot()[
+                    "effective_config"
+                ]
+            )
+        )
     recovery_policy = (
         aggregator_recovery_policy(experiment_config)
         if experiment_config is not None
@@ -4371,12 +4397,55 @@ async def build_experiment_provider(
                     request_context=request_context,
                     ranking_config=ranking_config,
                 )
+                dry_routes = [
+                    {
+                        "provider": str(route["provider"]),
+                        "model": str(route["model"]),
+                        "upstream_provider": str(route["upstream_provider"]),
+                    }
+                    for route in task_analyzer_execution_contract["routes"]
+                ]
+                dry_timeout = float(
+                    task_analyzer_execution_contract["total_timeout_seconds"]
+                )
                 task_analysis = TaskAnalysisResult(
                     profile=task_profile,
-                    source="dry_run_fallback",
+                    source="router_fallback",
                     schema_valid=False,
                     confidence=0.0,
                     fallback_reason="dry_run_no_analyzer_call",
+                    usage={"physical_attempts": [], "attempt_count": 0},
+                    provider_id=dry_routes[-1]["provider"],
+                    model_id=dry_routes[-1]["model"],
+                    chain_trace={
+                        "protocol": (
+                            "opensquilla.task-analyzer-fallback-chain/v1"
+                        ),
+                        "configured_routes": dry_routes,
+                        "attempt_outcomes": [
+                            {
+                                "candidate_index": index,
+                                **route,
+                                "outcome": "failed",
+                                "reason": "dry_run_no_analyzer_call",
+                                "physical_request_count": 0,
+                            }
+                            for index, route in enumerate(dry_routes)
+                        ],
+                        "selected_index": None,
+                        "exhausted": True,
+                        "schema_repair_max_retries": (
+                            task_analyzer_execution_contract[
+                                "schema_repair_max_retries"
+                            ]
+                        ),
+                        "deadline": {
+                            "configured_seconds": dry_timeout,
+                            "elapsed_seconds": 0.0,
+                            "remaining_seconds": dry_timeout,
+                            "expired": False,
+                        },
+                    },
                 )
             dry_ranking_inputs = {
                 "decision_id": ("dry-" + hashlib.sha256(prompt.encode()).hexdigest()[:24]),
@@ -4392,6 +4461,9 @@ async def build_experiment_provider(
                         else {}
                     ),
                 "registry_allowlist": resolved_g1_registry_contract,
+                "task_analyzer_execution_contract": (
+                    task_analyzer_execution_contract
+                ),
             }
             if thinking_assignment_enabled:
                 dry_ranking_inputs["request_tools_present"] = bool(tools)
@@ -4645,6 +4717,7 @@ async def build_experiment_provider(
             dynamic_output_token_budgets,
             frozen_task_analysis_result,
             mock_user_profile,
+            task_analyzer_chain_policy,
             task_analyzer_policy,
         )
 
@@ -4658,10 +4731,13 @@ async def build_experiment_provider(
         analyzer_policy = task_analyzer_policy(ranking_config)
         analyzer_provider_id = str(analyzer_policy["provider"])
         analyzer_model_id = str(analyzer_policy["model"])
-        analyzer_upstream_provider = str(analyzer_policy["upstream_provider"])
+        common_analyzer_chain = task_analyzer_chain_policy(ranking_config)
         resolved_analyzer_chain = (
-            resolved_g1_registry_contract.get("live_task_analyzer_chain")
-            if isinstance(resolved_g1_registry_contract, Mapping)
+            task_analyzer_execution_contract.get("routes")
+            if isinstance(task_analyzer_execution_contract, Mapping)
+            and str(
+                task_analyzer_execution_contract.get("route_source") or ""
+            ).startswith("g1_registry_contract.")
             else None
         )
         configured_analyzer_chain = (
@@ -4685,13 +4761,7 @@ async def build_experiment_provider(
                 }
                 for route in configured_analyzer_chain
             ]
-            or [
-                {
-                    "provider": analyzer_provider_id,
-                    "model": analyzer_model_id,
-                    "upstream_provider": analyzer_upstream_provider,
-                }
-            ]
+            or list(common_analyzer_chain["routes"])
         )
         routing_extra = turn.metadata.get("routing_extra")
         routing_extra_map = routing_extra if isinstance(routing_extra, Mapping) else {}
@@ -4853,6 +4923,9 @@ async def build_experiment_provider(
                     else {}
                 ),
                 "registry_allowlist": resolved_g1_registry_contract,
+                "task_analyzer_execution_contract": (
+                    task_analyzer_execution_contract
+                ),
                 "request_tools_present": bool(tools),
             }
             if initial_plan.get("analyzer_failure_fallback") is True:
@@ -4972,7 +5045,7 @@ async def build_experiment_provider(
                         request_context=request_context,
                         ranking_config=ranking_config,
                     )
-                elif configured_analyzer_chain:
+                elif configured_analyzer_chain or common_analyzer_chain["configured"]:
                     task_analysis = await analyze_task_with_fallback_chain(
                         candidates=analyzer_candidates,
                         message=turn.semantic_message,
@@ -4981,6 +5054,23 @@ async def build_experiment_provider(
                         routed_tier=routed_tier,
                         routing_confidence=routing_confidence,
                         ranking_config=ranking_config,
+                        schema_repair_max_retries=(
+                            int(
+                                    task_analyzer_execution_contract[
+                                        "schema_repair_max_retries"
+                                    ]
+                                )
+                                if configured_analyzer_chain
+                                and isinstance(task_analyzer_execution_contract, Mapping)
+                                and isinstance(
+                                    task_analyzer_execution_contract.get(
+                                        "schema_repair_max_retries"
+                                    ),
+                                    int,
+                                )
+                            else None
+                        ),
+                        absolute_deadline=turn_absolute_deadline,
                         decision_id=decision_id,
                     )
                 else:
@@ -4995,6 +5085,7 @@ async def build_experiment_provider(
                         analyzer_model_id=analyzer_model_id,
                         ranking_config=ranking_config,
                         decision_id=decision_id,
+                        _absolute_deadline=turn_absolute_deadline,
                     )
             except (
                 TaskAnalyzerPhysicalEvidenceError,
@@ -5140,6 +5231,9 @@ async def build_experiment_provider(
                         else None
                     ),
                     "registry_allowlist": resolved_g1_registry_contract,
+                    "task_analyzer_execution_contract": (
+                        task_analyzer_execution_contract
+                    ),
                 }
                 analyzer_failure_fallback = (
                     g1_routing.analyzer_failure_fallback_ensemble
@@ -5232,6 +5326,7 @@ async def build_experiment_provider(
             fallback_provider=routed_provider,
             turn_metadata=turn.metadata,
             ranking_inputs=active_ranking_inputs,
+            _absolute_deadline=turn_absolute_deadline,
         )
         if b2_experiment is not None:
             materialized = align_b2_provider_to_g12(materialized, b2_experiment)
@@ -8377,6 +8472,7 @@ def ensemble_metadata_field_resolved(
 def g1_registry_contract_reasons(
     trace: Mapping[str, Any],
     contract: Mapping[str, Any] | None,
+    task_analyzer_execution_contract: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Fail closed when a G1 call drifts from its frozen registry allowlist."""
 
@@ -8433,6 +8529,57 @@ def g1_registry_contract_reasons(
     executed_plan = trace.get("selection_plan")
     if not isinstance(executed_plan, Mapping):
         return ["missing_g1_selection_plan"]
+    analyzer_trace = executed_plan.get("task_analyzer")
+    if (
+        isinstance(analyzer_trace, Mapping)
+        and analyzer_trace.get("source") != "frozen_replay"
+        and (
+            isinstance(
+                executed_plan.get("task_analyzer_execution_contract"),
+                Mapping,
+            )
+            or isinstance(analyzer_trace.get("chain"), Mapping)
+        )
+    ):
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            task_analyzer_execution_contract_from_g1_registry,
+            validate_task_analyzer_execution_trace,
+            validated_task_analyzer_execution_contract,
+        )
+
+        expected_execution = validated_task_analyzer_execution_contract(
+            task_analyzer_execution_contract
+        )
+        if expected_execution is None:
+            try:
+                expected_execution = validated_task_analyzer_execution_contract(
+                    task_analyzer_execution_contract_from_g1_registry(contract)
+                )
+            except (TypeError, ValueError):
+                expected_execution = None
+        declared_execution = executed_plan.get(
+            "task_analyzer_execution_contract"
+        )
+        chain_trace = analyzer_trace.get("chain")
+        new_trace = bool(
+            isinstance(chain_trace, Mapping)
+            and (
+                "schema_repair_max_retries" in chain_trace
+                or "deadline" in chain_trace
+            )
+        )
+        if expected_execution is None or (
+            new_trace and declared_execution != expected_execution
+        ):
+            reasons.append("invalid_g1_task_analyzer_execution_contract")
+        else:
+            _, execution_reasons = validate_task_analyzer_execution_trace(
+                execution_contract=expected_execution,
+                analyzer_trace=analyzer_trace,
+                models_equivalent=_formal_openrouter_models_equivalent,
+            )
+            if execution_reasons:
+                reasons.append("invalid_g1_task_analyzer_execution_trace")
     if executed_plan.get("analyzer_failure_fallback") is True:
         fallback = contract.get("analyzer_failure_fallback_ensemble")
         proposer_routes = (
@@ -8887,6 +9034,7 @@ def ensemble_call_core_reasons(
     expected_selection_mode: str = "",
     expected_selection_plan: Mapping[str, Any] | None = None,
     expected_g1_registry_contract: Mapping[str, Any] | None = None,
+    expected_task_analyzer_execution_contract: Mapping[str, Any] | None = None,
     final_text: str = "",
     require_output_binding: bool = False,
 ) -> list[str]:
@@ -9005,6 +9153,7 @@ def ensemble_call_core_reasons(
         g1_registry_contract_reasons(
             trace,
             expected_g1_registry_contract,
+            expected_task_analyzer_execution_contract,
         )
     )
     if expected_plan:
@@ -9788,6 +9937,7 @@ def ensemble_generation_retry_reason(
     expected_selection_mode: str = "",
     expected_selection_plan: Mapping[str, Any] | None = None,
     expected_g1_registry_contract: Mapping[str, Any] | None = None,
+    expected_task_analyzer_execution_contract: Mapping[str, Any] | None = None,
 ) -> str:
     """Return only a reason that proves the ensemble answer is unusable."""
 
@@ -9838,6 +9988,9 @@ def ensemble_generation_retry_reason(
             expected_selection_mode=expected_selection_mode,
             expected_selection_plan=expected_selection_plan,
             expected_g1_registry_contract=expected_g1_registry_contract,
+            expected_task_analyzer_execution_contract=(
+                expected_task_analyzer_execution_contract
+            ),
             final_text=result.final_text,
             require_output_binding=index == len(call_traces) - 1,
         )
@@ -10045,6 +10198,7 @@ def generation_retry_reason(
     expected_selection_mode: str = "",
     expected_selection_plan: Mapping[str, Any] | None = None,
     expected_g1_registry_contract: Mapping[str, Any] | None = None,
+    expected_task_analyzer_execution_contract: Mapping[str, Any] | None = None,
     expected_model: str = "",
     expected_provider: str = "",
 ) -> str:
@@ -10070,6 +10224,9 @@ def generation_retry_reason(
             expected_selection_mode=expected_selection_mode,
             expected_selection_plan=expected_selection_plan,
             expected_g1_registry_contract=expected_g1_registry_contract,
+            expected_task_analyzer_execution_contract=(
+                expected_task_analyzer_execution_contract
+            ),
         )
     if expected_model or expected_provider:
         return single_generation_identity_reason(
@@ -10678,6 +10835,7 @@ async def collect_generation_with_retries(
     expected_model: str = "",
     expected_provider: str = "",
     expected_g1_registry_contract: Mapping[str, Any] | None = None,
+    expected_task_analyzer_execution_contract: Mapping[str, Any] | None = None,
     paid_attempt_sink: dict[str, Any] | None = None,
 ) -> tuple[RunResult, list[dict[str, Any]], int]:
     attempts: list[dict[str, Any]] = []
@@ -11230,6 +11388,9 @@ async def collect_generation_with_retries(
             expected_selection_mode=expected_selection_mode,
             expected_selection_plan=expected_selection_plan,
             expected_g1_registry_contract=expected_g1_registry_contract,
+            expected_task_analyzer_execution_contract=(
+                expected_task_analyzer_execution_contract
+            ),
             expected_model=expected_model,
             expected_provider=expected_provider,
         )
@@ -12354,6 +12515,7 @@ async def run_one(
     tools: list[ToolDefinition] | None = None,
     run_compatibility_fingerprint: str = "",
     g1_registry_contract: Mapping[str, Any] | None = None,
+    task_analyzer_execution_contract: Mapping[str, Any] | None = None,
     frozen_g1_lifecycle: Mapping[str, Any] | None = None,
     require_openrouter_non_byok: bool = False,
 ) -> dict[str, Any]:
@@ -12391,6 +12553,7 @@ async def run_one(
         ensemble_proposer_timeout=ensemble_proposer_timeout,
         ensemble_aggregator_timeout=ensemble_aggregator_timeout,
     )
+    turn_absolute_deadline = time.monotonic() + effective_timeout
     generation_config = generation_chat_config(
         generation_policy,
         model=spec["model"] if spec["kind"] == "single" else None,
@@ -12414,9 +12577,15 @@ async def run_one(
             ensemble_aggregator_timeout=ensemble_aggregator_timeout,
             experiment_config=experiment_config,
             g1_registry_contract=g1_registry_contract,
+            task_analyzer_execution_contract=(
+                task_analyzer_execution_contract
+                if group == "G1"
+                else None
+            ),
             generation_policy=generation_policy,
             tools=tools,
             frozen_g1_lifecycle=frozen_g1_lifecycle,
+            turn_absolute_deadline=turn_absolute_deadline,
         )
         candidate_prompt = build.prompt
         safe_routing_trace = json_safe(build.routing_trace)
@@ -12505,6 +12674,9 @@ async def run_one(
                 expected_model=expected_generation_model,
                 expected_provider=expected_generation_provider,
                 expected_g1_registry_contract=g1_registry_contract,
+                expected_task_analyzer_execution_contract=(
+                    task_analyzer_execution_contract
+                ),
                 paid_attempt_sink=paid_attempt_sink,
             )
         except Exception as exc:  # noqa: BLE001 - commit a returned paid call
@@ -12590,6 +12762,9 @@ async def run_one(
                     else {}
                 ),
                 expected_g1_registry_contract=g1_registry_contract,
+                expected_task_analyzer_execution_contract=(
+                    task_analyzer_execution_contract
+                ),
                 expected_model=expected_generation_model,
                 expected_provider=expected_generation_provider,
             )
@@ -16046,6 +16221,18 @@ def build_run_compatibility(
             "g1_registry_contract": (
                 dict(getattr(args, "_g1_registry_contract", {}) or {}) if group == "G1" else None
             ),
+            "task_analyzer_execution_contract": (
+                dict(
+                    getattr(
+                        args,
+                        "_task_analyzer_execution_contract",
+                        {},
+                    )
+                    or {}
+                )
+                if group == "G1"
+                else None
+            ),
             "formal_runtime_freeze": dict(getattr(args, "_formal_runtime_freeze", {}) or {}),
             "dry_run": bool(args.dry_run),
         }
@@ -16504,6 +16691,15 @@ def write_manifest(
     g1_registry_contract = getattr(args, "_g1_registry_contract", None)
     if isinstance(g1_registry_contract, Mapping):
         payload["g1_registry_contract"] = dict(g1_registry_contract)
+    task_analyzer_execution_contract = getattr(
+        args,
+        "_task_analyzer_execution_contract",
+        None,
+    )
+    if isinstance(task_analyzer_execution_contract, Mapping):
+        payload["task_analyzer_execution_contract"] = dict(
+            task_analyzer_execution_contract
+        )
     formal_runtime_freeze = getattr(args, "_formal_runtime_freeze", None)
     if isinstance(formal_runtime_freeze, Mapping):
         payload["formal_runtime_freeze"] = dict(formal_runtime_freeze)
@@ -17428,9 +17624,9 @@ def g1_provider_lifecycle_analyzer_reasons(
             if analyzers:
                 reasons.append("unexpected_g1_task_analyzer_request_in_frozen_replay")
         return list(dict.fromkeys(reasons))
-    live_chain = (
-        registry.get("live_task_analyzer_chain")
-        if isinstance(registry, Mapping)
+    execution_contract = (
+        contract.get("task_analyzer_execution_contract")
+        if isinstance(contract, Mapping)
         else None
     )
     first_task_analyzer = (
@@ -17438,20 +17634,45 @@ def g1_provider_lifecycle_analyzer_reasons(
         if isinstance(first_plan, Mapping)
         else None
     )
-    first_chain_trace = (
-        first_task_analyzer.get("chain")
-        if isinstance(first_task_analyzer, Mapping)
-        else None
-    )
+    # Older single-route lifecycles predate the sibling execution contract and
+    # are intentionally validated by the legacy policy below.  Only a declared
+    # live chain may be reconstructed from the authenticated registry here.
     if (
-        isinstance(live_chain, list)
-        and live_chain
-        and isinstance(first_chain_trace, Mapping)
+        not isinstance(execution_contract, Mapping)
+        and isinstance(registry, Mapping)
+        and isinstance(registry.get("live_task_analyzer_chain"), list)
+        and isinstance(first_task_analyzer, Mapping)
+        and isinstance(first_task_analyzer.get("chain"), Mapping)
     ):
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            build_task_analyzer_execution_contract,
+            task_analyzer_execution_contract_from_g1_registry,
+        )
+
+        try:
+            execution_contract = task_analyzer_execution_contract_from_g1_registry(
+                registry
+            )
+        except (TypeError, ValueError):
+            raw_routes = registry.get("live_task_analyzer_chain")
+            try:
+                execution_contract = build_task_analyzer_execution_contract(
+                    routes=raw_routes,
+                    schema_repair_max_retries=0,
+                    total_timeout_seconds=30.0 * len(raw_routes),
+                    route_source=(
+                        "legacy.g1_registry_contract.live_task_analyzer_chain"
+                    ),
+                    source_payload={"live_task_analyzer_chain": raw_routes},
+                )
+            except (TypeError, ValueError):
+                execution_contract = None
+    if isinstance(execution_contract, Mapping):
         return _g1_frozen_lifecycle_analyzer_reasons(
             request_attempts,
             initial_plan=first_plan,
             g1_contract=registry,
+            task_analyzer_execution_contract=execution_contract,
         )
     ranking_parameters = (
         first_plan.get("ranking_parameters")
@@ -17520,6 +17741,7 @@ def _g1_frozen_lifecycle_plan_reasons(
     plan: Any,
     *,
     g1_contract: Mapping[str, Any],
+    task_analyzer_execution_contract: Mapping[str, Any],
 ) -> list[str]:
     """Validate one serialized adaptive plan against replay and route freezes."""
 
@@ -17530,6 +17752,7 @@ def _g1_frozen_lifecycle_plan_reasons(
     registry_reasons = g1_registry_contract_reasons(
         {"selection_plan": plan},
         g1_contract,
+        task_analyzer_execution_contract,
     )
     if plan.get("analyzer_failure_fallback") is True:
         return list(dict.fromkeys(registry_reasons))
@@ -17548,12 +17771,12 @@ def _g1_frozen_lifecycle_analyzer_reasons(
     *,
     initial_plan: Mapping[str, Any],
     g1_contract: Mapping[str, Any],
+    task_analyzer_execution_contract: Mapping[str, Any],
 ) -> list[str]:
     """Require analyzer receipts only on the first paid lifecycle attempt."""
 
     from opensquilla.provider.ranking_router import (
         frozen_task_analysis_plan_reasons,
-        task_analyzer_policy,
     )
 
     if not attempts:
@@ -17639,180 +17862,40 @@ def _g1_frozen_lifecycle_analyzer_reasons(
             return ["g1_task_analyzer_setup_usage_mismatch"]
         analyzer_units_by_attempt.append(usage_units)
     first_units = analyzer_units_by_attempt[0]
-    attempt_ordinals = [unit.get("attempt") for unit in first_units]
-    attempt_ids = [str(unit.get("physical_attempt_id") or "") for unit in first_units]
-    raw_chain = g1_contract.get("live_task_analyzer_chain")
-    expected_routes: list[dict[str, str]] = []
-    if isinstance(raw_chain, list) and raw_chain:
-        for route in raw_chain:
-            if not isinstance(route, Mapping) or route.get("max_attempts") != 1:
-                return ["invalid_g1_task_analyzer_policy"]
-            provider = str(route.get("provider") or "").strip().casefold()
-            model = str(route.get("model") or "").strip()
-            upstream = str(route.get("upstream_provider") or "").strip().casefold()
-            if provider != "openrouter" or not model or not upstream or upstream == "auto":
-                return ["invalid_g1_task_analyzer_policy"]
-            expected_routes.append(
-                {
-                    "provider": provider,
-                    "model": model,
-                    "upstream_provider": upstream,
-                }
+    analyzer_trace = initial_plan.get("task_analyzer")
+    if not isinstance(analyzer_trace, Mapping):
+        return ["missing_g1_task_analyzer_trace"]
+    from opensquilla.eval.draco_task_analyzer_execution import (
+        validate_task_analyzer_execution_trace,
+    )
+
+    _, execution_reasons = validate_task_analyzer_execution_trace(
+        execution_contract=task_analyzer_execution_contract,
+        analyzer_trace=analyzer_trace,
+        physical_attempts=first_units,
+        models_equivalent=_formal_openrouter_models_equivalent,
+    )
+    if execution_reasons:
+        reason_aliases = {
+            "invalid_task_analyzer_chain_trace": (
+                "invalid_g1_task_analyzer_chain_trace"
+            ),
+            "invalid_task_analyzer_physical_attempts": (
+                "invalid_g1_task_analyzer_attempt_sequence"
+            ),
+            "invalid_task_analyzer_usage_count": (
+                "invalid_g1_task_analyzer_attempt_sequence"
+            ),
+            "task_analyzer_repair_budget_exceeded": (
+                "invalid_g1_task_analyzer_attempt_sequence"
+            ),
+        }
+        return [
+            reason_aliases.get(
+                execution_reasons[0],
+                "invalid_g1_task_analyzer_execution_trace",
             )
-        analyzer_trace = initial_plan.get("task_analyzer")
-        chain_trace = (
-            analyzer_trace.get("chain")
-            if isinstance(analyzer_trace, Mapping)
-            else None
-        )
-        configured_routes = (
-            chain_trace.get("configured_routes")
-            if isinstance(chain_trace, Mapping)
-            else None
-        )
-        outcomes = (
-            chain_trace.get("attempt_outcomes")
-            if isinstance(chain_trace, Mapping)
-            else None
-        )
-        expected_configured_routes = [
-            {
-                "provider": route["provider"],
-                "model": route["model"],
-                "upstream_provider": route["upstream_provider"],
-            }
-            for route in expected_routes
         ]
-        if (
-            not isinstance(chain_trace, Mapping)
-            or chain_trace.get("protocol")
-            != "opensquilla.task-analyzer-fallback-chain/v1"
-            or configured_routes != expected_configured_routes
-            or not isinstance(outcomes, list)
-            or not outcomes
-            or len(outcomes) > len(expected_routes)
-        ):
-            return ["invalid_g1_task_analyzer_chain_trace"]
-        physical_routes: list[dict[str, str]] = []
-        success_indexes: list[int] = []
-        for index, outcome in enumerate(outcomes):
-            route = expected_routes[index]
-            if (
-                not isinstance(outcome, Mapping)
-                or outcome.get("candidate_index") != index
-                or str(outcome.get("provider") or "").strip().casefold()
-                != route["provider"]
-                or not _formal_openrouter_models_equivalent(
-                    outcome.get("model"),
-                    route["model"],
-                )
-                or str(outcome.get("upstream_provider") or "")
-                .strip()
-                .casefold()
-                != route["upstream_provider"]
-                or outcome.get("outcome") not in {"success", "failed"}
-                or type(outcome.get("physical_request_count")) is not int
-                or outcome.get("physical_request_count") not in {0, 1}
-            ):
-                return ["invalid_g1_task_analyzer_chain_trace"]
-            if outcome.get("outcome") == "success":
-                success_indexes.append(index)
-            if outcome.get("physical_request_count") == 1:
-                physical_routes.append(route)
-        selected_index = chain_trace.get("selected_index")
-        exhausted = chain_trace.get("exhausted")
-        if success_indexes:
-            if (
-                success_indexes != [len(outcomes) - 1]
-                or selected_index != success_indexes[0]
-                or exhausted is not False
-            ):
-                return ["invalid_g1_task_analyzer_chain_trace"]
-        elif (
-            len(outcomes) != len(expected_routes)
-            or selected_index is not None
-            or exhausted is not True
-        ):
-            return ["invalid_g1_task_analyzer_chain_trace"]
-        expected_routes = physical_routes
-    else:
-        ranking_parameters = initial_plan.get("ranking_parameters")
-        try:
-            analyzer_policy = task_analyzer_policy(
-                ranking_parameters if isinstance(ranking_parameters, Mapping) else None
-            )
-        except Exception:  # noqa: BLE001 - malformed frozen evidence fails closed
-            return ["invalid_g1_task_analyzer_policy"]
-        analyzer_config = (
-            ranking_parameters.get("task_analyzer")
-            if isinstance(ranking_parameters, Mapping)
-            else None
-        )
-        max_retries = (
-            analyzer_config.get("max_retries")
-            if isinstance(analyzer_config, Mapping)
-            else None
-        )
-        if (
-            not isinstance(max_retries, int)
-            or isinstance(max_retries, bool)
-            or max_retries < 0
-        ):
-            return ["invalid_g1_task_analyzer_policy"]
-        expected_routes = [
-            {
-                "provider": str(analyzer_policy["provider"]).casefold(),
-                "model": str(analyzer_policy["model"]),
-                "upstream_provider": str(
-                    analyzer_policy["upstream_provider"]
-                ).casefold(),
-            }
-            for _ in range(max_retries + 1)
-        ]
-        if not first_units:
-            return ["missing_g1_task_analyzer_request"]
-    if (
-        (
-            len(first_units) != len(expected_routes)
-            if isinstance(raw_chain, list) and raw_chain
-            else len(first_units) > len(expected_routes)
-        )
-        or attempt_ordinals != list(range(1, len(first_units) + 1))
-        or len(set(attempt_ids)) != len(attempt_ids)
-        or any(
-            len(attempt_id) != 32
-            or any(character not in "0123456789abcdef" for character in attempt_id)
-            for attempt_id in attempt_ids
-        )
-    ):
-        return ["invalid_g1_task_analyzer_attempt_sequence"]
-    for unit, expected_route in zip(first_units, expected_routes):
-        placeholder = _g1_is_unknown_task_analyzer_placeholder(unit)
-        if (
-            (
-                not placeholder
-                and str(unit.get("role") or "").strip().casefold()
-                != "task_analyzer"
-            )
-            or str(unit.get("requested_provider") or "").strip().casefold()
-            != expected_route["provider"]
-            or not _formal_openrouter_models_equivalent(
-                unit.get("requested_model"),
-                expected_route["model"],
-            )
-            or (
-                not placeholder
-                and (
-                    str(unit.get("provider") or "").strip().casefold()
-                    != expected_route["provider"]
-                    or not _formal_openrouter_models_equivalent(
-                        unit.get("model"),
-                        expected_route["model"],
-                    )
-                )
-            )
-        ):
-            return ["wrong_g1_task_analyzer_route"]
     if any(analyzer_units_by_attempt[1:]):
         return ["repeated_g1_task_analyzer_request"]
     return []
@@ -17998,12 +18081,48 @@ def reconstruct_g1_cross_wave_frozen_lifecycle(
     g1_contract = current_run_compatibility_contract.get("g1_registry_contract")
     if not isinstance(g1_contract, Mapping):
         raise ValueError("G1 frozen lifecycle lacks the current registry contract")
+    task_analyzer_execution_contract = (
+        current_run_compatibility_contract.get(
+            "task_analyzer_execution_contract"
+        )
+    )
     ordered = sorted(
         (copy.deepcopy(dict(attempt)) for attempt in attempts),
         key=lambda attempt: coerce_metric_int(attempt.get("attempt")),
     )
     if not ordered:
         raise ValueError("G1 frozen lifecycle has no physical generation attempts")
+    if not isinstance(task_analyzer_execution_contract, Mapping):
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            task_analyzer_execution_contract_from_g1_registry,
+            task_analyzer_execution_contract_from_ranking_config,
+        )
+
+        try:
+            task_analyzer_execution_contract = (
+                task_analyzer_execution_contract_from_g1_registry(
+                    g1_contract
+                )
+            )
+        except (TypeError, ValueError):
+            first_plan = ordered[0].get("selection_plan")
+            ranking_parameters = (
+                first_plan.get("ranking_parameters")
+                if isinstance(first_plan, Mapping)
+                else None
+            )
+            try:
+                task_analyzer_execution_contract = (
+                    task_analyzer_execution_contract_from_ranking_config(
+                        ranking_parameters
+                    )
+                )
+            except (TypeError, ValueError):
+                task_analyzer_execution_contract = None
+    if not isinstance(task_analyzer_execution_contract, Mapping):
+        raise ValueError(
+            "G1 frozen lifecycle lacks the Analyzer execution contract"
+        )
     reasons: list[str] = []
     initial_plan: Mapping[str, Any] | None = None
     initial_decision_id = ""
@@ -18076,6 +18195,9 @@ def reconstruct_g1_cross_wave_frozen_lifecycle(
             _g1_frozen_lifecycle_plan_reasons(
                 plan,
                 g1_contract=g1_contract,
+                task_analyzer_execution_contract=(
+                    task_analyzer_execution_contract
+                ),
             )
         )
         decision_id = str(plan.get("decision_id") or "")
@@ -18151,6 +18273,9 @@ def reconstruct_g1_cross_wave_frozen_lifecycle(
                 _g1_frozen_lifecycle_plan_reasons(
                     routed_plan,
                     g1_contract=g1_contract,
+                    task_analyzer_execution_contract=(
+                        task_analyzer_execution_contract
+                    ),
                 )
             )
             if not _g1_full_plans_match(plan, routed_plan):
@@ -18183,6 +18308,9 @@ def reconstruct_g1_cross_wave_frozen_lifecycle(
                 _g1_frozen_lifecycle_plan_reasons(
                     physical_plan,
                     g1_contract=g1_contract,
+                    task_analyzer_execution_contract=(
+                        task_analyzer_execution_contract
+                    ),
                 )
             )
             if not _g1_full_plans_match(plan, physical_plan):
@@ -18285,6 +18413,9 @@ def reconstruct_g1_cross_wave_frozen_lifecycle(
                 _g1_frozen_lifecycle_plan_reasons(
                     retry_plan,
                     g1_contract=g1_contract,
+                    task_analyzer_execution_contract=(
+                        task_analyzer_execution_contract
+                    ),
                 )
             )
             retry_exclusions, retry_exclusions_valid = (
@@ -18343,6 +18474,9 @@ def reconstruct_g1_cross_wave_frozen_lifecycle(
                 ordered,
                 initial_plan=initial_plan,
                 g1_contract=g1_contract,
+                task_analyzer_execution_contract=(
+                    task_analyzer_execution_contract
+                ),
             )
         )
     if initial_plan is None or last_plan is None:
@@ -21131,8 +21265,35 @@ async def _amain_with_run_lock(
             experiment_config,
             config,
         )
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            task_analyzer_execution_contract_from_g1_registry,
+            validated_task_analyzer_execution_contract,
+        )
+
+        replay = experiment_config.g1_routing.task_analysis_execution
+        replay_execution_contract = getattr(
+            replay,
+            "source_task_analyzer_execution_contract",
+            None,
+        )
+        if replay_execution_contract is not None:
+            execution_contract = validated_task_analyzer_execution_contract(
+                replay_execution_contract
+            )
+        else:
+            execution_contract = validated_task_analyzer_execution_contract(
+                task_analyzer_execution_contract_from_g1_registry(
+                    args._g1_registry_contract
+                )
+            )
+        if execution_contract is None:
+            raise ValueError("G1 task Analyzer execution contract is invalid")
+        args._task_analyzer_execution_contract = execution_contract
         if alignment is not None:
             alignment["g1_registry_contract"] = dict(args._g1_registry_contract)
+            alignment["task_analyzer_execution_contract"] = dict(
+                execution_contract
+            )
     expected_compatibility_manifest = getattr(
         args,
         "expected_compatibility_manifest",
@@ -21196,6 +21357,32 @@ async def _amain_with_run_lock(
             path=expected_compatibility_manifest,
             actual=args._run_compatibility,
             groups=groups,
+        )
+    if "G1" in groups:
+        inherited_g1_contract = args._run_compatibility.get(
+            "contracts",
+            {},
+        ).get("G1", {})
+        inherited_execution_contract = (
+            inherited_g1_contract.get("task_analyzer_execution_contract")
+            if isinstance(inherited_g1_contract, Mapping)
+            else None
+        )
+        from opensquilla.eval.draco_task_analyzer_execution import (
+            validated_task_analyzer_execution_contract,
+        )
+
+        validated_inherited_execution_contract = (
+            validated_task_analyzer_execution_contract(
+                inherited_execution_contract
+            )
+        )
+        if validated_inherited_execution_contract is None:
+            raise ValueError(
+                "inherited G1 task Analyzer execution contract is invalid"
+            )
+        args._task_analyzer_execution_contract = (
+            validated_inherited_execution_contract
         )
     judge_required = bool(str(getattr(args, "judge_model", "") or "").strip())
     resume_states, resume_audit = load_resume_group_task_states(
@@ -21770,6 +21957,15 @@ async def _amain_with_run_lock(
                 run_compatibility_fingerprint=args._run_compatibility["fingerprints"][group],
                 g1_registry_contract=(
                     getattr(args, "_g1_registry_contract", None) if group == "G1" else None
+                ),
+                task_analyzer_execution_contract=(
+                    getattr(
+                        args,
+                        "_task_analyzer_execution_contract",
+                        None,
+                    )
+                    if group == "G1"
+                    else None
                 ),
                 frozen_g1_lifecycle=frozen_g1_lifecycle,
                 require_openrouter_non_byok=bool(

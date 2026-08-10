@@ -3260,11 +3260,13 @@ class TurnRunner:
         *,
         session_key: str,
         ranking_config: Mapping[str, Any],
+        analyzer_route: Mapping[str, Any] | None = None,
     ) -> Any | None:
         """Build the frozen task analyzer without reusing another credential."""
 
         from opensquilla.engine.selector_override import resolve_tier_provider_config
         from opensquilla.provider.ranking_router import (
+            TaskAnalyzerCandidate,
             task_analyzer_policy,
         )
         from opensquilla.provider.registry import get_provider_spec
@@ -3278,9 +3280,23 @@ class TurnRunner:
         analyzer_model_id = "unknown"
         try:
             analyzer_policy = task_analyzer_policy(ranking_config)
-            analyzer_provider_id = str(analyzer_policy["provider"])
-            analyzer_model_id = str(analyzer_policy["model"])
-            analyzer_upstream_provider = str(analyzer_policy["upstream_provider"])
+            route = (
+                dict(analyzer_route)
+                if analyzer_route is not None
+                else {
+                    "provider": analyzer_policy["provider"],
+                    "model": analyzer_policy["model"],
+                    "upstream_provider": analyzer_policy["upstream_provider"],
+                }
+            )
+            validated_route = TaskAnalyzerCandidate(
+                provider_id=str(route.get("provider") or ""),
+                model_id=str(route.get("model") or ""),
+                upstream_provider=str(route.get("upstream_provider") or ""),
+            )
+            analyzer_provider_id = validated_route.provider_id
+            analyzer_model_id = validated_route.model_id
+            analyzer_upstream_provider = validated_route.upstream_provider
             spec = get_provider_spec(analyzer_provider_id)
             turn_config = self._turn_config()
             inherited_provider = str(
@@ -4056,6 +4072,12 @@ class TurnRunner:
                 )
 
             with bind_usage_accounting_scope(turn_usage_scope):
+                turn_absolute_deadline = time.monotonic() + (
+                    self._resolve_agent_request_timeout(
+                        session_key,
+                        request_timeout,
+                    )
+                )
                 pa_outcome = await self._prompt_assembler_stage.run(
                     PromptAssemblerStageInput(
                         runtime_message=runtime_message,
@@ -4087,6 +4109,7 @@ class TurnRunner:
                         input_provenance=input_provenance,
                         skill_catalog=skill_catalog,
                         usage_execution_context=pipeline_usage_context,
+                        turn_absolute_deadline=turn_absolute_deadline,
                     )
                 )
             pa_out = pa_outcome.require_output()
@@ -6241,6 +6264,7 @@ class TurnRunner:
         input_provenance: dict[str, Any] | None = None,
         skill_catalog: Any | None = None,
         usage_execution_context: UsageExecutionContext | None = None,
+        turn_absolute_deadline: float | None = None,
     ) -> tuple[Any, Any]:
         """Run the pre-turn pipeline and re-resolve provider if model changed.
 
@@ -6670,10 +6694,13 @@ class TurnRunner:
                     if selection_mode == "router_dynamic":
                         from opensquilla.provider.ranking_router import (
                             DynamicRankingError,
+                            TaskAnalyzerCandidate,
+                            analyze_task_with_fallback_chain,
                             analyze_task_with_provider,
                             build_request_context,
                             dynamic_output_token_budgets,
                             ranking_config_snapshot,
+                            task_analyzer_chain_policy,
                             task_analyzer_policy,
                         )
 
@@ -6719,6 +6746,7 @@ class TurnRunner:
                                 ),
                             )
                         analyzer_policy = task_analyzer_policy(ranking_config)
+                        analyzer_chain = task_analyzer_chain_policy(ranking_config)
                         analyzer_provider_id = str(analyzer_policy["provider"])
                         analyzer_model_id = str(analyzer_policy["model"])
                         routing_extra = turn.metadata.get("routing_extra")
@@ -6778,11 +6806,6 @@ class TurnRunner:
                             if ranking_user_profile_application_enabled
                             else None
                         )
-                        analyzer_provider = self._router_dynamic_task_analyzer_provider(
-                            current_provider_config,
-                            session_key=turn.session_key,
-                            ranking_config=ranking_config,
-                        )
                         analyzer_admission_controller = None
                         analyzer_admission_deadline = None
                         admission_config = getattr(
@@ -6821,27 +6844,76 @@ class TurnRunner:
                                     )
                                 )
                             )
-                            analyzer_admission_deadline = time.monotonic() + float(
-                                analyzer_policy["timeout_seconds"]
+                            analyzer_admission_timeout = float(
+                                analyzer_chain["total_timeout_seconds"]
+                                if analyzer_chain["configured"]
+                                else analyzer_policy["timeout_seconds"]
                             )
-                        task_analysis = await analyze_task_with_provider(
-                            provider=analyzer_provider,
-                            message=turn.semantic_message,
-                            user_profile_enabled=user_profile is not None,
-                            request_context=request_context,
-                            routed_tier=routed_tier,
-                            routing_confidence=routing_confidence,
-                            usage_tracker=self._usage_tracker,
-                            session_key=turn.session_key,
-                            analyzer_provider_id=analyzer_provider_id,
-                            analyzer_model_id=analyzer_model_id,
-                            ranking_config=ranking_config,
-                            decision_id=ensemble_decision_id,
-                            admission_controller=(
-                                analyzer_admission_controller
-                            ),
-                            admission_deadline=analyzer_admission_deadline,
-                        )
+                            analyzer_admission_deadline = (
+                                time.monotonic() + analyzer_admission_timeout
+                            )
+                            if turn_absolute_deadline is not None:
+                                analyzer_admission_deadline = min(
+                                    analyzer_admission_deadline,
+                                    turn_absolute_deadline,
+                                )
+                        if analyzer_chain["configured"]:
+                            analyzer_candidates = [
+                                TaskAnalyzerCandidate(
+                                    provider=self._router_dynamic_task_analyzer_provider(
+                                        current_provider_config,
+                                        session_key=turn.session_key,
+                                        ranking_config=ranking_config,
+                                        analyzer_route=route,
+                                    ),
+                                    provider_id=str(route["provider"]),
+                                    model_id=str(route["model"]),
+                                    upstream_provider=str(route["upstream_provider"]),
+                                )
+                                for route in analyzer_chain["routes"]
+                            ]
+                            task_analysis = await analyze_task_with_fallback_chain(
+                                candidates=analyzer_candidates,
+                                message=turn.semantic_message,
+                                user_profile_enabled=user_profile is not None,
+                                request_context=request_context,
+                                routed_tier=routed_tier,
+                                routing_confidence=routing_confidence,
+                                usage_tracker=self._usage_tracker,
+                                session_key=turn.session_key,
+                                ranking_config=ranking_config,
+                                decision_id=ensemble_decision_id,
+                                absolute_deadline=turn_absolute_deadline,
+                                admission_controller=(
+                                    analyzer_admission_controller
+                                ),
+                                admission_deadline=analyzer_admission_deadline,
+                            )
+                        else:
+                            analyzer_provider = self._router_dynamic_task_analyzer_provider(
+                                current_provider_config,
+                                session_key=turn.session_key,
+                                ranking_config=ranking_config,
+                            )
+                            task_analysis = await analyze_task_with_provider(
+                                provider=analyzer_provider,
+                                message=turn.semantic_message,
+                                user_profile_enabled=user_profile is not None,
+                                request_context=request_context,
+                                routed_tier=routed_tier,
+                                routing_confidence=routing_confidence,
+                                usage_tracker=self._usage_tracker,
+                                session_key=turn.session_key,
+                                analyzer_provider_id=analyzer_provider_id,
+                                analyzer_model_id=analyzer_model_id,
+                                ranking_config=ranking_config,
+                                decision_id=ensemble_decision_id,
+                                admission_controller=(
+                                    analyzer_admission_controller
+                                ),
+                                admission_deadline=analyzer_admission_deadline,
+                                _absolute_deadline=turn_absolute_deadline,
+                            )
                         ranking_inputs = {
                             "decision_id": ensemble_decision_id,
                             "task_analysis": task_analysis,
@@ -6890,6 +6962,7 @@ class TurnRunner:
                         _session_key=turn.session_key,
                         _fallback_selector=cloned_selector,
                         _provider_health_ledger=provider_health_ledger,
+                        _absolute_deadline=turn_absolute_deadline,
                     )
                 except dynamic_cleanup_errors as exc:
                     log_ensemble_decision_failed(
