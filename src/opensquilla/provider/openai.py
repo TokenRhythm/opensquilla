@@ -3557,15 +3557,15 @@ def _build_openai_wire_messages(
             thinking=cfg.thinking,
         )
     )
-    explicit_cache_supported = False
-    if cfg.system:
-        explicit_cache_supported = policy.supports_explicit_prompt_cache and (
-            _supports_explicit_prompt_cache(
-                provider_kind,
-                model,
-                cfg.cache_mode,
-            )
+    has_system_prompt = bool(cfg.system)
+    explicit_cache_supported = policy.supports_explicit_prompt_cache and (
+        _supports_explicit_prompt_cache(
+            provider_kind,
+            model,
+            cfg.cache_mode,
         )
+    )
+    if has_system_prompt:
         if cfg.cache_breakpoints and explicit_cache_supported:
             content_blocks = _build_cache_breakpoint_blocks(
                 cfg.cache_breakpoints,
@@ -3614,6 +3614,7 @@ def _build_openai_wire_messages(
         )
     elif (
         provider_kind == "openrouter"
+        and has_system_prompt
         and cfg.cache_mode in {"auto", "on"}
         and explicit_cache_supported
         and _openrouter_model_uses_alibaba_message_cache(model)

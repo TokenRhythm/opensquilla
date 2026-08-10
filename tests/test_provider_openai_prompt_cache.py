@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from opensquilla.provider import openai as openai_module
 from opensquilla.provider.openai import OpenAIProvider
@@ -51,10 +52,16 @@ def _patch_openai_transport(monkeypatch, captured: dict[str, Any]) -> None:
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", patched_async_client)
 
 
-def _collect_done(provider: OpenAIProvider, cfg: ChatConfig) -> DoneEvent:
+def _collect_done(
+    provider: OpenAIProvider,
+    cfg: ChatConfig,
+    messages: list[Message] | None = None,
+) -> DoneEvent:
+    request_messages = messages if messages is not None else [Message(role="user", content="hi")]
+
     async def _collect() -> DoneEvent:
         done: DoneEvent | None = None
-        async for ev in provider.chat([Message(role="user", content="hi")], config=cfg):
+        async for ev in provider.chat(request_messages, config=cfg):
             if isinstance(ev, DoneEvent):
                 done = ev
         assert done is not None
@@ -227,6 +234,59 @@ def test_tokenrhythm_qwen37_max_on_adds_message_cache_control(monkeypatch) -> No
     ]
 
 
+def test_tokenrhythm_qwen37_max_on_without_system_marks_initial_user(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+    _patch_openai_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-max",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    _collect_done(provider, ChatConfig(cache_mode="on"))
+
+    assert captured["payload"]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "hi",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "cache_mode"),
+    [
+        ("glm-5.2", "on"),
+        ("qwen3.7-max", "auto"),
+        ("qwen3.7-max", "off"),
+    ],
+)
+def test_tokenrhythm_without_system_keeps_unsupported_or_non_on_requests_unmarked(
+    monkeypatch,
+    model: str,
+    cache_mode: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_openai_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    _collect_done(provider, ChatConfig(cache_mode=cache_mode))
+
+    assert captured["payload"]["messages"] == [{"role": "user", "content": "hi"}]
+
+
 def test_tokenrhythm_qwen37_max_auto_enables_system_cache_control(monkeypatch) -> None:
     captured: dict[str, Any] = {}
     _patch_openai_transport(monkeypatch, captured)
@@ -338,6 +398,49 @@ def test_tokenrhythm_qwen37_max_on_never_exceeds_four_markers(monkeypatch) -> No
     assert messages[1] == {"role": "user", "content": "hi"}
 
 
+def test_tokenrhythm_qwen37_max_on_without_system_never_exceeds_four_markers(
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_openai_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen3.7-max",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+    request_messages = [
+        Message(role="user", content="initial issue"),
+        Message(role="assistant", content="analysis 1"),
+        Message(role="user", content="tool result 1"),
+        Message(role="assistant", content="analysis 2"),
+        Message(role="user", content="tool result 2"),
+        Message(role="assistant", content="analysis 3"),
+    ]
+
+    _collect_done(
+        provider,
+        ChatConfig(cache_mode="on"),
+        messages=request_messages,
+    )
+
+    messages = captured["payload"]["messages"]
+    marker_positions = [
+        (message_index, message["role"], block_index)
+        for message_index, message in enumerate(messages)
+        if isinstance(message.get("content"), list)
+        for block_index, block in enumerate(message["content"])
+        if block.get("cache_control") == {"type": "ephemeral"}
+    ]
+    assert marker_positions == [
+        (0, "user", 0),
+        (3, "assistant", 0),
+        (4, "user", 0),
+        (5, "assistant", 0),
+    ]
+    assert len(marker_positions) == 4
+
+
 def test_tokenrhythm_cache_usage_log_contains_hashes_but_not_prompt_text(monkeypatch) -> None:
     captured: dict[str, Any] = {}
     _patch_openai_transport(monkeypatch, captured)
@@ -447,6 +550,25 @@ def test_openrouter_unprefixed_qwen36_flash_auto_cache_adds_message_cache_contro
         (0, "system", 0),
         (1, "user", 0),
     ]
+
+
+@pytest.mark.parametrize("cache_mode", ["auto", "on"])
+def test_openrouter_qwen36_flash_without_system_keeps_existing_unmarked_shape(
+    monkeypatch,
+    cache_mode: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_openai_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="qwen/qwen3.6-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+
+    _collect_done(provider, ChatConfig(cache_mode=cache_mode))
+
+    assert captured["payload"]["messages"] == [{"role": "user", "content": "hi"}]
 
 
 def test_openrouter_zai_auto_cache_requires_live_capability_proof(monkeypatch) -> None:
