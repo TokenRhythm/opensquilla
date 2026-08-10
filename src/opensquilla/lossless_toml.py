@@ -116,15 +116,30 @@ def _skip_quoted(text: str, index: int) -> int:
 
 
 def _find_multiline_close(text: str, delimiter: str, start: int) -> int:
+    """Return the end of the closing quote run, or ``-1`` when still open.
+
+    TOML permits one or two quote characters immediately inside a multi-line
+    string delimiter.  A terminal run can therefore contain three, four, or
+    five quotes: the last three close the string and any preceding quotes are
+    content.  Consuming the complete run also keeps a fourth quote from being
+    mistaken for a new single-line string that hides a following ``]``/``}``.
+    """
     literal = delimiter == "'''"
+    quote = delimiter[0]
     index = start
     while index < len(text):
         if not literal and text[index] == "\\":
             index += 2
             continue
-        if text.startswith(delimiter, index):
-            return index
-        index += 1
+        if text[index] != quote:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(text) and text[end] == quote:
+            end += 1
+        if end - index >= len(delimiter):
+            return end
+        index = end
     return -1
 
 
@@ -140,7 +155,7 @@ def _scan_value(text: str, depth: int, pending: str | None) -> tuple[int, str | 
         closing = _find_multiline_close(text, pending, 0)
         if closing < 0:
             return depth, pending
-        index = closing + len(pending)
+        index = closing
         pending = None
     while index < len(text):
         character = text[index]
@@ -152,7 +167,7 @@ def _scan_value(text: str, depth: int, pending: str | None) -> tuple[int, str | 
                 closing = _find_multiline_close(text, delimiter, index + 3)
                 if closing < 0:
                     return depth, delimiter
-                index = closing + 3
+                index = closing
                 continue
             index = _skip_quoted(text, index)
             continue
@@ -173,6 +188,26 @@ def _value_last_line(lines: list[str], start: int, suffix: str) -> int:
         continuation, _newline = _split_newline(lines[last])
         depth, pending = _scan_value(continuation, depth, pending)
     return last
+
+
+def _physical_lines(text: str) -> list[str]:
+    """Split on TOML physical newlines while preserving their exact bytes.
+
+    TOML defines a newline as LF or CRLF.  ``str.splitlines`` additionally
+    treats several legal Unicode string characters (for example U+2028) as
+    line boundaries, which can make the scanner splice an assignment inside a
+    quoted value.
+    """
+    lines: list[str] = []
+    start = 0
+    while start < len(text):
+        end = text.find("\n", start)
+        if end < 0:
+            lines.append(text[start:])
+            break
+        lines.append(text[start : end + 1])
+        start = end + 1
+    return lines
 
 
 def _scan(
@@ -320,7 +355,7 @@ def patch_import_config(
     if original == transformed:
         return raw
 
-    lines = text.splitlines(keepends=True)
+    lines = _physical_lines(text)
     assignments, insertion_points, spanning = _scan(lines)
     original_leaves = _leaves(original)
     transformed_leaves = _leaves(transformed)
@@ -389,10 +424,31 @@ def patch_import_config(
         insertions.setdefault(insertion_points[context], []).append(insertion)
 
     output: list[str] = []
+    has_output = False
+    ends_with_newline = True
     for index in range(len(lines) + 1):
-        output.extend(insertions.get(index, ()))
+        pending_insertions = insertions.get(index, ())
+        if pending_insertions and has_output and not ends_with_newline:
+            output.append(newline)
+            ends_with_newline = True
+        for insertion_index, insertion in enumerate(pending_insertions):
+            fragment = insertion
+            if (
+                index == len(lines)
+                and insertion_index == len(pending_insertions) - 1
+                and text
+                and not text.endswith("\n")
+            ):
+                fragment = insertion[: -len(newline)]
+            output.append(fragment)
+            has_output = True
+            ends_with_newline = fragment.endswith("\n")
         if index < len(lines):
-            output.append(replacements.get(index, lines[index]))
+            fragment = replacements.get(index, lines[index])
+            if fragment:
+                output.append(fragment)
+                has_output = True
+                ends_with_newline = fragment.endswith("\n")
     patched = "".join(output)
     try:
         parsed = tomllib.loads(patched)

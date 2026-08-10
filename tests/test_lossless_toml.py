@@ -142,6 +142,102 @@ def test_crlf_config_with_a_multi_line_array_keeps_its_line_endings() -> None:
     assert "\r\n" in patched
 
 
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("terminal_quotes", [3, 4, 5])
+def test_terminal_quote_runs_inside_an_array_do_not_hide_the_next_table(
+    quote: str,
+    terminal_quotes: int,
+) -> None:
+    delimiter = quote * 3
+    raw = (
+        "[cors]\n"
+        f"allowed_origins = [{delimiter}https://example.com{quote * terminal_quotes} ]\n"
+        "\n"
+        "[sandbox]\n"
+        "sandbox = true\n"
+    ).encode()
+
+    from opensquilla.sandbox.upgrade_migration import lossless_patch_sandbox_fields
+
+    patched, mode = lossless_patch_sandbox_fields(raw)
+    payload = tomllib.loads(patched.decode("utf-8"))
+    assert mode == "safe"
+    assert payload["sandbox"]["run_mode"] == "safe"
+    assert payload["cors"]["allowed_origins"] == [
+        "https://example.com" + quote * (terminal_quotes - 3)
+    ]
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("opening_quotes", [3, 4, 5])
+def test_opening_quote_runs_inside_an_array_keep_the_collection_close_visible(
+    quote: str,
+    opening_quotes: int,
+) -> None:
+    delimiter = quote * 3
+    raw = (
+        "[cors]\n"
+        f"allowed_origins = [{quote * opening_quotes}example{delimiter} ]\n"
+        "\n"
+        "[sandbox]\n"
+        "sandbox = true\n"
+    ).encode()
+
+    from opensquilla.sandbox.upgrade_migration import lossless_patch_sandbox_fields
+
+    patched, mode = lossless_patch_sandbox_fields(raw)
+    payload = tomllib.loads(patched.decode("utf-8"))
+    assert mode == "safe"
+    assert payload["sandbox"]["run_mode"] == "safe"
+    assert payload["cors"]["allowed_origins"] == [
+        quote * (opening_quotes - 3) + "example"
+    ]
+
+
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_unicode_string_separators_are_not_toml_physical_lines(separator: str) -> None:
+    raw = f'name = "before{separator}after"\n'.encode()
+    patched = _patched(
+        raw,
+        lambda payload: payload.setdefault("sandbox", {}).update(run_mode="full"),
+    )
+    assert f'before{separator}after' in patched
+    assert tomllib.loads(patched)["sandbox"]["run_mode"] == "full"
+
+
+def test_insertion_after_an_eof_assignment_adds_a_physical_newline() -> None:
+    raw = b"port = 1"
+    patched = _patched(
+        raw,
+        lambda payload: payload.setdefault("sandbox", {}).update(run_mode="full"),
+    )
+    assert patched == 'port = 1\nsandbox.run_mode = "full"'
+
+
+def test_boot_stamp_after_an_eof_table_assignment_adds_a_physical_newline() -> None:
+    from opensquilla.sandbox.upgrade_migration import lossless_patch_sandbox_fields
+
+    raw = b"[sandbox]\nsandbox = true"
+    patched, mode = lossless_patch_sandbox_fields(raw)
+    assert mode == "safe"
+    assert patched == b'[sandbox]\nsandbox = true\nrun_mode = "safe"'
+
+
+def test_multiple_eof_insertions_have_separators_without_adding_a_final_newline() -> None:
+    raw = b"port = 1"
+    patched = _patched(raw, lambda payload: payload.update(alpha=1, beta=2))
+    assert patched == "port = 1\nalpha = 1\nbeta = 2"
+
+
+def test_crlf_eof_insertion_uses_crlf_without_adding_a_final_newline() -> None:
+    from opensquilla.sandbox.upgrade_migration import lossless_patch_sandbox_fields
+
+    raw = b"port = 1\r\n[sandbox]\r\nsandbox = true"
+    patched, mode = lossless_patch_sandbox_fields(raw)
+    assert mode == "safe"
+    assert patched == b'port = 1\r\n[sandbox]\r\nsandbox = true\r\nrun_mode = "safe"'
+
+
 # ---------------------------------------------------------------------------
 # Configs with no multi-line value must come through untouched
 # ---------------------------------------------------------------------------
