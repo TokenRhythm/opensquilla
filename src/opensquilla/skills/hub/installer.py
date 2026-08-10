@@ -14,6 +14,7 @@ from opensquilla.paths import default_opensquilla_home
 from opensquilla.skills.hub.lockfile import LockEntry, Lockfile, compute_sha256
 from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.hub.scanner import ScanResult, scan_skill_bundle
+from opensquilla.skills.hub.source import SkillFetchError
 from opensquilla.skills.paths import default_managed_skills_dir
 
 log = structlog.get_logger(__name__)
@@ -78,7 +79,10 @@ class SkillInstaller:
     ) -> InstallResult:
         """Full install lifecycle: fetch → quarantine → scan → install → lockfile."""
         # 1. Fetch
-        bundle = await self._router.fetch(identifier, source_id)
+        try:
+            bundle = await self._router.fetch(identifier, source_id)
+        except SkillFetchError as exc:
+            return InstallResult(success=False, name=identifier, message=exc.reason)
         if bundle is None:
             return InstallResult(
                 success=False,

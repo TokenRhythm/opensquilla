@@ -21,6 +21,28 @@ class SkillMeta:
     license: str = ""
     tags: list[str] = field(default_factory=list)
     platforms: list[str] = field(default_factory=list)
+    # Publisher handle; disambiguates duplicate slugs on registries that
+    # allow the same slug under multiple publishers (e.g. clawhub).
+    owner_handle: str = ""
+    # For aggregated listings (e.g. clawhub entries mirrored from skills.sh),
+    # the registry download endpoint may not serve the artifact at all.
+    # fallback_source names the upstream registry and fallback_url points at
+    # a directly downloadable artifact (e.g. a GitHub archive zip).
+    fallback_source: str = ""
+    fallback_url: str = ""
+
+
+class SkillFetchError(Exception):
+    """Raised by a SkillSource when a fetch fails for a known, actionable reason.
+
+    The installer surfaces ``reason`` to the user so a 404, an ambiguous slug,
+    or a rate limit is not hidden behind one generic message.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
 
 
 @dataclass
