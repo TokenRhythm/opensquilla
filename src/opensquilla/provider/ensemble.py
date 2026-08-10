@@ -2246,6 +2246,34 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[: max(0, max_chars - len(marker))] + marker
 
 
+_CONTINUATION_DEDUP_MIN_BOUNDARY_OVERLAP_CHARS = 3
+
+
+def _continuation_overlap_is_boundary_aligned(
+    existing: str,
+    continuation: str,
+    overlap: int,
+) -> bool:
+    """Return whether a partial overlap is strong evidence of repeated text."""
+
+    if overlap < _CONTINUATION_DEDUP_MIN_BOUNDARY_OVERLAP_CHARS:
+        return False
+
+    def is_word_character(value: str) -> bool:
+        return value.isalnum() or value == "_"
+
+    existing_start = len(existing) - overlap
+    left_boundary = existing_start == 0 or not (
+        is_word_character(existing[existing_start - 1])
+        and is_word_character(existing[existing_start])
+    )
+    right_boundary = overlap == len(continuation) or not (
+        is_word_character(continuation[overlap - 1])
+        and is_word_character(continuation[overlap])
+    )
+    return left_boundary and right_boundary
+
+
 def _deduplicate_continuation(existing: str, continuation: str) -> str:
     """Remove a repeated prefix from a continuation without rewriting text."""
 
@@ -2271,7 +2299,13 @@ def _deduplicate_continuation(existing: str, continuation: str) -> str:
             candidate += 1
         failure[index] = candidate
     overlap = failure[-1]
-    if overlap > 0:
+    # One- or two-character suffixes commonly match the beginning of an
+    # unrelated next sentence, identifier, or CJK word. A partial overlap must
+    # contain at least three characters and align to both word boundaries before
+    # it is strong enough to rewrite the stream.
+    if _continuation_overlap_is_boundary_aligned(
+        existing, continuation, overlap
+    ):
         return continuation[overlap:]
     return continuation
 

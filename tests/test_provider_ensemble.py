@@ -16447,6 +16447,73 @@ def test_long_continuation_overlap_is_removed_without_a_fixed_4k_window() -> Non
     )
 
 
+def test_complete_continuation_prefix_is_removed() -> None:
+    existing = "A complete previously delivered answer."
+
+    assert (
+        _deduplicate_continuation(
+            existing,
+            f"{existing} Missing remainder.",
+        )
+        == " Missing remainder."
+    )
+
+
+def test_three_character_boundary_aligned_continuation_overlap_is_removed() -> None:
+    assert (
+        _deduplicate_continuation("Answer ABC", "ABC DEF")
+        == " DEF"
+    )
+
+
+def test_boundary_aligned_continuation_overlap_is_removed() -> None:
+    repeated_tail = "Repeated sentence with enough context to identify it."
+
+    assert (
+        _deduplicate_continuation(
+            f"Earlier answer.\n{repeated_tail}",
+            f"{repeated_tail}\nMissing remainder.",
+        )
+        == "\nMissing remainder."
+    )
+
+
+@pytest.mark.parametrize(
+    ("existing", "continuation"),
+    [
+        (
+            "A complete answer ending in a",
+            "answer starts a different sentence.",
+        ),
+        (
+            "A complete answer ending in re",
+            "result starts a different sentence.",
+        ),
+        (
+            "这是已经交付的回答，末尾是答",
+            "答案应当完整保留。",
+        ),
+        (
+            "The prior code stores result",
+            "result_count = 1",
+        ),
+    ],
+    ids=("one-character", "two-character", "cjk-character", "code-token"),
+)
+def test_short_continuation_overlap_is_not_removed(
+    existing: str,
+    continuation: str,
+) -> None:
+    assert _deduplicate_continuation(existing, continuation) == continuation
+
+
+def test_long_continuation_overlap_inside_word_is_not_removed() -> None:
+    overlap = "identifierfragment" * 3
+    continuation = f"{overlap}suffix"
+
+    assert _deduplicate_continuation(f"prefix{overlap}", continuation) == continuation
+
+
 @pytest.mark.asyncio
 async def test_aggregator_only_reserves_visible_output_and_recovers_reasoning_only(
     monkeypatch: pytest.MonkeyPatch,
