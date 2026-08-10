@@ -2247,6 +2247,27 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
         return values
 
 
+class GoalConfig(BaseSettings):
+    """Guardrails for session-level Goal execution.
+
+    TOML section ``[goal]``; keys mirror the field names (snake_case).
+    Automatic execution is enabled by default, with a fail-closed operator
+    switch and bounded per-resume execution windows.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_GOAL_",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    execution_enabled: bool = True
+    max_turns: int = Field(default=50, ge=1, le=500)
+    # Accumulated running time only. Queued, paused, and process downtime are
+    # deliberately excluded from this limit.
+    runtime_budget_seconds: int = Field(default=3_600, ge=60, le=86_400)
+
+
 class GatewayConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_GATEWAY_",
@@ -2309,6 +2330,7 @@ class GatewayConfig(BaseSettings):
     naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    goal: GoalConfig = Field(default_factory=GoalConfig)
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)

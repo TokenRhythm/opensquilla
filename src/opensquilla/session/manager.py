@@ -1149,6 +1149,10 @@ class SessionManager:
         """
         session_key = canonicalize_session_key(session_key)
         self._epoch_cache.pop(session_key, None)
+        goal_service = getattr(self._task_runtime, "goal_service", None)
+        revoke_goal_lease = getattr(goal_service, "revoke_session", None)
+        if callable(revoke_goal_lease):
+            revoke_goal_lease(session_key, session_id=session_id)
         try:
             from opensquilla.gateway.subagent_announce import _tracker as _spawn_tracker
 
@@ -3141,7 +3145,13 @@ class SessionManager:
     async def prune_stale(self, max_age_ms: int) -> int:
         """Delete sessions older than max_age_ms. Returns number pruned."""
         cutoff = _now_ms() - max_age_ms
-        return await self._storage.prune_stale_sessions(cutoff)
+        stale = await self._storage.prune_stale_session_records(cutoff)
+        for session in stale:
+            self.evict_session_runtime_state(
+                session.session_key,
+                session_id=session.session_id,
+            )
+        return len(stale)
 
     async def cap_entries(self, max_entries: int = 500) -> int:
         """Delete oldest sessions beyond max_entries. Returns number deleted."""
@@ -3153,6 +3163,10 @@ class SessionManager:
         to_delete = sorted(sessions, key=lambda s: s.updated_at)[: total - max_entries]
         for s in to_delete:
             await self._storage.delete_session(s.session_key)
+            self.evict_session_runtime_state(
+                s.session_key,
+                session_id=s.session_id,
+            )
         return len(to_delete)
 
     async def archive(self, session_key: str) -> None:

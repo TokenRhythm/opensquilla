@@ -247,7 +247,11 @@ from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
-from opensquilla.tools.types import ToolContext, current_tool_context
+from opensquilla.tools.types import (
+    ToolContext,
+    current_tool_context,
+    is_goal_owned_main_default_turn,
+)
 from opensquilla.tools.write_policy import match_workspace_write_deny
 from opensquilla.tools.write_tracking import classify_workspace_path
 from opensquilla.usage_reasons import (
@@ -2032,6 +2036,7 @@ _SYNTHETIC_USER_CONTEXT_PREFIXES = (
     "[Request context for this turn]",
     "[Runtime context for this turn]",
     "[Current user request reminder]",
+    "[Current Goal objective reminder]",
     "Runtime state capsule:",
 )
 
@@ -6382,6 +6387,8 @@ class Agent:
         artifact_delivery_final_response_pending = False
         artifact_delivery_degraded_final_response = False
         artifact_delivery_final_response_artifacts: list[dict[str, Any]] = []
+        goal_terminal_final_response_pending = False
+        goal_terminal_final_status: str | None = None
         max_iterations_finalization_attempted = False
         max_iterations_finalization_pending = False
         max_iterations_finalization_message: Message | None = None
@@ -6734,6 +6741,7 @@ class Agent:
 
         pending_input_batch_staged = False
         staged_pending_input_message: Message | None = None
+        staged_claimed_goal_context: dict[str, Any] | None = None
 
         def _continuation_capabilities() -> tuple[int, bool, bool, str] | None:
             """Resolve capabilities for the physical leg that just completed."""
@@ -6883,11 +6891,12 @@ class Agent:
                 return False
             return True
 
-        def _claim_pending_inputs_for_next_call() -> bool:
+        async def _claim_pending_inputs_for_next_call() -> bool:
             """Claim one FIFO steer batch when another model call has headroom."""
 
             nonlocal pending_input_batch_staged
             nonlocal staged_pending_input_message
+            nonlocal staged_claimed_goal_context
             if pending_input_provider is None or pending_input_batch_staged:
                 return False
             if _turn_budget_error() is not None:
@@ -6913,10 +6922,62 @@ class Agent:
             )
             if not _continuation_request_fits(pending_message):
                 return False
-            pending_inputs = pending_input_provider.drain_pending()
+            claim_pending = getattr(pending_input_provider, "claim_pending", None)
+            if callable(claim_pending):
+                prepared_claim = claim_pending()
+                if inspect.isawaitable(prepared_claim):
+                    prepared_claim = await prepared_claim
+                pending_inputs = list(getattr(prepared_claim, "texts", ()) or ())
+                claimed_goal_context = getattr(prepared_claim, "goal_context", None)
+            else:
+                pending_inputs = pending_input_provider.drain_pending()
+                claimed_goal_context = None
+            goal_context_accepted = claimed_goal_context is None
+            if isinstance(claimed_goal_context, Mapping):
+                from opensquilla.session.goals import GoalTurnContext
+
+                current_goal_context = GoalTurnContext.from_task_detail(
+                    getattr(self._tool_context, "goal_context", None)
+                )
+                next_goal_context = GoalTurnContext.from_task_detail(
+                    claimed_goal_context
+                )
+                if (
+                    self._tool_context is not None
+                    and current_goal_context is not None
+                    and next_goal_context is not None
+                    and next_goal_context.session_id == current_goal_context.session_id
+                    and next_goal_context.epoch == current_goal_context.epoch
+                    and next_goal_context.goal_id == current_goal_context.goal_id
+                    and next_goal_context.task_id == current_goal_context.task_id
+                    and next_goal_context.objective_revision
+                    >= current_goal_context.objective_revision
+                ):
+                    staged_claimed_goal_context = dict(claimed_goal_context)
+                    goal_context_accepted = True
+            if claimed_goal_context is not None and not goal_context_accepted:
+                # The internal Goal control is always the first claimed text.
+                # Drop it fail-closed if the Agent's own immutable task
+                # identity cannot adopt the validated durable context.
+                pending_inputs = pending_inputs[1:]
+                reject_goal_context = getattr(
+                    pending_input_provider,
+                    "reject_claimed_goal_context",
+                    None,
+                )
+                if callable(reject_goal_context):
+                    rejected = reject_goal_context()
+                    if inspect.isawaitable(rejected):
+                        _ = await rejected
             if not pending_inputs:
                 return False
-            staged_pending_input_message = pending_message
+            staged_pending_input_message = Message(
+                role="user",
+                content=[
+                    ContentBlockText(text=pending_input)
+                    for pending_input in pending_inputs
+                ],
+            )
             turn_messages.append(staged_pending_input_message)
             pending_input_batch_staged = True
             return True
@@ -6930,6 +6991,8 @@ class Agent:
 
             nonlocal pending_input_batch_staged
             nonlocal staged_pending_input_message
+            nonlocal staged_claimed_goal_context
+            nonlocal turn_objective_message
             if not pending_input_batch_staged or pending_input_provider is None:
                 return
             mark_applied = getattr(pending_input_provider, "mark_applied", None)
@@ -6940,6 +7003,49 @@ class Agent:
                 )
                 if inspect.isawaitable(result):
                     await result
+            take_applied_goal_context = getattr(
+                pending_input_provider,
+                "take_applied_goal_context",
+                None,
+            )
+            applied_goal_context = (
+                take_applied_goal_context()
+                if callable(take_applied_goal_context)
+                else None
+            )
+            if (
+                staged_claimed_goal_context is not None
+                and isinstance(applied_goal_context, Mapping)
+            ):
+                from opensquilla.session.goals import GoalTurnContext
+
+                staged_context = GoalTurnContext.from_task_detail(
+                    staged_claimed_goal_context
+                )
+                applied_context = GoalTurnContext.from_task_detail(
+                    applied_goal_context
+                )
+                current_context = GoalTurnContext.from_task_detail(
+                    getattr(self._tool_context, "goal_context", None)
+                )
+                if (
+                    self._tool_context is not None
+                    and staged_context is not None
+                    and applied_context == staged_context
+                    and current_context is not None
+                    and applied_context.session_id == current_context.session_id
+                    and applied_context.epoch == current_context.epoch
+                    and applied_context.goal_id == current_context.goal_id
+                    and applied_context.task_id == current_context.task_id
+                    and applied_context.objective_revision
+                    >= current_context.objective_revision
+                ):
+                    self._tool_context.goal_context = dict(applied_goal_context)
+                    turn_objective_message = self._goal_objective_message(
+                        applied_context.objective_snapshot,
+                        enabled=self._turn_objective_reminder_enabled,
+                        max_chars=self._turn_objective_reminder_max_chars,
+                    )
             applied_model_call_boundaries.append(
                 {
                     "model_call_id": model_call_id,
@@ -6952,6 +7058,7 @@ class Agent:
             )
             pending_input_batch_staged = False
             staged_pending_input_message = None
+            staged_claimed_goal_context = None
 
         def _finish_artifact_delivery_degraded(
             *,
@@ -6997,11 +7104,67 @@ class Agent:
                 artifact_count=len(artifact_delivery_final_response_artifacts),
             )
 
+        def _goal_terminal_final_response_text() -> str:
+            return (
+                "The Goal is complete."
+                if goal_terminal_final_status == "complete"
+                else "The Goal is blocked."
+            )
+
+        def _record_goal_terminal_synthesized_response(
+            *,
+            reason: str,
+            code: str,
+        ) -> str:
+            final_response_text = _goal_terminal_final_response_text()
+            self._write_turn_call_log(
+                "goal_terminal_final_response_synthesized",
+                reason=reason,
+                code=code,
+                status=goal_terminal_final_status,
+            )
+            return final_response_text
+
+        def _finish_goal_terminal_without_provider(*, reason: str, code: str) -> None:
+            """Finish an already-durable Goal when no summary call has headroom."""
+
+            nonlocal goal_terminal_final_response_pending
+            nonlocal goal_terminal_final_status
+            final_response_text = _record_goal_terminal_synthesized_response(
+                reason=reason,
+                code=code,
+            )
+            current_text = "".join(final_text_parts)
+            if final_response_text not in current_text:
+                prefix = "\n\n" if current_text.strip() else ""
+                final_text_parts.append(prefix + final_response_text)
+            goal_terminal_final_response_pending = False
+            goal_terminal_final_status = None
+
         try:
             while True:
+                if goal_terminal_final_response_pending:
+                    terminal_headroom_error = _turn_budget_error()
+                    if terminal_headroom_error is None:
+                        terminal_headroom_error = _turn_llm_call_budget_error(
+                            turn_llm_calls + 1
+                        )
+                    if terminal_headroom_error is not None:
+                        _finish_goal_terminal_without_provider(
+                            reason=terminal_headroom_error.message,
+                            code=terminal_headroom_error.code,
+                        )
+                        break
+                    if _total_deadline is not None and _loop.time() > _total_deadline:
+                        _finish_goal_terminal_without_provider(
+                            reason="The total turn deadline expired after Goal terminalization.",
+                            code="total_timeout",
+                        )
+                        break
                 if (
                     self.config.max_iterations > 0
                     and iterations >= self.config.max_iterations
+                    and not goal_terminal_final_response_pending
                     and not _defer_max_iterations_cap()
                 ):
                     max_iterations_source = str(
@@ -7236,6 +7399,7 @@ class Agent:
                         None
                         if (
                             artifact_delivery_final_response_pending
+                            or goal_terminal_final_response_pending
                             or max_iterations_finalization_pending
                             or post_write_convergence_finalization_pending
                         )
@@ -7258,6 +7422,7 @@ class Agent:
                     tools_supported_for_call = (
                         tools_supported
                         and not artifact_delivery_final_response_pending
+                        and not goal_terminal_final_response_pending
                         and not max_iterations_finalization_pending
                         and not post_write_convergence_finalization_pending
                     )
@@ -7282,7 +7447,12 @@ class Agent:
                         active_protected_turn_start_index = current_turn_start_index
 
                     request_suffix_messages: list[Message] = []
-                    if (
+                    if goal_terminal_final_response_pending:
+                        # The terminal Goal ToolResult is sufficient context for
+                        # one ordinary summary. Do not splice work/recovery
+                        # directives after the durable terminal decision.
+                        request_suffix_messages = []
+                    elif (
                         post_write_convergence_finalization_pending
                         and post_write_convergence_finalization_message is not None
                     ):
@@ -7314,17 +7484,35 @@ class Agent:
                         *base_request_turn_messages,
                         *request_suffix_messages,
                     ]
-                    (
-                        request_messages,
-                        request_sanitize_result,
-                    ) = await self._provider_request_messages_with_sanitize_async(
-                        request_turn_messages,
-                        request_context_message=request_context_message,
-                        request_context_insert_index=active_request_context_insert_index,
-                        runtime_context_message=runtime_context_message,
-                        runtime_context_insert_index=active_runtime_context_insert_index,
-                        turn_objective_message=turn_objective_message,
-                    )
+                    try:
+                        (
+                            request_messages,
+                            request_sanitize_result,
+                        ) = await self._provider_request_messages_with_sanitize_async(
+                            request_turn_messages,
+                            request_context_message=request_context_message,
+                            request_context_insert_index=active_request_context_insert_index,
+                            runtime_context_message=runtime_context_message,
+                            runtime_context_insert_index=active_runtime_context_insert_index,
+                            turn_objective_message=turn_objective_message,
+                        )
+                    except Exception as exc:
+                        if not goal_terminal_final_response_pending:
+                            raise
+                        response_text = _record_goal_terminal_synthesized_response(
+                            reason=(
+                                "Goal terminal summary request assembly failed after "
+                                f"terminalization ({type(exc).__name__})."
+                            ),
+                            code="goal_terminal_summary_request_assembly_failed",
+                        )
+                        assistant_text_parts.append(response_text)
+                        provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                        _got_done_event = True
+                        _got_error = False
+                        terminal_error = None
+                        yield TextDeltaEvent(text=response_text)
+                        break
                     validation_error = validate_provider_chat_request(
                         self.provider,
                         request_messages,
@@ -7334,16 +7522,28 @@ class Agent:
                             message=validation_error.message,
                             code=validation_error.code,
                         )
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action="stop",
-                            reason=terminal_error.message,
-                            code=terminal_error.code,
-                            iteration=iterations,
-                            attempt=_call_attempt,
-                        )
-                        yield self._transition(AgentState.ERROR)
-                        yield terminal_error
+                        if goal_terminal_final_response_pending:
+                            response_text = _record_goal_terminal_synthesized_response(
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                            )
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            terminal_error = None
+                            yield TextDeltaEvent(text=response_text)
+                        else:
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="stop",
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
                         break
                     identical_request_action = self._identical_request_loop_break_action(
                         request_messages,
@@ -7379,6 +7579,17 @@ class Agent:
                                 code=terminal_error.code,
                             )
                             terminal_error = None
+                        elif goal_terminal_final_response_pending:
+                            response_text = _record_goal_terminal_synthesized_response(
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                            )
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            terminal_error = None
+                            yield TextDeltaEvent(text=response_text)
                         else:
                             yield self._transition(AgentState.ERROR)
                             yield terminal_error
@@ -7430,6 +7641,20 @@ class Agent:
                                 code=terminal_error.code,
                             )
                             terminal_error = None
+                        elif goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            terminal_error = None
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_without_summary_retry_headroom",
+                                reason="goal_terminal",
+                                code="turn_llm_call_budget_exceeded",
+                            )
+                            yield TextDeltaEvent(text=response_text)
                         else:
                             yield self._transition(AgentState.ERROR)
                             yield terminal_error
@@ -7444,6 +7669,10 @@ class Agent:
                             workspace_edit_gate_recovery_reads_remaining
                         ),
                     )
+                    if goal_terminal_final_response_pending:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={"tool_choice": None}
+                        )
                     forced_tool_choice = self.config.metadata.get("meta_match_tool_choice")
                     if (
                         forced_tool_choice is not None
@@ -7515,8 +7744,13 @@ class Agent:
                     # Time-to-first-event for this provider call, stamped once
                     # at the first streamed event (diagnostics only).
                     first_event_at: float | None = None
+                    call_outcome_notified = False
 
                     def _notify_call_outcome(*, ok: bool, failure_kind: str = "") -> None:
+                        nonlocal call_outcome_notified
+                        if call_outcome_notified:
+                            return
+                        call_outcome_notified = True
                         self._notify_provider_call_observer(
                             ttft_ms=(
                                 int((first_event_at - call_started_at) * 1000)
@@ -7655,6 +7889,7 @@ class Agent:
                                     # discards reasoning for a directive-free,
                                     # otherwise identical request.
                                     and not artifact_delivery_final_response_pending
+                                    and not goal_terminal_final_response_pending
                                     and not max_iterations_finalization_pending
                                     and not post_write_convergence_finalization_pending
                                     and (
@@ -7751,6 +7986,7 @@ class Agent:
                                 if (
                                     _reasoning_stream_char_cap > 0
                                     and not _reasoning_cap_preempt_done
+                                    and not goal_terminal_final_response_pending
                                 ):
                                     attempt_reasoning_stream_chars += len(
                                         raw_ev.text or ""
@@ -7830,6 +8066,7 @@ class Agent:
                                 if not tools_supported_for_call:
                                     if (
                                         artifact_delivery_final_response_pending
+                                        or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
                                         or post_write_convergence_finalization_pending
                                     ):
@@ -7928,6 +8165,7 @@ class Agent:
                                 if not tools_supported_for_call:
                                     if (
                                         artifact_delivery_final_response_pending
+                                        or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
                                         or post_write_convergence_finalization_pending
                                     ):
@@ -8366,6 +8604,7 @@ class Agent:
                                     thinking_enabled
                                     and not _thinking_fallback_done
                                     and self.config.provider_error_thinking_fallback
+                                    and not goal_terminal_final_response_pending
                                     and ("thinking" in _err_lower or "reasoning" in _err_lower)
                                 ):
                                     _thinking_fallback_done = True
@@ -8408,6 +8647,20 @@ class Agent:
                                 ),
                                 code="iteration_timeout",
                             )
+                            break
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_timeout",
+                                reason="goal_terminal",
+                                code="iteration_timeout",
+                            )
+                            yield TextDeltaEvent(text=response_text)
                             break
                         yield self._transition(AgentState.ERROR)
                         terminal_error = ErrorEvent(
@@ -8465,6 +8718,20 @@ class Agent:
                         # record the failed call, then propagate unchanged.
                         usage_unknown_reason = "total_timeout"
                         _notify_call_outcome(ok=False, failure_kind="total_timeout")
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_timeout",
+                                reason="goal_terminal",
+                                code="total_timeout",
+                            )
+                            yield TextDeltaEvent(text=response_text)
+                            break
                         raise
                     except Exception:
                         # A provider stream that raises (instead of yielding a
@@ -8472,6 +8739,20 @@ class Agent:
                         # the exception propagates unchanged.
                         usage_unknown_reason = "provider_exception"
                         _notify_call_outcome(ok=False, failure_kind="raised")
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_provider_error",
+                                reason="goal_terminal",
+                                code="provider_exception",
+                            )
+                            yield TextDeltaEvent(text=response_text)
+                            break
                         raise
                     finally:
                         if usage_call is not None and not usage_call_terminal:
@@ -8546,7 +8827,11 @@ class Agent:
                         self._write_turn_call_log("llm_response", **response_payload)
 
                     # -- after async for (retry loop level) --
-                    terminal_error = _turn_budget_error()
+                    terminal_error = (
+                        None
+                        if goal_terminal_final_response_pending
+                        else _turn_budget_error()
+                    )
                     if terminal_error is not None:
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
@@ -8570,6 +8855,12 @@ class Agent:
                         if artifact_delivery_final_response_pending:
                             response_text = self._artifact_delivery_final_response_text(
                                 artifact_delivery_final_response_artifacts
+                            )
+                        elif goal_terminal_final_response_pending:
+                            response_text = (
+                                "The Goal is complete."
+                                if goal_terminal_final_status == "complete"
+                                else "The Goal is blocked."
                             )
                         elif max_iterations_finalization_pending:
                             response_text = (
@@ -8674,6 +8965,23 @@ class Agent:
                             output_tokens=iter_output_tokens,
                         )
                     if not _got_error and attempt_classification.kind != _ProviderAttemptKind.OK:
+                        if goal_terminal_final_response_pending:
+                            fallback_text = _goal_terminal_final_response_text()
+                            if fallback_text not in response_text:
+                                prefix = "\n\n" if response_text.strip() else ""
+                                appended_text = prefix + fallback_text
+                                assistant_text_parts.append(appended_text)
+                                yield TextDeltaEvent(text=appended_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_invalid_summary_response",
+                                reason="goal_terminal",
+                                code=attempt_classification.kind.value,
+                            )
+                            break
                         logger.warning(
                             "provider.invalid_response",
                             session_key=self._session_key,
@@ -9296,6 +9604,21 @@ class Agent:
                             status_code=provider_error_status_code,
                             raw_code=provider_error.code,
                         )
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_provider_error",
+                                reason="goal_terminal",
+                                code=goal_terminal_final_status or "goal_terminal",
+                                provider_error_code=provider_error.code,
+                            )
+                            yield TextDeltaEvent(text=response_text)
+                            break
                         message_limit_proof = provider_error.message_limit_proof
                         if message_limit_proof is not None:
                             proof_log = {
@@ -10391,6 +10714,7 @@ class Agent:
                             terminal_error = ErrorEvent(
                                 message=provider_error.message,
                                 code=provider_error.code,
+                                failure_kind=failure_kind.value,
                             )
                             yield terminal_error
                             break
@@ -10761,7 +11085,11 @@ class Agent:
 
                 # No tool calls → we're done
                 if not tool_calls:
-                    if _claim_pending_inputs_for_next_call():
+                    if goal_terminal_final_response_pending:
+                        goal_terminal_final_response_pending = False
+                        goal_terminal_final_status = None
+                        break
+                    if await _claim_pending_inputs_for_next_call():
                         # A plain response is also a safe same-turn boundary.
                         # Keep the assistant output already emitted above, then
                         # continue with the claimed steer in this turn.
@@ -12034,9 +12362,27 @@ class Agent:
                         # the same response (notably submit_plan) race past it.
                         if mutex_result is not None and (
                             mutex_result.terminates_turn
+                            or self._is_turn_yield_result(mutex_result)
                             or tc.tool_name == "request_user_input"
                             or _pending_approval_payload(mutex_result.content) is not None
                         ):
+                            dispatch_boundary = mutex_result
+                        if (
+                            mutex_result is not None
+                            and tc.tool_name == "update_goal"
+                            and is_goal_owned_main_default_turn(
+                                self._tool_context or current_tool_context.get()
+                            )
+                            and self._accepted_goal_terminal_status(
+                                [tc],
+                                [mutex_result],
+                            )
+                            is not None
+                        ):
+                            # A durable Goal terminal decision owns the rest of
+                            # this provider batch. Pair every later tool call
+                            # with a not-executed result, then perform exactly
+                            # one tool-free final-summary model call.
                             dispatch_boundary = mutex_result
                         if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
                             plan_run_delivery_only = True
@@ -12312,10 +12658,23 @@ class Agent:
                 terminal_artifacts = self._terminal_artifact_delivery_artifacts(executed_results)
                 if terminal_artifacts:
                     artifact_delivery_final_response_artifacts = terminal_artifacts
+                accepted_goal_terminal_status = (
+                    self._accepted_goal_terminal_status(tool_calls, executed_results)
+                    if is_goal_owned_main_default_turn(
+                        self._tool_context or current_tool_context.get()
+                    )
+                    else None
+                )
 
-                turn_tool_errors += sum(1 for result in executed_results if result.is_error)
+                actual_tool_errors = [
+                    result
+                    for result in executed_results
+                    if result.is_error
+                    and not self._is_not_executed_after_dispatch_boundary(result)
+                ]
+                turn_tool_errors += len(actual_tool_errors)
                 first_tool_error = next(
-                    (result for result in executed_results if result.is_error),
+                    iter(actual_tool_errors),
                     None,
                 )
                 workspace_write_count = len(self._effective_workspace_write_records())
@@ -12491,7 +12850,10 @@ class Agent:
                         runtime_diagnostic_events.append(runtime_event)
                         append_runtime_event(self.config.runtime_events_path, runtime_event)
                 post_write_convergence_guidance: str | None = None
-                if post_write_convergence_tracker is not None:
+                if (
+                    accepted_goal_terminal_status is None
+                    and post_write_convergence_tracker is not None
+                ):
                     continued_activity_after_verification = bool(
                         (
                             focused_verification_success_before_results
@@ -12588,7 +12950,11 @@ class Agent:
                             )
                 progress_watchdog_guidance: str | None = None
                 watchdog_decision = None
-                if progress_watchdog_mode != "off" and post_write_convergence_guidance is None:
+                if (
+                    accepted_goal_terminal_status is None
+                    and progress_watchdog_mode != "off"
+                    and post_write_convergence_guidance is None
+                ):
                     watchdog_decision = progress_watchdog.observe(
                         ProgressObservation(
                             iteration=iterations,
@@ -12690,7 +13056,10 @@ class Agent:
                             code="progress_watchdog_blocked",
                         )
                 source_loop_recovery_guidance: str | None = None
-                if progress_watchdog_guidance is None:
+                if (
+                    accepted_goal_terminal_status is None
+                    and progress_watchdog_guidance is None
+                ):
                     source_loop_recovery = source_loop_recovery_decision(
                         global_mode=runtime_recovery_mode,
                         diagnostic_events=runtime_diagnostic_events,
@@ -12738,7 +13107,11 @@ class Agent:
                                     "asking the model to reassess the current patch once."
                                 ),
                             )
-                budget_error = _turn_budget_error()
+                budget_error = (
+                    None
+                    if accepted_goal_terminal_status is not None
+                    else _turn_budget_error()
+                )
                 if terminal_error is None:
                     terminal_error = budget_error
                 if terminal_error is not None:
@@ -12753,7 +13126,9 @@ class Agent:
                         yield terminal_error
                     break
 
-                if any(_is_threshold_denial(result) for result in executed_results):
+                if accepted_goal_terminal_status is None and any(
+                    _is_threshold_denial(result) for result in executed_results
+                ):
                     yield self._transition(AgentState.ERROR)
                     terminal_error = ErrorEvent(
                         message=(
@@ -12766,7 +13141,10 @@ class Agent:
                     break
 
                 # Per-iteration deadline check after tool execution
-                if _loop.time() > tool_deadline:
+                if (
+                    accepted_goal_terminal_status is None
+                    and _loop.time() > tool_deadline
+                ):
                     yield self._transition(AgentState.ERROR)
                     terminal_error = ErrorEvent(
                         message=(
@@ -12782,7 +13160,18 @@ class Agent:
                 turn_messages.append(
                     Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
                 )
-                _claim_pending_inputs_for_next_call()
+                if accepted_goal_terminal_status is not None:
+                    last_executed_results = list(executed_results)
+                    if turn_yielded:
+                        break
+                    workspace_edit_gate_details = None
+                    workspace_edit_gate_recovery_read_paths.clear()
+                    workspace_edit_gate_recovery_reads_remaining = 0
+                    goal_terminal_final_response_pending = True
+                    goal_terminal_final_status = accepted_goal_terminal_status
+                    yield self._transition(AgentState.THINKING)
+                    continue
+                await _claim_pending_inputs_for_next_call()
                 if progress_watchdog_guidance is not None:
                     turn_messages.append(Message(role="user", content=progress_watchdog_guidance))
                 if (
@@ -12970,11 +13359,13 @@ class Agent:
                         iteration=iterations,
                         tool_use_ids=sorted(preflight_tool_results),
                     )
-                if terminal_artifacts:
-                    _finish_artifact_delivery_without_provider()
-                    break
                 last_executed_results = list(executed_results)
                 if turn_yielded:
+                    break
+                if terminal_artifacts and not is_goal_owned_main_default_turn(
+                    self._tool_context or current_tool_context.get()
+                ):
+                    _finish_artifact_delivery_without_provider()
                     break
 
                 # ------ TOOL_CALLING → THINKING ------
@@ -16591,6 +16982,30 @@ class Agent:
         return Message(role="user", content="\n".join(lines))
 
     @staticmethod
+    def _goal_objective_message(
+        objective_snapshot: str | None,
+        *,
+        enabled: bool = True,
+        max_chars: int = _TURN_OBJECTIVE_REMINDER_MAX_CHARS,
+    ) -> Message | None:
+        """Build a request-only reminder for an adopted durable Goal edit."""
+
+        if not enabled:
+            return None
+        if not objective_snapshot or not objective_snapshot.strip():
+            return None
+        objective = objective_snapshot.strip()
+        if len(objective) > max_chars:
+            objective = objective[:max_chars].rstrip() + "..."
+        lines = [
+            "[Current Goal objective reminder]",
+            "This is the active durable Goal objective for this task, not a new user request.",
+            "Continue using the tool results above to make progress on:",
+            objective,
+        ]
+        return Message(role="user", content="\n".join(lines))
+
+    @staticmethod
     def _with_request_context_messages(
         messages: list[Message],
         request_context_message: Message | None,
@@ -16697,6 +17112,53 @@ class Agent:
         if not isinstance(payload, dict):
             return False
         return payload.get("status") == "yielded"
+
+    @staticmethod
+    def _is_not_executed_after_dispatch_boundary(result: ToolResult) -> bool:
+        """Return whether an error-shaped result represents an undispatched tail."""
+
+        if not result.is_error:
+            return False
+        try:
+            payload = json.loads(result.content)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(payload, Mapping)
+            and payload.get("status") == "not_executed"
+            and payload.get("reason") == "prior_tool_dispatch_boundary"
+        )
+
+    @staticmethod
+    def _accepted_goal_terminal_status(
+        tool_calls: list[ToolCall],
+        results: list[ToolResult],
+    ) -> str | None:
+        """Return the durably accepted Goal terminal status from one tool batch."""
+
+        for tool_call, result in zip(tool_calls, results, strict=False):
+            if (
+                tool_call.tool_name != "update_goal"
+                or result.tool_name != "update_goal"
+                or result.is_error
+            ):
+                continue
+            requested_status = str(tool_call.arguments.get("status") or "").strip().lower()
+            if requested_status not in {"complete", "blocked"}:
+                continue
+            try:
+                payload = json.loads(result.content)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, Mapping) or payload.get("status") != "accepted":
+                continue
+            goal = payload.get("goal")
+            if not isinstance(goal, Mapping):
+                continue
+            persisted_status = str(goal.get("status") or "").strip().lower()
+            if persisted_status == requested_status:
+                return requested_status
+        return None
 
     @staticmethod
     def _terminal_artifact_delivery_artifacts(

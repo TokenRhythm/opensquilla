@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import contextvars
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -178,6 +178,16 @@ class ToolContext:
     # run. Runtime-only prompt input; checkpoint tools continue to read live
     # storage for compare-and-set transitions.
     plan_run: Any | None = field(default=None, repr=False)
+    # Dormant compatibility surface for callers built against the earlier
+    # Goal-aware PlanRun runtime. The session Goal path no longer populates it,
+    # but retaining its positional slot avoids shifting embedded callers.
+    goal_run: Any | None = field(default=None, repr=False)
+    # Immutable generation-fenced Goal context captured for this exact task.
+    # It is runtime-only authority and never reconstructed from a current row.
+    goal_context: Any | None = field(default=None, repr=False)
+    # Process-local Goal coordinator used only by Goal-owned main-agent turns.
+    # The service is never serialized into task details or route metadata.
+    goal_service: Any | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.validate_path_roots()
@@ -199,6 +209,29 @@ class ToolContext:
             "scratch_dir must not equal or contain workspace_dir; use a disjoint "
             "scratch root or a dedicated scratch subdirectory inside the workspace"
         )
+
+
+def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
+    """Return whether ``ctx`` carries authority for a top-level Goal turn.
+
+    ``main`` describes the execution role here, not the configured agent ID.
+    Named top-level agents own ordinary sessions too; caller provenance and
+    subagent depth are the authority boundary.
+    """
+
+    return bool(
+        ctx is not None
+        and isinstance(getattr(ctx, "goal_context", None), Mapping)
+        and str(getattr(ctx, "collaboration_mode", "default")) == "default"
+        and ctx.caller_kind
+        in {
+            CallerKind.AGENT,
+            CallerKind.CHANNEL,
+            CallerKind.CLI,
+            CallerKind.WEB,
+        }
+        and int(getattr(ctx, "subagent_depth", 0) or 0) == 0
+    )
 
 
 # Request-scoped context — set by build_tool_handler before each dispatch.

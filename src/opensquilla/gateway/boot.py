@@ -310,10 +310,12 @@ class TaskRuntimeStreamError(RuntimeError):
         *,
         code: str | None = None,
         terminal_reason: str | None = None,
+        failure_kind: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.terminal_reason = terminal_reason
+        self.failure_kind = failure_kind
 
 
 # fmt: off
@@ -680,6 +682,7 @@ class ServiceContainer:
     router_calibration_service: Any = None
     provider_stats: Any = None  # ProviderStatsStore | None (rolling call latency samples)
     task_runtime: Any = None
+    goal_service: Any = None
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
     prompt_cache_keepalive_service: Any = None
@@ -837,6 +840,12 @@ class ServiceContainer:
                     await store.close()
                 except Exception:
                     pass
+        if self.goal_service is not None:
+            try:
+                await self.goal_service.close()
+            except Exception:
+                log.debug("gateway.goal_service_close_failed", exc_info=True)
+            self.goal_service = None
         if self.task_runtime is not None:
             try:
                 await self.task_runtime.shutdown()
@@ -1269,6 +1278,7 @@ async def dispatch_task_runtime_turn(
     """
     from opensquilla.gateway.project_workspace_runtime import (
         apply_accepted_run_mode_override,
+        apply_run_context_route_metadata,
         authoritative_project_run_context,
         map_project_workspace_error,
     )
@@ -1306,15 +1316,11 @@ async def dispatch_task_runtime_turn(
                 },
             )
             raise
-        from opensquilla.gateway.rpc_sessions import (
-            _apply_run_context_route_metadata,
-        )
-
         run_context = apply_accepted_run_mode_override(
             run_context,
             getattr(run, "accepted_run_mode_override", None),
         )
-        _apply_run_context_route_metadata(
+        apply_run_context_route_metadata(
             run.envelope,
             run_context,
             principal_is_owner=_task_runtime_envelope_owner(run.envelope),
@@ -1379,13 +1385,18 @@ async def dispatch_task_runtime_turn(
                 client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
                 user_message_id=getattr(run, "persisted_user_message_id", None),
                 surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
+                input_mode=getattr(run, "input_mode", "user"),
+                run_kind=getattr(run, "run_kind", None),
             )
     except TaskRuntimeStreamError as exc:
         if exc.code in {
             "provider_request_budget_exhausted",
             "provider_request_too_large",
             "current_turn_context_exhausted",
-        }:
+        } and (
+            str(getattr(run.envelope, "metadata", {}).get("turn_context_intent") or "")
+            != "goal_set"
+        ):
             rollback_reason = exc.code
             remove_message = getattr(session_manager, "remove_message", None)
             raw_message_ids = getattr(run, "persisted_user_message_ids", ())
@@ -1500,6 +1511,11 @@ def build_task_runtime_run_kwargs(
         "input_provenance": run.input_provenance,
         "run_kind": run.run_kind,
         "no_memory_capture": run.no_memory_capture,
+        "input_mode": getattr(run, "input_mode", "user"),
+        "persist_input": bool(getattr(run, "persist_input", False)),
+        "history_has_persisted_user": bool(
+            getattr(run, "history_has_persisted_user", True)
+        ),
         "fresh_user_session": bool(getattr(run, "fresh_user_session", False)),
         "ingress_pipeline_steps": ingress_steps,
         "pending_input_provider": getattr(run, "pending_input_provider", None),
@@ -1655,6 +1671,8 @@ async def _emit_task_runtime_stream_events(
     client_message_id: str | None = None,
     user_message_id: str | None = None,
     surface_id: str | None = None,
+    input_mode: str | None = None,
+    run_kind: str | None = None,
 ) -> None:
     """Emit turn events and fail the task if the stream reports an error.
 
@@ -1669,6 +1687,7 @@ async def _emit_task_runtime_stream_events(
 
     error_message: str | None = None
     error_code: str | None = None
+    failure_kind: str | None = None
     terminal_reason: str | None = None
     async for event in wrap_stream(
         raw_stream,
@@ -1706,6 +1725,12 @@ async def _emit_task_runtime_stream_events(
             )
             code = event_dict.get("code")
             error_code = str(code) if code else None
+            # Keep the normalized provider classification internal to the
+            # durable task outcome; it is not part of the public stream event.
+            raw_failure_kind = event_dict.pop("failure_kind", None)
+            failure_kind = (
+                str(raw_failure_kind) if isinstance(raw_failure_kind, str) else None
+            )
             code_text = str(code or "").lower()
             is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
             is_output_truncated = code_text == "provider_output_truncated"
@@ -1749,6 +1774,10 @@ async def _emit_task_runtime_stream_events(
             event_dict["user_message_id"] = user_message_id
         if surface_id:
             event_dict["surface_id"] = surface_id
+        if input_mode:
+            event_dict["input_mode"] = input_mode
+        if run_kind:
+            event_dict["run_kind"] = run_kind
         await event_emitter(
             session_key,
             f"session.event.{event_kind}",
@@ -1762,6 +1791,7 @@ async def _emit_task_runtime_stream_events(
             error_message,
             code=error_code,
             terminal_reason=terminal_reason,
+            failure_kind=failure_kind,
         )
 
 
@@ -1988,6 +2018,16 @@ class GatewayServer:
             # task_runtime.shutdown() waits for all running turns to complete before
             # returning; only then do we stop channel delivery.
             drain_budget = gateway_graceful_timeout()
+            goal_service = (
+                getattr(self._services, "goal_service", None)
+                if self._services is not None
+                else None
+            )
+            if goal_service is not None:
+                try:
+                    await goal_service.prepare_shutdown()
+                except Exception:
+                    log.debug("gateway.goal_service_shutdown_failed", exc_info=True)
             if self._services is not None and self._services.task_runtime is not None:
                 try:
                     await self._services.task_runtime.shutdown(
@@ -2629,7 +2669,13 @@ async def build_services(
         if storage_db_path != ":memory:" and "://" not in storage_db_path:
             os.makedirs(os.path.dirname(storage_db_path) or os.curdir, mode=0o700, exist_ok=True)
         storage = SessionStorage(storage_db_path)
-        await storage.connect()
+        await storage.connect(
+            goal_pause_reason=(
+                "process_restart"
+                if config.goal.execution_enabled
+                else "feature_disabled"
+            )
+        )
         log.info(
             "build_services.session_storage_ready",
             duration_ms=_elapsed_monotonic_ms(session_storage_started_at),
@@ -3859,15 +3905,16 @@ async def start_gateway_server(
             event_emitter=runtime_event_bridge.emit,
         )
 
+    session_lifecycle_listener = _make_task_session_lifecycle_listener(
+        session_manager=svc.session_manager,
+        event_emitter=runtime_event_bridge.emit,
+    )
     task_runtime = TaskRuntime(
         storage=get_session_storage(svc.session_manager) or svc.session_manager,
         turn_handler=_task_runtime_turn_handler,
         event_emitter=runtime_event_bridge.emit,
         terminal_listener=_subagent_completion_listener,
-        lifecycle_listener=_make_task_session_lifecycle_listener(
-            session_manager=svc.session_manager,
-            event_emitter=runtime_event_bridge.emit,
-        ),
+        lifecycle_listener=session_lifecycle_listener,
         max_concurrency=_task_runtime_max_concurrency(config),
         max_pending_per_session=_task_runtime_max_pending_per_session(config),
         subagent_reserved_slots=int(
@@ -3878,6 +3925,48 @@ async def start_gateway_server(
         pending_overflow_policy=getattr(
             config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),
+    )
+    from opensquilla.gateway.goal_service import GoalService
+
+    goal_service = GoalService(
+        storage=get_session_storage(svc.session_manager) or svc.session_manager,
+        session_manager=svc.session_manager,
+        task_runtime=task_runtime,
+        event_emitter=runtime_event_bridge.emit,
+        subscription_manager=subscription_manager,
+        # Keep the live root object: config.set/reload replace ``config.goal``
+        # in place, and the Goal kill switch must observe that replacement.
+        config=config,
+    )
+
+    async def _ordered_task_lifecycle(event: TaskLifecycleEvent) -> None:
+        # Session projection remains first. Goal settlement is independently
+        # isolated so one observer cannot suppress the other.
+        try:
+            await session_lifecycle_listener(event)
+        except Exception:
+            log.warning(
+                "gateway.session_lifecycle_projection_failed",
+                session_key=event.session_key,
+                task_id=event.task_id,
+                exc_info=True,
+            )
+        try:
+            await goal_service.on_task_lifecycle(event)
+        except Exception:
+            log.warning(
+                "gateway.goal_lifecycle_settlement_failed",
+                session_key=event.session_key,
+                task_id=event.task_id,
+                exc_info=True,
+            )
+
+    task_runtime.set_lifecycle_listener(_ordered_task_lifecycle)
+    task_runtime.set_activation_listener(goal_service.on_task_activation)
+    task_runtime.set_idle_listener(goal_service.on_runtime_idle)
+    task_runtime.set_goal_service(goal_service)
+    subscription_manager.set_message_unsubscribe_listener(
+        goal_service.on_subscription_lost
     )
     # Wire task_runtime's short write-lock provider into turn_runner.
     turn_runner.set_session_lock_provider(task_runtime._get_session_lock_for_turn)
@@ -3902,6 +3991,7 @@ async def start_gateway_server(
     else:
         log.warning("gateway.prompt_cache_keepalive_recorder_unavailable")
     svc.prompt_cache_keepalive_service = prompt_cache_keepalive_service
+    svc.goal_service = goal_service
     # Wire the runtime into SessionManager so kill_session can cascade-cancel.
     attach_runtime = getattr(svc.session_manager, "attach_task_runtime", None)
     if callable(attach_runtime):

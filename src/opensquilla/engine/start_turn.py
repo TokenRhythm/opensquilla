@@ -28,6 +28,11 @@ def _turn_kwargs(
     mode: str | None,
     run_kind: str,
     no_memory_capture: bool,
+    input_mode: str,
+    persist_input: bool,
+    history_has_persisted_user: bool,
+    goal_context: dict[str, Any] | None,
+    goal_candidate: dict[str, Any] | None,
     semantic_message: str | None,
     persisted_user_message_id: str | None,
     fresh_user_session: bool | None,
@@ -43,6 +48,16 @@ def _turn_kwargs(
     }
     if no_memory_capture:
         kwargs["no_memory_capture"] = True
+    if input_mode != "user":
+        kwargs["input_mode"] = input_mode
+    if persist_input:
+        kwargs["persist_input"] = True
+    if not history_has_persisted_user:
+        kwargs["history_has_persisted_user"] = False
+    if goal_context is not None:
+        kwargs["goal_context"] = dict(goal_context)
+    if goal_candidate is not None:
+        kwargs["goal_candidate"] = dict(goal_candidate)
     if semantic_message is not None:
         kwargs["semantic_message"] = semantic_message
     if persisted_user_message_id is not None:
@@ -67,6 +82,11 @@ async def reserve_turn_via_runtime(
     mode: str | None = None,
     run_kind: str = "default",
     no_memory_capture: bool = False,
+    input_mode: str = "user",
+    persist_input: bool = False,
+    history_has_persisted_user: bool = True,
+    goal_context: dict[str, Any] | None = None,
+    goal_candidate: dict[str, Any] | None = None,
     semantic_message: str | None = None,
     persisted_user_message_id: str | None = None,
     fresh_user_session: bool | None = None,
@@ -75,6 +95,7 @@ async def reserve_turn_via_runtime(
     overflow_policy: Any = None,
     bypass_pending_limit: bool = False,
     accepted_run_mode_override: Any | None = None,
+    update_envelope_cache: bool = True,
 ) -> TaskReservation:
     """Reserve runtime admission while preserving shared ingress metadata."""
 
@@ -83,6 +104,11 @@ async def reserve_turn_via_runtime(
         mode=mode,
         run_kind=run_kind,
         no_memory_capture=no_memory_capture,
+        input_mode=input_mode,
+        persist_input=persist_input,
+        history_has_persisted_user=history_has_persisted_user,
+        goal_context=goal_context,
+        goal_candidate=goal_candidate,
         semantic_message=semantic_message,
         persisted_user_message_id=persisted_user_message_id,
         fresh_user_session=fresh_user_session,
@@ -95,6 +121,8 @@ async def reserve_turn_via_runtime(
     if bypass_pending_limit:
         # Only restart recovery of already-durable accepted work uses this.
         kwargs["bypass_pending_limit"] = True
+    if not update_envelope_cache:
+        kwargs["update_envelope_cache"] = False
     return await runtime.reserve(envelope, message, **kwargs)
 
 
@@ -107,6 +135,11 @@ async def start_turn_via_runtime(
     mode: str | None = None,
     run_kind: str = "default",
     no_memory_capture: bool = False,
+    input_mode: str = "user",
+    persist_input: bool = False,
+    history_has_persisted_user: bool = True,
+    goal_context: dict[str, Any] | None = None,
+    goal_candidate: dict[str, Any] | None = None,
     semantic_message: str | None = None,
     persisted_user_message_id: str | None = None,
     fresh_user_session: bool | None = None,
@@ -136,6 +169,11 @@ async def start_turn_via_runtime(
         mode=mode,
         run_kind=run_kind,
         no_memory_capture=no_memory_capture,
+        input_mode=input_mode,
+        persist_input=persist_input,
+        history_has_persisted_user=history_has_persisted_user,
+        goal_context=goal_context,
+        goal_candidate=goal_candidate,
         semantic_message=semantic_message,
         persisted_user_message_id=persisted_user_message_id,
         fresh_user_session=fresh_user_session,

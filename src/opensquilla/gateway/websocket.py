@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
@@ -733,6 +734,28 @@ class SubscriptionManager:
         self._session_subs: set[str] = set()  # conn_ids subscribed to session lifecycle
         self._message_subs: dict[str, set[str]] = {}  # session_key -> {conn_id}
         self._topic_subs: dict[str, set[str]] = {}  # topic -> {conn_id}
+        self._message_unsubscribe_listener: Any | None = None
+
+    def set_message_unsubscribe_listener(self, listener: Any | None) -> None:
+        """Install a process-local observer for lost message subscriptions."""
+
+        self._message_unsubscribe_listener = listener
+
+    def _notify_message_unsubscribed(self, conn_id: str, session_key: str) -> None:
+        listener = self._message_unsubscribe_listener
+        if listener is None:
+            return
+        try:
+            result = listener(conn_id, session_key)
+            if inspect.isawaitable(result):
+                asyncio.ensure_future(result)
+        except Exception:
+            log.warning(
+                "subscription.message_unsubscribe_listener_failed",
+                conn_id=conn_id,
+                session_key=session_key,
+                exc_info=True,
+            )
 
     # -- session-level (sessions.subscribe / sessions.unsubscribe) --
 
@@ -752,7 +775,12 @@ class SubscriptionManager:
 
     def unsubscribe_messages(self, conn_id: str, session_key: str) -> None:
         if session_key in self._message_subs:
+            removed = conn_id in self._message_subs[session_key]
             self._message_subs[session_key].discard(conn_id)
+            if not self._message_subs[session_key]:
+                del self._message_subs[session_key]
+            if removed:
+                self._notify_message_unsubscribed(conn_id, session_key)
 
     def get_message_subscribers(self, session_key: str) -> set[str]:
         return set(self._message_subs.get(session_key, set()))
@@ -774,8 +802,13 @@ class SubscriptionManager:
     def remove_connection(self, conn_id: str) -> None:
         """Clean up all subscriptions for a disconnected connection."""
         self._session_subs.discard(conn_id)
-        for subs in self._message_subs.values():
-            subs.discard(conn_id)
+        removed_message_sessions: list[str] = []
+        for session_key, subs in list(self._message_subs.items()):
+            if conn_id in subs:
+                subs.discard(conn_id)
+                removed_message_sessions.append(session_key)
+            if not subs:
+                del self._message_subs[session_key]
         empty_topics = []
         for topic, subs in self._topic_subs.items():
             subs.discard(conn_id)
@@ -783,6 +816,8 @@ class SubscriptionManager:
                 empty_topics.append(topic)
         for topic in empty_topics:
             del self._topic_subs[topic]
+        for session_key in removed_message_sessions:
+            self._notify_message_unsubscribed(conn_id, session_key)
 
 
 # Module-level registry shared across connections
