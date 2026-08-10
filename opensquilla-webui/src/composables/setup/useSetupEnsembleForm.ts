@@ -197,6 +197,9 @@ export interface EnsembleConfigSlice {
   candidates?: EnsembleCandidateConfig[]
   min_successful_proposers?: number
   all_failed_policy?: string
+  configured_all_failed_policy?: string
+  effective_all_failed_policy?: string
+  policy_deprecated?: boolean
   // Read-only in this form (no editor yet): consumed so effectiveFacts can
   // report an explicit operator override instead of the static default.
   proposer_timeout_seconds?: number
@@ -414,6 +417,8 @@ export function useSetupEnsembleForm() {
   const candidates = ref<EnsembleCandidateConfig[]>([])
   const minSuccessfulProposers = ref(DEFAULT_MIN_SUCCESSFUL_PROPOSERS)
   const allFailedPolicy = ref(DEFAULT_ALL_FAILED_POLICY)
+  const configuredAllFailedPolicy = ref(DEFAULT_ALL_FAILED_POLICY)
+  const policyDeprecated = ref(false)
   // Stored timeout values mirrored from config (read-only here — the panel
   // has no editor for them, but effectiveFacts must reflect explicit
   // operator overrides instead of always claiming the static defaults).
@@ -491,7 +496,16 @@ export function useSetupEnsembleForm() {
     minSuccessfulProposers.value = normalizeMinSuccessful(
       config.min_successful_proposers ?? DEFAULT_MIN_SUCCESSFUL_PROPOSERS,
     )
-    allFailedPolicy.value = normalizeAllFailedPolicy(config.all_failed_policy)
+    configuredAllFailedPolicy.value = normalizeAllFailedPolicy(
+      config.configured_all_failed_policy ?? config.all_failed_policy,
+    )
+    // `error` remains readable for upgrades but is no longer an effective UI
+    // strategy: every ensemble failure converges on the fixed fallback model.
+    allFailedPolicy.value = DEFAULT_ALL_FAILED_POLICY
+    policyDeprecated.value = (
+      config.policy_deprecated === true
+      || configuredAllFailedPolicy.value !== DEFAULT_ALL_FAILED_POLICY
+    )
     storedProposerTimeoutSeconds.value = normalizeStoredTimeoutSeconds(
       config.proposer_timeout_seconds,
     )
@@ -856,7 +870,10 @@ export function useSetupEnsembleForm() {
   }
 
   function setAllFailedPolicy(value: string) {
-    allFailedPolicy.value = normalizeAllFailedPolicy(value)
+    // Kept as a compatibility method for older parents. New UI has no policy
+    // selector and never restores the retired error behavior.
+    void value
+    allFailedPolicy.value = DEFAULT_ALL_FAILED_POLICY
   }
 
   // Partial by design: only user-changed keys are sent; the gateway keeps the
@@ -874,7 +891,10 @@ export function useSetupEnsembleForm() {
       role: normalizeCandidateRole(candidate.role),
     }))
     if (minSuccessfulDirty.value) params.minSuccessfulProposers = minSuccessfulProposers.value
-    if (allFailedPolicyDirty.value) params.allFailedPolicy = allFailedPolicy.value
+    if (
+      allFailedPolicyDirty.value
+      || (policyDeprecated.value && Object.keys(params).length > 0)
+    ) params.allFailedPolicy = DEFAULT_ALL_FAILED_POLICY
     return params
   }
 
@@ -1043,6 +1063,9 @@ export function useSetupEnsembleForm() {
         staticSelectionMode: providerStaticMode,
         minSuccessfulProposers: minSuccessfulProposers.value,
         allFailedPolicy: allFailedPolicy.value,
+        configuredAllFailedPolicy: configuredAllFailedPolicy.value,
+        effectiveAllFailedPolicy: DEFAULT_ALL_FAILED_POLICY,
+        policyDeprecated: policyDeprecated.value,
         showModelOptions: scheme !== 'preset',
         showCandidateEditor: scheme === 'custom' || scheme === 'legacy',
         showOpenrouterHint: false,
@@ -1062,6 +1085,8 @@ export function useSetupEnsembleForm() {
     candidates,
     minSuccessfulProposers,
     allFailedPolicy,
+    configuredAllFailedPolicy,
+    policyDeprecated,
     enabledDirty,
     selectionModeDirty,
     modelOptionsDirty,

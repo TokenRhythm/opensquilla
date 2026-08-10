@@ -21,6 +21,9 @@ export interface SetupTierValue {
   ensembleSelectionMode?: string
 }
 
+export type RouterTierProviderRole = 'direct' | 'dormant_draft' | 'dynamic_member' | 'blocked'
+export type RouterProviderRoles = Record<string, RouterTierProviderRole>
+
 export interface SetupTierRow extends SetupTierValue {
   name: string
 }
@@ -103,8 +106,56 @@ interface RouterConfig {
 
 export type RouterBinding = 'follow_primary' | 'custom' | 'legacy'
 
-function tierProviderIsDormant(name: string, tier: SetupTierValue): boolean {
-  return normalizeRouterTier(name) === 'c3' && tier.ensembleEnabled === true
+function normalizeRouterProviderRole(value: unknown): RouterTierProviderRole {
+  const raw = String(
+    value && typeof value === 'object'
+      ? (value as Record<string, unknown>).role || (value as Record<string, unknown>).providerRole
+      : value || '',
+  ).trim().toLowerCase()
+  if (raw === 'dormant_draft' || raw === 'dormant') return 'dormant_draft'
+  if (raw === 'dynamic_member' || raw === 'dynamic' || raw === 'plan_anchor') return 'dynamic_member'
+  if (raw === 'blocked') return 'blocked'
+  return 'direct'
+}
+
+export function normalizeRouterProviderRoles(value: unknown): RouterProviderRoles {
+  const out: RouterProviderRoles = {}
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (!entry || typeof entry !== 'object') continue
+      const row = entry as Record<string, unknown>
+      const name = normalizeRouterTier(String(row.tier || row.name || '')) || String(row.tier || row.name || '')
+      if (name) out[name] = normalizeRouterProviderRole(row.role || row.providerRole)
+    }
+    return out
+  }
+  if (!value || typeof value !== 'object') return out
+  for (const [name, role] of Object.entries(value as Record<string, unknown>)) {
+    const tier = normalizeRouterTier(name) || name
+    if (tier) out[tier] = normalizeRouterProviderRole(role)
+  }
+  return out
+}
+
+export function routerTierProviderRole(
+  name: string,
+  _tier: SetupTierValue,
+  roles: RouterProviderRoles,
+): RouterTierProviderRole {
+  // The Gateway owns the complete mode-aware role calculation, including the
+  // case where router_dynamic consumes every text tier as a lineup member.
+  // Older Gateways omit the additive map, so a missing entry intentionally
+  // remains the conservative execution dependency (`direct`).
+  return roles[normalizeRouterTier(name) || name] || 'direct'
+}
+
+export function routerTierProviderParticipates(
+  name: string,
+  tier: SetupTierValue,
+  roles: RouterProviderRoles,
+): boolean {
+  const role = routerTierProviderRole(name, tier, roles)
+  return role === 'direct' || role === 'dynamic_member'
 }
 
 interface RouterPanelContext {
@@ -130,6 +181,7 @@ export function useSetupRouterForm() {
   const savedBinding = ref<RouterBinding>('legacy')
   const crossProviderTiers = ref(false)
   const tierProviderMismatch = ref<'route' | 'veto'>('route')
+  const routerProviderRoles = ref<RouterProviderRoles>({})
   const mode = computed(() => routerMode.value)
   const defaultTier = computed(() => routerDefaultTier.value)
   const routerModeChoice = computed(() =>
@@ -143,10 +195,7 @@ export function useSetupRouterForm() {
   const tierProviderIds = computed(() => {
     const ids = new Set<string>()
     Object.entries(tierValues.value).forEach(([name, tier]) => {
-      // Shared C3 fusion is owned by the global ensemble plan. Its saved tier
-      // provider belongs only to the sleeping single-model draft, so it must
-      // not opt the active router into cross-provider execution or vetoes.
-      if (tierProviderIsDormant(name, tier)) return
+      if (!routerTierProviderParticipates(name, tier, routerProviderRoles.value)) return
       const provider = String(tier.provider || '').trim().toLowerCase()
       if (provider) ids.add(provider)
     })
@@ -184,10 +233,12 @@ export function useSetupRouterForm() {
     profileTiers: Record<string, TierConfig>,
     provider = '',
     statusBinding?: RouterBinding,
+    providerRoles?: unknown,
   ) {
     activeProvider.value = provider.toLowerCase()
     crossProviderTiers.value = router.cross_provider_tiers === true
     tierProviderMismatch.value = router.tier_provider_mismatch === 'veto' ? 'veto' : 'route'
+    routerProviderRoles.value = normalizeRouterProviderRoles(providerRoles)
     // Ownership is a server contract, not a shape inferred from tier_profile.
     // Missing ownership is an historical/older-Gateway config and must be
     // treated conservatively: editing it may explicitly adopt `custom`, but it
@@ -341,6 +392,7 @@ export function useSetupRouterForm() {
         discoveredModelsByProvider: context.discoveredModelsByProvider?.value ?? {},
         providerOptions: context.providerOptions?.value ?? [],
         providerCredentialStatus: context.providerCredentialStatus?.value ?? [],
+        routerProviderRoles: { ...routerProviderRoles.value },
       }
     })
   }
@@ -351,6 +403,7 @@ export function useSetupRouterForm() {
     visibleModeChoice,
     tierTemplateState,
     hasMixedTierProviders,
+    routerProviderRoles,
     routingDirty,
     visualModeDirty,
     isDirty,

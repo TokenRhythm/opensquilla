@@ -187,13 +187,15 @@ base_url = "https://tokenrhythm.studio/v1"
 # shared plan through squilla_router.tiers.c3.ensemble_enabled below. Keep this
 # global switch off when C0-C2 should remain single-model routes. Enabling it
 # applies the same plan to every request; C3 never stores a second plan.
-# C3 fusion disables the dedicated image_model route; another text tier with
-# supports_image=true can still handle image requests.
+# C3 fusion itself does not handle images. The dedicated image_model route stays
+# enabled and is preferred; another non-C3 tier with supports_image=true is used
+# only when the dedicated image route is unavailable.
 # The static_tokenrhythm_b5 profile is the TokenRhythm mirror of B5
 # (deepseek-v4-pro, glm-5.2, kimi-k2.7-code, qwen3.7-max + glm-5.2
 # aggregator). It needs a TokenRhythm credential: the [llm] api_key when
 # TokenRhythm is active, or TOKENRHYTHM_API_KEY in the environment. Without
-# one, C3 safely uses its configured GLM 5.2 fallback.
+# one, or whenever fusion cannot complete, requests use the fixed/direct
+# provider and model configured under [llm].
 #
 # The keys below are also writable at runtime via the Web UI / the
 # `onboarding.ensemble.configure` RPC; omitted keys keep their current
@@ -238,7 +240,10 @@ model_options = [
 # with their own quorum at runtime: 3-of-4 for the static profiles, N-1 for a
 # custom lineup of N proposers.
 min_successful_proposers = 1
-# When aggregation cannot proceed: "fallback_single" (single-provider turn) or "error".
+# When aggregation cannot proceed, the effective policy is always
+# "fallback_single": use the fixed/direct provider and model under [llm]. Legacy
+# "error" values remain loadable but are deprecated, behave as fallback_single,
+# and are normalized the next time the ensemble settings are saved.
 all_failed_policy = "fallback_single"
 
 # Advanced knobs — TOML-only (not on the configure RPC surface). Defaults:
@@ -445,7 +450,7 @@ supports_image = false
 [squilla_router.tiers.c3]
 provider = "tokenrhythm"
 model = "glm-5.2"
-description = "Highest tier: static TokenRhythm B5 multi-model fusion, with GLM 5.2 as the deterministic single-model fallback"
+description = "Highest tier: shared static TokenRhythm B5 fusion; this provider/model is retained for single-model C3 mode"
 supports_image = false
 ensemble_enabled = true
 

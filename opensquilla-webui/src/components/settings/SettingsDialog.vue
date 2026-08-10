@@ -157,7 +157,6 @@
               @import-ensemble-tier-candidates="importEnsembleTierCandidates"
               @migrate-ensemble-legacy="migrateEnsembleLegacy"
               @update-ensemble-min-successful="setEnsembleMinSuccessful"
-              @update-ensemble-all-failed-policy="setEnsembleAllFailedPolicy"
               @go-to-section="selectSection"
             />
             <SetupCapabilitiesPanel
@@ -303,7 +302,6 @@ const {
   migrateEnsembleLegacy,
   setEnsembleScheme,
   setEnsembleMinSuccessful,
-  setEnsembleAllFailedPolicy,
   applyProviderPreset,
   updateProviderField,
   updateLlmTimeout,

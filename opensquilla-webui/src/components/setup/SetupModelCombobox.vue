@@ -46,6 +46,10 @@ const props = defineProps<{
   // Optional semantic choice pinned above provider models. Router C3 uses it
   // for the shared multi-model plan while retaining free-text model entry.
   leadingOption?: LeadingOption
+  // Semantic pickers can keep search text local until the user explicitly
+  // chooses a catalog row (or the "use typed value" row). This prevents a
+  // search query from changing the saved processing mode while it is typed.
+  commitOnSelect?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -73,6 +77,7 @@ const listStyle = ref<Record<string, string>>({})
 // dropdown (focus / arrow keys) always shows every model, and the query filter
 // only kicks in once the user edits the text during this open.
 const typedSinceOpen = ref(false)
+const localInputValue = ref('')
 
 const fieldId = computed(() => `setup-provider-${String(props.field.name || 'model')}`)
 const fieldName = computed(() => `setup_provider_${String(props.field.name || 'model')}`)
@@ -82,11 +87,19 @@ const fieldTooltipId = computed(() => `${fieldId.value}-info-tooltip`)
 const leadingSelected = computed(() => Boolean(
   props.leadingOption && props.value === props.leadingOption.value,
 ))
-const inputDisplayValue = computed(() => (
+const committedDisplayValue = computed(() => (
   leadingSelected.value ? props.leadingOption?.label || '' : props.value
 ))
+const inputDisplayValue = computed(() => (
+  props.commitOnSelect ? localInputValue.value : committedDisplayValue.value
+))
+const typedValue = computed(() => (
+  props.commitOnSelect ? localInputValue.value : String(props.value || '')
+))
 const query = computed(() => (
-  leadingSelected.value ? '' : String(props.value || '').trim().toLowerCase()
+  leadingSelected.value && !(props.commitOnSelect && typedSinceOpen.value)
+    ? ''
+    : typedValue.value.trim().toLowerCase()
 ))
 const catalogAvailable = computed(() => (
   !props.disabled
@@ -112,6 +125,11 @@ const selectedId = computed(() => {
   return typed && props.models.some(model => model.id === typed) ? typed : ''
 })
 
+const typedExactId = computed(() => {
+  const typed = typedValue.value.trim()
+  return typed && props.models.some(model => model.id === typed) ? typed : ''
+})
+
 const matches = computed(() => {
   if (!query.value || !typedSinceOpen.value) {
     // Full-list mode: pin the current model first so it stays rendered and
@@ -131,10 +149,10 @@ const truncatedCount = computed(() => Math.max(0, matches.value.length - visible
 // The escape hatch: whatever was typed is always usable as-is. Shown whenever
 // there is typed text that is not an exact discovered id.
 const showFreeTextRow = computed(() => {
-  if (leadingSelected.value) return false
-  const typed = String(props.value || '').trim()
+  if (leadingSelected.value && !(props.commitOnSelect && typedSinceOpen.value)) return false
+  const typed = typedValue.value.trim()
   if (!typed) return false
-  return !selectedId.value
+  return !typedExactId.value
 })
 
 const leadingOptionCount = computed(() => props.leadingOption ? 1 : 0)
@@ -250,7 +268,9 @@ function scrollActiveOptionIntoView() {
 }
 
 function onInput(event: Event) {
-  emit('update', (event.target as HTMLInputElement).value)
+  const value = (event.target as HTMLInputElement).value
+  if (props.commitOnSelect && catalogAvailable.value) localInputValue.value = value
+  else emit('update', value)
   if (!catalogAvailable.value) return
   open.value = true
   typedSinceOpen.value = true
@@ -261,6 +281,7 @@ function onInput(event: Event) {
 // text edit must go through it so the filter never leaks across opens.
 function openList() {
   if (!catalogAvailable.value) return
+  if (props.commitOnSelect) localInputValue.value = committedDisplayValue.value
   open.value = true
   typedSinceOpen.value = false
   activeIndex.value = -1
@@ -279,35 +300,57 @@ function onClick() {
 function toggleList() {
   if (!catalogAvailable.value) return
   if (open.value) {
-    close()
+    close(true)
     return
   }
   openList()
   inputEl.value?.focus()
 }
 
-function close() {
+function close(restoreCommitted = true) {
   open.value = false
   typedSinceOpen.value = false
   activeIndex.value = -1
+  if (props.commitOnSelect && restoreCommitted) {
+    localInputValue.value = committedDisplayValue.value
+  }
 }
 
 watch(catalogAvailable, available => {
-  if (!available) close()
+  if (!available) close(true)
 })
 
-function selectModel(id: string) {
+watch(committedDisplayValue, value => {
+  // Parent updates following an explicit selection become the next committed
+  // display. Do not overwrite an in-progress local search query.
+  if (!open.value || !typedSinceOpen.value) localInputValue.value = value
+}, { immediate: true })
+
+function selectModel(id: string, displayValue = id) {
+  if (props.commitOnSelect) localInputValue.value = displayValue
   emit('update', id)
-  close()
+  close(false)
+}
+
+function selectTypedValue() {
+  if (!props.commitOnSelect) {
+    close()
+    return
+  }
+  const value = localInputValue.value.trim()
+  if (!value) return
+  selectModel(value)
 }
 
 function selectAt(index: number) {
   if (index < 0 || index >= optionCount.value) return
-  if (props.leadingOption && index === 0) selectModel(props.leadingOption.value)
+  if (props.leadingOption && index === 0) {
+    selectModel(props.leadingOption.value, props.leadingOption.label)
+  }
   else if (index - leadingOptionCount.value < visibleModels.value.length) {
     selectModel(visibleModels.value[index - leadingOptionCount.value].id)
   }
-  else close() // free-text row: the typed value is already the field value
+  else selectTypedValue()
 }
 
 // Anchor the teleported listbox to the input: below by default, flipped above
@@ -362,7 +405,7 @@ function onKeydown(event: KeyboardEvent) {
     if (open.value) {
       event.preventDefault()
       event.stopPropagation()
-      close()
+      close(true)
     }
     return
   }
@@ -450,7 +493,7 @@ function onKeydown(event: KeyboardEvent) {
         @input="onInput"
         @focus="openList"
         @click="onClick"
-        @blur="close"
+        @blur="close(true)"
         @keydown="onKeydown"
       >
       <span v-if="catalogAvailable" :id="`${fieldId}-catalog-count`" class="setup-model-combobox__sr-only">
@@ -505,7 +548,7 @@ function onKeydown(event: KeyboardEvent) {
               role="option"
               :aria-selected="leadingSelected ? 'true' : 'false'"
               @mousedown.prevent
-              @click="selectModel(leadingOption.value)"
+              @click="selectModel(leadingOption.value, leadingOption.label)"
             >
               <span class="setup-model-combobox__identity">
                 <span class="setup-model-combobox__id">{{ leadingOption.label }}</span>
@@ -594,9 +637,9 @@ function onKeydown(event: KeyboardEvent) {
               role="option"
               aria-selected="false"
               @mousedown.prevent
-              @click="close()"
+              @click="selectTypedValue"
             >
-              <span class="setup-model-combobox__id" :title="String(value || '').trim()">{{ t('setup.provider.modelUseTyped', { value: String(value || '').trim() }) }}</span>
+              <span class="setup-model-combobox__id" :title="typedValue.trim()">{{ t('setup.provider.modelUseTyped', { value: typedValue.trim() }) }}</span>
             </button>
           </div>
           <div v-if="!leadingOption && !visibleModels.length && !showFreeTextRow" class="setup-model-combobox__footer">

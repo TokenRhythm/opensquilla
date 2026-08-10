@@ -378,10 +378,45 @@ describe('SetupModelStrategyPanel', () => {
     expect(summary).toContain('Fixed and fallback model: DeepSeek · deepseek-chat')
     expect(summary).not.toContain('sleeping-c3-model')
     expect(el.textContent).toContain('Determined by Multi-model fusion')
+    expect(el.textContent).toContain('Current fusion plan needs attention')
     app.unmount()
   })
 
-  it('describes shared C3 fusion as error-only when fallback is disabled', async () => {
+  it('shows a compact ready state for a healthy shared C3 plan', async () => {
+    const readyCandidate = {
+      key: 'custom:proposer:openrouter:ready-model',
+      provider: 'openrouter',
+      model: 'ready-model',
+      source: 'custom',
+      enabled: true,
+      role: '',
+      credential: { provider: 'openrouter', available: true, source: 'env' },
+    }
+    const { app, el } = await mountPanel({
+      router: {
+        tierRows: [{
+          name: 'c3',
+          provider: 'openrouter',
+          model: 'sleeping-c3-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        custom: customLineup({
+          proposers: [readyCandidate, { ...readyCandidate, key: 'custom:proposer:openrouter:ready-model-2', model: 'ready-model-2' }],
+          proposerCount: 2,
+          belowMinimum: false,
+        }),
+      },
+    })
+
+    expect(el.textContent).toContain('Current fusion plan is ready')
+    app.unmount()
+  })
+
+  it('uses the fixed fallback for shared C3 even when a retired error policy is loaded', async () => {
     const { app, el } = await mountPanel({
       router: {
         tierRows: [{
@@ -397,8 +432,8 @@ describe('SetupModelStrategyPanel', () => {
     })
 
     const summary = el.querySelector('.setup-tier-table__model-note')?.textContent || ''
-    expect(summary).toContain('returns an error if fusion cannot complete')
-    expect(summary).not.toContain('uses the Fixed and fallback model')
+    expect(summary).toContain('uses the Fixed and fallback model')
+    expect(summary).not.toContain('returns an error')
     app.unmount()
   })
 
@@ -983,15 +1018,14 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('updates the success threshold and failure policy from runtime strategy', async () => {
+  it('updates the success threshold and shows the fixed fallback as read-only', async () => {
     const onUpdateEnsembleMinSuccessful = vi.fn()
-    const onUpdateEnsembleAllFailedPolicy = vi.fn()
     const { app, el } = await mountPanel(
       {
         activeStrategy: 'ensemble',
         ensemble: { enabled: true, scheme: 'custom' },
       },
-      { onUpdateEnsembleMinSuccessful, onUpdateEnsembleAllFailedPolicy },
+      { onUpdateEnsembleMinSuccessful },
     )
 
     const runtime = el.querySelector<HTMLDetailsElement>('[data-testid="ensemble-runtime-strategy"]')!
@@ -1010,18 +1044,16 @@ describe('SetupModelStrategyPanel', () => {
     await nextTick()
     expect(onUpdateEnsembleMinSuccessful).toHaveBeenCalledWith(2)
 
-    const failure = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_all_failed_policy"]')
-    expect(failure?.closest('label')?.textContent)
+    expect(el.querySelector('select[name="setup_model_strategy_all_failed_policy"]')).toBeNull()
+    const fallback = el.querySelector<HTMLElement>('[data-testid="ensemble-fixed-fallback"]')
+    expect(fallback?.closest('label')?.textContent)
       .toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
-    failure!.value = 'error'
-    failure!.dispatchEvent(new Event('change', { bubbles: true }))
-    await nextTick()
-    expect(onUpdateEnsembleAllFailedPolicy).toHaveBeenCalledWith('error')
+    expect(fallback?.textContent).toContain('OpenRouter · deepseek/deepseek-v4-pro')
 
     app.unmount()
   })
 
-  it('does not describe a fallback target when ensemble failure policy returns errors', async () => {
+  it('reads a retired error policy as the fixed fallback contract', async () => {
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
       ensemble: {
@@ -1031,12 +1063,10 @@ describe('SetupModelStrategyPanel', () => {
       },
     })
 
-    const failure = el.querySelector<HTMLSelectElement>(
-      'select[name="setup_model_strategy_all_failed_policy"]',
-    )
-    const copy = failure?.closest('label')?.textContent || ''
-    expect(copy).toContain('return an error without using a fallback model')
-    expect(copy).not.toContain('Fixed and fallback model:')
+    expect(el.querySelector('select[name="setup_model_strategy_all_failed_policy"]')).toBeNull()
+    const copy = el.querySelector('[data-testid="ensemble-fixed-fallback"]')?.closest('label')?.textContent || ''
+    expect(copy).toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
+    expect(copy).not.toContain('return an error')
     app.unmount()
   })
 
@@ -1217,6 +1247,9 @@ describe('SetupModelStrategyPanel', () => {
 
     const banner = el.querySelector('[data-testid="ensemble-legacy-banner"]')
     expect(banner).toBeTruthy()
+    expect(banner?.textContent).toContain('follows the saved model tiers')
+    expect(banner?.textContent).toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
+    expect(banner?.textContent).not.toContain('router_dynamic')
     // Legacy dynamic selection has different runtime semantics, so it stays
     // read-only until the user explicitly migrates to a custom lineup.
     expect(el.querySelector('[data-testid="ensemble-scheme-preset"]')).toBeNull()

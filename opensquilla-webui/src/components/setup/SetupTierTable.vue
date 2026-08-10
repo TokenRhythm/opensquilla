@@ -38,14 +38,13 @@ const props = withDefaults(defineProps<{
   // previews omit it and receive generic, still truthful shared-plan copy.
   fixedFallbackProvider?: string
   fixedFallbackModel?: string
-  ensembleAllFailedPolicy?: string
+  ensemblePlanStatus?: 'ready' | 'attention'
 }>(), {
   disabled: false,
   readonly: false,
   modelsByProvider: () => ({}),
   providerOptions: () => [],
   providerCredentialStatus: () => [],
-  ensembleAllFailedPolicy: 'fallback_single',
 })
 
 const emit = defineEmits<{
@@ -134,24 +133,19 @@ function providerManagedByEnsemble(row: SetupTierRow): boolean {
   return row.name === 'c3' && row.ensembleEnabled === true
 }
 
-const c3EnsembleActive = computed(() => props.rows.some(row => (
-  row.name === 'c3' && tierEnsembleActive(row)
-)))
-
 function rowFieldsDisabled(row: SetupTierRow): boolean {
   // The saved C3 provider/model are only the sleeping single-model draft while
   // shared fusion is selected. An unavailable draft provider must not trap the
   // user in fusion or make the active shared plan appear unavailable.
   if (providerManagedByEnsemble(row)) return props.disabled
   return dependentFieldsDisabled(row)
-    || (row.name === 'image_model' && c3EnsembleActive.value)
 }
 
-function providerFieldDisabled(row: SetupTierRow): boolean {
+function providerFieldDisabled(): boolean {
   // An invalid/retired saved provider disables its dependent fields, not the
-  // remediation control itself. Only a globally locked table or the dormant
-  // image row under shared C3 fusion disables provider selection completely.
-  return props.disabled || (row.name === 'image_model' && c3EnsembleActive.value)
+  // remediation control itself. C3 fusion only disables C3's own image input;
+  // the dedicated image route remains an independent editable capability.
+  return props.disabled
 }
 
 function imageSwitchDisabled(row: SetupTierRow): boolean {
@@ -160,7 +154,6 @@ function imageSwitchDisabled(row: SetupTierRow): boolean {
 
 function displayedImageSupport(row: SetupTierRow): boolean {
   if (row.name === 'c3' && tierEnsembleActive(row)) return false
-  if (row.name === 'image_model' && c3EnsembleActive.value) return false
   return row.supportsImage
 }
 
@@ -178,8 +171,10 @@ function ensembleSummaryId(row: SetupTierRow): string {
   return `setup-tier-${row.name}-ensemble-summary`
 }
 
-function ensembleReturnsError(): boolean {
-  return String(props.ensembleAllFailedPolicy || '').trim().toLowerCase() === 'error'
+function ensemblePlanStatusLabel(): string {
+  return props.ensemblePlanStatus === 'attention'
+    ? t('setup.router.tierEnsemblePlanAttention')
+    : t('setup.router.tierEnsemblePlanReady')
 }
 
 const fallbackContextProvided = computed(() => (
@@ -193,14 +188,17 @@ const hasExactFallbackTarget = computed(() => Boolean(
 
 function ensembleSummary(row: SetupTierRow): string {
   if (legacyTierEnsembleActive(row)) {
-    return t(
-      ensembleReturnsError()
-        ? 'setup.router.tierLegacyEnsembleErrorSummary'
-        : 'setup.router.tierLegacyEnsembleSummary',
-      { model: row.model || '-' },
-    )
+    if (hasExactFallbackTarget.value) {
+      return t('setup.router.tierLegacyEnsembleSummary', {
+        provider: String(props.fixedFallbackProvider || '').trim(),
+        model: String(props.fixedFallbackModel || '').trim(),
+      })
+    }
+    if (fallbackContextProvided.value) {
+      return t('setup.router.tierLegacyEnsembleFallbackMissingSummary')
+    }
+    return t('setup.router.tierLegacyEnsembleSummaryGeneric')
   }
-  if (ensembleReturnsError()) return t('setup.router.tierEnsembleErrorSummary')
   if (hasExactFallbackTarget.value) {
     return t('setup.router.tierEnsembleSummary', {
       provider: String(props.fixedFallbackProvider || '').trim(),
@@ -276,9 +274,9 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
       v-for="tier in rows"
       :key="tier.name"
       class="setup-tier-table__row"
-      :class="{ 'is-disabled': providerFieldDisabled(tier) }"
+      :class="{ 'is-disabled': providerFieldDisabled() }"
       role="row"
-      :aria-disabled="providerFieldDisabled(tier) ? 'true' : undefined"
+      :aria-disabled="providerFieldDisabled() ? 'true' : undefined"
     >
       <span class="setup-tier-table__tier">{{ tierLabel(tier.name) }}</span>
       <template v-if="showProviderColumn">
@@ -297,7 +295,7 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
             :value="tier.provider.trim().toLowerCase()"
             :aria-label="t('setup.router.tierProviderAria', { tier: tier.name })"
             :aria-invalid="credentialFor(tier) && !credentialFor(tier)?.available ? 'true' : undefined"
-            :disabled="providerFieldDisabled(tier)"
+            :disabled="providerFieldDisabled()"
             @change="emit('updateTierField', tier.name, 'provider', ($event.target as HTMLSelectElement).value)"
           >
             <option v-if="!tier.provider" value="" disabled>-</option>
@@ -335,11 +333,21 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
           >
             {{ ensembleSummary(tier) }}
           </small>
-          <small v-if="tier.name === 'image_model' && c3EnsembleActive" class="setup-tier-table__model-note">
-            {{ t('setup.router.tierEnsembleImageDisabled') }}
+          <small
+            v-if="tierEnsembleActive(tier) && ensemblePlanStatus"
+            class="setup-tier-table__plan-status"
+            :class="ensemblePlanStatus === 'attention' ? 'needs-attention' : 'is-ready'"
+          >{{ ensemblePlanStatusLabel() }}</small>
+          <small v-if="tier.name === 'c3' && tierEnsembleActive(tier)" class="setup-tier-table__model-note">
+            {{ t('setup.router.tierEnsembleImageRouting') }}
           </small>
         </div>
-        <span class="setup-tier-table__readonly" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })">{{ tier.thinkingLevel || '-' }}</span>
+        <span
+          class="setup-tier-table__readonly"
+          :aria-label="providerManagedByEnsemble(tier)
+            ? t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })
+            : t('setup.router.tierThinkingAria', { tier: tier.name })"
+        >{{ providerManagedByEnsemble(tier) ? t('setup.router.tierThinkingManagedByEnsemble') : tier.thinkingLevel || '-' }}</span>
         <ControlSwitch :checked="displayedImageSupport(tier)" :disabled="true" :aria-label="t('setup.router.tierImageAria', { tier: tier.name })" />
       </template>
       <template v-else>
@@ -351,6 +359,7 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
             :models="catalogFor(tier).models"
             :model-source="catalogFor(tier).source"
             :disabled="rowFieldsDisabled(tier)"
+            :commit-on-select="tier.name === 'c3'"
             :external-description-id="tierEnsembleActive(tier) ? ensembleSummaryId(tier) : undefined"
             :leading-option="tier.name === 'c3' ? {
               value: ENSEMBLE_CHOICE,
@@ -366,11 +375,22 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
           >
             {{ ensembleSummary(tier) }}
           </small>
-          <small v-if="tier.name === 'image_model' && c3EnsembleActive" class="setup-tier-table__model-note">
-            {{ t('setup.router.tierEnsembleImageDisabled') }}
+          <small
+            v-if="tierEnsembleActive(tier) && ensemblePlanStatus"
+            class="setup-tier-table__plan-status"
+            :class="ensemblePlanStatus === 'attention' ? 'needs-attention' : 'is-ready'"
+          >{{ ensemblePlanStatusLabel() }}</small>
+          <small v-if="tier.name === 'c3' && tierEnsembleActive(tier)" class="setup-tier-table__model-note">
+            {{ t('setup.router.tierEnsembleImageRouting') }}
           </small>
         </div>
-        <select :value="tier.thinkingLevel" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })" :disabled="rowFieldsDisabled(tier)" @change="emit('updateTierField', tier.name, 'thinkingLevel', ($event.target as HTMLSelectElement).value)">
+        <span
+          v-if="providerManagedByEnsemble(tier)"
+          class="setup-tier-table__readonly"
+          :aria-label="t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })"
+          :title="t('setup.router.tierThinkingManagedByEnsemble')"
+        >{{ t('setup.router.tierThinkingManagedByEnsemble') }}</span>
+        <select v-else :value="tier.thinkingLevel" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })" :disabled="rowFieldsDisabled(tier)" @change="emit('updateTierField', tier.name, 'thinkingLevel', ($event.target as HTMLSelectElement).value)">
           <option v-for="v in THINKING_LEVELS" :key="v" :value="v">{{ v || '-' }}</option>
         </select>
         <ControlSwitch :checked="displayedImageSupport(tier)" :disabled="imageSwitchDisabled(tier)" :aria-label="t('setup.router.tierImageAria', { tier: tier.name })" @change="(v) => emit('updateTierField', tier.name, 'supportsImage', v)" />
@@ -429,6 +449,20 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
   font-size: 10px;
   line-height: 1.2;
   overflow-wrap: anywhere;
+}
+
+.setup-tier-table__plan-status {
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.setup-tier-table__plan-status.is-ready {
+  color: var(--ok);
+}
+
+.setup-tier-table__plan-status.needs-attention {
+  color: var(--warning-text, var(--text-muted));
 }
 
 .setup-tier-table__row.is-disabled:not(.is-head) {

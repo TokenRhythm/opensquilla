@@ -15,7 +15,11 @@ import {
   type EffectiveMaxTokens,
   type ProviderCredentialPanelState,
 } from '@/composables/setup/useSetupProviderForm'
-import { useSetupRouterForm, type SetupTierRow } from '@/composables/setup/useSetupRouterForm'
+import {
+  routerTierProviderParticipates,
+  useSetupRouterForm,
+  type SetupTierRow,
+} from '@/composables/setup/useSetupRouterForm'
 import {
   CUSTOM_B5_SELECTION_MODE,
   LEGACY_OPENROUTER_MODEL_OPTIONS,
@@ -166,6 +170,13 @@ interface SectionDetail {
   // Server-owned routing intent. Older gateways omit this field and are
   // treated conservatively as legacy/preserve by the WebUI.
   routerBinding?: 'follow_primary' | 'custom' | 'legacy'
+  // Additive mode-aware ownership returned by newer Gateways. The composable
+  // accepts both this map and richer per-tier role objects.
+  routerProviderRoles?: unknown
+  router_provider_roles?: unknown
+  configuredAllFailedPolicy?: string
+  effectiveAllFailedPolicy?: string
+  policyDeprecated?: boolean
 }
 
 interface OnboardingStatus {
@@ -343,6 +354,9 @@ interface ConfigData {
     candidates?: EnsembleCandidateConfig[]
     min_successful_proposers?: number
     all_failed_policy?: string
+    configured_all_failed_policy?: string
+    effective_all_failed_policy?: string
+    policy_deprecated?: boolean
   }
   naming?: {
     enabled?: boolean
@@ -788,8 +802,15 @@ async function loadData(options: {
         currentRouterProfile.value?.tiers || {},
         currentProvider.value,
         binding === 'follow_primary' || binding === 'custom' ? binding : 'legacy',
+        routerDetail.routerProviderRoles || routerDetail.router_provider_roles,
       )
-      ensembleForm.initFromConfig(config.value.llm_ensemble || {})
+      const ensembleDetail = (status.value.sectionDetails || {}).ensemble || {}
+      ensembleForm.initFromConfig({
+        ...(config.value.llm_ensemble || {}),
+        configured_all_failed_policy: ensembleDetail.configuredAllFailedPolicy,
+        effective_all_failed_policy: ensembleDetail.effectiveAllFailedPolicy,
+        policy_deprecated: ensembleDetail.policyDeprecated,
+      })
       capabilitiesForm.initSearchFromConfig(config.value, searchProviders.value)
       capabilitiesForm.initMemoryFromConfig(config.value)
       capabilitiesForm.initImageFromConfig(config.value, status.value, imageProviders.value)
@@ -1650,7 +1671,17 @@ function routerConflictsWithTarget(value: string): boolean {
     || routerBinding.value === 'follow_primary'
     || crossProviderRoutingEnabled.value
   ) return false
-  return Object.values(config.value.squilla_router?.tiers || {}).some(tier => {
+  return Object.entries(config.value.squilla_router?.tiers || {}).some(([name, tier]) => {
+    if (!routerTierProviderParticipates(name, {
+      provider: tier.provider || '',
+      model: tier.model || '',
+      thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
+      supportsImage: tier.supportsImage || tier.supports_image || false,
+      ensembleEnabled: typeof tier.ensembleEnabled === 'boolean'
+        ? tier.ensembleEnabled
+        : tier.ensemble_enabled,
+      ensembleSelectionMode: tier.ensembleSelectionMode || tier.ensemble_selection_mode || '',
+    }, routerForm.routerProviderRoles.value)) return false
     const provider = normalizeProviderId(tier.provider)
     return Boolean(provider && provider !== target)
   })

@@ -1969,6 +1969,38 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     app.unmount()
   })
 
+  it('surfaces the configured and effective failure policies reported by the Gateway', async () => {
+    mockProviderState(
+      {
+        ...configuredProviderStatus('tokenrhythm'),
+        sectionDetails: {
+          ensemble: {
+            configuredAllFailedPolicy: 'error',
+            effectiveAllFailedPolicy: 'fallback_single',
+            policyDeprecated: true,
+          },
+        },
+      },
+      {
+        llm: { provider: 'tokenrhythm', model: 'deepseek-v4-flash' },
+        squilla_router: { enabled: false, cross_provider_tiers: false },
+        llm_ensemble: {
+          enabled: true,
+          selection_mode: 'static_tokenrhythm_b5',
+          all_failed_policy: 'fallback_single',
+        },
+      },
+    )
+
+    const { api, app } = await mountCatalog()
+
+    expect(api.ensemblePanel.value.configuredAllFailedPolicy).toBe('error')
+    expect(api.ensemblePanel.value.effectiveAllFailedPolicy).toBe('fallback_single')
+    expect(api.ensemblePanel.value.policyDeprecated).toBe(true)
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+    app.unmount()
+  })
+
   it('does not present ordinary router enablement as multi-provider routing', async () => {
     mockProviderState(
       {
@@ -2048,6 +2080,46 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     const { api, app } = await mountCatalog()
 
     expect(api.providerPanel.value.routingEnabled).toBe(true)
+    app.unmount()
+  })
+
+  it.each([
+    { role: 'dormant_draft', expected: false },
+    { role: 'dynamic_member', expected: true },
+  ])('consumes the server C3 provider role $role', async ({ role, expected }) => {
+    mockProviderState(
+      {
+        ...configuredProviderStatus('tokenrhythm'),
+        sectionDetails: {
+          router: {
+            routerBinding: 'custom',
+            routerProviderRoles: { c0: 'direct', c3: role },
+          },
+        },
+      },
+      {
+        llm: { provider: 'tokenrhythm', model: 'primary-model' },
+        squilla_router: {
+          enabled: true,
+          tiers: {
+            c0: { provider: 'tokenrhythm', model: 'fast-model' },
+            c3: {
+              provider: 'openrouter',
+              model: 'saved-c3-model',
+              ensemble_enabled: true,
+            },
+          },
+        },
+        llm_ensemble: { enabled: false, selection_mode: 'static_tokenrhythm_b5' },
+      },
+    )
+
+    const { api, app } = await mountCatalog()
+    expect(api.modelStrategyPanel.value.router.hasMixedTierProviders).toBe(expected)
+    expect(api.modelStrategyPanel.value.router.routerProviderRoles).toEqual({
+      c0: 'direct',
+      c3: role,
+    })
     app.unmount()
   })
 

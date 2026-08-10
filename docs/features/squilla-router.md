@@ -53,10 +53,17 @@ C3 reuses the plan configured under `llm_ensemble`: four proposer models
 produce candidates and GLM 5.2 aggregates the final answer in the recommended
 TokenRhythm setup. The plan is activated only for C3; C0–C2 stay single-model
 routes. Editing the shared plan also changes what C3 uses, without a second
-tier-specific profile. If no TokenRhythm credential resolves, C3 safely falls
-back to its configured `glm-5.2` model. While C3 fusion is selected, C3 itself
-and the dedicated `image_model` tier are excluded from image routing; another
-text tier with `supports_image = true` may still handle image requests.
+tier-specific profile. If the shared plan cannot start or complete, C3 uses the
+global provider/model configured under `[llm]` — the same fixed/direct fallback
+model used by global fusion. The provider/model stored on C3 remains available
+only when C3 is switched back to single-model routing.
+
+C3 fusion itself is excluded from image routing, but the dedicated
+`image_model` tier remains eligible and is preferred for image requests. If it
+is unavailable, another non-C3 tier with `supports_image = true` may handle the
+request. Older configs with `llm_ensemble.all_failed_policy = "error"` remain
+loadable for upgrade compatibility, but their effective behavior is
+`fallback_single`; saving the ensemble settings normalizes the stored value.
 
 Disable routing and use the configured provider/model directly:
 

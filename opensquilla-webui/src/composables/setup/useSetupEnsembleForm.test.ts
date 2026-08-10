@@ -57,7 +57,9 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
       { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: '' },
     ])
     expect(f.minSuccessfulProposers.value).toBe(2)
-    expect(f.allFailedPolicy.value).toBe('error')
+    expect(f.configuredAllFailedPolicy.value).toBe('error')
+    expect(f.allFailedPolicy.value).toBe('fallback_single')
+    expect(f.policyDeprecated.value).toBe(true)
   })
 
   it('keeps a stored legacy router_dynamic mode readable', () => {
@@ -126,12 +128,12 @@ describe('useSetupEnsembleForm — partial payload building', () => {
     expect(f.payload()).toEqual({})
   })
 
-  it('sends ONLY the changed key (enabled-only save never clobbers the rest)', () => {
+  it('normalizes a retired error policy alongside the next ensemble save', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig(SAVED)
 
     f.setEnabled(true)
-    expect(f.payload()).toEqual({ enabled: true })
+    expect(f.payload()).toEqual({ enabled: true, allFailedPolicy: 'fallback_single' })
   })
 
   it('sends only the selection mode when only it changed', () => {
@@ -139,7 +141,10 @@ describe('useSetupEnsembleForm — partial payload building', () => {
     f.initFromConfig(SAVED)
 
     f.setSelectionMode('static_openrouter_b5')
-    expect(f.payload()).toEqual({ selectionMode: 'static_openrouter_b5' })
+    expect(f.payload()).toEqual({
+      selectionMode: 'static_openrouter_b5',
+      allFailedPolicy: 'fallback_single',
+    })
   })
 
   it('accumulates exactly the dirty keys across several edits', () => {
@@ -149,6 +154,7 @@ describe('useSetupEnsembleForm — partial payload building', () => {
     f.addModelOption('custom/model-c')
     expect(f.payload()).toEqual({
       modelOptions: ['custom/model-a', 'custom/model-b', 'custom/model-c'],
+      allFailedPolicy: 'fallback_single',
     })
   })
 
@@ -163,15 +169,17 @@ describe('useSetupEnsembleForm — partial payload building', () => {
         { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: '' },
         { provider: 'openrouter', model: 'qwen/qwen3.7-max', source: 'custom', enabled: true, role: 'critic' },
       ],
+      allFailedPolicy: 'fallback_single',
     })
   })
 
-  it('sends allFailedPolicy alone when only it changed', () => {
+  it('does not let a compatibility setter restore the retired error policy', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig(SAVED)
 
-    f.setAllFailedPolicy('fallback_single')
-    expect(f.payload()).toEqual({ allFailedPolicy: 'fallback_single' })
+    f.setAllFailedPolicy('error')
+    expect(f.allFailedPolicy.value).toBe('fallback_single')
+    expect(f.payload()).toEqual({})
   })
 
   it('never carries candidate editor state into a static preset save', () => {

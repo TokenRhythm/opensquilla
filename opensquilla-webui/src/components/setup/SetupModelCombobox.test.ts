@@ -542,6 +542,72 @@ describe('SetupModelCombobox', () => {
     expect(listbox()).toBeTruthy()
   })
 
+  it('keeps search local in commit-on-select mode and restores the committed choice on blur', async () => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({
+      value: '__ensemble__',
+      leadingOption: {
+        value: '__ensemble__',
+        label: 'Multi-model fusion',
+      },
+      commitOnSelect: true,
+      onUpdate,
+    })
+    const input = el.querySelector<HTMLInputElement>('input[role="combobox"]')!
+
+    input.dispatchEvent(new Event('focus'))
+    input.value = 'alpha'
+    input.dispatchEvent(new Event('input'))
+    await nextTick()
+
+    expect(onUpdate).not.toHaveBeenCalled()
+    expect(input.value).toBe('alpha')
+    expect(optionRows().map(row => row.textContent)).toEqual(expect.arrayContaining([
+      expect.stringContaining('test-vendor/alpha'),
+      expect.stringContaining('Use "alpha"'),
+    ]))
+
+    input.dispatchEvent(new Event('blur'))
+    await nextTick()
+    expect(input.value).toBe('Multi-model fusion')
+    expect(onUpdate).not.toHaveBeenCalled()
+
+    input.dispatchEvent(new Event('focus'))
+    input.value = 'beta'
+    input.dispatchEvent(new Event('input'))
+    input.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Escape',
+      cancelable: true,
+      bubbles: true,
+    }))
+    await nextTick()
+    expect(input.value).toBe('Multi-model fusion')
+    expect(onUpdate).not.toHaveBeenCalled()
+  })
+
+  it('commits a typed custom id only through the explicit free-text row', async () => {
+    const onUpdate = vi.fn()
+    const { el } = await mountCombobox({
+      value: '__ensemble__',
+      leadingOption: { value: '__ensemble__', label: 'Multi-model fusion' },
+      commitOnSelect: true,
+      onUpdate,
+    })
+    const input = el.querySelector<HTMLInputElement>('input[role="combobox"]')!
+
+    input.dispatchEvent(new Event('focus'))
+    input.value = 'my/custom-model'
+    input.dispatchEvent(new Event('input'))
+    await nextTick()
+    const custom = optionRows().find(row => row.textContent?.includes('Use "my/custom-model"'))!
+    custom.click()
+    await nextTick()
+
+    expect(onUpdate).toHaveBeenCalledTimes(1)
+    expect(onUpdate).toHaveBeenCalledWith('my/custom-model')
+    expect(listbox()).toBeNull()
+  })
+
   it('selects the active row with Enter after arrow-key navigation', async () => {
     const onUpdate = vi.fn()
     const { el } = await mountCombobox({ onUpdate })

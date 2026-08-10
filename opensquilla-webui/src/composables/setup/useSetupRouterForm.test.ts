@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { computed } from 'vue'
-import { useSetupRouterForm } from './useSetupRouterForm'
+import { routerTierProviderParticipates, useSetupRouterForm } from './useSetupRouterForm'
 
 // openrouter-mix is backend-supported but was unreachable in the WebUI. The
 // round-trip is subtle: it is the only enabled mode whose tier_profile is null,
@@ -355,7 +355,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     })
   })
 
-  it('ignores the dormant shared C3 provider in panel state and save policy', () => {
+  it('ignores a server-owned dormant shared C3 provider in panel state and save policy', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({
       enabled: true,
@@ -368,7 +368,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
           ensemble_enabled: true,
         },
       },
-    }, {}, 'openrouter')
+    }, {}, 'openrouter', 'legacy', { c3: 'dormant_draft' })
 
     expect(f.hasMixedTierProviders.value).toBe(false)
     expect(makePanel(f, true).value.hasMixedTierProviders).toBe(false)
@@ -383,6 +383,61 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     })
     expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(f.payload()).not.toHaveProperty('tierProviderMismatch')
+  })
+
+  it('treats a shared C3 provider as direct when an older Gateway omits ownership', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model' },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'saved-c3-draft',
+          ensemble_enabled: true,
+        },
+      },
+    }, {}, 'openrouter')
+
+    expect(f.routerProviderRoles.value).toEqual({})
+    expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).toMatchObject({
+      crossProviderTiers: true,
+      tierProviderMismatch: 'veto',
+    })
+  })
+
+  it('includes a router_dynamic C3 member while accepting richer role objects', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model' },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'dynamic-member',
+          ensemble_enabled: true,
+        },
+      },
+    }, {}, 'openrouter', 'custom', {
+      c3: { role: 'dynamic_member' },
+    })
+
+    expect(f.routerProviderRoles.value).toEqual({ c3: 'dynamic_member' })
+    expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(makePanel(f, true).value.routerProviderRoles).toEqual({ c3: 'dynamic_member' })
+  })
+
+  it('uses server roles for every tier and defaults missing older-Gateway entries to direct', () => {
+    const tier = {
+      provider: 'openrouter',
+      model: 'saved-model',
+      thinkingLevel: 'high',
+      supportsImage: false,
+    }
+
+    expect(routerTierProviderParticipates('c0', tier, { c0: 'blocked' })).toBe(false)
+    expect(routerTierProviderParticipates('c0', tier, {})).toBe(true)
   })
 
   it.each([

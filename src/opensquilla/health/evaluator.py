@@ -1764,11 +1764,57 @@ _ENSEMBLE_SELECTION_MODES = frozenset(
 )
 
 
+def _deprecated_ensemble_failure_policy(
+    payload: dict[str, Any],
+) -> HealthFinding | None:
+    configured_policy = str(
+        payload.get("configuredAllFailedPolicy")
+        or payload.get("allFailedPolicy")
+        or payload.get("all_failed_policy")
+        or "fallback_single"
+    ).strip()
+    effective_policy = str(
+        payload.get("effectiveAllFailedPolicy") or "fallback_single"
+    ).strip()
+    deprecated = bool(payload.get("policyDeprecated")) or configured_policy == "error"
+    if not deprecated:
+        return None
+    return HealthFinding(
+        id="llm_ensemble.all_failed_policy.deprecated",
+        severity="warn",
+        surface="llm_ensemble",
+        title="LLM ensemble failure policy is deprecated",
+        detail=(
+            "The configured all_failed_policy='error' remains loadable for upgrade "
+            "compatibility, but its effective behavior is fallback_single: if fusion "
+            "cannot complete, OpenSquilla uses the configured fixed/direct fallback "
+            "model. Save the ensemble settings to migrate the stored policy."
+        ),
+        evidence={
+            "configuredAllFailedPolicy": configured_policy,
+            "effectiveAllFailedPolicy": effective_policy,
+            "policyDeprecated": True,
+        },
+        fix_steps=[
+            FixStep(
+                label="Save the ensemble settings",
+                detail=(
+                    "Open Settings → Model routing, review the shared multi-model plan, "
+                    "and save it. OpenSquilla will persist fallback_single."
+                ),
+            )
+        ],
+        restart_required=False,
+    )
+
+
 def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
     enabled = bool(payload.get("enabled"))
     selection_mode = str(payload.get("selectionMode") or "")
+    deprecated_policy = _deprecated_ensemble_failure_policy(payload)
+    policy_findings = [deprecated_policy] if deprecated_policy is not None else []
     if not enabled:
-        return []
+        return policy_findings
     if selection_mode not in _ENSEMBLE_SELECTION_MODES:
         return [
             HealthFinding(
@@ -1778,8 +1824,9 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
                 title="LLM ensemble selection mode is unsupported",
                 detail=(
                     f"The configured selection mode {selection_mode or '<empty>'!r} "
-                    "is not supported, so ensemble execution is blocked. Choose a "
-                    "supported mode or disable the ensemble."
+                    "is not supported, so ensemble execution is blocked and OpenSquilla "
+                    "uses the configured fixed/direct fallback model. Choose a supported "
+                    "mode or disable the ensemble."
                 ),
                 evidence={
                     "enabled": True,
@@ -1800,13 +1847,14 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
                         command="opensquilla config set llm_ensemble.enabled false",
                     ),
                 ],
-            )
+            ),
+            *policy_findings,
         ]
     if enabled and selection_mode == "custom_b5":
-        return _evaluate_custom_b5_ensemble(payload)
+        return [*_evaluate_custom_b5_ensemble(payload), *policy_findings]
     mode_details = _STATIC_B5_MODE_DETAILS.get(selection_mode)
     if mode_details is None:
-        return []
+        return policy_findings
     provider_label, env_key_fallback = mode_details
     api_key_env = str(payload.get("apiKeyEnv") or env_key_fallback)
     credential_available = bool(payload.get("credentialAvailable"))
@@ -1844,14 +1892,15 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
                     f"{provider_label} credential and is active for turns."
                 ),
                 evidence=evidence,
-            )
+            ),
+            *policy_findings,
         ]
     if tier_managed:
         detail = (
             f"The static {provider_label} B5 ensemble configured for router tier "
             f"{tier_label} cannot resolve a {provider_label} credential. Those "
-            f"tiers safely fall back to their configured single-model routes. Set "
-            f"{api_key_env}, or change the affected tier's ensemble selection mode."
+            "requests safely use the configured fixed/direct fallback model. Set "
+            f"{api_key_env}, or repair the shared multi-model plan."
         )
         disable_step = FixStep(
             label="Review the router tier",
@@ -1864,7 +1913,7 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
         detail = (
             f"LLM ensemble (static {provider_label} B5) is enabled but no "
             f"{provider_label} credential resolves — the ensemble is inactive and "
-            f"every turn falls back to the single configured provider. Set "
+            "every turn uses the configured fixed/direct fallback model. Set "
             f"{api_key_env}, switch llm_ensemble.selection_mode, or disable the "
             "ensemble."
         )
@@ -1892,7 +1941,8 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
                 FixStep(label="Restart gateway", command="opensquilla gateway restart"),
             ],
             restart_required=True,
-        )
+        ),
+        *policy_findings,
     ]
 
 
@@ -1932,20 +1982,20 @@ def _evaluate_custom_b5_ensemble(payload: dict[str, Any]) -> list[HealthFinding]
         detail = (
             "LLM ensemble (custom lineup) is enabled but the "
             f"{provider_id} member resolves no API key — the ensemble is "
-            "inactive and every turn falls back to the single configured "
-            "provider. Set the provider key, remove the member, or disable "
-            "the ensemble."
+            "inactive and every turn uses the configured fixed/direct fallback "
+            "model. Set the provider key, remove the member, or disable the ensemble."
         )
     elif reason == "no_proposers":
         detail = (
             "LLM ensemble (custom lineup) is enabled but has no enabled "
-            "proposer candidates — add candidates or disable the ensemble."
+            "proposer candidates, so requests use the configured fixed/direct "
+            "fallback model. Add candidates or disable the ensemble."
         )
     else:
         detail = (
             "LLM ensemble (custom lineup) is enabled but cannot run "
-            f"({reason or 'unknown reason'}) — every turn falls back to the "
-            "single configured provider."
+            f"({reason or 'unknown reason'}) — every turn uses the configured "
+            "fixed/direct fallback model."
         )
     return [
         HealthFinding(

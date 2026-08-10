@@ -110,7 +110,6 @@ const emit = defineEmits<{
   importEnsembleTierCandidates: []
   migrateEnsembleLegacy: []
   updateEnsembleMinSuccessful: [value: number]
-  updateEnsembleAllFailedPolicy: [value: string]
   goToSection: [value: string]
 }>()
 
@@ -397,6 +396,29 @@ const activeFacts = computed(() => (
   ensembleScheme.value === 'preset'
     ? props.panel.ensemble.presetFacts
     : customLineup.value.facts
+))
+const ensemblePlanNeedsAttention = computed(() => {
+  const credentialUnavailable = (candidate: EnsembleCandidateView | undefined | null) => (
+    candidate?.credential?.available === false
+  )
+  if (ensembleScheme.value === 'preset') {
+    const profile = props.panel.ensemble.fixedProfile
+    return !profile
+      || props.panel.ensemble.presetProviderMismatch === true
+      || profile.proposers.some(credentialUnavailable)
+      || credentialUnavailable(profile.aggregator)
+  }
+  if (ensembleScheme.value === 'legacy') {
+    return props.panel.ensemble.customCandidates.length === 0
+      || props.panel.ensemble.customCandidates.some(credentialUnavailable)
+  }
+  return customLineup.value.belowMinimum
+    || customLineup.value.proposers.some(credentialUnavailable)
+    || credentialUnavailable(customLineup.value.aggregator)
+    || (!customLineup.value.aggregator && !customLineup.value.inheritedAggregatorModel)
+})
+const ensemblePlanStatus = computed<'ready' | 'attention'>(() => (
+  ensemblePlanNeedsAttention.value ? 'attention' : 'ready'
 ))
 const legacyProposers = computed(() => (
   props.panel.ensemble.customCandidates.filter(candidate => candidate.role !== 'aggregator')
@@ -699,7 +721,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           :models-by-provider="panel.router.discoveredModelsByProvider || {}"
           :fixed-fallback-provider="panel.single.providerLabel"
           :fixed-fallback-model="panel.single.model"
-          :ensemble-all-failed-policy="panel.ensemble.allFailedPolicy"
+          :ensemble-plan-status="ensemblePlanStatus"
           @update-tier-field="(name, key, value) => emit('updateTierField', name, key, value)"
         />
 
@@ -774,7 +796,13 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           class="setup-model-strategy__notice setup-model-strategy__notice--legacy"
           data-testid="ensemble-legacy-banner"
         >
-          <span>{{ t('setup.modelStrategy.legacyDynamicNotice') }}</span>
+          <span>
+            {{ t('setup.modelStrategy.legacyDynamicNotice') }}
+            {{ t('setup.modelStrategy.ensembleFailure', {
+              provider: panel.single.providerLabel,
+              model: panel.single.model,
+            }) }}
+          </span>
           <button
             type="button"
             class="btn"
@@ -1372,24 +1400,17 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.failurePolicyLabel') }}</span>
                 <span class="control-row__desc">
-                  {{ panel.ensemble.allFailedPolicy === 'error'
-                    ? t('setup.modelStrategy.ensembleFailureError')
-                    : t('setup.modelStrategy.ensembleFailure', {
-                      provider: panel.single.providerLabel,
-                      model: panel.single.model,
-                    }) }}
+                  {{ t('setup.modelStrategy.ensembleFailure', {
+                    provider: panel.single.providerLabel,
+                    model: panel.single.model,
+                  }) }}
                 </span>
               </div>
               <div class="control-row__control">
-                <select
-                  class="control-input"
-                  :value="panel.ensemble.allFailedPolicy"
-                  name="setup_model_strategy_all_failed_policy"
-                  @change="emit('updateEnsembleAllFailedPolicy', ($event.target as HTMLSelectElement).value)"
-                >
-                  <option value="fallback_single">{{ t('setup.ensemble.allFailedFallback') }}</option>
-                  <option value="error">{{ t('setup.ensemble.allFailedError') }}</option>
-                </select>
+                <span
+                  class="setup-model-strategy__runtime-value"
+                  data-testid="ensemble-fixed-fallback"
+                >{{ panel.single.providerLabel }} · {{ panel.single.model }}</span>
               </div>
             </label>
             <div class="setup-model-strategy__runtime-limits">
@@ -2654,6 +2675,14 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-model-strategy__runtime-body .control-row {
   padding-left: 0;
   padding-right: 0;
+}
+
+.setup-model-strategy__runtime-value {
+  color: var(--text);
+  display: block;
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+  padding: var(--sp-2) 0;
 }
 
 .setup-model-strategy__runtime-limits {
