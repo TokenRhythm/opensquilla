@@ -994,6 +994,8 @@
       "fallbackTierLabel": "路由无法确定时",
       "fallbackTierDesc": "当路由无法判断请求档位时使用。",
       "modelRolesTitle": "模型角色",
+      "addProvider": "添加服务商",
+      "addProviderHint": "添加另一个模型服务商后，可为每个档位选择不同服务商。",
       "advancedTitle": "高级选项",
       "advancedDesc": "兜底档位与聊天中的路由展示。",
       "visualModeLabel": "路由决策面板样式",

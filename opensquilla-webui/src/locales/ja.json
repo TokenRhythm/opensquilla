@@ -943,6 +943,8 @@
       "fallbackTierLabel": "ルーティングが確信できない場合",
       "fallbackTierDesc": "ルーティングがレベルを判断できないときに使われます。",
       "modelRolesTitle": "モデルの役割",
+      "addProvider": "プロバイダーを追加",
+      "addProviderHint": "モデルプロバイダーを追加すると、階層ごとに異なるプロバイダーを選択できます。",
       "advancedTitle": "詳細オプション",
       "advancedDesc": "フォールバックレベルとチャットでのルーティング表示。",
       "visualModeLabel": "ルーティング決定パネルの表示スタイル",

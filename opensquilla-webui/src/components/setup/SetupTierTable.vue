@@ -443,14 +443,45 @@ const allowsFloatingContent = computed(() => (
       </template>
       <template v-if="readonly">
         <div class="setup-tier-table__model-cell">
-          <span
-            class="setup-tier-table__readonly"
-            :aria-label="modelFieldLabel(tier)"
-            :aria-describedby="ensembleDescriptionId(tier)"
-            :title="tierEnsembleActive(tier) ? t('setup.router.tierUseEnsemble') : tier.model || undefined"
-          >
-            {{ tierEnsembleActive(tier) ? t('setup.router.tierUseEnsemble') : tier.model || '-' }}
-          </span>
+          <div class="setup-tier-table__model-primary">
+            <span
+              class="setup-tier-table__readonly"
+              :aria-label="modelFieldLabel(tier)"
+              :aria-describedby="ensembleDescriptionId(tier)"
+              :title="tierEnsembleActive(tier) ? t('setup.router.tierUseEnsemble') : tier.model || undefined"
+            >
+              {{ tierEnsembleActive(tier) ? t('setup.router.tierUseEnsemble') : tier.model || '-' }}
+            </span>
+            <span
+              v-if="compactSharedTierEnsembleActive(tier)"
+              class="setup-tier-table__ensemble-details"
+              @mouseenter="showEnsembleDetails(tier, 'hover')"
+              @mouseleave="hideEnsembleDetails(tier, 'hover')"
+            >
+              <button
+                type="button"
+                class="setup-tier-table__ensemble-details-trigger"
+                :aria-label="t('setup.router.tierEnsembleDetailsAria')"
+                :aria-describedby="ensembleDetailsId(tier)"
+                :data-open="ensembleDetailsOpen(tier) ? 'true' : 'false'"
+                @focus="showEnsembleDetails(tier, 'focus')"
+                @blur="hideEnsembleDetails(tier, 'focus')"
+              >
+                <Icon name="info" :size="13" aria-hidden="true" />
+              </button>
+              <span
+                :id="ensembleDetailsId(tier)"
+                class="setup-tier-table__ensemble-tooltip"
+                :class="{ 'is-open': ensembleDetailsOpen(tier) }"
+                role="tooltip"
+              >
+                <strong>{{ ensemblePlanStatusLabel() }}</strong>
+                <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
+                <span>{{ ensembleSummary(tier) }}</span>
+                <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
+              </span>
+            </span>
+          </div>
           <small
             v-if="showInlineEnsembleSummary(tier)"
             :id="ensembleSummaryId(tier)"
@@ -470,35 +501,6 @@ const allowsFloatingContent = computed(() => (
           <small v-if="showInlineImageRule(tier)" class="setup-tier-table__model-note">
             {{ t('setup.router.tierEnsembleImageRouting') }}
           </small>
-          <span
-            v-if="compactSharedTierEnsembleActive(tier)"
-            class="setup-tier-table__ensemble-details"
-            @mouseenter="showEnsembleDetails(tier, 'hover')"
-            @mouseleave="hideEnsembleDetails(tier, 'hover')"
-          >
-            <button
-              type="button"
-              class="setup-tier-table__ensemble-details-trigger"
-              :aria-label="t('setup.router.tierEnsembleDetailsAria')"
-              :aria-describedby="ensembleDetailsId(tier)"
-              :data-open="ensembleDetailsOpen(tier) ? 'true' : 'false'"
-              @focus="showEnsembleDetails(tier, 'focus')"
-              @blur="hideEnsembleDetails(tier, 'focus')"
-            >
-              <Icon name="info" :size="13" aria-hidden="true" />
-            </button>
-            <span
-              :id="ensembleDetailsId(tier)"
-              class="setup-tier-table__ensemble-tooltip"
-              :class="{ 'is-open': ensembleDetailsOpen(tier) }"
-              role="tooltip"
-            >
-              <strong>{{ ensemblePlanStatusLabel() }}</strong>
-              <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
-              <span>{{ ensembleSummary(tier) }}</span>
-              <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
-            </span>
-          </span>
         </div>
         <span
           class="setup-tier-table__readonly"
@@ -510,22 +512,53 @@ const allowsFloatingContent = computed(() => (
       </template>
       <template v-else>
         <div class="setup-tier-table__model-cell">
-          <SetupModelCombobox
-            cell
-            :field="{ name: `tier_${tier.name}_model`, label: modelFieldLabel(tier), placeholder: modelFieldLabel(tier) }"
-            :value="modelChoiceValue(tier)"
-            :models="catalogFor(tier).models"
-            :model-source="catalogFor(tier).source"
-            :disabled="rowFieldsDisabled(tier)"
-            :commit-on-select="tier.name === 'c3'"
-            :external-description-id="ensembleDescriptionId(tier)"
-            :leading-option="tier.name === 'c3' ? {
-              value: ENSEMBLE_CHOICE,
-              label: t('setup.router.tierUseEnsemble'),
-              description: t('setup.router.tierUseEnsembleDescription'),
-            } : undefined"
-            @update="(val) => updateModelChoice(tier, val)"
-          />
+          <div class="setup-tier-table__model-primary">
+            <SetupModelCombobox
+              cell
+              :field="{ name: `tier_${tier.name}_model`, label: modelFieldLabel(tier), placeholder: modelFieldLabel(tier) }"
+              :value="modelChoiceValue(tier)"
+              :models="catalogFor(tier).models"
+              :model-source="catalogFor(tier).source"
+              :disabled="rowFieldsDisabled(tier)"
+              :commit-on-select="tier.name === 'c3'"
+              :external-description-id="ensembleDescriptionId(tier)"
+              :leading-option="tier.name === 'c3' ? {
+                value: ENSEMBLE_CHOICE,
+                label: t('setup.router.tierUseEnsemble'),
+                description: t('setup.router.tierUseEnsembleDescription'),
+              } : undefined"
+              @update="(val) => updateModelChoice(tier, val)"
+            />
+            <span
+              v-if="compactSharedTierEnsembleActive(tier)"
+              class="setup-tier-table__ensemble-details"
+              @mouseenter="showEnsembleDetails(tier, 'hover')"
+              @mouseleave="hideEnsembleDetails(tier, 'hover')"
+            >
+              <button
+                type="button"
+                class="setup-tier-table__ensemble-details-trigger"
+                :aria-label="t('setup.router.tierEnsembleDetailsAria')"
+                :aria-describedby="ensembleDetailsId(tier)"
+                :data-open="ensembleDetailsOpen(tier) ? 'true' : 'false'"
+                @focus="showEnsembleDetails(tier, 'focus')"
+                @blur="hideEnsembleDetails(tier, 'focus')"
+              >
+                <Icon name="info" :size="13" aria-hidden="true" />
+              </button>
+              <span
+                :id="ensembleDetailsId(tier)"
+                class="setup-tier-table__ensemble-tooltip"
+                :class="{ 'is-open': ensembleDetailsOpen(tier) }"
+                role="tooltip"
+              >
+                <strong>{{ ensemblePlanStatusLabel() }}</strong>
+                <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
+                <span>{{ ensembleSummary(tier) }}</span>
+                <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
+              </span>
+            </span>
+          </div>
           <small
             v-if="showInlineEnsembleSummary(tier)"
             :id="ensembleSummaryId(tier)"
@@ -552,35 +585,6 @@ const allowsFloatingContent = computed(() => (
           <small v-if="showInlineImageRule(tier)" class="setup-tier-table__model-note">
             {{ t('setup.router.tierEnsembleImageRouting') }}
           </small>
-          <span
-            v-if="compactSharedTierEnsembleActive(tier)"
-            class="setup-tier-table__ensemble-details"
-            @mouseenter="showEnsembleDetails(tier, 'hover')"
-            @mouseleave="hideEnsembleDetails(tier, 'hover')"
-          >
-            <button
-              type="button"
-              class="setup-tier-table__ensemble-details-trigger"
-              :aria-label="t('setup.router.tierEnsembleDetailsAria')"
-              :aria-describedby="ensembleDetailsId(tier)"
-              :data-open="ensembleDetailsOpen(tier) ? 'true' : 'false'"
-              @focus="showEnsembleDetails(tier, 'focus')"
-              @blur="hideEnsembleDetails(tier, 'focus')"
-            >
-              <Icon name="info" :size="13" aria-hidden="true" />
-            </button>
-            <span
-              :id="ensembleDetailsId(tier)"
-              class="setup-tier-table__ensemble-tooltip"
-              :class="{ 'is-open': ensembleDetailsOpen(tier) }"
-              role="tooltip"
-            >
-              <strong>{{ ensemblePlanStatusLabel() }}</strong>
-              <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
-              <span>{{ ensembleSummary(tier) }}</span>
-              <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
-            </span>
-          </span>
         </div>
         <span
           v-if="thinkingManagedByEnsemble(tier)"
@@ -643,6 +647,14 @@ const allowsFloatingContent = computed(() => (
   position: relative;
 }
 
+.setup-tier-table__model-primary {
+  align-items: center;
+  display: grid;
+  gap: 4px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+}
+
 .setup-tier-table__model-note {
   color: var(--text-muted);
   font-size: 10px;
@@ -685,7 +697,7 @@ const allowsFloatingContent = computed(() => (
 .setup-tier-table__ensemble-details {
   align-items: center;
   display: inline-flex;
-  justify-self: start;
+  justify-self: end;
   position: relative;
 }
 
@@ -697,10 +709,10 @@ const allowsFloatingContent = computed(() => (
   color: var(--text-dim);
   cursor: help;
   display: inline-flex;
-  height: 20px;
+  height: 24px;
   justify-content: center;
   padding: 0;
-  width: 20px;
+  width: 24px;
 }
 
 .setup-tier-table__ensemble-details-trigger:hover {
@@ -723,9 +735,10 @@ const allowsFloatingContent = computed(() => (
   font-size: var(--fs-xs);
   font-weight: 400;
   gap: 5px;
-  left: 0;
+  inset-inline-end: 0;
+  inset-inline-start: auto;
   line-height: 1.4;
-  max-width: min(340px, 70vw);
+  max-width: min(340px, calc(100vw - 24px));
   opacity: 0;
   padding: 8px 10px;
   pointer-events: none;

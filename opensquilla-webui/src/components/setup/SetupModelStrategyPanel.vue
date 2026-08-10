@@ -199,6 +199,7 @@ const configuredProviderIds = computed(() => new Set(
     .map(option => String(option.providerId || '').trim().toLowerCase())
     .filter(Boolean),
 ))
+const showAddProviderShortcut = computed(() => configuredProviderIds.value.size === 1)
 const fixedProviderOptions = computed(() => providerOptionsFor(props.panel.single.providerId))
 const selectedFixedProviderOption = computed(() => (
   fixedProviderOptions.value.find(option => option.providerId === props.panel.single.providerId)
@@ -762,6 +763,18 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
         <div class="setup-model-strategy__roles-head">
           <h5>{{ t('setup.modelStrategy.modelRolesTitle') }}</h5>
+          <button
+            v-if="showAddProviderShortcut"
+            type="button"
+            class="setup-inline-link setup-model-strategy__add-provider"
+            data-testid="router-add-provider"
+            :aria-label="t('setup.modelStrategy.addProviderHint')"
+            :title="t('setup.modelStrategy.addProviderHint')"
+            @click="emit('goToSection', 'provider')"
+          >
+            <Icon name="plus" :size="13" aria-hidden="true" />
+            {{ t('setup.modelStrategy.addProvider') }}
+          </button>
         </div>
 
         <SetupTierTable
@@ -1977,8 +1990,11 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 }
 
 .setup-model-strategy__roles-head {
-  display: grid;
-  gap: 3px;
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  justify-content: space-between;
   margin-top: var(--sp-1);
 }
 
@@ -1991,6 +2007,11 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   color: var(--text-muted);
   font-size: var(--fs-xs);
   line-height: 1.45;
+}
+
+.setup-inline-link.setup-model-strategy__add-provider {
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
 }
 
 .setup-model-strategy__candidate-list {

@@ -211,6 +211,9 @@ describe('SetupTierTable — editable routing rows', () => {
       'button[aria-label="Show C3 fusion details"]',
     )!
     const tooltip = el.querySelector<HTMLElement>('[role="tooltip"]')!
+    const primary = picker.closest('.setup-tier-table__model-primary')
+    expect(primary).toBeTruthy()
+    expect(details.closest('.setup-tier-table__model-primary')).toBe(primary)
     expect(details.getAttribute('aria-describedby')).toBe(tooltip.id)
     expect(tooltip.textContent).toContain('Current fusion plan is ready')
     expect(tooltip.textContent)
@@ -750,8 +753,18 @@ describe('SetupTierTable — readonly preview mode', () => {
       routerProviderRoles: { c3: 'dormant_draft' },
     })
 
-    expect(el.querySelector('[aria-label="C3 processing mode or model"]')?.textContent)
+    const picker = el.querySelector('[aria-label="C3 processing mode or model"]')
+    const details = el.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show C3 fusion details"]',
+    )
+    expect(picker?.textContent)
       .toContain('Multi-model fusion')
+    const primary = picker?.closest('.setup-tier-table__model-primary')
+    expect(primary).toBeTruthy()
+    expect(details?.closest('.setup-tier-table__model-primary')).toBe(primary)
+    expect(details?.getAttribute('aria-describedby')).toBe(
+      el.querySelector<HTMLElement>('[role="tooltip"]')?.id,
+    )
     expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
       .toContain('uses the Fixed and fallback model')
     expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')

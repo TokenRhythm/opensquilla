@@ -281,6 +281,43 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
+  it('offers a compact provider shortcut when only one provider is available', async () => {
+    const onGoToSection = vi.fn()
+    const { app, el } = await mountPanel({
+      activeStrategy: 'router',
+      router: {
+        providerOptions: [
+          { providerId: 'openrouter', label: 'OpenRouter' },
+          { providerId: 'retired-provider', label: 'Retired provider', disabled: true },
+        ],
+      },
+    }, { onGoToSection })
+
+    const shortcut = el.querySelector<HTMLButtonElement>('[data-testid="router-add-provider"]')
+    const hint = 'Add another model provider to choose a different provider for each tier.'
+    expect(shortcut?.textContent).toContain('Add provider')
+    expect(shortcut?.getAttribute('title')).toBe(hint)
+    expect(shortcut?.getAttribute('aria-label')).toBe(hint)
+    expect(el.querySelector('[aria-label="c0 request entry"]')).toBeNull()
+
+    shortcut?.click()
+    await nextTick()
+
+    expect(onGoToSection).toHaveBeenCalledWith('provider')
+    app.unmount()
+  })
+
+  it('removes the provider shortcut once tier provider choices are available', async () => {
+    const { app, el } = await mountPanel({ activeStrategy: 'router' })
+
+    expect(el.querySelector('[data-testid="router-add-provider"]')).toBeNull()
+    expect(el.querySelector('[aria-label="c0 request entry"]')).toBeTruthy()
+    expect(el.querySelector('.setup-tier-table__row.is-head')?.textContent)
+      .toContain('Request entry')
+
+    app.unmount()
+  })
+
   it('lets a router tier choose a discovered model from the model input', async () => {
     const onUpdateTierField = vi.fn()
     const discoveredModels = [

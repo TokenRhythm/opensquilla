@@ -943,6 +943,8 @@
       "fallbackTierLabel": "Quand le routage est incertain",
       "fallbackTierDesc": "Utilisé quand le routage ne peut pas déterminer le niveau.",
       "modelRolesTitle": "Rôles des modèles",
+      "addProvider": "Ajouter un fournisseur",
+      "addProviderHint": "Ajoute un autre fournisseur de modèles pour choisir un fournisseur différent à chaque niveau.",
       "advancedTitle": "Options avancées",
       "advancedDesc": "Niveau de repli et affichage du routage dans le chat.",
       "visualModeLabel": "Style du panneau de décision de routage",

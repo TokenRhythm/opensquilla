@@ -994,6 +994,8 @@
       "fallbackTierLabel": "When routing is uncertain",
       "fallbackTierDesc": "Used when routing can't judge a request's level.",
       "modelRolesTitle": "Model roles",
+      "addProvider": "Add provider",
+      "addProviderHint": "Add another model provider to choose a different provider for each tier.",
       "advancedTitle": "Advanced options",
       "advancedDesc": "Fallback tier and how routing appears in chat.",
       "visualModeLabel": "Routing decision panel style",
