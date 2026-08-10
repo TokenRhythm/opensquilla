@@ -1011,6 +1011,33 @@ async def test_c3_fusion_rejects_image_input_when_no_independent_image_tier_is_a
 
 
 @pytest.mark.asyncio
+async def test_global_fusion_rejects_c3_as_the_only_image_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        squilla_router_step,
+        "_get_strategy",
+        lambda _config: pytest.fail("image routing should not invoke text strategy"),
+    )
+    ctx = make_context(
+        "Describe this screenshot.",
+        attachments=[{"type": "image/png", "data": "abc"}],
+    )
+    ctx.config.llm_ensemble.enabled = True
+    ctx.config.llm_ensemble.selection_mode = "static_openrouter_b5"
+    ctx.config.squilla_router.tiers = {
+        "c3": {
+            "model": "vision/high-quality",
+            "supports_image": True,
+            "ensemble_enabled": False,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="while C3 multi-model fusion is selected"):
+        await apply_squilla_router(ctx)
+
+
+@pytest.mark.asyncio
 async def test_single_c3_remains_available_for_image_routing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1066,6 +1093,63 @@ async def test_image_route_prefers_dedicated_tier_over_declaration_order(
 
     assert routed.metadata["routed_tier"] == "image_model"
     assert routed.model == "vision/dedicated"
+
+
+@pytest.mark.asyncio
+async def test_image_route_falls_back_when_dedicated_tier_has_blank_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        squilla_router_step,
+        "_get_strategy",
+        lambda _config: pytest.fail("image routing should not invoke text strategy"),
+    )
+    ctx = make_context(
+        "Describe this screenshot.",
+        attachments=[{"type": "image/png", "data": "abc"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "vision_primary": {
+            "model": "vision/primary",
+            "supports_image": True,
+        },
+        "image_model": {
+            "model": "   ",
+            "supports_image": True,
+            "image_only": True,
+        },
+    }
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routed_tier"] == "vision_primary"
+    assert routed.model == "vision/primary"
+
+
+@pytest.mark.asyncio
+async def test_image_route_rejects_when_every_image_tier_has_blank_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        squilla_router_step,
+        "_get_strategy",
+        lambda _config: pytest.fail("image routing should not invoke text strategy"),
+    )
+    ctx = make_context(
+        "Describe this screenshot.",
+        attachments=[{"type": "image/png", "data": "abc"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "vision_primary": {"model": "", "supports_image": True},
+        "image_model": {
+            "model": "   ",
+            "supports_image": True,
+            "image_only": True,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="non-empty model"):
+        await apply_squilla_router(ctx)
 
 
 @pytest.mark.asyncio
@@ -1167,6 +1251,41 @@ async def test_image_route_flags_tier_provider_mismatch_when_cross_provider_disa
 
     assert routed.metadata["routing_source"] == "image_route"
     assert routed.metadata.get("router_tier_provider_mismatch") == "openai"
+
+
+@pytest.mark.asyncio
+async def test_global_fixed_lineup_keeps_image_provider_direct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        squilla_router_step,
+        "_get_strategy",
+        lambda _config: pytest.fail("image routing should not invoke text strategy"),
+    )
+    ctx = make_context(
+        "Describe this screenshot.",
+        attachments=[{"type": "image", "mime_type": "image/png"}],
+    )
+    ctx.config.llm.provider = "deepseek"
+    ctx.config.llm_ensemble.enabled = True
+    ctx.config.llm_ensemble.selection_mode = "static_openrouter_b5"
+    ctx.config.squilla_router.cross_provider_tiers = False
+    ctx.config.squilla_router.tiers = {
+        "image_model": {
+            "model": "vision/model-1",
+            "provider": "openai",
+            "supports_image": True,
+            "image_only": True,
+        },
+        "c1": {"model": "text/model-1", "provider": "openai"},
+    }
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routing_source"] == "image_route"
+    assert routed.metadata["router_tier_provider_role"] == "direct"
+    assert routed.metadata["router_tier_provider_mismatch"] == "openai"
+    assert routed.metadata["routed_provider"] == "openai"
 
 
 @pytest.mark.asyncio

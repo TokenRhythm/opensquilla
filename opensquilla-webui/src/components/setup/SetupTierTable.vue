@@ -8,11 +8,13 @@
 //   • combobox   — that same input gains a provider-scoped catalog only when
 //                  a verified live listing exists (no remount on async arrival);
 //   • readonly   — preset preview: no editable controls at all.
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
+import Icon from '@/components/Icon.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type {
+  RouterProviderRoles,
   SetupProviderCredentialStatus,
   SetupProviderOption,
   SetupTierRow,
@@ -38,22 +40,30 @@ const props = withDefaults(defineProps<{
   // previews omit it and receive generic, still truthful shared-plan copy.
   fixedFallbackProvider?: string
   fixedFallbackModel?: string
-  ensemblePlanStatus?: 'ready' | 'attention'
+  ensemblePlanStatus?: 'ready' | 'attention' | 'blocked'
+  ensemblePlanBlockedReason?: string
+  ensembleFixedFallbackReady?: boolean | null
+  routerProviderRoles?: RouterProviderRoles
+  effectiveEnsembleSelectionMode?: string
 }>(), {
   disabled: false,
   readonly: false,
   modelsByProvider: () => ({}),
   providerOptions: () => [],
   providerCredentialStatus: () => [],
+  routerProviderRoles: () => ({}),
 })
 
 const emit = defineEmits<{
   updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
+  migrateLegacyEnsemble: []
 }>()
 
 const THINKING_LEVELS = ['', 'off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const ENSEMBLE_CHOICE = '__shared_ensemble__'
 const EMPTY_CATALOG: DiscoveredModelCatalog = { models: [], source: 'none' }
+const hoveredEnsembleDetails = ref('')
+const focusedEnsembleDetails = ref('')
 
 function catalogFor(row: SetupTierRow): DiscoveredModelCatalog {
   const provider = row.provider.trim().toLowerCase()
@@ -128,9 +138,9 @@ function legacyTierEnsembleActive(row: SetupTierRow): boolean {
 }
 
 function providerManagedByEnsemble(row: SetupTierRow): boolean {
-  // Only the new shared-plan contract makes the tier-local provider dormant.
-  // Legacy pinned modes still execute and fall back through this row.
-  return row.name === 'c3' && row.ensembleEnabled === true
+  if (row.name !== 'c3' || row.ensembleEnabled !== true) return false
+  const role = props.routerProviderRoles[row.name] || 'direct'
+  return role === 'dormant_draft' || role === 'blocked'
 }
 
 function rowFieldsDisabled(row: SetupTierRow): boolean {
@@ -171,11 +181,68 @@ function ensembleSummaryId(row: SetupTierRow): string {
   return `setup-tier-${row.name}-ensemble-summary`
 }
 
+function ensembleDetailsId(row: SetupTierRow): string {
+  return `setup-tier-${row.name}-ensemble-details`
+}
+
+function sharedTierEnsembleActive(row: SetupTierRow): boolean {
+  return row.name === 'c3' && row.ensembleEnabled === true
+}
+
+function legacyDynamicTierEnsembleActive(row: SetupTierRow): boolean {
+  if (row.name !== 'c3' || !tierEnsembleActive(row)) return false
+  if (legacyTierEnsembleActive(row)) return row.ensembleSelectionMode === 'router_dynamic'
+  return row.ensembleEnabled === true
+    && String(props.effectiveEnsembleSelectionMode || '').trim() === 'router_dynamic'
+}
+
+function compatibilityTierEnsembleActive(row: SetupTierRow): boolean {
+  return legacyTierEnsembleActive(row) || legacyDynamicTierEnsembleActive(row)
+}
+
+function effectiveTierEnsembleSelectionMode(row: SetupTierRow): string {
+  if (legacyTierEnsembleActive(row)) return String(row.ensembleSelectionMode || '').trim()
+  if (sharedTierEnsembleActive(row)) {
+    return String(props.effectiveEnsembleSelectionMode || '').trim()
+  }
+  return ''
+}
+
+function thinkingManagedByEnsemble(row: SetupTierRow): boolean {
+  return row.name === 'c3'
+    && tierEnsembleActive(row)
+    && effectiveTierEnsembleSelectionMode(row) !== 'router_dynamic'
+}
+
+function compactSharedTierEnsembleActive(row: SetupTierRow): boolean {
+  return sharedTierEnsembleActive(row) && !legacyDynamicTierEnsembleActive(row)
+}
+
 function ensemblePlanStatusLabel(): string {
+  if (props.ensemblePlanStatus === 'blocked') {
+    return t('setup.router.tierEnsemblePlanBlocked')
+  }
   return props.ensemblePlanStatus === 'attention'
     ? t('setup.router.tierEnsemblePlanAttention')
     : t('setup.router.tierEnsemblePlanReady')
 }
+
+const ensemblePlanBlockedReasonLabel = computed(() => {
+  const reason = String(props.ensemblePlanBlockedReason || '').trim().toLowerCase()
+  if (!reason) return ''
+  if (
+    props.ensembleFixedFallbackReady === false
+    || reason === 'missing_fixed_fallback'
+    || reason.startsWith('fixed_fallback:')
+  ) return t('setup.router.tierEnsembleBlockedFixedFallback')
+  if (reason === 'configuration_unavailable' || reason === 'unknown_selection_mode') {
+    return t('setup.router.tierEnsembleBlockedGeneric')
+  }
+  // Static/custom member credential and lineup failures, plus dynamic member
+  // resolution failures, all belong to the fusion plan rather than its valid
+  // fixed fallback target. Keep their remediation copy distinct.
+  return t('setup.router.tierEnsembleBlockedMember')
+})
 
 const fallbackContextProvided = computed(() => (
   props.fixedFallbackProvider !== undefined || props.fixedFallbackModel !== undefined
@@ -187,17 +254,20 @@ const hasExactFallbackTarget = computed(() => Boolean(
 ))
 
 function ensembleSummary(row: SetupTierRow): string {
-  if (legacyTierEnsembleActive(row)) {
+  if (compatibilityTierEnsembleActive(row)) {
+    const keyPrefix = legacyDynamicTierEnsembleActive(row)
+      ? 'tierLegacyDynamicEnsemble'
+      : 'tierLegacyEnsemble'
     if (hasExactFallbackTarget.value) {
-      return t('setup.router.tierLegacyEnsembleSummary', {
+      return t(`setup.router.${keyPrefix}Summary`, {
         provider: String(props.fixedFallbackProvider || '').trim(),
         model: String(props.fixedFallbackModel || '').trim(),
       })
     }
     if (fallbackContextProvided.value) {
-      return t('setup.router.tierLegacyEnsembleFallbackMissingSummary')
+      return t(`setup.router.${keyPrefix}FallbackMissingSummary`)
     }
-    return t('setup.router.tierLegacyEnsembleSummaryGeneric')
+    return t(`setup.router.${keyPrefix}SummaryGeneric`)
   }
   if (hasExactFallbackTarget.value) {
     return t('setup.router.tierEnsembleSummary', {
@@ -211,8 +281,61 @@ function ensembleSummary(row: SetupTierRow): string {
   return t('setup.router.tierEnsembleSummaryGeneric')
 }
 
+function showInlineEnsembleSummary(row: SetupTierRow): boolean {
+  if (compatibilityTierEnsembleActive(row)) return true
+  if (!sharedTierEnsembleActive(row)) return false
+  return props.ensemblePlanStatus !== 'ready' || !hasExactFallbackTarget.value
+}
+
+function showInlinePlanStatus(row: SetupTierRow): boolean {
+  return sharedTierEnsembleActive(row)
+    && Boolean(props.ensemblePlanStatus)
+    && props.ensemblePlanStatus !== 'ready'
+}
+
+function showInlineBlockedReason(row: SetupTierRow): boolean {
+  return showInlinePlanStatus(row) && Boolean(ensemblePlanBlockedReasonLabel.value)
+}
+
+function showInlineImageRule(row: SetupTierRow): boolean {
+  return row.name === 'c3' && compatibilityTierEnsembleActive(row)
+}
+
+function ensembleDescriptionId(row: SetupTierRow): string | undefined {
+  if (!tierEnsembleActive(row)) return undefined
+  return showInlineEnsembleSummary(row)
+    ? ensembleSummaryId(row)
+    : ensembleDetailsId(row)
+}
+
+function ensembleDetailsOpen(row: SetupTierRow): boolean {
+  const id = ensembleDetailsId(row)
+  return hoveredEnsembleDetails.value === id || focusedEnsembleDetails.value === id
+}
+
+function showEnsembleDetails(row: SetupTierRow, source: 'hover' | 'focus') {
+  const id = ensembleDetailsId(row)
+  if (source === 'hover') hoveredEnsembleDetails.value = id
+  else focusedEnsembleDetails.value = id
+}
+
+function hideEnsembleDetails(row: SetupTierRow, source: 'hover' | 'focus') {
+  const id = ensembleDetailsId(row)
+  if (source === 'hover' && hoveredEnsembleDetails.value === id) hoveredEnsembleDetails.value = ''
+  if (source === 'focus' && focusedEnsembleDetails.value === id) focusedEnsembleDetails.value = ''
+}
+
 function c3StateAnnouncement(row: SetupTierRow): string {
-  if (tierEnsembleActive(row)) return ensembleSummary(row)
+  if (tierEnsembleActive(row)) {
+    return [
+      sharedTierEnsembleActive(row) && props.ensemblePlanStatus
+        ? ensemblePlanStatusLabel()
+        : '',
+      sharedTierEnsembleActive(row) ? ensemblePlanBlockedReasonLabel.value : '',
+      ensembleSummary(row),
+      t('setup.router.tierEnsembleImageRouting'),
+    ].filter(Boolean).join(' ')
+  }
   return t('setup.router.tierSingleModelAnnouncement', { model: row.model || '-' })
 }
 
@@ -251,17 +374,19 @@ const showProviderColumn = computed(() => {
   ))
 })
 
-// The combobox dropdown is absolutely positioned; the table's rounded-corner
-// overflow clip would cut it off, so overflow opens up only when a combobox
-// is actually rendered.
+// The combobox dropdown and compact-plan tooltip are absolutely positioned;
+// the table's rounded-corner overflow clip must open whenever either floats.
 const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
+const allowsFloatingContent = computed(() => (
+  hasCombobox.value || props.rows.some(row => compactSharedTierEnsembleActive(row))
+))
 </script>
 
 <template>
   <div
     class="setup-tier-table"
     :class="{
-      'setup-tier-table--open': hasCombobox,
+      'setup-tier-table--open': allowsFloatingContent,
       'setup-tier-table--without-provider': !showProviderColumn,
     }"
     role="table"
@@ -321,33 +446,66 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
           <span
             class="setup-tier-table__readonly"
             :aria-label="modelFieldLabel(tier)"
-            :aria-describedby="tierEnsembleActive(tier) ? ensembleSummaryId(tier) : undefined"
+            :aria-describedby="ensembleDescriptionId(tier)"
             :title="tierEnsembleActive(tier) ? t('setup.router.tierUseEnsemble') : tier.model || undefined"
           >
             {{ tierEnsembleActive(tier) ? t('setup.router.tierUseEnsemble') : tier.model || '-' }}
           </span>
           <small
-            v-if="tierEnsembleActive(tier)"
+            v-if="showInlineEnsembleSummary(tier)"
             :id="ensembleSummaryId(tier)"
             class="setup-tier-table__model-note"
           >
             {{ ensembleSummary(tier) }}
           </small>
           <small
-            v-if="tierEnsembleActive(tier) && ensemblePlanStatus"
+            v-if="showInlinePlanStatus(tier)"
             class="setup-tier-table__plan-status"
-            :class="ensemblePlanStatus === 'attention' ? 'needs-attention' : 'is-ready'"
+            :class="ensemblePlanStatus === 'blocked' ? 'is-blocked' : 'needs-attention'"
           >{{ ensemblePlanStatusLabel() }}</small>
-          <small v-if="tier.name === 'c3' && tierEnsembleActive(tier)" class="setup-tier-table__model-note">
+          <small
+            v-if="showInlineBlockedReason(tier)"
+            class="setup-tier-table__blocked-reason"
+          >{{ ensemblePlanBlockedReasonLabel }}</small>
+          <small v-if="showInlineImageRule(tier)" class="setup-tier-table__model-note">
             {{ t('setup.router.tierEnsembleImageRouting') }}
           </small>
+          <span
+            v-if="compactSharedTierEnsembleActive(tier)"
+            class="setup-tier-table__ensemble-details"
+            @mouseenter="showEnsembleDetails(tier, 'hover')"
+            @mouseleave="hideEnsembleDetails(tier, 'hover')"
+          >
+            <button
+              type="button"
+              class="setup-tier-table__ensemble-details-trigger"
+              :aria-label="t('setup.router.tierEnsembleDetailsAria')"
+              :aria-describedby="ensembleDetailsId(tier)"
+              :data-open="ensembleDetailsOpen(tier) ? 'true' : 'false'"
+              @focus="showEnsembleDetails(tier, 'focus')"
+              @blur="hideEnsembleDetails(tier, 'focus')"
+            >
+              <Icon name="info" :size="13" aria-hidden="true" />
+            </button>
+            <span
+              :id="ensembleDetailsId(tier)"
+              class="setup-tier-table__ensemble-tooltip"
+              :class="{ 'is-open': ensembleDetailsOpen(tier) }"
+              role="tooltip"
+            >
+              <strong>{{ ensemblePlanStatusLabel() }}</strong>
+              <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
+              <span>{{ ensembleSummary(tier) }}</span>
+              <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
+            </span>
+          </span>
         </div>
         <span
           class="setup-tier-table__readonly"
-          :aria-label="providerManagedByEnsemble(tier)
+          :aria-label="thinkingManagedByEnsemble(tier)
             ? t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })
             : t('setup.router.tierThinkingAria', { tier: tier.name })"
-        >{{ providerManagedByEnsemble(tier) ? t('setup.router.tierThinkingManagedByEnsemble') : tier.thinkingLevel || '-' }}</span>
+        >{{ thinkingManagedByEnsemble(tier) ? t('setup.router.tierThinkingManagedByEnsemble') : tier.thinkingLevel || '-' }}</span>
         <ControlSwitch :checked="displayedImageSupport(tier)" :disabled="true" :aria-label="t('setup.router.tierImageAria', { tier: tier.name })" />
       </template>
       <template v-else>
@@ -360,7 +518,7 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
             :model-source="catalogFor(tier).source"
             :disabled="rowFieldsDisabled(tier)"
             :commit-on-select="tier.name === 'c3'"
-            :external-description-id="tierEnsembleActive(tier) ? ensembleSummaryId(tier) : undefined"
+            :external-description-id="ensembleDescriptionId(tier)"
             :leading-option="tier.name === 'c3' ? {
               value: ENSEMBLE_CHOICE,
               label: t('setup.router.tierUseEnsemble'),
@@ -369,23 +527,63 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
             @update="(val) => updateModelChoice(tier, val)"
           />
           <small
-            v-if="tierEnsembleActive(tier)"
+            v-if="showInlineEnsembleSummary(tier)"
             :id="ensembleSummaryId(tier)"
             class="setup-tier-table__model-note"
           >
             {{ ensembleSummary(tier) }}
           </small>
+          <button
+            v-if="legacyDynamicTierEnsembleActive(tier)"
+            type="button"
+            class="setup-inline-link setup-tier-table__legacy-migrate"
+            data-testid="tier-ensemble-migrate-legacy"
+            @click="emit('migrateLegacyEnsemble')"
+          >{{ t('setup.modelStrategy.legacyDynamicMigrate') }}</button>
           <small
-            v-if="tierEnsembleActive(tier) && ensemblePlanStatus"
+            v-if="showInlinePlanStatus(tier)"
             class="setup-tier-table__plan-status"
-            :class="ensemblePlanStatus === 'attention' ? 'needs-attention' : 'is-ready'"
+            :class="ensemblePlanStatus === 'blocked' ? 'is-blocked' : 'needs-attention'"
           >{{ ensemblePlanStatusLabel() }}</small>
-          <small v-if="tier.name === 'c3' && tierEnsembleActive(tier)" class="setup-tier-table__model-note">
+          <small
+            v-if="showInlineBlockedReason(tier)"
+            class="setup-tier-table__blocked-reason"
+          >{{ ensemblePlanBlockedReasonLabel }}</small>
+          <small v-if="showInlineImageRule(tier)" class="setup-tier-table__model-note">
             {{ t('setup.router.tierEnsembleImageRouting') }}
           </small>
+          <span
+            v-if="compactSharedTierEnsembleActive(tier)"
+            class="setup-tier-table__ensemble-details"
+            @mouseenter="showEnsembleDetails(tier, 'hover')"
+            @mouseleave="hideEnsembleDetails(tier, 'hover')"
+          >
+            <button
+              type="button"
+              class="setup-tier-table__ensemble-details-trigger"
+              :aria-label="t('setup.router.tierEnsembleDetailsAria')"
+              :aria-describedby="ensembleDetailsId(tier)"
+              :data-open="ensembleDetailsOpen(tier) ? 'true' : 'false'"
+              @focus="showEnsembleDetails(tier, 'focus')"
+              @blur="hideEnsembleDetails(tier, 'focus')"
+            >
+              <Icon name="info" :size="13" aria-hidden="true" />
+            </button>
+            <span
+              :id="ensembleDetailsId(tier)"
+              class="setup-tier-table__ensemble-tooltip"
+              :class="{ 'is-open': ensembleDetailsOpen(tier) }"
+              role="tooltip"
+            >
+              <strong>{{ ensemblePlanStatusLabel() }}</strong>
+              <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
+              <span>{{ ensembleSummary(tier) }}</span>
+              <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
+            </span>
+          </span>
         </div>
         <span
-          v-if="providerManagedByEnsemble(tier)"
+          v-if="thinkingManagedByEnsemble(tier)"
           class="setup-tier-table__readonly"
           :aria-label="t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })"
           :title="t('setup.router.tierThinkingManagedByEnsemble')"
@@ -442,6 +640,7 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
   display: grid;
   gap: 3px;
   min-width: 0;
+  position: relative;
 }
 
 .setup-tier-table__model-note {
@@ -449,6 +648,14 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
   font-size: 10px;
   line-height: 1.2;
   overflow-wrap: anywhere;
+}
+
+.setup-tier-table__legacy-migrate {
+  align-self: start;
+  font-size: 10px;
+  justify-self: start;
+  line-height: 1.2;
+  padding: 0;
 }
 
 .setup-tier-table__plan-status {
@@ -463,6 +670,78 @@ const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
 
 .setup-tier-table__plan-status.needs-attention {
   color: var(--warning-text, var(--text-muted));
+}
+
+.setup-tier-table__plan-status.is-blocked {
+  color: var(--danger);
+}
+
+.setup-tier-table__blocked-reason {
+  color: var(--danger);
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.setup-tier-table__ensemble-details {
+  align-items: center;
+  display: inline-flex;
+  justify-self: start;
+  position: relative;
+}
+
+.setup-tier-table__ensemble-details-trigger {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-full);
+  color: var(--text-dim);
+  cursor: help;
+  display: inline-flex;
+  height: 20px;
+  justify-content: center;
+  padding: 0;
+  width: 20px;
+}
+
+.setup-tier-table__ensemble-details-trigger:hover {
+  color: var(--text);
+}
+
+.setup-tier-table__ensemble-details-trigger:focus-visible {
+  color: var(--text);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.setup-tier-table__ensemble-tooltip {
+  background: var(--text);
+  border-radius: var(--radius-sm);
+  bottom: calc(100% + 7px);
+  box-shadow: var(--shadow-md);
+  color: var(--bg-elevated);
+  display: grid;
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  gap: 5px;
+  left: 0;
+  line-height: 1.4;
+  max-width: min(340px, 70vw);
+  opacity: 0;
+  padding: 8px 10px;
+  pointer-events: none;
+  position: absolute;
+  text-align: left;
+  visibility: hidden;
+  white-space: normal;
+  width: max-content;
+  z-index: 40;
+}
+
+.setup-tier-table__ensemble-tooltip.is-open,
+.setup-tier-table__ensemble-details:hover .setup-tier-table__ensemble-tooltip,
+.setup-tier-table__ensemble-details:focus-within .setup-tier-table__ensemble-tooltip {
+  opacity: 1;
+  visibility: visible;
 }
 
 .setup-tier-table__row.is-disabled:not(.is-head) {

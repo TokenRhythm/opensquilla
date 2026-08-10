@@ -54,6 +54,57 @@ describe('useSetupModelStrategyForm', () => {
     expect(ensembleDirtyForm.strategy.isDirty.value).toBe(true)
   })
 
+  it('marks saved tier-fusion runtime status stale after a local model-strategy edit', () => {
+    const router = useSetupRouterForm()
+    const ensemble = useSetupEnsembleForm()
+    router.initFromConfig({
+      enabled: true,
+      tiers: {
+        c3: { provider: 'openrouter', model: 'quality-model', ensemble_enabled: true },
+      },
+    }, {}, 'openrouter', 'custom', { c3: 'dormant_draft' }, 'custom_b5', false, {
+      selectionMode: 'custom_b5',
+      activationTiers: ['c3'],
+      runtimeStatus: 'ready',
+      configurationReady: true,
+      fixedFallbackReady: true,
+    })
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'custom_b5' })
+    const strategy = useSetupModelStrategyForm(
+      router,
+      ensemble,
+      computed(() => 'openrouter'),
+      undefined,
+      computed(() => 'fallback-model'),
+    )
+    strategy.initFixedModel()
+    const routerPanel = router.createPanel({
+      routerSummary: computed(() => ''),
+      ensembleProfileActive: computed(() => false),
+      hasSavedProvider: computed(() => true),
+      isOpenrouter: computed(() => true),
+      textTiers: ['c3'],
+      tierLabel: tier => tier,
+    })
+    const ensemblePanel = ensemble.createPanel({
+      statusText: computed(() => ''),
+      activeProvider: computed(() => 'openrouter'),
+      activeModel: computed(() => 'fallback-model'),
+    })
+    const strategyPanel = strategy.createPanel({
+      hasSavedProvider: computed(() => true),
+      providerLabel: computed(() => 'OpenRouter'),
+      routerPanel,
+      ensemblePanel,
+      routerTemplateState: computed(() => 'custom'),
+      fixedModelCatalog: computed(() => ({ models: [], source: 'none' as const })),
+    })
+
+    expect(strategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
+    router.updateTierField('c3', 'model', 'new-quality-model')
+    expect(strategyPanel.value.router.tierEnsembleStatusFresh).toBe(false)
+  })
+
   it('tracks the fixed model as part of Model Routing and emits only its config patch', () => {
     const { strategy } = makeForm()
 
@@ -111,6 +162,35 @@ describe('useSetupModelStrategyForm', () => {
     expect(ensemble.enabled.value).toBe(false)
     expect(router.mode.value).toBe('custom')
     expect(strategy.activeStrategy.value).toBe('router')
+  })
+
+  it('refreshes provider roles across local ensemble and router strategy transitions', () => {
+    const router = useSetupRouterForm()
+    const ensemble = useSetupEnsembleForm()
+    router.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model' },
+        c3: { provider: 'tokenrhythm', model: 'quality-model' },
+      },
+    }, {}, 'openrouter', 'custom', {
+      c0: 'direct',
+      c3: 'direct',
+    }, 'static_openrouter_b5', false)
+    ensemble.initFromConfig({ enabled: false, selection_mode: 'static_openrouter_b5' })
+    const strategy = useSetupModelStrategyForm(router, ensemble)
+
+    strategy.setStrategy('ensemble')
+    expect(router.routerProviderRoles.value).toEqual({
+      c0: 'dormant_draft',
+      c3: 'dormant_draft',
+    })
+
+    strategy.setStrategy('router')
+    expect(router.routerProviderRoles.value).toEqual({
+      c0: 'direct',
+      c3: 'direct',
+    })
   })
 
   it('re-enables a follow-primary router as the managed provider preset', () => {

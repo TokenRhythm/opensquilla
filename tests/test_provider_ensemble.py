@@ -6155,7 +6155,12 @@ def test_ensemble_runtime_status_counts_static_custom_and_dynamic() -> None:
     assert custom_status["perTurnCallCount"] == 3
 
     dynamic_cfg = GatewayConfig(
-        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"}
+        llm={
+            "provider": "tokenrhythm",
+            "model": "balanced",
+            "api_key": "sk_tr_abcdefghijklmnop",
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
     )
     dynamic_status = ensemble_runtime_status(dynamic_cfg)
     assert dynamic_status["runtimeStatus"] == "conditional"
@@ -6249,7 +6254,13 @@ def test_router_dynamic_applies_provider_policy_to_every_tier_candidate(
         turn_metadata={
             "routed_tier": "c1",
             "provider_state_continuity": (
-                {"decision": continuity_decision}
+                {
+                    "decision": continuity_decision,
+                    "candidate_provider": "openrouter",
+                    "candidate_model": "foreign-model",
+                    "active_state_provider": "tokenrhythm",
+                    "portable_fallback_available": False,
+                }
                 if continuity_decision
                 else {}
             ),
@@ -6279,6 +6290,306 @@ def test_router_dynamic_applies_provider_policy_to_every_tier_candidate(
         assert blocked_candidates[0]["provider"] == "openrouter"
         assert blocked_candidates[0]["model"] == "foreign-model"
         assert blocked_candidates[0]["reason"] == expected_blocked_reason
+
+
+@pytest.mark.parametrize(
+    ("continuity", "foreign_allowed"),
+    [
+        (
+            {
+                "decision": "keep_provider",
+                "candidate_provider": "tokenrhythm",
+                "candidate_model": "balanced",
+                "active_state_provider": "tokenrhythm",
+                "portable_fallback_available": False,
+            },
+            False,
+        ),
+        (
+            {
+                "decision": "discard_provider_state",
+                "candidate_provider": "tokenrhythm",
+                "candidate_model": "balanced",
+                "active_state_provider": "openrouter",
+                "portable_fallback_available": False,
+            },
+            True,
+        ),
+    ],
+    ids=["foreign-loses-native-state", "foreign-owns-native-state"],
+)
+def test_router_dynamic_re_evaluates_continuity_for_each_candidate_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    continuity: dict[str, object],
+    foreign_allowed: bool,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    baseline = ProviderConfig(
+        provider="tokenrhythm",
+        model="balanced",
+        api_key="sk-tr-synthetic",
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": baseline.provider,
+            "model": baseline.model,
+            "api_key": baseline.api_key,
+        },
+        llm_profiles={
+            "openrouter": {
+                "provider": "openrouter",
+                "model": "foreign-model",
+                "api_key": "sk-or-synthetic",
+            }
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+            "tiers": {
+                "c0": {"provider": "openrouter", "model": "foreign-model"},
+                "c1": {"provider": "tokenrhythm", "model": "balanced"},
+            },
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=baseline,
+        fallback_provider=None,
+        turn_metadata={
+            "routed_tier": "c1",
+            "provider_state_continuity": continuity,
+        },
+        _dynamic_baseline_provider_config=baseline,
+    )
+
+    foreign_candidates = [
+        candidate
+        for candidate in provider.selection_plan["candidate_pool"]
+        if candidate["provider"] == "openrouter"
+    ]
+    blocked_foreign = [
+        candidate
+        for candidate in provider.selection_plan["blocked_tier_candidates"]
+        if candidate["provider"] == "openrouter"
+    ]
+    if foreign_allowed:
+        assert len(foreign_candidates) == 1
+        assert blocked_foreign == []
+    else:
+        assert foreign_candidates == []
+        assert blocked_foreign[0]["reason"] == "provider_state_continuity"
+
+
+def test_router_dynamic_foreign_anchor_reuses_live_baseline_deployment() -> None:
+    baseline = ProviderConfig(
+        provider="tokenrhythm",
+        model="fixed-model",
+        api_key="sk-tr-inline",
+        base_url="https://tokenrhythm.example/v1",
+    )
+    foreign_anchor = ProviderConfig(
+        provider="openrouter",
+        model="z-ai/glm-5.2",
+        api_key="sk-or-inline",
+        base_url="https://openrouter.ai/api/v1",
+        replay_provider_state=False,
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": baseline.provider,
+            "model": baseline.model,
+            "api_key": baseline.api_key,
+            "base_url": baseline.base_url,
+        },
+        llm_profiles={
+            "openrouter": {
+                "provider": "openrouter",
+                "model": foreign_anchor.model,
+                "api_key": foreign_anchor.api_key,
+            }
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+            "tiers": {
+                "c0": {"provider": "tokenrhythm", "model": "cheap"},
+                "c1": {"provider": "tokenrhythm", "model": "balanced"},
+                "c2": {"provider": "tokenrhythm", "model": "strong"},
+                "c3": {"provider": "openrouter", "model": foreign_anchor.model},
+            },
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=baseline,
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c3", "routing_applied": True},
+        _plan_provider_config=foreign_anchor,
+        _dynamic_baseline_provider_config=baseline,
+    )
+
+    baseline_members = [
+        member
+        for member in [*provider.proposers, provider.aggregator]
+        if member.provider_config.provider == "tokenrhythm"
+    ]
+    assert baseline_members
+    assert all(member.ready for member in baseline_members)
+    assert all(
+        member.provider_config.api_key == baseline.api_key
+        for member in baseline_members
+    )
+    assert all(
+        member.provider_config.base_url == baseline.base_url
+        for member in baseline_members
+    )
+
+
+def test_ensemble_runtime_status_blocks_missing_fixed_fallback() -> None:
+    config = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "",
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_tokenrhythm_b5",
+        },
+    )
+
+    status = ensemble_runtime_status(config)
+
+    assert status["runtimeStatus"] == "blocked"
+    assert status["configurationReady"] is False
+    assert status["blockedReason"] == "missing_fixed_fallback"
+    assert status["fixedFallbackReady"] is False
+    assert status["fixedFallbackBlockedReason"] == "missing_fixed_fallback"
+    assert status["fixedFallbackProvider"] == "tokenrhythm"
+    assert status["fixedFallbackModel"] == ""
+
+
+@pytest.mark.parametrize(
+    ("cross_provider_tiers", "mismatch_policy", "expected_status", "expected_reason"),
+    [
+        (True, "route", "blocked", "router_dynamic_not_ready:missing_credential"),
+        (False, "veto", "conditional", None),
+    ],
+    ids=["runtime-blocker", "veto-is-not-runtime-blocker"],
+)
+def test_router_dynamic_status_uses_runtime_tier_blocker_rules(
+    monkeypatch: pytest.MonkeyPatch,
+    cross_provider_tiers: bool,
+    mismatch_policy: str,
+    expected_status: str,
+    expected_reason: str | None,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "balanced",
+            "api_key": "sk-tr-synthetic",
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": cross_provider_tiers,
+            "tier_provider_mismatch": mismatch_policy,
+            "tiers": {
+                "c0": {"provider": "openrouter", "model": "foreign-fast"},
+                "c1": {"provider": "tokenrhythm", "model": "balanced"},
+            },
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    status = ensemble_runtime_status(config)
+
+    assert status["runtimeStatus"] == expected_status
+    assert status["blockedReason"] == expected_reason
+    assert status["blockedTierCandidates"] == [
+        {
+            "source": "router_tier:c0",
+            "provider": "openrouter",
+            "model": "foreign-fast",
+            "reason": (
+                "missing_credential"
+                if cross_provider_tiers
+                else "cross_provider_veto"
+            ),
+        }
+    ]
+
+
+def test_router_dynamic_consumes_only_canonical_text_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    baseline = ProviderConfig(
+        provider="tokenrhythm",
+        model="balanced",
+        api_key="sk-tr-synthetic",
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": baseline.provider,
+            "model": baseline.model,
+            "api_key": baseline.api_key,
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+            "tiers": {
+                # The canonical key wins over its retained legacy alias.
+                "t0": {"provider": "openrouter", "model": "legacy-foreign"},
+                "c0": {"provider": "tokenrhythm", "model": "canonical-fast"},
+                "c1": {"provider": "tokenrhythm", "model": "balanced-tier"},
+                "image_model": {
+                    "provider": "openrouter",
+                    "model": "vision/unavailable",
+                    "supports_image": True,
+                    "image_only": True,
+                },
+                "unknown_tier": {
+                    "provider": "anthropic",
+                    "model": "unknown/unavailable",
+                },
+            },
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=baseline,
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c1"},
+        _dynamic_baseline_provider_config=baseline,
+    )
+    status = ensemble_runtime_status(config)
+
+    tier_candidates = [
+        candidate
+        for candidate in provider.selection_plan["candidate_pool"]
+        if candidate["source"].startswith("router_tier:")
+    ]
+    assert {(row["source"], row["model"]) for row in tier_candidates} == {
+        ("router_tier:c0", "canonical-fast"),
+        ("router_tier:c1", "balanced-tier"),
+    }
+    assert provider.selection_plan["blocked_tier_candidates"] == []
+    assert status["runtimeStatus"] == "conditional"
+    assert status["blockedTierCandidates"] == []
+    assert status["memberProviders"] == ["tokenrhythm"]
 
 
 def test_ensemble_runtime_status_checks_inherited_custom_aggregator_credential(

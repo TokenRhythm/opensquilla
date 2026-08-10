@@ -405,6 +405,44 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       crossProviderTiers: true,
       tierProviderMismatch: 'veto',
     })
+    expect(f.tierEnsembleStatus.value).toBeNull()
+  })
+
+  it('normalizes additive saved tier-fusion runtime status from the Router card', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c3: {
+          provider: 'openrouter',
+          model: 'quality-model',
+          ensemble_enabled: true,
+        },
+      },
+    }, {}, 'openrouter', 'custom', { c3: 'dynamic_member' }, 'router_dynamic', false, {
+      selectionMode: 'router_dynamic',
+      activationTiers: ['C3'],
+      tierSelectionModes: { C3: 'router_dynamic' },
+      runtimeStatus: 'conditional',
+      configurationReady: null,
+      blockedReason: null,
+      blockedTierCandidates: [{ source: 'router_tier:c0', reason: 'cross_provider_veto' }],
+      fixedFallbackReady: true,
+      fixedFallbackBlockedReason: null,
+    })
+
+    expect(f.tierEnsembleStatus.value).toEqual({
+      selectionMode: 'router_dynamic',
+      activationTiers: ['c3'],
+      tierSelectionModes: { c3: 'router_dynamic' },
+      runtimeStatus: 'conditional',
+      configurationReady: null,
+      blockedReason: '',
+      blockedTierCandidates: [{ source: 'router_tier:c0', reason: 'cross_provider_veto' }],
+      fixedFallbackReady: true,
+      fixedFallbackBlockedReason: '',
+    })
+    expect(makePanel(f, true).value.tierEnsembleStatus?.runtimeStatus).toBe('conditional')
   })
 
   it('includes a router_dynamic C3 member while accepting richer role objects', () => {
@@ -426,6 +464,206 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     expect(f.routerProviderRoles.value).toEqual({ c3: 'dynamic_member' })
     expect(f.hasMixedTierProviders.value).toBe(true)
     expect(makePanel(f, true).value.routerProviderRoles).toEqual({ c3: 'dynamic_member' })
+  })
+
+  it('recomputes a stale dormant C3 role when the local draft switches to one model', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model' },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'saved-c3-draft',
+          ensemble_enabled: true,
+        },
+      },
+    }, {}, 'openrouter', 'custom', {
+      c0: 'direct',
+      c3: 'dormant_draft',
+    }, 'custom_b5', false)
+
+    expect(f.hasMixedTierProviders.value).toBe(false)
+
+    f.updateTierField('c3', 'ensembleEnabled', false)
+    f.updateTierField('c3', 'ensembleSelectionMode', '')
+
+    expect(f.routerProviderRoles.value).toEqual({
+      c0: 'direct',
+      c3: 'direct',
+    })
+    expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).toMatchObject({
+      crossProviderTiers: true,
+      tierProviderMismatch: 'veto',
+    })
+  })
+
+  it('keeps authoritative server roles when the local ensemble context did not change', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c3: { provider: 'openrouter', model: 'quality-model', ensemble_enabled: true },
+      },
+    }, {}, 'openrouter', 'custom', { c3: 'blocked' }, 'custom_b5', false)
+
+    f.setEnsembleContext('custom_b5', false)
+
+    expect(f.routerProviderRoles.value).toEqual({ c3: 'blocked' })
+  })
+
+  it('recomputes a stale direct C3 role when the local draft selects shared fusion', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model' },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'saved-c3-draft',
+          ensemble_enabled: false,
+        },
+      },
+    }, {}, 'openrouter', 'custom', {
+      c0: 'direct',
+      c3: 'direct',
+    }, 'custom_b5', false)
+
+    expect(f.hasMixedTierProviders.value).toBe(true)
+
+    f.updateTierField('c3', 'ensembleEnabled', true)
+    f.updateTierField('c3', 'ensembleSelectionMode', '')
+
+    expect(f.routerProviderRoles.value).toEqual({
+      c0: 'direct',
+      c3: 'dormant_draft',
+    })
+    expect(f.hasMixedTierProviders.value).toBe(false)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
+    expect(f.payload()).not.toHaveProperty('tierProviderMismatch')
+  })
+
+  it('derives all text tiers as dynamic members for an active router_dynamic plan', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model', thinking_level: 'low' },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'quality-model',
+          thinking_level: 'high',
+          ensemble_enabled: true,
+        },
+        image_model: { provider: 'openai', model: 'vision-model' },
+      },
+    }, {}, 'openrouter', 'custom', {
+      c0: 'dynamic_member',
+      c3: 'dynamic_member',
+      image_model: 'direct',
+    }, 'router_dynamic', false)
+
+    f.setEnsembleContext('router_dynamic', false)
+    f.updateTierField('c3', 'provider', 'deepseek')
+    f.updateTierField('c3', 'thinkingLevel', 'xhigh')
+
+    expect(f.routerProviderRoles.value).toEqual({
+      c0: 'dynamic_member',
+      c3: 'dynamic_member',
+      image_model: 'direct',
+    })
+    expect(f.payload()).toMatchObject({
+      tiers: {
+        c3: {
+          provider: 'deepseek',
+          model: '',
+          thinkingLevel: 'xhigh',
+          ensembleEnabled: true,
+        },
+      },
+    })
+  })
+
+  it('does not revive retained legacy dynamic metadata after C3 explicitly switches to one model', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model' },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'quality-model',
+          ensemble_selection_mode: 'router_dynamic',
+        },
+      },
+    }, {}, 'openrouter', 'custom', undefined, 'static_openrouter_b5', false)
+
+    f.setEnsembleContext('custom_b5', false)
+    expect(f.routerProviderRoles.value.c3).toBe('dynamic_member')
+
+    f.updateTierField('c3', 'ensembleEnabled', false)
+
+    expect(f.routerProviderRoles.value).toEqual({
+      c0: 'direct',
+      c3: 'direct',
+    })
+  })
+
+  it('marks every text tier dormant while global static fusion is active', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model' },
+        c3: { provider: 'tokenrhythm', model: 'quality-model' },
+        image_model: { provider: 'openai', model: 'vision-model' },
+      },
+    }, {}, 'openrouter', 'custom', undefined, 'static_openrouter_b5', false)
+
+    f.setEnsembleContext('static_openrouter_b5', true)
+
+    expect(f.routerProviderRoles.value).toEqual({
+      c0: 'dormant_draft',
+      c3: 'dormant_draft',
+      image_model: 'direct',
+    })
+  })
+
+  it('keeps a retained legacy static tier direct while global fusion is locally enabled', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: { provider: 'openrouter', model: 'fast-model', thinking_level: 'low' },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'legacy-quality-model',
+          thinking_level: 'high',
+          ensemble_selection_mode: 'static_tokenrhythm_b5',
+        },
+      },
+    }, {}, 'openrouter', 'custom', {
+      c0: 'direct',
+      c3: 'direct',
+    }, 'static_openrouter_b5', false)
+
+    f.setEnsembleContext('custom_b5', true)
+
+    expect(f.routerProviderRoles.value).toEqual({
+      c0: 'dormant_draft',
+      c3: 'direct',
+    })
+    expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).toMatchObject({
+      tiers: {
+        c3: {
+          provider: 'tokenrhythm',
+          thinkingLevel: 'high',
+          ensembleSelectionMode: 'static_tokenrhythm_b5',
+        },
+      },
+    })
   })
 
   it('uses server roles for every tier and defaults missing older-Gateway entries to direct', () => {

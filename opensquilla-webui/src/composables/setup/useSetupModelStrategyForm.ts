@@ -91,6 +91,10 @@ export function useSetupModelStrategyForm(
         activeProvider?.value,
         tierCandidates?.value ?? [],
       )
+      routerForm.setEnsembleContext(
+        ensembleForm.selectionMode.value,
+        ensembleForm.enabled.value,
+      )
       return
     }
     if (next === 'router') {
@@ -98,10 +102,18 @@ export function useSetupModelStrategyForm(
       if (routerForm.mode.value === 'disabled' || routerForm.mode.value === 'openrouter-mix') {
         routerForm.enableFromSavedBinding()
       }
+      routerForm.setEnsembleContext(
+        ensembleForm.selectionMode.value,
+        ensembleForm.enabled.value,
+      )
       return
     }
     ensembleForm.setEnabled(false)
     routerForm.setRouterMode('disabled')
+    routerForm.setEnsembleContext(
+      ensembleForm.selectionMode.value,
+      ensembleForm.enabled.value,
+    )
   }
 
   function createPanel(context: ModelStrategyPanelContext) {
@@ -115,7 +127,13 @@ export function useSetupModelStrategyForm(
       hasSavedProvider: context.hasSavedProvider.value,
       providerLabel: context.providerLabel.value,
       routerTemplateState: context.routerTemplateState.value,
-      router: context.routerPanel.value,
+      router: {
+        ...context.routerPanel.value,
+        // Runtime readiness is a snapshot of the last saved configuration.
+        // Once any routing, lineup, or fixed-fallback field changes locally,
+        // the UI must fall back to conservative draft validation until save.
+        tierEnsembleStatusFresh: !isDirty.value,
+      },
       ensemble: context.ensemblePanel.value,
       single: {
         providerId,

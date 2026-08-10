@@ -235,7 +235,13 @@ def test_selection_mode_only_upsert_keeps_all_other_keys() -> None:
     assert ensemble.min_successful_proposers == 2
     assert ensemble.target_successful_proposers == 3
     assert ensemble.proposer_max_retries == 2
-    assert ensemble.all_failed_policy == "error"
+    # The old value remains loadable, then migrates only at an intentional
+    # Ensemble write boundary.
+    assert ensemble.all_failed_policy == "fallback_single"
+    assert res.warnings == [
+        "llm_ensemble.all_failed_policy=error is deprecated; "
+        "fusion failures now use the configured fixed/direct model"
+    ]
     assert res.restart_required is False
 
 

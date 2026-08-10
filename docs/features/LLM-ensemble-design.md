@@ -310,11 +310,14 @@ selection_mode = "static_openrouter_b5"
 min_successful_proposers = 3
 target_successful_proposers = 4
 proposer_max_retries = 2
-all_failed_policy = "error"
 ```
 
-This never falls back to a single model: four successful drafts are preferred,
-three are accepted after retries, and two or fewer terminate the ensemble turn.
+Four successful drafts are preferred and three are accepted after retries. If
+the lineup cannot reach quorum, or if the aggregator cannot complete, the turn
+uses the provider and model configured in `[llm]` as the fixed fallback. Older
+configs may still contain `all_failed_policy = "error"`; the value remains
+loadable for upgrade compatibility, but its effective behavior is
+`fallback_single` and the next Ensemble save normalizes it.
 
 ---
 

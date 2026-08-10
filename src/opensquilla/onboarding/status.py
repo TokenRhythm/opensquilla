@@ -190,6 +190,11 @@ _ENSEMBLE_ONBOARDING_STATUS_KEYS = (
     "configuredAllFailedPolicy",
     "effectiveAllFailedPolicy",
     "policyDeprecated",
+    "fixedFallbackReady",
+    "fixedFallbackBlockedReason",
+    "fixedFallbackProvider",
+    "fixedFallbackModel",
+    "blockedTierCandidates",
 )
 
 
@@ -206,6 +211,7 @@ def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
         or "fallback_single"
     ).strip()
     if not globally_enabled:
+        llm = getattr(cfg, "llm", None)
         selection_mode = str(
             getattr(getattr(cfg, "llm_ensemble", None), "selection_mode", "") or ""
         )
@@ -224,6 +230,15 @@ def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
             "configuredAllFailedPolicy": configured_policy,
             "effectiveAllFailedPolicy": "fallback_single",
             "policyDeprecated": configured_policy != "fallback_single",
+            # The global card is intentionally a top-level-toggle projection.
+            # When it is disabled, readiness is not evaluated here; active
+            # tier-local plans expose their truthful fallback status on the
+            # Router card instead.
+            "fixedFallbackReady": None,
+            "fixedFallbackBlockedReason": None,
+            "fixedFallbackProvider": str(getattr(llm, "provider", "") or ""),
+            "fixedFallbackModel": str(getattr(llm, "model", "") or ""),
+            "blockedTierCandidates": [],
         }
     else:
         # Runtime readiness may resolve several provider credentials. Avoid
@@ -239,6 +254,42 @@ def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
             configured_policy != str(runtime["effectiveAllFailedPolicy"]),
         )
     return {key: runtime.get(key) for key in _ENSEMBLE_ONBOARDING_STATUS_KEYS}
+
+
+_TIER_ENSEMBLE_STATUS_KEYS = (
+    "selectionMode",
+    "activationTiers",
+    "tierSelectionModes",
+    "runtimeStatus",
+    "configurationReady",
+    "blockedReason",
+    "blockedTierCandidates",
+    "fixedFallbackReady",
+    "fixedFallbackBlockedReason",
+)
+
+
+def _tier_ensemble_onboarding_statuses(
+    cfg: GatewayConfig,
+) -> dict[str, dict[str, object]]:
+    """Project each active tier-local fusion plan onto the Router card.
+
+    The global Ensemble card intentionally mirrors only the top-level toggle
+    for older clients.  Per-tier rows prevent mixed legacy profiles from
+    borrowing whichever selection mode happens to appear first in a mapping.
+    A globally enabled plan is not tier-local, but retained legacy overrides
+    remain visible because runtime still honors them for upgrade compatibility.
+    """
+
+    from opensquilla.provider.ensemble import tier_ensemble_runtime_statuses
+
+    statuses: dict[str, dict[str, object]] = {}
+    for tier, runtime in tier_ensemble_runtime_statuses(cfg).items():
+        statuses[tier] = {
+            key: runtime.get(key)
+            for key in _TIER_ENSEMBLE_STATUS_KEYS
+        }
+    return statuses
 
 
 def _ensemble_detail(cfg: GatewayConfig) -> str:
@@ -842,6 +893,7 @@ def _router_provider_conflicts(cfg: GatewayConfig) -> tuple[str, ...]:
                 tier,
                 shared_selection_mode=shared_selection_mode,
                 router_dynamic_members_active=dynamic_members_active,
+                ensemble_globally_enabled=ensemble_globally_enabled,
             )
             if provider_role not in {"direct", "dynamic_member"}:
                 continue
@@ -1164,6 +1216,13 @@ def get_onboarding_status(
             ensemble_globally_enabled=bool(
                 getattr(getattr(config, "llm_ensemble", None), "enabled", False)
             ),
+        )
+        tier_ensemble_statuses = _tier_ensemble_onboarding_statuses(config)
+        section_details["router"]["tierEnsembleStatuses"] = tier_ensemble_statuses
+        # Compatibility field for the current C3 editor.  Its meaning is now
+        # explicit: never infer C3 readiness from another tier's legacy mode.
+        section_details["router"]["tierEnsembleStatus"] = (
+            tier_ensemble_statuses.get("c3")
         )
     if "ensemble" in section_details:
         section_details["ensemble"].update(_ensemble_onboarding_status(config))

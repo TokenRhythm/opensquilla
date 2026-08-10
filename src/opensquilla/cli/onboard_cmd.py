@@ -1477,7 +1477,11 @@ def configure_command(
     all_failed_policy: str = typer.Option(
         "",
         "--all-failed-policy",
-        help="Policy when all proposers fail: fallback_single or error.",
+        # Kept as a hidden compatibility input for older automation.  The
+        # runtime has one supported failure outcome and the mutation layer
+        # canonicalizes legacy ``error`` writes with an explicit warning.
+        hidden=True,
+        help="Deprecated compatibility option; fusion failures use fallback_single.",
         rich_help_panel="LLM ensemble",
     ),
     search_provider: str = typer.Option(
@@ -1666,7 +1670,7 @@ def configure_command(
                     if piece.strip()
                 ]
                 engine = SetupEngine(path=config_path)
-                engine.apply(
+                mutation = engine.apply(
                     "ensemble",
                     {
                         "enabled": enabled,
@@ -1677,6 +1681,8 @@ def configure_command(
                     },
                 )
                 result = engine.persist()
+                for warning in mutation.warnings:
+                    console.print(warning_panel(warning))
                 _print_saved_path(result.path)
                 _print_restart_guidance(result, config_path)
                 return

@@ -129,9 +129,10 @@ class TierConfig:
     # ``llm_ensemble`` plan. ``None`` preserves pre-field configs, whose
     # explicit ``ensemble_selection_mode`` remains a legacy override.
     ensemble_enabled: bool | None = None
-    # Optional execution override for a router tier.  A non-empty value asks
-    # the runtime to wrap that tier in an already-configured Ensemble profile
-    # while keeping ``model`` as the deterministic single-model fallback.
+    # Optional execution override for a router tier. A non-empty value asks
+    # the runtime to wrap that tier in an already-configured Ensemble profile.
+    # ``model`` remains the reversible tier draft/lineup anchor; all Ensemble
+    # failures use the fixed provider and model from ``[llm]``.
     ensemble_selection_mode: str = ""
 
     @classmethod
@@ -170,30 +171,53 @@ def tier_provider_role(
     *,
     shared_selection_mode: str,
     router_dynamic_members_active: bool = False,
+    ensemble_globally_enabled: bool = False,
 ) -> TierProviderRole:
     """Return the execution role owned by one stored tier provider.
 
     C3's shared-plan flag does not by itself make the retained provider/model
     dormant. Static and custom shared plans own their complete lineup, so the
-    C3 deployment is only a single-model draft. An active ``router_dynamic``
-    plan instead derives members from every text Router tier, so those rows
-    are execution dependencies. Legacy tier-local plans and ordinary tiers
-    remain direct dependencies. An absent or unknown shared plan is blocked;
-    treating it as dormant would hide the configuration error, while treating
-    it as direct would accidentally execute a draft deployment.
+    C3 deployment is only a single-model draft. A globally enabled static or
+    custom plan likewise owns physical execution for every routed request;
+    Router rows remain logical decisions, but their stored provider/model
+    values are drafts until the global plan is disabled. An active
+    ``router_dynamic`` plan instead derives members from every text Router
+    tier, so those rows are execution dependencies. Legacy tier-local plans
+    and ordinary tiers remain direct dependencies. An absent or unknown
+    shared plan is blocked; treating it as dormant would hide the configuration
+    error, while treating it as direct would accidentally execute a draft deployment.
     """
 
     normalized_tier = normalize_text_tier(tier)
     config = TierConfig.from_value(value)
+    selection_mode = str(shared_selection_mode or "").strip()
+    if normalized_tier is None:
+        # Image and extension tiers are selected directly for their capability;
+        # they never become members or drafts of a text Ensemble plan.
+        return "direct"
     if router_dynamic_members_active and normalized_tier in TEXT_TIERS:
         return "dynamic_member"
+    if config.ensemble_enabled is None and config.ensemble_selection_mode:
+        # A retained pre-boolean mode still owns its routed turn. Dynamic
+        # membership was handled above; fixed legacy profiles keep this tier's
+        # deployment as a direct plan anchor/credential source.
+        return "direct"
+    if (
+        ensemble_globally_enabled
+        and selection_mode
+        in {
+            "static_openrouter_b5",
+            "static_tokenrhythm_b5",
+            "custom_b5",
+        }
+    ):
+        return "dormant_draft"
     if (
         normalized_tier != HIGHEST_TEXT_TIER
         or config.ensemble_enabled is not True
     ):
         return "direct"
 
-    selection_mode = str(shared_selection_mode or "").strip()
     if selection_mode == "router_dynamic":
         return "dynamic_member"
     if selection_mode in {
@@ -225,6 +249,7 @@ def router_tier_provider_roles(
             value,
             shared_selection_mode=shared_selection_mode,
             router_dynamic_members_active=dynamic_members_active,
+            ensemble_globally_enabled=ensemble_globally_enabled,
         )
         for tier, value in normalized.items()
     }
@@ -240,13 +265,19 @@ def router_dynamic_tier_members_active(
 
     normalized = normalize_tier_mapping(tiers)
     c3 = TierConfig.from_value(normalized.get(HIGHEST_TEXT_TIER))
-    return (
-        str(shared_selection_mode or "").strip() == "router_dynamic"
-        and (ensemble_globally_enabled or c3.ensemble_enabled is True)
-    ) or any(
-        TierConfig.from_value(value).ensemble_selection_mode == "router_dynamic"
-        for value in normalized.values()
-    )
+    selection_mode = str(shared_selection_mode or "").strip()
+    for tier in TEXT_TIERS:
+        config = TierConfig.from_value(normalized.get(tier))
+        if (
+            config.ensemble_enabled is None
+            and config.ensemble_selection_mode == "router_dynamic"
+        ):
+            return True
+    if ensemble_globally_enabled:
+        return selection_mode == "router_dynamic"
+    if selection_mode == "router_dynamic" and c3.ensemble_enabled is True:
+        return True
+    return False
 
 
 def tier_provider_is_dormant(

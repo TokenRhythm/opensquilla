@@ -8189,6 +8189,39 @@ class TurnRunner:
             pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
 
+        # Image routing is a capability boundary, not an Ensemble activation.
+        # This applies to the dedicated image row and to any text tier selected
+        # as the image-capable fallback.  Resolve that deployment through the
+        # normal selector path before touching fixed-fallback or fusion state.
+        if (
+            turn.metadata.get("routing_applied") is True
+            and str(turn.metadata.get("routing_source") or "") == "image_route"
+        ):
+            if turn.model and cloned_selector is not None:
+                from opensquilla.engine.selector_override import (
+                    apply_model_override,
+                    cross_provider_tier_config,
+                )
+
+                provider = apply_model_override(
+                    cloned_selector,
+                    turn.model,
+                    turn_metadata=turn.metadata,
+                    realign_routed_model=False,
+                    tier_provider_config=cross_provider_tier_config(
+                        self._turn_config(),
+                        turn.metadata,
+                        turn.model,
+                        active_provider_id=getattr(
+                            cloned_selector,
+                            "active_provider_id",
+                            "",
+                        ),
+                        session_key=turn.session_key,
+                    ),
+                )
+            return turn, provider
+
         ensemble_cfg = getattr(self._turn_config(), "llm_ensemble", None)
         # Resolve the tier's execution contract before changing the selector.
         # A shared tier uses C3 only as the logical trigger for the one global
@@ -8207,6 +8240,9 @@ class TurnRunner:
                 shared_selection_mode=configured_selection_mode,
             )
         ensemble_globally_enabled = bool(getattr(ensemble_cfg, "enabled", False))
+        # Retained pre-boolean tier modes remain authoritative for upgrade
+        # compatibility.  ``tier_ensemble_execution`` already makes either
+        # explicit boolean value win over that legacy field.
         selection_mode = tier_ensemble_mode or configured_selection_mode
         # Every active Ensemble uses the configured fixed/direct deployment as
         # its physical baseline and all-failed fallback. Legacy tier-local
@@ -8267,6 +8303,7 @@ class TurnRunner:
             turn.metadata["ensemble_fallback_reason"] = reason
             turn.metadata["routed_provider_fallback_provider"] = provider_id
             turn.metadata["routed_provider_fallback_model"] = model_id
+            turn.metadata["routed_provider_fallback_reason"] = reason
             for key in (
                 "savings_pct",
                 "savings_max_price_per_m",
@@ -8275,7 +8312,8 @@ class TurnRunner:
                 if key in turn.metadata:
                     turn.metadata[key] = 0.0
         routed_plan_owns_tier = (
-            selection_mode == "router_dynamic" or tier_ensemble_binding == "legacy"
+            selection_mode == "router_dynamic"
+            or tier_ensemble_binding == "legacy"
         )
         if (
             fixed_baseline_ensemble
@@ -8418,6 +8456,7 @@ class TurnRunner:
             from opensquilla.provider.ensemble import (
                 CUSTOM_B5_SELECTION_MODE,
                 build_ensemble_provider_from_config,
+                custom_b5_lineup_ready,
                 static_b5_credential_available,
                 static_b5_profile,
             )
@@ -8467,21 +8506,19 @@ class TurnRunner:
                     str(turn.metadata["ensemble_wrap_skipped_reason"])
                 )
                 return turn, provider
-            # The shared deployment resolver marks an unexecutable member
-            # unavailable before any network call. Keep the ensemble wrapper so
-            # custom lineups can retain quorum semantics when only one provider
-            # is unavailable; only a structurally empty lineup is rejected here.
-            custom_has_proposer = (
-                any(
-                    getattr(candidate, "enabled", True) is not False
-                    and str(getattr(candidate, "provider", "") or "").strip()
-                    and str(getattr(candidate, "model", "") or "").strip()
-                    and str(getattr(candidate, "role", "") or "").strip().lower()
-                    != "aggregator"
-                    for candidate in (getattr(ensemble_cfg, "candidates", None) or [])
+            # A custom plan is one saved lineup.  Preflight every deployment
+            # with the same session credential resolver used by construction;
+            # a partial saved lineup must fall back before any member call,
+            # matching the configuration/runtime status contract.
+            custom_lineup_ready, custom_lineup_blocked_reason = (
+                custom_b5_lineup_ready(
+                    self._turn_config(),
+                    plan_provider_config,
+                    credential_pool_acquirer=acquire_profile_credential,
+                    session_key=turn.session_key,
                 )
                 if selection_mode == CUSTOM_B5_SELECTION_MODE
-                else True
+                else (True, "")
             )
             if current_provider_config is None:
                 log.warning(
@@ -8533,23 +8570,31 @@ class TurnRunner:
                 _record_fixed_ensemble_execution(
                     str(turn.metadata["ensemble_wrap_skipped_reason"])
                 )
-            elif not custom_has_proposer:
+            elif not custom_lineup_ready:
                 log.warning(
                     "llm_ensemble.wrap_skipped",
-                    reason=f"{selection_mode}_not_ready:no_proposers",
+                    reason=(
+                        f"{selection_mode}_not_ready:"
+                        f"{custom_lineup_blocked_reason or 'deployment_unavailable'}"
+                    ),
                 )
                 turn.metadata["ensemble_wrap_skipped_reason"] = (
-                    f"{selection_mode}_not_ready:no_proposers"
+                    f"{selection_mode}_not_ready:"
+                    f"{custom_lineup_blocked_reason or 'deployment_unavailable'}"
                 )
                 _record_fixed_ensemble_execution(
                     str(turn.metadata["ensemble_wrap_skipped_reason"])
                 )
             else:
                 turn.metadata["ensemble_enabled"] = True
-                turn.metadata["ensemble_activation_source"] = (
-                    "router_tier" if tier_ensemble_mode else "global"
+                tier_scoped_ensemble = bool(tier_ensemble_mode) and (
+                    not ensemble_globally_enabled
+                    or tier_ensemble_binding == "legacy"
                 )
-                if tier_ensemble_mode:
+                turn.metadata["ensemble_activation_source"] = (
+                    "router_tier" if tier_scoped_ensemble else "global"
+                )
+                if tier_scoped_ensemble:
                     turn.metadata["ensemble_tier_binding"] = tier_ensemble_binding
                 turn.metadata["ensemble_selection_mode"] = selection_mode
                 turn.metadata.setdefault(
@@ -8576,6 +8621,7 @@ class TurnRunner:
                     _selection_mode_override=selection_mode,
                     _plan_provider_config=plan_provider_config,
                     _dynamic_baseline_provider_config=initial_provider_config,
+                    _defer_provider_state_replay_activation=True,
                 )
                 blocked_dynamic_candidates = (
                     list(
@@ -8603,7 +8649,7 @@ class TurnRunner:
                         "llm_ensemble.wrap_skipped",
                         reason=skip_reason,
                     )
-                    turn.metadata["ensemble_anchor_blocked_reason"] = blocked_reason
+                    turn.metadata["ensemble_dynamic_blocked_reason"] = blocked_reason
                     turn.metadata["ensemble_dynamic_blocked_candidates"] = (
                         unavailable_dynamic_candidates
                     )
@@ -8614,6 +8660,7 @@ class TurnRunner:
                     _record_fixed_ensemble_execution(skip_reason)
                     provider = fixed_provider
                 else:
+                    ensemble_provider.activate_provider_state_replay_boundary()
                     provider = ensemble_provider
 
         return turn, provider

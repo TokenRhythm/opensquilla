@@ -4,10 +4,18 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from opensquilla.engine.routing import RoutingDecision
 from opensquilla.engine.selector_override import apply_model_override
-from opensquilla.engine.steps.squilla_router import _flag_tier_provider_mismatch
+from opensquilla.engine.steps.squilla_router import (
+    _apply_provider_mismatch_veto,
+    _flag_tier_provider_mismatch,
+)
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.onboarding.mutations import _cross_provider_tier_warnings, upsert_router
+from opensquilla.onboarding.mutations import (
+    _cross_provider_tier_warnings,
+    _router_provider_conflicts,
+    upsert_router,
+)
 from opensquilla.router_tiers import (
     TierConfig,
     router_tier_provider_roles,
@@ -189,6 +197,67 @@ def test_router_tier_provider_roles_marks_all_text_tiers_for_global_dynamic_plan
     }
 
 
+def test_global_fixed_lineup_preserves_legacy_dynamic_and_direct_image_roles() -> None:
+    tiers = {
+        "c0": {"provider": "openai", "model": "fast"},
+        "c1": {"provider": "deepseek", "model": "balanced"},
+        "c2": {"provider": "deepseek", "model": "reasoning"},
+        "c3": {
+            "provider": "openrouter",
+            "model": "quality",
+            "ensemble_selection_mode": "router_dynamic",
+        },
+        "image_model": {"provider": "openrouter", "model": "vision"},
+    }
+
+    for selection_mode in (
+        "static_openrouter_b5",
+        "static_tokenrhythm_b5",
+        "custom_b5",
+    ):
+        roles = router_tier_provider_roles(
+            tiers,
+            shared_selection_mode=selection_mode,
+            ensemble_globally_enabled=True,
+        )
+        assert roles == {
+            "c0": "dynamic_member",
+            "c1": "dynamic_member",
+            "c2": "dynamic_member",
+            "c3": "dynamic_member",
+            "image_model": "direct",
+        }
+        assert tier_provider_role(
+            "c0",
+            tiers["c0"],
+            shared_selection_mode=selection_mode,
+            router_dynamic_members_active=True,
+            ensemble_globally_enabled=True,
+        ) == "dynamic_member"
+
+
+def test_explicit_single_model_suppresses_retained_legacy_dynamic_membership() -> None:
+    tiers = {
+        "c0": {"provider": "deepseek", "model": "fast"},
+        "c3": {
+            "provider": "openrouter",
+            "model": "quality",
+            "ensemble_enabled": False,
+            "ensemble_selection_mode": "router_dynamic",
+        },
+    }
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c3",
+        shared_selection_mode="custom_b5",
+    ) == ("", "single")
+    assert router_tier_provider_roles(
+        tiers,
+        shared_selection_mode="custom_b5",
+    ) == {"c0": "direct", "c3": "direct"}
+
+
 # ---------------------------------------------------------------------------
 # Tier provider mismatch detection
 # ---------------------------------------------------------------------------
@@ -221,6 +290,103 @@ def test_observe_phase_does_not_flag() -> None:
     tiers = {"c2": {"provider": "openai", "model": "gpt-5.5"}}
     _flag_tier_provider_mismatch(ctx, tiers, "c2", routing_applied=False)
     assert "router_tier_provider_mismatch" not in ctx.metadata
+
+
+def test_global_fixed_lineup_suppresses_tier_mismatch_and_veto() -> None:
+    tiers = {
+        "c0": {"provider": "openai", "model": "gpt-fast"},
+        "c1": {"provider": "deepseek", "model": "deepseek-balanced"},
+        "image_model": {"provider": "openai", "model": "gpt-vision"},
+    }
+    decision = RoutingDecision(
+        tier="c0",
+        model="gpt-fast",
+        confidence=0.9,
+        source="test",
+    )
+
+    for selection_mode in (
+        "static_openrouter_b5",
+        "static_tokenrhythm_b5",
+        "custom_b5",
+    ):
+        router = SimpleNamespace(
+            cross_provider_tiers=False,
+            tier_provider_mismatch="veto",
+            default_tier="c1",
+        )
+        config = SimpleNamespace(
+            llm=SimpleNamespace(provider="deepseek"),
+            llm_ensemble=SimpleNamespace(
+                enabled=True,
+                selection_mode=selection_mode,
+                model_fields_set={"selection_mode"},
+            ),
+            squilla_router=router,
+        )
+        ctx = SimpleNamespace(metadata={}, config=config, session_key=selection_mode)
+
+        _flag_tier_provider_mismatch(ctx, tiers, "c0", routing_applied=True)
+        assert ctx.metadata == {"router_tier_provider_role": "dormant_draft"}
+
+        ctx.metadata = {}
+        _flag_tier_provider_mismatch(
+            ctx,
+            tiers,
+            "image_model",
+            routing_applied=True,
+        )
+        assert ctx.metadata == {
+            "router_tier_provider_role": "direct",
+            "router_tier_provider_mismatch": "openai",
+            "routed_provider": "openai",
+        }
+
+        rebound, thinking_mode, prompt_policy = _apply_provider_mismatch_veto(
+            ctx,
+            router,
+            tiers,
+            ["c0", "c1"],
+            decision,
+            "T0",
+            "P0",
+            routing_applied=True,
+        )
+        assert rebound == decision
+        assert thinking_mode == "T0"
+        assert prompt_policy == "P0"
+        assert "provider_mismatch_veto_applied" not in ctx.metadata
+
+
+def test_global_fixed_lineup_suppresses_provider_switch_conflicts_and_warnings() -> None:
+    tiers = {
+        "c0": {"provider": "openai", "model": "gpt-fast"},
+        "c1": {"provider": "deepseek", "model": "deepseek-balanced"},
+        "image_model": {"provider": "openai", "model": "gpt-vision"},
+    }
+    config = GatewayConfig(
+        llm={"provider": "deepseek", "model": "deepseek-chat"},
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+        },
+        squilla_router={
+            "enabled": True,
+            "cross_provider_tiers": False,
+            "tiers": tiers,
+        },
+    )
+
+    assert _router_provider_conflicts(config, "tokenrhythm") == ("openai",)
+    warnings = _cross_provider_tier_warnings(
+        tiers,
+        "deepseek",
+        shared_selection_mode="static_openrouter_b5",
+        ensemble_globally_enabled=True,
+    )
+    assert len(warnings) == 1
+    assert "image_model" in warnings[0]
+    assert "openai" in warnings[0]
 
 
 # ---------------------------------------------------------------------------

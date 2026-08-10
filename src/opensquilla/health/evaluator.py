@@ -1809,12 +1809,116 @@ def _deprecated_ensemble_failure_policy(
 
 
 def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
+    tier_statuses = payload.get("tierEnsembleStatuses")
+    if isinstance(tier_statuses, dict) and tier_statuses:
+        # The aggregate row describes the global plan, while retained legacy
+        # tier plans can choose a different profile at runtime. Diagnose those
+        # rows independently so a healthy global lineup cannot hide the plan
+        # that a routed C3 turn will actually execute.
+        aggregate = dict(payload)
+        aggregate.pop("tierEnsembleStatuses", None)
+        findings: list[HealthFinding] = []
+        if bool(payload.get("globalEnabled")):
+            findings.extend(evaluate_llm_ensemble(aggregate))
+        else:
+            deprecated = _deprecated_ensemble_failure_policy(aggregate)
+            if deprecated is not None:
+                findings.append(deprecated)
+        for tier, raw_status in tier_statuses.items():
+            if not isinstance(raw_status, dict):
+                continue
+            tier_payload = dict(raw_status)
+            tier_payload.setdefault("activationSource", "router_tier")
+            tier_payload.setdefault("activationTiers", [str(tier)])
+            # The stored policy belongs to the one shared config and is
+            # diagnosed once above; suppress duplicate migration findings.
+            tier_payload["configuredAllFailedPolicy"] = "fallback_single"
+            tier_payload["effectiveAllFailedPolicy"] = "fallback_single"
+            tier_payload["policyDeprecated"] = False
+            findings.extend(evaluate_llm_ensemble(tier_payload))
+        return findings
+
     enabled = bool(payload.get("enabled"))
     selection_mode = str(payload.get("selectionMode") or "")
+    activation_source = str(payload.get("activationSource") or "global")
+    activation_tiers = [
+        str(tier).upper()
+        for tier in payload.get("activationTiers", [])
+        if str(tier).strip()
+    ]
+    tier_managed = activation_source == "router_tier"
+    tier_label = ", ".join(activation_tiers) or "the configured router tier"
     deprecated_policy = _deprecated_ensemble_failure_policy(payload)
     policy_findings = [deprecated_policy] if deprecated_policy is not None else []
     if not enabled:
         return policy_findings
+    # Every active plan has one physical safety net: the configured
+    # fixed/direct deployment. Diagnose that boundary before lineup-specific
+    # checks so a missing fixed model is never misreported as a member API-key
+    # problem (and never described as a safe fallback).
+    if payload.get("fixedFallbackReady") is False:
+        fixed_provider = str(payload.get("fixedFallbackProvider") or "")
+        fixed_model = str(payload.get("fixedFallbackModel") or "")
+        reason = str(
+            payload.get("fixedFallbackBlockedReason")
+            or payload.get("blockedReason")
+            or "missing_fixed_fallback"
+        )
+        return [
+            HealthFinding(
+                id="llm_ensemble.fixed_fallback.not_ready",
+                severity="error",
+                surface="llm_ensemble",
+                title="LLM ensemble fixed fallback is not ready",
+                detail=(
+                    f"Multi-model fusion for router tier {tier_label} requires a "
+                    "runnable fixed/direct provider and model for wrapper skips and "
+                    "all-failed fallback. Configure that deployment before sending "
+                    "requests; the runtime otherwise blocks the turn before fusion starts."
+                    if tier_managed
+                    else "Multi-model fusion requires a runnable fixed/direct provider "
+                    "and model for wrapper skips and all-failed fallback. Configure that "
+                    "deployment before sending requests; the runtime otherwise blocks "
+                    "the turn before fusion starts."
+                ),
+                evidence={
+                    "enabled": True,
+                    "globalEnabled": bool(payload.get("globalEnabled", enabled)),
+                    "selectionMode": selection_mode,
+                    "activationSource": activation_source,
+                    "activationTiers": activation_tiers,
+                    "fixedFallbackReady": False,
+                    "fixedFallbackProvider": fixed_provider,
+                    "fixedFallbackModel": fixed_model,
+                    "fixedFallbackBlockedReason": reason,
+                },
+                fix_steps=[
+                    FixStep(
+                        label="Configure the fixed model",
+                        detail=(
+                            "Open Settings → Model services and configure a provider, "
+                            "credential, and non-empty fixed/direct model."
+                        ),
+                    ),
+                    (
+                        FixStep(
+                            label="Review the router tier",
+                            detail=(
+                                "Open Settings → Model routing and switch the affected "
+                                "tier to a single model, or repair its shared fusion plan."
+                            ),
+                        )
+                        if tier_managed
+                        else FixStep(
+                            label="Disable the ensemble",
+                            command="opensquilla config set llm_ensemble.enabled false",
+                        )
+                    ),
+                ],
+                restart_required=False,
+            ),
+            *policy_findings,
+        ]
     if selection_mode not in _ENSEMBLE_SELECTION_MODES:
         return [
             HealthFinding(
@@ -1852,20 +1956,56 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
         ]
     if enabled and selection_mode == "custom_b5":
         return [*_evaluate_custom_b5_ensemble(payload), *policy_findings]
+    if (
+        selection_mode == "router_dynamic"
+        and str(payload.get("runtimeStatus") or "") == "blocked"
+    ):
+        reason = str(payload.get("blockedReason") or "dynamic_member_unavailable")
+        return [
+            HealthFinding(
+                id="llm_ensemble.router_dynamic.not_ready",
+                severity="warn",
+                surface="llm_ensemble",
+                title="Dynamic LLM ensemble is not ready",
+                detail=(
+                    "At least one required Router member deployment is unavailable, so "
+                    "the dynamic wrapper is skipped and requests use the configured "
+                    "fixed/direct fallback. Repair the affected tier deployment or "
+                    "choose a fixed lineup."
+                ),
+                evidence={
+                    "enabled": True,
+                    "selectionMode": selection_mode,
+                    "runtimeStatus": "blocked",
+                    "blockedReason": reason,
+                    "blockedTierCandidates": payload.get("blockedTierCandidates") or [],
+                },
+                fix_steps=[
+                    FixStep(
+                        label="Repair Router member deployments",
+                        detail=(
+                            "Open Settings → Model routing and verify each tier's "
+                            "provider credential and endpoint."
+                        ),
+                    ),
+                    FixStep(
+                        label="Choose a fixed lineup",
+                        detail=(
+                            "Open Settings → Multi-model fusion and choose a static "
+                            "or custom lineup whose providers are configured."
+                        ),
+                    ),
+                ],
+                restart_required=False,
+            ),
+            *policy_findings,
+        ]
     mode_details = _STATIC_B5_MODE_DETAILS.get(selection_mode)
     if mode_details is None:
         return policy_findings
     provider_label, env_key_fallback = mode_details
     api_key_env = str(payload.get("apiKeyEnv") or env_key_fallback)
     credential_available = bool(payload.get("credentialAvailable"))
-    activation_source = str(payload.get("activationSource") or "global")
-    activation_tiers = [
-        str(tier).upper()
-        for tier in payload.get("activationTiers", [])
-        if str(tier).strip()
-    ]
-    tier_label = ", ".join(activation_tiers) or "the configured router tier"
-    tier_managed = activation_source == "router_tier"
     evidence = {
         "enabled": enabled,
         "globalEnabled": bool(payload.get("globalEnabled", enabled)),

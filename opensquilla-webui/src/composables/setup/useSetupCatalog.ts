@@ -174,6 +174,10 @@ interface SectionDetail {
   // accepts both this map and richer per-tier role objects.
   routerProviderRoles?: unknown
   router_provider_roles?: unknown
+  tierEnsembleStatuses?: unknown
+  tier_ensemble_statuses?: unknown
+  tierEnsembleStatus?: unknown
+  tier_ensemble_status?: unknown
   configuredAllFailedPolicy?: string
   effectiveAllFailedPolicy?: string
   policyDeprecated?: boolean
@@ -266,6 +270,22 @@ interface OnboardingStatus {
       failureKind?: string
     }
   }>
+}
+
+function c3TierEnsembleStatus(detail: SectionDetail): unknown {
+  const perTier = detail.tierEnsembleStatuses ?? detail.tier_ensemble_statuses
+  if (perTier && typeof perTier === 'object' && !Array.isArray(perTier)) {
+    const statuses = perTier as Record<string, unknown>
+    const entry = Object.entries(statuses).find(([name]) => (
+      (normalizeRouterTier(name) || name.trim().toLowerCase()) === 'c3'
+    ))
+    // A present per-tier projection is authoritative. In particular, never
+    // borrow the compatibility singleton when this map says C3 is inactive.
+    return entry?.[1] ?? null
+  }
+  // Older Gateways only exposed the compatibility singleton. It remains safe
+  // to consume because the panel independently validates exact C3 scope.
+  return detail.tierEnsembleStatus ?? detail.tier_ensemble_status ?? null
 }
 
 export interface LastProbeStatus {
@@ -791,6 +811,13 @@ async function loadData(options: {
       // free-form model input available.
       if (providerForm.selectedProvider.value) void providerForm.discoverModels()
       behaviorForm.initFromConfig(config.value)
+      const ensembleDetail = (status.value.sectionDetails || {}).ensemble || {}
+      ensembleForm.initFromConfig({
+        ...(config.value.llm_ensemble || {}),
+        configured_all_failed_policy: ensembleDetail.configuredAllFailedPolicy,
+        effective_all_failed_policy: ensembleDetail.effectiveAllFailedPolicy,
+        policy_deprecated: ensembleDetail.policyDeprecated,
+      })
       const routerDetail = (status.value.sectionDetails || {}).router || {}
       const binding = String(
         routerDetail.routerBinding
@@ -803,14 +830,10 @@ async function loadData(options: {
         currentProvider.value,
         binding === 'follow_primary' || binding === 'custom' ? binding : 'legacy',
         routerDetail.routerProviderRoles || routerDetail.router_provider_roles,
+        ensembleForm.selectionMode.value,
+        ensembleForm.enabled.value,
+        c3TierEnsembleStatus(routerDetail),
       )
-      const ensembleDetail = (status.value.sectionDetails || {}).ensemble || {}
-      ensembleForm.initFromConfig({
-        ...(config.value.llm_ensemble || {}),
-        configured_all_failed_policy: ensembleDetail.configuredAllFailedPolicy,
-        effective_all_failed_policy: ensembleDetail.effectiveAllFailedPolicy,
-        policy_deprecated: ensembleDetail.policyDeprecated,
-      })
       capabilitiesForm.initSearchFromConfig(config.value, searchProviders.value)
       capabilitiesForm.initMemoryFromConfig(config.value)
       capabilitiesForm.initImageFromConfig(config.value, status.value, imageProviders.value)
@@ -1843,7 +1866,10 @@ const routerPanel = routerForm.createPanel({
 })
 
 const ensembleTierCandidates = computed(() => routerPanel.value.tierRows
-  .filter(row => configuredProviderIds.value.has(normalizeProviderId(row.provider)))
+  .filter(row => (
+    (TEXT_TIERS as readonly string[]).includes(row.name)
+    && configuredProviderIds.value.has(normalizeProviderId(row.provider))
+  ))
   .map(row => ({
     provider: row.provider,
     model: row.model,
@@ -2917,10 +2943,12 @@ function updateTierField(
 
 function setEnsembleEnabled(value: boolean) {
   ensembleForm.setEnabled(value)
+  routerForm.setEnsembleContext(ensembleForm.selectionMode.value, ensembleForm.enabled.value)
 }
 
 function setEnsembleSelectionMode(value: string) {
   ensembleForm.setSelectionMode(value)
+  routerForm.setEnsembleContext(ensembleForm.selectionMode.value, ensembleForm.enabled.value)
 }
 
 function addEnsembleModelOption(value: string) {
@@ -2961,6 +2989,7 @@ function discoverModelStrategyProviderModels(provider: string) {
 
 function migrateEnsembleLegacy() {
   ensembleForm.migrateLegacyToCustom(ensembleTierCandidates.value, currentProvider.value)
+  routerForm.setEnsembleContext(ensembleForm.selectionMode.value, ensembleForm.enabled.value)
 }
 
 function resetEnsembleCandidates() {
@@ -2969,6 +2998,7 @@ function resetEnsembleCandidates() {
 
 function setEnsembleScheme(scheme: 'preset' | 'custom') {
   ensembleForm.setScheme(scheme, staticB5ModeForProvider(currentProvider.value))
+  routerForm.setEnsembleContext(ensembleForm.selectionMode.value, ensembleForm.enabled.value)
 }
 
 function setEnsembleMinSuccessful(value: number) {

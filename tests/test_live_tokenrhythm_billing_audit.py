@@ -178,6 +178,68 @@ def test_scenario_report_reconciles_all_five_token_buckets() -> None:
     ]
 
 
+def test_scenario_report_counts_missing_usage_without_fabricating_zero_receipt() -> None:
+    rows = []
+    for scale, role in enumerate(("proposer", "proposer", "proposer", "aggregator"), 1):
+        rows.append(
+            {
+                "role": role,
+                "provider": "tokenrhythm",
+                "model": "deepseek-v4-flash",
+                "input_tokens": scale,
+                "output_tokens": scale * 2,
+                "reasoning_tokens": scale * 3,
+                "cached_tokens": scale * 4,
+                "cache_write_tokens": scale * 5,
+                "billed_cost": scale / 1_000_000,
+                "cost_source": "provider_billed",
+                "billing_receipt": ProviderBillingReceipt(
+                    currency="CNY",
+                    status="confirmed",
+                    amount_nanos=scale * 6_975,
+                    usd_equivalent_nanos=scale * 1_000,
+                    fx_native_per_usd_nanos=6_975_000_000,
+                ),
+            }
+        )
+
+    done = DoneEvent(
+        input_tokens=sum(row["input_tokens"] for row in rows),
+        output_tokens=sum(row["output_tokens"] for row in rows),
+        reasoning_tokens=sum(row["reasoning_tokens"] for row in rows),
+        cached_tokens=sum(row["cached_tokens"] for row in rows),
+        cache_write_tokens=sum(row["cache_write_tokens"] for row in rows),
+        billed_cost=sum(row["billed_cost"] for row in rows),
+        model="deepseek-v4-flash",
+        model_usage_breakdown=rows,
+        usage_missing_count=1,
+    )
+
+    report = audit._scenario_report(
+        scenario_id="synthetic_b5_missing_usage",
+        kind="b5_ensemble",
+        done=done,
+        error=None,
+        exception=None,
+        latency_ms=1,
+        expected_physical_requests=5,
+    )
+
+    assert report["observedPhysicalRequests"] == 5
+    assert report["usageMissingCount"] == 1
+    assert report["status"] == "failed"
+    assert report["reasonCodes"] == ["physical_request_usage_missing"]
+    # The fifth request remains an explicit unknown. It contributes to the
+    # observed count, but must not become a synthetic zero-usage/zero-cost row.
+    assert len(report["physicalRequests"]) == 4
+    assert report["totals"] == {
+        "confirmedReceiptCount": 4,
+        "pendingReceiptCount": 0,
+        "nativeCnyAmountNanos": "69750",
+        "usdEquivalentNanos": "10000",
+    }
+
+
 def test_report_guard_rejects_raw_prompt_response_and_secret() -> None:
     with pytest.raises(RuntimeError, match="unsafe field"):
         audit._assert_report_safe({"prompt": "must not persist"}, {})

@@ -3,6 +3,7 @@ import i18n from '@/i18n'
 import {
   DEFAULT_TEXT_TIER,
   IMAGE_TIER,
+  TEXT_TIERS,
   normalizeRouterTier,
 } from '@/utils/chat/routerTiers'
 import {
@@ -23,6 +24,18 @@ export interface SetupTierValue {
 
 export type RouterTierProviderRole = 'direct' | 'dormant_draft' | 'dynamic_member' | 'blocked'
 export type RouterProviderRoles = Record<string, RouterTierProviderRole>
+
+export interface TierEnsembleRuntimeStatus {
+  selectionMode: string
+  activationTiers: string[]
+  tierSelectionModes: Record<string, string>
+  runtimeStatus: string
+  configurationReady: boolean | null
+  blockedReason: string
+  blockedTierCandidates: Array<Record<string, unknown>>
+  fixedFallbackReady: boolean | null
+  fixedFallbackBlockedReason: string
+}
 
 export interface SetupTierRow extends SetupTierValue {
   name: string
@@ -106,6 +119,12 @@ interface RouterConfig {
 
 export type RouterBinding = 'follow_primary' | 'custom' | 'legacy'
 
+const DORMANT_SHARED_SELECTION_MODES = new Set([
+  'static_openrouter_b5',
+  'static_tokenrhythm_b5',
+  'custom_b5',
+])
+
 function normalizeRouterProviderRole(value: unknown): RouterTierProviderRole {
   const raw = String(
     value && typeof value === 'object'
@@ -137,6 +156,43 @@ export function normalizeRouterProviderRoles(value: unknown): RouterProviderRole
   return out
 }
 
+function normalizeTierEnsembleRuntimeStatus(value: unknown): TierEnsembleRuntimeStatus | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const runtimeStatus = String(raw.runtimeStatus ?? raw.runtime_status ?? '').trim().toLowerCase()
+  if (!runtimeStatus) return null
+  const configurationReady = raw.configurationReady ?? raw.configuration_ready
+  const fixedFallbackReady = raw.fixedFallbackReady ?? raw.fixed_fallback_ready
+  const blockedTierCandidates = raw.blockedTierCandidates ?? raw.blocked_tier_candidates
+  const activationTiers = raw.activationTiers ?? raw.activation_tiers
+  const rawTierSelectionModes = raw.tierSelectionModes ?? raw.tier_selection_modes
+  const tierSelectionModes: Record<string, string> = {}
+  if (rawTierSelectionModes && typeof rawTierSelectionModes === 'object' && !Array.isArray(rawTierSelectionModes)) {
+    for (const [name, mode] of Object.entries(rawTierSelectionModes as Record<string, unknown>)) {
+      const tier = normalizeRouterTier(name) || name.trim().toLowerCase()
+      const selectionMode = String(mode || '').trim()
+      if (tier && selectionMode) tierSelectionModes[tier] = selectionMode
+    }
+  }
+  return {
+    selectionMode: String(raw.selectionMode ?? raw.selection_mode ?? '').trim(),
+    activationTiers: Array.isArray(activationTiers)
+      ? activationTiers.map(tier => normalizeRouterTier(String(tier)) || String(tier)).filter(Boolean)
+      : [],
+    tierSelectionModes,
+    runtimeStatus,
+    configurationReady: typeof configurationReady === 'boolean' ? configurationReady : null,
+    blockedReason: String(raw.blockedReason ?? raw.blocked_reason ?? '').trim(),
+    blockedTierCandidates: Array.isArray(blockedTierCandidates)
+      ? blockedTierCandidates.filter(row => row && typeof row === 'object') as Array<Record<string, unknown>>
+      : [],
+    fixedFallbackReady: typeof fixedFallbackReady === 'boolean' ? fixedFallbackReady : null,
+    fixedFallbackBlockedReason: String(
+      raw.fixedFallbackBlockedReason ?? raw.fixed_fallback_blocked_reason ?? '',
+    ).trim(),
+  }
+}
+
 export function routerTierProviderRole(
   name: string,
   _tier: SetupTierValue,
@@ -156,6 +212,49 @@ export function routerTierProviderParticipates(
 ): boolean {
   const role = routerTierProviderRole(name, tier, roles)
   return role === 'direct' || role === 'dynamic_member'
+}
+
+function deriveDraftRouterProviderRoles(
+  tiers: Record<string, SetupTierValue>,
+  sharedSelectionMode: string,
+  ensembleGloballyEnabled: boolean,
+): RouterProviderRoles {
+  const selectionMode = String(sharedSelectionMode || '').trim()
+  const c3 = tiers.c3
+  const dynamicMembersActive = (
+    selectionMode === 'router_dynamic'
+    && (ensembleGloballyEnabled || c3?.ensembleEnabled === true)
+  ) || Object.values(tiers).some(tier => (
+    tier.ensembleEnabled === undefined
+    && tier.ensembleSelectionMode === 'router_dynamic'
+  ))
+
+  const out: RouterProviderRoles = {}
+  for (const [name, tier] of Object.entries(tiers)) {
+    const normalized = normalizeRouterTier(name) || name
+    if (dynamicMembersActive && (TEXT_TIERS as readonly string[]).includes(normalized)) {
+      out[normalized] = 'dynamic_member'
+    } else if (tier.ensembleEnabled === undefined && tier.ensembleSelectionMode) {
+      // Retained pre-boolean tier plans still own their routed turn. Keep the
+      // backend's legacy-first precedence when local shared-plan edits make us
+      // recompute roles; only router_dynamic (handled above) consumes all text
+      // tiers as dynamic members.
+      out[normalized] = 'direct'
+    } else if (
+      ensembleGloballyEnabled
+      && (TEXT_TIERS as readonly string[]).includes(normalized)
+      && DORMANT_SHARED_SELECTION_MODES.has(selectionMode)
+    ) {
+      out[normalized] = 'dormant_draft'
+    } else if (normalized === 'c3' && tier.ensembleEnabled === true) {
+      out[normalized] = DORMANT_SHARED_SELECTION_MODES.has(selectionMode)
+        ? 'dormant_draft'
+        : 'blocked'
+    } else {
+      out[normalized] = 'direct'
+    }
+  }
+  return out
 }
 
 interface RouterPanelContext {
@@ -181,7 +280,20 @@ export function useSetupRouterForm() {
   const savedBinding = ref<RouterBinding>('legacy')
   const crossProviderTiers = ref(false)
   const tierProviderMismatch = ref<'route' | 'veto'>('route')
-  const routerProviderRoles = ref<RouterProviderRoles>({})
+  const persistedRouterProviderRoles = ref<RouterProviderRoles>({})
+  const tierEnsembleStatus = ref<TierEnsembleRuntimeStatus | null>(null)
+  const sharedSelectionMode = ref('')
+  const ensembleGloballyEnabled = ref(false)
+  const providerRoleContextDirty = ref(false)
+  const routerProviderRoles = computed<RouterProviderRoles>(() => (
+    providerRoleContextDirty.value
+      ? deriveDraftRouterProviderRoles(
+          tierValues.value,
+          sharedSelectionMode.value,
+          ensembleGloballyEnabled.value,
+        )
+      : persistedRouterProviderRoles.value
+  ))
   const mode = computed(() => routerMode.value)
   const defaultTier = computed(() => routerDefaultTier.value)
   const routerModeChoice = computed(() =>
@@ -234,11 +346,18 @@ export function useSetupRouterForm() {
     provider = '',
     statusBinding?: RouterBinding,
     providerRoles?: unknown,
+    currentSharedSelectionMode = '',
+    currentEnsembleGloballyEnabled = false,
+    currentTierEnsembleStatus?: unknown,
   ) {
     activeProvider.value = provider.toLowerCase()
     crossProviderTiers.value = router.cross_provider_tiers === true
     tierProviderMismatch.value = router.tier_provider_mismatch === 'veto' ? 'veto' : 'route'
-    routerProviderRoles.value = normalizeRouterProviderRoles(providerRoles)
+    persistedRouterProviderRoles.value = normalizeRouterProviderRoles(providerRoles)
+    sharedSelectionMode.value = String(currentSharedSelectionMode || '').trim()
+    ensembleGloballyEnabled.value = currentEnsembleGloballyEnabled === true
+    providerRoleContextDirty.value = false
+    tierEnsembleStatus.value = normalizeTierEnsembleRuntimeStatus(currentTierEnsembleStatus)
     // Ownership is a server contract, not a shape inferred from tier_profile.
     // Missing ownership is an historical/older-Gateway config and must be
     // treated conservatively: editing it may explicitly adopt `custom`, but it
@@ -292,6 +411,11 @@ export function useSetupRouterForm() {
       const provider = String(value || '').trim().toLowerCase()
       const currentProvider = String(tier.provider || '').trim().toLowerCase()
       if (provider === currentProvider) return
+      const dynamicMember = routerTierProviderRole(
+        name,
+        tier,
+        routerProviderRoles.value,
+      ) === 'dynamic_member'
       // Provider and model form one routing identity. Replace the whole row in
       // one reactive assignment so no observer can see a foreign model id
       // paired with the newly selected provider.
@@ -301,8 +425,12 @@ export function useSetupRouterForm() {
           ...tier,
           provider,
           model: '',
-          ensembleEnabled: tier.ensembleEnabled === undefined ? undefined : false,
-          ensembleSelectionMode: '',
+          ensembleEnabled: dynamicMember
+            ? tier.ensembleEnabled
+            : tier.ensembleEnabled === undefined
+              ? undefined
+              : false,
+          ensembleSelectionMode: dynamicMember ? tier.ensembleSelectionMode : '',
         },
       }
       return
@@ -314,6 +442,21 @@ export function useSetupRouterForm() {
     } else {
       tier[key] = String(value)
     }
+    if (key === 'ensembleEnabled' || key === 'ensembleSelectionMode') {
+      providerRoleContextDirty.value = true
+    }
+  }
+
+  function setEnsembleContext(selectionMode: string, globallyEnabled: boolean) {
+    const nextSelectionMode = String(selectionMode || '').trim()
+    const nextGloballyEnabled = globallyEnabled === true
+    if (
+      sharedSelectionMode.value === nextSelectionMode
+      && ensembleGloballyEnabled.value === nextGloballyEnabled
+    ) return
+    sharedSelectionMode.value = nextSelectionMode
+    ensembleGloballyEnabled.value = nextGloballyEnabled
+    providerRoleContextDirty.value = true
   }
 
   function tierRows(textTiers: readonly string[]): SetupTierRow[] {
@@ -393,6 +536,13 @@ export function useSetupRouterForm() {
         providerOptions: context.providerOptions?.value ?? [],
         providerCredentialStatus: context.providerCredentialStatus?.value ?? [],
         routerProviderRoles: { ...routerProviderRoles.value },
+        tierEnsembleStatus: tierEnsembleStatus.value
+          ? {
+              ...tierEnsembleStatus.value,
+              tierSelectionModes: { ...tierEnsembleStatus.value.tierSelectionModes },
+              blockedTierCandidates: tierEnsembleStatus.value.blockedTierCandidates.map(row => ({ ...row })),
+            }
+          : null,
       }
     })
   }
@@ -404,6 +554,7 @@ export function useSetupRouterForm() {
     tierTemplateState,
     hasMixedTierProviders,
     routerProviderRoles,
+    tierEnsembleStatus,
     routingDirty,
     visualModeDirty,
     isDirty,
@@ -413,6 +564,7 @@ export function useSetupRouterForm() {
     setRouterDefaultTier,
     setRouterVisualMode,
     updateTierField,
+    setEnsembleContext,
     payload,
     visualModePatches,
     createPanel,

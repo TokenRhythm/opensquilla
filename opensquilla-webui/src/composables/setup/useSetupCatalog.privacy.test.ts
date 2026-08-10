@@ -2123,6 +2123,180 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     app.unmount()
   })
 
+  it('loads saved C3 fusion readiness from the Router status and invalidates it on edit', async () => {
+    mockProviderState(
+      {
+        ...configuredProviderStatus('tokenrhythm'),
+        sectionDetails: {
+          router: {
+            routerBinding: 'custom',
+            routerProviderRoles: { c0: 'dynamic_member', c3: 'dynamic_member' },
+            tierEnsembleStatuses: {
+              c0: {
+                selectionMode: 'static_tokenrhythm_b5',
+                activationTiers: ['c0'],
+                tierSelectionModes: { c0: 'static_tokenrhythm_b5' },
+                runtimeStatus: 'blocked',
+                configurationReady: false,
+                blockedReason: 'other_tier_not_ready',
+                blockedTierCandidates: [],
+                fixedFallbackReady: true,
+                fixedFallbackBlockedReason: null,
+              },
+              c3: {
+                selectionMode: 'router_dynamic',
+                activationTiers: ['c3'],
+                tierSelectionModes: { c3: 'router_dynamic' },
+                runtimeStatus: 'conditional',
+                configurationReady: null,
+                blockedReason: null,
+                blockedTierCandidates: [],
+                fixedFallbackReady: true,
+                fixedFallbackBlockedReason: null,
+              },
+            },
+          },
+        },
+      },
+      {
+        llm: { provider: 'tokenrhythm', model: 'primary-model' },
+        squilla_router: {
+          enabled: true,
+          tiers: {
+            c0: { provider: 'tokenrhythm', model: 'fast-model' },
+            c3: {
+              provider: 'tokenrhythm',
+              model: 'quality-model',
+              ensemble_enabled: true,
+            },
+          },
+        },
+        llm_ensemble: { enabled: false, selection_mode: 'router_dynamic' },
+      },
+    )
+
+    const { api, app } = await mountCatalog()
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toMatchObject({
+      selectionMode: 'router_dynamic',
+      activationTiers: ['c3'],
+      tierSelectionModes: { c3: 'router_dynamic' },
+      runtimeStatus: 'conditional',
+      fixedFallbackReady: true,
+    })
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
+
+    api.updateTierField('c3', 'model', 'edited-quality-model')
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(false)
+    app.unmount()
+  })
+
+  it('does not fall back to a singular C3 status when the per-tier map omits C3', async () => {
+    mockProviderState(
+      {
+        ...configuredProviderStatus('tokenrhythm'),
+        sectionDetails: {
+          router: {
+            routerBinding: 'custom',
+            routerProviderRoles: { c3: 'dynamic_member' },
+            tierEnsembleStatuses: {
+              c0: {
+                selectionMode: 'router_dynamic',
+                activationTiers: ['c0'],
+                tierSelectionModes: { c0: 'router_dynamic' },
+                runtimeStatus: 'conditional',
+              },
+            },
+            tierEnsembleStatus: {
+              selectionMode: 'router_dynamic',
+              activationTiers: ['c3'],
+              tierSelectionModes: { c3: 'router_dynamic' },
+              runtimeStatus: 'conditional',
+            },
+          },
+        },
+      },
+      {
+        llm: { provider: 'tokenrhythm', model: 'primary-model' },
+        squilla_router: {
+          enabled: true,
+          tiers: {
+            c3: {
+              provider: 'tokenrhythm',
+              model: 'quality-model',
+              ensemble_enabled: true,
+            },
+          },
+        },
+        llm_ensemble: { enabled: false, selection_mode: 'router_dynamic' },
+      },
+    )
+
+    const { api, app } = await mountCatalog()
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toBeNull()
+    app.unmount()
+  })
+
+  it('invalidates saved C3 readiness when an independent image-model row is edited', async () => {
+    mockProviderState(
+      {
+        ...configuredProviderStatus('tokenrhythm'),
+        sectionDetails: {
+          router: {
+            routerBinding: 'custom',
+            routerProviderRoles: { c3: 'dormant_draft', image_model: 'direct' },
+            tierEnsembleStatuses: {
+              c3: {
+                selectionMode: 'static_tokenrhythm_b5',
+                activationTiers: ['c3'],
+                tierSelectionModes: { c3: 'static_tokenrhythm_b5' },
+                runtimeStatus: 'blocked',
+                configurationReady: false,
+                blockedReason: 'fixed_fallback:missing_credential:tokenrhythm',
+                blockedTierCandidates: [],
+                fixedFallbackReady: false,
+                fixedFallbackBlockedReason: 'fixed_fallback:missing_credential:tokenrhythm',
+              },
+            },
+          },
+        },
+      },
+      {
+        llm: { provider: 'tokenrhythm', model: 'primary-model' },
+        squilla_router: {
+          enabled: true,
+          tiers: {
+            c3: {
+              provider: 'tokenrhythm',
+              model: 'quality-model',
+              ensemble_enabled: true,
+            },
+            image_model: {
+              provider: 'tokenrhythm',
+              model: 'vision-model',
+              supports_image: true,
+            },
+          },
+        },
+        llm_ensemble: { enabled: false, selection_mode: 'static_tokenrhythm_b5' },
+      },
+    )
+
+    const { api, app } = await mountCatalog()
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toMatchObject({
+      runtimeStatus: 'blocked',
+      fixedFallbackReady: false,
+    })
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
+
+    api.updateTierField('image_model', 'model', 'vision-model-v2')
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(false)
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toMatchObject({
+      runtimeStatus: 'blocked',
+      fixedFallbackReady: false,
+    })
+    app.unmount()
+  })
+
   it.each([
     {
       name: 'ignores a stale cross-provider flag while the router is disabled',
@@ -2779,6 +2953,7 @@ describe('useSetupCatalog configured provider management', () => {
             tiers: {
               c0: { provider: 'openrouter', model: 'legacy-model' },
               c1: { provider: 'deepseek', model: 'deepseek-chat' },
+              image_model: { provider: 'deepseek', model: 'deepseek-vision' },
             },
           },
         }
@@ -2798,7 +2973,10 @@ describe('useSetupCatalog configured provider management', () => {
     expect(api.routerPanel.value.tierRows).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: 'c0', provider: 'openrouter', model: 'legacy-model' }),
       expect.objectContaining({ name: 'c1', provider: 'deepseek', model: 'deepseek-chat' }),
+      expect.objectContaining({ name: 'image_model', provider: 'deepseek', model: 'deepseek-vision' }),
     ]))
+    // The dedicated image route is independent and must never be imported as
+    // a text proposer when the user converts a legacy dynamic plan.
     expect(api.ensemblePanel.value.tierCandidates).toEqual([
       expect.objectContaining({ provider: 'deepseek', model: 'deepseek-chat', source: 'tier' }),
     ])

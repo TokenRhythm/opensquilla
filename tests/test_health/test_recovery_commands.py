@@ -608,6 +608,55 @@ def test_llm_ensemble_unknown_selection_mode_is_diagnosed() -> None:
     assert "static_tokenrhythm_typo" in findings[0].detail
 
 
+def test_llm_ensemble_missing_fixed_fallback_is_reported_before_lineup() -> None:
+    findings = evaluate_llm_ensemble(
+        {
+            "enabled": True,
+            "selectionMode": "static_openrouter_b5",
+            "runtimeStatus": "blocked",
+            "configurationReady": False,
+            "credentialAvailable": True,
+            "fixedFallbackReady": False,
+            "fixedFallbackProvider": "openrouter",
+            "fixedFallbackModel": "",
+            "fixedFallbackBlockedReason": "missing_fixed_fallback",
+        }
+    )
+
+    assert [finding.id for finding in findings] == [
+        "llm_ensemble.fixed_fallback.not_ready"
+    ]
+    assert findings[0].severity == "error"
+    assert "blocks the turn before fusion starts" in findings[0].detail
+
+
+def test_llm_ensemble_dynamic_blocker_is_actionable() -> None:
+    blocked_candidates = [
+        {
+            "source": "router_tier:c0",
+            "provider": "openrouter",
+            "model": "example/model",
+            "reason": "missing_credential",
+        }
+    ]
+    findings = evaluate_llm_ensemble(
+        {
+            "enabled": True,
+            "selectionMode": "router_dynamic",
+            "runtimeStatus": "blocked",
+            "configurationReady": False,
+            "blockedReason": "router_dynamic_not_ready:missing_credential",
+            "blockedTierCandidates": blocked_candidates,
+            "fixedFallbackReady": True,
+        }
+    )
+
+    assert [finding.id for finding in findings] == [
+        "llm_ensemble.router_dynamic.not_ready"
+    ]
+    assert findings[0].evidence["blockedTierCandidates"] == blocked_candidates
+
+
 def test_tier_managed_ensemble_health_explains_c3_activation_and_fallback() -> None:
     base_payload = {
         "enabled": True,

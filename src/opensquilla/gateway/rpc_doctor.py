@@ -278,19 +278,18 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
     )
 
     shared_selection_mode = effective_ensemble_selection_mode(config)
+    ensemble_globally_enabled = bool(
+        getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+    )
     provider_roles = router_tier_provider_roles(
         tiers if isinstance(tiers, dict) else {},
         shared_selection_mode=shared_selection_mode,
-        ensemble_globally_enabled=bool(
-            getattr(getattr(config, "llm_ensemble", None), "enabled", False)
-        ),
+        ensemble_globally_enabled=ensemble_globally_enabled,
     )
     dynamic_members_active = router_dynamic_tier_members_active(
         tiers if isinstance(tiers, dict) else {},
         shared_selection_mode=shared_selection_mode,
-        ensemble_globally_enabled=bool(
-            getattr(getattr(config, "llm_ensemble", None), "enabled", False)
-        ),
+        ensemble_globally_enabled=ensemble_globally_enabled,
     )
     if isinstance(tiers, dict) and active_provider.strip():
         active_l = active_provider.strip().lower()
@@ -301,6 +300,7 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
                 tier_value,
                 shared_selection_mode=shared_selection_mode,
                 router_dynamic_members_active=dynamic_members_active,
+                ensemble_globally_enabled=ensemble_globally_enabled,
             )
             if (
                 provider_role in {"direct", "dynamic_member"}
@@ -365,14 +365,39 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
             "configuredAllFailedPolicy": "fallback_single",
             "effectiveAllFailedPolicy": "fallback_single",
             "policyDeprecated": False,
+            "tierEnsembleStatuses": {},
         }
 
-    from opensquilla.provider.ensemble import ensemble_runtime_status, static_b5_profile
+    from opensquilla.provider.ensemble import (
+        ensemble_runtime_status,
+        static_b5_profile,
+        tier_ensemble_runtime_statuses,
+    )
 
-    payload = {
-        **ensemble_runtime_status(config),
-        "activeProvider": str(getattr(config.llm, "provider", "") or ""),
-    }
+    def decorate(runtime: dict[str, Any]) -> dict[str, Any]:
+        decorated = {
+            **runtime,
+            "activeProvider": str(getattr(config.llm, "provider", "") or ""),
+        }
+        static_profile = static_b5_profile(str(decorated["selectionMode"]))
+        if static_profile is not None and decorated["enabled"]:
+            from opensquilla.provider.registry import get_provider_spec
+
+            decorated["memberProvider"] = static_profile.provider_id
+            decorated["apiKeyEnv"] = str(
+                get_provider_spec(static_profile.provider_id).env_key or ""
+            )
+            decorated["credentialAvailable"] = bool(
+                decorated["configurationReady"]
+            )
+        elif decorated["enabled"] and decorated["selectionMode"] == "custom_b5":
+            decorated["lineupReady"] = bool(decorated["configurationReady"])
+            decorated["lineupBlockedReason"] = str(
+                decorated["blockedReason"] or ""
+            )
+        return decorated
+
+    payload = decorate(ensemble_runtime_status(config))
     configured_policy = str(
         getattr(config.llm_ensemble, "all_failed_policy", "fallback_single")
         or "fallback_single"
@@ -383,18 +408,10 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
         "policyDeprecated",
         configured_policy != str(payload["effectiveAllFailedPolicy"]),
     )
-    static_profile = static_b5_profile(str(payload["selectionMode"]))
-    if static_profile is not None and payload["enabled"]:
-        from opensquilla.provider.registry import get_provider_spec
-
-        payload["memberProvider"] = static_profile.provider_id
-        payload["apiKeyEnv"] = str(
-            get_provider_spec(static_profile.provider_id).env_key or ""
-        )
-        payload["credentialAvailable"] = bool(payload["configurationReady"])
-    elif payload["enabled"] and payload["selectionMode"] == "custom_b5":
-        payload["lineupReady"] = bool(payload["configurationReady"])
-        payload["lineupBlockedReason"] = str(payload["blockedReason"] or "")
+    payload["tierEnsembleStatuses"] = {
+        tier: decorate(runtime)
+        for tier, runtime in tier_ensemble_runtime_statuses(config).items()
+    }
     return payload
 
 

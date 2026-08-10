@@ -115,6 +115,8 @@ SECTION_EXTRA_KEYS = {
             "routerBinding",
             "routerProviderConflicts",
             "routerProviderRoles",
+            "tierEnsembleStatus",
+            "tierEnsembleStatuses",
         }
     ),
     "ensemble": frozenset(
@@ -133,6 +135,11 @@ SECTION_EXTRA_KEYS = {
             "configuredAllFailedPolicy",
             "effectiveAllFailedPolicy",
             "policyDeprecated",
+            "fixedFallbackReady",
+            "fixedFallbackBlockedReason",
+            "fixedFallbackProvider",
+            "fixedFallbackModel",
+            "blockedTierCandidates",
         }
     ),
 }
@@ -317,6 +324,8 @@ async def test_router_section_carries_an_explicit_router_mode(tmp_path) -> None:
     provider_roles = payload["sectionDetails"]["router"]["routerProviderRoles"]
     assert isinstance(provider_roles, dict)
     assert set(provider_roles.values()) <= ROUTER_PROVIDER_ROLE_VALUES
+    tier_ensemble = payload["sectionDetails"]["router"]["tierEnsembleStatus"]
+    assert tier_ensemble is None or isinstance(tier_ensemble, dict)
 
 
 async def test_router_provider_conflicts_ignore_only_dormant_shared_c3(tmp_path) -> None:
@@ -348,6 +357,44 @@ async def test_router_provider_conflicts_ignore_only_dormant_shared_c3(tmp_path)
     assert payload["sectionDetails"]["router"]["routerProviderRoles"]["c3"] == (
         "dormant_draft"
     )
+
+
+async def test_global_fixed_lineup_hides_all_router_provider_conflicts(tmp_path) -> None:
+    cfg = _synthetic_config(
+        tmp_path,
+        llm=LlmProviderConfig(provider="deepseek", model="deepseek-chat"),
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": False,
+            "tiers": {
+                "c0": {"provider": "openai", "model": "gpt-test"},
+                "c3": {"provider": "openrouter", "model": "synthetic/model"},
+                "image_model": {
+                    "provider": "openai",
+                    "model": "gpt-vision-test",
+                    "supports_image": True,
+                    "image_only": True,
+                },
+            },
+        },
+    )
+
+    payload = _status_payload(RpcContext(conn_id="contract", config=cfg))
+    router = payload["sectionDetails"]["router"]
+
+    assert router["routerProviderConflicts"] == ["openai"]
+    assert router["routerProviderRoles"] == {
+        "c0": "dormant_draft",
+        "c3": "dormant_draft",
+        "image_model": "direct",
+    }
+    assert router["tierEnsembleStatus"] is None
+    assert router["tierEnsembleStatuses"] == {}
 
 
 async def test_router_provider_conflicts_include_dynamic_shared_c3(tmp_path) -> None:
@@ -383,6 +430,107 @@ async def test_router_provider_conflicts_include_dynamic_shared_c3(tmp_path) -> 
     } == {"dynamic_member"}
 
 
+async def test_router_status_projects_tier_managed_dynamic_readiness(tmp_path) -> None:
+    cfg = _synthetic_config(
+        tmp_path,
+        llm=LlmProviderConfig(
+            provider="tokenrhythm",
+            model="deepseek-v4-flash-0731",
+            api_key="sk-tr-synthetic",
+        ),
+        llm_ensemble={"enabled": False, "selection_mode": "router_dynamic"},
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+            "tiers": {
+                "c0": {"provider": "openrouter", "model": "example/fast"},
+                "c1": {"provider": "tokenrhythm", "model": "balanced"},
+                "c2": {"provider": "tokenrhythm", "model": "strong"},
+                "c3": {
+                    "provider": "tokenrhythm",
+                    "model": "quality",
+                    "ensemble_enabled": True,
+                },
+            },
+        },
+    )
+
+    payload = _status_payload(RpcContext(conn_id="contract", config=cfg))
+    router = payload["sectionDetails"]["router"]
+    tier_ensemble = router["tierEnsembleStatus"]
+
+    assert payload["sectionDetails"]["ensemble"]["enabled"] is False
+    assert tier_ensemble == {
+        "selectionMode": "router_dynamic",
+        "activationTiers": ["c3"],
+        "tierSelectionModes": {"c3": "router_dynamic"},
+        "runtimeStatus": "blocked",
+        "configurationReady": False,
+        "blockedReason": "router_dynamic_not_ready:missing_credential",
+        "blockedTierCandidates": [
+            {
+                "source": "router_tier:c0",
+                "provider": "openrouter",
+                "model": "example/fast",
+                "reason": "missing_credential",
+            }
+        ],
+        "fixedFallbackReady": True,
+        "fixedFallbackBlockedReason": None,
+    }
+    assert router["tierEnsembleStatuses"] == {"c3": tier_ensemble}
+
+
+async def test_tier_ensemble_status_is_c3_specific_with_mixed_legacy_modes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = _synthetic_config(
+        tmp_path,
+        llm=LlmProviderConfig(
+            provider="tokenrhythm",
+            model="deepseek-v4-flash-0731",
+            api_key="sk-tr-synthetic",
+        ),
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "static_tokenrhythm_b5",
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "tiers": {
+                "t0": {
+                    "provider": "openrouter",
+                    "model": "example/fast",
+                    "ensemble_selection_mode": "static_openrouter_b5",
+                },
+                "t3": {
+                    "provider": "tokenrhythm",
+                    "model": "quality",
+                    "ensemble_selection_mode": "static_tokenrhythm_b5",
+                },
+            },
+        },
+    )
+
+    router = _status_payload(RpcContext(conn_id="contract", config=cfg))[
+        "sectionDetails"
+    ]["router"]
+    statuses = router["tierEnsembleStatuses"]
+
+    assert set(statuses) == {"c0", "c3"}
+    assert statuses["c0"]["selectionMode"] == "static_openrouter_b5"
+    assert statuses["c0"]["activationTiers"] == ["c0"]
+    assert statuses["c0"]["configurationReady"] is False
+    assert statuses["c3"]["selectionMode"] == "static_tokenrhythm_b5"
+    assert statuses["c3"]["activationTiers"] == ["c3"]
+    assert statuses["c3"]["configurationReady"] is True
+    assert router["tierEnsembleStatus"] == statuses["c3"]
+
+
 async def test_ensemble_status_exposes_effective_failure_policy(tmp_path) -> None:
     cfg = _synthetic_config(
         tmp_path,
@@ -395,6 +543,7 @@ async def test_ensemble_status_exposes_effective_failure_policy(tmp_path) -> Non
     assert ensemble["configuredAllFailedPolicy"] == "error"
     assert ensemble["effectiveAllFailedPolicy"] == "fallback_single"
     assert ensemble["policyDeprecated"] is True
+    assert ensemble["fixedFallbackReady"] is None
 
 
 async def test_sparse_disabled_router_follows_primary_without_claiming_explicit_tiers(

@@ -931,21 +931,24 @@ def _flag_tier_provider_mismatch(
     adapter re-assesses (and normally records a clean match for) the
     rebound tier.
     """
+    ensemble_globally_enabled = bool(
+        getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
+    )
+    shared_selection_mode = effective_ensemble_selection_mode(ctx.config)
     provider_role = tier_provider_role(
         tier_name,
         tiers.get(tier_name),
-        shared_selection_mode=effective_ensemble_selection_mode(ctx.config),
+        shared_selection_mode=shared_selection_mode,
         router_dynamic_members_active=router_dynamic_tier_members_active(
             tiers,
-            shared_selection_mode=effective_ensemble_selection_mode(ctx.config),
-            ensemble_globally_enabled=bool(
-                getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
-            ),
+            shared_selection_mode=shared_selection_mode,
+            ensemble_globally_enabled=ensemble_globally_enabled,
         ),
+        ensemble_globally_enabled=ensemble_globally_enabled,
     )
     ctx.metadata["router_tier_provider_role"] = provider_role
     if provider_role in {"dormant_draft", "blocked"}:
-        # Static/custom shared plans do not execute the stored C3 deployment;
+        # Static/custom shared plans do not execute stored Router deployments;
         # an unknown shared plan is rejected later by the ensemble boundary.
         # Neither state may claim that the draft provider was routed.
         return
@@ -1009,18 +1012,20 @@ def _apply_provider_mismatch_veto(
     if mode != "veto" or not routing_applied:
         return decision, thinking_mode, prompt_policy
     shared_selection_mode = effective_ensemble_selection_mode(ctx.config)
+    ensemble_globally_enabled = bool(
+        getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
+    )
     dynamic_members_active = router_dynamic_tier_members_active(
         tiers,
         shared_selection_mode=shared_selection_mode,
-        ensemble_globally_enabled=bool(
-            getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
-        ),
+        ensemble_globally_enabled=ensemble_globally_enabled,
     )
     selected_role = tier_provider_role(
         decision.tier,
         tiers.get(decision.tier),
         shared_selection_mode=shared_selection_mode,
         router_dynamic_members_active=dynamic_members_active,
+        ensemble_globally_enabled=ensemble_globally_enabled,
     )
     if selected_role in {"dormant_draft", "blocked"}:
         return decision, thinking_mode, prompt_policy
@@ -1036,6 +1041,7 @@ def _apply_provider_mismatch_veto(
             policy_tiers.get(tier_name),
             shared_selection_mode=shared_selection_mode,
             router_dynamic_members_active=dynamic_members_active,
+            ensemble_globally_enabled=ensemble_globally_enabled,
         )
         if role == "blocked":
             continue
@@ -1165,29 +1171,38 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     # for every image turn — which is exactly the gate's no-op default.
     turn_needs_image = current_turn_has_image or history_gate_needs_image
     if turn_needs_image:
-        c3_fusion_active = tier_ensemble_active(tiers, HIGHEST_TEXT_TIER)
-        image_tiers = {
+        c3_fusion_active = bool(
+            getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
+        ) or tier_ensemble_active(tiers, HIGHEST_TEXT_TIER)
+        image_capable_tiers = {
             name: tier
             for name, tier in tiers.items()
             if tier.get("supports_image", False)
             and not (c3_fusion_active and name == HIGHEST_TEXT_TIER)
         }
+        image_tiers = {
+            name: tier
+            for name, tier in image_capable_tiers.items()
+            if str(tier.get("model") or "").strip()
+        }
         if not image_tiers:
             log.warning(
                 "squilla_router.no_image_tier",
-                note="image detected but no supports_image tier",
+                note="image detected but no executable supports_image tier",
                 c3_fusion_active=c3_fusion_active,
+                empty_model_tiers=sorted(image_capable_tiers),
             )
             if c3_fusion_active:
                 raise RuntimeError(
                     "No image-capable SquillaRouter tier is available for this image "
                     "request while C3 multi-model fusion is selected. Configure "
-                    "squilla_router.tiers.image_model with supports_image=true or enable "
-                    "image support on another non-C3 tier."
+                    "squilla_router.tiers.image_model with supports_image=true and a "
+                    "non-empty model, or enable image support on another non-C3 tier."
                 )
             raise RuntimeError(
-                "No image-capable SquillaRouter tier is configured for this image request. "
-                "Configure squilla_router.tiers.image_model with supports_image=true."
+                "No image-capable SquillaRouter tier is configured with a non-empty model "
+                "for this image request. Configure squilla_router.tiers.image_model with "
+                "supports_image=true and a model."
             )
         # The dedicated image tier owns image requests regardless of TOML
         # declaration order. Other image-capable tiers remain deterministic
@@ -1195,7 +1210,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         tier_name = IMAGE_TIER if IMAGE_TIER in image_tiers else next(iter(image_tiers))
         decision = RoutingDecision(
             tier=tier_name,
-            model=image_tiers[tier_name].get("model", ctx.model),
+            model=str(image_tiers[tier_name].get("model") or "").strip(),
             confidence=1.0,
             source="image_route",
         )

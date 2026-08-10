@@ -190,6 +190,8 @@ describe('SetupTierTable — editable routing rows', () => {
       },
       fixedFallbackProvider: 'OpenRouter',
       fixedFallbackModel: 'deepseek/deepseek-v4-pro',
+      ensemblePlanStatus: 'ready',
+      routerProviderRoles: { c3: 'dormant_draft' },
     }, { onUpdateTierField })
 
     const picker = el.querySelector<HTMLInputElement>(
@@ -197,19 +199,40 @@ describe('SetupTierTable — editable routing rows', () => {
     )!
     expect(picker.value).toBe('Multi-model fusion')
     expect(picker.getAttribute('aria-describedby'))
-      .toContain('setup-tier-c3-ensemble-summary')
+      .toContain('setup-tier-c3-ensemble-details')
     expect(el.querySelector('select[aria-label="c3 execution mode"]')).toBeNull()
     expect(el.querySelector('select[aria-label="c3 request entry"]')).toBeNull()
     expect(el.querySelector('[aria-label="c3 request entry is determined by the Multi-model fusion plan"]')
       ?.textContent).toContain('Determined by Multi-model fusion')
     expect(el.textContent).not.toContain('static_tokenrhythm_b5')
-    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+    expect(el.querySelector('.setup-tier-table__model-note')).toBeNull()
+    expect(el.querySelector('.setup-tier-table__plan-status')).toBeNull()
+    const details = el.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show C3 fusion details"]',
+    )!
+    const tooltip = el.querySelector<HTMLElement>('[role="tooltip"]')!
+    expect(details.getAttribute('aria-describedby')).toBe(tooltip.id)
+    expect(tooltip.textContent).toContain('Current fusion plan is ready')
+    expect(tooltip.textContent)
       .toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
+    expect(tooltip.textContent).toContain('image requests still use the Image model configuration')
+    expect(details.dataset.open).toBe('false')
+    details.parentElement?.dispatchEvent(new MouseEvent('mouseenter'))
+    await nextTick()
+    expect(details.dataset.open).toBe('true')
+    expect(tooltip.classList.contains('is-open')).toBe(true)
+    details.parentElement?.dispatchEvent(new MouseEvent('mouseleave'))
+    details.focus()
+    await nextTick()
+    expect(document.activeElement).toBe(details)
+    expect(details.dataset.open).toBe('true')
+    details.blur()
+    await nextTick()
+    expect(details.dataset.open).toBe('false')
     expect(el.textContent).not.toContain('glm-5.2')
     expect(el.querySelector('select[aria-label="c3 thinking level"]')).toBeNull()
     expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')
       ?.textContent).toContain('Determined by fusion plan')
-    expect(el.textContent).toContain('image requests still use the Image model configuration')
     const liveStatus = el.querySelector<HTMLElement>('[role="status"][aria-live="polite"]')
     expect(liveStatus?.getAttribute('aria-atomic')).toBe('true')
     expect(liveStatus?.textContent)
@@ -237,6 +260,152 @@ describe('SetupTierTable — editable routing rows', () => {
     app.unmount()
   })
 
+  it('keeps dynamic-member controls visible and labels shared router_dynamic as compatible', async () => {
+    const onUpdateTierField = vi.fn()
+    const onMigrateLegacyEnsemble = vi.fn()
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        provider: 'tokenrhythm',
+        model: 'quality-model',
+        thinkingLevel: 'high',
+        ensembleEnabled: true,
+      }],
+      providerOptions: [
+        { providerId: 'openrouter', label: 'OpenRouter' },
+        { providerId: 'tokenrhythm', label: 'TokenRhythm' },
+      ],
+      routerProviderRoles: { c3: 'dynamic_member' },
+      effectiveEnsembleSelectionMode: 'router_dynamic',
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'fallback-model',
+      ensemblePlanStatus: 'ready',
+    }, { onUpdateTierField, onMigrateLegacyEnsemble })
+
+    const provider = el.querySelector<HTMLSelectElement>('select[aria-label="c3 request entry"]')!
+    const thinking = el.querySelector<HTMLSelectElement>('select[aria-label="c3 thinking level"]')!
+    expect(provider.value).toBe('tokenrhythm')
+    expect(provider.disabled).toBe(false)
+    expect(thinking.value).toBe('high')
+    expect(thinking.disabled).toBe(false)
+    expect(el.textContent).toContain('previously saved tier-following fusion plan')
+    expect(el.textContent).not.toContain('Determined by Multi-model fusion')
+    expect(el.textContent).not.toContain('Determined by fusion plan')
+    const migrate = el.querySelector<HTMLButtonElement>('[data-testid="tier-ensemble-migrate-legacy"]')!
+    expect(migrate.textContent).toContain('Convert to custom lineup')
+    migrate.click()
+    expect(onMigrateLegacyEnsemble).toHaveBeenCalledOnce()
+
+    thinking.value = 'xhigh'
+    thinking.dispatchEvent(new Event('change', { bubbles: true }))
+    expect(onUpdateTierField).toHaveBeenCalledWith('c3', 'thinkingLevel', 'xhigh')
+    app.unmount()
+  })
+
+  it('treats shared C3 as direct when an older Gateway omits provider roles', async () => {
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        provider: 'openai',
+        model: 'saved-c3-model',
+        thinkingLevel: 'high',
+        ensembleEnabled: true,
+      }],
+      providerOptions: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'openrouter', label: 'OpenRouter' },
+      ],
+      fixedFallbackProvider: 'OpenAI',
+      fixedFallbackModel: 'fallback-model',
+      ensemblePlanStatus: 'ready',
+      effectiveEnsembleSelectionMode: 'custom_b5',
+    })
+
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 request entry"]')?.value)
+      .toBe('openai')
+    expect(el.querySelector('select[aria-label="c3 thinking level"]')).toBeNull()
+    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')
+      ?.textContent).toContain('Determined by fusion plan')
+    app.unmount()
+  })
+
+  it('keeps blocked shared-plan guidance visible instead of hiding it in the tooltip', async () => {
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        ensembleEnabled: true,
+      }],
+      routerProviderRoles: { c3: 'blocked' },
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'fallback-model',
+      ensemblePlanStatus: 'blocked',
+    })
+
+    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+      .toContain('Fixed and fallback model: OpenRouter · fallback-model')
+    const status = el.querySelector('.setup-tier-table__plan-status')
+    expect(status?.textContent).toContain('Current fusion plan is unavailable')
+    expect(status?.classList.contains('is-blocked')).toBe(true)
+    app.unmount()
+  })
+
+  it('identifies a member credential failure when the fixed fallback remains ready', async () => {
+    const { app, el } = await mountTable({
+      rows: [{ ...ROWS[1], name: 'c3', ensembleEnabled: true }],
+      routerProviderRoles: { c3: 'dormant_draft' },
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'fallback-model',
+      ensemblePlanStatus: 'blocked',
+      ensemblePlanBlockedReason: 'credential_missing',
+      ensembleFixedFallbackReady: true,
+    })
+
+    expect(el.querySelector('.setup-tier-table__blocked-reason')?.textContent)
+      .toContain('One or more models in this fusion plan are not ready')
+    expect(el.querySelector('.setup-tier-table__blocked-reason')?.textContent)
+      .not.toContain('Fixed and fallback model is not ready')
+    app.unmount()
+  })
+
+  it('identifies an unavailable fixed fallback separately from member failures', async () => {
+    const { app, el } = await mountTable({
+      rows: [{ ...ROWS[1], name: 'c3', ensembleEnabled: true }],
+      routerProviderRoles: { c3: 'dormant_draft' },
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'fallback-model',
+      ensemblePlanStatus: 'blocked',
+      ensemblePlanBlockedReason: 'fixed_fallback:missing_credential:openrouter',
+      ensembleFixedFallbackReady: false,
+    })
+
+    expect(el.querySelector('.setup-tier-table__blocked-reason')?.textContent)
+      .toContain('Fixed and fallback model is not ready')
+    app.unmount()
+  })
+
+  it('keeps compact shared details unclipped with an offline catalog in readonly mode', async () => {
+    const { app, el } = await mountTable({
+      readonly: true,
+      rows: [{ ...ROWS[1], name: 'c3', ensembleEnabled: true }],
+      routerProviderRoles: { c3: 'dormant_draft' },
+      modelsByProvider: {},
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'fallback-model',
+      ensemblePlanStatus: 'ready',
+    })
+
+    expect(el.querySelector('.setup-tier-table')?.classList.contains('setup-tier-table--open')).toBe(true)
+    const trigger = el.querySelector<HTMLButtonElement>('[aria-label="Show C3 fusion details"]')!
+    expect(trigger).toBeTruthy()
+    trigger.dispatchEvent(new Event('focus'))
+    await nextTick()
+    expect(el.querySelector<HTMLElement>('[role="tooltip"]')?.classList.contains('is-open')).toBe(true)
+    app.unmount()
+  })
+
   it('does not claim a pinned legacy C3 profile follows the current shared plan', async () => {
     const { app, el } = await mountTable({
       rows: [{
@@ -251,13 +420,15 @@ describe('SetupTierTable — editable routing rows', () => {
       ],
     })
 
-    expect(el.textContent).toContain('previously saved tier-following fusion plan')
+    expect(el.textContent).toContain('previously saved compatible fusion plan')
     expect(el.textContent).toContain('uses the Fixed and fallback model')
     expect(el.textContent).not.toContain('glm-5.2')
     expect(el.textContent).not.toContain('static_tokenrhythm_b5')
     const provider = el.querySelector<HTMLSelectElement>('[aria-label="c3 request entry"]')
     expect(provider?.value).toBe('openai')
-    expect(el.textContent).not.toContain('Determined by Multi-model fusion')
+    expect(el.querySelector('select[aria-label="c3 thinking level"]')).toBeNull()
+    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')
+      ?.textContent).toContain('Determined by fusion plan')
     app.unmount()
   })
 
@@ -298,12 +469,34 @@ describe('SetupTierTable — editable routing rows', () => {
     })
 
     const summary = el.querySelector('.setup-tier-table__model-note')?.textContent || ''
-    expect(summary).toContain('previously saved tier-following fusion plan')
+    expect(summary).toContain('previously saved compatible fusion plan')
     expect(summary).toContain('OpenRouter · deepseek/deepseek-v4-pro')
     expect(summary).not.toContain('legacy-fallback-model')
     expect(el.querySelector<HTMLSelectElement>('[aria-label="c3 request entry"]')?.value)
       .toBe('openai')
-    expect(el.textContent).not.toContain('Determined by Multi-model fusion')
+    expect(el.querySelector('select[aria-label="c3 thinking level"]')).toBeNull()
+    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')
+      ?.textContent).toContain('Determined by fusion plan')
+    app.unmount()
+  })
+
+  it('uses tier-following copy only for the legacy router_dynamic mode', async () => {
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        model: 'legacy-dynamic-model',
+        ensembleSelectionMode: 'router_dynamic',
+      }],
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'deepseek/deepseek-v4-pro',
+    })
+
+    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+      .toContain('previously saved tier-following fusion plan')
+    expect(el.querySelector('[data-testid="tier-ensemble-migrate-legacy"]')).toBeTruthy()
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 thinking level"]')?.value)
+      .toBe(ROWS[1].thinkingLevel)
     app.unmount()
   })
 
@@ -554,6 +747,7 @@ describe('SetupTierTable — readonly preview mode', () => {
         model: 'glm-5.2',
         ensembleEnabled: true,
       }],
+      routerProviderRoles: { c3: 'dormant_draft' },
     })
 
     expect(el.querySelector('[aria-label="C3 processing mode or model"]')?.textContent)

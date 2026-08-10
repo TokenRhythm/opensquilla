@@ -36,6 +36,21 @@ function customLineup(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function tierEnsembleStatus(overrides: Record<string, unknown> = {}) {
+  return {
+    selectionMode: 'router_dynamic',
+    activationTiers: ['c3'],
+    tierSelectionModes: { c3: 'router_dynamic' },
+    runtimeStatus: 'conditional',
+    configurationReady: null,
+    blockedReason: '',
+    blockedTierCandidates: [],
+    fixedFallbackReady: true,
+    fixedFallbackBlockedReason: '',
+    ...overrides,
+  }
+}
+
 function panel(overrides: Record<string, unknown> = {}) {
   const base = {
     activeStrategy: 'router',
@@ -67,6 +82,7 @@ function panel(overrides: Record<string, unknown> = {}) {
       providerCredentialStatus: [],
       discoveredModelsByProvider: {},
       hasMixedTierProviders: false,
+      routerProviderRoles: {},
     },
     single: {
       providerId: 'openrouter',
@@ -351,6 +367,7 @@ describe('SetupModelStrategyPanel', () => {
   it('binds shared C3 fusion to the global fixed and fallback target', async () => {
     const { app, el } = await mountPanel({
       router: {
+        routerProviderRoles: { c3: 'dormant_draft' },
         tierRows: [{
           name: 'c3',
           provider: 'tokenrhythm',
@@ -394,6 +411,7 @@ describe('SetupModelStrategyPanel', () => {
     }
     const { app, el } = await mountPanel({
       router: {
+        routerProviderRoles: { c3: 'dormant_draft' },
         tierRows: [{
           name: 'c3',
           provider: 'openrouter',
@@ -412,7 +430,296 @@ describe('SetupModelStrategyPanel', () => {
       },
     })
 
-    expect(el.textContent).toContain('Current fusion plan is ready')
+    expect(el.querySelector('.setup-tier-table__model-note')).toBeNull()
+    expect(el.querySelector('.setup-tier-table__plan-status')).toBeNull()
+    expect(el.querySelector('button[aria-label="Show C3 fusion details"]')).toBeTruthy()
+    expect(el.querySelector('[role="tooltip"]')?.textContent)
+      .toContain('Current fusion plan is ready')
+    app.unmount()
+  })
+
+  it('evaluates a legacy dynamic shared plan from router tier candidates', async () => {
+    const onMigrateEnsembleLegacy = vi.fn()
+    const tierCandidate = {
+      key: 'tier:openrouter:dynamic-member',
+      provider: 'openrouter',
+      model: 'dynamic-member',
+      source: 'tier',
+      enabled: true,
+      role: '',
+      credential: { provider: 'openrouter', available: true, source: 'env' },
+    }
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dynamic_member' },
+        tierRows: [{
+          name: 'c3',
+          provider: 'openrouter',
+          model: 'dynamic-member',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'router_dynamic',
+        scheme: 'legacy',
+        tierCandidates: [tierCandidate],
+        customCandidates: [],
+      },
+    }, { onMigrateEnsembleLegacy })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')).toBeNull()
+    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+      .toContain('previously saved tier-following fusion plan')
+    expect(el.querySelector('[data-testid="tier-ensemble-migrate-legacy"]')).toBeTruthy()
+    el.querySelector<HTMLButtonElement>('[data-testid="tier-ensemble-migrate-legacy"]')?.click()
+    expect(onMigrateEnsembleLegacy).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
+  it.each([
+    {
+      name: 'route mode through the fixed provider',
+      credentialAvailable: false,
+      status: tierEnsembleStatus(),
+    },
+    {
+      name: 'veto mode with a foreign tier excluded',
+      credentialAvailable: false,
+      status: tierEnsembleStatus({
+        blockedTierCandidates: [{
+          source: 'router_tier:c0',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          reason: 'cross_provider_veto',
+        }],
+      }),
+    },
+    {
+      name: 'ready cross-provider deployment',
+      credentialAvailable: true,
+      status: tierEnsembleStatus(),
+    },
+  ])('trusts saved dynamic runtime status for $name', async ({ credentialAvailable, status }) => {
+    const tierCandidate = {
+      key: 'tier:foreign-provider:foreign-model',
+      provider: 'foreign-provider',
+      model: 'foreign-model',
+      source: 'tier',
+      enabled: true,
+      role: '',
+      credential: {
+        provider: 'foreign-provider',
+        available: credentialAvailable,
+        source: credentialAvailable ? 'env' : 'none',
+      },
+    }
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dynamic_member' },
+        tierEnsembleStatus: status,
+        tierEnsembleStatusFresh: true,
+        tierRows: [{
+          name: 'c3',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'router_dynamic',
+        scheme: 'legacy',
+        tierCandidates: [tierCandidate],
+        customCandidates: [],
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')).toBeNull()
+    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+      .toContain('previously saved tier-following fusion plan')
+    expect(el.querySelector('[data-testid="tier-ensemble-migrate-legacy"]')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('shows a saved unready dynamic deployment as an actionable inline error', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dynamic_member' },
+        tierEnsembleStatus: tierEnsembleStatus({
+          runtimeStatus: 'blocked',
+          configurationReady: false,
+          blockedReason: 'router_dynamic_not_ready:missing_credential',
+        }),
+        tierEnsembleStatusFresh: true,
+        tierRows: [{
+          name: 'c3',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'router_dynamic',
+        scheme: 'legacy',
+        tierCandidates: [],
+        customCandidates: [],
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+      .toContain('Current fusion plan is unavailable')
+    expect(el.querySelector('.setup-tier-table__blocked-reason')?.textContent)
+      .toContain('One or more models in this fusion plan are not ready')
+    expect(el.querySelector('.setup-tier-table__model-note')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('falls back to conservative local validation when saved tier status is null or stale', async () => {
+    const tierCandidate = {
+      key: 'tier:foreign-provider:foreign-model',
+      provider: 'foreign-provider',
+      model: 'foreign-model',
+      source: 'tier',
+      enabled: true,
+      role: '',
+      credential: { provider: 'foreign-provider', available: false, source: 'none' },
+    }
+    for (const routerStatus of [
+      { tierEnsembleStatus: null, tierEnsembleStatusFresh: true },
+      { tierEnsembleStatus: tierEnsembleStatus(), tierEnsembleStatusFresh: false },
+    ]) {
+      const { app, el } = await mountPanel({
+        router: {
+          routerProviderRoles: { c3: 'dynamic_member' },
+          ...routerStatus,
+          tierRows: [{
+            name: 'c3',
+            provider: 'foreign-provider',
+            model: 'foreign-model',
+            thinkingLevel: 'high',
+            supportsImage: false,
+            ensembleEnabled: true,
+          }],
+        },
+        ensemble: {
+          selectionMode: 'router_dynamic',
+          scheme: 'legacy',
+          tierCandidates: [tierCandidate],
+          customCandidates: [],
+        },
+      })
+
+      expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+        .toContain('Current fusion plan needs attention')
+      app.unmount()
+    }
+  })
+
+  it('never upgrades an invalidated saved blocker to ready after an unrelated local edit', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dormant_draft' },
+        tierEnsembleStatus: tierEnsembleStatus({
+          selectionMode: 'static_tokenrhythm_b5',
+          tierSelectionModes: { c3: 'static_tokenrhythm_b5' },
+          runtimeStatus: 'blocked',
+          configurationReady: false,
+          blockedReason: 'fixed_fallback:missing_credential:tokenrhythm',
+          fixedFallbackReady: false,
+          fixedFallbackBlockedReason: 'fixed_fallback:missing_credential:tokenrhythm',
+        }),
+        tierEnsembleStatusFresh: false,
+        tierRows: [{
+          name: 'c3',
+          provider: 'tokenrhythm',
+          model: 'quality-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'static_tokenrhythm_b5',
+        scheme: 'preset',
+        fixedProfile: {
+          provider: 'tokenrhythm',
+          providerLabel: 'TokenRhythm',
+          proposers: [],
+          aggregator: null,
+        },
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+      .toContain('Current fusion plan needs attention')
+    app.unmount()
+  })
+
+  it('rejects an ambiguous mixed-tier runtime aggregate instead of borrowing it for C3', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dynamic_member' },
+        tierEnsembleStatus: tierEnsembleStatus({
+          activationTiers: ['c0', 'c3'],
+          tierSelectionModes: {
+            c0: 'static_openrouter_b5',
+            c3: 'router_dynamic',
+          },
+        }),
+        tierEnsembleStatusFresh: true,
+        tierRows: [{
+          name: 'c3',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'router_dynamic',
+        scheme: 'legacy',
+        tierCandidates: [{
+          key: 'tier:foreign-provider:foreign-model',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          source: 'tier',
+          enabled: true,
+          role: '',
+          credential: { provider: 'foreign-provider', available: false, source: 'none' },
+        }],
+        customCandidates: [],
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+      .toContain('Current fusion plan needs attention')
+    app.unmount()
+  })
+
+  it('surfaces a blocked shared-provider role inline', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'blocked' },
+        tierRows: [{
+          name: 'c3',
+          provider: 'openrouter',
+          model: 'saved-draft',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+      .toContain('Current fusion plan is unavailable')
+    expect(el.querySelector('.setup-tier-table__model-note')).toBeTruthy()
     app.unmount()
   })
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -106,6 +107,26 @@ class _ScriptedProvider:
 
     async def list_models(self) -> list[Any]:
         return []
+
+
+class _ReplayAwareProvider(_Provider):
+    def __init__(self) -> None:
+        self.replay_provider_state = True
+        self.disable_calls = 0
+
+    def disable_provider_state_replay(self) -> None:
+        self.disable_calls += 1
+        self.replay_provider_state = False
+
+
+class _ReplayAwareSelector(_FakeSelector):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.disable_calls = 0
+
+    def disable_provider_state_replay(self) -> None:
+        self.disable_calls += 1
+        self._cfg = replace(self._cfg, replay_provider_state=False)
 
 
 def _static_b5_config(**ensemble_overrides: Any) -> GatewayConfig:
@@ -683,9 +704,160 @@ async def test_router_dynamic_unavailable_non_anchor_member_skips_to_fixed(
             "reason": "missing_credential",
         }
     ]
+    assert turn.metadata["ensemble_dynamic_blocked_reason"] == "missing_credential"
+    assert "ensemble_anchor_blocked_reason" not in turn.metadata
     assert turn.metadata["executed_provider"] == "tokenrhythm"
     assert turn.metadata["executed_model"] == fixed_model
+    assert turn.metadata["routed_provider_fallback_reason"] == (
+        "router_dynamic_not_ready:missing_credential"
+    )
     assert "ensemble_enabled" not in turn.metadata
+
+
+async def test_router_dynamic_late_skip_keeps_fixed_provider_state_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    fixed_model = "deepseek-v4-flash-0731"
+    routed_model = "z-ai/glm-5.2"
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": fixed_model,
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_profiles={
+            "openrouter": {
+                "provider": "openrouter",
+                "model": routed_model,
+                "api_key": "sk-or-synthetic",
+            }
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+            "tiers": {
+                "c0": {"provider": "anthropic", "model": "claude-unavailable"},
+                "c3": {"provider": "openrouter", "model": routed_model},
+            },
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    async def route_to_foreign_c3(turn):
+        turn.model = routed_model
+        turn.metadata.update(
+            {
+                "routed_tier": "c3",
+                "routed_model": routed_model,
+                "routed_provider": "openrouter",
+                "routing_applied": True,
+            }
+        )
+        return turn
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.apply_squilla_router",
+        route_to_foreign_c3,
+    )
+    fixed_provider = _ReplayAwareProvider()
+    selector = _ReplayAwareSelector(
+        provider="tokenrhythm",
+        model=fixed_model,
+        api_key="sk-tr-synthetic",
+    )
+
+    turn, provider = await TurnRunner(
+        provider_selector=None,
+        config=cfg,
+    )._run_pipeline(
+        "route with a blocked non-anchor deployment",
+        "agent:main:router-dynamic-late-skip-replay",
+        fixed_provider,
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert provider is fixed_provider
+    assert turn.metadata["ensemble_wrap_skipped_reason"] == (
+        "router_dynamic_not_ready:missing_credential"
+    )
+    assert fixed_provider.disable_calls == 0
+    assert fixed_provider.replay_provider_state is True
+    assert selector.disable_calls == 0
+    assert selector.current_config.replay_provider_state is True
+
+
+async def test_router_dynamic_ignores_unready_image_model_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    fixed_model = "balanced"
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": fixed_model,
+            "api_key": "sk-tr-synthetic",
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+            "tiers": {
+                "c1": {"provider": "tokenrhythm", "model": fixed_model},
+                "image_model": {
+                    "provider": "openrouter",
+                    "model": "vision/unavailable",
+                    "supports_image": True,
+                    "image_only": True,
+                },
+            },
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    async def route_to_c1(turn):
+        turn.model = fixed_model
+        turn.metadata.update(
+            {
+                "routed_tier": "c1",
+                "routed_model": fixed_model,
+                "routed_provider": "tokenrhythm",
+                "routing_applied": True,
+            }
+        )
+        return turn
+
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", route_to_c1)
+    selector = _FakeSelector(
+        provider="tokenrhythm",
+        model=fixed_model,
+        api_key="sk-tr-synthetic",
+    )
+
+    turn, provider = await TurnRunner(
+        provider_selector=None,
+        config=cfg,
+    )._run_pipeline(
+        "text-only dynamic request",
+        "agent:main:router-dynamic-image-tier-independent",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert isinstance(provider, EnsembleProvider)
+    assert provider.selection_plan["blocked_tier_candidates"] == []
+    assert all(
+        candidate["source"] != "router_tier:image_model"
+        for candidate in provider.selection_plan["candidate_pool"]
+    )
+    assert "ensemble_wrap_skipped_reason" not in turn.metadata
 
 
 @pytest.mark.parametrize(
@@ -1311,7 +1483,7 @@ async def test_c3_explicit_single_model_keeps_the_tier_local_model(
     assert "ensemble_enabled" not in turn.metadata
 
 
-async def test_c3_legacy_selection_mode_uses_the_global_fixed_fallback(
+async def test_c3_legacy_selection_mode_uses_fixed_fallback_when_global_plan_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = GatewayConfig(
@@ -1331,9 +1503,9 @@ async def test_c3_legacy_selection_mode_uses_the_global_fixed_fallback(
                 }
             },
         },
-        # A retained tier-local profile outranks even a simultaneously enabled
-        # global plan for upgrade compatibility.
-        llm_ensemble={"enabled": True},
+        # Retained tier-local profiles remain an upgrade path only while the
+        # top-level shared plan is disabled.
+        llm_ensemble={"enabled": False},
     )
 
     async def route_to_c3(turn):
@@ -1374,6 +1546,290 @@ async def test_c3_legacy_selection_mode_uses_the_global_fixed_fallback(
     assert turn.model == "deepseek-v4-flash-0731"
     assert turn.metadata["ensemble_fallback_provider"] == "tokenrhythm"
     assert turn.metadata["ensemble_fallback_model"] == "deepseek-v4-flash-0731"
+
+
+async def test_retained_tier_dynamic_mode_overrides_global_static_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_model = "deepseek-v4-flash-0731"
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": fixed_model,
+            "api_key": "sk-tr-synthetic",
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "tiers": {
+                "c3": {
+                    "provider": "tokenrhythm",
+                    "model": "glm-5.2",
+                    # Pre-boolean metadata remains an upgrade contract until
+                    # the tier is explicitly saved with ensemble_enabled.
+                    "ensemble_selection_mode": "router_dynamic",
+                }
+            },
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_tokenrhythm_b5",
+        },
+    )
+
+    async def route_to_c3(turn):
+        turn.model = "glm-5.2"
+        turn.metadata.update(
+            {
+                "routed_tier": "c3",
+                "routed_model": "glm-5.2",
+                "routed_provider": "tokenrhythm",
+                "routing_applied": True,
+            }
+        )
+        return turn
+
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", route_to_c3)
+    selector = _FakeSelector(
+        provider="tokenrhythm",
+        model=fixed_model,
+        api_key="sk-tr-synthetic",
+    )
+
+    turn, provider = await TurnRunner(
+        provider_selector=None,
+        config=cfg,
+    )._run_pipeline(
+        "use the global static plan",
+        "agent:main:global-static-over-retained-dynamic",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert isinstance(provider, EnsembleProvider)
+    assert provider.profile_name == "router_dynamic/c3"
+    assert provider.selection_plan["strategy"] == "router_dynamic"
+    assert provider.fallback_model == fixed_model
+    assert turn.metadata["ensemble_selection_mode"] == "router_dynamic"
+    assert turn.metadata["ensemble_activation_source"] == "router_tier"
+    assert turn.metadata["ensemble_tier_binding"] == "legacy"
+    assert turn.model == fixed_model
+
+
+async def test_explicit_shared_tier_ignores_retained_legacy_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_model = "deepseek-v4-flash-0731"
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": fixed_model,
+            "api_key": "sk-tr-synthetic",
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "tiers": {
+                "c3": {
+                    "provider": "tokenrhythm",
+                    "model": "glm-5.2",
+                    "ensemble_enabled": True,
+                    "ensemble_selection_mode": "router_dynamic",
+                }
+            },
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_tokenrhythm_b5",
+        },
+    )
+
+    async def route_to_c3(turn):
+        turn.model = "glm-5.2"
+        turn.metadata.update(
+            {
+                "routed_tier": "c3",
+                "routed_model": "glm-5.2",
+                "routed_provider": "tokenrhythm",
+                "routing_applied": True,
+            }
+        )
+        return turn
+
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", route_to_c3)
+    selector = _FakeSelector(
+        provider="tokenrhythm",
+        model=fixed_model,
+        api_key="sk-tr-synthetic",
+    )
+
+    turn, provider = await TurnRunner(
+        provider_selector=None,
+        config=cfg,
+    )._run_pipeline(
+        "use the explicitly shared plan",
+        "agent:main:shared-over-retained-dynamic",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert isinstance(provider, EnsembleProvider)
+    assert provider.profile_name == "static_tokenrhythm_b5"
+    assert turn.metadata["ensemble_selection_mode"] == "static_tokenrhythm_b5"
+    assert turn.metadata["ensemble_activation_source"] == "global"
+    assert "ensemble_tier_binding" not in turn.metadata
+
+
+@pytest.mark.parametrize(
+    "selection_mode",
+    ["static_openrouter_b5", "custom_b5", "router_dynamic"],
+)
+async def test_image_route_bypasses_every_global_ensemble_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    selection_mode: str,
+) -> None:
+    fixed_model = "text-model"
+    image_model = "vision-model"
+    ensemble_config: dict[str, Any] = {
+        "enabled": True,
+        "selection_mode": selection_mode,
+    }
+    if selection_mode == "custom_b5":
+        ensemble_config["candidates"] = [
+            {"provider": "tokenrhythm", "model": "candidate-a"},
+            {"provider": "tokenrhythm", "model": "candidate-b"},
+        ]
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": fixed_model,
+            "api_key": "sk-tr-synthetic",
+        },
+        squilla_router={"enabled": True, "preset_binding": "custom"},
+        llm_ensemble=ensemble_config,
+    )
+
+    async def route_image(turn):
+        turn.model = image_model
+        turn.metadata.update(
+            {
+                "routed_tier": "image_model",
+                "routed_model": image_model,
+                "routed_provider": "tokenrhythm",
+                "routing_source": "image_route",
+                "routing_applied": True,
+            }
+        )
+        return turn
+
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", route_image)
+    selector = _FakeSelector(
+        provider="tokenrhythm",
+        model=fixed_model,
+        api_key="sk-tr-synthetic",
+    )
+
+    turn, provider = await TurnRunner(
+        provider_selector=None,
+        config=cfg,
+    )._run_pipeline(
+        "inspect this image",
+        f"agent:main:image-direct-{selection_mode}",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert not isinstance(provider, EnsembleProvider)
+    assert selector.current_config.model == image_model
+    assert turn.model == image_model
+    assert turn.metadata["executed_model"] == image_model
+    for key in (
+        "ensemble_enabled",
+        "ensemble_activation_source",
+        "ensemble_tier_binding",
+        "ensemble_fallback_provider",
+        "ensemble_fallback_model",
+        "ensemble_wrap_skipped_reason",
+        "routed_model_before_ensemble",
+    ):
+        assert key not in turn.metadata
+
+
+async def test_cross_provider_image_route_executes_image_deployment_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_model = "openai/gpt-vision-synthetic"
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": "text-model",
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_profiles={
+            "openrouter": {
+                "provider": "openrouter",
+                "model": image_model,
+                "api_key": "sk-or-synthetic",
+            }
+        },
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "static_openrouter_b5"},
+    )
+
+    async def route_image(turn):
+        turn.model = image_model
+        turn.metadata.update(
+            {
+                "routed_tier": "image_model",
+                "routed_model": image_model,
+                "routed_provider": "openrouter",
+                "routing_source": "image_route",
+                "routing_applied": True,
+            }
+        )
+        return turn
+
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", route_image)
+    selector = _FakeSelector(
+        provider="tokenrhythm",
+        model="text-model",
+        api_key="sk-tr-synthetic",
+    )
+
+    turn, provider = await TurnRunner(
+        provider_selector=None,
+        config=cfg,
+    )._run_pipeline(
+        "inspect this image",
+        "agent:main:image-cross-provider-direct",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert not isinstance(provider, EnsembleProvider)
+    assert selector.current_config.provider == "openrouter"
+    assert selector.current_config.model == image_model
+    assert turn.metadata["executed_provider"] == "openrouter"
+    assert turn.metadata["executed_model"] == image_model
+    assert turn.metadata["routed_provider_applied"] == "openrouter"
+    assert "ensemble_enabled" not in turn.metadata
+    assert "ensemble_fallback_model" not in turn.metadata
 
 
 async def test_tokenrhythm_c3_uses_fixed_model_without_ensemble_credential(
@@ -1522,7 +1978,7 @@ def _custom_b5_guard_config(candidates: list[dict[str, Any]]) -> GatewayConfig:
     )
 
 
-async def test_custom_b5_tracks_missing_member_and_preserves_quorum(
+async def test_custom_b5_missing_member_skips_wrapper_before_member_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -1535,25 +1991,25 @@ async def test_custom_b5_tracks_missing_member_and_preserves_quorum(
     runner = TurnRunner(provider_selector=None, config=cfg)
     selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
 
+    fixed_provider = _Provider()
     turn, provider = await runner._run_pipeline(
         "hello",
         "agent:main:test",
-        _Provider(),
+        fixed_provider,
         selector,
         [],
         "system prompt",
         [],
     )
 
-    assert isinstance(provider, EnsembleProvider)
-    by_provider = {
-        member.provider_config.provider: member for member in provider.proposers
-    }
-    assert by_provider["groq"].ready is True
-    assert by_provider["openrouter"].ready is False
-    assert by_provider["openrouter"].unavailable_reason == "missing_credential"
-    assert turn.metadata["ensemble_enabled"] is True
-    assert "ensemble_wrap_skipped_reason" not in turn.metadata
+    assert provider is fixed_provider
+    assert not isinstance(provider, EnsembleProvider)
+    assert turn.metadata["ensemble_wrap_skipped_reason"] == (
+        "custom_b5_not_ready:missing_credential:openrouter"
+    )
+    assert turn.metadata["executed_provider"] == "groq"
+    assert turn.metadata["executed_model"] == "base-model"
+    assert "ensemble_enabled" not in turn.metadata
 
 
 async def test_custom_b5_wraps_when_every_member_resolves_a_key(

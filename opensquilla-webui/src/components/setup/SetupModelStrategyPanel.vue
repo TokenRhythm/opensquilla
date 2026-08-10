@@ -7,9 +7,11 @@ import SetupTierTable from '@/components/setup/SetupTierTable.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { ModelStrategy } from '@/composables/setup/useSetupModelStrategyForm'
 import type {
+  RouterProviderRoles,
   SetupProviderCredentialStatus,
   SetupProviderOption,
   SetupTierRow,
+  TierEnsembleRuntimeStatus,
 } from '@/composables/setup/useSetupRouterForm'
 import type {
   DiscoveredModelCatalog,
@@ -48,6 +50,9 @@ interface RouterPanelContract {
   providerCredentialStatus: readonly SetupProviderCredentialStatus[]
   discoveredModelsByProvider?: DiscoveredModelsByProvider
   hasMixedTierProviders: boolean
+  routerProviderRoles?: RouterProviderRoles
+  tierEnsembleStatus?: TierEnsembleRuntimeStatus | null
+  tierEnsembleStatusFresh?: boolean
 }
 
 interface EnsemblePanelContract {
@@ -397,10 +402,47 @@ const activeFacts = computed(() => (
     ? props.panel.ensemble.presetFacts
     : customLineup.value.facts
 ))
+const c3FusionActive = computed(() => props.panel.router.tierRows.some(row => (
+  row.name === 'c3'
+  && (
+    row.ensembleEnabled === true
+    || (row.ensembleEnabled === undefined && Boolean(row.ensembleSelectionMode))
+  )
+)))
+const savedTierEnsembleStatus = computed(() => {
+  if (!c3FusionActive.value || props.panel.router.tierEnsembleStatusFresh !== true) return null
+  const status = props.panel.router.tierEnsembleStatus
+  if (!status || !['ready', 'conditional', 'blocked'].includes(status.runtimeStatus)) return null
+  // New Gateways project this status per tier. Require an exact C3 scope so a
+  // mixed legacy profile can never show another tier's plan as C3 readiness.
+  if (status.activationTiers.length !== 1 || status.activationTiers[0] !== 'c3') return null
+  const scopedModes = Object.keys(status.tierSelectionModes)
+  if (scopedModes.length !== 1 || scopedModes[0] !== 'c3') return null
+  return status
+})
+const staleTierEnsembleStatus = computed(() => (
+  c3FusionActive.value
+  && Boolean(props.panel.router.tierEnsembleStatus)
+  && props.panel.router.tierEnsembleStatusFresh === false
+))
+const savedTierEnsembleBlocked = computed(() => {
+  const status = savedTierEnsembleStatus.value
+  if (!status) return false
+  return status.runtimeStatus === 'blocked'
+    || status.configurationReady === false
+    || status.fixedFallbackReady === false
+    || Boolean(status.blockedReason)
+})
 const ensemblePlanNeedsAttention = computed(() => {
   const credentialUnavailable = (candidate: EnsembleCandidateView | undefined | null) => (
     candidate?.credential?.available === false
   )
+  if (!props.panel.single.providerId || !props.panel.single.model.trim()) return true
+  // A local edit invalidates the server snapshot. Do not upgrade a previously
+  // blocked/conditional saved plan to ready using a less complete heuristic;
+  // retain an attention state until the edited configuration is saved.
+  if (staleTierEnsembleStatus.value) return true
+  if (savedTierEnsembleStatus.value) return savedTierEnsembleBlocked.value
   if (ensembleScheme.value === 'preset') {
     const profile = props.panel.ensemble.fixedProfile
     return !profile
@@ -409,16 +451,26 @@ const ensemblePlanNeedsAttention = computed(() => {
       || credentialUnavailable(profile.aggregator)
   }
   if (ensembleScheme.value === 'legacy') {
-    return props.panel.ensemble.customCandidates.length === 0
-      || props.panel.ensemble.customCandidates.some(credentialUnavailable)
+    return props.panel.ensemble.tierCandidates.length === 0
+      || props.panel.ensemble.tierCandidates.some(credentialUnavailable)
   }
   return customLineup.value.belowMinimum
     || customLineup.value.proposers.some(credentialUnavailable)
     || credentialUnavailable(customLineup.value.aggregator)
     || (!customLineup.value.aggregator && !customLineup.value.inheritedAggregatorModel)
 })
-const ensemblePlanStatus = computed<'ready' | 'attention'>(() => (
-  ensemblePlanNeedsAttention.value ? 'attention' : 'ready'
+const ensemblePlanStatus = computed<'ready' | 'attention' | 'blocked'>(() => {
+  if (props.panel.router.routerProviderRoles?.c3 === 'blocked') return 'blocked'
+  if (savedTierEnsembleBlocked.value) return 'blocked'
+  return ensemblePlanNeedsAttention.value ? 'attention' : 'ready'
+})
+const ensemblePlanBlockedReason = computed(() => (
+  savedTierEnsembleBlocked.value
+    ? savedTierEnsembleStatus.value?.blockedReason
+      || (savedTierEnsembleStatus.value?.fixedFallbackReady === false
+        ? savedTierEnsembleStatus.value.fixedFallbackBlockedReason || 'missing_fixed_fallback'
+        : 'configuration_unavailable')
+    : ''
 ))
 const legacyProposers = computed(() => (
   props.panel.ensemble.customCandidates.filter(candidate => candidate.role !== 'aggregator')
@@ -722,7 +774,12 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           :fixed-fallback-provider="panel.single.providerLabel"
           :fixed-fallback-model="panel.single.model"
           :ensemble-plan-status="ensemblePlanStatus"
+          :ensemble-plan-blocked-reason="ensemblePlanBlockedReason"
+          :ensemble-fixed-fallback-ready="savedTierEnsembleStatus?.fixedFallbackReady"
+          :router-provider-roles="panel.router.routerProviderRoles || {}"
+          :effective-ensemble-selection-mode="panel.ensemble.selectionMode"
           @update-tier-field="(name, key, value) => emit('updateTierField', name, key, value)"
+          @migrate-legacy-ensemble="emit('migrateEnsembleLegacy')"
         />
 
         <details

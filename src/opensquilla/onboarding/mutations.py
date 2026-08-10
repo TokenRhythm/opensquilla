@@ -463,6 +463,7 @@ def _cross_provider_tier_warnings(
             tier,
             shared_selection_mode=shared_selection_mode,
             router_dynamic_members_active=dynamic_members_active,
+            ensemble_globally_enabled=ensemble_globally_enabled,
         )
         if provider_role == "dormant_draft":
             continue
@@ -623,12 +624,13 @@ def _router_provider_conflicts(
         else str(shared_selection_mode or "").strip()
     )
     tiers = getattr(router, "tiers", {}) or {}
+    ensemble_globally_enabled = bool(
+        getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+    )
     dynamic_members_active = router_dynamic_tier_members_active(
         tiers if isinstance(tiers, Mapping) else {},
         shared_selection_mode=effective_shared_mode,
-        ensemble_globally_enabled=bool(
-            getattr(getattr(config, "llm_ensemble", None), "enabled", False)
-        ),
+        ensemble_globally_enabled=ensemble_globally_enabled,
     )
     conflicts: set[str] = set()
     if isinstance(tiers, Mapping):
@@ -640,6 +642,7 @@ def _router_provider_conflicts(
                 tier,
                 shared_selection_mode=effective_shared_mode,
                 router_dynamic_members_active=dynamic_members_active,
+                ensemble_globally_enabled=ensemble_globally_enabled,
             )
             if provider_role not in {"direct", "dynamic_member"}:
                 continue
