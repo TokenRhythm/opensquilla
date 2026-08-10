@@ -829,7 +829,8 @@ def test_router_dynamic_ensemble_uses_step2_default_tier1_single_proposer_bound(
     assert provider.selection_plan["selection_steps"][0]["step"] == 1
     assert provider.proposer_timeout_seconds == 3600.0
     assert provider.aggregator_timeout_seconds == 3600.0
-    assert provider.quorum_grace_seconds == 0.0
+    assert provider.quorum_grace_seconds == 2.0
+    assert provider.selection_plan["quorum_grace_seconds"] == 2.0
 
 
 def test_router_dynamic_explicit_quorum_one_is_not_treated_as_auto() -> None:

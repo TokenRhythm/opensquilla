@@ -133,6 +133,9 @@ _ROUTER_DYNAMIC_RECOVERY_PLAN_DRIFT_CODE = (
 _ANALYZER_FAILURE_FALLBACK_SCHEMA = (
     "opensquilla.router-dynamic-analyzer-failure-fallback/v1"
 )
+_PROPOSER_QUORUM_EXECUTION_SCHEMA = (
+    "opensquilla.proposer-quorum-execution/v1"
+)
 _POLICY_THINKING_BUDGET_TOKENS: dict[str, int] = {
     "off": 0,
     "minimal": 1_024,
@@ -3883,6 +3886,7 @@ class EnsembleProvider:
         self._active_chat = False
         self._proposer_retry_scope: _ProposerRecoveryScopeState | None = None
         self._current_proposer_recovery_trace: dict[str, Any] | None = None
+        self._current_proposer_quorum_trace: dict[str, Any] | None = None
         self._pending_cleanup_tasks: set[asyncio.Future[Any]] = set()
         self._pending_cleanup_phases: dict[asyncio.Future[Any], str] = {}
         self._cleanup_poisoned_reason = ""
@@ -6156,6 +6160,7 @@ class EnsembleProvider:
             return
         self._reset_usage_accounting_snapshot(accounting_state)
         self._current_proposer_recovery_trace = None
+        self._current_proposer_quorum_trace = None
         self._active_chat = True
         try:
             async with _closing_async_iterator(
@@ -9685,6 +9690,34 @@ class EnsembleProvider:
         ] = {}
         results: list[_CandidateResult] = []
         proposer_start_gate = asyncio.Event()
+        proposer_batch_started = time.monotonic()
+        quorum_trace: dict[str, Any] | None = None
+        if self._router_dynamic_selection() and self.quorum_grace_seconds > 0:
+            quorum_trace = {
+                "schema": _PROPOSER_QUORUM_EXECUTION_SCHEMA,
+                "wait_for_all_proposers": False,
+                "quorum_required": self.min_successful_proposers,
+                "quorum_reached": False,
+                "quorum_reached_at": None,
+                "time_to_quorum_ms": None,
+                "grace_seconds": self.quorum_grace_seconds,
+                "effective_grace_seconds": 0.0,
+                "grace_elapsed_ms": 0,
+                "pending_at_quorum": 0,
+                "completed_during_grace": 0,
+                "cancellation": {
+                    "reason": "",
+                    "requested_task_count": 0,
+                },
+                "cleanup": {
+                    "awaited_task_count": 0,
+                    "completed_task_count": 0,
+                    "lingering_task_count": 0,
+                    "stream_close_proven_count": 0,
+                    "stream_close_unproven_count": 0,
+                },
+            }
+        self._current_proposer_quorum_trace = quorum_trace
 
         async def collect_after_start_gate(
             *,
@@ -9800,11 +9833,55 @@ class EnsembleProvider:
         pending: set[asyncio.Task[_CandidateResult]] = set(tasks)
         cancel_code = ""
         cancel_message = ""
+        cancelled_task_keys: set[tuple[int, int]] = set()
         try:
             dynamic_partial_quorum = bool(
                 self._router_dynamic_selection()
                 and not require_strict_quorum
             )
+
+            def observe_execution_quorum() -> bool:
+                if dynamic_partial_quorum:
+                    quorum_required = _proposer_execution_quorum_required(
+                        results,
+                        self.min_successful_proposers,
+                    )
+                    quorum_count = len(_usable_proposer_candidates(results))
+                else:
+                    quorum_required = self.min_successful_proposers
+                    quorum_count = sum(
+                        1
+                        for result in results
+                        if self._strict_proposer_success(result)
+                    )
+                quorum_met = quorum_count >= quorum_required
+                if (
+                    quorum_met
+                    and quorum_trace is not None
+                    and quorum_trace["quorum_reached"] is False
+                ):
+                    quorum_reached = time.monotonic()
+                    quorum_trace.update(
+                        {
+                            "quorum_required": quorum_required,
+                            "quorum_reached": True,
+                            "quorum_reached_at": time.time(),
+                            "time_to_quorum_ms": int(
+                                (quorum_reached - proposer_batch_started) * 1000
+                            ),
+                            "pending_at_quorum": len(pending),
+                        }
+                    )
+                    log.info(
+                        "llm_ensemble.proposer_quorum_reached",
+                        profile=self.profile_name,
+                        quorum_required=quorum_required,
+                        quorum_count=quorum_count,
+                        pending_count=len(pending),
+                        grace_seconds=self.quorum_grace_seconds,
+                    )
+                return quorum_met
+
             usable_count = (
                 len(_usable_proposer_candidates(results))
                 if dynamic_partial_quorum
@@ -9940,22 +10017,8 @@ class EnsembleProvider:
                         f"< {execution_quorum_required} required"
                     )
                     break
-                if (
-                    self.quorum_grace_seconds > 0
-                    and (
-                        _proposer_execution_quorum_met(
-                            results,
-                            self.min_successful_proposers,
-                        )
-                        if dynamic_partial_quorum
-                        else sum(
-                            1
-                            for result in results
-                            if self._strict_proposer_success(result)
-                        )
-                        >= self.min_successful_proposers
-                    )
-                ):
+                quorum_met = observe_execution_quorum()
+                if self.quorum_grace_seconds > 0 and quorum_met:
                     break
 
             if pending and not cancel_code:
@@ -9965,7 +10028,15 @@ class EnsembleProvider:
                         grace_timeout,
                         max(0.0, soft_deadline - time.monotonic()),
                     )
+                grace_started = time.monotonic()
+                if quorum_trace is not None:
+                    quorum_trace["effective_grace_seconds"] = grace_timeout
                 done, pending = await asyncio.wait(pending, timeout=grace_timeout)
+                if quorum_trace is not None:
+                    quorum_trace["grace_elapsed_ms"] = int(
+                        (time.monotonic() - grace_started) * 1000
+                    )
+                    quorum_trace["completed_during_grace"] = len(done)
                 for task in done:
                     results.append(await task)
                 if (
@@ -9987,6 +10058,16 @@ class EnsembleProvider:
                 controlled_message = cancel_message or (
                     f"proposer cancelled after {self.quorum_grace_seconds:g}s ensemble quorum grace"
                 )
+                remaining = list(pending)
+                cancelled_task_keys = {
+                    (task_meta[task][0], task_meta[task][1])
+                    for task in remaining
+                }
+                if quorum_trace is not None:
+                    quorum_trace["cancellation"] = {
+                        "reason": controlled_code,
+                        "requested_task_count": len(remaining),
+                    }
                 for task in pending:
                     setattr(task, "_opensquilla_ensemble_cancel_code", controlled_code)
                     setattr(
@@ -9995,10 +10076,17 @@ class EnsembleProvider:
                         controlled_message,
                     )
                     task.cancel()
-                remaining = list(pending)
                 for task in remaining:
                     self._track_pending_cleanup(task, "proposers")
                 lingering = await _bounded_task_cleanup(remaining, phase="proposers")
+                if quorum_trace is not None:
+                    quorum_trace["cleanup"].update(
+                        {
+                            "awaited_task_count": len(remaining),
+                            "completed_task_count": len(remaining) - len(lingering),
+                            "lingering_task_count": len(lingering),
+                        }
+                    )
                 for task in remaining:
                     task_controlled_code = controlled_code
                     task_controlled_message = controlled_message
@@ -10259,6 +10347,22 @@ class EnsembleProvider:
                                 ),
                             )
                         )
+            if quorum_trace is not None and cancelled_task_keys:
+                cancelled_results = [
+                    result
+                    for result in results
+                    if (result.index, result.sample_index) in cancelled_task_keys
+                ]
+                quorum_trace["cleanup"].update(
+                    {
+                        "stream_close_proven_count": sum(
+                            result.stream_closed for result in cancelled_results
+                        ),
+                        "stream_close_unproven_count": sum(
+                            not result.stream_closed for result in cancelled_results
+                        ),
+                    }
+                )
             return sorted(results, key=lambda result: (result.index, result.sample_index))
         except BaseException:
             for task in pending:
@@ -11491,6 +11595,10 @@ class EnsembleProvider:
         if self._current_proposer_recovery_trace is not None:
             trace["proposer_recovery"] = _json_safe(
                 self._current_proposer_recovery_trace
+            )
+        if self._current_proposer_quorum_trace is not None:
+            trace["proposer_quorum"] = _json_safe(
+                self._current_proposer_quorum_trace
             )
         if self._thinking_policy_active():
             trace["thinking_execution_fallbacks"] = _json_safe(
@@ -16284,6 +16392,10 @@ _STATIC_B5_DEFAULT_SHUFFLE_CANDIDATES = False
 # proposer timeout prevents one slow upstream from dominating end-to-end
 # latency while preserving the fixed lineup's configured quorum quality floor.
 _STATIC_B5_QUORUM_GRACE_SECONDS = 10.0
+# Dynamic routing serves interactive turns. Start at the documented experiment
+# range's lower bound so useful late candidates still get a bounded chance to
+# join without letting a single stalled upstream dominate the tail.
+_ROUTER_DYNAMIC_QUORUM_GRACE_SECONDS = 2.0
 
 _DYNAMIC_SLOT_WEIGHTS = {
     "cheap_contrast": {
@@ -19071,8 +19183,8 @@ def build_ensemble_provider_from_config(
         and selection_plan.get("analyzer_failure_fallback") is True
     )
     # Static and custom lineups share the fixed-lineup defaults family
-    # (quorum replacement, 300/480s timeouts, no shuffle, quorum grace);
-    # Dynamic modes keep the legacy defaults untouched.
+    # (quorum replacement, 300/480s timeouts, no shuffle, quorum grace).
+    # Dynamic modes keep legacy timeouts/shuffle but bound the post-quorum tail.
     is_static_b5 = static_profile is not None or is_custom_b5
     ensemble_fields_set = set(getattr(ensemble_cfg, "model_fields_set", set()) or set())
     configured_min_success = (
@@ -19148,7 +19260,13 @@ def build_ensemble_provider_from_config(
         (selection_plan.get("aggregator") or {}).get("requires_order_randomization")
     ):
         shuffle_candidates = True
-    quorum_grace_seconds = _STATIC_B5_QUORUM_GRACE_SECONDS if is_static_b5 else 0.0
+    quorum_grace_seconds = (
+        _STATIC_B5_QUORUM_GRACE_SECONDS
+        if is_static_b5
+        else _ROUTER_DYNAMIC_QUORUM_GRACE_SECONDS
+        if selection_mode == "router_dynamic"
+        else 0.0
+    )
     selection_plan["configured_min_successful_proposers"] = (
         1 if is_analyzer_failure_fallback else configured_min_success
     )

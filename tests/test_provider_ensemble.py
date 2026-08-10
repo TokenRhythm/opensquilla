@@ -9208,6 +9208,163 @@ async def test_ensemble_streams_proposer_progress_live_not_buffered(
     assert finishes == {"p1", "p2"}
 
 
+def _quorum_one_router_dynamic_plan(
+    proposers: list[EnsembleMemberConfig],
+) -> dict[str, Any]:
+    plan = _slot_recovery_plan(proposers, [])
+    plan["effective_min_successful_proposers"] = 1
+    plan["proposer_recovery_policy"]["quorum_required"] = 1
+    return plan
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_bounded_grace_cancels_hung_proposer_and_cleans_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slow_gate = asyncio.Event()
+    slow_closed = asyncio.Event()
+    aggregator_started = asyncio.Event()
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="d1"), DoneEvent(model="p1")]),
+            "p2": _FakePlan(
+                [TextDeltaEvent(text="d2"), DoneEvent(model="p2")],
+                gate=slow_gate,
+                closed=slow_closed,
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="agg")],
+                started=aggregator_started,
+            ),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    proposers = [_member("p1"), _member("p2")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c1",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        proposer_timeout_seconds=10,
+        aggregator_timeout_seconds=1,
+        quorum_grace_seconds=0.02,
+        shuffle_candidates=False,
+        selection_plan=_quorum_one_router_dynamic_plan(proposers),
+    )
+    tasks_before = set(asyncio.all_tasks())
+    wall_started = time.time()
+
+    events = await asyncio.wait_for(_collect(provider), timeout=1.0)
+    wall_finished = time.time()
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if not provider._cleanup_is_pending():
+            break
+
+    assert aggregator_started.is_set() is True
+    assert slow_gate.is_set() is False
+    assert slow_closed.is_set() is True
+    assert provider._cleanup_is_pending() is False
+    assert [
+        task
+        for task in asyncio.all_tasks() - tasks_before
+        if not task.done()
+    ] == []
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    quorum = done.ensemble_trace["proposer_quorum"]
+    assert quorum["schema"] == "opensquilla.proposer-quorum-execution/v1"
+    assert quorum["wait_for_all_proposers"] is False
+    assert quorum["quorum_required"] == 1
+    assert quorum["quorum_reached"] is True
+    assert wall_started <= quorum["quorum_reached_at"] <= wall_finished
+    assert quorum["time_to_quorum_ms"] >= 0
+    assert quorum["grace_seconds"] == pytest.approx(0.02)
+    assert quorum["effective_grace_seconds"] == pytest.approx(0.02)
+    assert quorum["pending_at_quorum"] == 1
+    assert quorum["completed_during_grace"] == 0
+    assert quorum["cancellation"] == {
+        "reason": "quorum_cancelled",
+        "requested_task_count": 1,
+    }
+    assert quorum["cleanup"] == {
+        "awaited_task_count": 1,
+        "completed_task_count": 1,
+        "lingering_task_count": 0,
+        "stream_close_proven_count": 1,
+        "stream_close_unproven_count": 0,
+    }
+    p2 = done.ensemble_trace["candidates"][1]
+    assert p2["error_code"] == "quorum_cancelled"
+    assert p2["stream_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_bounded_grace_keeps_late_proposer_in_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    late_gate = asyncio.Event()
+    grace_started = asyncio.Event()
+    real_asyncio_wait = asyncio.wait
+
+    async def observed_wait(
+        futures: set[asyncio.Task[Any]],
+        **kwargs: Any,
+    ) -> tuple[set[asyncio.Task[Any]], set[asyncio.Task[Any]]]:
+        if kwargs.get("timeout") == 0.2:
+            grace_started.set()
+        return await real_asyncio_wait(futures, **kwargs)
+
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="d1"), DoneEvent(model="p1")]),
+            "p2": _FakePlan(
+                [TextDeltaEvent(text="d2"), DoneEvent(model="p2")],
+                gate=late_gate,
+            ),
+            "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    monkeypatch.setattr("opensquilla.provider.ensemble.asyncio.wait", observed_wait)
+    proposers = [_member("p1"), _member("p2")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c1",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        proposer_timeout_seconds=10,
+        aggregator_timeout_seconds=1,
+        quorum_grace_seconds=0.2,
+        shuffle_candidates=False,
+        selection_plan=_quorum_one_router_dynamic_plan(proposers),
+    )
+
+    consume_task = asyncio.create_task(_collect(provider))
+    try:
+        await asyncio.wait_for(grace_started.wait(), timeout=1.0)
+        late_gate.set()
+        events = await asyncio.wait_for(consume_task, timeout=1.0)
+    finally:
+        if not consume_task.done():
+            consume_task.cancel()
+        await asyncio.gather(consume_task, return_exceptions=True)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["successful_proposers"] == 2
+    assert done.ensemble_trace["selected_candidate_indexes"] == [0, 1]
+    quorum = done.ensemble_trace["proposer_quorum"]
+    assert quorum["pending_at_quorum"] == 1
+    assert quorum["completed_during_grace"] == 1
+    assert quorum["cancellation"] == {
+        "reason": "",
+        "requested_task_count": 0,
+    }
+    assert quorum["cleanup"]["awaited_task_count"] == 0
+    assert quorum["cleanup"]["lingering_task_count"] == 0
+
+
 @pytest.mark.asyncio
 async def test_static_openrouter_b5_quorum_cancels_slow_proposer(
     monkeypatch: pytest.MonkeyPatch,
@@ -9261,6 +9418,7 @@ async def test_static_openrouter_b5_quorum_cancels_slow_proposer(
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.usage_missing_count == 1
     assert done.ensemble_trace is not None
+    assert "proposer_quorum" not in done.ensemble_trace
     assert done.ensemble_trace["successful_proposers"] == 3
     assert done.ensemble_trace["selected_candidate_count"] == 3
     assert done.ensemble_trace["selected_candidate_indexes"] == [0, 1, 2]
@@ -9962,30 +10120,41 @@ async def test_required_all_quorum_cancels_remaining_after_failure(
 
 
 @pytest.mark.asyncio
-async def test_default_ensemble_waits_for_all_proposers_without_quorum(
+async def test_draco_explicit_zero_grace_waits_for_all_proposers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     slow_gate = asyncio.Event()
+    slow_closed = asyncio.Event()
     registry = _FakeRegistry(
         {
             "p1": _FakePlan([TextDeltaEvent(text="d1"), DoneEvent(model="p1")]),
             "p2": _FakePlan(
                 [TextDeltaEvent(text="d2"), DoneEvent(model="p2")],
                 gate=slow_gate,
+                closed=slow_closed,
             ),
             "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
         }
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    proposers = [_member("p1"), _member("p2")]
+    selection_plan = _quorum_one_router_dynamic_plan(proposers)
+    selection_plan.update(
+        {
+            "wait_for_all_proposers": True,
+            "quorum_grace_seconds": 0.0,
+        }
+    )
     provider = EnsembleProvider(
         profile_name="router_dynamic/c1",
-        proposers=[_member("p1"), _member("p2")],
+        proposers=proposers,
         aggregator=_member("agg"),
         min_successful_proposers=1,
         proposer_timeout_seconds=2,
         aggregator_timeout_seconds=1,
         quorum_grace_seconds=0.0,
         shuffle_candidates=False,
+        selection_plan=selection_plan,
     )
 
     consume_task = asyncio.create_task(_collect(provider))
@@ -9996,8 +10165,11 @@ async def test_default_ensemble_waits_for_all_proposers_without_quorum(
     events = await asyncio.wait_for(consume_task, timeout=1.0)
 
     assert [call["model"] for call in registry.calls] == ["p1", "p2", "agg"]
+    assert slow_closed.is_set() is True
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
+    assert "proposer_quorum" not in done.ensemble_trace
+    assert done.ensemble_trace["selection_plan"]["wait_for_all_proposers"] is True
     assert done.ensemble_trace["successful_proposers"] == 2
     assert done.ensemble_trace["quorum_grace_seconds"] == 0.0
     assert "execution_mode" not in done.ensemble_trace
