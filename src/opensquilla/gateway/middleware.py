@@ -55,6 +55,7 @@ def _is_control_plane_path(path: str) -> bool:
         path in _CONTROL_PLANE_PATHS
         or _path_is_at_or_below(path, "/api")
         or _path_is_at_or_below(path, "/ws")
+        or _path_is_at_or_below(path, "/v1")
     )
 
 

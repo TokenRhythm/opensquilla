@@ -2247,6 +2247,26 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
         return values
 
 
+class OpenAICompatConfig(BaseSettings):
+    """OpenAI-compatible relay surface for third-party clients.
+
+    ``POST /v1/chat/completions`` and ``GET /v1/models`` let OpenAI-protocol
+    clients (astrbot, one-api, chatbox, ...) drive the configured LLM
+    deployments through the gateway.
+
+    The relay implements no authentication of its own: the ``/v1/*`` paths
+    belong to the gateway control plane, so the global ``AuthMiddleware``
+    applies (``auth.mode``: token / password / trusted-proxy).  In the
+    default ``auth.mode = "none"`` the relay enforces a loopback-only
+    guard, keeping the gateway's default bind scope as the safety
+    boundary.  Disabled by default: operators opt in explicitly.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_OPENAI_COMPAT_")
+
+    enabled: bool = False
+
+
 class GatewayConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_GATEWAY_",
@@ -2304,6 +2324,8 @@ class GatewayConfig(BaseSettings):
     prompt: PromptConfig = Field(default_factory=PromptConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     squilla_router: SquillaRouterConfig = Field(default_factory=SquillaRouterConfig)
+    # OpenAI-compatible relay (POST /v1/chat/completions, GET /v1/models).
+    openai_compat: OpenAICompatConfig = Field(default_factory=OpenAICompatConfig)
     agent_token_saving: AgentTokenSavingConfig = Field(default_factory=AgentTokenSavingConfig)
     compaction: CompactionLlmConfig = Field(default_factory=CompactionLlmConfig)
     naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)

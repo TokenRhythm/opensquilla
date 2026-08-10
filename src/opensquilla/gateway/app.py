@@ -29,6 +29,7 @@ from opensquilla.gateway.middleware import (
     SecurityHeadersMiddleware,
     UnsafeOriginGuardMiddleware,
 )
+from opensquilla.gateway.openai_compat import openai_compat_routes
 from opensquilla.gateway.origin_guard import (
     extract_http_token,
     forbidden_origin_response,
@@ -788,6 +789,7 @@ def create_gateway_app(
             methods=["PUT"],
         ),
         Route("/api/channels/status", api_channels_status, methods=["GET"]),
+        *openai_compat_routes(config),
         Route("/api/channels/logout", _same_origin(api_channels_logout), methods=["POST"]),
         Route("/api/channels/pairings", api_channel_pairings, methods=["GET"]),
         Route(
