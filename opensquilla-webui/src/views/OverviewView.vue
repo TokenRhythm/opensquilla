@@ -194,6 +194,8 @@ import { useRpcStore } from '@/stores/rpc'
 import { useRequest } from '@/composables/useRequest'
 import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
+import { SESSION_LIST_VIEW, normalizeSessionItem } from '@/composables/useSessions'
+import type { SessionsListResponse } from '@/types/rpc'
 import type { UsageSnapshot } from '@/types/usage'
 import { useToasts } from '@/composables/useToasts'
 import { isOwnedGatewayConnection } from '@/composables/useCliInvocation'
@@ -346,8 +348,26 @@ async function refreshUsage(): Promise<UsageData | null> {
       cachedSnapshot: usageSnapshot.value,
     })
     usageSnapshot.value = snapshot
+    // "Total sessions" counts every session the storage knows about, matching
+    // the Sessions page. The ledger's sessionCount only covers sessions that
+    // produced usage records, so a session created without a provider call
+    // (e.g. "No provider available") would otherwise read 0 here.
+    let totalSessions = snapshot.totals.sessions
+    try {
+      const list = await rpc.call<SessionsListResponse>('sessions.list', {
+        limit: 200,
+        view: SESSION_LIST_VIEW,
+      })
+      const rows = (list?.sessions || []).filter(
+        (item) => normalizeSessionItem(item) !== null,
+      )
+      totalSessions = rows.length
+    } catch {
+      // sessions.list is the source of truth; a ledger count stays as a
+      // lower-bound fallback when it is unavailable.
+    }
     const result = {
-      totalSessions: snapshot.totals.sessions,
+      totalSessions,
       totalTokens: snapshot.totals.totalTokens,
       totalCostUsd: snapshot.totals.cost,
     }

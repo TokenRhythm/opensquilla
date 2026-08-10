@@ -16,6 +16,8 @@ interface MountOptions {
     params: unknown,
     callIndex: number,
   ) => Record<string, unknown> | Promise<Record<string, unknown>>
+  /** Response for sessions.list; null makes the call reject. */
+  sessionsList?: unknown | null
 }
 
 interface PushArg {
@@ -82,6 +84,20 @@ async function mountOverview(options: MountOptions = {}) {
       if (options.failProviders) throw new Error('providers unavailable')
       return options.providers ?? { providers: [] }
     }
+    if (method === 'usage.query') {
+      return {
+        totals: { sessionCount: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+        sessions: [],
+        models: [],
+        days: [],
+        coverage: {},
+        range: {},
+      }
+    }
+    if (method === 'sessions.list') {
+      if (options.sessionsList === null) throw new Error('sessions unavailable')
+      return options.sessionsList ?? { sessions: [], count: 0 }
+    }
     throw new Error(`unexpected rpc method: ${method}`)
   })
 
@@ -93,6 +109,8 @@ async function mountOverview(options: MountOptions = {}) {
       on: rpcOn,
       waitForConnection: vi.fn(async () => {}),
       call: rpcCall,
+      supportsMethod: vi.fn(() => true),
+      markMethodUnavailable: vi.fn(),
     }),
   }))
   const useRequestMethods: string[] = []
@@ -209,8 +227,36 @@ describe('OverviewView status lifecycle', () => {
     expect(el.querySelector('.conn-pill')).toBeNull()
     expect(el.querySelector('.ov-event-log')).toBeNull()
     expect(useRequestMethods).toEqual(['status'])
-    expect(rpcCall.mock.calls.some(([method]) => method === 'sessions.list')).toBe(false)
+    // The Total sessions KPI reads sessions.list (same source as the Sessions
+    // page) so sessions without usage records still count.
+    const sessionsListCalls = rpcCall.mock.calls.filter(
+      ([method]) => method === 'sessions.list',
+    )
+    expect(sessionsListCalls.length).toBeGreaterThan(0)
+    expect(sessionsListCalls[0][1]).toEqual({ limit: 200, view: 'session-list-v1' })
     expect(rpcOn).not.toHaveBeenCalled()
+  })
+
+  it('counts stored sessions without usage records in the Total sessions card', async () => {
+    const { el, flush } = await mountOverview({
+      sessionsList: {
+        sessions: [
+          { key: 'agent:main:webchat:abc', title: 'QA Browser Session' },
+          { key: 'unknown', title: 'ignored' },
+        ],
+        count: 2,
+      },
+    })
+    await flush()
+    const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
+  })
+
+  it('falls back to the ledger session count when sessions.list is unavailable', async () => {
+    const { el, flush } = await mountOverview({ sessionsList: null })
+    await flush()
+    const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('0')
   })
 
   it('runs one initial deep check, silent shallow refreshes, and stops while inactive', async () => {
