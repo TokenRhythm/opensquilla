@@ -19,6 +19,7 @@ from opensquilla.engine.usage_accounting import (
 from opensquilla.provider.ranking_router import (
     CAPABILITIES,
     DOMAINS,
+    TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL,
     TASK_ANALYZER_MODEL_ID,
     TASK_ANALYZER_PROVIDER_ID,
     TASK_ANALYZER_VERSION,
@@ -27,6 +28,7 @@ from opensquilla.provider.ranking_router import (
     TaskAnalysisResult,
     TaskAnalyzerPhysicalEvidenceError,
     TaskAnalyzerStreamCleanupError,
+    analyze_task_with_fallback_chain,
     analyze_task_with_provider,
     build_model_registry_snapshot,
     build_request_context,
@@ -289,6 +291,94 @@ def test_ranking_trace_embeds_public_frozen_replay_evidence() -> None:
     assert trace["registry_snapshot"]["models"]
     assert trace["request_context"]["snapshot_hash"] == trace["request_context_hash"]
     assert trace["task_profile_pre_escalation"]
+    assert ranking_trace_replay_reasons(trace) == []
+
+
+@pytest.mark.parametrize(
+    ("schema_valid", "selected_index", "exhausted", "source"),
+    [
+        (True, 1, False, "provider"),
+        (False, None, True, "router_fallback"),
+    ],
+)
+def test_ranking_trace_replay_preserves_task_analyzer_chain(
+    schema_valid: bool,
+    selected_index: int | None,
+    exhausted: bool,
+    source: str,
+) -> None:
+    configured_routes = [
+        {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "upstream_provider": "anthropic",
+        },
+        {
+            "provider": "openrouter",
+            "model": "openai/gpt-5.6-sol",
+            "upstream_provider": "azure",
+        },
+        {
+            "provider": "openrouter",
+            "model": "google/gemini-3.1-pro-preview",
+            "upstream_provider": "google-ai-studio",
+        },
+    ]
+    outcome_count = len(configured_routes) if exhausted else int(selected_index or 0) + 1
+    attempt_outcomes = [
+        {
+            "candidate_index": index,
+            **route,
+            "outcome": (
+                "success"
+                if selected_index is not None and index == selected_index
+                else "failed"
+            ),
+            "reason": (
+                ""
+                if selected_index is not None and index == selected_index
+                else "provider_error"
+            ),
+            "physical_request_count": 1,
+        }
+        for index, route in enumerate(configured_routes[:outcome_count])
+    ]
+    chain_trace = {
+        "protocol": TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL,
+        "configured_routes": configured_routes,
+        "attempt_outcomes": attempt_outcomes,
+        "selected_index": selected_index,
+        "exhausted": exhausted,
+    }
+    terminal_route = configured_routes[
+        selected_index if selected_index is not None else len(configured_routes) - 1
+    ]
+    analysis = TaskAnalysisResult(
+        profile=_task_profile(tier=3),
+        source=source,
+        schema_valid=schema_valid,
+        confidence=0.9,
+        fallback_reason="" if schema_valid else "provider_error",
+        provider_id=terminal_route["provider"],
+        model_id=terminal_route["model"],
+        chain_trace=chain_trace,
+    )
+
+    trace = rank_models(
+        task_analysis=analysis,
+        user_profile=None,
+        request_context=_context(),
+        registry_snapshot=_snapshot(
+            _model("alpha", capability=0.95, aggregator_fit=0.82),
+            _model("beta", capability=0.90, aggregator_fit=0.97),
+            _model("gamma", capability=0.85, aggregator_fit=0.88),
+        ),
+        routed_tier="c2",
+        routing_confidence=0.91,
+        decision_id=f"chain-replay-{source}",
+    ).trace
+
+    assert trace["task_analyzer"]["chain"] == chain_trace
     assert ranking_trace_replay_reasons(trace) == []
 
 
@@ -1692,6 +1782,350 @@ class _AnalyzerTerminalProvider:
         return []
 
 
+_TASK_ANALYZER_CHAIN_ROUTES = (
+    ("openrouter", "anthropic/claude-opus-4.8", "anthropic"),
+    ("openrouter", "openai/gpt-5.6-sol", "azure"),
+    (
+        "openrouter",
+        "google/gemini-3.1-pro-preview",
+        "google-ai-studio",
+    ),
+)
+
+
+def _task_analyzer_chain_candidates(
+    providers: list[Any | None],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "provider": provider,
+            "provider_id": provider_id,
+            "model_id": model_id,
+            "upstream_provider": upstream_provider,
+        }
+        for provider, (provider_id, model_id, upstream_provider) in zip(
+            providers,
+            _TASK_ANALYZER_CHAIN_ROUTES,
+            strict=True,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("success_index", [0, 1, 2])
+async def test_task_analyzer_fallback_chain_selects_first_valid_candidate(
+    success_index: int,
+) -> None:
+    providers = [
+        _AnalyzerProvider(
+            json.dumps(_task_profile(tier=2))
+            if index == success_index
+            else "not-json"
+        )
+        for index in range(3)
+    ]
+
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates(providers),
+        message="implement a parser",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+        decision_id="1" * 32,
+    )
+
+    assert result.source == "llm_provider"
+    assert result.schema_valid is True
+    assert result.provider_id == _TASK_ANALYZER_CHAIN_ROUTES[success_index][0]
+    assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[success_index][1]
+    assert [len(provider.calls) for provider in providers] == [
+        1 if index <= success_index else 0 for index in range(3)
+    ]
+    assert all(
+        config is not None and config.allow_provider_stream_fallback is False
+        for provider in providers
+        for _, config in provider.calls
+    )
+    assert result.usage["attempt_count"] == success_index + 1
+    attempts = result.usage["physical_attempts"]
+    assert [attempt["attempt"] for attempt in attempts] == list(
+        range(1, success_index + 2)
+    )
+    assert [attempt["requested_model"] for attempt in attempts] == [
+        route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES[: success_index + 1]
+    ]
+    assert len({attempt["physical_attempt_id"] for attempt in attempts}) == (
+        success_index + 1
+    )
+    assert result.usage["input_tokens"] == 11 * (success_index + 1)
+    assert result.usage["billed_cost"] == pytest.approx(0.012 * (success_index + 1))
+    chain = result.trace()["chain"]
+    assert chain["protocol"] == TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL
+    assert chain["configured_routes"] == [
+        {
+            "provider": provider_id,
+            "model": model_id,
+            "upstream_provider": upstream_provider,
+        }
+        for provider_id, model_id, upstream_provider in _TASK_ANALYZER_CHAIN_ROUTES
+    ]
+    assert chain["selected_index"] == success_index
+    assert chain["exhausted"] is False
+    assert [attempt["outcome"] for attempt in chain["attempt_outcomes"]] == [
+        *(["failed"] * success_index),
+        "success",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_fallback_chain_advances_past_unavailable_provider() -> None:
+    second = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    third = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates([None, second, third]),
+        message="implement a parser",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+    )
+
+    assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[1][1]
+    assert len(second.calls) == 1
+    assert third.calls == []
+    assert result.usage["attempt_count"] == 1
+    chain_attempts = result.trace()["chain"]["attempt_outcomes"]
+    assert chain_attempts[0]["reason"] == "provider_unavailable"
+    assert chain_attempts[0]["physical_request_count"] == 0
+    assert chain_attempts[1]["outcome"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_fallback_chain_all_unavailable_has_zero_usage() -> None:
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates([None, None, None]),
+        message="implement a parser",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+    )
+
+    assert result.source == "router_fallback"
+    assert result.schema_valid is False
+    assert result.usage == {"physical_attempts": [], "attempt_count": 0}
+    chain = result.trace()["chain"]
+    assert chain["selected_index"] is None
+    assert chain["exhausted"] is True
+    assert [outcome["physical_request_count"] for outcome in chain["attempt_outcomes"]] == [
+        0,
+        0,
+        0,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_fallback_chain_advances_after_closed_timeout() -> None:
+    class _TimeoutStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self) -> _TimeoutStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class _TimeoutProvider:
+        accounts_physical_usage = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.stream = _TimeoutStream()
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            self.calls += 1
+            return self.stream
+
+    first = _TimeoutProvider()
+    second = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    third = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates([first, second, third]),
+        message="classify this task",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        timeout_seconds=0.01,
+    )
+
+    assert first.calls == 1
+    assert first.stream.closed is True
+    assert len(second.calls) == 1
+    assert third.calls == []
+    assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[1][1]
+    chain_attempts = result.trace()["chain"]["attempt_outcomes"]
+    assert chain_attempts[0]["reason"] == "TimeoutError"
+    assert chain_attempts[1]["outcome"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_fallback_chain_returns_fallback_after_exhaustion() -> None:
+    providers = [_AnalyzerProvider("not-json") for _ in range(3)]
+
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates(providers),
+        message="classify this task",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        decision_id="2" * 32,
+    )
+
+    assert result.source == "router_fallback"
+    assert result.schema_valid is False
+    assert result.profile["tier_dist"] == {"3": 1.0}
+    assert [len(provider.calls) for provider in providers] == [1, 1, 1]
+    assert result.usage["attempt_count"] == 3
+    assert [
+        attempt["requested_model"]
+        for attempt in result.usage["physical_attempts"]
+    ] == [route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES]
+    chain = result.trace()["chain"]
+    assert chain["selected_index"] is None
+    assert chain["exhausted"] is True
+    assert [attempt["outcome"] for attempt in chain["attempt_outcomes"]] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
+    assert [attempt["reason"] for attempt in chain["attempt_outcomes"]] == [
+        "ValueError",
+        "ValueError",
+        "ValueError",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_fallback_chain_cleanup_failure_does_not_advance() -> None:
+    class _HangingStream:
+        def __aiter__(self) -> _HangingStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            await asyncio.Event().wait()
+
+    class _HangingProvider:
+        accounts_physical_usage = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            self.calls += 1
+            return _HangingStream()
+
+    first = _HangingProvider()
+    second = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    third = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+
+    with pytest.raises(TaskAnalyzerStreamCleanupError):
+        await asyncio.wait_for(
+            analyze_task_with_fallback_chain(
+                candidates=_task_analyzer_chain_candidates([first, second, third]),
+                message="classify this task",
+                user_profile_enabled=False,
+                request_context=_context(),
+                routed_tier="c2",
+                routing_confidence=0.77,
+                timeout_seconds=0.01,
+            ),
+            timeout=0.2,
+        )
+
+    assert first.calls == 1
+    assert second.calls == []
+    assert third.calls == []
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_fallback_chain_physical_evidence_failure_does_not_advance() -> None:
+    first = _AnalyzerTerminalProvider(
+        [
+            ErrorEvent(
+                message="conflicting request identities",
+                code="response_invalid",
+                model_usage_breakdown=[
+                    {
+                        "provider": "openrouter",
+                        "model": "analyzer-test",
+                        "input_tokens": 3,
+                        "output_tokens": 1,
+                        "billed_cost": 0.01,
+                        "cost_source": "provider_billed",
+                        "physical_attempt_id": "c" * 32,
+                        "provider_usage": {
+                            "response_ids": ["paid-response"],
+                            "physical_attempt_id": "d" * 32,
+                        },
+                    }
+                ],
+                diagnostic_done=DoneEvent(
+                    provider="openrouter",
+                    model="analyzer-test",
+                    input_tokens=3,
+                    output_tokens=1,
+                    billed_cost=0.01,
+                    cost_source="provider_billed",
+                    provider_usage={
+                        "response_ids": ["paid-response"],
+                        "physical_attempt_id": "d" * 32,
+                    },
+                ),
+                request_started=True,
+                physical_request_count=1,
+            )
+        ]
+    )
+    second = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    third = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+
+    with pytest.raises(TaskAnalyzerPhysicalEvidenceError):
+        await analyze_task_with_fallback_chain(
+            candidates=_task_analyzer_chain_candidates([first, second, third]),
+            message="classify this task",
+            user_profile_enabled=False,
+            request_context=_context(),
+            routed_tier="c2",
+            routing_confidence=0.77,
+        )
+
+    assert len(first.calls) == 1
+    assert second.calls == []
+    assert third.calls == []
+
+
 @pytest.mark.asyncio
 async def test_task_analyzer_hanging_stream_close_is_bounded(
 ) -> None:
@@ -1803,6 +2237,7 @@ async def test_task_analyzer_uses_provider_interface_and_validates_json() -> Non
     assert len(provider.calls) == 1
     assert provider.calls[0][1] is not None
     assert provider.calls[0][1].temperature == 0.0
+    assert provider.calls[0][1].allow_provider_stream_fallback is True
     assert '"modality":["<allowed modality>"]' in provider.calls[0][1].system
     assert '"session_intent":{"type":"<allowed intent>"' in provider.calls[0][1].system
     assert "research is a domain, not a capability" in provider.calls[0][1].system
@@ -2077,6 +2512,7 @@ async def test_task_analyzer_retries_three_times_before_succeeding() -> None:
     retry_events = [row for row in captured if row["event"].endswith("task_analyzer_retry")]
     assert [row["attempt"] for row in retry_events] == [1, 2, 3]
     assert not any(row["event"].endswith("task_analyzer_fallback") for row in captured)
+    assert "chain" not in result.trace()
 
 
 @pytest.mark.asyncio

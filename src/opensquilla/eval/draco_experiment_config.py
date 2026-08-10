@@ -130,9 +130,7 @@ class DracoFrozenTaskAnalysisExecutionConfig(_StrictConfig):
         serialize_by_alias=True,
     )
 
-    schema_id: Literal["opensquilla.draco.frozen-task-analysis/v1"] = Field(
-        alias="schema"
-    )
+    schema_id: Literal["opensquilla.draco.frozen-task-analysis/v1"] = Field(alias="schema")
     mode: Literal["frozen_replay"]
     source_experiment: str = Field(min_length=1)
     source_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -158,8 +156,7 @@ class DracoFrozenTaskAnalysisExecutionConfig(_StrictConfig):
         ):
             raise ValueError("source_task_analyzer_config_sha256 does not match")
         entries = {
-            task_id: entry.model_dump(mode="json")
-            for task_id, entry in self.entries.items()
+            task_id: entry.model_dump(mode="json") for task_id, entry in self.entries.items()
         }
         if _canonical_json_sha256(entries) != self.entries_sha256:
             raise ValueError("frozen task analysis entries_sha256 does not match entries")
@@ -232,9 +229,7 @@ class DracoFrozenTaskAnalysisExecutionV2Config(_StrictConfig):
         serialize_by_alias=True,
     )
 
-    schema_id: Literal["opensquilla.draco.frozen-task-analysis/v2"] = Field(
-        alias="schema"
-    )
+    schema_id: Literal["opensquilla.draco.frozen-task-analysis/v2"] = Field(alias="schema")
     mode: Literal["frozen_replay"]
     source_experiment: str = Field(min_length=1)
     source_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -260,11 +255,47 @@ class DracoFrozenTaskAnalysisExecutionV2Config(_StrictConfig):
         ):
             raise ValueError("source_task_analyzer_config_sha256 does not match")
         entries = {
-            task_id: entry.model_dump(mode="json")
-            for task_id, entry in self.entries.items()
+            task_id: entry.model_dump(mode="json") for task_id, entry in self.entries.items()
         }
         if _canonical_json_sha256(entries) != self.entries_sha256:
             raise ValueError("frozen task analysis entries_sha256 does not match entries")
+        return self
+
+
+class DracoTaskAnalyzerRouteConfig(_StrictConfig):
+    """One explicitly pinned OpenRouter route in the live Analyzer chain."""
+
+    provider: Literal["openrouter"] = "openrouter"
+    model: str = Field(
+        min_length=3,
+        pattern=r"^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._:/-]*$",
+    )
+    upstream_provider: str = Field(
+        min_length=1,
+        pattern=r"^[a-z0-9][a-z0-9._-]*$",
+    )
+    max_attempts: Literal[1] = 1
+
+
+class DracoAnalyzerFailureFallbackConfig(_StrictConfig):
+    """Fixed ensemble used only after every live Analyzer route fails."""
+
+    proposers: list[DracoTaskAnalyzerRouteConfig] = Field(
+        min_length=4,
+        max_length=4,
+    )
+    aggregator: DracoTaskAnalyzerRouteConfig
+    min_successful_proposers: Literal[1] = 1
+    complete_proposers_only: Literal[True] = True
+    aggregator_max_recovery_actions: Literal[1] = 1
+
+    @model_validator(mode="after")
+    def _validate_unique_proposers(self) -> DracoAnalyzerFailureFallbackConfig:
+        identities = [(route.provider, route.model) for route in self.proposers]
+        if len(set(identities)) != len(identities):
+            raise ValueError(
+                "analyzer_failure_fallback_ensemble.proposers must not contain duplicate routes"
+            )
         return self
 
 
@@ -284,10 +315,32 @@ class DracoG1RoutingConfig(_StrictConfig):
     expected_routes: dict[str, str] | None = None
     expected_routes_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     task_analysis_execution: (
-        DracoFrozenTaskAnalysisExecutionConfig
-        | DracoFrozenTaskAnalysisExecutionV2Config
-        | None
+        DracoFrozenTaskAnalysisExecutionConfig | DracoFrozenTaskAnalysisExecutionV2Config | None
     ) = None
+    live_task_analyzer_chain: list[DracoTaskAnalyzerRouteConfig] | None = Field(
+        default=None,
+        min_length=1,
+    )
+    analyzer_failure_fallback_ensemble: DracoAnalyzerFailureFallbackConfig | None = None
+
+    @model_validator(mode="after")
+    def _validate_live_task_analyzer_chain(self) -> DracoG1RoutingConfig:
+        has_live_chain = self.live_task_analyzer_chain is not None
+        has_failure_fallback = self.analyzer_failure_fallback_ensemble is not None
+        if has_live_chain is not has_failure_fallback:
+            raise ValueError(
+                "g1_routing live_task_analyzer_chain and "
+                "analyzer_failure_fallback_ensemble must be configured together"
+            )
+        if not has_live_chain:
+            return self
+        assert self.live_task_analyzer_chain is not None
+        identities = [(route.provider, route.model) for route in self.live_task_analyzer_chain]
+        if len(set(identities)) != len(identities):
+            raise ValueError(
+                "g1_routing.live_task_analyzer_chain must not contain duplicate routes"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_expected_routes(self) -> DracoG1RoutingConfig:
@@ -537,17 +590,11 @@ class DracoExperimentConfig(_StrictConfig):
     def _validate_frozen_task_analysis(self) -> DracoExperimentConfig:
         """Bind all ten inline profiles to the benchmark and effective Analyzer."""
 
-        replay = (
-            self.g1_routing.task_analysis_execution
-            if self.g1_routing is not None
-            else None
-        )
+        replay = self.g1_routing.task_analysis_execution if self.g1_routing is not None else None
         if replay is None:
             return self
         expected_task_ids = self.benchmark_input.task_ids
-        if self.benchmark_input.task_count != 10 or set(replay.entries) != set(
-            expected_task_ids
-        ):
+        if self.benchmark_input.task_count != 10 or set(replay.entries) != set(expected_task_ids):
             raise ValueError(
                 "g1_routing.task_analysis_execution entries must exactly match "
                 "the 10 benchmark task ids"
@@ -562,9 +609,7 @@ class DracoExperimentConfig(_StrictConfig):
             override=(self.router_dynamic_ranking_override or None),
         )
         effective = resolution.get("effective_config")
-        effective_analyzer = (
-            effective.get("task_analyzer") if isinstance(effective, dict) else None
-        )
+        effective_analyzer = effective.get("task_analyzer") if isinstance(effective, dict) else None
         if not isinstance(effective_analyzer, dict) or effective_analyzer != (
             replay.source_task_analyzer_config
         ):
@@ -598,13 +643,9 @@ class DracoExperimentConfig(_StrictConfig):
             override=(self.router_dynamic_ranking_override or None),
         )
         effective = resolution.get("effective_config")
-        proposer_count = (
-            effective.get("proposer_count") if isinstance(effective, dict) else None
-        )
+        proposer_count = effective.get("proposer_count") if isinstance(effective, dict) else None
         ranking_backup_count = (
-            proposer_count.get("backup_count")
-            if isinstance(proposer_count, dict)
-            else None
+            proposer_count.get("backup_count") if isinstance(proposer_count, dict) else None
         )
         if self.ensemble.proposer_backup_count != ranking_backup_count:
             raise ValueError(
@@ -674,9 +715,7 @@ def validate_formal_draco_credential_bindings(config: DracoExperimentConfig) -> 
     expected_env = FORMAL_DRACO_WEB_SEARCH_API_KEY_ENVS[search.provider]
     if search.api_key_env != expected_env:
         requirement = expected_env or "an empty api_key_env"
-        raise ValueError(
-            "formal DRACO requires tools.web_search.api_key_env=" + requirement
-        )
+        raise ValueError("formal DRACO requires tools.web_search.api_key_env=" + requirement)
 
 
 def validate_formal_draco_gateway_credential_binding(
@@ -694,8 +733,7 @@ def validate_formal_draco_gateway_credential_binding(
         f"{FORMAL_DRACO_OPENROUTER_BASE_URL}/",
     }:
         raise ValueError(
-            "formal DRACO requires config.llm.base_url to be the official "
-            "OpenRouter endpoint"
+            "formal DRACO requires config.llm.base_url to be the official OpenRouter endpoint"
         )
     if api_key_env not in {"", FORMAL_DRACO_OPENROUTER_API_KEY_ENV}:
         raise ValueError(
@@ -736,9 +774,7 @@ class DracoExperimentConfigBundle:
                 }
                 for index, (path, _) in enumerate(self.override_documents)
             ],
-            "effective_config_sha256": _canonical_json_sha256(
-                self.config.model_dump(mode="json")
-            ),
+            "effective_config_sha256": _canonical_json_sha256(self.config.model_dump(mode="json")),
             "inline_overlay": {
                 "present": self.inline_overlay_document is not None,
                 "field_paths": _document_field_paths(self.inline_overlay_document),

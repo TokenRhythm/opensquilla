@@ -15,10 +15,82 @@ from opensquilla.eval.draco_experiment_config import (
     validate_formal_draco_gateway_credential_binding,
     validate_reference_input,
 )
-from opensquilla.provider.ranking_router import load_model_registry_snapshot
+from opensquilla.provider.ranking_router import (
+    TASK_ANALYZER_VERSION,
+    load_model_registry_snapshot,
+    ranking_config_resolution,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "configs/benchmarks/draco_b2_g12.json"
+
+
+def _frozen_router_fallback_replay_payload(
+    task_ids: list[str],
+) -> dict[str, object]:
+    profile = {"task_type": "analysis"}
+    profile_sha256 = hashlib.sha256(
+        json.dumps(
+            profile,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    source_config = dict(
+        ranking_config_resolution()["effective_config"]["task_analyzer"]
+    )
+    source_config_sha256 = hashlib.sha256(
+        json.dumps(
+            source_config,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    entries = {
+        task_id: {
+            "task_input_sha256": f"sha256:{'a' * 64}",
+            "prompt_sha256": "b" * 64,
+            "task_profile_pre_escalation": profile,
+            "task_profile_pre_escalation_sha256": profile_sha256,
+            "origin_outcome": "deterministic_router_fallback",
+            "task_analyzer": {
+                "source": "frozen_replay",
+                "schema_valid": False,
+                "confidence": 0.0,
+                "analyzer_version": TASK_ANALYZER_VERSION,
+                "provider": source_config["provider"],
+                "model": source_config["model"],
+                "fallback_reason": "task_analysis_not_supplied",
+                "usage": {},
+                "normalization_warnings": [],
+            },
+        }
+        for task_id in task_ids
+    }
+    entries_sha256 = hashlib.sha256(
+        json.dumps(
+            entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema": "opensquilla.draco.frozen-task-analysis/v2",
+        "mode": "frozen_replay",
+        "source_experiment": "legacy-e0",
+        "source_manifest_sha256": "c" * 64,
+        "source_results_sha256": "d" * 64,
+        "source_task_analyzer_config": source_config,
+        "source_task_analyzer_config_sha256": source_config_sha256,
+        "entries": entries,
+        "entries_sha256": entries_sha256,
+    }
 
 
 def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
@@ -52,6 +124,33 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.g1_routing.expected_candidate_count is None
     assert config.g1_routing.expected_routes is None
     assert config.g1_routing.expected_routes_sha256 is None
+    assert config.g1_routing.live_task_analyzer_chain is not None
+    assert [
+        (route.provider, route.model, route.upstream_provider, route.max_attempts)
+        for route in config.g1_routing.live_task_analyzer_chain
+    ] == [
+        ("openrouter", "anthropic/claude-opus-4.8", "anthropic", 1),
+        ("openrouter", "openai/gpt-5.6-sol", "azure", 1),
+        (
+            "openrouter",
+            "google/gemini-3.1-pro-preview",
+            "google-ai-studio",
+            1,
+        ),
+    ]
+    analyzer_fallback = config.g1_routing.analyzer_failure_fallback_ensemble
+    assert analyzer_fallback is not None
+    assert [(route.model, route.upstream_provider) for route in analyzer_fallback.proposers] == [
+        ("z-ai/glm-5.2", "z-ai"),
+        ("moonshotai/kimi-k2.7-code", "moonshotai"),
+        ("qwen/qwen3.8-max", "alibaba"),
+        ("deepseek/deepseek-v4-pro", "deepseek"),
+    ]
+    assert analyzer_fallback.aggregator.model == "z-ai/glm-5.2"
+    assert analyzer_fallback.aggregator.upstream_provider == "z-ai"
+    assert analyzer_fallback.min_successful_proposers == 1
+    assert analyzer_fallback.complete_proposers_only is True
+    assert analyzer_fallback.aggregator_max_recovery_actions == 1
     assert [member.model for member in config.ensemble.proposers] == [
         "deepseek/deepseek-v4-pro",
         "z-ai/glm-5.2",
@@ -89,6 +188,7 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
         "poolside/laguna-xs-2.1": "high",
         "qwen/qwen3.7-max": "high",
         "qwen/qwen3.7-plus": "high",
+        "qwen/qwen3.8-max": "high",
         "sakana/fugu-ultra": "max",
         "tencent/hy3": "high",
         "x-ai/grok-4.5": "high",
@@ -143,9 +243,7 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
 def test_draco_ensemble_accepts_uint64_candidate_order_seed(seed: int) -> None:
     config = load_draco_experiment_config(
         DEFAULT_CONFIG,
-        inline_overlay_json=json.dumps(
-            {"ensemble": {"candidate_order_seed": seed}}
-        ),
+        inline_overlay_json=json.dumps({"ensemble": {"candidate_order_seed": seed}}),
     ).config
 
     assert config.ensemble.candidate_order_seed == seed
@@ -156,9 +254,7 @@ def test_draco_ensemble_rejects_invalid_candidate_order_seed(seed: object) -> No
     with pytest.raises(ValidationError, match="candidate_order_seed"):
         load_draco_experiment_config(
             DEFAULT_CONFIG,
-            inline_overlay_json=json.dumps(
-                {"ensemble": {"candidate_order_seed": seed}}
-            ),
+            inline_overlay_json=json.dumps({"ensemble": {"candidate_order_seed": seed}}),
         )
 
 
@@ -528,9 +624,7 @@ def test_public_provenance_omits_inline_values_and_per_value_hashes() -> None:
     dotted_marker = "public-provenance-dotted-marker"
     bundle = load_draco_experiment_config(
         DEFAULT_CONFIG,
-        inline_overlay_json=json.dumps(
-            {"reference": {"repository": overlay_marker}}
-        ),
+        inline_overlay_json=json.dumps({"reference": {"repository": overlay_marker}}),
         inline_sets=[f"reference.run_directory={json.dumps(dotted_marker)}"],
     )
 
@@ -648,6 +742,103 @@ def test_g1_registry_all_requires_no_explicit_route_fields(tmp_path: Path) -> No
         partial_config.write_text(json.dumps(payload), encoding="utf-8")
         with pytest.raises(ValidationError, match="must be specified together"):
             load_draco_experiment_config(partial_config)
+
+
+def test_live_task_analyzer_chain_is_strictly_nonempty_and_unique() -> None:
+    with pytest.raises(ValidationError):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_overlay_json=json.dumps({"g1_routing": {"live_task_analyzer_chain": []}}),
+        )
+
+    with pytest.raises(ValidationError, match="must not contain duplicate routes"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=['g1_routing.live_task_analyzer_chain.1.model="anthropic/claude-opus-4.8"'],
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "g1_routing.live_task_analyzer_chain.0.max_attempts=2",
+        'g1_routing.live_task_analyzer_chain.0.provider="anthropic"',
+        "g1_routing.analyzer_failure_fallback_ensemble.min_successful_proposers=2",
+        "g1_routing.analyzer_failure_fallback_ensemble.complete_proposers_only=false",
+        "g1_routing.analyzer_failure_fallback_ensemble.aggregator_max_recovery_actions=2",
+    ],
+)
+def test_live_analyzer_and_failure_fallback_literals_fail_closed(
+    override: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        load_draco_experiment_config(DEFAULT_CONFIG, inline_sets=[override])
+
+
+def test_analyzer_failure_fallback_rejects_duplicate_proposer_routes() -> None:
+    with pytest.raises(ValidationError, match="must not contain duplicate routes"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_sets=[
+                'g1_routing.analyzer_failure_fallback_ensemble.proposers.1.model="z-ai/glm-5.2"'
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "live_task_analyzer_chain",
+        "analyzer_failure_fallback_ensemble",
+    ],
+)
+def test_live_analyzer_chain_and_failure_fallback_must_be_configured_together(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    payload = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    payload["g1_routing"].pop(missing_field)
+    invalid_config = tmp_path / f"missing-{missing_field}.json"
+    invalid_config.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="must be configured together"):
+        load_draco_experiment_config(invalid_config)
+
+
+def test_historical_g1_configs_may_omit_new_live_analyzer_fields(
+    tmp_path: Path,
+) -> None:
+    payload = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    payload["g1_routing"].pop("live_task_analyzer_chain")
+    payload["g1_routing"].pop("analyzer_failure_fallback_ensemble")
+    historical_config = tmp_path / "historical.json"
+    historical_config.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = load_draco_experiment_config(historical_config).config
+
+    assert config.g1_routing is not None
+    assert config.g1_routing.live_task_analyzer_chain is None
+    assert config.g1_routing.analyzer_failure_fallback_ensemble is None
+
+
+def test_frozen_replay_may_coexist_with_inactive_live_analyzer_pair(
+    tmp_path: Path,
+) -> None:
+    payload = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    payload["g1_routing"]["task_analysis_execution"] = (
+        _frozen_router_fallback_replay_payload(
+            payload["benchmark_input"]["task_ids"]
+        )
+    )
+    coexist_config = tmp_path / "replay-with-inactive-live-pair.json"
+    coexist_config.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = load_draco_experiment_config(coexist_config).config
+
+    assert config.g1_routing is not None
+    assert config.g1_routing.task_analysis_execution is not None
+    assert config.g1_routing.live_task_analyzer_chain is not None
+    assert config.g1_routing.analyzer_failure_fallback_ensemble is not None
 
 
 def test_g1_explicit_routes_remain_hash_and_count_fail_closed(tmp_path: Path) -> None:

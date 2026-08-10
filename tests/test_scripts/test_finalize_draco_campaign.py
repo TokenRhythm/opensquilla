@@ -38,18 +38,14 @@ def _registry_all_contract(module) -> dict[str, object]:
         "candidate_scope": "registry_all",
         "policy": "all_registry_models",
         "user_profile_enabled": False,
-        "source_registry_snapshot_version": (
-            module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION
-        ),
+        "source_registry_snapshot_version": (module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION),
         "expected_routes": routes,
         "expected_routes_sha256": module.canonical_sha256(routes),
         "expected_candidate_count": len(routes),
         "expected_source_registry_snapshot_sha256": (
             module.FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256
         ),
-        "expected_ranking_config_schema_version": (
-            module.FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION
-        ),
+        "expected_ranking_config_schema_version": (module.FORMAL_G1_RANKING_CONFIG_SCHEMA_VERSION),
         "expected_ranking_config_version": module.FORMAL_G1_RANKING_CONFIG_VERSION,
         "expected_ranking_config_sha256": module.FORMAL_G1_RANKING_CONFIG_SHA256,
     }
@@ -592,9 +588,7 @@ def test_selected_endpoint_receipt_binds_serving_alias_and_provider(module) -> N
                 ]
             },
             allowed_models={module.B0_MODEL},
-            provider_pins={
-                module.B0_MODEL: module.FORMAL_UPSTREAM_PINS[module.B0_MODEL]
-            },
+            provider_pins={module.B0_MODEL: module.FORMAL_UPSTREAM_PINS[module.B0_MODEL]},
         )
         == []
     )
@@ -754,16 +748,12 @@ def test_registry_all_contract_rejects_frozen_route_tampering(module, mutation: 
         contract["expected_source_registry_snapshot_sha256"] = "0" * 64
     elif mutation == "provider":
         contract["expected_routes"]["test-vendor/model-00"] = "some-provider"
-        contract["expected_routes_sha256"] = module.canonical_sha256(
-            contract["expected_routes"]
-        )
+        contract["expected_routes_sha256"] = module.canonical_sha256(contract["expected_routes"])
     else:
-        contract["expected_routes"]["TEST-VENDOR/model-00"] = contract[
-            "expected_routes"
-        ].pop("test-vendor/model-00")
-        contract["expected_routes_sha256"] = module.canonical_sha256(
-            contract["expected_routes"]
+        contract["expected_routes"]["TEST-VENDOR/model-00"] = contract["expected_routes"].pop(
+            "test-vendor/model-00"
         )
+        contract["expected_routes_sha256"] = module.canonical_sha256(contract["expected_routes"])
 
     assert module.authenticated_registry_all_routes(contract) is None
 
@@ -814,9 +804,9 @@ def test_auto_candidate_provider_accepts_any_successful_upstream_but_role_pin_re
     )
     analyzer["provider_usage"]["requested_model"] = module.TASK_ANALYZER_MODEL
     analyzer["provider_usage"]["router_metadata"]["requested"] = module.TASK_ANALYZER_MODEL
-    analyzer["provider_usage"]["router_metadata"]["attempts"][0][
-        "model"
-    ] = module.TASK_ANALYZER_MODEL
+    analyzer["provider_usage"]["router_metadata"]["attempts"][0]["model"] = (
+        module.TASK_ANALYZER_MODEL
+    )
     reasons = module.usage_route_reasons(
         {"model_usage_breakdown": [analyzer]},
         allowed_models={requested_model},
@@ -1087,6 +1077,8 @@ def _ensemble_trace(
                 "request_started": True,
                 "physical_request_count": 1,
                 "error": "",
+                "completion_outcome": "complete",
+                "stop_reason": "stop",
                 "provider": "openrouter",
                 "model": model,
                 "requested_provider": "openrouter",
@@ -1849,8 +1841,8 @@ def test_provider_native_proposer_recovery_accepts_effective_backup_shortfall(
 
     from opensquilla.provider.protocol import provider_retry_roster_fingerprint
 
-    call["proposer_recovery"]["selection_plan_fingerprint"] = (
-        provider_retry_roster_fingerprint(plan)
+    call["proposer_recovery"]["selection_plan_fingerprint"] = provider_retry_roster_fingerprint(
+        plan
     )
     _, _, reasons = module.proposer_recovery_execution_reasons(
         call,
@@ -3204,9 +3196,7 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
 def _test_ranking_config(module) -> dict[str, object]:
     from opensquilla.provider.ranking_router import ranking_config_snapshot
 
-    config = deepcopy(
-        ranking_config_snapshot(base_version=module.FORMAL_G1_RANKING_CONFIG_VERSION)
-    )
+    config = deepcopy(ranking_config_snapshot(base_version=module.FORMAL_G1_RANKING_CONFIG_VERSION))
     # Make this tiny three-model fixture select all three proposers while still
     # exercising the complete production ranking configuration.
     config["proposer_count"]["by_tier"]["3"] = {"min": 3, "max": 3}
@@ -3269,9 +3259,7 @@ def _thinking_registry_all_contract(module) -> dict[str, object]:
         {
             "candidate_scope": "registry_all",
             "policy": "all_registry_models",
-            "source_registry_snapshot_version": (
-                module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION
-            ),
+            "source_registry_snapshot_version": (module.FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION),
             "expected_routes": routes,
             "expected_routes_sha256": module.canonical_sha256(routes),
             "expected_candidate_count": len(routes),
@@ -3536,9 +3524,7 @@ def test_g1_ranking_config_identity_rejects_resolution_tampering(
         resolution["thinking_assignment_enabled"] = True
     elif mutation == "undeclared_effective_change":
         resolution["effective_config"]["penalties"]["default_cost_weight"] = 0.123
-        resolution["effective_sha256"] = module.canonical_sha256(
-            resolution["effective_config"]
-        )
+        resolution["effective_sha256"] = module.canonical_sha256(resolution["effective_config"])
         contract["expected_ranking_config_sha256"] = resolution["effective_sha256"]
     elif mutation == "override_not_applied":
         resolution["override"]["penalties"]["task_cost_weights"]["medium"] = 0.11
@@ -3547,9 +3533,7 @@ def test_g1_ranking_config_identity_rejects_resolution_tampering(
             f"{resolution['base_config']['config_version']}+override."
             f"{resolution['override_sha256'][:12]}"
         )
-        resolution["effective_sha256"] = module.canonical_sha256(
-            resolution["effective_config"]
-        )
+        resolution["effective_sha256"] = module.canonical_sha256(resolution["effective_config"])
         contract["expected_ranking_config_version"] = resolution["effective_config"][
             "config_version"
         ]
@@ -3861,16 +3845,29 @@ def _formalize_provider_native_call(
         )
         physical_units.append((physical_id, model, "proposer"))
 
-    strict_successful = sum(module.successful_candidate(candidate) for candidate in candidates)
+    recovery_policy = plan.get("proposer_recovery_policy")
+    assert isinstance(recovery_policy, dict)
+    complete_proposers_only = plan.get("complete_proposers_only") is True
+    quorum_required = int(recovery_policy["quorum_required"])
+    max_additional_requests = int(recovery_policy["max_additional_physical_requests"])
+    strict_successful = sum(
+        module.successful_candidate(candidate)
+        and (not complete_proposers_only or candidate.get("completion_outcome") == "complete")
+        for candidate in candidates
+    )
     usable = sum(module.usable_candidate(candidate) for candidate in candidates)
     call.update(
         {
             "successful_proposers": strict_successful,
             "usable_proposers": usable,
             "partial_proposers": usable - strict_successful,
-            "strict_quorum_met": strict_successful >= 2,
-            "execution_quorum_required": 2,
-            "execution_quorum_met": usable >= 2,
+            "strict_quorum_met": strict_successful >= quorum_required,
+            "execution_quorum_required": quorum_required,
+            "execution_quorum_met": (
+                strict_successful >= quorum_required
+                if complete_proposers_only
+                else usable >= quorum_required
+            ),
         }
     )
 
@@ -3879,14 +3876,18 @@ def _formalize_provider_native_call(
         "selection_plan_fingerprint": provider_retry_roster_fingerprint(plan),
         "scope": "run_turn",
         "scope_id": scope_id,
-        "max_additional_physical_requests": 3,
+        "max_additional_physical_requests": max_additional_requests,
         "external_physical_requests_reserved": 0,
         "additional_physical_requests_started": 0,
-        "remaining_additional_physical_requests": 3,
-        "quorum_required": 2,
+        "remaining_additional_physical_requests": max_additional_requests,
+        "quorum_required": quorum_required,
         "strict_successful_proposers": strict_successful,
         "usable_proposers": usable,
-        "quorum_reached": usable >= 2,
+        "quorum_reached": (
+            strict_successful >= quorum_required
+            if complete_proposers_only
+            else usable >= quorum_required
+        ),
         "cumulative_excluded_identities": [],
         "visited_identities": [],
         "executed_proposer_roster_before": list(selected),
@@ -5914,9 +5915,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
     replace_aggregator_cap(dynamic_cap_history)
     dynamic_cap_contract = deepcopy(paid_attempt_contracts["G1"])
     dynamic_cap_contract["formal_runtime_freeze"]["aggregator_max_tokens_cap"] = 32_768
-    dynamic_cap_contract["gateway_execution"]["llm_ensemble"][
-        "aggregator_max_tokens_cap"
-    ] = 32_768
+    dynamic_cap_contract["gateway_execution"]["llm_ensemble"]["aggregator_max_tokens_cap"] = 32_768
     module.validate_g1_paid_attempt_plan_history(
         [
             module.SourceRecord(
@@ -6325,9 +6324,7 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         )
 
     authenticated_contract = deepcopy(paid_attempt_contracts["G1"])
-    authenticated_contract["source_identity"] = deepcopy(
-        module.LEGACY_MANAGED_V3_SOURCE_IDENTITY
-    )
+    authenticated_contract["source_identity"] = deepcopy(module.LEGACY_MANAGED_V3_SOURCE_IDENTITY)
     module.validate_g1_paid_attempt_plan_history(
         [
             module.SourceRecord(
@@ -8140,10 +8137,7 @@ def test_b2_declared_quorum_mismatch_is_audit_only_when_candidates_prove_quorum(
         os.close(lock_fd)
     assert manifest["status"] == "complete"
     assert manifest["execution_pass"] is True
-    assert any(
-        "successful_proposer_count_mismatch" in warning
-        for warning in manifest["warnings"]
-    )
+    assert any("successful_proposer_count_mismatch" in warning for warning in manifest["warnings"])
 
 
 def _b2_physical_call(
@@ -8185,6 +8179,471 @@ def _b2_physical_call_reasons(module, call: dict[str, object]) -> list[str]:
         final_text="bound final answer",
         require_output_binding=True,
     )
+
+
+def _analyzer_failure_fallback_physical_call(
+    module,
+    *,
+    outcomes: tuple[str, str, str, str],
+) -> tuple[dict[str, object], dict[str, object], list[str], str]:
+    proposers = [
+        "z-ai/glm-5.2",
+        "moonshotai/kimi-k2.7-code",
+        "qwen/qwen3.8-max",
+        "deepseek/deepseek-v4-pro",
+    ]
+    aggregator = "z-ai/glm-5.2"
+    selected_p = [f"openrouter:{model}" for model in proposers]
+    selected_a = f"openrouter:{aggregator}"
+    plan: dict[str, object] = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "analyzer_failure_fallback": True,
+        "analyzer_failure_fallback_schema": (
+            "opensquilla.router-dynamic-analyzer-failure-fallback/v1"
+        ),
+        "selected_P": selected_p,
+        "backup_P": [],
+        "selected_A": selected_a,
+        "aggregator_candidates": [selected_a],
+        "proposer_count": 4,
+        "proposer_sample_count": 4,
+        "proposer_models": proposers,
+        "aggregator_model": aggregator,
+        "configured_proposer_backup_count": 0,
+        "configured_min_successful_proposers": 1,
+        "effective_min_successful_proposers": 1,
+        "N_min": 1,
+        "N_max": 4,
+        "complete_proposers_only": True,
+        "aggregator_max_recovery_actions": 1,
+        "all_failed_policy": "error",
+        "proposer_recovery_policy": (module.analyzer_failure_fallback_proposer_recovery_policy()),
+        **deepcopy(module.FORMAL_AGGREGATOR_RECOVERY_POLICY),
+    }
+    trace = _ensemble_trace(
+        proposers,
+        aggregator,
+        final_text="bound final answer",
+        selection_mode="router_dynamic",
+    )
+    call = trace["calls"][0]
+    assert isinstance(call, dict)
+    recovery = call["aggregator_recovery"]
+    assert isinstance(recovery, dict)
+    recovery["max_recovery_actions"] = 1
+    _formalize_provider_native_call(
+        module,
+        call,
+        plan,
+        scope_id="analyzer-failure-fixed-fallback",
+    )
+
+    candidates = call["candidates"]
+    assert isinstance(candidates, list)
+    for candidate, outcome in zip(candidates, outcomes, strict=True):
+        assert isinstance(candidate, dict)
+        execution = candidate["execution"]
+        assert isinstance(execution, dict)
+        attempts = execution["physical_attempts"]
+        assert isinstance(attempts, list)
+        physical_attempt = attempts[-1]
+        assert isinstance(physical_attempt, dict)
+        if outcome == "complete":
+            continue
+        if outcome == "partial_usable":
+            text = str(candidate["content"]["text"])
+            candidate.update(
+                {
+                    "ok": False,
+                    "error": "length",
+                    "error_code": "proposer_length_limit",
+                    "usable_for_aggregation": True,
+                    "completion_outcome": "partial_usable",
+                    "stop_reason": "length",
+                    "content": {
+                        "text": text,
+                        "chars": len(text),
+                        "truncated": False,
+                    },
+                }
+            )
+            physical_attempt["outcome"] = "failed"
+        else:
+            candidate.update(
+                {
+                    "ok": False,
+                    "error": "test proposer failure",
+                    "error_code": "provider_error",
+                    "usable_for_aggregation": False,
+                    "completion_outcome": "failed",
+                    "stop_reason": "error",
+                    "content": {"text": "", "chars": 0, "truncated": False},
+                }
+            )
+            physical_attempt["outcome"] = "failed"
+
+    strict_successful = sum(
+        module.successful_candidate(candidate) and candidate.get("completion_outcome") == "complete"
+        for candidate in candidates
+    )
+    usable = sum(module.usable_candidate(candidate) for candidate in candidates)
+    partial = sum(module.partial_usable_candidate(candidate) for candidate in candidates)
+    call.update(
+        {
+            "successful_proposers": strict_successful,
+            "usable_proposers": usable,
+            "partial_proposers": partial,
+            "strict_quorum_met": strict_successful >= 1,
+            "complete_proposers_only": True,
+            "execution_quorum_required": 1,
+            "execution_quorum_met": strict_successful >= 1,
+        }
+    )
+    proposer_recovery = call["proposer_recovery"]
+    assert isinstance(proposer_recovery, dict)
+    proposer_recovery.update(
+        {
+            "complete_proposers_only": True,
+            "strict_successful_proposers": strict_successful,
+            "usable_proposers": usable,
+            "quorum_reached": strict_successful >= 1,
+        }
+    )
+    return call, plan, proposers, aggregator
+
+
+def _analyzer_failure_fallback_call_reasons(
+    module,
+    call: dict[str, object],
+    proposers: list[str],
+    aggregator: str,
+) -> list[str]:
+    return module.ensemble_physical_call_reasons(
+        call,
+        expected_proposers=proposers,
+        expected_aggregator=aggregator,
+        final_text="bound final answer",
+        require_output_binding=True,
+    )
+
+
+def test_analyzer_failure_fallback_accepts_one_complete_and_one_length_partial(
+    module,
+) -> None:
+    call, _, proposers, aggregator = _analyzer_failure_fallback_physical_call(
+        module,
+        outcomes=("complete", "partial_usable", "failed", "failed"),
+    )
+
+    reasons = _analyzer_failure_fallback_call_reasons(
+        module,
+        call,
+        proposers,
+        aggregator,
+    )
+
+    assert reasons == []
+
+
+def test_analyzer_failure_fallback_rejects_partials_only(
+    module,
+) -> None:
+    call, _, proposers, aggregator = _analyzer_failure_fallback_physical_call(
+        module,
+        outcomes=(
+            "partial_usable",
+            "partial_usable",
+            "failed",
+            "failed",
+        ),
+    )
+
+    reasons = _analyzer_failure_fallback_call_reasons(
+        module,
+        call,
+        proposers,
+        aggregator,
+    )
+
+    assert "proposer_quorum_not_met" in reasons
+    assert "insufficient_actual_proposer_quorum" in reasons
+
+
+def test_analyzer_failure_fallback_accepts_zero_proposer_recovery_receipt(
+    module,
+) -> None:
+    call, plan, _, _ = _analyzer_failure_fallback_physical_call(
+        module,
+        outcomes=("complete", "partial_usable", "failed", "failed"),
+    )
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+        expected_policy=(module.analyzer_failure_fallback_proposer_recovery_policy()),
+    )
+
+    assert call["proposer_recovery"]["max_additional_physical_requests"] == 0
+    assert call["proposer_recovery"]["attempts"] == []
+    assert reasons == []
+
+
+def test_g1_analyzer_failure_fallback_plan_requires_zero_recovery_policy(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ranking_parameters = _test_ranking_config(module)
+    ranking_hash = module.canonical_sha256(ranking_parameters)
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_SHA256",
+        ranking_hash,
+    )
+    contract = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+    fallback_routes = [
+        ("z-ai/glm-5.2", "z-ai"),
+        ("moonshotai/kimi-k2.7-code", "moonshotai"),
+        ("qwen/qwen3.8-max", "alibaba"),
+        ("deepseek/deepseek-v4-pro", "deepseek"),
+    ]
+    contract["analyzer_failure_fallback_ensemble"] = {
+        "proposers": [
+            {
+                "provider": "openrouter",
+                "model": model,
+                "upstream_provider": upstream,
+                "max_attempts": 1,
+            }
+            for model, upstream in fallback_routes
+        ],
+        "aggregator": {
+            "provider": "openrouter",
+            "model": "z-ai/glm-5.2",
+            "upstream_provider": "z-ai",
+            "max_attempts": 1,
+        },
+        "min_successful_proposers": 1,
+        "complete_proposers_only": True,
+        "aggregator_max_recovery_actions": 1,
+    }
+    _, plan, _, _ = _analyzer_failure_fallback_physical_call(
+        module,
+        outcomes=("complete", "partial_usable", "failed", "failed"),
+    )
+    plan.update(
+        {
+            "task_analyzer": {
+                "schema_valid": False,
+                "chain": {"exhausted": True},
+            },
+            "ranking_config_schema_version": contract["expected_ranking_config_schema_version"],
+            "ranking_config_version": contract["expected_ranking_config_version"],
+            "ranking_config_hash": ranking_hash,
+            "ranking_parameters": ranking_parameters,
+        }
+    )
+
+    reasons, _, _ = module.g1_registry_plan_reasons(
+        plan,
+        contract=contract,
+    )
+    ordinary_policy = deepcopy(plan)
+    ordinary_policy["proposer_recovery_policy"] = deepcopy(module.FORMAL_PROPOSER_RECOVERY_POLICY)
+    wrong_reasons, _, _ = module.g1_registry_plan_reasons(
+        ordinary_policy,
+        contract=contract,
+    )
+
+    assert reasons == []
+    assert "wrong_g1_proposer_recovery_policy" in wrong_reasons
+
+
+def test_analyzer_failure_fallback_rejects_aggregator_recovery_over_budget(
+    module,
+) -> None:
+    call, _, proposers, aggregator = _analyzer_failure_fallback_physical_call(
+        module,
+        outcomes=("complete", "partial_usable", "failed", "failed"),
+    )
+    recovery = call["aggregator_recovery"]
+    assert isinstance(recovery, dict)
+    attempts = recovery["attempts"]
+    assert isinstance(attempts, list)
+    for attempt_number in (2, 3):
+        attempts.append(
+            {
+                "attempt": attempt_number,
+                "physical_attempt_index": attempt_number,
+                "physical_request_count": 1,
+                "physical_attempt_id": _physical_attempt_id(
+                    f"analyzer-fallback-aggregator-overrun-{attempt_number}"
+                ),
+                "kind": "same_model_recovery",
+                "fallback_index": 0,
+                "trigger": "ensemble_aggregator_error",
+                "request_started": True,
+                "visible_output_emitted": False,
+                "stream_closed": True,
+                "outcome": "failed",
+                "stop_reason": "error",
+                "requested_provider": "openrouter",
+                "requested_model": aggregator,
+                "actual_provider": "openrouter",
+                "actual_model": aggregator,
+            }
+        )
+    recovery["same_model_recovery_count"] = 2
+    call["llm_request_count"] += 2
+    call["physical_request_count"] += 2
+
+    reasons = _analyzer_failure_fallback_call_reasons(
+        module,
+        call,
+        proposers,
+        aggregator,
+    )
+
+    assert "aggregator_recovery_action_budget_exceeded" in reasons
+
+
+def test_analyzer_failure_fallback_one_complete_proves_execution_evidence(
+    module,
+) -> None:
+    final_text = "bound final answer"
+    call, _, _, _ = _analyzer_failure_fallback_physical_call(
+        module,
+        outcomes=("complete", "partial_usable", "failed", "failed"),
+    )
+    row = {
+        "final_text": final_text,
+        "final_text_chars": len(final_text),
+        "final_text_sha256": module.text_sha256(final_text),
+        "ensemble_trace": {
+            "mode": "agent_loop",
+            "agent_llm_call_count": 1,
+            "untraced_agent_llm_call_count": 0,
+            "calls": [call],
+        },
+    }
+
+    assert module.row_has_bound_answer_and_proposer_quorum(row) is True
+
+
+@pytest.mark.parametrize(
+    ("physical_counts", "selected_index", "exhausted", "expected_models"),
+    [
+        ([0, 1], 1, False, ["openai/gpt-5.6-sol"]),
+        ([0, 0, 0], None, True, []),
+    ],
+)
+def test_analyzer_chain_trace_derives_only_physical_request_routes(
+    module,
+    physical_counts: list[int],
+    selected_index: int | None,
+    exhausted: bool,
+    expected_models: list[str],
+) -> None:
+    chain = [
+        {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "upstream_provider": "anthropic",
+            "max_attempts": 1,
+        },
+        {
+            "provider": "openrouter",
+            "model": "openai/gpt-5.6-sol",
+            "upstream_provider": "azure",
+            "max_attempts": 1,
+        },
+        {
+            "provider": "openrouter",
+            "model": "google/gemini-3.1-pro-preview",
+            "upstream_provider": "google-ai-studio",
+            "max_attempts": 1,
+        },
+    ]
+    outcomes = []
+    for index, physical_count in enumerate(physical_counts):
+        route = chain[index]
+        outcomes.append(
+            {
+                "candidate_index": index,
+                "provider": route["provider"],
+                "model": route["model"],
+                "upstream_provider": route["upstream_provider"],
+                "outcome": ("success" if selected_index == index else "failed"),
+                "reason": "" if selected_index == index else "provider_unavailable",
+                "physical_request_count": physical_count,
+            }
+        )
+    plan = {
+        "task_analyzer": {
+            "chain": {
+                "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+                "configured_routes": [
+                    {key: route[key] for key in ("provider", "model", "upstream_provider")}
+                    for route in chain
+                ],
+                "attempt_outcomes": outcomes,
+                "selected_index": selected_index,
+                "exhausted": exhausted,
+            }
+        }
+    }
+
+    routes, reasons = module.g1_task_analyzer_physical_routes_from_trace(
+        plan,
+        chain,
+    )
+
+    assert reasons == []
+    assert [route["model"] for route in routes] == expected_models
+
+
+def test_analyzer_chain_trace_rejects_boolean_physical_request_count(
+    module,
+) -> None:
+    chain = [
+        {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "upstream_provider": "anthropic",
+            "max_attempts": 1,
+        }
+    ]
+    route = {
+        key: chain[0][key]
+        for key in ("provider", "model", "upstream_provider")
+    }
+    plan = {
+        "task_analyzer": {
+            "chain": {
+                "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+                "configured_routes": [route],
+                "attempt_outcomes": [
+                    {
+                        "candidate_index": 0,
+                        **route,
+                        "outcome": "failed",
+                        "reason": "provider_unavailable",
+                        "physical_request_count": False,
+                    }
+                ],
+                "selected_index": None,
+                "exhausted": True,
+            }
+        }
+    }
+
+    routes, reasons = module.g1_task_analyzer_physical_routes_from_trace(
+        plan,
+        chain,
+    )
+
+    assert routes == []
+    assert reasons == ["invalid_g1_task_analyzer_chain_trace"]
 
 
 def test_b2_physical_call_accepts_failed_candidate_without_actual_route(
@@ -9441,6 +9900,82 @@ def test_formal_gateway_aggregator_recovery_tampering_fails_closed(
     assert f"G1 gateway llm_ensemble.{field}" in str(error.value)
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "openai/gpt-5.6-sol",
+        "google/gemini-3.1-pro-preview",
+        "qwen/qwen3.8-max",
+    ],
+)
+def test_formal_g1_analyzer_and_fallback_route_pins_are_authenticated(
+    module,
+    model: str,
+) -> None:
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    g1 = contracts["G1"]
+    registry = g1["g1_registry_contract"]
+    registry["live_task_analyzer_chain"] = [
+        {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "upstream_provider": "anthropic",
+            "max_attempts": 1,
+        },
+        {
+            "provider": "openrouter",
+            "model": "openai/gpt-5.6-sol",
+            "upstream_provider": "azure",
+            "max_attempts": 1,
+        },
+        {
+            "provider": "openrouter",
+            "model": "google/gemini-3.1-pro-preview",
+            "upstream_provider": "google-ai-studio",
+            "max_attempts": 1,
+        },
+    ]
+    registry["analyzer_failure_fallback_ensemble"] = {
+        "proposers": [
+            {
+                "provider": "openrouter",
+                "model": fallback_model,
+                "upstream_provider": upstream,
+                "max_attempts": 1,
+            }
+            for fallback_model, upstream in [
+                ("z-ai/glm-5.2", "z-ai"),
+                ("moonshotai/kimi-k2.7-code", "moonshotai"),
+                ("qwen/qwen3.8-max", "alibaba"),
+                ("deepseek/deepseek-v4-pro", "deepseek"),
+            ]
+        ],
+        "aggregator": {
+            "provider": "openrouter",
+            "model": "z-ai/glm-5.2",
+            "upstream_provider": "z-ai",
+            "max_attempts": 1,
+        },
+        "min_successful_proposers": 1,
+        "complete_proposers_only": True,
+        "aggregator_max_recovery_actions": 1,
+    }
+    g1["resolved_llm_runtime"]["provider_routing"].update(
+        {
+            "openai/gpt-5.6-sol": "azure",
+            "google/gemini-3.1-pro-preview": "google-ai-studio",
+            "qwen/qwen3.8-max": "alibaba",
+        }
+    )
+    g1["resolved_llm_runtime"]["provider_routing"][model] = "wrong-provider"
+
+    with pytest.raises(
+        module.FinalizationError,
+        match="upstream provider pin differs",
+    ):
+        module.validate_formal_campaign_contracts(contracts)
+
+
 def _apply_dynamic_experiment_policy(contract: dict[str, object]) -> None:
     profile = contract["global_experiment_profile"]
     profile["timeouts"].update(
@@ -9532,9 +10067,7 @@ def test_max_generation_attempts_cli_is_only_an_authenticated_policy_assertion(
     module,
 ) -> None:
     parser = module.build_parser()
-    action = next(
-        action for action in parser._actions if action.dest == "max_generation_attempts"
-    )
+    action = next(action for action in parser._actions if action.dest == "max_generation_attempts")
     assert action.default is None
 
     policy = module.FinalizerExperimentPolicy(
@@ -9558,12 +10091,10 @@ def test_max_generation_attempts_cli_is_only_an_authenticated_policy_assertion(
 def test_formal_contract_accepts_lowercase_api_key_env_name(module) -> None:
     contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
     for contract in contracts.values():
-        contract["global_experiment_profile"]["tools"]["web_search"][
-            "api_key_env"
-        ] = "brave_search_key"
-        contract["tools"]["local_web_tools"]["web_search"][
-            "api_key_env"
-        ] = "brave_search_key"
+        contract["global_experiment_profile"]["tools"]["web_search"]["api_key_env"] = (
+            "brave_search_key"
+        )
+        contract["tools"]["local_web_tools"]["web_search"]["api_key_env"] = "brave_search_key"
 
     policy = module.validate_formal_campaign_contracts(contracts)
 
@@ -10798,6 +11329,39 @@ def test_blocked_regenerate_accepts_both_producer_terminal_schemas(
     }
 
     assert module.blocked_regenerate_terminal_evidence(execution) is True
+
+
+def test_fixed_fallback_non_proposer_terminal_is_valid_repair_evidence(
+    module,
+) -> None:
+    attempt_id = "a" * 32
+    execution = {
+        "resume_action": "regenerate",
+        "generation_reused": True,
+        "generation_auto_retry_blocked": True,
+        "generation_model_started": False,
+        "generation_attempts": [{"attempt_id": attempt_id}],
+        "provider_native_proposer_recovery_terminal": {
+            "schema": module.PROVIDER_NATIVE_PROPOSER_RECOVERY_TERMINAL_SCHEMA,
+            "status": "receipt_invalid",
+            "attempt_id": attempt_id,
+            "automatic_generation_retry_allowed": False,
+        },
+    }
+    row = {
+        "resume_completion": {
+            "action": "regenerate",
+            "generation_reused": True,
+            "status": "incomplete",
+            "post_repair_action": "regenerate",
+            "judge_reran": False,
+            "metadata_repaired": False,
+            "incomplete_reasons": ["generation_auto_retry_blocked"],
+        }
+    }
+
+    assert module.blocked_regenerate_terminal_evidence(execution) is True
+    assert module.repair_evidence(row, execution) is True
 
 
 @pytest.mark.parametrize("tamper", ["counter", "result_pair_set"])

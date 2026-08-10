@@ -61,6 +61,9 @@ TASK_ANALYZER_PROVIDER_ID = "openrouter"
 TASK_ANALYZER_MODEL_ID = "anthropic/claude-opus-4.8"
 TASK_ANALYZER_UPSTREAM_PROVIDER = "anthropic"
 TASK_ANALYZER_VERSION = "opus-4.8-json-v3"
+TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL = (
+    "opensquilla.task-analyzer-fallback-chain/v1"
+)
 FROZEN_TASK_ANALYSIS_SCHEMA = "opensquilla.draco.frozen-task-analysis/v1"
 FROZEN_TASK_ANALYSIS_SCHEMA_V2 = "opensquilla.draco.frozen-task-analysis/v2"
 FROZEN_TASK_ANALYSIS_SCHEMAS = frozenset(
@@ -193,6 +196,57 @@ class _ValidatedRankingConfig(dict[str, Any]):
     """Internal marker for a detached config that already passed full validation."""
 
 
+@dataclass(frozen=True)
+class TaskAnalyzerCandidate:
+    """One strict, caller-resolved candidate in an Analyzer fallback chain."""
+
+    provider_id: str
+    model_id: str
+    upstream_provider: str
+    provider: LLMProvider | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        provider_id = self.provider_id.strip()
+        model_id = self.model_id.strip()
+        upstream_provider = self.upstream_provider.strip()
+        if (
+            not provider_id
+            or provider_id != self.provider_id
+            or provider_id != provider_id.casefold()
+        ):
+            raise ValueError(
+                "task analyzer candidate provider_id must be non-empty, lowercase, and trimmed"
+            )
+        if (
+            not model_id
+            or model_id != self.model_id
+            or model_id != model_id.casefold()
+            or any(character.isspace() for character in model_id)
+            or "/" not in model_id
+            or any(not segment for segment in model_id.split("/"))
+        ):
+            raise ValueError(
+                "task analyzer candidate model_id must be lowercase, trimmed, "
+                "contain '/', and contain no whitespace"
+            )
+        if (
+            not upstream_provider
+            or upstream_provider != self.upstream_provider
+            or upstream_provider != upstream_provider.casefold()
+            or _TASK_ANALYZER_UPSTREAM_PROVIDER_RE.fullmatch(upstream_provider) is None
+        ):
+            raise ValueError(
+                "task analyzer candidate upstream_provider must be non-empty, "
+                "lowercase, and trimmed"
+            )
+        if self.provider is not None and not callable(
+            getattr(self.provider, "chat", None)
+        ):
+            raise ValueError(
+                "task analyzer candidate provider must implement the LLMProvider interface"
+            )
+
+
 def _normalize_attachment_mime(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -217,6 +271,7 @@ class TaskAnalysisResult:
     model_id: str = ""
     normalization_warnings: tuple[str, ...] = ()
     replay: dict[str, Any] = field(default_factory=dict)
+    chain_trace: dict[str, Any] = field(default_factory=dict)
 
     def trace(self, ranking_config: Mapping[str, Any] | None = None) -> dict[str, Any]:
         decimal_places = _ranking_int(
@@ -235,6 +290,7 @@ class TaskAnalysisResult:
             "usage": copy.deepcopy(self.usage),
             "normalization_warnings": list(self.normalization_warnings),
             **({"replay": copy.deepcopy(self.replay)} if self.replay else {}),
+            **({"chain": copy.deepcopy(self.chain_trace)} if self.chain_trace else {}),
         }
 
 
@@ -3898,6 +3954,7 @@ async def analyze_task_with_provider(
     _attempt: int = 1,
     _retry_feedback: str = "",
     _accumulated_usage: Mapping[str, Any] | None = None,
+    _allow_provider_stream_fallback: bool = True,
 ) -> TaskAnalysisResult:
     """Use the caller-supplied dedicated provider as the task analyzer."""
 
@@ -4060,6 +4117,7 @@ async def analyze_task_with_provider(
             system=system_prompt,
             thinking=analyzer_thinking,
             timeout=effective_timeout,
+            allow_provider_stream_fallback=_allow_provider_stream_fallback,
             output_json_schema=copy.deepcopy(_task_analyzer_output_schema()),
             output_json_schema_strict=True,
         )
@@ -4370,6 +4428,9 @@ async def analyze_task_with_provider(
                 _attempt=_attempt + 1,
                 _retry_feedback=reason,
                 _accumulated_usage=accumulated_usage,
+                _allow_provider_stream_fallback=(
+                    _allow_provider_stream_fallback
+                ),
             )
         log.warning(
             "llm_ensemble.router_dynamic.task_analyzer_fallback",
@@ -4436,6 +4497,189 @@ async def analyze_task_with_provider(
         provider_id=provider_id,
         model_id=model_id,
         normalization_warnings=tuple(normalization_issues),
+    )
+
+
+def _normalize_task_analyzer_chain_candidates(
+    candidates: Sequence[TaskAnalyzerCandidate | Mapping[str, Any]],
+) -> tuple[TaskAnalyzerCandidate, ...]:
+    if isinstance(candidates, (str, bytes)):
+        raise ValueError("task analyzer fallback candidates must be a sequence")
+    normalized: list[TaskAnalyzerCandidate] = []
+    expected_mapping_keys = {
+        "provider",
+        "provider_id",
+        "model_id",
+        "upstream_provider",
+    }
+    for index, raw_candidate in enumerate(candidates):
+        if isinstance(raw_candidate, TaskAnalyzerCandidate):
+            candidate = raw_candidate
+        elif isinstance(raw_candidate, Mapping):
+            if set(raw_candidate) != expected_mapping_keys:
+                raise ValueError(
+                    "task analyzer fallback candidate mapping must contain exactly "
+                    "provider, provider_id, model_id, and upstream_provider"
+                )
+            candidate = TaskAnalyzerCandidate(
+                provider=raw_candidate["provider"],
+                provider_id=str(raw_candidate["provider_id"]),
+                model_id=str(raw_candidate["model_id"]),
+                upstream_provider=str(raw_candidate["upstream_provider"]),
+            )
+        else:
+            raise ValueError(
+                "task analyzer fallback candidate at index "
+                f"{index} must be a TaskAnalyzerCandidate or mapping"
+            )
+        normalized.append(candidate)
+    if not normalized:
+        raise ValueError("task analyzer fallback candidates cannot be empty")
+    routes = [
+        (candidate.provider_id, candidate.model_id, candidate.upstream_provider)
+        for candidate in normalized
+    ]
+    if len(routes) != len(set(routes)):
+        raise ValueError("task analyzer fallback candidates cannot contain duplicate routes")
+    return tuple(normalized)
+
+
+def _task_analyzer_candidate_ranking_config(
+    ranking_config: Mapping[str, Any],
+    candidate: TaskAnalyzerCandidate,
+) -> _ValidatedRankingConfig:
+    temporary = copy.deepcopy(dict(ranking_config))
+    analyzer = temporary.get("task_analyzer")
+    if not isinstance(analyzer, dict):
+        raise DynamicRankingError("router_dynamic task_analyzer must be a JSON object")
+    analyzer.update(
+        {
+            "provider": candidate.provider_id,
+            "model": candidate.model_id,
+            "upstream_provider": candidate.upstream_provider,
+            "max_retries": 0,
+        }
+    )
+    return _validate_ranking_config(temporary)
+
+
+def _public_task_analyzer_chain_failure_reason(value: Any) -> str:
+    reason = str(value or "").strip()
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", reason):
+        return reason
+    return "analyzer_failed"
+
+
+async def analyze_task_with_fallback_chain(
+    *,
+    candidates: Sequence[TaskAnalyzerCandidate | Mapping[str, Any]],
+    message: str,
+    user_profile_enabled: bool,
+    request_context: Mapping[str, Any],
+    routed_tier: str,
+    routing_confidence: float,
+    timeout_seconds: float | None = None,
+    usage_tracker: Any | None = None,
+    session_key: str | None = None,
+    ranking_config: Mapping[str, Any] | None = None,
+    decision_id: str = "",
+) -> TaskAnalysisResult:
+    """Try each resolved Analyzer candidate once, in caller-declared order.
+
+    Ordinary request or validation failures advance to the next candidate. A
+    stream-cleanup or physical-evidence failure remains fail-closed because a
+    replacement request cannot safely start while the previous request may
+    still be running or its billing identity is contradictory.
+    """
+
+    normalized_candidates = _normalize_task_analyzer_chain_candidates(candidates)
+    effective_config = _resolve_ranking_config(ranking_config)
+    configured_routes = [
+        {
+            "provider": candidate.provider_id,
+            "model": candidate.model_id,
+            "upstream_provider": candidate.upstream_provider,
+        }
+        for candidate in normalized_candidates
+    ]
+    outcomes: list[dict[str, Any]] = []
+    accumulated_usage = _task_analyzer_zero_request_usage(None)
+    last_result: TaskAnalysisResult | None = None
+
+    def chain_trace(*, selected_index: int | None, exhausted: bool) -> dict[str, Any]:
+        return {
+            "protocol": TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL,
+            "configured_routes": copy.deepcopy(configured_routes),
+            "attempt_outcomes": copy.deepcopy(outcomes),
+            "selected_index": selected_index,
+            "exhausted": exhausted,
+        }
+
+    for candidate_index, candidate in enumerate(normalized_candidates):
+        candidate_config = _task_analyzer_candidate_ranking_config(
+            effective_config,
+            candidate,
+        )
+        physical_attempts_before = _task_analyzer_physical_attempt_count(
+            accumulated_usage
+        )
+        result = await analyze_task_with_provider(
+            provider=candidate.provider,
+            message=message,
+            user_profile_enabled=user_profile_enabled,
+            request_context=request_context,
+            routed_tier=routed_tier,
+            routing_confidence=routing_confidence,
+            timeout_seconds=timeout_seconds,
+            usage_tracker=usage_tracker,
+            session_key=session_key,
+            analyzer_provider_id=candidate.provider_id,
+            analyzer_model_id=candidate.model_id,
+            ranking_config=candidate_config,
+            decision_id=decision_id,
+            _accumulated_usage=accumulated_usage,
+            _allow_provider_stream_fallback=False,
+        )
+        if result.usage:
+            accumulated_usage = copy.deepcopy(result.usage)
+        physical_attempts_after = _task_analyzer_physical_attempt_count(
+            accumulated_usage
+        )
+        outcome = {
+            "candidate_index": candidate_index,
+            "provider": candidate.provider_id,
+            "model": candidate.model_id,
+            "upstream_provider": candidate.upstream_provider,
+            "outcome": "success" if result.schema_valid else "failed",
+            "reason": (
+                ""
+                if result.schema_valid
+                else _public_task_analyzer_chain_failure_reason(
+                    result.fallback_reason
+                )
+            ),
+            "physical_request_count": max(
+                0,
+                physical_attempts_after - physical_attempts_before,
+            ),
+        }
+        outcomes.append(outcome)
+        last_result = result
+        if result.schema_valid:
+            return replace(
+                result,
+                usage=copy.deepcopy(accumulated_usage),
+                chain_trace=chain_trace(
+                    selected_index=candidate_index,
+                    exhausted=False,
+                ),
+            )
+
+    assert last_result is not None
+    return replace(
+        last_result,
+        usage=copy.deepcopy(accumulated_usage),
+        chain_trace=chain_trace(selected_index=None, exhausted=True),
     )
 
 
@@ -7737,6 +7981,11 @@ def ranking_trace_replay_reasons(
             replay=(
                 copy.deepcopy(dict(analyzer["replay"]))
                 if isinstance(analyzer.get("replay"), Mapping)
+                else {}
+            ),
+            chain_trace=(
+                copy.deepcopy(dict(analyzer["chain"]))
+                if isinstance(analyzer.get("chain"), Mapping)
                 else {}
             ),
         )

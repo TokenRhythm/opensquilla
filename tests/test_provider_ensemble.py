@@ -73,6 +73,10 @@ from opensquilla.provider.protocol import (
 )
 from opensquilla.provider.ranking_router import (
     DynamicRankingError,
+    TaskAnalysisResult,
+    build_request_context,
+    build_router_dynamic_task_analysis_reuse_binding,
+    fallback_task_profile,
     load_model_registry_snapshot,
 )
 from opensquilla.provider.selector import ProviderConfig
@@ -3821,6 +3825,343 @@ def test_router_dynamic_selection_plan_is_materialized_without_rewriting_members
         member.thinking_policy_managed is False
         for member in [*provider.proposers, provider.aggregator]
     )
+
+
+def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallback() -> None:
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "min_successful_proposers": 3,
+            "shuffle_candidates": False,
+            "aggregator_recovery_mode": "experiment",
+        },
+    )
+    fallback = {
+        "schema": "opensquilla.router-dynamic-analyzer-failure-fallback/v1",
+        "proposers": [
+            {
+                "provider": "openrouter",
+                "model": model,
+                "upstream_provider": upstream,
+                "max_attempts": 1,
+            }
+            for model, upstream in [
+                ("z-ai/glm-5.2", "z-ai"),
+                ("moonshotai/kimi-k2.7-code", "moonshotai"),
+                ("qwen/qwen3.8-max", "alibaba"),
+                ("deepseek/deepseek-v4-pro", "deepseek"),
+            ]
+        ],
+        "aggregator": {
+            "provider": "openrouter",
+            "model": "z-ai/glm-5.2",
+            "upstream_provider": "z-ai",
+            "max_attempts": 1,
+        },
+        "min_successful_proposers": 1,
+        "complete_proposers_only": True,
+        "aggregator_max_recovery_actions": 1,
+    }
+    exhausted_chain_trace = {
+        "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+        "configured_routes": [
+            {
+                "provider": "openrouter",
+                "model": "anthropic/claude-opus-4.8",
+                "upstream_provider": "anthropic",
+            }
+        ],
+        "attempt_outcomes": [
+            {
+                "candidate_index": 0,
+                "provider": "openrouter",
+                "model": "anthropic/claude-opus-4.8",
+                "upstream_provider": "anthropic",
+                "outcome": "failed",
+                "reason": "TimeoutError",
+                "physical_request_count": 1,
+            }
+        ],
+        "selected_index": None,
+        "exhausted": True,
+    }
+    registry_allowlist = {
+        "live_task_analyzer_chain": [
+            {**route, "max_attempts": 1}
+            for route in exhausted_chain_trace["configured_routes"]
+        ]
+    }
+    request_context = build_request_context(
+        message="Resolve the analyzer-failure fallback request.",
+        turn_metadata={
+            "routed_tier": "c2",
+            "router_dynamic_request_context": {
+                "conversation": {"summary": "fixed fallback resume evidence"},
+            },
+        },
+        attachments=[],
+        candidate_output_tokens=4_096,
+        aggregator_output_tokens=8_192,
+    )
+    fallback_profile = fallback_task_profile(
+        routed_tier="c2",
+        request_context=request_context,
+    )
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+            provider_routing={"existing/model": "existing"},
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+        ranking_inputs={
+            "decision_id": "fixed-fallback-decision",
+            "request_context": request_context,
+            "task_analysis": TaskAnalysisResult(
+                profile=fallback_profile,
+                source="router_fallback",
+                schema_valid=False,
+                confidence=0.0,
+                fallback_reason="analyzer_chain_exhausted",
+                chain_trace=deepcopy(exhausted_chain_trace),
+            ),
+            "analyzer_failure_fallback": fallback,
+            "registry_allowlist": registry_allowlist,
+        },
+    )
+    legacy_provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+        ranking_inputs={
+            "task_analysis": TaskAnalysisResult(
+                profile=deepcopy(fallback_profile),
+                source="router_fallback",
+                schema_valid=False,
+                confidence=0.0,
+                fallback_reason="analyzer_chain_exhausted",
+                chain_trace=deepcopy(exhausted_chain_trace),
+            ),
+            "analyzer_failure_fallback": fallback,
+        },
+    )
+
+    assert legacy_provider.selection_plan["analyzer_failure_fallback"] is True
+    assert [
+        member.provider_config.model for member in provider.proposers
+    ] == [
+        "z-ai/glm-5.2",
+        "moonshotai/kimi-k2.7-code",
+        "qwen/qwen3.8-max",
+        "deepseek/deepseek-v4-pro",
+    ]
+    assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
+    assert provider.proposer_backups == []
+    assert provider.aggregator_fallbacks == []
+    assert provider.min_successful_proposers == 1
+    assert provider.all_failed_policy == "error"
+    assert provider.selection_plan["analyzer_failure_fallback"] is True
+    assert provider.selection_plan["analyzer_failure_fallback_schema"] == (
+        "opensquilla.router-dynamic-analyzer-failure-fallback/v1"
+    )
+    assert provider.selection_plan["task_analyzer"]["schema_valid"] is False
+    assert provider.selection_plan["task_analyzer"]["chain"]["exhausted"] is True
+    assert provider.selection_plan["decision_id"] == "fixed-fallback-decision"
+    assert provider.selection_plan["task_profile_pre_escalation"] == (
+        provider.selection_plan["task_profile"]
+    )
+    assert provider.selection_plan["user_profile_enabled"] is False
+    assert provider.selection_plan["user_profile_version"] == ""
+    assert provider.selection_plan["user_profile_source"] == ""
+    assert provider.selection_plan["request_context_hash"] == (
+        provider.selection_plan["request_context"]["snapshot_hash"]
+    )
+    assert provider.selection_plan["request_context"]["conversation"]["summary"] == (
+        "fixed fallback resume evidence"
+    )
+    reuse_binding = build_router_dynamic_task_analysis_reuse_binding(
+        provider.selection_plan
+    )
+    assert reuse_binding["source_decision_id"] == "fixed-fallback-decision"
+    assert reuse_binding["projection"]["request_context"] == (
+        provider.selection_plan["request_context"]
+    )
+    retry_context = provider._router_dynamic_retry_context
+    assert retry_context is not None
+    assert retry_context.frozen_ranking_inputs["request_context"] == (
+        provider.selection_plan["request_context"]
+    )
+    request_context["conversation"]["summary"] = "mutated after construction"
+    assert provider.selection_plan["request_context"]["conversation"]["summary"] == (
+        "fixed fallback resume evidence"
+    )
+    assert provider.selection_plan["ranking_parameters"]
+    assert len(provider.selection_plan["ranking_config_hash"]) == 64
+    assert provider.selection_plan["complete_proposers_only"] is True
+    assert provider.selection_plan["effective_min_successful_proposers"] == 1
+    assert provider.selection_plan["N_max"] == 4
+    assert provider.selection_plan["aggregator_max_recovery_actions"] == 1
+    assert provider.selection_plan["all_failed_policy"] == "error"
+    assert provider.selection_plan["backup_P"] == []
+    assert provider.proposer_recovery_max_additional_calls == 0
+    recovery_policy = provider.selection_plan["proposer_recovery_policy"]
+    assert recovery_policy["max_additional_physical_requests"] == 0
+    assert provider.selection_plan["proposer_count"] == 4
+    assert provider.selection_plan["proposer_sample_count"] == 4
+    assert provider.selection_plan["proposer_models"] == [
+        "z-ai/glm-5.2",
+        "moonshotai/kimi-k2.7-code",
+        "qwen/qwen3.8-max",
+        "deepseek/deepseek-v4-pro",
+    ]
+    assert provider.selection_plan["aggregator_model"] == "z-ai/glm-5.2"
+    assert provider.selection_plan["aggregator_candidates"] == [
+        "openrouter:z-ai/glm-5.2"
+    ]
+    assert provider.selection_plan["llm_configured_min_successful_proposers"] == 3
+    expected_pins = {
+        "z-ai/glm-5.2": "z-ai",
+        "moonshotai/kimi-k2.7-code": "moonshotai",
+        "qwen/qwen3.8-max": "alibaba",
+        "deepseek/deepseek-v4-pro": "deepseek",
+    }
+    for member in [*provider.proposers, provider.aggregator]:
+        assert member.provider_config.provider_routing[member.provider_config.model] == (
+            expected_pins[member.provider_config.model]
+        )
+        assert member.provider_config.provider_routing["existing/model"] == "existing"
+
+    mismatched_chain_trace = deepcopy(exhausted_chain_trace)
+    mismatched_chain_trace["configured_routes"][0]["model"] = (
+        "anthropic/claude-opus-4.8-forged"
+    )
+    mismatched_chain_trace["attempt_outcomes"][0]["model"] = (
+        "anthropic/claude-opus-4.8-forged"
+    )
+    overcounted_chain_trace = deepcopy(exhausted_chain_trace)
+    overcounted_chain_trace["attempt_outcomes"][0]["physical_request_count"] = 2
+    for invalid_trace in [mismatched_chain_trace, overcounted_chain_trace]:
+        with pytest.raises(
+            DynamicRankingError,
+            match="authenticated exhausted task-analyzer chain trace",
+        ):
+            build_ensemble_provider_from_config(
+                config=config,
+                inherited_provider_config=ProviderConfig(
+                    provider="openrouter",
+                    model="deepseek/deepseek-v4-pro",
+                    api_key="fake",
+                ),
+                fallback_provider=None,
+                turn_metadata={"routed_tier": "c2"},
+                ranking_inputs={
+                    "task_analysis": TaskAnalysisResult(
+                        profile={},
+                        source="router_fallback",
+                        schema_valid=False,
+                        confidence=0.0,
+                        fallback_reason="analyzer_chain_exhausted",
+                        chain_trace=invalid_trace,
+                    ),
+                    "analyzer_failure_fallback": fallback,
+                    "registry_allowlist": registry_allowlist,
+                },
+            )
+
+    fallback_with_unknown_key = deepcopy(fallback)
+    fallback_with_unknown_key["unknown"] = "not-allowed"
+    route_with_unknown_key = deepcopy(fallback)
+    route_with_unknown_key["proposers"][0]["thinking"] = "high"
+    fallback_with_auto_pin = deepcopy(fallback)
+    fallback_with_auto_pin["aggregator"]["upstream_provider"] = "auto"
+    fallback_with_conflicting_shared_model_pin = deepcopy(fallback)
+    fallback_with_conflicting_shared_model_pin["aggregator"][
+        "upstream_provider"
+    ] = "other-z-ai"
+    for invalid_fallback, error_match in [
+        (fallback_with_unknown_key, "unsupported keys"),
+        (route_with_unknown_key, "unsupported keys"),
+        (fallback_with_auto_pin, "explicit upstream_provider pin"),
+        (fallback_with_conflicting_shared_model_pin, "conflicting upstream_provider"),
+    ]:
+        with pytest.raises(DynamicRankingError, match=error_match):
+            build_ensemble_provider_from_config(
+                config=config,
+                inherited_provider_config=ProviderConfig(
+                    provider="openrouter",
+                    model="deepseek/deepseek-v4-pro",
+                    api_key="fake",
+                ),
+                fallback_provider=None,
+                turn_metadata={"routed_tier": "c2"},
+                ranking_inputs={
+                    "task_analysis": TaskAnalysisResult(
+                        profile={},
+                        source="router_fallback",
+                        schema_valid=False,
+                        confidence=0.0,
+                        fallback_reason="analyzer_chain_exhausted",
+                        chain_trace=deepcopy(exhausted_chain_trace),
+                    ),
+                    "analyzer_failure_fallback": invalid_fallback,
+                },
+            )
+
+    normal_config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+        },
+    )
+    normal_provider = build_ensemble_provider_from_config(
+        config=normal_config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+        ranking_inputs={
+            "task_analysis": TaskAnalysisResult(
+                profile=fallback_task_profile(
+                    routed_tier="c2",
+                    request_context={
+                        "routing_budget": {"estimated_input_tokens": 128},
+                        "input_modalities": ["text"],
+                    },
+                ),
+                source="test",
+                schema_valid=True,
+                confidence=1.0,
+            ),
+            "analyzer_failure_fallback": fallback,
+        },
+    )
+    assert normal_provider.selection_plan.get("analyzer_failure_fallback") is not True
+    assert "qwen/qwen3.8-max" not in [
+        member.provider_config.model for member in normal_provider.proposers
+    ]
 
 
 def test_router_dynamic_retry_metadata_projects_around_real_skill_loader(
@@ -11009,6 +11350,26 @@ def _slot_recovery_plan(
     }
 
 
+def _analyzer_failure_fallback_recovery_plan(
+    proposers: list[EnsembleMemberConfig],
+) -> dict[str, Any]:
+    plan = _slot_recovery_plan(proposers, [], max_additional=0)
+    plan.update(
+        {
+            "schema": "opensquilla.router-dynamic-analyzer-failure-fallback/v1",
+            "analyzer_failure_fallback": True,
+            "complete_proposers_only": True,
+            "aggregator_max_recovery_actions": 1,
+            "all_failed_policy": "error",
+            "configured_min_successful_proposers": 1,
+            "effective_min_successful_proposers": 1,
+            "N_min": 1,
+        }
+    )
+    plan["proposer_recovery_policy"]["quorum_required"] = 1
+    return plan
+
+
 @pytest.mark.asyncio
 async def test_router_dynamic_aggregator_binds_physical_attempt_evidence(
     monkeypatch: pytest.MonkeyPatch,
@@ -11645,6 +12006,256 @@ async def test_router_dynamic_initial_evidence_warning_keeps_usable_quorum(
 
 
 @pytest.mark.asyncio
+async def test_analyzer_failure_fallback_aggregates_one_complete_and_ignores_partials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "agg": [
+                [
+                    TextDeltaEvent(text="Fused from the complete draft."),
+                    _billed_done("agg", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member(f"p{index}") for index in range(4)]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/analyzer_failure_fallback",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=0,
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_analyzer_failure_fallback_recovery_plan(proposers),
+    )
+    candidates = [
+        _slot_candidate(
+            index=0,
+            model="p0",
+            text="The only complete draft.",
+            physical_attempt_id="a" * 32,
+        ),
+        _slot_candidate(
+            index=1,
+            model="p1",
+            text="Length-truncated partial draft must not be aggregated.",
+            stop_reason="length",
+            physical_attempt_id="b" * 32,
+        ),
+        *[
+            _slot_candidate(
+                index=index,
+                model=f"p{index}",
+                text=f"Partial draft {index} must not be aggregated.",
+                error="upstream interrupted",
+                error_code="upstream_interrupted",
+                physical_attempt_id=character * 32,
+            )
+            for index, character in [(2, "c"), (3, "d")]
+        ],
+    ]
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return candidates
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"agg": 1}
+    [aggregator_call] = registry.calls
+    aggregator_input = str(aggregator_call["messages"][-1].content)
+    assert "The only complete draft." in aggregator_input
+    assert "Partial draft" not in aggregator_input
+    trace = done.ensemble_trace
+    assert trace["complete_proposers_only"] is True
+    assert trace["successful_proposers"] == 1
+    assert trace["usable_proposers"] == 4
+    assert trace["execution_quorum_required"] == 1
+    assert trace["execution_quorum_met"] is True
+    assert trace["selected_candidate_indexes"] == [0]
+    assert all(
+        candidate["selected_for_aggregation"] is (candidate["index"] == 0)
+        for candidate in trace["candidates"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_analyzer_failure_fallback_quarantines_unclosed_after_one_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "agg": [
+                [
+                    TextDeltaEvent(text="Fused from the complete draft."),
+                    _billed_done("agg", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member(f"p{index}") for index in range(4)]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/analyzer_failure_fallback",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=0,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_analyzer_failure_fallback_recovery_plan(proposers),
+    )
+    scope_id = "analyzer-fallback-one-complete-unclosed"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=0,
+    )
+    unclosed_attempt_id = "b" * 32
+    unclosed = _slot_candidate(
+        index=1,
+        model="p1",
+        error="provider stream cleanup did not finish",
+        error_code="ensemble_proposer_close_timeout",
+        usage_reported=False,
+        physical_attempt_id=unclosed_attempt_id,
+    )
+    unclosed.stream_closed = False
+    unclosed.model_usage_breakdown = []
+    unclosed.execution["physical_attempts"][0].update(
+        {
+            "attempt": 1,
+            "identity": "fake:p1",
+            "outcome": "interrupted",
+            "stream_closed": False,
+        }
+    )
+    candidates = [
+        _slot_candidate(
+            index=0,
+            model="p0",
+            text="The complete draft.",
+            physical_attempt_id="a" * 32,
+        ),
+        unclosed,
+        _slot_candidate(
+            index=2,
+            model="p2",
+            error="failed",
+            error_code="upstream_failed",
+            physical_attempt_id="c" * 32,
+        ),
+        _slot_candidate(
+            index=3,
+            model="p3",
+            error="failed",
+            error_code="upstream_failed",
+            physical_attempt_id="d" * 32,
+        ),
+    ]
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return candidates
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"agg": 1}
+    [aggregator_call] = registry.calls
+    assert aggregator_call["tools"] is None
+    assert done.ensemble_trace["selected_candidate_indexes"] == [0]
+    marker = done.ensemble_trace["proposer_cleanup_quorum_bypass"]
+    assert marker["quorum_required"] == 1
+    assert marker["successful_proposers"] == 1
+    assert marker["candidate_indexes"] == [1]
+    assert marker["physical_attempt_ids"] == [unclosed_attempt_id]
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_analyzer_failure_fallback_rejects_partial_only_proposers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "agg": [
+                [
+                    TextDeltaEvent(text="must not run"),
+                    _billed_done("agg", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member(f"p{index}") for index in range(4)]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/analyzer_failure_fallback",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=0,
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_analyzer_failure_fallback_recovery_plan(proposers),
+    )
+    candidates = [
+        _slot_candidate(
+            index=index,
+            model=f"p{index}",
+            text=f"Partial draft {index}.",
+            stop_reason="length" if index == 0 else "",
+            error="" if index == 0 else "upstream interrupted",
+            error_code="" if index == 0 else "upstream_interrupted",
+            physical_attempt_id=character * 32,
+        )
+        for index, character in enumerate(("a", "b", "c", "d"))
+    ]
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return candidates
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+
+    events = await _collect(provider)
+
+    [error] = [event for event in events if isinstance(event, ErrorEvent)]
+    assert error.code == "ensemble_complete_proposer_required"
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert registry.call_counts == {}
+    assert error.ensemble_trace["complete_proposers_only"] is True
+    assert error.ensemble_trace["successful_proposers"] == 0
+    assert error.ensemble_trace["usable_proposers"] == 4
+    assert error.ensemble_trace["partial_proposers"] == 4
+    assert error.ensemble_trace["selected_candidate_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_router_dynamic_uses_partial_unclosed_draft_for_two_draft_quorum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11895,6 +12506,135 @@ async def test_router_dynamic_excludes_contract_violating_unclosed_draft(
     assert marker["candidate_indexes"] == [2]
     assert done.usage_missing_count == 1
     assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_analyzer_failure_fallback_retries_visible_truncation_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [
+                [
+                    TextDeltaEvent(text="Complete proposer draft."),
+                    _billed_done("p0", cost=0.1),
+                ]
+            ],
+            "agg": [
+                [
+                    TextDeltaEvent(text="First half of the answer. "),
+                    _billed_done("agg", cost=0.2, stop_reason="length"),
+                ],
+                [
+                    TextDeltaEvent(text="Second half is still truncated."),
+                    _billed_done("agg", cost=0.3, stop_reason="length"),
+                ],
+                [
+                    TextDeltaEvent(text="A forbidden third attempt."),
+                    _billed_done("agg", cost=0.4),
+                ],
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/analyzer_failure_fallback",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=0,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_analyzer_failure_fallback_recovery_plan(proposers),
+    )
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"p0": 1, "agg": 2}
+    aggregator_calls = [
+        call for call in registry.calls if call["model"] == "agg"
+    ]
+    assert aggregator_calls[0]["tools"]
+    assert aggregator_calls[1]["tools"] is None
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == "First half of the answer. Second half is still truncated."
+    recovery = done.ensemble_trace["aggregator_recovery"]
+    assert recovery["max_recovery_actions"] == 1
+    assert recovery["continuation_count"] == 1
+    assert recovery["success"] is False
+    assert recovery["delivery_outcome"] == "degraded_success"
+    assert done.ensemble_trace["execution_outcome"] == "degraded_success"
+    assert len(
+        [row for row in recovery["attempts"] if row.get("request_started") is True]
+    ) == 2
+    assert done.ensemble_trace["physical_request_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_analyzer_failure_fallback_rejects_unusable_second_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [
+                [
+                    TextDeltaEvent(text="Complete proposer draft."),
+                    _billed_done("p0", cost=0.1),
+                ]
+            ],
+            "agg": [
+                [
+                    TextDeltaEvent(text="Short "),
+                    _billed_done("agg", cost=0.2, stop_reason="length"),
+                ],
+                [
+                    TextDeltaEvent(text="tail"),
+                    _billed_done("agg", cost=0.3, stop_reason="length"),
+                ],
+                [
+                    TextDeltaEvent(text="A forbidden third attempt."),
+                    _billed_done("agg", cost=0.4),
+                ],
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/analyzer_failure_fallback",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_recovery_max_additional_calls=0,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_analyzer_failure_fallback_recovery_plan(proposers),
+    )
+
+    events = await _collect(provider)
+
+    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert registry.call_counts == {"p0": 1, "agg": 2}
+    aggregator_calls = [
+        call for call in registry.calls if call["model"] == "agg"
+    ]
+    assert aggregator_calls[0]["tools"]
+    assert aggregator_calls[1]["tools"] is None
 
 
 @pytest.mark.asyncio

@@ -372,8 +372,15 @@ def formal_proposer_recovery_policy_for_plan(
     policy = plan.get("proposer_recovery_policy")
     if not isinstance(policy, Mapping):
         return None
+    analyzer_failure_fallback = bool(
+        plan.get("analyzer_failure_fallback") is True
+        and plan.get("complete_proposers_only") is True
+        and plan.get("effective_min_successful_proposers") == 1
+    )
     ranking_config = plan.get("ranking_parameters")
-    if isinstance(ranking_config, Mapping):
+    if analyzer_failure_fallback:
+        backup_count = 0
+    elif isinstance(ranking_config, Mapping):
         try:
             backup_count = ranking_proposer_backup_count(ranking_config)
         except ValueError:
@@ -396,6 +403,8 @@ def formal_proposer_recovery_policy_for_plan(
         )
     except ValueError:
         return None
+    if analyzer_failure_fallback:
+        expected["quorum_required"] = 1
     effective_backup_count = policy.get("effective_backup_count")
     if (
         isinstance(effective_backup_count, bool)
@@ -616,19 +625,79 @@ def validate_g1_registry_contract(
         if not model or model in available:
             raise ValueError("G1 registry snapshot contains a missing or duplicate model id")
         available.add(model)
-    analyzer_model = str(analyzer_policy["model"])
-    analyzer_upstream_provider = str(analyzer_policy["upstream_provider"])
-    if analyzer_upstream_provider == "auto":
+    replay_contract_configured = contract.task_analysis_execution is not None
+    analyzer_routes = (
+        [route.model_dump(mode="json") for route in contract.live_task_analyzer_chain]
+        if contract.live_task_analyzer_chain and not replay_contract_configured
+        else []
+    )
+    if not analyzer_routes:
+        analyzer_routes = [
+            {
+                "provider": str(analyzer_policy["provider"]),
+                "model": str(analyzer_policy["model"]),
+                "upstream_provider": str(
+                    analyzer_policy["upstream_provider"]
+                ),
+            }
+        ]
+    primary_route = analyzer_routes[0]
+    if str(analyzer_policy["upstream_provider"]) == "auto":
         raise ValueError(
             "formal G1 task analyzer upstream provider must be explicitly pinned"
         )
-    if analyzer_model not in available:
-        raise ValueError("G1 task analyzer model is missing from the frozen registry")
+    if (
+        str(primary_route["provider"]) != str(analyzer_policy["provider"])
+        or str(primary_route["model"]) != str(analyzer_policy["model"])
+        or str(primary_route["upstream_provider"])
+        != str(analyzer_policy["upstream_provider"])
+    ):
+        raise ValueError(
+            "G1 live task analyzer chain primary differs from effective ranking config"
+        )
     runtime = resolve_llm_runtime_config(config)
-    if runtime.provider != str(analyzer_policy["provider"]):
-        raise ValueError("G1 task analyzer provider differs from the resolved runtime")
-    if runtime.provider_routing.get(analyzer_model) != analyzer_upstream_provider:
-        raise ValueError("G1 task analyzer upstream provider pin differs from the runtime")
+    for route in analyzer_routes:
+        route_provider = str(route["provider"])
+        route_model = str(route["model"])
+        route_upstream = str(route["upstream_provider"])
+        if route_upstream == "auto":
+            raise ValueError(
+                "formal G1 task analyzer upstream provider must be explicitly pinned"
+            )
+        if route_model not in available:
+            raise ValueError(
+                "G1 task analyzer model is missing from the frozen registry"
+            )
+        if runtime.provider != route_provider:
+            raise ValueError(
+                "G1 task analyzer provider differs from the resolved runtime"
+            )
+        if runtime.provider_routing.get(route_model) != route_upstream:
+            raise ValueError(
+                "G1 task analyzer upstream provider pin differs from the runtime"
+            )
+    analyzer_failure_fallback = (
+        None
+        if replay_contract_configured
+        else contract.analyzer_failure_fallback_ensemble
+    )
+    if analyzer_failure_fallback is not None:
+        fallback_routes = [
+            *analyzer_failure_fallback.proposers,
+            analyzer_failure_fallback.aggregator,
+        ]
+        for route in fallback_routes:
+            if route.provider != runtime.provider:
+                raise ValueError(
+                    "G1 analyzer-failure fallback provider differs from runtime"
+                )
+            if route.upstream_provider == "auto" or (
+                runtime.provider_routing.get(route.model)
+                != route.upstream_provider
+            ):
+                raise ValueError(
+                    "G1 analyzer-failure fallback route is not explicitly pinned"
+                )
     if contract.candidate_scope == "exact_routes":
         assert contract.expected_routes is not None
         assert contract.expected_candidate_count is not None
@@ -665,8 +734,12 @@ def validate_g1_registry_contract(
         runtime_pins_match = None
     if expected_count < actual_proposer_max:
         raise ValueError("G1 registry has fewer candidates than the proposer maximum")
+    serialized_contract = contract.model_dump(mode="json", exclude_none=True)
+    if replay_contract_configured:
+        serialized_contract.pop("live_task_analyzer_chain", None)
+        serialized_contract.pop("analyzer_failure_fallback_ensemble", None)
     resolved_contract = {
-        **contract.model_dump(mode="json", exclude_none=True),
+        **serialized_contract,
         "candidate_scope": contract.candidate_scope,
         "policy": policy,
         "expected_candidate_count": expected_count,
@@ -3091,6 +3164,25 @@ def enforce_draco_legal_proposer_quorum(provider: Any) -> Any:
     if proposer_count <= 0:
         return provider
     selection_plan = dict(getattr(provider, "selection_plan", {}) or {})
+    if selection_plan.get("analyzer_failure_fallback") is True:
+        if (
+            selection_plan.get("complete_proposers_only") is not True
+            or coerce_metric_int(
+                selection_plan.get("effective_min_successful_proposers")
+            )
+            != 1
+            or int(getattr(provider, "min_successful_proposers", 0) or 0)
+            != 1
+        ):
+            raise ValueError(
+                "DRACO analyzer-failure fallback requires one complete proposer"
+            )
+        selection_plan["legal_min_successful_proposers"] = 1
+        selection_plan["legal_quorum_policy"] = (
+            "analyzer_failure_fallback_complete_1"
+        )
+        provider.selection_plan = selection_plan
+        return provider
     provider_native_policy = selection_plan.get(
         "proposer_recovery_policy"
     )
@@ -4533,7 +4625,10 @@ async def build_experiment_provider(
     setup_usage: list[dict[str, Any]] = []
     if selection_mode == "router_dynamic":
         from opensquilla.provider.ranking_router import (
+            TaskAnalyzerCandidate,
+            TaskAnalyzerPhysicalEvidenceError,
             TaskAnalyzerStreamCleanupError,
+            analyze_task_with_fallback_chain,
             analyze_task_with_provider,
             build_request_context,
             dynamic_output_token_budgets,
@@ -4553,6 +4648,40 @@ async def build_experiment_provider(
         analyzer_provider_id = str(analyzer_policy["provider"])
         analyzer_model_id = str(analyzer_policy["model"])
         analyzer_upstream_provider = str(analyzer_policy["upstream_provider"])
+        resolved_analyzer_chain = (
+            resolved_g1_registry_contract.get("live_task_analyzer_chain")
+            if isinstance(resolved_g1_registry_contract, Mapping)
+            else None
+        )
+        configured_analyzer_chain = (
+            [dict(route) for route in resolved_analyzer_chain]
+            if isinstance(resolved_analyzer_chain, list)
+            and resolved_analyzer_chain
+            and all(isinstance(route, Mapping) for route in resolved_analyzer_chain)
+            else [
+                route.model_dump(mode="json")
+                for route in g1_routing.live_task_analyzer_chain
+            ]
+            if g1_routing is not None and g1_routing.live_task_analyzer_chain
+            else []
+        )
+        analyzer_routes = (
+            [
+                {
+                    "provider": str(route["provider"]),
+                    "model": str(route["model"]),
+                    "upstream_provider": str(route["upstream_provider"]),
+                }
+                for route in configured_analyzer_chain
+            ]
+            or [
+                {
+                    "provider": analyzer_provider_id,
+                    "model": analyzer_model_id,
+                    "upstream_provider": analyzer_upstream_provider,
+                }
+            ]
+        )
         routing_extra = turn.metadata.get("routing_extra")
         routing_extra_map = routing_extra if isinstance(routing_extra, Mapping) else {}
         routed_tier = str(
@@ -4603,16 +4732,47 @@ async def build_experiment_provider(
             raw_profile = initial_plan.get("task_profile_pre_escalation")
             request_context = initial_plan.get("request_context")
             analyzer = initial_plan.get("task_analyzer")
+            analyzer_identity_matches_chain = bool(
+                isinstance(analyzer, Mapping)
+                and any(
+                    str(analyzer.get("provider") or "")
+                    == str(route["provider"])
+                    and str(analyzer.get("model") or "")
+                    == str(route["model"])
+                    for route in analyzer_routes
+                )
+            )
+            initial_plan_replay_reasons = (
+                g1_registry_contract_reasons(
+                    {"selection_plan": initial_plan},
+                    resolved_g1_registry_contract,
+                )
+                if isinstance(initial_plan, Mapping)
+                and initial_plan.get("analyzer_failure_fallback") is True
+                else ranking_trace_replay_reasons(initial_plan)
+                if isinstance(initial_plan, Mapping)
+                else ["missing_g1_selection_plan"]
+            )
+            target_plan_replay_reasons = (
+                g1_registry_contract_reasons(
+                    {"selection_plan": target_plan},
+                    resolved_g1_registry_contract,
+                )
+                if isinstance(target_plan, Mapping)
+                and target_plan.get("analyzer_failure_fallback") is True
+                else ranking_trace_replay_reasons(target_plan)
+                if isinstance(target_plan, Mapping)
+                else ["missing_g1_selection_plan"]
+            )
             if (
                 not isinstance(frozen_ranking_config, Mapping)
                 or dict(ranking_config) != dict(frozen_ranking_config)
                 or not isinstance(raw_profile, Mapping)
                 or not isinstance(request_context, Mapping)
                 or not isinstance(analyzer, Mapping)
-                or str(analyzer.get("provider") or "") != analyzer_provider_id
-                or str(analyzer.get("model") or "") != analyzer_model_id
-                or ranking_trace_replay_reasons(initial_plan)
-                or ranking_trace_replay_reasons(target_plan)
+                or not analyzer_identity_matches_chain
+                or initial_plan_replay_reasons
+                or target_plan_replay_reasons
             ):
                 raise ValueError(
                     "frozen G1 ranker evidence differs from the current registry/config"
@@ -4658,6 +4818,11 @@ async def build_experiment_provider(
                     if isinstance(analyzer.get("replay"), Mapping)
                     else {}
                 ),
+                chain_trace=(
+                    copy.deepcopy(dict(analyzer["chain"]))
+                    if isinstance(analyzer.get("chain"), Mapping)
+                    else {}
+                ),
             )
             decision_id = str(target_plan.get("decision_id") or "")
             if not decision_id:
@@ -4679,6 +4844,25 @@ async def build_experiment_provider(
                 "registry_allowlist": resolved_g1_registry_contract,
                 "request_tools_present": bool(tools),
             }
+            if initial_plan.get("analyzer_failure_fallback") is True:
+                analyzer_failure_fallback = (
+                    g1_routing.analyzer_failure_fallback_ensemble
+                    if g1_routing is not None
+                    else None
+                )
+                if analyzer_failure_fallback is None:
+                    raise ValueError(
+                        "frozen G1 analyzer fallback lacks the current contract"
+                    )
+                ranking_inputs["analyzer_failure_fallback"] = {
+                    "schema": (
+                        "opensquilla.router-dynamic-"
+                        "analyzer-failure-fallback/v1"
+                    ),
+                    **analyzer_failure_fallback.model_dump(mode="json"),
+                }
+                ensemble_cfg.min_successful_proposers = 1
+                ensemble_cfg.all_failed_policy = "error"
             if exclusions:
                 ranking_inputs.update(
                     {
@@ -4744,15 +4928,25 @@ async def build_experiment_provider(
             )
             replay = g1_routing.task_analysis_execution if g1_routing is not None else None
             replay_contract = replay.model_dump(mode="json") if replay is not None else None
-            analyzer_provider = (
-                None
+            analyzer_candidates = (
+                []
                 if replay_contract is not None
-                else build_task_analyzer_provider(
-                    routed_config,
-                    provider_id=analyzer_provider_id,
-                    model_id=analyzer_model_id,
-                    upstream_provider=analyzer_upstream_provider,
-                )
+                else [
+                    TaskAnalyzerCandidate(
+                        provider=build_task_analyzer_provider(
+                            routed_config,
+                            provider_id=str(route["provider"]),
+                            model_id=str(route["model"]),
+                            upstream_provider=str(
+                                route["upstream_provider"]
+                            ),
+                        ),
+                        provider_id=str(route["provider"]),
+                        model_id=str(route["model"]),
+                        upstream_provider=str(route["upstream_provider"]),
+                    )
+                    for route in analyzer_routes
+                ]
             )
             try:
                 if replay_contract is not None:
@@ -4767,9 +4961,20 @@ async def build_experiment_provider(
                         request_context=request_context,
                         ranking_config=ranking_config,
                     )
+                elif configured_analyzer_chain:
+                    task_analysis = await analyze_task_with_fallback_chain(
+                        candidates=analyzer_candidates,
+                        message=turn.semantic_message,
+                        user_profile_enabled=user_profile_enabled,
+                        request_context=request_context,
+                        routed_tier=routed_tier,
+                        routing_confidence=routing_confidence,
+                        ranking_config=ranking_config,
+                        decision_id=decision_id,
+                    )
                 else:
                     task_analysis = await analyze_task_with_provider(
-                        provider=analyzer_provider,
+                        provider=analyzer_candidates[0].provider,
                         message=turn.semantic_message,
                         user_profile_enabled=user_profile_enabled,
                         request_context=request_context,
@@ -4780,7 +4985,10 @@ async def build_experiment_provider(
                         ranking_config=ranking_config,
                         decision_id=decision_id,
                     )
-            except TaskAnalyzerStreamCleanupError as exc:
+            except (
+                TaskAnalyzerPhysicalEvidenceError,
+                TaskAnalyzerStreamCleanupError,
+            ) as exc:
                 setup_usage.extend(
                     task_analyzer_usage_rows(
                         exc.usage or {"attempt_count": 1},
@@ -4793,6 +5001,7 @@ async def build_experiment_provider(
                 routing_trace["task_analyzer"] = {
                     "provider": analyzer_provider_id,
                     "model": analyzer_model_id,
+                    "configured_chain": analyzer_routes,
                     "source": "analyzer_stream_cleanup_failed",
                     "schema_valid": False,
                     "fallback_reason": type(exc).__name__,
@@ -4921,30 +5130,35 @@ async def build_experiment_provider(
                     ),
                     "registry_allowlist": resolved_g1_registry_contract,
                 }
+                analyzer_failure_fallback = (
+                    g1_routing.analyzer_failure_fallback_ensemble
+                    if g1_routing is not None
+                    and replay_contract is None
+                    and not task_analysis.schema_valid
+                    else None
+                )
+                if analyzer_failure_fallback is not None:
+                    fallback_payload = analyzer_failure_fallback.model_dump(
+                        mode="json"
+                    )
+                    ranking_inputs["analyzer_failure_fallback"] = {
+                        "schema": (
+                            "opensquilla.router-dynamic-"
+                            "analyzer-failure-fallback/v1"
+                        ),
+                        **fallback_payload,
+                    }
+                    ensemble_cfg.min_successful_proposers = 1
+                    ensemble_cfg.all_failed_policy = "error"
                 if thinking_assignment_enabled:
                     ranking_inputs["request_tools_present"] = bool(tools)
-                routing_trace["task_analyzer"] = (
-                    {
-                        **task_analysis.trace(ranking_config),
-                        "request_context_hash": request_context.get(
-                            "snapshot_hash"
-                        ),
-                        "user_profile_enabled": user_profile_enabled,
-                    }
-                    if replay_contract is not None
-                    else {
-                        "provider": analyzer_provider_id,
-                        "model": analyzer_model_id,
-                        "source": analyzer_source,
-                        "schema_valid": task_analysis.schema_valid,
-                        "confidence": task_analysis.confidence,
-                        "fallback_reason": analyzer_fallback_reason,
-                        "request_context_hash": request_context.get(
-                            "snapshot_hash"
-                        ),
-                        "user_profile_enabled": user_profile_enabled,
-                    }
-                )
+                routing_trace["task_analyzer"] = {
+                    **task_analysis.trace(ranking_config),
+                    "request_context_hash": request_context.get(
+                        "snapshot_hash"
+                    ),
+                    "user_profile_enabled": user_profile_enabled,
+                }
             except Exception as exc:  # noqa: BLE001 - preserve a paid analyzer call
                 if not setup_usage:
                     raise
@@ -8208,6 +8422,87 @@ def g1_registry_contract_reasons(
     executed_plan = trace.get("selection_plan")
     if not isinstance(executed_plan, Mapping):
         return ["missing_g1_selection_plan"]
+    if executed_plan.get("analyzer_failure_fallback") is True:
+        fallback = contract.get("analyzer_failure_fallback_ensemble")
+        proposer_routes = (
+            fallback.get("proposers")
+            if isinstance(fallback, Mapping)
+            else None
+        )
+        aggregator_route = (
+            fallback.get("aggregator")
+            if isinstance(fallback, Mapping)
+            else None
+        )
+        if (
+            not isinstance(proposer_routes, list)
+            or len(proposer_routes) != 4
+            or not isinstance(aggregator_route, Mapping)
+            or fallback.get("min_successful_proposers") != 1
+            or fallback.get("complete_proposers_only") is not True
+            or fallback.get("aggregator_max_recovery_actions") != 1
+        ):
+            return ["invalid_g1_analyzer_failure_fallback_contract"]
+        expected_p = [
+            f"{str(route.get('provider') or '')}:"
+            f"{str(route.get('model') or '')}"
+            for route in proposer_routes
+            if isinstance(route, Mapping)
+        ]
+        expected_a = (
+            f"{str(aggregator_route.get('provider') or '')}:"
+            f"{str(aggregator_route.get('model') or '')}"
+        )
+        if len(expected_p) != 4 or len(set(expected_p)) != 4:
+            return ["invalid_g1_analyzer_failure_fallback_contract"]
+        if executed_plan.get("user_profile_enabled") is not False:
+            reasons.append("wrong_g1_user_profile_enabled")
+        if executed_plan.get("analyzer_failure_fallback_schema") != (
+            "opensquilla.router-dynamic-analyzer-failure-fallback/v1"
+        ):
+            reasons.append("wrong_g1_analyzer_failure_fallback_schema")
+        if executed_plan.get("selected_P") != expected_p:
+            reasons.append("wrong_g1_selected_proposers")
+        if executed_plan.get("selected_A") != expected_a:
+            reasons.append("wrong_g1_selected_aggregator")
+        if (
+            executed_plan.get("complete_proposers_only") is not True
+            or coerce_metric_int(
+                executed_plan.get("effective_min_successful_proposers")
+            )
+            != 1
+            or coerce_metric_int(executed_plan.get("N_min")) != 1
+            or coerce_metric_int(executed_plan.get("N_max")) != 4
+            or executed_plan.get("aggregator_max_recovery_actions") != 1
+        ):
+            reasons.append("wrong_g1_analyzer_failure_fallback_quorum")
+        analyzer_trace = executed_plan.get("task_analyzer")
+        analyzer_chain_trace = (
+            analyzer_trace.get("chain")
+            if isinstance(analyzer_trace, Mapping)
+            else None
+        )
+        if (
+            not isinstance(analyzer_trace, Mapping)
+            or analyzer_trace.get("schema_valid") is not False
+            or not isinstance(analyzer_chain_trace, Mapping)
+            or analyzer_chain_trace.get("exhausted") is not True
+        ):
+            reasons.append("wrong_g1_analyzer_failure_fallback_activation")
+        ranking_parameters = executed_plan.get("ranking_parameters")
+        if (
+            not isinstance(ranking_parameters, Mapping)
+            or canonical_json_sha256(ranking_parameters).removeprefix("sha256:")
+            != expected_ranking_hash
+            or executed_plan.get("ranking_config_schema_version")
+            != expected_ranking_schema
+            or executed_plan.get("ranking_config_version")
+            != expected_ranking_version
+            or executed_plan.get("ranking_config_hash")
+            != expected_ranking_hash
+        ):
+            reasons.append("wrong_g1_ranking_config_trace")
+        return list(dict.fromkeys(reasons))
     if executed_plan.get("user_profile_enabled") is not False:
         reasons.append("wrong_g1_user_profile_enabled")
     ranking_parameters = executed_plan.get("ranking_parameters")
@@ -8617,8 +8912,17 @@ def ensemble_call_core_reasons(
     total = trace.get("total_candidates")
     successful = trace.get("successful_proposers")
     candidate_rows = trace.get("candidates")
+    quorum_plan = expected_plan or (
+        dict(executed_plan) if isinstance(executed_plan, Mapping) else {}
+    )
+    complete_only_analyzer_fallback = bool(
+        quorum_plan.get("analyzer_failure_fallback") is True
+        and quorum_plan.get("complete_proposers_only") is True
+        and quorum_plan.get("effective_min_successful_proposers") == 1
+    )
     dynamic_usable_contract = bool(
         dynamic_selection
+        and not complete_only_analyzer_fallback
         and (
             any(
                 field in trace
@@ -8741,6 +9045,10 @@ def ensemble_call_core_reasons(
                 and isinstance(candidate, Mapping)
                 and candidate.get("ok") is True
                 and not candidate.get("error")
+                and (
+                    not complete_only_analyzer_fallback
+                    or candidate.get("completion_outcome") == "complete"
+                )
             )
             partial_proven = bool(
                 dynamic_usable_contract
@@ -8760,6 +9068,11 @@ def ensemble_call_core_reasons(
                 isinstance(candidate, Mapping)
                 and candidate.get("ok") is True
                 and not strict_proven
+                and not (
+                    complete_only_analyzer_fallback
+                    and content_proven
+                    and candidate.get("completion_outcome") == "partial_usable"
+                )
             ):
                 reasons.append("invalid_successful_proposer_evidence")
             if dynamic_usable_contract and isinstance(candidate, Mapping):
@@ -8796,9 +9109,6 @@ def ensemble_call_core_reasons(
             reasons.append("successful_proposer_count_mismatch")
         actual_usable = sum(proven_usable)
         actual_partials = sum(proven_partials)
-        quorum_plan = expected_plan or (
-            dict(executed_plan) if isinstance(executed_plan, Mapping) else {}
-        )
         quorum_total = expected_total or (
             total if isinstance(total, int) and not isinstance(total, bool) else 0
         )
@@ -10309,7 +10619,8 @@ def g1_provider_native_recovery_policy_reason(
         or bool(set(backups).intersection(aggregator_candidates))
         or plan.get("configured_proposer_backup_count") != configured_backup_count
         or plan.get("effective_proposer_backup_count") != effective_backup_count
-        or plan.get("effective_min_successful_proposers") != 2
+        or plan.get("effective_min_successful_proposers")
+        != expected_policy["quorum_required"]
     ):
         return "invalid_g1_proposer_recovery_roster"
     from opensquilla.provider.protocol import (
@@ -13391,6 +13702,22 @@ def _frozen_estimate_price(
                 **registry_provenance,
                 "registry_provider": "openrouter",
                 "registry_model_id": normalized_model,
+            }
+        if normalized_model == "qwen/qwen3.8-max":
+            return ResolvedModelPrice(
+                PriceEntry(
+                    input_per_m=2.0,
+                    output_per_m=6.0,
+                    cache_read_per_m=0.25,
+                    cache_write_per_m=2.5,
+                ),
+                "static_table",
+            ), {
+                "source": "static_table",
+                "snapshot_version": "",
+                "snapshot_canonical_sha256": "",
+                "registry_provider": "",
+                "registry_model_id": "",
             }
         # An empty provider is the legacy OpenRouter form used by older
         # receipts.  A registry miss must remain unknown: the layered pricing
@@ -17083,6 +17410,31 @@ def g1_provider_lifecycle_analyzer_reasons(
             if analyzers:
                 reasons.append("unexpected_g1_task_analyzer_request_in_frozen_replay")
         return list(dict.fromkeys(reasons))
+    live_chain = (
+        registry.get("live_task_analyzer_chain")
+        if isinstance(registry, Mapping)
+        else None
+    )
+    first_task_analyzer = (
+        first_plan.get("task_analyzer")
+        if isinstance(first_plan, Mapping)
+        else None
+    )
+    first_chain_trace = (
+        first_task_analyzer.get("chain")
+        if isinstance(first_task_analyzer, Mapping)
+        else None
+    )
+    if (
+        isinstance(live_chain, list)
+        and live_chain
+        and isinstance(first_chain_trace, Mapping)
+    ):
+        return _g1_frozen_lifecycle_analyzer_reasons(
+            request_attempts,
+            initial_plan=first_plan,
+            g1_contract=registry,
+        )
     ranking_parameters = (
         first_plan.get("ranking_parameters")
         if isinstance(first_plan, Mapping)
@@ -17157,13 +17509,16 @@ def _g1_frozen_lifecycle_plan_reasons(
         return ["missing_g1_attempt_selection_plan"]
     from opensquilla.provider.ranking_router import ranking_trace_replay_reasons
 
+    registry_reasons = g1_registry_contract_reasons(
+        {"selection_plan": plan},
+        g1_contract,
+    )
+    if plan.get("analyzer_failure_fallback") is True:
+        return list(dict.fromkeys(registry_reasons))
     return list(
         dict.fromkeys(
             [
-                *g1_registry_contract_reasons(
-                    {"selection_plan": plan},
-                    g1_contract,
-                ),
+                *registry_reasons,
                 *ranking_trace_replay_reasons(plan),
             ]
         )
@@ -17266,34 +17621,144 @@ def _g1_frozen_lifecycle_analyzer_reasons(
             return ["g1_task_analyzer_setup_usage_mismatch"]
         analyzer_units_by_attempt.append(usage_units)
     first_units = analyzer_units_by_attempt[0]
-    if not first_units:
-        return ["missing_g1_task_analyzer_request"]
     attempt_ordinals = [unit.get("attempt") for unit in first_units]
     attempt_ids = [str(unit.get("physical_attempt_id") or "") for unit in first_units]
-    ranking_parameters = initial_plan.get("ranking_parameters")
-    try:
-        analyzer_policy = task_analyzer_policy(
-            ranking_parameters if isinstance(ranking_parameters, Mapping) else None
+    raw_chain = g1_contract.get("live_task_analyzer_chain")
+    expected_routes: list[dict[str, str]] = []
+    if isinstance(raw_chain, list) and raw_chain:
+        for route in raw_chain:
+            if not isinstance(route, Mapping) or route.get("max_attempts") != 1:
+                return ["invalid_g1_task_analyzer_policy"]
+            provider = str(route.get("provider") or "").strip().casefold()
+            model = str(route.get("model") or "").strip()
+            upstream = str(route.get("upstream_provider") or "").strip().casefold()
+            if provider != "openrouter" or not model or not upstream or upstream == "auto":
+                return ["invalid_g1_task_analyzer_policy"]
+            expected_routes.append(
+                {
+                    "provider": provider,
+                    "model": model,
+                    "upstream_provider": upstream,
+                }
+            )
+        analyzer_trace = initial_plan.get("task_analyzer")
+        chain_trace = (
+            analyzer_trace.get("chain")
+            if isinstance(analyzer_trace, Mapping)
+            else None
         )
-    except Exception:  # noqa: BLE001 - malformed frozen evidence fails closed
-        return ["invalid_g1_task_analyzer_policy"]
-    analyzer_provider_id = str(analyzer_policy["provider"])
-    analyzer_model_id = str(analyzer_policy["model"])
-    analyzer_config = (
-        ranking_parameters.get("task_analyzer")
-        if isinstance(ranking_parameters, Mapping)
-        else None
-    )
-    max_retries = (
-        analyzer_config.get("max_retries")
-        if isinstance(analyzer_config, Mapping)
-        else None
-    )
+        configured_routes = (
+            chain_trace.get("configured_routes")
+            if isinstance(chain_trace, Mapping)
+            else None
+        )
+        outcomes = (
+            chain_trace.get("attempt_outcomes")
+            if isinstance(chain_trace, Mapping)
+            else None
+        )
+        expected_configured_routes = [
+            {
+                "provider": route["provider"],
+                "model": route["model"],
+                "upstream_provider": route["upstream_provider"],
+            }
+            for route in expected_routes
+        ]
+        if (
+            not isinstance(chain_trace, Mapping)
+            or chain_trace.get("protocol")
+            != "opensquilla.task-analyzer-fallback-chain/v1"
+            or configured_routes != expected_configured_routes
+            or not isinstance(outcomes, list)
+            or not outcomes
+            or len(outcomes) > len(expected_routes)
+        ):
+            return ["invalid_g1_task_analyzer_chain_trace"]
+        physical_routes: list[dict[str, str]] = []
+        success_indexes: list[int] = []
+        for index, outcome in enumerate(outcomes):
+            route = expected_routes[index]
+            if (
+                not isinstance(outcome, Mapping)
+                or outcome.get("candidate_index") != index
+                or str(outcome.get("provider") or "").strip().casefold()
+                != route["provider"]
+                or not _formal_openrouter_models_equivalent(
+                    outcome.get("model"),
+                    route["model"],
+                )
+                or str(outcome.get("upstream_provider") or "")
+                .strip()
+                .casefold()
+                != route["upstream_provider"]
+                or outcome.get("outcome") not in {"success", "failed"}
+                or type(outcome.get("physical_request_count")) is not int
+                or outcome.get("physical_request_count") not in {0, 1}
+            ):
+                return ["invalid_g1_task_analyzer_chain_trace"]
+            if outcome.get("outcome") == "success":
+                success_indexes.append(index)
+            if outcome.get("physical_request_count") == 1:
+                physical_routes.append(route)
+        selected_index = chain_trace.get("selected_index")
+        exhausted = chain_trace.get("exhausted")
+        if success_indexes:
+            if (
+                success_indexes != [len(outcomes) - 1]
+                or selected_index != success_indexes[0]
+                or exhausted is not False
+            ):
+                return ["invalid_g1_task_analyzer_chain_trace"]
+        elif (
+            len(outcomes) != len(expected_routes)
+            or selected_index is not None
+            or exhausted is not True
+        ):
+            return ["invalid_g1_task_analyzer_chain_trace"]
+        expected_routes = physical_routes
+    else:
+        ranking_parameters = initial_plan.get("ranking_parameters")
+        try:
+            analyzer_policy = task_analyzer_policy(
+                ranking_parameters if isinstance(ranking_parameters, Mapping) else None
+            )
+        except Exception:  # noqa: BLE001 - malformed frozen evidence fails closed
+            return ["invalid_g1_task_analyzer_policy"]
+        analyzer_config = (
+            ranking_parameters.get("task_analyzer")
+            if isinstance(ranking_parameters, Mapping)
+            else None
+        )
+        max_retries = (
+            analyzer_config.get("max_retries")
+            if isinstance(analyzer_config, Mapping)
+            else None
+        )
+        if (
+            not isinstance(max_retries, int)
+            or isinstance(max_retries, bool)
+            or max_retries < 0
+        ):
+            return ["invalid_g1_task_analyzer_policy"]
+        expected_routes = [
+            {
+                "provider": str(analyzer_policy["provider"]).casefold(),
+                "model": str(analyzer_policy["model"]),
+                "upstream_provider": str(
+                    analyzer_policy["upstream_provider"]
+                ).casefold(),
+            }
+            for _ in range(max_retries + 1)
+        ]
+        if not first_units:
+            return ["missing_g1_task_analyzer_request"]
     if (
-        not isinstance(max_retries, int)
-        or isinstance(max_retries, bool)
-        or max_retries < 0
-        or len(first_units) > max_retries + 1
+        (
+            len(first_units) != len(expected_routes)
+            if isinstance(raw_chain, list) and raw_chain
+            else len(first_units) > len(expected_routes)
+        )
         or attempt_ordinals != list(range(1, len(first_units) + 1))
         or len(set(attempt_ids)) != len(attempt_ids)
         or any(
@@ -17303,22 +17768,30 @@ def _g1_frozen_lifecycle_analyzer_reasons(
         )
     ):
         return ["invalid_g1_task_analyzer_attempt_sequence"]
-    for unit in first_units:
-        if _g1_is_unknown_task_analyzer_placeholder(unit):
-            continue
+    for unit, expected_route in zip(first_units, expected_routes):
+        placeholder = _g1_is_unknown_task_analyzer_placeholder(unit)
         if (
-            str(unit.get("role") or "").strip().casefold() != "task_analyzer"
-            or str(unit.get("provider") or "").strip().casefold()
-            != analyzer_provider_id.casefold()
-            or str(unit.get("requested_provider") or "").strip().casefold()
-            != analyzer_provider_id.casefold()
-            or not _formal_openrouter_models_equivalent(
-                unit.get("model"),
-                analyzer_model_id,
+            (
+                not placeholder
+                and str(unit.get("role") or "").strip().casefold()
+                != "task_analyzer"
             )
+            or str(unit.get("requested_provider") or "").strip().casefold()
+            != expected_route["provider"]
             or not _formal_openrouter_models_equivalent(
                 unit.get("requested_model"),
-                analyzer_model_id,
+                expected_route["model"],
+            )
+            or (
+                not placeholder
+                and (
+                    str(unit.get("provider") or "").strip().casefold()
+                    != expected_route["provider"]
+                    or not _formal_openrouter_models_equivalent(
+                        unit.get("model"),
+                        expected_route["model"],
+                    )
+                )
             )
         ):
             return ["wrong_g1_task_analyzer_route"]
@@ -19009,10 +19482,12 @@ def provider_native_proposer_recovery_terminal_evidence(
     """Classify explicit provider-owned recovery as terminal across Waves.
 
     The provider owns every additional proposer request inside one run-turn
-    scope.  Provider-owned proposer failures must not replay the whole roster,
-    while later agent or aggregator failures retain their outer task retry
-    budget. Malformed receipts remain terminal rather than authorizing a paid
-    call whose proposer recovery state cannot be proven.
+    scope. Provider-owned proposer failures must not replay the whole roster.
+    Later agent or aggregator failures retain their outer task retry budget on
+    ordinary plans, but the authenticated complete-only Analyzer fallback is
+    terminal after its one aggregator recovery action. Malformed receipts
+    remain terminal rather than authorizing a paid call whose proposer recovery
+    state cannot be proven.
     """
 
     execution = row.get("execution")
@@ -19045,6 +19520,14 @@ def provider_native_proposer_recovery_terminal_evidence(
     retry_suppressed_reason = str(
         attempt.get("retry_suppressed_reason") or ""
     ).strip()
+    plan = attempt.get("selection_plan")
+    complete_only_analyzer_fallback = bool(
+        isinstance(plan, Mapping)
+        and plan.get("analyzer_failure_fallback") is True
+        and plan.get("complete_proposers_only") is True
+        and type(plan.get("effective_min_successful_proposers")) is int
+        and plan.get("effective_min_successful_proposers") == 1
+    )
     if (
         not selected_generation_succeeded
         and retry_reason
@@ -19052,6 +19535,7 @@ def provider_native_proposer_recovery_terminal_evidence(
         and not provider_native_proposer_retry_reason(
             retry_suppressed_reason
         )
+        and not complete_only_analyzer_fallback
     ):
         return None
     suppression_required = not (selected_generation_succeeded and not retry_reason)
@@ -19064,7 +19548,6 @@ def provider_native_proposer_recovery_terminal_evidence(
         )
     ):
         reasons.append("provider_native_outer_retry_not_suppressed")
-    plan = attempt.get("selection_plan")
     plan_reason = g1_provider_native_recovery_policy_reason(
         plan if isinstance(plan, Mapping) else None
     )
@@ -19072,6 +19555,29 @@ def provider_native_proposer_recovery_terminal_evidence(
         reasons.append("missing_provider_native_selection_plan")
     elif plan_reason:
         reasons.append(plan_reason)
+    expected_recovery_policy = (
+        formal_proposer_recovery_policy_for_plan(plan)
+        if isinstance(plan, Mapping)
+        else None
+    )
+    expected_max_additional = (
+        coerce_metric_int(
+            expected_recovery_policy.get("max_additional_physical_requests")
+        )
+        if isinstance(expected_recovery_policy, Mapping)
+        else 3
+    )
+    expected_quorum = (
+        coerce_metric_int(expected_recovery_policy.get("quorum_required"))
+        if isinstance(expected_recovery_policy, Mapping)
+        else 2
+    )
+    complete_only_analyzer_fallback = bool(
+        isinstance(plan, Mapping)
+        and plan.get("analyzer_failure_fallback") is True
+        and plan.get("complete_proposers_only") is True
+        and expected_quorum == 1
+    )
 
     from opensquilla.provider.protocol import (
         provider_retry_roster_fingerprint,
@@ -19094,7 +19600,7 @@ def provider_native_proposer_recovery_terminal_evidence(
     prior_receipts: list[dict[str, Any]] = []
     prior_started = 0
     scope_id = ""
-    latest_remaining = 3
+    latest_remaining = expected_max_additional
     latest_quorum_reached = False
     for call in calls:
         call_plan = call.get("selection_plan")
@@ -19128,15 +19634,16 @@ def provider_native_proposer_recovery_terminal_evidence(
             receipt.get("schema") != PROPOSER_RECOVERY_SCHEMA
             or receipt.get("selection_plan_fingerprint")
             != expected_fingerprint
-            or receipt.get("max_additional_physical_requests") != 3
+            or receipt.get("max_additional_physical_requests")
+            != expected_max_additional
             or receipt.get("external_physical_requests_reserved") != 0
             or isinstance(started, bool)
             or not isinstance(started, int)
-            or not 0 <= started <= 3
+            or not 0 <= started <= expected_max_additional
             or isinstance(remaining, bool)
             or not isinstance(remaining, int)
-            or remaining != 3 - started
-            or receipt.get("quorum_required") != 2
+            or remaining != expected_max_additional - started
+            or receipt.get("quorum_required") != expected_quorum
             or type(receipt.get("quorum_reached")) is not bool
             or not isinstance(receipt_attempts, list)
         ):
@@ -19344,6 +19851,10 @@ def provider_native_proposer_recovery_terminal_evidence(
             slot_index
             for slot_index, candidate in enumerate(candidates or [])
             if provider_native_candidate_usable(candidate)
+            and (
+                not complete_only_analyzer_fallback
+                or candidate.get("completion_outcome") == "complete"
+            )
         }
         started_new_receipt_indexes_by_slot: dict[int, list[int]] = {}
         semantic_success_receipt_indexes: set[int] = set()
@@ -19380,12 +19891,14 @@ def provider_native_proposer_recovery_terminal_evidence(
         for receipt_index, item in enumerate(new_receipts):
             if item.get("request_started") is not True:
                 continue
-            if len(successful_slots) >= 2:
+            if len(successful_slots) >= expected_quorum:
                 reasons.append("provider_native_recovery_continued_after_quorum")
             slot_index = coerce_metric_int(item.get("slot_index"))
             if receipt_index in semantic_success_receipt_indexes:
                 successful_slots.add(slot_index)
-        if latest_quorum_reached != (len(successful_slots) >= 2):
+        if latest_quorum_reached != (
+            len(successful_slots) >= expected_quorum
+        ):
             reasons.append("provider_native_recovery_quorum_mismatch")
 
         prior_receipts = normalized_attempts

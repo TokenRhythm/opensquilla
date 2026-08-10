@@ -130,6 +130,9 @@ _ROUTER_DYNAMIC_AGGREGATOR_ONLY_QUORUM_UNPROVEN_CODE = (
 _ROUTER_DYNAMIC_RECOVERY_PLAN_DRIFT_CODE = (
     "router_dynamic_proposer_recovery_plan_drift"
 )
+_ANALYZER_FAILURE_FALLBACK_SCHEMA = (
+    "opensquilla.router-dynamic-analyzer-failure-fallback/v1"
+)
 _POLICY_THINKING_BUDGET_TOKENS: dict[str, int] = {
     "off": 0,
     "minimal": 1_024,
@@ -3619,6 +3622,28 @@ class EnsembleProvider:
                 "match the executable prompt version"
             )
         self.selection_plan = normalized_selection_plan
+        self._analyzer_failure_fallback_declared_at_init = bool(
+            self.selection_plan.get("analyzer_failure_fallback") is True
+        )
+        self._analyzer_failure_aggregator_max_recovery_actions = 0
+        if self._analyzer_failure_fallback_declared_at_init:
+            analyzer_failure_plan_is_valid = bool(
+                self.selection_plan.get("schema")
+                == _ANALYZER_FAILURE_FALLBACK_SCHEMA
+                and self.selection_plan.get("complete_proposers_only") is True
+                and self.selection_plan.get("aggregator_max_recovery_actions") == 1
+                and self.selection_plan.get("all_failed_policy") == "error"
+                and self.selection_plan.get("effective_min_successful_proposers") == 1
+                and self.min_successful_proposers == 1
+                and self.all_failed_policy == "error"
+                and not self.proposer_backups
+                and not self.aggregator_fallbacks
+            )
+            if not analyzer_failure_plan_is_valid:
+                raise ValueError(
+                    "router_dynamic analyzer-failure fallback execution plan is invalid"
+                )
+            self._analyzer_failure_aggregator_max_recovery_actions = 1
         self._router_dynamic_declared_at_init = bool(
             self.selection_plan.get("strategy") == "router_dynamic"
             or self.selection_plan.get("selection_mode")
@@ -5462,7 +5487,9 @@ class EnsembleProvider:
                 "profile": self.profile_name,
                 "selection_strategy": "router_dynamic",
                 "successful_proposers": sum(
-                    1 for candidate in candidate_rows if candidate.ok
+                    1
+                    for candidate in candidate_rows
+                    if self._strict_proposer_success(candidate)
                 ),
                 "total_candidates": len(candidate_rows),
                 "fallback_used": False,
@@ -5514,6 +5541,25 @@ class EnsembleProvider:
     def _router_dynamic_selection(self) -> bool:
         return bool(self._proposer_recovery_guard_fingerprint)
 
+    def _analyzer_failure_fallback_selection(self) -> bool:
+        """Return the constructor-authenticated fixed fallback execution mode."""
+
+        return self._analyzer_failure_fallback_declared_at_init
+
+    def _complete_proposers_only(self) -> bool:
+        return self._analyzer_failure_fallback_selection()
+
+    def _strict_proposer_success(self, candidate: _CandidateResult) -> bool:
+        """Return whether a proposer satisfies the active strict quorum."""
+
+        return bool(
+            candidate.ok
+            and (
+                not self._complete_proposers_only()
+                or candidate.completion_outcome == "complete"
+            )
+        )
+
     def _router_dynamic_declared(self) -> bool:
         return self._router_dynamic_declared_at_init
 
@@ -5552,7 +5598,7 @@ class EnsembleProvider:
         ] = []
         for candidate in candidates:
             if (
-                candidate.ok
+                self._strict_proposer_success(candidate)
                 if require_strict_quorum
                 else candidate.usable_for_aggregation
             ):
@@ -6291,6 +6337,10 @@ class EnsembleProvider:
         # a heartbeat-interval gap -> yield a keep-alive, the sentinel -> done.
         progress_queue: asyncio.Queue[EnsembleProgressEvent | None] = asyncio.Queue()
         proposer_recovery_state = self._chat_proposer_recovery_state()
+        strict_proposer_quorum_required = bool(
+            (bool(tools) and self.aggregator_tools)
+            or self._complete_proposers_only()
+        )
 
         async def _drain_proposers() -> list[_CandidateResult]:
             try:
@@ -6302,9 +6352,7 @@ class EnsembleProvider:
                     soft_deadline=soft_deadline,
                     soft_deadline_triggered=soft_deadline_triggered,
                     recovery_state=proposer_recovery_state,
-                    require_strict_quorum=(
-                        bool(tools) and self.aggregator_tools
-                    ),
+                    require_strict_quorum=strict_proposer_quorum_required,
                 )
             finally:
                 progress_queue.put_nowait(None)  # sentinel: proposers finished
@@ -6341,14 +6389,19 @@ class EnsembleProvider:
         ]
         if proposer_close_failures and not recovery_policy_enabled:
             strict_successful_count = sum(
-                1 for candidate in candidates if candidate.ok
+                1
+                for candidate in candidates
+                if self._strict_proposer_success(candidate)
             )
             quarantined_indexes: list[int] = []
             quarantined_attempt_ids: list[str] = []
             usage_evidence_unverified_indexes: list[int] = []
             cleanup_can_be_quarantined = bool(
                 strict_successful_count >= self.min_successful_proposers
-                and all(not candidate.ok for candidate in proposer_close_failures)
+                and all(
+                    not self._strict_proposer_success(candidate)
+                    for candidate in proposer_close_failures
+                )
             )
             if cleanup_can_be_quarantined:
                 for candidate in proposer_close_failures:
@@ -6420,7 +6473,9 @@ class EnsembleProvider:
                     fallback_reason=close_reason,
                     final_request_role="none",
                     selected_candidates=[
-                        candidate for candidate in candidates if candidate.ok
+                        candidate
+                        for candidate in candidates
+                        if self._strict_proposer_success(candidate)
                     ],
                 )
                 close_trace["usage_missing_count"] = close_missing_count
@@ -6461,7 +6516,7 @@ class EnsembleProvider:
                 messages=messages,
                 tools=tools,
                 config=config,
-                require_strict_quorum=bool(tools) and self.aggregator_tools,
+                require_strict_quorum=strict_proposer_quorum_required,
                 soft_deadline=soft_deadline,
                 soft_deadline_triggered=soft_deadline_triggered,
             )
@@ -6520,13 +6575,17 @@ class EnsembleProvider:
                 recovery_error_trace = self._trace_payload(
                     candidates,
                     successful_count=sum(
-                        1 for candidate in candidates if candidate.ok
+                        1
+                        for candidate in candidates
+                        if self._strict_proposer_success(candidate)
                     ),
                     fallback_used=False,
                     fallback_reason=recovery_reason,
                     final_request_role="none",
                     selected_candidates=[
-                        candidate for candidate in candidates if candidate.ok
+                        candidate
+                        for candidate in candidates
+                        if self._strict_proposer_success(candidate)
                     ],
                 )
                 recovery_error_trace["usage_missing_count"] = (
@@ -6562,18 +6621,28 @@ class EnsembleProvider:
         if soft_finalize:
             soft_deadline_triggered.set()
             soft_trace_overrides = _soft_finalization_trace()
-        strict_successful = [candidate for candidate in candidates if candidate.ok]
+        strict_successful = [
+            candidate
+            for candidate in candidates
+            if self._strict_proposer_success(candidate)
+        ]
         strict_tool_quorum_required = bool(tools) and self.aggregator_tools
         if (
-            strict_tool_quorum_required
+            strict_proposer_quorum_required
             and len(strict_successful) < self.min_successful_proposers
         ):
             strict_quorum_code = (
                 "ensemble_strict_quorum_required_for_tools"
+                if strict_tool_quorum_required
+                else "ensemble_complete_proposer_required"
             )
             strict_quorum_reason = (
-                "tool-enabled aggregation requires "
-                f"{self.min_successful_proposers} fully completed proposer "
+                (
+                    "tool-enabled aggregation requires "
+                    if strict_tool_quorum_required
+                    else "analyzer-failure fallback aggregation requires "
+                )
+                + f"{self.min_successful_proposers} fully completed proposer "
                 f"draft(s), but only {len(strict_successful)} completed; "
                 "aggregation was not started"
             )
@@ -6593,7 +6662,8 @@ class EnsembleProvider:
             strict_trace["usage_missing_count"] = strict_missing_count
             strict_trace["proposer_strict_quorum"] = {
                 "schema": "opensquilla.ensemble-strict-proposer-quorum/v1",
-                "required_for_tools": True,
+                "required_for_tools": strict_tool_quorum_required,
+                "complete_proposers_only": self._complete_proposers_only(),
                 "quorum_required": self.min_successful_proposers,
                 "strict_successful_proposers": len(strict_successful),
                 "usable_proposers": len(
@@ -6602,7 +6672,8 @@ class EnsembleProvider:
                 "partial_candidate_indexes": [
                     candidate.index
                     for candidate in candidates
-                    if candidate.usable_for_aggregation and not candidate.ok
+                    if candidate.usable_for_aggregation
+                    and not self._strict_proposer_success(candidate)
                 ],
                 "aggregator_started": False,
             }
@@ -6622,7 +6693,7 @@ class EnsembleProvider:
             )
             return
         dynamic_partial_quorum = bool(
-            recovery_policy_enabled and not strict_tool_quorum_required
+            recovery_policy_enabled and not strict_proposer_quorum_required
         )
         successful = (
             _usable_proposer_candidates(candidates)
@@ -8186,7 +8257,7 @@ class EnsembleProvider:
         """Exclude an identity only when no same-chat sibling proved it usable."""
 
         for candidate in candidates:
-            if not candidate.ok:
+            if not self._strict_proposer_success(candidate):
                 continue
             candidate_identity = _normalized_provider_model_identity(
                 candidate.requested_provider or candidate.provider,
@@ -8246,6 +8317,7 @@ class EnsembleProvider:
                 - state.internal_physical_requests_pending,
             ),
             "quorum_required": quorum,
+            "complete_proposers_only": self._complete_proposers_only(),
             "quorum_reached": False,
             "quorum_reached_once": state.quorum_reached_once,
             "scope_terminal_code": state.terminal_code,
@@ -8284,18 +8356,31 @@ class EnsembleProvider:
             - state.internal_physical_requests_pending,
         )
         trace["strict_successful_proposers"] = sum(
-            1 for candidate in candidates if candidate.ok
+            1
+            for candidate in candidates
+            if self._strict_proposer_success(candidate)
         )
         trace["usable_proposers"] = len(
             _usable_proposer_candidates(candidates)
         )
-        trace["quorum_required"] = _proposer_execution_quorum_required(
-            candidates,
-            self.min_successful_proposers,
+        complete_proposers_only = self._complete_proposers_only()
+        trace["complete_proposers_only"] = complete_proposers_only
+        trace["quorum_required"] = (
+            self.min_successful_proposers
+            if complete_proposers_only
+            else _proposer_execution_quorum_required(
+                candidates,
+                self.min_successful_proposers,
+            )
         )
-        trace["quorum_reached"] = _proposer_execution_quorum_met(
-            candidates,
-            self.min_successful_proposers,
+        trace["quorum_reached"] = (
+            trace["strict_successful_proposers"]
+            >= self.min_successful_proposers
+            if complete_proposers_only
+            else _proposer_execution_quorum_met(
+                candidates,
+                self.min_successful_proposers,
+            )
         )
         trace["quorum_reached_once"] = state.quorum_reached_once
         trace["scope_terminal_code"] = state.terminal_code
@@ -8745,7 +8830,11 @@ class EnsembleProvider:
         def recovery_quorum_met() -> bool:
             if require_strict_quorum:
                 return (
-                    sum(1 for candidate in recovered if candidate.ok)
+                    sum(
+                        1
+                        for candidate in recovered
+                        if self._strict_proposer_success(candidate)
+                    )
                     >= self.min_successful_proposers
                 )
             return _proposer_execution_quorum_met(
@@ -8755,7 +8844,7 @@ class EnsembleProvider:
 
         def slot_recovered(candidate: _CandidateResult) -> bool:
             return (
-                candidate.ok
+                self._strict_proposer_success(candidate)
                 if require_strict_quorum
                 else candidate.usable_for_aggregation
             )
@@ -8805,17 +8894,37 @@ class EnsembleProvider:
             self._current_proposer_recovery_trace = trace
             return recovered
         trace = self._new_proposer_recovery_trace(state)
-        trace["strict_quorum_required_for_tools"] = require_strict_quorum
+        trace["strict_quorum_required_for_tools"] = bool(
+            require_strict_quorum and not self._complete_proposers_only()
+        )
+        trace["complete_proposers_only"] = self._complete_proposers_only()
         self._current_proposer_recovery_trace = trace
-        successful_count = sum(1 for candidate in recovered if candidate.ok)
+        successful_count = sum(
+            1
+            for candidate in recovered
+            if self._strict_proposer_success(candidate)
+        )
         usable_count = len(_usable_proposer_candidates(recovered))
-        # Continuing while one physical stream remains unclosed is a narrower
-        # exception than the normal configurable ensemble quorum.  Require at
-        # least two independent completed drafts even when a serving profile
-        # is configured with a one-proposer quorum.
-        cleanup_bypass_quorum = max(2, self.min_successful_proposers)
+        # The authenticated analyzer-failure fallback deliberately accepts one
+        # complete draft.  A separate, failed proposer stream can be
+        # quarantined without discarding that usable answer.  Normal dynamic
+        # routes retain the stricter two-draft cleanup exception.
+        complete_only_analyzer_fallback = bool(
+            self._analyzer_failure_fallback_selection()
+            and self._complete_proposers_only()
+        )
+        cleanup_bypass_quorum = (
+            self.min_successful_proposers
+            if complete_only_analyzer_fallback
+            else max(2, self.min_successful_proposers)
+        )
+        cleanup_bypass_evidence_count = (
+            successful_count
+            if require_strict_quorum or complete_only_analyzer_fallback
+            else usable_count
+        )
         cleanup_bypass_quorum_met = (
-            usable_count >= cleanup_bypass_quorum
+            cleanup_bypass_evidence_count >= cleanup_bypass_quorum
         )
         quarantined_cleanup_indexes: list[int] = []
         quarantined_physical_attempt_ids: list[str] = []
@@ -8831,7 +8940,7 @@ class EnsembleProvider:
                 candidate.error_code = _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE
                 if (
                     cleanup_bypass_quorum_met
-                    and not candidate.ok
+                    and not self._strict_proposer_success(candidate)
                     and self._persist_unclosed_request_usage(candidate)
                 ):
                     quarantined_cleanup_indexes.append(candidate.index)
@@ -9510,7 +9619,11 @@ class EnsembleProvider:
             usable_count = (
                 len(_usable_proposer_candidates(results))
                 if dynamic_partial_quorum
-                else sum(1 for result in results if result.ok)
+                else sum(
+                    1
+                    for result in results
+                    if self._strict_proposer_success(result)
+                )
             )
             execution_quorum_required = (
                 _proposer_execution_quorum_required(
@@ -9589,7 +9702,11 @@ class EnsembleProvider:
                 usable_count = (
                     len(_usable_proposer_candidates(results))
                     if dynamic_partial_quorum
-                    else sum(1 for result in results if result.ok)
+                    else sum(
+                        1
+                        for result in results
+                        if self._strict_proposer_success(result)
+                    )
                 )
                 execution_quorum_required = (
                     _proposer_execution_quorum_required(
@@ -9642,7 +9759,11 @@ class EnsembleProvider:
                             self.min_successful_proposers,
                         )
                         if dynamic_partial_quorum
-                        else sum(1 for result in results if result.ok)
+                        else sum(
+                            1
+                            for result in results
+                            if self._strict_proposer_success(result)
+                        )
                         >= self.min_successful_proposers
                     )
                 ):
@@ -11055,12 +11176,20 @@ class EnsembleProvider:
             (candidate.index, candidate.sample_index) for candidate in selected
         }
         usable_count = len(_usable_proposer_candidates(candidates))
+        complete_proposers_only = self._complete_proposers_only()
         partial_count = sum(
             1
             for candidate in candidates
-            if candidate.usable_for_aggregation and not candidate.ok
+            if candidate.usable_for_aggregation
+            and (
+                not self._strict_proposer_success(candidate)
+                if complete_proposers_only
+                else not candidate.ok
+            )
         )
-        dynamic_partial_quorum = self._router_dynamic_selection()
+        dynamic_partial_quorum = bool(
+            self._router_dynamic_selection() and not complete_proposers_only
+        )
         execution_quorum_required = (
             _proposer_execution_quorum_required(
                 candidates,
@@ -11085,6 +11214,7 @@ class EnsembleProvider:
             "usable_proposers": usable_count,
             "partial_proposers": partial_count,
             "strict_quorum_met": successful_count >= self.min_successful_proposers,
+            "complete_proposers_only": complete_proposers_only,
             "execution_quorum_required": execution_quorum_required,
             "execution_quorum_met": execution_quorum_met,
             "total_candidates": len(candidates),
@@ -11378,7 +11508,13 @@ class EnsembleProvider:
             else _ENSEMBLE_AGGREGATOR_MAX_RETRIES
         )
         max_recovery_actions = (
-            0 if disable_recovery else None if recovery_mode == "experiment" else 1
+            0
+            if disable_recovery
+            else self._analyzer_failure_aggregator_max_recovery_actions
+            if self._analyzer_failure_fallback_selection()
+            else None
+            if recovery_mode == "experiment"
+            else 1
         )
         attempt_kind = "model_fallback" if active_fallback_index > 0 else "primary"
         attempt_trigger = initial_trigger if active_fallback_index > 0 else ""
@@ -11404,11 +11540,13 @@ class EnsembleProvider:
             recovery_trace = {
                 "schema": "opensquilla.ensemble-aggregator-recovery/v1",
                 "mode": recovery_mode,
+                "max_recovery_actions": max_recovery_actions,
                 "attempts": [],
                 "proposer_reused": True,
                 "success": False,
             }
             trace["aggregator_recovery"] = recovery_trace
+        recovery_trace["max_recovery_actions"] = max_recovery_actions
         recovery_attempts = recovery_trace.setdefault("attempts", [])
         existing_attempts = (
             [dict(row) for row in recovery_attempts if isinstance(row, Mapping)]
@@ -13326,10 +13464,19 @@ class EnsembleProvider:
                         yield pending_event
                     pending_visible_events.clear()
 
+                analyzer_fallback_text_only_continuation = bool(
+                    self._analyzer_failure_fallback_selection()
+                    and partial_visible_length
+                    and stream_closed
+                    and not tool_output_streamed
+                    and recovery_budget_available()
+                )
                 if (
                     tools_required_for_recovery
+                    and active_tools is not None
                     and terminal_stream_error is None
                     and (partial_visible_length or empty_terminal)
+                    and not analyzer_fallback_text_only_continuation
                 ):
                     terminal_stream_error = tool_recovery_unavailable_error(
                         diagnostic_error,
@@ -13345,6 +13492,10 @@ class EnsembleProvider:
                     self._router_dynamic_selection()
                     and partial_visible_length
                     and terminal_stream_error is None
+                    and not (
+                        self._analyzer_failure_fallback_selection()
+                        and recovery_budget_available()
+                    )
                     and aggregator_visible_answer_looks_usable(
                         "".join(final_text_parts)
                     )
@@ -13398,6 +13549,19 @@ class EnsembleProvider:
                         message="ensemble aggregator continuation could not be initialized",
                         code="ensemble_aggregator_recovery_unavailable",
                     )
+                elif (
+                    self._analyzer_failure_fallback_selection()
+                    and partial_visible_length
+                    and terminal_stream_error is None
+                    and not recovery_budget_available()
+                ):
+                    # The fixed Analyzer-failure fallback permits exactly one
+                    # aggregator recovery action. If that bounded continuation
+                    # is also length-capped, do not let the ordinary experiment
+                    # continuation limit make the incomplete answer look like a
+                    # successful terminal response. A usable assembled answer
+                    # has already been returned as degraded delivery above.
+                    terminal_stream_error = diagnostic_error
                 elif (
                     empty_terminal
                     and terminal_stream_error is None
@@ -13826,6 +13990,10 @@ class EnsembleProvider:
                         degraded_contribution = ""
                 if (
                     self._router_dynamic_selection()
+                    and not (
+                        self._analyzer_failure_fallback_selection()
+                        and recovery_budget_available()
+                    )
                     and not tool_output_streamed
                     and aggregator_visible_answer_looks_usable(
                         "".join(final_text_parts)
@@ -13843,6 +14011,10 @@ class EnsembleProvider:
                     return
                 if (
                     recovery_mode == "serving"
+                    and not (
+                        self._analyzer_failure_fallback_selection()
+                        and recovery_budget_available()
+                    )
                     and final_text_parts
                     and not tool_output_streamed
                     and aggregator_visible_answer_looks_usable(
@@ -13903,7 +14075,10 @@ class EnsembleProvider:
                     yield aggregator_progress("aggregator_finish")
                     yield done_event
                     return
-                elif recovery_mode == "experiment" and final_text_parts and stream_closed:
+                elif (
+                    recovery_mode == "experiment"
+                    or self._analyzer_failure_fallback_selection()
+                ) and final_text_parts and stream_closed:
                     pending_error = terminal_stream_error
                     failed_member = active_member
                     failed_config = active_config
@@ -14164,6 +14339,47 @@ class EnsembleProvider:
                             ),
                         )
                         continue
+                if (
+                    self._analyzer_failure_fallback_selection()
+                    and stream_closed
+                    and content_streamed
+                    and not tool_output_streamed
+                    and recovery_mode != "off"
+                    and continuation_count < max_continuations
+                    and recovery_budget_available()
+                ):
+                    visible_prefix = "".join(final_text_parts)
+                    record_abandoned_attempt(
+                        error,
+                        trigger="ensemble_aggregator_incomplete",
+                        stream_closed=True,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text=(
+                            ""
+                            if attempt_kind.startswith("continuation")
+                            else "".join(attempt_text_parts)
+                        ),
+                    )
+                    continuation_count += 1
+                    if activate_recovery_attempt(
+                        member=active_member,
+                        kind="continuation",
+                        trigger="ensemble_aggregator_incomplete",
+                        continuation_text=visible_prefix,
+                        fallback_index=active_fallback_index,
+                    ):
+                        attempt += 1
+                        trace.setdefault("final_request", {})[
+                            "retry_count"
+                        ] = attempt
+                        yield ProviderHeartbeatEvent(
+                            phase="ensemble_aggregator_continuation",
+                            message=(
+                                "Ensemble aggregator stream ended without a "
+                                "completion; continuing once from the visible answer"
+                            ),
+                        )
+                        continue
                 if self._router_dynamic_selection():
                     degraded_contribution = (
                         "".join(attempt_text_parts)
@@ -14186,6 +14402,10 @@ class EnsembleProvider:
                             degraded_contribution = ""
                     if (
                         not tool_output_streamed
+                        and not (
+                            self._analyzer_failure_fallback_selection()
+                            and recovery_budget_available()
+                        )
                         and aggregator_visible_answer_looks_usable(
                             "".join(final_text_parts)
                         )
@@ -14272,7 +14492,10 @@ class EnsembleProvider:
                     return
             rejected_attempt = record_abandoned_attempt(retry_error)
             final_request = trace.get("final_request")
-            if recovery_mode == "serving":
+            if (
+                recovery_mode == "serving"
+                or self._analyzer_failure_fallback_selection()
+            ):
                 if not recovery_budget_available():
                     yield aggregator_progress(
                         "aggregator_finish",
@@ -14470,7 +14693,11 @@ class EnsembleProvider:
                     )
                     and not self.aggregator.thinking_policy_managed,
                     "soft_deadline_quorum_met": (
-                        sum(1 for candidate in candidates if candidate.ok)
+                        sum(
+                            1
+                            for candidate in candidates
+                            if self._strict_proposer_success(candidate)
+                        )
                         >= self.min_successful_proposers
                     ),
                 }
@@ -14571,11 +14798,19 @@ class EnsembleProvider:
                 self._mark_cleanup_unproven("ensemble_fallback_soft_deadline_close_unproven")
                 close_trace = self._trace_payload(
                     candidates,
-                    successful_count=sum(1 for candidate in candidates if candidate.ok),
+                    successful_count=sum(
+                        1
+                        for candidate in candidates
+                        if self._strict_proposer_success(candidate)
+                    ),
                     fallback_used=True,
                     fallback_reason=reason,
                     final_request_role="fallback_single",
-                    selected_candidates=[candidate for candidate in candidates if candidate.ok],
+                    selected_candidates=[
+                        candidate
+                        for candidate in candidates
+                        if self._strict_proposer_success(candidate)
+                    ],
                     final_request_model=(
                         self.fallback_model or _provider_model_id(self.fallback_provider)
                     ),
@@ -14676,7 +14911,11 @@ class EnsembleProvider:
                     )
                 ),
                 "soft_deadline_quorum_met": (
-                    sum(1 for candidate in candidates if candidate.ok)
+                    sum(
+                        1
+                        for candidate in candidates
+                        if self._strict_proposer_success(candidate)
+                    )
                     >= self.min_successful_proposers
                 ),
                 "soft_deadline_replacement_reason": "fallback_timeout",
@@ -14724,11 +14963,19 @@ class EnsembleProvider:
 
         error_trace = self._trace_payload(
             candidates,
-            successful_count=sum(1 for candidate in candidates if candidate.ok),
+            successful_count=sum(
+                1
+                for candidate in candidates
+                if self._strict_proposer_success(candidate)
+            ),
             fallback_used=False,
             fallback_reason=reason,
             final_request_role="none",
-            selected_candidates=[candidate for candidate in candidates if candidate.ok],
+            selected_candidates=[
+                candidate
+                for candidate in candidates
+                if self._strict_proposer_success(candidate)
+            ],
         )
         if effective_trace_overrides:
             error_trace.update(_json_safe(effective_trace_overrides))
@@ -14826,11 +15073,19 @@ class EnsembleProvider:
         )
         trace = self._trace_payload(
             candidates,
-            successful_count=sum(1 for candidate in candidates if candidate.ok),
+            successful_count=sum(
+                1
+                for candidate in candidates
+                if self._strict_proposer_success(candidate)
+            ),
             fallback_used=True,
             fallback_reason=reason,
             final_request_role="fallback_single",
-            selected_candidates=[candidate for candidate in candidates if candidate.ok],
+            selected_candidates=[
+                candidate
+                for candidate in candidates
+                if self._strict_proposer_success(candidate)
+            ],
             final_request_model=(self.fallback_model or _provider_model_id(self.fallback_provider)),
             final_request_config=fallback_config,
             final_request_tools=fallback_tools,
@@ -16847,8 +17102,10 @@ def _build_router_dynamic_members(
     """Build members from the profile-driven Step2 ranking decision."""
 
     from .ranking_router import (
+        TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL,
         DynamicRankingError,
         TaskAnalysisResult,
+        _canonical_hash,
         _legacy_ranking_config_projection,
         _legacy_registry_snapshot_projection,
         _request_context_hash,
@@ -17053,6 +17310,489 @@ def _build_router_dynamic_members(
             schema_valid=False,
             confidence=max(0.0, min(1.0, routing_confidence)),
             fallback_reason="task_analysis_not_supplied",
+        )
+
+    raw_analyzer_failure_fallback = inputs.get(
+        "analyzer_failure_fallback"
+    )
+    if (
+        task_analysis.schema_valid is False
+        and raw_analyzer_failure_fallback is not None
+    ):
+        if not isinstance(raw_analyzer_failure_fallback, Mapping):
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback must be a mapping"
+            )
+        analyzer_failure_fallback = dict(raw_analyzer_failure_fallback)
+        allowed_fallback_keys = {
+            "schema",
+            "proposers",
+            "aggregator",
+            "min_successful_proposers",
+            "complete_proposers_only",
+            "aggregator_max_recovery_actions",
+        }
+        unsupported_fallback_keys = [
+            repr(key)
+            for key in analyzer_failure_fallback
+            if key not in allowed_fallback_keys
+        ]
+        if unsupported_fallback_keys:
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback has unsupported "
+                f"keys: {', '.join(sorted(unsupported_fallback_keys))}"
+            )
+        if (
+            analyzer_failure_fallback.get("schema")
+            != _ANALYZER_FAILURE_FALLBACK_SCHEMA
+        ):
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback has an unsupported schema"
+            )
+        fallback_min_success = analyzer_failure_fallback.get(
+            "min_successful_proposers"
+        )
+        if (
+            not isinstance(fallback_min_success, int)
+            or isinstance(fallback_min_success, bool)
+            or fallback_min_success != 1
+        ):
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback requires "
+                "min_successful_proposers=1"
+            )
+        if analyzer_failure_fallback.get("complete_proposers_only") is not True:
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback requires "
+                "complete_proposers_only=true"
+            )
+        fallback_aggregator_recovery_actions = analyzer_failure_fallback.get(
+            "aggregator_max_recovery_actions"
+        )
+        if (
+            not isinstance(fallback_aggregator_recovery_actions, int)
+            or isinstance(fallback_aggregator_recovery_actions, bool)
+            or fallback_aggregator_recovery_actions != 1
+        ):
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback requires "
+                "aggregator_max_recovery_actions=1"
+            )
+
+        raw_proposers = analyzer_failure_fallback.get("proposers")
+        raw_aggregator = analyzer_failure_fallback.get("aggregator")
+        if (
+            not isinstance(raw_proposers, Sequence)
+            or isinstance(raw_proposers, (str, bytes))
+            or len(raw_proposers) != 4
+        ):
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback requires exactly "
+                "four proposers"
+            )
+        if not isinstance(raw_aggregator, Mapping):
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback aggregator must be a mapping"
+            )
+
+        def fixed_ref(
+            raw: object,
+            *,
+            role: str,
+        ) -> tuple[_EnsembleModelRef, str]:
+            if not isinstance(raw, Mapping):
+                raise DynamicRankingError(
+                    "router_dynamic analyzer_failure_fallback "
+                    f"{role} must be a mapping"
+                )
+            allowed_route_keys = {
+                "provider",
+                "model",
+                "upstream_provider",
+                "max_attempts",
+            }
+            unsupported_route_keys = [
+                repr(key)
+                for key in raw
+                if key not in allowed_route_keys
+            ]
+            if unsupported_route_keys:
+                raise DynamicRankingError(
+                    "router_dynamic analyzer_failure_fallback "
+                    f"{role} has unsupported keys: "
+                    f"{', '.join(sorted(unsupported_route_keys))}"
+                )
+            raw_provider_id = raw.get("provider")
+            raw_model_id = raw.get("model")
+            raw_upstream_provider = raw.get("upstream_provider")
+            if (
+                not isinstance(raw_provider_id, str)
+                or not isinstance(raw_model_id, str)
+                or not isinstance(raw_upstream_provider, str)
+            ):
+                raise DynamicRankingError(
+                    "router_dynamic analyzer_failure_fallback "
+                    f"{role} provider, model, and upstream_provider must be strings"
+                )
+            provider_id = raw_provider_id.strip().lower()
+            model_id = raw_model_id.strip().lower()
+            upstream_provider = raw_upstream_provider.strip().lower()
+            if (
+                raw_provider_id != provider_id
+                or raw_model_id != model_id
+                or raw_upstream_provider != upstream_provider
+            ):
+                raise DynamicRankingError(
+                    "router_dynamic analyzer_failure_fallback "
+                    f"{role} requires canonical route identifiers"
+                )
+            if provider_id != "openrouter" or not model_id or not upstream_provider:
+                raise DynamicRankingError(
+                    "router_dynamic analyzer_failure_fallback "
+                    f"{role} requires an OpenRouter provider, model, and "
+                    "upstream_provider pin"
+                )
+            if upstream_provider == "auto":
+                raise DynamicRankingError(
+                    "router_dynamic analyzer_failure_fallback "
+                    f"{role} requires an explicit upstream_provider pin; "
+                    "'auto' is not allowed"
+                )
+            max_attempts = raw.get("max_attempts", 1)
+            if (
+                not isinstance(max_attempts, int)
+                or isinstance(max_attempts, bool)
+                or max_attempts != 1
+            ):
+                raise DynamicRankingError(
+                    "router_dynamic analyzer_failure_fallback "
+                    f"{role} requires max_attempts=1"
+                )
+            return (
+                _EnsembleModelRef(
+                    provider=provider_id,
+                    model=model_id,
+                    thinking=None,
+                ),
+                upstream_provider,
+            )
+
+        proposer_refs_and_pins = [
+            fixed_ref(raw, role=f"proposer[{index}]")
+            for index, raw in enumerate(raw_proposers)
+        ]
+        proposer_identities = [
+            (ref.provider, ref.model) for ref, _ in proposer_refs_and_pins
+        ]
+        if len(set(proposer_identities)) != len(proposer_identities):
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback proposers must be unique"
+            )
+        aggregator_ref, aggregator_upstream_provider = fixed_ref(
+            raw_aggregator,
+            role="aggregator",
+        )
+        fallback_route_pins: dict[str, str] = {}
+        for ref, upstream_provider in [
+            *proposer_refs_and_pins,
+            (aggregator_ref, aggregator_upstream_provider),
+        ]:
+            existing_pin = fallback_route_pins.get(ref.model)
+            if existing_pin is not None and existing_pin != upstream_provider:
+                raise DynamicRankingError(
+                    "router_dynamic analyzer_failure_fallback has conflicting "
+                    f"upstream_provider pins for model {ref.model!r}"
+                )
+            fallback_route_pins[ref.model] = upstream_provider
+        provider_routing = dict(inherited_provider_config.provider_routing)
+        provider_routing.update(fallback_route_pins)
+        pinned_inherited_provider_config = replace(
+            inherited_provider_config,
+            provider_routing=provider_routing,
+        )
+        proposers = [
+            _member_from_ref(
+                ref,
+                config=config,
+                inherited=pinned_inherited_provider_config,
+                label=f"proposer_{index + 1}",
+                credential_pool_acquirer=credential_pool_acquirer,
+                session_key=session_key,
+            )
+            for index, (ref, _) in enumerate(proposer_refs_and_pins)
+        ]
+        aggregator = _member_from_ref(
+            aggregator_ref,
+            config=config,
+            inherited=pinned_inherited_provider_config,
+            label="aggregator",
+            credential_pool_acquirer=credential_pool_acquirer,
+            session_key=session_key,
+        )
+        trace_request_context = deepcopy(dict(request_context))
+        trace_request_context["snapshot_hash"] = _request_context_hash(
+            trace_request_context
+        )
+        if retry_context_inputs_out is not None:
+            retry_context_inputs_out.update(deepcopy(inputs))
+            retry_context_inputs_out.update(
+                {
+                    "task_analysis": deepcopy(task_analysis),
+                    "request_context": deepcopy(trace_request_context),
+                    "ranking_config": deepcopy(dict(ranking_config)),
+                }
+            )
+            if user_profile is not None:
+                retry_context_inputs_out["user_profile"] = deepcopy(
+                    dict(user_profile)
+                )
+            else:
+                retry_context_inputs_out.pop("user_profile", None)
+        selected_proposers = [
+            f"{member.provider_config.provider}:{member.provider_config.model}"
+            for member in proposers
+        ]
+        selected_aggregator = (
+            f"{aggregator.provider_config.provider}:"
+            f"{aggregator.provider_config.model}"
+        )
+        task_analyzer_trace = task_analysis.trace(ranking_config)
+        task_analyzer_chain = task_analyzer_trace.get("chain")
+        registry_allowlist = inputs.get("registry_allowlist")
+        registry_analyzer_chain = (
+            registry_allowlist.get("live_task_analyzer_chain")
+            if isinstance(registry_allowlist, Mapping)
+            else None
+        )
+        registry_analyzer_chain_declared = bool(
+            isinstance(registry_analyzer_chain, list)
+            and registry_analyzer_chain
+        )
+        configured_analyzer_routes = (
+            task_analyzer_chain.get("configured_routes")
+            if isinstance(task_analyzer_chain, Mapping)
+            else None
+        )
+        analyzer_attempt_outcomes = (
+            task_analyzer_chain.get("attempt_outcomes")
+            if isinstance(task_analyzer_chain, Mapping)
+            else None
+        )
+
+        def normalized_analyzer_route(
+            route: object,
+            *,
+            require_single_attempt: bool,
+        ) -> dict[str, str] | None:
+            if not isinstance(route, Mapping):
+                return None
+            raw_provider = route.get("provider")
+            raw_model = route.get("model")
+            raw_upstream = route.get("upstream_provider")
+            if not all(
+                isinstance(value, str)
+                for value in (raw_provider, raw_model, raw_upstream)
+            ):
+                return None
+            provider = raw_provider.strip().lower()
+            model = raw_model.strip().lower()
+            upstream = raw_upstream.strip().lower()
+            if (
+                not provider
+                or not model
+                or not upstream
+                or upstream == "auto"
+                or (
+                    require_single_attempt
+                    and (
+                        not isinstance(route.get("max_attempts"), int)
+                        or isinstance(route.get("max_attempts"), bool)
+                        or route.get("max_attempts") != 1
+                    )
+                )
+            ):
+                return None
+            return {
+                "provider": provider,
+                "model": model,
+                "upstream_provider": upstream,
+            }
+
+        expected_analyzer_routes = (
+            [
+                normalized_analyzer_route(
+                    route,
+                    require_single_attempt=True,
+                )
+                for route in registry_analyzer_chain
+            ]
+            if registry_analyzer_chain_declared
+            else []
+        )
+        normalized_configured_routes = (
+            [
+                normalized_analyzer_route(
+                    route,
+                    require_single_attempt=False,
+                )
+                for route in configured_analyzer_routes
+            ]
+            if isinstance(configured_analyzer_routes, list)
+            else []
+        )
+        analyzer_routes_match_registry = bool(
+            not registry_analyzer_chain_declared
+            or (
+                all(
+                    route is not None
+                    for route in expected_analyzer_routes
+                )
+                and len(
+                    {
+                        (
+                            route["provider"],
+                            route["model"],
+                            route["upstream_provider"],
+                        )
+                        for route in expected_analyzer_routes
+                        if route is not None
+                    }
+                )
+                == len(expected_analyzer_routes)
+                and normalized_configured_routes
+                == expected_analyzer_routes
+            )
+        )
+        routes_for_outcome_validation = (
+            expected_analyzer_routes
+            if registry_analyzer_chain_declared
+            else (
+                configured_analyzer_routes
+                if isinstance(configured_analyzer_routes, list)
+                else []
+            )
+        )
+        analyzer_chain_evidence_valid = bool(
+            isinstance(task_analyzer_chain, Mapping)
+            and task_analyzer_chain.get("protocol")
+            == TASK_ANALYZER_FALLBACK_CHAIN_PROTOCOL
+            and task_analyzer_chain.get("selected_index") is None
+            and task_analyzer_chain.get("exhausted") is True
+            and isinstance(configured_analyzer_routes, list)
+            and bool(configured_analyzer_routes)
+            and analyzer_routes_match_registry
+            and isinstance(analyzer_attempt_outcomes, list)
+            and len(analyzer_attempt_outcomes)
+            == len(routes_for_outcome_validation)
+            and all(
+                isinstance(route, Mapping)
+                and isinstance(outcome, Mapping)
+                and outcome.get("candidate_index") == index
+                and (
+                    normalized_analyzer_route(
+                        outcome,
+                        require_single_attempt=False,
+                    )
+                    == route
+                    if registry_analyzer_chain_declared
+                    else (
+                        outcome.get("provider")
+                        == route.get("provider")
+                        and outcome.get("model") == route.get("model")
+                        and outcome.get("upstream_provider")
+                        == route.get("upstream_provider")
+                    )
+                )
+                and outcome.get("outcome") == "failed"
+                and isinstance(outcome.get("physical_request_count"), int)
+                and not isinstance(outcome.get("physical_request_count"), bool)
+                and outcome.get("physical_request_count") in {0, 1}
+                for index, (route, outcome) in enumerate(
+                    zip(
+                        routes_for_outcome_validation,
+                        analyzer_attempt_outcomes,
+                        strict=True,
+                    )
+                )
+            )
+        )
+        if (
+            not analyzer_chain_evidence_valid
+        ):
+            raise DynamicRankingError(
+                "router_dynamic analyzer_failure_fallback requires an "
+                "authenticated exhausted task-analyzer chain trace"
+            )
+        trace_task_profile = deepcopy(task_analysis.profile)
+        selection_plan = {
+            "schema": _ANALYZER_FAILURE_FALLBACK_SCHEMA,
+            "strategy": "router_dynamic",
+            "selection_mode": "router_dynamic",
+            "decision_id": decision_id,
+            "analyzer_failure_fallback": True,
+            "analyzer_failure_fallback_schema": (
+                _ANALYZER_FAILURE_FALLBACK_SCHEMA
+            ),
+            "ranking_config_schema_version": str(
+                ranking_config.get("schema_version") or ""
+            ),
+            "ranking_config_version": str(
+                ranking_config.get("config_version") or ""
+            ),
+            "ranking_config_hash": _canonical_hash(ranking_config),
+            "ranking_parameters": deepcopy(dict(ranking_config)),
+            "task_analyzer": task_analyzer_trace,
+            "task_profile": trace_task_profile,
+            "task_profile_hash": _canonical_hash(trace_task_profile),
+            "task_profile_pre_escalation": deepcopy(trace_task_profile),
+            "task_analysis_fallback_reason": task_analysis.fallback_reason,
+            "user_profile_enabled": user_profile_enabled,
+            "user_profile_version": (
+                str(user_profile.get("profile_version") or "")
+                if user_profile is not None
+                else ""
+            ),
+            "user_profile_source": (
+                str(user_profile.get("profile_source") or "")
+                if user_profile is not None
+                else ""
+            ),
+            "request_context_hash": trace_request_context["snapshot_hash"],
+            "request_context": trace_request_context,
+            "routed_tier": routed_tier,
+            "routing_confidence": round(
+                max(0.0, min(1.0, routing_confidence)),
+                6,
+            ),
+            "selected_P": selected_proposers,
+            "backup_P": [],
+            "selected_A": selected_aggregator,
+            "aggregator_candidates": [selected_aggregator],
+            "proposer_count": len(proposers),
+            "proposer_sample_count": len(proposers),
+            "proposer_models": [
+                member.provider_config.model for member in proposers
+            ],
+            "aggregator_model": aggregator.provider_config.model,
+            "configured_proposer_backup_count": 0,
+            "N_min": 1,
+            "N_max": len(proposers),
+            "complete_proposers_only": True,
+            "aggregator_max_recovery_actions": 1,
+            "all_failed_policy": "error",
+            "provider_routing": {
+                ref.model: upstream_provider
+                for ref, upstream_provider in [
+                    *proposer_refs_and_pins,
+                    (aggregator_ref, aggregator_upstream_provider),
+                ]
+            },
+        }
+        return (
+            "router_dynamic/analyzer_failure_fallback",
+            proposers,
+            aggregator,
+            selection_plan,
         )
 
     operator_candidates = [
@@ -18130,6 +18870,10 @@ def build_ensemble_provider_from_config(
             aggregator_prompt_version
         )
     is_custom_b5 = selection_mode == CUSTOM_B5_SELECTION_MODE
+    is_analyzer_failure_fallback = bool(
+        selection_mode == "router_dynamic"
+        and selection_plan.get("analyzer_failure_fallback") is True
+    )
     # Static and custom lineups share the fixed-lineup defaults family
     # (quorum replacement, 300/480s timeouts, no shuffle, quorum grace);
     # Dynamic modes keep the legacy defaults untouched.
@@ -18145,7 +18889,9 @@ def build_ensemble_provider_from_config(
         and "min_successful_proposers" in ensemble_fields_set
     )
     requested_min_success = configured_min_success
-    if is_static_b5 and configured_min_success == _LEGACY_ENSEMBLE_MIN_SUCCESSFUL_PROPOSERS:
+    if is_analyzer_failure_fallback:
+        requested_min_success = 1
+    elif is_static_b5 and configured_min_success == _LEGACY_ENSEMBLE_MIN_SUCCESSFUL_PROPOSERS:
         requested_min_success = (
             # Custom lineups size freely (2–6): quorum defaults to N-1, the
             # same "all but one" shape the 3-of-4 static default encodes.
@@ -18155,7 +18901,11 @@ def build_ensemble_provider_from_config(
         )
     elif selection_mode == "router_dynamic" and not dynamic_min_success_explicit:
         requested_min_success = int(selection_plan.get("N_min") or 1)
-    if dynamic_min_success_explicit and len(proposers) < requested_min_success:
+    if (
+        dynamic_min_success_explicit
+        and not is_analyzer_failure_fallback
+        and len(proposers) < requested_min_success
+    ):
         from .ranking_router import DynamicRankingError
 
         raise DynamicRankingError(
@@ -18166,7 +18916,7 @@ def build_ensemble_provider_from_config(
         )
     min_successful_proposers = (
         requested_min_success
-        if dynamic_min_success_explicit
+        if dynamic_min_success_explicit or is_analyzer_failure_fallback
         else min(requested_min_success, max(1, len(proposers)))
     )
     configured_proposer_timeout_seconds = float(
@@ -18203,7 +18953,13 @@ def build_ensemble_provider_from_config(
     ):
         shuffle_candidates = True
     quorum_grace_seconds = _STATIC_B5_QUORUM_GRACE_SECONDS if is_static_b5 else 0.0
-    selection_plan["configured_min_successful_proposers"] = configured_min_success
+    selection_plan["configured_min_successful_proposers"] = (
+        1 if is_analyzer_failure_fallback else configured_min_success
+    )
+    if is_analyzer_failure_fallback:
+        selection_plan["llm_configured_min_successful_proposers"] = (
+            configured_min_success
+        )
     selection_plan["effective_min_successful_proposers"] = min_successful_proposers
     selection_plan["configured_proposer_timeout_seconds"] = configured_proposer_timeout_seconds
     selection_plan["effective_proposer_timeout_seconds"] = proposer_timeout_seconds
@@ -18255,6 +19011,8 @@ def build_ensemble_provider_from_config(
         )
         or 0
     )
+    if is_analyzer_failure_fallback:
+        proposer_recovery_max_additional_calls = 0
     selection_plan.setdefault(
         "selected_P",
         [
@@ -18387,7 +19145,11 @@ def build_ensemble_provider_from_config(
         fallback_model=inherited_provider_config.model,
         fallback_api_key=inherited_provider_config.api_key,
         min_successful_proposers=min_successful_proposers,
-        all_failed_policy=getattr(ensemble_cfg, "all_failed_policy", "fallback_single"),
+        all_failed_policy=(
+            "error"
+            if is_analyzer_failure_fallback
+            else getattr(ensemble_cfg, "all_failed_policy", "fallback_single")
+        ),
         proposer_timeout_seconds=proposer_timeout_seconds,
         aggregator_timeout_seconds=aggregator_timeout_seconds,
         aggregator_serving_chain_timeout_seconds=float(

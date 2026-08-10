@@ -40,7 +40,64 @@
     "expected_ranking_config_schema_version": "step2-ranking-config-v3",
     "expected_ranking_config_version": "step2-ranking-2026-08-02.2",
     "expected_ranking_config_sha256": "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6",
-    "expected_proposer_count_max": 5
+    "expected_proposer_count_max": 5,
+    "live_task_analyzer_chain": [
+      {
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4.8",
+        "upstream_provider": "anthropic",
+        "max_attempts": 1
+      },
+      {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.6-sol",
+        "upstream_provider": "azure",
+        "max_attempts": 1
+      },
+      {
+        "provider": "openrouter",
+        "model": "google/gemini-3.1-pro-preview",
+        "upstream_provider": "google-ai-studio",
+        "max_attempts": 1
+      }
+    ],
+    "analyzer_failure_fallback_ensemble": {
+      "proposers": [
+        {
+          "provider": "openrouter",
+          "model": "z-ai/glm-5.2",
+          "upstream_provider": "z-ai",
+          "max_attempts": 1
+        },
+        {
+          "provider": "openrouter",
+          "model": "moonshotai/kimi-k2.7-code",
+          "upstream_provider": "moonshotai",
+          "max_attempts": 1
+        },
+        {
+          "provider": "openrouter",
+          "model": "qwen/qwen3.8-max",
+          "upstream_provider": "alibaba",
+          "max_attempts": 1
+        },
+        {
+          "provider": "openrouter",
+          "model": "deepseek/deepseek-v4-pro",
+          "upstream_provider": "deepseek",
+          "max_attempts": 1
+        }
+      ],
+      "aggregator": {
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.2",
+        "upstream_provider": "z-ai",
+        "max_attempts": 1
+      },
+      "min_successful_proposers": 1,
+      "complete_proposers_only": true,
+      "aggregator_max_recovery_actions": 1
+    }
   },
   "ensemble": {
     "profile_name": "g12_k2_replace_gemini",
@@ -162,6 +219,7 @@
       "poolside/laguna-xs-2.1": "high",
       "qwen/qwen3.7-max": "high",
       "qwen/qwen3.7-plus": "high",
+      "qwen/qwen3.8-max": "high",
       "sakana/fugu-ultra": "max",
       "tencent/hy3": "high",
       "x-ai/grok-4.5": "high"

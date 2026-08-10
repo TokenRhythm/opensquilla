@@ -71,6 +71,68 @@ def _canonical_digest(value: object) -> str:
     ).hexdigest()
 
 
+def _frozen_router_fallback_replay_payload(
+    task_ids: list[str],
+) -> dict[str, object]:
+    from opensquilla.provider.ranking_router import (
+        TASK_ANALYZER_VERSION,
+        ranking_config_resolution,
+    )
+
+    profile = {"task_type": "analysis"}
+    source_config = dict(
+        ranking_config_resolution()["effective_config"]["task_analyzer"]
+    )
+    entries = {
+        task_id: {
+            "task_input_sha256": f"sha256:{'a' * 64}",
+            "prompt_sha256": "b" * 64,
+            "task_profile_pre_escalation": profile,
+            "task_profile_pre_escalation_sha256": _canonical_digest(profile),
+            "origin_outcome": "deterministic_router_fallback",
+            "task_analyzer": {
+                "source": "frozen_replay",
+                "schema_valid": False,
+                "confidence": 0.0,
+                "analyzer_version": TASK_ANALYZER_VERSION,
+                "provider": source_config["provider"],
+                "model": source_config["model"],
+                "fallback_reason": "task_analysis_not_supplied",
+                "usage": {},
+                "normalization_warnings": [],
+            },
+        }
+        for task_id in task_ids
+    }
+    return {
+        "schema": "opensquilla.draco.frozen-task-analysis/v2",
+        "mode": "frozen_replay",
+        "source_experiment": "legacy-e0",
+        "source_manifest_sha256": "c" * 64,
+        "source_results_sha256": "d" * 64,
+        "source_task_analyzer_config": source_config,
+        "source_task_analyzer_config_sha256": _canonical_digest(source_config),
+        "entries": entries,
+        "entries_sha256": _canonical_digest(entries),
+    }
+
+
+def _experiment_with_inactive_live_pair_and_frozen_replay(
+    module,
+):
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=True,
+    )
+    payload = experiment.model_dump(mode="json")
+    payload["g1_routing"]["task_analysis_execution"] = (
+        _frozen_router_fallback_replay_payload(
+            payload["benchmark_input"]["task_ids"]
+        )
+    )
+    return type(experiment).model_validate(payload)
+
+
 def _test_proposer_execution(
     identity: str,
     *,
@@ -997,6 +1059,13 @@ def _experiment_config():
     return runner.load_draco_experiment_config(runner.DEFAULT_B2_EXPERIMENT_CONFIG_PATH).config
 
 
+def test_analyzer_chain_and_fixed_fallback_models_have_default_provider_pins() -> None:
+    from opensquilla.gateway.llm_runtime import OPENROUTER_DEFAULT_PROVIDER_ROUTING
+
+    assert OPENROUTER_DEFAULT_PROVIDER_ROUTING["openai/gpt-5.6-sol"] == "azure"
+    assert OPENROUTER_DEFAULT_PROVIDER_ROUTING["qwen/qwen3.8-max"] == "alibaba"
+
+
 def _experiment_with_current_g1_contract(
     module,
     *,
@@ -1058,6 +1127,69 @@ def _resolved_g1_registry_contract(module, experiment, config: GatewayConfig) ->
     assert contract["candidate_scope"] == "registry_all"
     assert contract["policy"] == "all_registry_models"
     return contract
+
+
+def _g1_config_with_task_analyzer_override(module, *, live_chain: bool):
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=True,
+    )
+    payload = experiment.model_dump(mode="json")
+    if not live_chain:
+        payload["g1_routing"].pop("live_task_analyzer_chain")
+        payload["g1_routing"].pop("analyzer_failure_fallback_ensemble")
+    payload["router_dynamic_ranking_override"] = {
+        "task_analyzer": {
+            "model": "openai/gpt-5.6-sol",
+            "upstream_provider": "azure",
+        }
+    }
+    experiment = type(experiment).model_validate(payload)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+            "ranking_config_override": (
+                experiment.router_dynamic_ranking_override
+            ),
+        },
+    )
+    return experiment, config
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_live_analyzer_chain_primary_cannot_drift_via_ranking_override(
+    module,
+) -> None:
+    experiment, config = _g1_config_with_task_analyzer_override(
+        module,
+        live_chain=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="live task analyzer chain primary differs from effective ranking config",
+    ):
+        _resolved_g1_registry_contract(module, experiment, config)
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_legacy_single_analyzer_still_accepts_ranking_override(module) -> None:
+    experiment, config = _g1_config_with_task_analyzer_override(
+        module,
+        live_chain=False,
+    )
+
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+
+    assert contract["task_analyzer"]["model"] == "openai/gpt-5.6-sol"
+    assert "live_task_analyzer_chain" not in contract
 
 
 def _experiment_with_exact_g1_routes(module):
@@ -5129,9 +5261,12 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
         )
         return turn
 
-    async def fake_analyze_task_with_provider(**kwargs):
+    async def fake_analyze_task_with_fallback_chain(**kwargs):
         nonlocal analyzer_calls
         analyzer_calls += 1
+        candidates = kwargs["candidates"]
+        analyzer_provider = candidates[0].provider_id
+        analyzer_model = candidates[0].model_id
         return TaskAnalysisResult(
             profile=fallback_task_profile(
                 routed_tier=kwargs["routed_tier"],
@@ -5142,22 +5277,46 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
             schema_valid=True,
             confidence=0.9,
             usage={
-                "provider": kwargs["analyzer_provider_id"],
-                "model": kwargs["analyzer_model_id"],
-                "requested_provider": kwargs["analyzer_provider_id"],
-                "requested_model": kwargs["analyzer_model_id"],
+                "provider": analyzer_provider,
+                "model": analyzer_model,
+                "requested_provider": analyzer_provider,
+                "requested_model": analyzer_model,
                 "input_tokens": 5,
                 "output_tokens": 2,
                 "attempt_count": 1,
             },
-            provider_id=str(kwargs["analyzer_provider_id"]),
-            model_id=str(kwargs["analyzer_model_id"]),
+            provider_id=str(analyzer_provider),
+            model_id=str(analyzer_model),
+            chain_trace={
+                "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+                "configured_routes": [
+                    {
+                        "provider": candidate.provider_id,
+                        "model": candidate.model_id,
+                        "upstream_provider": candidate.upstream_provider,
+                    }
+                    for candidate in candidates
+                ],
+                "attempt_outcomes": [
+                    {
+                        "candidate_index": 0,
+                        "provider": analyzer_provider,
+                        "model": analyzer_model,
+                        "upstream_provider": candidates[0].upstream_provider,
+                        "outcome": "success",
+                        "reason": "",
+                        "physical_request_count": 1,
+                    }
+                ],
+                "selected_index": 0,
+                "exhausted": False,
+            },
         )
 
     monkeypatch.setattr(module, "run_pipeline", fake_run_pipeline)
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
-        fake_analyze_task_with_provider,
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        fake_analyze_task_with_fallback_chain,
     )
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
@@ -5210,6 +5369,377 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
     assert module.consume_provider_setup(build.provider).get("usage", []) == []
     if not thinking_assignment_enabled:
         assert "thinking_execution_projection" not in setup["routing"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_g1_exhausted_analyzer_chain_materializes_fixed_complete_only_fallback(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.ranking_router import (
+        TaskAnalysisResult,
+        fallback_task_profile,
+    )
+
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=True,
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+    )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+    captured_routes: list[tuple[str, str, str]] = []
+
+    async def fake_run_pipeline(turn, _steps):
+        turn.model = inherited.model
+        turn.metadata.update(
+            {
+                "routed_tier": "c1",
+                "routing_confidence": 0.9,
+                "routing_source": "test",
+                "routing_applied": False,
+            }
+        )
+        return turn
+
+    async def fake_analyze_task_with_fallback_chain(**kwargs):
+        candidates = kwargs["candidates"]
+        captured_routes.extend(
+            (
+                candidate.provider_id,
+                candidate.model_id,
+                candidate.upstream_provider,
+            )
+            for candidate in candidates
+        )
+        physical_attempts = [
+            {
+                "attempt": index,
+                "physical_attempt_id": f"{index:032x}",
+                "provider": candidate.provider_id,
+                "model": candidate.model_id,
+                "requested_provider": candidate.provider_id,
+                "requested_model": candidate.model_id,
+                "input_tokens": 5,
+                "output_tokens": 2,
+                "provider_usage": {"physical_attempt_id": f"{index:032x}"},
+            }
+            for index, candidate in enumerate(candidates, start=1)
+        ]
+        return TaskAnalysisResult(
+            profile=fallback_task_profile(
+                routed_tier=kwargs["routed_tier"],
+                request_context=kwargs["request_context"],
+                ranking_config=kwargs["ranking_config"],
+            ),
+            source="router_fallback",
+            schema_valid=False,
+            confidence=0.0,
+            fallback_reason="analyzer_chain_exhausted",
+            usage={
+                "attempt_count": len(physical_attempts),
+                "physical_attempts": physical_attempts,
+            },
+            provider_id=candidates[-1].provider_id,
+            model_id=candidates[-1].model_id,
+            chain_trace={
+                "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+                "configured_routes": [
+                    {
+                        "provider": candidate.provider_id,
+                        "model": candidate.model_id,
+                        "upstream_provider": candidate.upstream_provider,
+                    }
+                    for candidate in candidates
+                ],
+                "attempt_outcomes": [
+                    {
+                        "candidate_index": index,
+                        "provider": candidate.provider_id,
+                        "model": candidate.model_id,
+                        "upstream_provider": candidate.upstream_provider,
+                        "outcome": "failed",
+                        "reason": "TimeoutError",
+                        "physical_request_count": 1,
+                    }
+                    for index, candidate in enumerate(candidates)
+                ],
+                "selected_index": None,
+                "exhausted": True,
+            },
+        )
+
+    monkeypatch.setattr(module, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        fake_analyze_task_with_fallback_chain,
+    )
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
+
+    build = await module.build_experiment_provider(
+        config=config,
+        inherited=inherited,
+        group="G1",
+        prompt="test prompt",
+        dry_run=False,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy={},
+    )
+
+    assert captured_routes == [
+        ("openrouter", "anthropic/claude-opus-4.8", "anthropic"),
+        ("openrouter", "openai/gpt-5.6-sol", "azure"),
+        (
+            "openrouter",
+            "google/gemini-3.1-pro-preview",
+            "google-ai-studio",
+        ),
+    ]
+    assert build.provider.selection_plan["selected_P"] == [
+        "openrouter:z-ai/glm-5.2",
+        "openrouter:moonshotai/kimi-k2.7-code",
+        "openrouter:qwen/qwen3.8-max",
+        "openrouter:deepseek/deepseek-v4-pro",
+    ]
+    assert build.provider.selection_plan["selected_A"] == (
+        "openrouter:z-ai/glm-5.2"
+    )
+    assert build.provider.selection_plan["complete_proposers_only"] is True
+    assert build.provider.selection_plan["effective_min_successful_proposers"] == 1
+    assert build.provider.min_successful_proposers == 1
+    assert [row["requested_model"] for row in build.setup_usage] == [
+        route[1] for route in captured_routes
+    ]
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_frozen_replay_registry_contract_omits_inactive_live_analyzer_pair(
+    module,
+) -> None:
+    experiment = _experiment_with_inactive_live_pair_and_frozen_replay(module)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+
+    assert contract["task_analysis_execution"]["mode"] == "frozen_replay"
+    assert "live_task_analyzer_chain" not in contract
+    assert "analyzer_failure_fallback_ensemble" not in contract
+    assert contract["task_analyzer"]["model"] == "anthropic/claude-opus-4.8"
+    assert contract["task_analyzer"]["upstream_provider"] == "anthropic"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_schema_invalid_frozen_replay_does_not_activate_live_analyzer_or_fixed_fallback(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.ranking_router import (
+        TaskAnalysisResult,
+        fallback_task_profile,
+    )
+
+    experiment = _experiment_with_inactive_live_pair_and_frozen_replay(module)
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+    )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+
+    async def fake_run_pipeline(turn, _steps):
+        turn.model = inherited.model
+        turn.metadata.update(
+            {
+                "routed_tier": "c1",
+                "routing_confidence": 0.9,
+                "routing_source": "test",
+                "routing_applied": False,
+            }
+        )
+        return turn
+
+    async def unexpected_live_analyzer(**_kwargs):
+        raise AssertionError("frozen replay must not invoke a live Analyzer")
+
+    def fake_frozen_task_analysis_result(
+        _replay_contract,
+        **kwargs,
+    ):
+        return TaskAnalysisResult(
+            profile=fallback_task_profile(
+                routed_tier=kwargs["routed_tier"],
+                request_context=kwargs["request_context"],
+                ranking_config=kwargs["ranking_config"],
+            ),
+            source="frozen_replay",
+            schema_valid=False,
+            confidence=0.0,
+            fallback_reason="task_analysis_not_supplied",
+            usage={},
+            provider_id="openrouter",
+            model_id="legacy-analyzer",
+        )
+
+    monkeypatch.setattr(module, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        unexpected_live_analyzer,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_provider",
+        unexpected_live_analyzer,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.frozen_task_analysis_result",
+        fake_frozen_task_analysis_result,
+    )
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
+
+    build = await module.build_experiment_provider(
+        config=config,
+        inherited=inherited,
+        group="G1",
+        prompt="historical replay prompt",
+        task_id="task-1",
+        task_input_sha256=f"sha256:{'a' * 64}",
+        prompt_sha256="b" * 64,
+        dry_run=False,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy={},
+    )
+
+    assert build.setup_usage == []
+    assert build.provider.selection_plan.get("analyzer_failure_fallback") is not True
+    assert build.provider.selection_plan["effective_min_successful_proposers"] == 2
+    assert build.provider.selection_plan["proposer_recovery_policy"][
+        "quorum_required"
+    ] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_unavailable_live_analyzer_chain_enters_fixed_fallback_without_synthetic_usage(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = _experiment_with_current_g1_contract(
+        module,
+        thinking_assignment_enabled=True,
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "ranking_thinking_assignment_enabled": True,
+        },
+    )
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="fake",
+    )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+
+    async def fake_run_pipeline(turn, _steps):
+        turn.model = inherited.model
+        turn.metadata.update(
+            {
+                "routed_tier": "c1",
+                "routing_confidence": 0.9,
+                "routing_source": "test",
+                "routing_applied": False,
+            }
+        )
+        return turn
+
+    monkeypatch.setattr(module, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        module,
+        "build_task_analyzer_provider",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
+
+    build = await module.build_experiment_provider(
+        config=config,
+        inherited=inherited,
+        group="G1",
+        prompt="all live analyzers unavailable",
+        dry_run=False,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=None,
+        ensemble_aggregator_timeout=None,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy={},
+    )
+
+    chain = build.routing_trace["task_analyzer"]["chain"]
+    assert chain["exhausted"] is True
+    assert [row["physical_request_count"] for row in chain["attempt_outcomes"]] == [
+        0,
+        0,
+        0,
+    ]
+    assert build.setup_usage == []
+    assert build.provider.selection_plan["analyzer_failure_fallback"] is True
+    assert build.provider.selection_plan["effective_min_successful_proposers"] == 1
 
 
 @pytest.mark.asyncio
@@ -5283,11 +5813,12 @@ async def test_task_analyzer_post_return_failure_preserves_paid_receipts(
         def get(self, key: str, default=None):
             return self._payload.get(key, default)
 
-    async def fake_analyze_task_with_provider(**kwargs):
+    async def fake_analyze_task_with_fallback_chain(**kwargs):
         nonlocal analyzer_calls
         analyzer_calls += 1
-        analyzer_provider = kwargs["analyzer_provider_id"]
-        analyzer_model = kwargs["analyzer_model_id"]
+        first_candidate = kwargs["candidates"][0]
+        analyzer_provider = first_candidate.provider_id
+        analyzer_model = first_candidate.model_id
         physical_attempts = [
             {
                 "attempt": ordinal,
@@ -5342,8 +5873,8 @@ async def test_task_analyzer_post_return_failure_preserves_paid_receipts(
 
     monkeypatch.setattr(module, "run_pipeline", fake_run_pipeline)
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
-        fake_analyze_task_with_provider,
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        fake_analyze_task_with_fallback_chain,
     )
     if failure_mode == "usage_materialization":
         monkeypatch.setattr(
@@ -10576,6 +11107,17 @@ def test_resume_paid_adaptive_g1_requires_frozen_lifecycle_reconstruction() -> N
         state=adaptive_state,
         current_run_compatibility_contract=enabled_contract,
     )
+    fixed_fallback_state = deepcopy(adaptive_state)
+    fixed_fallback_plan = fixed_fallback_state["row"]["execution"][
+        "generation_attempts"
+    ][0]["selection_plan"]
+    fixed_fallback_plan["analyzer_failure_fallback"] = True
+    assert resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
+        group="G1",
+        prior_attempts_used=1,
+        state=fixed_fallback_state,
+        current_run_compatibility_contract=enabled_contract,
+    )
     assert not resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
         group="G1",
         prior_attempts_used=0,
@@ -12062,9 +12604,12 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
         )
         return turn
 
-    async def fake_analyze_task_with_provider(**kwargs):
+    async def fake_analyze_task_with_fallback_chain(**kwargs):
         nonlocal analyzer_calls
         analyzer_calls += 1
+        candidates = kwargs["candidates"]
+        analyzer_provider = candidates[0].provider_id
+        analyzer_model = candidates[0].model_id
         return TaskAnalysisResult(
             profile=fallback_task_profile(
                 routed_tier=kwargs["routed_tier"],
@@ -12075,16 +12620,40 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
             schema_valid=True,
             confidence=0.9,
             usage={
-                "provider": kwargs["analyzer_provider_id"],
-                "model": kwargs["analyzer_model_id"],
-                "requested_provider": kwargs["analyzer_provider_id"],
-                "requested_model": kwargs["analyzer_model_id"],
+                "provider": analyzer_provider,
+                "model": analyzer_model,
+                "requested_provider": analyzer_provider,
+                "requested_model": analyzer_model,
                 "input_tokens": 5,
                 "output_tokens": 2,
                 "attempt_count": 1,
             },
-            provider_id=str(kwargs["analyzer_provider_id"]),
-            model_id=str(kwargs["analyzer_model_id"]),
+            provider_id=str(analyzer_provider),
+            model_id=str(analyzer_model),
+            chain_trace={
+                "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+                "configured_routes": [
+                    {
+                        "provider": candidate.provider_id,
+                        "model": candidate.model_id,
+                        "upstream_provider": candidate.upstream_provider,
+                    }
+                    for candidate in candidates
+                ],
+                "attempt_outcomes": [
+                    {
+                        "candidate_index": 0,
+                        "provider": analyzer_provider,
+                        "model": analyzer_model,
+                        "upstream_provider": candidates[0].upstream_provider,
+                        "outcome": "success",
+                        "reason": "",
+                        "physical_request_count": 1,
+                    }
+                ],
+                "selected_index": 0,
+                "exhausted": False,
+            },
         )
 
     monkeypatch.setattr(
@@ -12093,8 +12662,8 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
         fake_run_pipeline,
     )
     monkeypatch.setattr(
-        "opensquilla.provider.ranking_router.analyze_task_with_provider",
-        fake_analyze_task_with_provider,
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        fake_analyze_task_with_fallback_chain,
     )
     monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_REQUIRE_PARAMETERS", "1")
@@ -14883,6 +15452,12 @@ def test_g1_runtime_ranking_override_rebinds_effective_contract(module) -> None:
         thinking_assignment_enabled=False,
     )
     payload = experiment.model_dump(mode="json")
+    payload["g1_routing"]["live_task_analyzer_chain"][0].update(
+        {
+            "model": "openai/gpt-5.5",
+            "upstream_provider": "openai",
+        }
+    )
     payload["router_dynamic_ranking_override"] = {
         "penalties": {"task_cost_weights": {"medium": 0.17}},
         "proposer_count": {"backup_count": 1},
@@ -16750,6 +17325,65 @@ def test_missing_cost_is_estimated_cache_aware_with_frozen_price_provenance(
         "output_per_m": 4.0,
         "cache_read_per_m": 0.5,
         "cache_write_per_m": 3.0,
+    }
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize("provider", ["openrouter", ""], ids=["explicit", "legacy-empty"])
+def test_qwen_3_8_registry_miss_uses_frozen_cache_aware_static_price(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    provider: str,
+) -> None:
+    snapshot = {
+        "schema_version": "test/v1",
+        "snapshot_version": "frozen-price-test-v1",
+        "models": [],
+    }
+    module._frozen_openrouter_registry_price_index.cache_clear()
+    request.addfinalizer(module._frozen_openrouter_registry_price_index.cache_clear)
+    monkeypatch.setattr(
+        module,
+        "_load_frozen_model_registry_snapshot",
+        lambda: snapshot,
+    )
+    monkeypatch.setattr(
+        module,
+        "resolve_model_price",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("the frozen Qwen price must not use layered pricing")
+        ),
+    )
+    usage = {
+        "provider": provider,
+        "model": "qwen/qwen3.8-max",
+        "input_tokens": 1_000_000,
+        "output_tokens": 1_000_000,
+        "cached_tokens": 100_000,
+        "cache_write_tokens": 100_000,
+        "cost_source": "none",
+    }
+
+    assert module.estimate_missing_usage_costs(usage) is True
+    assert usage["estimated_cost_usd"] == pytest.approx(7.875)
+    assert usage["cost_usd"] == pytest.approx(7.875)
+    assert usage["cost_source"] == "opensquilla_static_estimate"
+    provider_usage = usage["provider_usage"]
+    assert provider_usage["estimate_basis"] == "cache_aware"
+    assert provider_usage["price_source"] == "static_table"
+    assert provider_usage["estimate_pricing"] == {
+        "source": "static_table",
+        "snapshot_version": "",
+        "snapshot_canonical_sha256": "",
+        "registry_provider": "",
+        "registry_model_id": "",
+        "provider": provider,
+        "model": "qwen/qwen3.8-max",
+        "input_per_m": 2.0,
+        "output_per_m": 6.0,
+        "cache_read_per_m": 0.25,
+        "cache_write_per_m": 2.5,
     }
 
 
@@ -19620,3 +20254,581 @@ def test_ensemble_call_core_uses_frozen_provider_quorum(module) -> None:
     assert module.frozen_proposer_quorum(invalid_policy, 5) == 2
     invalid_policy.pop("effective_min_successful_proposers")
     assert module.frozen_proposer_quorum(invalid_policy, 5) == module.legal_proposer_quorum(5) == 4
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_ensemble_call_core_accepts_one_complete_analyzer_fallback_proposer(
+    module,
+) -> None:
+    plan = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "analyzer_failure_fallback": True,
+        "complete_proposers_only": True,
+        "proposer_models": [f"model-{index}" for index in range(4)],
+        "proposer_sample_count": 4,
+        "effective_min_successful_proposers": 1,
+        "proposer_recovery_policy": {"quorum_required": 1},
+        "aggregator_model": "aggregator",
+        "selected_A": "openrouter:aggregator",
+    }
+
+    def candidate(index: int, outcome: str) -> dict[str, object]:
+        has_text = outcome != "failed"
+        text = f"candidate-{index}" if has_text else ""
+        complete = outcome == "complete"
+        return {
+            "ok": has_text,
+            "request_started": True,
+            "physical_request_count": 1,
+            "usage_reported": has_text,
+            "stop_reason": "end_turn" if complete else "length" if has_text else "",
+            "error": "" if has_text else "failed",
+            "completion_outcome": outcome,
+            "usable_for_aggregation": complete,
+            "selected_for_aggregation": complete,
+            "content": {"text": text, "chars": len(text)},
+        }
+
+    trace: dict[str, object] = {
+        "request_outcome": "llm_response",
+        "fallback_used": False,
+        "final_request_role": "aggregator",
+        "selection_plan": deepcopy(plan),
+        "total_candidates": 4,
+        "successful_proposers": 1,
+        "usable_proposers": 2,
+        "partial_proposers": 1,
+        "selected_candidate_count": 1,
+        "execution_quorum_required": 1,
+        "execution_quorum_met": True,
+        "strict_quorum_met": True,
+        "candidates": [
+            candidate(0, "complete"),
+            candidate(1, "partial_usable"),
+            candidate(2, "failed"),
+            candidate(3, "failed"),
+        ],
+        "final_request": {
+            "request_started": True,
+            "role": "aggregator",
+            "error": "",
+            "usage": {
+                "provider": "openrouter",
+                "requested_provider": "openrouter",
+                "model": "aggregator",
+                "requested_model": "aggregator",
+                "stop_reason": "end_turn",
+            },
+        },
+    }
+
+    assert module.ensemble_call_core_reasons(
+        trace,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+    ) == []
+
+    partials_only = deepcopy(trace)
+    partials_only["successful_proposers"] = 0
+    partials_only["strict_quorum_met"] = False
+    partials_only["execution_quorum_met"] = False
+    candidates = partials_only["candidates"]
+    assert isinstance(candidates, list)
+    candidates[0] = candidate(0, "partial_usable")
+    reasons = module.ensemble_call_core_reasons(
+        partials_only,
+        expected_selection_mode="router_dynamic",
+        expected_selection_plan=plan,
+    )
+    assert "insufficient_proposer_quorum" in reasons
+    assert "insufficient_configured_proposer_quorum" in reasons
+    assert "insufficient_actual_proposer_quorum" in reasons
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_analyzer_failure_fallback_uses_zero_recovery_quorum_one_policy(
+    module,
+) -> None:
+    policy = module.formal_proposer_recovery_policy(
+        0,
+        max_additional_physical_requests=0,
+    )
+    policy["quorum_required"] = 1
+    plan = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "analyzer_failure_fallback": True,
+        "complete_proposers_only": True,
+        "ranking_parameters": {"proposer_count": {"backup_count": 2}},
+        "selected_P": [f"openrouter:model-{index}" for index in range(4)],
+        "proposer_models": [f"model-{index}" for index in range(4)],
+        "proposer_sample_count": 4,
+        "backup_P": [],
+        "configured_proposer_backup_count": 0,
+        "effective_proposer_backup_count": 0,
+        "effective_min_successful_proposers": 1,
+        "selected_A": "openrouter:aggregator",
+        "aggregator_candidates": ["openrouter:aggregator"],
+        "proposer_recovery_policy": policy,
+    }
+
+    assert module.formal_proposer_recovery_policy_for_plan(plan) == policy
+    assert module.g1_provider_native_recovery_policy_reason(plan) == ""
+
+
+def _fixed_fallback_provider_native_row(
+    *,
+    selected_generation_succeeded: bool = True,
+    retry_reason: str = "",
+    retry_suppressed_reason: str = "",
+) -> dict[str, object]:
+    policy = resume_runner.formal_proposer_recovery_policy(
+        0,
+        max_additional_physical_requests=0,
+    )
+    policy["quorum_required"] = 1
+    selected = [f"openrouter:model-{index}" for index in range(4)]
+    plan = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "analyzer_failure_fallback": True,
+        "complete_proposers_only": True,
+        "ranking_parameters": {"proposer_count": {"backup_count": 2}},
+        "selected_P": selected,
+        "proposer_models": [f"model-{index}" for index in range(4)],
+        "proposer_sample_count": 4,
+        "backup_P": [],
+        "configured_proposer_backup_count": 0,
+        "effective_proposer_backup_count": 0,
+        "effective_min_successful_proposers": 1,
+        "selected_A": "openrouter:aggregator",
+        "aggregator_candidates": ["openrouter:aggregator"],
+        "proposer_recovery_policy": policy,
+    }
+    from opensquilla.provider.protocol import provider_retry_roster_fingerprint
+
+    fingerprint = provider_retry_roster_fingerprint(plan)
+    candidates = []
+    for index, identity in enumerate(selected):
+        complete = index == 0
+        attempt_id = f"{index + 1:x}" * 32
+        candidates.append(
+            {
+                "ok": complete,
+                "error": "" if complete else "failed",
+                "usable_for_aggregation": complete,
+                "completion_outcome": "complete" if complete else "failed",
+                "request_started": True,
+                "physical_request_count": 1,
+                "content": {
+                    "text": "complete draft" if complete else "",
+                    "chars": len("complete draft") if complete else 0,
+                },
+                "execution": {
+                    "physical_attempts": [
+                        {
+                            "attempt": 1,
+                            "physical_attempt_id": attempt_id,
+                            "identity": identity,
+                            "request_started": True,
+                            "stream_closed": True,
+                            "outcome": "succeeded" if complete else "failed",
+                        }
+                    ]
+                },
+            }
+        )
+    call = {
+        "selection_plan": deepcopy(plan),
+        "successful_proposers": 1,
+        "candidates": candidates,
+        "proposer_recovery": {
+            "schema": resume_runner.PROPOSER_RECOVERY_SCHEMA,
+            "selection_plan_fingerprint": fingerprint,
+            "scope": "run_turn",
+            "scope_id": "fixed-fallback-scope",
+            "max_additional_physical_requests": 0,
+            "external_physical_requests_reserved": 0,
+            "additional_physical_requests_started": 0,
+            "remaining_additional_physical_requests": 0,
+            "quorum_required": 1,
+            "quorum_reached": True,
+            "cumulative_excluded_identities": [],
+            "visited_identities": [],
+            "executed_proposer_roster_before": selected,
+            "executed_proposer_roster_after": selected,
+            "attempts": [],
+        },
+    }
+    row = {
+        "group": "G1",
+        "error": "" if selected_generation_succeeded else retry_reason,
+        "selected_generation_succeeded": selected_generation_succeeded,
+        "execution": {
+            "generation_attempts": [
+                {
+                    "attempt_id": "f" * 32,
+                    "attempt_kind": "generation",
+                    "attempt": 1,
+                    "retry_reason": retry_reason,
+                    "retry_suppressed_reason": retry_suppressed_reason,
+                    "will_retry": False,
+                    "proposer_recovery_owner": "provider",
+                    "selection_plan": deepcopy(plan),
+                    "run": {
+                        "error": (
+                            "" if selected_generation_succeeded else retry_reason
+                        ),
+                        "ensemble_trace": call,
+                    },
+                }
+            ]
+        },
+    }
+    return row
+
+
+def test_resume_accepts_terminal_fixed_fallback_with_one_complete_proposer() -> None:
+    row = _fixed_fallback_provider_native_row()
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+
+    assert evidence is not None
+    assert evidence["status"] == "provider_scope_terminal"
+    assert evidence["receipt_valid"] is True
+    assert evidence["quorum_reached"] is True
+
+
+def test_resume_fixed_fallback_non_proposer_failure_is_terminal_across_waves() -> None:
+    retry_reason = "invalid_agent_call_output_binding"
+    row = _fixed_fallback_provider_native_row(
+        selected_generation_succeeded=False,
+        retry_reason=retry_reason,
+    )
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+
+    assert evidence is not None
+    assert evidence["automatic_generation_retry_allowed"] is False
+    assert evidence["status"] == "receipt_invalid"
+    assert "provider_native_outer_retry_not_suppressed" in evidence[
+        "receipt_reasons"
+    ]
+
+    resumable = _strict_attempt_resume_row(
+        attempt_id="f" * 32,
+        cumulative_budget=1,
+        generation_completed_at=1.0,
+    )
+    resumable["error"] = retry_reason
+    resumable["selected_generation_succeeded"] = False
+    resumable["execution"]["generation_attempts"] = deepcopy(
+        row["execution"]["generation_attempts"]
+    )
+    resumable = resume_runner.seal_result_row(resumable)
+    state = resume_runner.resume_row_completion_state(
+        resumable,
+        expected_prompt_sha256=resume_runner.text_sha256("same prompt"),
+        expected_task_input_sha256="sha256:task-input",
+        expected_run_compatibility_fingerprint="sha256:run-contract",
+        judge_required=False,
+    )
+
+    assert state["action"] == "regenerate"
+    assert state["generation_auto_retry_blocked"] is True
+    assert state["provider_native_proposer_recovery_terminal"] is not None
+    assert not resume_runner.g1_cross_wave_lifecycle_requires_reconstruction(
+        group="G1",
+        prior_attempts_used=1,
+        state=state,
+        current_run_compatibility_contract=(
+            _enabled_g1_frozen_lifecycle_contract()
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_amain_never_reruns_blocked_fixed_fallback_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = {"id": "task-1", "prompt": "blocked fixed fallback"}
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(json.dumps(task) + "\n", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    experiment_path = ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"
+    retry_reason = "invalid_agent_call_output_binding"
+    row = _fixed_fallback_provider_native_row(
+        selected_generation_succeeded=False,
+        retry_reason=retry_reason,
+    )
+    row.update(
+        {
+            "provider_spec": dict(resume_runner.GROUP_SPECS["G1"]),
+            "task_id": task["id"],
+            "prompt_sha256": resume_runner.text_sha256(task["prompt"]),
+            "task_input_sha256": resume_runner.canonical_json_sha256(task),
+            "run_compatibility_fingerprint": "sha256:prior-g1-contract",
+            "final_text": "",
+            "generation_attempt_count": 1,
+            "generation_attempt_budget_used": 1,
+            "generation_completed_at": 1.0,
+            "completed_at": 1.0,
+        }
+    )
+    terminal = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+    assert terminal is not None
+    assert terminal["automatic_generation_retry_allowed"] is False
+    state = {
+        "action": "regenerate",
+        "row": resume_runner.seal_result_row(row),
+        "prior_generation_attempts_used": 1,
+        "generation_auto_retry_blocked": True,
+        "generation_reasons": [retry_reason],
+        "generation_postprocessing_terminal": None,
+        "provider_native_proposer_recovery_terminal": terminal,
+    }
+    args = resume_runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--experiment-config",
+            str(experiment_path),
+            "--groups",
+            "G1",
+            "--max-tasks",
+            "1",
+            "--dry-run",
+            "--experiment-config-set",
+            "benchmark_input.enforce_reference_input=false",
+            "--experiment-config-set",
+            "runner.concurrency=1",
+            "--experiment-config-set",
+            "judge.concurrency=1",
+        ]
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        }
+    )
+    monkeypatch.setattr(resume_runner.GatewayConfig, "load", lambda _path: config)
+
+    def fake_resume_states(**kwargs):
+        assert kwargs["selected_keys"] == {("G1", "task-1")}
+        return {("G1", "task-1"): state}, {"source_row_count": 1}
+
+    calls = {"preflight": 0, "provider": 0, "run_one": 0}
+
+    async def forbidden_preflight(*_args, **_kwargs):
+        calls["preflight"] += 1
+        raise AssertionError("blocked fallback must not run model preflight")
+
+    def forbidden_provider(*_args, **_kwargs):
+        calls["provider"] += 1
+        raise AssertionError("blocked fallback must not construct a provider")
+
+    async def forbidden_run_one(*_args, **_kwargs):
+        calls["run_one"] += 1
+        raise AssertionError("blocked fallback must not call run_one")
+
+    monkeypatch.setattr(
+        resume_runner,
+        "load_resume_group_task_states",
+        fake_resume_states,
+    )
+    monkeypatch.setattr(
+        resume_runner,
+        "run_local_web_tools_preflight",
+        forbidden_preflight,
+    )
+    monkeypatch.setattr(resume_runner, "build_single_provider", forbidden_provider)
+    monkeypatch.setattr(resume_runner, "run_one", forbidden_run_one)
+
+    status = await resume_runner.amain(args)
+
+    assert status == 2
+    assert calls == {"preflight": 0, "provider": 0, "run_one": 0}
+    result_path = next(output_dir.glob("draco_ensemble_*.jsonl"))
+    result = json.loads(result_path.read_text(encoding="utf-8").splitlines()[0])
+    assert result["group"] == "G1"
+    assert result["execution"]["generation_model_started"] is False
+    assert result["execution"]["generation_auto_retry_blocked"] is True
+    manifest_path = next(output_dir.glob("draco_run_*.manifest.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["resume_selection"]["model_regenerate_pair_count"] == 0
+    assert manifest["resume_selection"]["generation_auto_retry_blocked_pair_count"] == 1
+
+
+def _exhausted_live_analyzer_chain_lifecycle_row() -> tuple[
+    dict[str, object],
+    dict[str, object],
+]:
+    routes = [
+        {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "upstream_provider": "anthropic",
+            "max_attempts": 1,
+        },
+        {
+            "provider": "openrouter",
+            "model": "openai/gpt-5.6-sol",
+            "upstream_provider": "azure",
+            "max_attempts": 1,
+        },
+        {
+            "provider": "openrouter",
+            "model": "google/gemini-3.1-pro-preview",
+            "upstream_provider": "google-ai-studio",
+            "max_attempts": 1,
+        },
+    ]
+    configured_routes = [
+        {
+            "provider": route["provider"],
+            "model": route["model"],
+            "upstream_provider": route["upstream_provider"],
+        }
+        for route in routes
+    ]
+    plan = {
+        "task_analyzer": {
+            "chain": {
+                "protocol": "opensquilla.task-analyzer-fallback-chain/v1",
+                "configured_routes": configured_routes,
+                "attempt_outcomes": [
+                    {
+                        "candidate_index": index,
+                        **configured_route,
+                        "outcome": "failed",
+                        "reason": "TimeoutError",
+                        "physical_request_count": 1,
+                    }
+                    for index, configured_route in enumerate(configured_routes)
+                ],
+                "selected_index": None,
+                "exhausted": True,
+            }
+        }
+    }
+    analyzer_units = []
+    for index, route in enumerate(routes, start=1):
+        unit = _task_analyzer_unit(
+            attempt=index,
+            physical_attempt_id=f"{index:x}" * 32,
+        )
+        unit["model"] = route["model"]
+        unit["requested_model"] = route["model"]
+        analyzer_units.append(unit)
+    run = {
+        "llm_request_count": len(analyzer_units),
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "setup_usage": deepcopy(analyzer_units),
+        "usage": {"model_usage_breakdown": deepcopy(analyzer_units)},
+    }
+    row = {
+        "group": "G1",
+        "task_id": "task-1",
+        "execution": {
+            "generation_attempts": [
+                {
+                    "attempt_id": "e" * 32,
+                    "attempt_kind": "generation",
+                    "attempt": 1,
+                    "run": run,
+                }
+            ]
+        },
+    }
+    contract = {
+        "g1_registry_contract": {
+            "live_task_analyzer_chain": routes,
+        }
+    }
+    return row, contract
+
+
+def test_resume_provider_lifecycle_accepts_exhausted_live_analyzer_chain() -> None:
+    row, contract = _exhausted_live_analyzer_chain_lifecycle_row()
+
+    assert resume_runner.g1_provider_lifecycle_analyzer_reasons(
+        row,
+        contract=contract,
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "selected_index",
+    [1, 2],
+    ids=["gpt", "gemini"],
+)
+def test_resume_provider_lifecycle_accepts_later_live_analyzer_success(
+    selected_index: int,
+) -> None:
+    row, contract = _exhausted_live_analyzer_chain_lifecycle_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    run = attempt["run"]
+    plan = run["routing_trace"]["selection_plan"]
+    chain = plan["task_analyzer"]["chain"]
+    outcomes = chain["attempt_outcomes"][: selected_index + 1]
+    outcomes[-1]["outcome"] = "success"
+    outcomes[-1]["reason"] = ""
+    chain["attempt_outcomes"] = outcomes
+    chain["selected_index"] = selected_index
+    chain["exhausted"] = False
+    run["setup_usage"] = run["setup_usage"][: selected_index + 1]
+    run["usage"]["model_usage_breakdown"] = run["usage"][
+        "model_usage_breakdown"
+    ][: selected_index + 1]
+    run["llm_request_count"] = selected_index + 1
+
+    assert resume_runner.g1_provider_lifecycle_analyzer_reasons(
+        row,
+        contract=contract,
+    ) == []
+
+
+def test_resume_provider_lifecycle_rejects_boolean_analyzer_physical_count() -> None:
+    row, contract = _exhausted_live_analyzer_chain_lifecycle_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    chain = attempt["run"]["routing_trace"]["selection_plan"]["task_analyzer"][
+        "chain"
+    ]
+    chain["attempt_outcomes"][0]["physical_request_count"] = True
+
+    assert resume_runner.g1_provider_lifecycle_analyzer_reasons(
+        row,
+        contract=contract,
+    ) == ["invalid_g1_task_analyzer_chain_trace"]
+
+
+def test_resume_provider_lifecycle_rejects_repeated_live_analyzer_chain() -> None:
+    row, contract = _exhausted_live_analyzer_chain_lifecycle_row()
+    attempts = row["execution"]["generation_attempts"]
+    assert isinstance(attempts, list)
+    first_run = attempts[0]["run"]
+    repeated_unit = deepcopy(first_run["setup_usage"][0])
+    attempts.append(
+        {
+            "attempt_id": "f" * 32,
+            "attempt_kind": "generation",
+            "attempt": 2,
+            "run": {
+                "llm_request_count": 1,
+                "routing_trace": deepcopy(first_run["routing_trace"]),
+                "setup_usage": [deepcopy(repeated_unit)],
+                "usage": {"model_usage_breakdown": [repeated_unit]},
+            },
+        }
+    )
+
+    assert resume_runner.g1_provider_lifecycle_analyzer_reasons(
+        row,
+        contract=contract,
+    ) == ["repeated_g1_task_analyzer_request"]

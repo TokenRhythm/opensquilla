@@ -93,9 +93,7 @@ FORMAL_G1_LEGACY_SOURCE_REGISTRY_SNAPSHOT_SHA256 = (
     "9f76c7f96e5cb22c05b615f69b71ca633965e5039fbec9673f0a5edf9b45078a"
 )
 # Backwards-compatible public name used by historical fixtures and callers.
-FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256 = (
-    FORMAL_G1_LEGACY_SOURCE_REGISTRY_SNAPSHOT_SHA256
-)
+FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256 = FORMAL_G1_LEGACY_SOURCE_REGISTRY_SNAPSHOT_SHA256
 FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-31.1"
 FORMAL_G1_FULL_REGISTRY_SNAPSHOT_SHA256 = (
     "b51b64d7880472e47f8a5f954b1a76eaee440d6cd59d28f9dc2579f876bac1ea"
@@ -223,6 +221,59 @@ FORMAL_PROPOSER_RECOVERY_POLICY = {
     "transient_same_model_retries": 1,
     "backup_reasoning_downgrades": 1,
 }
+
+
+def analyzer_failure_fallback_proposer_recovery_policy(
+    base_policy: Mapping[str, Any] = FORMAL_PROPOSER_RECOVERY_POLICY,
+) -> dict[str, Any]:
+    """Return the exact provider-owned recovery policy for fixed fallback."""
+
+    return {
+        **dict(base_policy),
+        "configured_backup_count": 0,
+        "effective_backup_count": 0,
+        "max_additional_physical_requests": 0,
+        "quorum_required": 1,
+    }
+
+
+def authenticated_analyzer_failure_fallback_plan(
+    plan: Any,
+    *,
+    proposer_recovery_policy: Mapping[str, Any] = FORMAL_PROPOSER_RECOVERY_POLICY,
+) -> bool:
+    """Recognize the strict, self-contained fixed fallback execution policy."""
+
+    if not isinstance(plan, Mapping):
+        return False
+    selected_p = plan.get("selected_P")
+    proposer_models = plan.get("proposer_models")
+    selected_a = str(plan.get("selected_A") or "")
+    return bool(
+        plan.get("analyzer_failure_fallback") is True
+        and plan.get("analyzer_failure_fallback_schema")
+        == "opensquilla.router-dynamic-analyzer-failure-fallback/v1"
+        and plan.get("selection_mode") == "router_dynamic"
+        and isinstance(selected_p, list)
+        and len(selected_p) == 4
+        and len(set(str(value) for value in selected_p)) == 4
+        and isinstance(proposer_models, list)
+        and len(proposer_models) == 4
+        and plan.get("proposer_sample_count") == 4
+        and plan.get("backup_P") == []
+        and plan.get("configured_min_successful_proposers") == 1
+        and plan.get("effective_min_successful_proposers") == 1
+        and plan.get("N_min") == 1
+        and plan.get("N_max") == 4
+        and plan.get("complete_proposers_only") is True
+        and plan.get("aggregator_max_recovery_actions") == 1
+        and bool(selected_a)
+        and plan.get("aggregator_candidates") == [selected_a]
+        and plan.get("proposer_recovery_policy")
+        == analyzer_failure_fallback_proposer_recovery_policy(proposer_recovery_policy)
+    )
+
+
 FORMAL_JUDGE_MAX_ATTEMPTS = 3
 FORMAL_BLOCKED_DOMAINS = (
     "hf.co",
@@ -265,6 +316,7 @@ FORMAL_MODEL_THINKING_LEVELS = {
     "poolside/laguna-xs-2.1": "high",
     "qwen/qwen3.7-max": "high",
     "qwen/qwen3.7-plus": "high",
+    "qwen/qwen3.8-max": "high",
     "sakana/fugu-ultra": "max",
     "tencent/hy3": "high",
     "x-ai/grok-4.5": "high",
@@ -541,10 +593,11 @@ def row_has_bound_answer_and_proposer_quorum(row: Mapping[str, Any]) -> bool:
     """Prove the minimum execution facts needed to demote forensic failures.
 
     This intentionally does not trust declared proposer counters.  Every
-    physical ensemble call must expose at least two independently usable
-    candidate records and a started aggregator request.  Prompt/task/source
-    bindings are checked by ``generation_reason_assessment`` before it enables
-    audit demotion.
+    physical ensemble call must expose the authenticated execution quorum and
+    a started aggregator request.  The ordinary quorum is two usable drafts;
+    the fixed analyzer-failure fallback instead requires one fully completed
+    draft.  Prompt/task/source bindings are checked by
+    ``generation_reason_assessment`` before it enables audit demotion.
     """
 
     final_text = str(row.get("final_text") or "")
@@ -564,9 +617,21 @@ def row_has_bound_answer_and_proposer_quorum(row: Mapping[str, Any]) -> bool:
     # Execution is determined by the terminal call that supplied final_text.
     terminal = calls[-1]
     candidates = terminal.get("candidates")
-    if not isinstance(candidates, list) or len(candidates) < 2:
+    plan = terminal.get("selection_plan")
+    fixed_complete_only = authenticated_analyzer_failure_fallback_plan(plan)
+    required = 1 if fixed_complete_only else 2
+    if not isinstance(candidates, list) or len(candidates) < required:
         return False
-    if sum(1 for candidate in candidates if usable_candidate(candidate)) < 2:
+    proven = sum(
+        1
+        for candidate in candidates
+        if (
+            successful_candidate(candidate) and candidate.get("completion_outcome") == "complete"
+            if fixed_complete_only
+            else usable_candidate(candidate)
+        )
+    )
+    if proven < required:
         return False
     final_request = terminal.get("final_request")
     if not (
@@ -646,10 +711,7 @@ def partition_execution_and_audit_reasons(
         if (
             reason in AUDIT_ONLY_GENERATION_REASONS
             or reason.startswith("audit:")
-            or (
-                evidence_proven
-                and evidence_reason_is_audit_only(reason)
-            )
+            or (evidence_proven and evidence_reason_is_audit_only(reason))
         ):
             warnings.append(reason)
         else:
@@ -1085,6 +1147,224 @@ def g1_task_analyzer_execution_policy(
     return policy
 
 
+def g1_task_analyzer_execution_chain(
+    contract: Mapping[str, Any] | None,
+) -> list[dict[str, Any]] | None:
+    """Return the authenticated ordered live Analyzer route chain."""
+
+    primary = g1_task_analyzer_execution_policy(contract)
+    if primary is None or not isinstance(contract, Mapping):
+        return None
+    raw_chain = contract.get("live_task_analyzer_chain")
+    if raw_chain is None:
+        return [
+            {
+                "provider": str(primary["provider"]),
+                "model": str(primary["model"]),
+                "upstream_provider": str(primary["upstream_provider"]),
+                "max_attempts": int(primary["max_retries"]) + 1,
+            }
+        ]
+    if not isinstance(raw_chain, list) or not raw_chain:
+        return None
+    chain: list[dict[str, Any]] = []
+    identities: set[tuple[str, str]] = set()
+    for raw_route in raw_chain:
+        if not isinstance(raw_route, Mapping) or set(raw_route) != {
+            "provider",
+            "model",
+            "upstream_provider",
+            "max_attempts",
+        }:
+            return None
+        provider = str(raw_route.get("provider") or "").strip().casefold()
+        model = str(raw_route.get("model") or "").strip()
+        upstream = str(raw_route.get("upstream_provider") or "").strip().casefold()
+        max_attempts = raw_route.get("max_attempts")
+        identity = (provider, model)
+        if (
+            provider != "openrouter"
+            or not model
+            or not upstream
+            or upstream == "auto"
+            or max_attempts != 1
+            or identity in identities
+        ):
+            return None
+        identities.add(identity)
+        chain.append(
+            {
+                "provider": provider,
+                "model": model,
+                "upstream_provider": upstream,
+                "max_attempts": 1,
+            }
+        )
+    first = chain[0]
+    if (
+        first["provider"] != str(primary["provider"]).casefold()
+        or not _formal_openrouter_models_equivalent(
+            first["model"],
+            primary["model"],
+        )
+        or first["upstream_provider"] != str(primary["upstream_provider"]).casefold()
+    ):
+        return None
+    return chain
+
+
+def g1_task_analyzer_physical_routes_from_trace(
+    plan: Mapping[str, Any],
+    analyzer_chain: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Derive paid Analyzer routes, allowing chain candidates that made no request."""
+
+    expanded_legacy_routes = [
+        dict(route) for route in analyzer_chain for _ in range(int(route["max_attempts"]))
+    ]
+    analyzer_trace = plan.get("task_analyzer")
+    chain_trace = analyzer_trace.get("chain") if isinstance(analyzer_trace, Mapping) else None
+    if chain_trace is None:
+        if len(analyzer_chain) != 1:
+            return [], ["missing_g1_task_analyzer_chain_trace"]
+        return expanded_legacy_routes, []
+    if not isinstance(chain_trace, Mapping):
+        return [], ["invalid_g1_task_analyzer_chain_trace"]
+    configured_routes = chain_trace.get("configured_routes")
+    outcomes = chain_trace.get("attempt_outcomes")
+    expected_routes = [
+        {
+            "provider": str(route["provider"]),
+            "model": str(route["model"]),
+            "upstream_provider": str(route["upstream_provider"]),
+        }
+        for route in analyzer_chain
+    ]
+    if (
+        any(int(route["max_attempts"]) != 1 for route in analyzer_chain)
+        or chain_trace.get("protocol") != "opensquilla.task-analyzer-fallback-chain/v1"
+        or configured_routes != expected_routes
+        or not isinstance(outcomes, list)
+        or not outcomes
+        or len(outcomes) > len(expected_routes)
+    ):
+        return [], ["invalid_g1_task_analyzer_chain_trace"]
+    physical_routes: list[dict[str, Any]] = []
+    success_indexes: list[int] = []
+    for index, outcome in enumerate(outcomes):
+        route = expected_routes[index]
+        if (
+            not isinstance(outcome, Mapping)
+            or outcome.get("candidate_index") != index
+            or str(outcome.get("provider") or "").strip().casefold()
+            != str(route["provider"]).casefold()
+            or not _formal_openrouter_models_equivalent(
+                outcome.get("model"),
+                route["model"],
+            )
+            or str(outcome.get("upstream_provider") or "").strip().casefold()
+            != str(route["upstream_provider"]).casefold()
+            or outcome.get("outcome") not in {"success", "failed"}
+            or type(outcome.get("physical_request_count")) is not int
+            or outcome.get("physical_request_count") not in {0, 1}
+        ):
+            return [], ["invalid_g1_task_analyzer_chain_trace"]
+        if outcome.get("outcome") == "success":
+            success_indexes.append(index)
+        if outcome.get("physical_request_count") == 1:
+            physical_routes.append(route)
+    selected_index = chain_trace.get("selected_index")
+    exhausted = chain_trace.get("exhausted")
+    if success_indexes:
+        if (
+            success_indexes != [len(outcomes) - 1]
+            or selected_index != success_indexes[0]
+            or exhausted is not False
+        ):
+            return [], ["invalid_g1_task_analyzer_chain_trace"]
+    elif (
+        len(outcomes) != len(expected_routes) or selected_index is not None or exhausted is not True
+    ):
+        return [], ["invalid_g1_task_analyzer_chain_trace"]
+    return physical_routes, []
+
+
+def g1_analyzer_failure_fallback_policy(
+    contract: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the authenticated complete-only fixed ensemble fallback."""
+
+    if not isinstance(contract, Mapping):
+        return None
+    raw = contract.get("analyzer_failure_fallback_ensemble")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping) or set(raw) != {
+        "proposers",
+        "aggregator",
+        "min_successful_proposers",
+        "complete_proposers_only",
+        "aggregator_max_recovery_actions",
+    }:
+        return None
+    raw_proposers = raw.get("proposers")
+    raw_aggregator = raw.get("aggregator")
+    if (
+        not isinstance(raw_proposers, list)
+        or len(raw_proposers) != 4
+        or not isinstance(raw_aggregator, Mapping)
+        or raw.get("min_successful_proposers") != 1
+        or raw.get("complete_proposers_only") is not True
+        or raw.get("aggregator_max_recovery_actions") != 1
+    ):
+        return None
+
+    def normalize_route(value: Any) -> dict[str, str] | None:
+        if not isinstance(value, Mapping) or set(value) != {
+            "provider",
+            "model",
+            "upstream_provider",
+            "max_attempts",
+        }:
+            return None
+        provider = str(value.get("provider") or "").strip().casefold()
+        model = str(value.get("model") or "").strip()
+        upstream = str(value.get("upstream_provider") or "").strip().casefold()
+        if (
+            provider != "openrouter"
+            or not model
+            or not upstream
+            or upstream == "auto"
+            or value.get("max_attempts") != 1
+        ):
+            return None
+        return {
+            "provider": provider,
+            "model": model,
+            "upstream_provider": upstream,
+        }
+
+    proposers = [normalize_route(route) for route in raw_proposers]
+    aggregator = normalize_route(raw_aggregator)
+    if aggregator is None or any(route is None for route in proposers):
+        return None
+    normalized_proposers = [route for route in proposers if route is not None]
+    proposer_identities = [
+        f"{route['provider']}:{route['model']}" for route in normalized_proposers
+    ]
+    if len(set(proposer_identities)) != len(proposer_identities):
+        return None
+    return {
+        "proposers": normalized_proposers,
+        "aggregator": aggregator,
+        "selected_P": proposer_identities,
+        "selected_A": f"{aggregator['provider']}:{aggregator['model']}",
+        "min_successful_proposers": 1,
+        "complete_proposers_only": True,
+        "aggregator_max_recovery_actions": 1,
+    }
+
+
 def g1_ranking_proposer_max(contract: Mapping[str, Any] | None) -> int | None:
     """Return the authenticated effective proposer ceiling for a G1 arm."""
 
@@ -1178,8 +1458,7 @@ def g1_registry_source_identity(
         return None
     resolution = contract.get("ranking_config_resolution")
     thinking_enabled = (
-        isinstance(resolution, Mapping)
-        and resolution.get("thinking_assignment_enabled") is True
+        isinstance(resolution, Mapping) and resolution.get("thinking_assignment_enabled") is True
     )
     source_version = str(contract.get("source_registry_snapshot_version") or "")
     return (
@@ -1700,13 +1979,9 @@ def load_manifest_contracts(
                     or (
                         str(row["execution"].get("resume_action") or "") == "regenerate"
                         and (
-                            row["execution"].get("generation_auto_retry_blocked")
-                            is not True
-                            or row["execution"].get("generation_model_started")
-                            is not False
-                            or not blocked_regenerate_terminal_evidence(
-                                row["execution"]
-                            )
+                            row["execution"].get("generation_auto_retry_blocked") is not True
+                            or row["execution"].get("generation_model_started") is not False
+                            or not blocked_regenerate_terminal_evidence(row["execution"])
                         )
                     )
                     or (
@@ -2316,15 +2591,17 @@ def _derive_finalizer_experiment_policy(
     search_api_key_env = str(raw_search.get("api_key_env") or "")
     if search_provider not in {"brave", "duckduckgo"}:
         raise FinalizationError("global web_search provider is invalid")
-    if search_provider == "brave" and re.fullmatch(
-        r"[A-Za-z_][A-Za-z0-9_]*",
-        search_api_key_env,
-    ) is None:
+    if (
+        search_provider == "brave"
+        and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*",
+            search_api_key_env,
+        )
+        is None
+    ):
         raise FinalizationError("global web_search api_key_env is invalid")
     if search_provider == "duckduckgo" and search_api_key_env:
-        raise FinalizationError(
-            "global DuckDuckGo web_search api_key_env must be empty"
-        )
+        raise FinalizationError("global DuckDuckGo web_search api_key_env must be empty")
     tools = {
         "mode": "local_web_tools",
         "sandbox_enabled": False,
@@ -2673,6 +2950,12 @@ def validate_formal_campaign_contracts(
         g1_analyzer_policy = (
             g1_task_analyzer_execution_policy(registry) if isinstance(registry, Mapping) else None
         ) or {}
+        g1_analyzer_chain = (
+            g1_task_analyzer_execution_chain(registry) if isinstance(registry, Mapping) else None
+        )
+        g1_analyzer_fallback = (
+            g1_analyzer_failure_fallback_policy(registry) if isinstance(registry, Mapping) else None
+        )
         registry_source_identity = (
             g1_registry_source_identity(registry) if isinstance(registry, Mapping) else None
         )
@@ -2706,6 +2989,7 @@ def validate_formal_campaign_contracts(
             or ranking_config_identity is None
             or ranking_proposer_max is None
             or not g1_analyzer_policy
+            or g1_analyzer_chain is None
             or str(g1_analyzer_policy.get("provider") or "") != "openrouter"
             or str(g1_analyzer_policy.get("upstream_provider") or "").strip().casefold()
             in {"", "auto"}
@@ -2721,21 +3005,16 @@ def validate_formal_campaign_contracts(
             )
 
             benchmark = policy.profile.get("benchmark_input")
-            task_ids = (
-                benchmark.get("task_ids") if isinstance(benchmark, Mapping) else None
-            )
+            task_ids = benchmark.get("task_ids") if isinstance(benchmark, Mapping) else None
             replay_reasons = frozen_task_analysis_contract_reasons(
                 replay_contract,
                 expected_task_ids=(
-                    [str(task_id) for task_id in task_ids]
-                    if isinstance(task_ids, list)
-                    else []
+                    [str(task_id) for task_id in task_ids] if isinstance(task_ids, list) else []
                 ),
             )
             if replay_reasons:
                 raise FinalizationError(
-                    "G1 frozen task analysis contract is invalid: "
-                    + ",".join(replay_reasons)
+                    "G1 frozen task analysis contract is invalid: " + ",".join(replay_reasons)
                 )
     for group, contract in contracts.items():
         gateway = contract.get("gateway_execution")
@@ -2751,6 +3030,21 @@ def validate_formal_campaign_contracts(
         pins = runtime.get("provider_routing") if isinstance(runtime, Mapping) else None
         if not isinstance(pins, Mapping):
             raise FinalizationError(f"{group} formal contract lacks provider_routing pins")
+        g1_explicit_pins: dict[str, str] = {}
+        if group == "G1":
+            explicit_routes = list(g1_analyzer_chain or [])
+            if g1_analyzer_fallback is not None:
+                explicit_routes.extend(g1_analyzer_fallback["proposers"])
+                explicit_routes.append(g1_analyzer_fallback["aggregator"])
+            for route in explicit_routes:
+                model = str(route["model"])
+                upstream = str(route["upstream_provider"]).strip().casefold()
+                prior = g1_explicit_pins.get(model)
+                if prior is not None and prior != upstream:
+                    raise FinalizationError(
+                        f"G1 contains conflicting upstream provider pins for {model}"
+                    )
+                g1_explicit_pins[model] = upstream
         required_models = (
             {B0_MODEL}
             if group == "B0"
@@ -2760,20 +3054,20 @@ def validate_formal_campaign_contracts(
             if group == "B1"
             else {*B2_PROPOSERS, B2_AGGREGATOR, TASK_ANALYZER_MODEL}
             if group == "B2"
-            else {*routes, str(g1_analyzer_policy["model"])}
+            else {*routes, *g1_explicit_pins}
         )
         for model in required_models:
             route_pin = (
                 str(routes[model]).strip().casefold() if group == "G1" and model in routes else ""
             )
-            if group == "G1" and route_pin == "auto":
+            if group == "G1" and route_pin == "auto" and model not in g1_explicit_pins:
                 # ``registry_all`` deliberately leaves candidate upstream
                 # selection to OpenRouter.  The fixed task analyzer remains
                 # independently pinned below.
                 continue
             expected_pin = (
-                str(g1_analyzer_policy["upstream_provider"])
-                if group == "G1" and model == str(g1_analyzer_policy["model"])
+                g1_explicit_pins[model]
+                if group == "G1" and model in g1_explicit_pins
                 else route_pin or FORMAL_UPSTREAM_PINS.get(model)
             )
             if not expected_pin or str(pins.get(model) or "").strip().casefold() != expected_pin:
@@ -2857,10 +3151,7 @@ def blocked_regenerate_terminal_evidence(execution: Mapping[str, Any]) -> bool:
         attempt_id
         for attempt in raw_attempts
         if isinstance(attempt, Mapping)
-        and HEX32.fullmatch(
-            attempt_id := str(attempt.get("attempt_id") or "")
-        )
-        is not None
+        and HEX32.fullmatch(attempt_id := str(attempt.get("attempt_id") or "")) is not None
     }
     if not generation_attempt_ids:
         return False
@@ -2910,9 +3201,7 @@ def repair_evidence(row: Mapping[str, Any], execution: Mapping[str, Any]) -> boo
             return False
     if action == "regenerate":
         incomplete_reasons = (
-            completion.get("incomplete_reasons")
-            if isinstance(completion, Mapping)
-            else None
+            completion.get("incomplete_reasons") if isinstance(completion, Mapping) else None
         )
         if (
             execution.get("generation_auto_retry_blocked") is not True
@@ -3070,8 +3359,7 @@ def validate_generation_attempt_evidence(
         actual_spend_metrics = row.get("actual_spend_metrics")
         if not isinstance(actual_spend_metrics, Mapping):
             raise FinalizationError(
-                "actual-spend generation attempt metrics are missing "
-                f"at {location}"
+                f"actual-spend generation attempt metrics are missing at {location}"
             )
         actual_spend_attempt_count = _require_policy_int(
             actual_spend_metrics.get("generation_attempt_count"),
@@ -3598,6 +3886,7 @@ def usage_route_reasons(
     role_model_pins: Mapping[str, str] | None = None,
     role_provider_pins: Mapping[str, str] | None = None,
     allow_unknown_task_analyzer_attempts: bool = False,
+    allowed_task_analyzer_models: set[str] | None = None,
     allow_unknown_judge_attempts: bool = False,
     unknown_judge_model: str = JUDGE_MODEL,
 ) -> list[str]:
@@ -3637,14 +3926,18 @@ def usage_route_reasons(
             return "" if pin == "auto" else pin
 
         if role in MISSING_USAGE_PLACEHOLDER_ROLES:
-            unknown_analyzer_allowed = (
+            analyzer_models = allowed_task_analyzer_models or {
+                str((role_model_pins or {}).get("task_analyzer") or TASK_ANALYZER_MODEL)
+            }
+            unknown_analyzer_allowed = bool(
                 allow_unknown_task_analyzer_attempts
-                and _is_unknown_task_analyzer_placeholder(
-                    unit,
-                    expected_provider="openrouter",
-                    expected_model=str(
-                        (role_model_pins or {}).get("task_analyzer") or TASK_ANALYZER_MODEL
-                    ),
+                and any(
+                    _is_unknown_task_analyzer_placeholder(
+                        unit,
+                        expected_provider="openrouter",
+                        expected_model=model,
+                    )
+                    for model in analyzer_models
                 )
             )
             unknown_judge_allowed = allow_unknown_judge_attempts and _is_unknown_judge_placeholder(
@@ -4993,6 +5286,15 @@ def aggregator_recovery_execution_reasons(
         "aggregator_visible_answer_reserve_tokens"
     ):
         reasons.append("wrong_aggregator_recovery_visible_answer_reserve_tokens")
+    analyzer_failure_recovery_budget: int | None = None
+    if isinstance(plan, Mapping) and plan.get("analyzer_failure_fallback") is True:
+        analyzer_failure_recovery_budget = 1
+        if plan.get(
+            "aggregator_max_recovery_actions"
+        ) != analyzer_failure_recovery_budget or recovery.get("max_recovery_actions") != plan.get(
+            "aggregator_max_recovery_actions"
+        ):
+            reasons.append("aggregator_recovery_max_actions_mismatch")
     recovery_candidates = recovery.get("candidate_ids")
     if recovery_candidates != list(candidate_chain):
         reasons.append("aggregator_recovery_candidates_mismatch")
@@ -5173,6 +5475,20 @@ def aggregator_recovery_execution_reasons(
         or len(attempt_numbers) != len(attempts)
     ):
         reasons.append("invalid_aggregator_recovery_attempt_sequence")
+    if analyzer_failure_recovery_budget is not None:
+        started_physical_requests = sum(
+            nonnegative_int(attempt.get("physical_request_count"))
+            for attempt in attempts
+            if isinstance(attempt, Mapping) and attempt.get("request_started") is True
+        )
+        declared_recovery_actions = nonnegative_int(continuation_count) + nonnegative_int(
+            same_model_recovery_count
+        )
+        if (
+            max(0, started_physical_requests - 1) > analyzer_failure_recovery_budget
+            or declared_recovery_actions > analyzer_failure_recovery_budget
+        ):
+            reasons.append("aggregator_recovery_action_budget_exceeded")
     expected_physical_index = 1
     for physical_index, physical_count in physical_attempt_spans:
         if physical_index != expected_physical_index:
@@ -5301,35 +5617,37 @@ def proposer_recovery_execution_reasons(
 
     policy = executed_plan.get("proposer_recovery_policy")
     receipt = call.get("proposer_recovery")
-    expected_configured_backup_count = expected_policy.get(
-        "configured_backup_count"
-    )
+    expected_configured_backup_count = expected_policy.get("configured_backup_count")
     actual_effective_backup_count = (
-        policy.get("effective_backup_count")
-        if isinstance(policy, Mapping)
-        else None
+        policy.get("effective_backup_count") if isinstance(policy, Mapping) else None
     )
     effective_backup_count_valid = bool(
         isinstance(expected_configured_backup_count, int)
         and not isinstance(expected_configured_backup_count, bool)
         and isinstance(actual_effective_backup_count, int)
         and not isinstance(actual_effective_backup_count, bool)
-        and 0
-        <= actual_effective_backup_count
-        <= expected_configured_backup_count
+        and 0 <= actual_effective_backup_count <= expected_configured_backup_count
     )
     expected_plan_policy = dict(expected_policy)
     if effective_backup_count_valid:
-        expected_plan_policy["effective_backup_count"] = (
-            actual_effective_backup_count
-        )
-    expected_backup_count = (
-        actual_effective_backup_count if effective_backup_count_valid else -1
-    )
+        expected_plan_policy["effective_backup_count"] = actual_effective_backup_count
+    expected_backup_count = actual_effective_backup_count if effective_backup_count_valid else -1
     expected_max_additional_requests = nonnegative_int(
         expected_policy.get("max_additional_physical_requests")
     )
     expected_quorum = nonnegative_int(expected_policy.get("quorum_required"))
+    complete_proposers_only = bool(
+        executed_plan.get("analyzer_failure_fallback") is True
+        and executed_plan.get("complete_proposers_only") is True
+        and expected_quorum == 1
+    )
+
+    def strict_successful_candidate(candidate: Any) -> bool:
+        return bool(
+            successful_candidate(candidate)
+            and (not complete_proposers_only or candidate.get("completion_outcome") == "complete")
+        )
+
     if policy is None:
         return (
             {},
@@ -5397,8 +5715,7 @@ def proposer_recovery_execution_reasons(
         or receipt.get("selection_plan_fingerprint") != expected_fingerprint
         or receipt.get("scope") != "run_turn"
         or not str(receipt.get("scope_id") or "").strip()
-        or receipt.get("max_additional_physical_requests")
-        != expected_max_additional_requests
+        or receipt.get("max_additional_physical_requests") != expected_max_additional_requests
         or receipt.get("external_physical_requests_reserved") != 0
         or isinstance(started_count, bool)
         or not isinstance(started_count, int)
@@ -5423,9 +5740,7 @@ def proposer_recovery_execution_reasons(
         and isinstance(attempt.get("slot_index"), int)
         and not isinstance(attempt.get("slot_index"), bool)
         and 0 <= int(attempt["slot_index"]) < len(expanded_slot_identities)
-        and HEX32.fullmatch(
-            physical_id := str(attempt.get("physical_attempt_id") or "")
-        )
+        and HEX32.fullmatch(physical_id := str(attempt.get("physical_attempt_id") or ""))
         is not None
     }
 
@@ -5571,8 +5886,7 @@ def proposer_recovery_execution_reasons(
                 isinstance(physical_attempt_ordinal, int)
                 and not isinstance(physical_attempt_ordinal, bool)
                 and physical_attempt_ordinal == 1
-                and declared_recovery_slot_by_physical_id.get(physical_id)
-                == slot_index
+                and declared_recovery_slot_by_physical_id.get(physical_id) == slot_index
             )
             quarantined_unclosed = bool(
                 isinstance(physical, Mapping)
@@ -5590,10 +5904,7 @@ def proposer_recovery_execution_reasons(
                 not isinstance(physical, Mapping)
                 or not isinstance(physical_attempt_ordinal, int)
                 or isinstance(physical_attempt_ordinal, bool)
-                or (
-                    physical_attempt_ordinal != ordinal
-                    and not receipt_bound_local_ordinal
-                )
+                or (physical_attempt_ordinal != ordinal and not receipt_bound_local_ordinal)
                 or physical.get("request_started") is not True
                 or stream_closed is not True
                 and not quarantined_unclosed
@@ -5614,7 +5925,7 @@ def proposer_recovery_execution_reasons(
         actual_identity = _canonical_proposer_recovery_identity(
             f"{str(candidate.get('provider') or '')}:{str(candidate.get('model') or '')}"
         )
-        strict_candidate = successful_candidate(candidate)
+        strict_candidate = strict_successful_candidate(candidate)
         partial_candidate = partial_usable_candidate(candidate)
         if (
             not requested_identity
@@ -5750,7 +6061,7 @@ def proposer_recovery_execution_reasons(
     strict_successful_slots = {
         slot_index
         for slot_index, candidate in enumerate(candidates)
-        if successful_candidate(candidate)
+        if strict_successful_candidate(candidate)
     }
     final_physical_id_by_slot: dict[int, str] = {}
     for slot_index, physical_attempts in candidate_physical_attempts_by_slot.items():
@@ -5874,7 +6185,7 @@ def proposer_recovery_execution_reasons(
         physical_id = str(attempt.get("physical_attempt_id") or "")
         if attempt.get("request_started") is not True or physical_id not in current_recovery_set:
             continue
-        if len(successful_slots) >= 2:
+        if len(successful_slots) >= expected_quorum:
             reasons.append("proposer_recovery_continued_after_quorum")
         slot_index = nonnegative_int(attempt.get("slot_index"))
         if (
@@ -5884,7 +6195,7 @@ def proposer_recovery_execution_reasons(
         ):
             successful_slots.add(slot_index)
     actual_strict_successful = (
-        sum(successful_candidate(candidate) for candidate in candidates)
+        sum(strict_successful_candidate(candidate) for candidate in candidates)
         if isinstance(candidates, list)
         else 0
     )
@@ -5907,7 +6218,12 @@ def proposer_recovery_execution_reasons(
         call.get("successful_proposers") != actual_strict_successful
         or receipt.get("strict_successful_proposers") != actual_strict_successful
         or receipt.get("usable_proposers") != actual_usable
-        or receipt.get("quorum_reached") is not (actual_usable >= 2)
+        or receipt.get("quorum_reached")
+        is not (
+            actual_strict_successful >= expected_quorum
+            if complete_proposers_only
+            else actual_usable >= expected_quorum
+        )
         or len(successful_slots) != actual_strict_successful
     ):
         reasons.append("proposer_recovery_success_count_mismatch")
@@ -5940,8 +6256,15 @@ def ensemble_physical_call_reasons(
     successful = call.get("successful_proposers")
     expected_total = len(expected_proposers)
     executed_plan = call.get("selection_plan")
+    complete_only_analyzer_fallback = bool(
+        isinstance(executed_plan, Mapping)
+        and executed_plan.get("analyzer_failure_fallback") is True
+        and executed_plan.get("complete_proposers_only") is True
+        and executed_plan.get("effective_min_successful_proposers") == 1
+    )
     dynamic_partial_quorum = bool(
         isinstance(executed_plan, Mapping)
+        and not complete_only_analyzer_fallback
         and executed_plan.get("proposer_recovery_policy") is not None
         and (
             executed_plan.get("selection_mode") == "router_dynamic"
@@ -5949,7 +6272,12 @@ def ensemble_physical_call_reasons(
         )
     )
     usable = call.get("usable_proposers") if dynamic_partial_quorum else successful
-    required_successful_proposers = min(2, expected_total)
+    required_successful_proposers = 1 if complete_only_analyzer_fallback else min(2, expected_total)
+    effective_proposer_recovery_policy = (
+        analyzer_failure_fallback_proposer_recovery_policy(proposer_recovery_policy)
+        if complete_only_analyzer_fallback
+        else proposer_recovery_policy
+    )
     successful_count_valid = (
         isinstance(successful, int)
         and not isinstance(successful, bool)
@@ -6016,7 +6344,7 @@ def ensemble_physical_call_reasons(
             ) = proposer_recovery_execution_reasons(
                 call,
                 executed_plan=executed_plan,
-                expected_policy=proposer_recovery_policy,
+                expected_policy=effective_proposer_recovery_policy,
             )
             reasons.extend(proposer_recovery_reasons)
             if not proposer_recovery_reasons:
@@ -6036,14 +6364,23 @@ def ensemble_physical_call_reasons(
     if not isinstance(candidates, list) or len(candidates) != expected_total:
         reasons.append("missing_actual_proposer_candidates")
     else:
-        strict_proven = [successful_candidate(candidate) for candidate in candidates]
+        strict_proven = [
+            successful_candidate(candidate)
+            and (
+                not complete_only_analyzer_fallback
+                or candidate.get("completion_outcome") == "complete"
+            )
+            for candidate in candidates
+        ]
         proven = [
             usable_candidate(candidate) if dynamic_partial_quorum else strict
             for candidate, strict in zip(candidates, strict_proven, strict=True)
         ]
         if any(
-            isinstance(candidate, Mapping) and candidate.get("ok") is True and not candidate_ok
-            for candidate, candidate_ok in zip(candidates, strict_proven, strict=True)
+            isinstance(candidate, Mapping)
+            and candidate.get("ok") is True
+            and not successful_candidate(candidate)
+            for candidate in candidates
         ):
             reasons.append("invalid_successful_proposer_evidence")
         actual_strict_successful = sum(strict_proven)
@@ -6733,14 +7070,10 @@ def g1_aggregator_prompt_plan_reason(plan: Mapping[str, Any]) -> str:
 
     ranking_parameters = plan.get("ranking_parameters")
     aggregator_policy = (
-        ranking_parameters.get("aggregator")
-        if isinstance(ranking_parameters, Mapping)
-        else None
+        ranking_parameters.get("aggregator") if isinstance(ranking_parameters, Mapping) else None
     )
     configured_version = (
-        aggregator_policy.get("prompt_version")
-        if isinstance(aggregator_policy, Mapping)
-        else None
+        aggregator_policy.get("prompt_version") if isinstance(aggregator_policy, Mapping) else None
     )
     evidence = plan.get("aggregator_prompt")
     # Archived pre-P0-35 plans did not record this additive field. New plans
@@ -6771,6 +7104,93 @@ def g1_registry_plan_reasons(
     reasons: list[str] = []
     if not isinstance(plan, Mapping):
         return ["missing_g1_selection_plan"], (), ""
+    if plan.get("analyzer_failure_fallback") is True:
+        fallback = g1_analyzer_failure_fallback_policy(contract)
+        ranking_identity = g1_ranking_config_identity(contract)
+        if (
+            fallback is None
+            or ranking_identity is None
+            or contract.get("selection_mode") != "router_dynamic"
+            or contract.get("user_profile_enabled") is not False
+        ):
+            return ["invalid_g1_analyzer_failure_fallback_contract"], (), ""
+        expected_p = list(fallback["selected_P"])
+        expected_a = str(fallback["selected_A"])
+        expected_models = [identity.partition(":")[2] for identity in expected_p]
+        expected_proposer_recovery = analyzer_failure_fallback_proposer_recovery_policy(
+            proposer_recovery_policy
+        )
+        if plan.get("analyzer_failure_fallback_schema") != (
+            "opensquilla.router-dynamic-analyzer-failure-fallback/v1"
+        ):
+            reasons.append("wrong_g1_analyzer_failure_fallback_schema")
+        if plan.get("selected_P") != expected_p:
+            reasons.append("wrong_g1_selected_proposers")
+        if plan.get("selected_A") != expected_a:
+            reasons.append("wrong_g1_selected_aggregator")
+        if (
+            plan.get("proposer_models") != expected_models
+            or nonnegative_int(plan.get("proposer_count")) != len(expected_p)
+            or nonnegative_int(plan.get("proposer_sample_count")) != len(expected_p)
+            or plan.get("aggregator_model") != expected_a.partition(":")[2]
+        ):
+            reasons.append("wrong_g1_physical_selection_plan")
+        if (
+            plan.get("complete_proposers_only") is not True
+            or plan.get("configured_min_successful_proposers") != 1
+            or plan.get("effective_min_successful_proposers") != 1
+            or plan.get("N_min") != 1
+            or plan.get("N_max") != len(expected_p)
+        ):
+            reasons.append("wrong_g1_analyzer_failure_fallback_quorum")
+        if plan.get("proposer_recovery_policy") != expected_proposer_recovery:
+            reasons.append("wrong_g1_proposer_recovery_policy")
+        if (
+            plan.get("aggregator_max_recovery_actions") != 1
+            or plan.get("backup_P") != []
+            or plan.get("configured_proposer_backup_count") != 0
+            or plan.get("aggregator_candidates") != [expected_a]
+        ):
+            reasons.append("wrong_g1_analyzer_failure_fallback_recovery")
+        for field, expected in aggregator_recovery_policy.items():
+            if plan.get(field) != expected:
+                reasons.append(f"wrong_g1_{field}")
+        try:
+            from opensquilla.provider.protocol import (
+                provider_retry_roster_fingerprint,
+            )
+
+            proposer_recovery_fingerprint = provider_retry_roster_fingerprint(plan)
+        except (TypeError, ValueError):
+            proposer_recovery_fingerprint = ""
+        if HEX64.fullmatch(proposer_recovery_fingerprint) is None:
+            reasons.append("invalid_g1_proposer_recovery_fingerprint")
+        analyzer_trace = plan.get("task_analyzer")
+        analyzer_chain_trace = (
+            analyzer_trace.get("chain") if isinstance(analyzer_trace, Mapping) else None
+        )
+        if (
+            not isinstance(analyzer_trace, Mapping)
+            or analyzer_trace.get("schema_valid") is not False
+            or not isinstance(analyzer_chain_trace, Mapping)
+            or analyzer_chain_trace.get("exhausted") is not True
+        ):
+            reasons.append("wrong_g1_analyzer_failure_fallback_activation")
+        ranking_schema, ranking_version, ranking_hash = ranking_identity
+        ranking_parameters = plan.get("ranking_parameters")
+        if (
+            plan.get("ranking_config_schema_version") != ranking_schema
+            or plan.get("ranking_config_version") != ranking_version
+            or plan.get("ranking_config_hash") != ranking_hash
+            or not isinstance(ranking_parameters, Mapping)
+            or canonical_sha256(ranking_parameters) != ranking_hash
+        ):
+            reasons.append("wrong_g1_ranking_config")
+        return (
+            list(dict.fromkeys(reasons)),
+            tuple(expected_models),
+            expected_a.partition(":")[2],
+        )
     profile_id = str(contract.get("profile_id") or "").strip()
     source_version = str(contract.get("source_registry_snapshot_version") or "").strip()
     routes_hash = str(contract.get("expected_routes_sha256") or "").strip()
@@ -6962,18 +7382,14 @@ def g1_registry_plan_reasons(
             **proposer_recovery_policy,
             "configured_backup_count": configured_backup_count,
         }
-        effective_backup_count = plan_proposer_recovery_policy.get(
-            "effective_backup_count"
-        )
+        effective_backup_count = plan_proposer_recovery_policy.get("effective_backup_count")
         effective_backup_count_valid = bool(
             isinstance(effective_backup_count, int)
             and not isinstance(effective_backup_count, bool)
             and 0 <= effective_backup_count <= configured_backup_count
         )
         if effective_backup_count_valid:
-            expected_proposer_recovery_policy["effective_backup_count"] = (
-                effective_backup_count
-            )
+            expected_proposer_recovery_policy["effective_backup_count"] = effective_backup_count
         if dict(plan_proposer_recovery_policy) != expected_proposer_recovery_policy:
             reasons.append("wrong_g1_proposer_recovery_policy")
         if (
@@ -7074,9 +7490,7 @@ def g1_registry_plan_reasons(
             frozen_task_analysis_plan_reasons,
         )
 
-        reasons.extend(
-            frozen_task_analysis_plan_reasons(plan, replay_contract)
-        )
+        reasons.extend(frozen_task_analysis_plan_reasons(plan, replay_contract))
     return list(dict.fromkeys(reasons)), proposer_models, aggregator_model
 
 
@@ -8009,8 +8423,9 @@ def validate_g1_paid_attempt_plan_history(
     analyzer_policy = g1_task_analyzer_execution_policy(registry)
     if analyzer_policy is None:
         raise FinalizationError("G1 paid-attempt audit lacks an authenticated analyzer policy")
-    analyzer_provider = str(analyzer_policy["provider"])
-    analyzer_model = str(analyzer_policy["model"])
+    analyzer_chain = g1_task_analyzer_execution_chain(registry)
+    if analyzer_chain is None:
+        raise FinalizationError("G1 paid-attempt audit lacks an authenticated analyzer chain")
     replay_contract = registry.get("task_analysis_execution")
     if replay_contract is not None:
         from opensquilla.provider.ranking_router import (
@@ -8212,12 +8627,10 @@ def validate_g1_paid_attempt_plan_history(
             ):
                 analyzer_occurrences.append((ordinal, unit))
         analyzer_reasons: list[str] = []
+        first_plan = ordered_attempts[0].get("selection_plan")
         if replay_contract is not None:
             if analyzer_occurrences:
-                analyzer_reasons.append(
-                    "unexpected_g1_task_analyzer_request_in_frozen_replay"
-                )
-            first_plan = ordered_attempts[0].get("selection_plan")
+                analyzer_reasons.append("unexpected_g1_task_analyzer_request_in_frozen_replay")
             assert frozen_task_analysis_plan_reasons is not None
             source_row = task_history[-1].row
             analyzer_reasons.extend(
@@ -8225,27 +8638,41 @@ def validate_g1_paid_attempt_plan_history(
                     first_plan,
                     replay_contract,
                     expected_task_id=task_key[1],
-                    expected_task_input_sha256=str(
-                        source_row.get("task_input_sha256") or ""
-                    ),
-                    expected_prompt_sha256=str(
-                        source_row.get("prompt_sha256") or ""
-                    ),
+                    expected_task_input_sha256=str(source_row.get("task_input_sha256") or ""),
+                    expected_prompt_sha256=str(source_row.get("prompt_sha256") or ""),
                 )
             )
         else:
-            if not analyzer_occurrences:
+            analyzer_attempt_routes, chain_trace_reasons = (
+                g1_task_analyzer_physical_routes_from_trace(
+                    first_plan if isinstance(first_plan, Mapping) else {},
+                    analyzer_chain,
+                )
+            )
+            analyzer_reasons.extend(chain_trace_reasons)
+            analyzer_trace = (
+                first_plan.get("task_analyzer") if isinstance(first_plan, Mapping) else None
+            )
+            has_chain_trace = bool(
+                isinstance(analyzer_trace, Mapping)
+                and isinstance(analyzer_trace.get("chain"), Mapping)
+            )
+            if not analyzer_occurrences and not (has_chain_trace and not analyzer_attempt_routes):
                 analyzer_reasons.append("missing_g1_task_analyzer_request")
-            else:
+            elif analyzer_occurrences:
                 if any(ordinal != 1 for ordinal, _ in analyzer_occurrences):
                     analyzer_reasons.append("g1_task_analyzer_not_in_first_attempt")
                 analyzer_attempts = [
-                    nonnegative_int(analyzer.get("attempt"))
-                    for _, analyzer in analyzer_occurrences
+                    nonnegative_int(analyzer.get("attempt")) for _, analyzer in analyzer_occurrences
                 ]
                 if analyzer_attempts != list(range(1, len(analyzer_occurrences) + 1)):
                     analyzer_reasons.append("invalid_g1_task_analyzer_retry_sequence")
-                if len(analyzer_occurrences) > (int(analyzer_policy["max_retries"]) + 1):
+                analyzer_budget = len(analyzer_attempt_routes)
+                if (
+                    len(analyzer_occurrences) != analyzer_budget
+                    if has_chain_trace
+                    else len(analyzer_occurrences) > analyzer_budget
+                ):
                     analyzer_reasons.append("g1_task_analyzer_retry_budget_exceeded")
                 physical_attempt_ids = [
                     str(analyzer.get("physical_attempt_id") or "")
@@ -8254,9 +8681,7 @@ def validate_g1_paid_attempt_plan_history(
                 if any(not HEX32.fullmatch(value) for value in physical_attempt_ids) or len(
                     physical_attempt_ids
                 ) != len(set(physical_attempt_ids)):
-                    analyzer_reasons.append(
-                        "invalid_g1_task_analyzer_physical_attempt_identity"
-                    )
+                    analyzer_reasons.append("invalid_g1_task_analyzer_physical_attempt_identity")
                 elif any(
                     physical_id in campaign_analyzer_physical_ids
                     for physical_id in physical_attempt_ids
@@ -8266,33 +8691,49 @@ def validate_g1_paid_attempt_plan_history(
                     )
                 else:
                     campaign_analyzer_physical_ids.update(physical_attempt_ids)
-                requested_routes = {
+                requested_routes = [
                     (
                         str(analyzer.get("requested_provider") or "").strip().casefold(),
                         str(analyzer.get("requested_model") or "").strip(),
                     )
                     for _, analyzer in analyzer_occurrences
-                }
-                if (
-                    len(requested_routes) != 1
-                    or next(iter(requested_routes))[0] != analyzer_provider
+                ]
+                expected_route_prefix = [
+                    (str(route["provider"]), str(route["model"]))
+                    for route in analyzer_attempt_routes[: len(requested_routes)]
+                ]
+                if len(requested_routes) > len(analyzer_attempt_routes) or any(
+                    actual_provider != expected_provider
                     or not _formal_openrouter_models_equivalent(
-                        next(iter(requested_routes))[1],
-                        analyzer_model,
+                        actual_model,
+                        expected_model,
+                    )
+                    for (
+                        actual_provider,
+                        actual_model,
+                    ), (
+                        expected_provider,
+                        expected_model,
+                    ) in zip(
+                        requested_routes,
+                        expected_route_prefix,
                     )
                 ):
                     analyzer_reasons.append("wrong_g1_task_analyzer_route")
-                for _, analyzer in analyzer_occurrences:
+                for index, (_, analyzer) in enumerate(
+                    analyzer_occurrences[: len(analyzer_attempt_routes)]
+                ):
+                    expected_route = analyzer_attempt_routes[index]
                     if not _is_unknown_task_analyzer_placeholder(
                         analyzer,
-                        expected_provider=analyzer_provider,
-                        expected_model=analyzer_model,
+                        expected_provider=str(expected_route["provider"]),
+                        expected_model=str(expected_route["model"]),
                     ) and (
                         str(analyzer.get("provider") or "").strip().casefold()
-                        != analyzer_provider
+                        != str(expected_route["provider"])
                         or not _formal_openrouter_models_equivalent(
                             analyzer.get("model"),
-                            analyzer_model,
+                            expected_route["model"],
                         )
                     ):
                         analyzer_reasons.append("wrong_g1_task_analyzer_route")
@@ -8382,9 +8823,7 @@ def g1_provider_lifecycle_analyzer_reasons(
     if replay_contract is not None:
         first_routing = request_attempts[0]["run"].get("routing_trace")
         first_plan = (
-            first_routing.get("selection_plan")
-            if isinstance(first_routing, Mapping)
-            else None
+            first_routing.get("selection_plan") if isinstance(first_routing, Mapping) else None
         )
         reasons = frozen_task_analysis_plan_reasons(
             first_plan,
@@ -8403,9 +8842,7 @@ def g1_provider_lifecycle_analyzer_reasons(
                 reasons.append("invalid_g1_task_analyzer_replay_usage_evidence")
                 continue
             if analyzers:
-                reasons.append(
-                    "unexpected_g1_task_analyzer_request_in_frozen_replay"
-                )
+                reasons.append("unexpected_g1_task_analyzer_request_in_frozen_replay")
         return list(dict.fromkeys(reasons))
     first_attempt_id = str(request_attempts[0].get("attempt_id") or "")
     try:
@@ -8551,10 +8988,18 @@ def route_reasons(
         routes = registry.get("expected_routes")
         allowed = set(routes) if isinstance(routes, Mapping) else set()
         analyzer_policy = g1_task_analyzer_execution_policy(registry)
+        analyzer_chain = g1_task_analyzer_execution_chain(registry)
+        analyzer_fallback = g1_analyzer_failure_fallback_policy(registry)
+        if analyzer_chain is not None:
+            allowed.update(str(route["model"]) for route in analyzer_chain)
+        if analyzer_fallback is not None:
+            allowed.update(str(route["model"]) for route in analyzer_fallback["proposers"])
+            allowed.add(str(analyzer_fallback["aggregator"]["model"]))
         if (
             registry.get("selection_mode") != "router_dynamic"
             or not allowed
             or analyzer_policy is None
+            or analyzer_chain is None
         ):
             reasons.append("invalid_g1_registry_contract")
         effective_routing, _, lifecycle_routing_reasons = effective_g1_lifecycle_routing(
@@ -8563,19 +9008,29 @@ def route_reasons(
         )
         reasons.extend(lifecycle_routing_reasons)
         routing = effective_routing
-        if allowed and analyzer_policy is not None:
+        if allowed and analyzer_policy is not None and analyzer_chain is not None:
+            single_analyzer_route = len(analyzer_chain) == 1
             reasons.extend(
                 usage_route_reasons(
                     row.get("usage"),
                     allowed_models=allowed,
                     provider_pins=provider_pins,
-                    role_model_pins={
-                        "task_analyzer": str(analyzer_policy["model"]),
-                    },
-                    role_provider_pins={
-                        "task_analyzer": str(analyzer_policy["upstream_provider"]),
-                    },
+                    role_model_pins=(
+                        {
+                            "task_analyzer": str(analyzer_policy["model"]),
+                        }
+                        if single_analyzer_route
+                        else None
+                    ),
+                    role_provider_pins=(
+                        {
+                            "task_analyzer": str(analyzer_policy["upstream_provider"]),
+                        }
+                        if single_analyzer_route
+                        else None
+                    ),
                     allow_unknown_task_analyzer_attempts=True,
+                    allowed_task_analyzer_models={str(route["model"]) for route in analyzer_chain},
                 )
             )
         row_plan = routing.get("selection_plan")
@@ -8622,9 +9077,7 @@ def route_reasons(
                             call.get("selection_plan"),
                             replay_contract,
                             expected_task_id=str(row.get("task_id") or ""),
-                            expected_task_input_sha256=str(
-                                row.get("task_input_sha256") or ""
-                            ),
+                            expected_task_input_sha256=str(row.get("task_input_sha256") or ""),
                             expected_prompt_sha256=str(row.get("prompt_sha256") or ""),
                         )
                     )

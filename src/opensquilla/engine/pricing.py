@@ -392,10 +392,28 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
     ("google/gemini-3.5-flash", PriceEntry(1.5, 9.0)),
     ("openai/gpt-5.4-mini", PriceEntry(0.75, 4.5)),
     ("openai/gpt-5.5", PriceEntry(5.0, 30.0)),
+    (
+        "openai/gpt-5.6-sol",
+        PriceEntry(
+            5.0,
+            30.0,
+            cache_read_per_m=0.5,
+            cache_write_per_m=6.25,
+        ),
+    ),
     ("meta-llama/llama-4-maverick", PriceEntry(0.15, 0.60)),
     ("mistralai/mistral-large-2512", PriceEntry(0.50, 1.50)),
     ("qwen/qwen3-coder-plus", PriceEntry(0.65, 3.25)),
     ("qwen/qwen3.7-max", PriceEntry(1.25, 3.75)),
+    (
+        "qwen/qwen3.8-max",
+        PriceEntry(
+            2.0,
+            6.0,
+            cache_read_per_m=0.25,
+            cache_write_per_m=2.5,
+        ),
+    ),
     ("x-ai/grok-4.3", PriceEntry(1.25, 2.5)),
     ("z-ai/glm-4.6", PriceEntry(0.43, 1.74)),
     ("stepfun/step-3.5-flash", PriceEntry(0.10, 0.30)),

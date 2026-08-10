@@ -153,6 +153,7 @@ def test_glm_5_static_price_matches_openrouter_native_provider(
     [
         ("qwen/qwen3.7-plus-20260602", 0.40, 1.60),
         ("qwen/qwen3.7-max", 1.25, 3.75),
+        ("qwen/qwen3.8-max", 2.0, 6.0),
         ("google/gemini-3-flash-preview-20251217", 0.50, 3.0),
         ("mistralai/mistral-large-2512", 0.50, 1.50),
         ("meta-llama/llama-4-maverick", 0.15, 0.60),
@@ -170,6 +171,30 @@ def test_g8_ensemble_static_fallback_prices_do_not_use_generic_default(
 
     assert price.input_per_m == pytest.approx(input_per_m)
     assert price.output_per_m == pytest.approx(output_per_m)
+
+
+def test_qwen_3_8_max_static_price_is_cache_aware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    price = lookup_price("qwen/qwen3.8-max")
+
+    assert price.cache_read_per_m == pytest.approx(0.25)
+    assert price.cache_write_per_m == pytest.approx(2.5)
+
+
+def test_gpt_5_6_sol_azure_static_price_is_cache_aware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    price = lookup_price("openai/gpt-5.6-sol")
+
+    assert price.input_per_m == pytest.approx(5.0)
+    assert price.output_per_m == pytest.approx(30.0)
+    assert price.cache_read_per_m == pytest.approx(0.5)
+    assert price.cache_write_per_m == pytest.approx(6.25)
 
 
 def test_claude_opus_4_8_static_price_matches_openrouter_model_catalog(
