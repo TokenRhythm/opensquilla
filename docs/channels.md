@@ -86,6 +86,22 @@ The channel runtime uses one shared boundary for provider identity, access
 policy, durability, and delivery diagnostics. These guarantees apply to the
 implemented runtime, not to provider features that the adapter does not expose.
 
+### Attachments and Media on Channels
+
+Both directions are supported:
+
+- **Inbound (user → bot)**: the adapter resolves the platform's media
+  reference into an attachment that feeds the shared ingest pipeline.
+  Telegram (photos/documents), Feishu (images/files), Discord, Matrix, Slack
+  (`files` array, downloaded with the bot token), WeCom webhook images
+  (`PicUrl`), and QQ (attachments array) are supported. DingTalk keeps a
+  text marker for media.
+- **Outbound (bot → user)**: `OutgoingMessage.attachments` are delivered via
+  each channel's native upload (`send_file`); Telegram routes images to
+  `sendPhoto`, QQ uploads via the official rich-media API, and
+  WeCom/Feishu/Slack/Discord/Matrix upload the file. DingTalk degrades to a
+  text notice (no file API on the stream robot path).
+
 ### Authenticated Admission
 
 Normal provider ingress records immutable provenance: provider, account,

@@ -878,6 +878,23 @@ class DiscordChannel:
 
     async def send(self, message: OutgoingMessage) -> ChannelSendResult:
         channel_id = str(message.reply_to or self.config.default_channel_id or "").strip()
+        attachments = list(message.attachments or [])
+        if attachments:
+            if not channel_id:
+                raise ValueError("discord.send: channel target is required")
+            from opensquilla.channels._attachment_io import deliver_message_attachments
+
+            await deliver_message_attachments(
+                self,
+                target=channel_id,
+                content=message.content,
+                attachments=attachments,
+            )
+            if not message.content.strip():
+                return ChannelSendResult.sent(
+                    capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+                    target_id=channel_id,
+                )
 
         interaction_token = str(message.metadata.get("interaction_token") or "")
         application_id = str(

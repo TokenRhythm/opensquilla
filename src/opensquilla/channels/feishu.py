@@ -1771,6 +1771,21 @@ class FeishuChannel:
     async def send(self, message: OutgoingMessage) -> None:
         request_uuid = _feishu_delivery_uuid(message.metadata.get("delivery_id"))
         reply_message_id = message.metadata.get("reply_message_id")
+        attachments = list(message.attachments or [])
+        if attachments:
+            from opensquilla.channels._attachment_io import deliver_message_attachments
+
+            target = str(reply_message_id or message.reply_to or self.config.default_chat_id or "")
+            if not target:
+                raise ValueError("feishu.send: chat target is required for attachments")
+            await deliver_message_attachments(
+                self,
+                target=target,
+                content=message.content,
+                attachments=attachments,
+            )
+            if not message.content.strip():
+                return
         if isinstance(reply_message_id, str) and reply_message_id:
             await self.reply_text(
                 reply_message_id,

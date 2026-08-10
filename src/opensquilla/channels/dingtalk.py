@@ -676,6 +676,14 @@ class DingTalkChannel:
         ``ChatbotHandler.reply_text`` is sync (uses ``requests``); we run it
         in a worker thread so the event loop stays free.
         """
+        if message.attachments:
+            names = ", ".join(str(a.name or "attachment") for a in message.attachments)
+            suffix = (
+                f"\n\n[attachment unsupported: {names}]"
+                if message.content.strip()
+                else f"[attachment unsupported: {names}]"
+            )
+            message = message.model_copy(update={"content": message.content + suffix})
         if self._handler is None:
             raise RuntimeError("dingtalk.send: adapter is not started")
         target = self._resolve_reply_target(message)

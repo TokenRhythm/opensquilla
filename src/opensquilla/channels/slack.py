@@ -39,6 +39,7 @@ from opensquilla.channels.contract import (
     ChannelSendResult,
 )
 from opensquilla.channels.types import (
+    Attachment,
     AuthenticatedPrincipal,
     ChannelHealth,
     IncomingMessage,
@@ -55,6 +56,31 @@ SLACK_API_BASE = "https://slack.com/api"
 _SLACK_MAX_MESSAGE_CHARS = 40000
 
 _MENTION_RE = re.compile(r"<@(U[A-Z0-9]+)(?:\|[^>]*)?>")
+
+
+def _slack_event_attachments(event: dict[str, Any]) -> list[Attachment]:
+    """Extract file attachments from a Slack message event (``files`` array)."""
+
+    raw_files = event.get("files")
+    if not isinstance(raw_files, list):
+        return []
+    attachments: list[Attachment] = []
+    for raw in raw_files:
+        if not isinstance(raw, dict):
+            continue
+        url_private = raw.get("url_private")
+        if not isinstance(url_private, str) or not url_private:
+            continue
+        size = raw.get("size")
+        attachments.append(
+            Attachment(
+                name=str(raw.get("name") or "") or "slack-file",
+                mime_type=raw.get("mimetype"),
+                url=url_private,
+                size=size if isinstance(size, int) else None,
+            )
+        )
+    return attachments
 
 # Channel-contract constants pinned by the adapter audit.
 CAPABILITY_TIER = "YELLOW-experimental"
@@ -180,8 +206,8 @@ class SlackChannel:
             ),
             ChannelPlatformCapability(
                 category=ChannelPlatformCategories.ATTACHMENTS,
-                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                notes=("Inbound Slack file download is not implemented in this adapter.",),
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                notes=("Inbound Slack files are downloaded with the bot token.",),
             ),
         )
 
@@ -267,10 +293,12 @@ class SlackChannel:
             self._last_thread_ts = thread_ts
 
         sender_id = str(event.get("user", self.sender_id))
+        attachments = _slack_event_attachments(event)
         return IncomingMessage(
             sender_id=sender_id,
             channel_id=event.get("channel", self.slack_channel_id),
             content=event.get("text", ""),
+            attachments=attachments,
             metadata=metadata,
             provenance=IngressProvenance(
                 provider="slack",
@@ -284,6 +312,33 @@ class SlackChannel:
                     else None
                 ),
             ),
+        )
+
+    async def resolve_inbound_attachment(self, attachment: Attachment) -> Attachment:
+        """Resolve a Slack file URL into bytes using the bot token.
+
+        Slack ``url_private`` requires the bot's Bearer token; the generic
+        materializer cannot fetch it, so this adapter performs the download and
+        the shared ingest path validates size bounds afterwards.
+        """
+
+        if attachment.data is not None:
+            return attachment
+        url = str(attachment.url or "").strip()
+        if not url:
+            return attachment
+        from opensquilla.channels._attachment_io import download_attachment_bytes
+
+        payload = await download_attachment_bytes(
+            attachment,
+            client=self._get_client(),
+        )
+        return Attachment(
+            name=attachment.name or "slack-file",
+            mime_type=attachment.mime_type,
+            data=payload,
+            size=len(payload),
+            metadata=attachment.metadata,
         )
 
     def build_reply_message(self, content: str, inbound: IncomingMessage) -> OutgoingMessage:
@@ -339,6 +394,19 @@ class SlackChannel:
         if not channel:
             log.error("slack.send_failed", channel="", error="no_target_channel")
             raise RuntimeError("Slack send has no target channel")
+
+        attachments = list(message.attachments or [])
+        if attachments:
+            from opensquilla.channels._attachment_io import deliver_message_attachments
+
+            await deliver_message_attachments(
+                self,
+                target=channel,
+                content=message.content,
+                attachments=attachments,
+            )
+            if not message.content.strip():
+                return
 
         payload: dict[str, Any] = {"channel": channel, "text": message.content}
         if thread_ts:

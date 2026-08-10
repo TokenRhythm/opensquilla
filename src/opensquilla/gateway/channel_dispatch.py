@@ -3673,13 +3673,17 @@ async def _deliver_runtime_channel_reply(
                     )
             if await stream_relay.reconcile_final_text(canonical_content):
                 return
+            if stream_relay.text_emitted:
+                # The stream already delivered the terminal text. A channel
+                # without edit (e.g. QQ) cannot reconcile the preview; re-sending
+                # the same content here would double-post the reply.
+                return
             stream_relay.stream_error = RuntimeError(
                 "streamed channel reply could not apply persisted terminal text"
             )
         elif (
             stream_relay is not None
             and stream_relay.text_emitted
-            and stream_relay.stream_error is None
         ):
             return
     else:

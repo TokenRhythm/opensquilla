@@ -694,6 +694,18 @@ class MatrixChannel:
         room_id = message.reply_to or message.metadata.get("room_id", "")
         if not room_id:
             raise RuntimeError("Matrix outbound requires a room_id (reply_to)")
+        attachments = list(message.attachments or [])
+        if attachments:
+            from opensquilla.channels._attachment_io import deliver_message_attachments
+
+            await deliver_message_attachments(
+                self,
+                target=room_id,
+                content=message.content,
+                attachments=attachments,
+            )
+            if not message.content.strip():
+                return
         formatted = self._render_html(message.content)
         content = self._build_text_content(message.content, formatted)
         reply_event_id = message.metadata.get("reply_event_id")

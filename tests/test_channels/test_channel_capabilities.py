@@ -334,13 +334,17 @@ def test_feishu_platform_manifest_derives_from_the_profile() -> None:
             QQChannel(QQChannelConfig()),
             {
                 ChannelPlatformCategories.FILES: (
-                    ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                    (),
+                    ChannelPlatformCapabilityStatus.SUPPORTED,
+                    (
+                        "POST /v2/users/{openid}/files",
+                        "POST /v2/groups/{group_openid}/files",
+                        "msg_type=7 media send",
+                    ),
                     (),
                 ),
                 ChannelPlatformCategories.MEDIA: (
-                    ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                    (),
+                    ChannelPlatformCapabilityStatus.SUPPORTED,
+                    ("msg_type=7 media.file_info",),
                     (),
                 ),
             },
@@ -514,8 +518,8 @@ def test_qq_profile_matches_current_official_bot_adapter_surface() -> None:
     assert profile.supports(ChannelCapabilities.REPLY)
     assert not profile.supports(ChannelCapabilities.EDIT)
     assert not profile.supports(ChannelCapabilities.DELETE)
-    assert not profile.supports(ChannelCapabilities.NATIVE_FILE_UPLOAD)
-    assert not profile.supports(ChannelCapabilities.MEDIA)
+    assert profile.supports(ChannelCapabilities.NATIVE_FILE_UPLOAD)
+    assert profile.supports(ChannelCapabilities.MEDIA)
 
 
 def test_group_thread_metadata_builds_thread_session_key() -> None:

@@ -30,14 +30,17 @@ from pydantic import BaseModel
 
 from opensquilla.channels._util import EventDedupeCache
 from opensquilla.channels.contract import (
+    ChannelCapabilities,
     ChannelCapabilityProfile,
     ChannelLengthUnit,
     ChannelPlatformCapability,
     ChannelPlatformCapabilityStatus,
     ChannelPlatformCategories,
     ChannelPlatformManifest,
+    ChannelSendResult,
 )
 from opensquilla.channels.types import (
+    Attachment,
     AuthenticatedPrincipal,
     ChannelHealth,
     IncomingMessage,
@@ -187,11 +190,13 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             splits_natively=False,
             group_chat=True,
             mentions=True,
+            native_file_upload=True,
+            media=True,
             reply=True,
             transports=("websocket",),
             notes=(
-                "QQ Bot Platform rich-media APIs exist, but this adapter currently "
-                "sends text replies only.",
+                "QQ official rich-media API (msg_type=7) delivers images and "
+                "files via base64 upload plus media.file_info.",
             ),
         )
 
@@ -199,16 +204,30 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
     def platform_capability_manifest(self) -> ChannelPlatformManifest:
         return ChannelPlatformManifest.from_channel_profile(
             self.capability_profile,
+            has_send_file=True,
+            has_inbound_attachment_resolver=True,
         ).with_capabilities(
             ChannelPlatformCapability(
                 category=ChannelPlatformCategories.FILES,
-                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                notes=("QQ official bot file delivery is not implemented in this adapter.",),
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=(
+                    "POST /v2/users/{openid}/files",
+                    "POST /v2/groups/{group_openid}/files",
+                    "msg_type=7 media send",
+                ),
+                notes=(
+                    "Files are uploaded as base64 file_data to the official "
+                    "rich-media endpoint, then delivered as msg_type=7 media.",
+                ),
             ),
             ChannelPlatformCapability(
                 category=ChannelPlatformCategories.MEDIA,
-                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                notes=("QQ official bot rich media is not implemented in this adapter.",),
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("msg_type=7 media.file_info",),
+                notes=(
+                    "Images and files are sent through the official media "
+                    "message API with a short-lived file_info.",
+                ),
             ),
         )
 
@@ -315,6 +334,27 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
 
         content = (getattr(raw, "content", "") or "").strip()
 
+        attachments: list[Attachment] = []
+        raw_attachments = getattr(raw, "attachments", None)
+        if isinstance(raw_attachments, list):
+            for item in raw_attachments:
+                url = getattr(item, "url", None)
+                content_type = getattr(item, "content_type", None)
+                if not isinstance(url, str) or not url:
+                    continue
+                name = str(getattr(item, "filename", "") or "") or "qq-file"
+                size = getattr(item, "size", None)
+                attachments.append(
+                    Attachment(
+                        name=name,
+                        mime_type=(
+                            str(content_type) if isinstance(content_type, str) else None
+                        ),
+                        url=url,
+                        size=size if isinstance(size, int) else None,
+                    )
+                )
+
         metadata: dict[str, Any] = {
             "is_group": is_group,
             "chat_type": chat_type,
@@ -329,6 +369,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             sender_id=sender_id,
             channel_id=channel_id or "unknown",
             content=content,
+            attachments=attachments,
             metadata=metadata,
             provenance=IngressProvenance(
                 provider="qq",
@@ -370,6 +411,30 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         if not bool(msg.metadata.get("is_group")):
             return True
         return msg.metadata.get("chat_type") == "group" and bool(msg.metadata.get("msg_id"))
+
+    async def resolve_inbound_attachment(self, attachment: Attachment) -> Attachment:
+        """Resolve a QQ image/file URL into bytes for shared ingest.
+
+        QQ delivers attachments as ``url`` references. The generic ingest path
+        requires ``data`` bytes, so the URL is streamed down here with the
+        shared size bound instead of being read fully into memory first.
+        """
+
+        if attachment.data is not None:
+            return attachment
+        url = str(attachment.url or "").strip()
+        if not url:
+            return attachment
+        from opensquilla.channels._attachment_io import download_attachment_bytes
+
+        payload = await download_attachment_bytes(attachment)
+        return Attachment(
+            name=attachment.name or "qq-file",
+            mime_type=attachment.mime_type,
+            data=payload,
+            size=len(payload),
+            metadata=attachment.metadata,
+        )
 
     def build_reply_message(self, content: str, inbound: IncomingMessage) -> OutgoingMessage:
         """Build a passive QQ reply from the triggering inbound envelope."""
@@ -442,6 +507,27 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         meta = message.metadata or {}
         chat_type = meta.get("chat_type", "")
         msg_id = meta.get("msg_id") or meta.get("reply_to_msg_id") or message.reply_to
+        if message.attachments:
+            from opensquilla.channels._attachment_io import deliver_message_attachments
+
+            target = (
+                meta.get("openid")
+                or meta.get("user_openid")
+                or meta.get("group_openid")
+                or ""
+            )
+            if not target:
+                raise ValueError("qq.send: attachment target is required")
+            await deliver_message_attachments(
+                self,
+                target=target,
+                content=message.content,
+                attachments=list(message.attachments),
+                chat_type=chat_type,
+                msg_id=msg_id,
+            )
+            if not message.content.strip():
+                return
 
         api = self.api
         if chat_type == "group":
@@ -473,6 +559,125 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
                 f"qq.send: metadata['chat_type'] must be 'c2c' or 'group', got {chat_type!r}"
             )
         log.debug("qq.outbound_sent", chat_type=chat_type, length=len(message.content))
+
+    async def send_file(
+        self,
+        target_id: str,
+        file_path: str,
+        content: str = "",
+        *,
+        chat_type: str | None = None,
+        msg_id: str | None = None,
+        file_name: str | None = None,
+    ) -> ChannelSendResult:
+        """Send a local file to a QQ chat via the official rich-media API.
+
+        QQ's passive-message file path is two steps:
+        1. Upload the local file bytes (Base64 ``file_data``) to
+           ``/v2/users/{openid}/files`` (c2c) or ``/v2/groups/{group_openid}/files``
+           (group) and get back a short-lived ``file_info``.
+        2. Send a ``msg_type=7`` (media) message carrying ``media.file_info``.
+
+        ``file_type`` is mapped from the file extension: 1 image, 2 video,
+        3 voice (silk), 4 file.
+        """
+
+        import base64
+        from pathlib import Path
+
+        target = str(target_id or "").strip()
+        if not target:
+            raise ValueError("qq.send_file: target is required")
+        path = Path(file_path)
+        if not path.is_file():
+            raise ValueError(f"qq.send_file: file not found: {file_path}")
+        if chat_type is None and self._last_incoming_envelope is not None:
+            chat_type = str(
+                (self._last_incoming_envelope.metadata or {}).get("chat_type", "")
+            )
+        if msg_id is None and self._last_incoming_envelope is not None:
+            msg_id = (
+                (self._last_incoming_envelope.metadata or {}).get("msg_id")
+                or (self._last_incoming_envelope.metadata or {}).get("reply_to_msg_id")
+            )
+        if chat_type not in {"c2c", "group"}:
+            chat_type = "c2c"
+        file_type = self._qq_file_type(path)
+        payload = base64.b64encode(path.read_bytes()).decode("ascii")
+        display_name = file_name or path.name
+
+        from botpy.http import Route
+
+        http = getattr(self.api, "_http", None)
+        if http is None:
+            raise RuntimeError("qq.send_file: botpy HTTP client unavailable")
+        if chat_type == "group":
+            route = Route("POST", "/v2/groups/{group_openid}/files", group_openid=target)
+        else:
+            route = Route("POST", "/v2/users/{openid}/files", openid=target)
+        upload = await http.request(
+            route,
+            json={
+                "file_type": file_type,
+                "file_data": payload,
+                # Official API accepts an optional file_name; without it the
+                # platform names received files generically ("未命名").
+                "file_name": display_name,
+            },
+        )
+        file_info = ""
+        if isinstance(upload, dict):
+            data = upload.get("data")
+            data_info = data.get("file_info") if isinstance(data, dict) else None
+            file_info = str(
+                upload.get("file_info")
+                or data_info
+                or ""
+            )
+        if not file_info:
+            code = upload.get("code") if isinstance(upload, dict) else None
+            message = upload.get("message") if isinstance(upload, dict) else None
+            raise RuntimeError(
+                "qq.send_file: upload returned no file_info"
+                + (f" (code={code}, message={message})" if code or message else "")
+            )
+
+        api = self.api
+        media = {"file_info": file_info}
+        if chat_type == "group":
+            await api.post_group_message(
+                group_openid=target,
+                msg_type=7,
+                content=None,
+                media=media,
+                msg_id=msg_id,
+                msg_seq=self._next_msg_seq(f"group:{msg_id or target}"),
+            )
+        else:
+            await api.post_c2c_message(
+                openid=target,
+                msg_type=7,
+                content=None,
+                media=media,
+                msg_id=msg_id,
+                msg_seq=self._next_msg_seq(f"c2c:{msg_id or target}"),
+            )
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+            target_id=target,
+            provider_message_id=file_info,
+        )
+
+    @staticmethod
+    def _qq_file_type(path: Any) -> int:
+        suffix = path.suffix.lower()
+        if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+            return 1
+        if suffix in {".mp4", ".mov", ".avi", ".webm"}:
+            return 2
+        if suffix in {".silk", ".amr"}:
+            return 3
+        return 4
 
     async def edit(self, message_id: str, content: str) -> None:
         """Raise: QQ Bot Platform has no message-edit primitive."""
