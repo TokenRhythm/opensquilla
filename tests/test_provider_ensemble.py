@@ -41,6 +41,10 @@ from opensquilla.provider import (
     provider_retry_roster_fingerprint,
     reserve_provider_retry_physical_request,
 )
+from opensquilla.provider.admission import (
+    ProviderAdmissionController,
+    ProviderAdmissionSettings,
+)
 from opensquilla.provider.ensemble import (
     EnsembleMemberConfig,
     EnsembleProvider,
@@ -140,6 +144,18 @@ def test_terminal_event_wire_shape_matches_f39_baseline() -> None:
         assert tuple(item.name for item in fields(event)) == expected_fields
         assert tuple(asdict(event)) == expected_fields
         assert "physical_attempt_id" not in asdict(event)
+
+
+def _admission_managed_member(model: str) -> EnsembleMemberConfig:
+    return EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model=model),
+        label=model,
+        thinking="high",
+        requested_thinking_level="high",
+        effective_thinking_level="high",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+    )
 
 
 def test_json_safe_serializes_provider_billing_receipt_as_object() -> None:
@@ -12205,6 +12221,825 @@ async def test_empty_non_length_done_is_structural_and_recovers_same_aggregator(
 
 
 @pytest.mark.asyncio
+async def test_aggregator_admission_timeout_uses_ranked_fallback_without_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposer = _admission_managed_member("p1")
+    primary = _admission_managed_member("a1")
+    fallback = _admission_managed_member("a2")
+    registry = _FakeRegistry(
+        plans={
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")]
+            ),
+            "a1": _FakePlan(
+                [TextDeltaEvent(text="wrong"), DoneEvent(model="a1")]
+            ),
+            "a2": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="a2")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=4,
+            provider_default_max_in_flight=4,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=0.01,
+        )
+    )
+    occupied_primary = await controller.acquire(
+        provider="fake",
+        model="a1",
+        role="another_turn",
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[proposer],
+        aggregator=primary,
+        aggregator_fallbacks=[fallback],
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        aggregator_recovery_mode="serving",
+        aggregator_recovery_top_k=2,
+        shuffle_candidates=False,
+        selection_plan=_managed_selection_plan(
+            [proposer],
+            primary,
+            [fallback],
+        ),
+        _admission_controller=controller,
+    )
+    try:
+        events = [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="answer")],
+                config=ChatConfig(max_tokens=64, thinking=False, timeout=1),
+            )
+        ]
+    finally:
+        occupied_primary.release()
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    visible = "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    )
+    assert visible == "final"
+    assert done.model == "a2"
+    assert [call["model"] for call in registry.calls] == ["p1", "a2"]
+    assert any(
+        isinstance(event, ProviderHeartbeatEvent)
+        and event.phase == "ensemble_aggregator_model_fallback"
+        for event in events
+    )
+    snapshot = controller.snapshot()
+    assert snapshot["active_leases"] == 0
+    assert snapshot["global_in_flight"] == 0
+    assert snapshot["global_queued"] == 0
+
+
+@pytest.mark.asyncio
+async def test_proposer_admission_timeout_is_not_started_physical_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposer = _admission_managed_member("p1")
+    aggregator = _admission_managed_member("a1")
+    registry = _FakeRegistry(
+        plans={
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")]
+            ),
+            "a1": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="a1")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=3,
+            provider_default_max_in_flight=3,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=0.01,
+        )
+    )
+    occupied_proposer = await controller.acquire(
+        provider="fake",
+        model="p1",
+        role="another_turn",
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[proposer],
+        aggregator=aggregator,
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        selection_plan=_managed_selection_plan([proposer], aggregator),
+        _admission_controller=controller,
+    )
+    try:
+        events = [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="answer")],
+                config=ChatConfig(max_tokens=64, thinking=False, timeout=1),
+            )
+        ]
+    finally:
+        occupied_proposer.release()
+
+    terminal = next(event for event in reversed(events) if isinstance(event, ErrorEvent))
+    assert terminal.code == "ensemble_insufficient_proposers"
+    assert registry.calls == []
+    candidates = terminal.ensemble_trace["candidates"]
+    assert candidates[0]["error_code"] == "ensemble_provider_admission_timeout"
+    assert candidates[0]["request_started"] is False
+    assert candidates[0]["physical_request_count"] == 0
+    assert controller.active_leases == 0
+
+
+@pytest.mark.asyncio
+async def test_aggregator_consumer_cancellation_releases_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposer = _admission_managed_member("p1")
+    aggregator = _admission_managed_member("a1")
+    aggregator_started = asyncio.Event()
+    aggregator_closed = asyncio.Event()
+    registry = _FakeRegistry(
+        plans={
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")]
+            ),
+            "a1": _FakePlan(
+                [],
+                gate=asyncio.Event(),
+                started=aggregator_started,
+                closed=aggregator_closed,
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=2,
+            provider_default_max_in_flight=2,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=1,
+        )
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[proposer],
+        aggregator=aggregator,
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        selection_plan=_managed_selection_plan([proposer], aggregator),
+        _admission_controller=controller,
+    )
+
+    async def consume() -> None:
+        async for _ in provider.chat(
+            [Message(role="user", content="answer")],
+            config=ChatConfig(max_tokens=64, thinking=False, timeout=1),
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(aggregator_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await asyncio.wait_for(aggregator_closed.wait(), timeout=1)
+    assert controller.active_leases == 0
+    assert controller.snapshot()["global_in_flight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_aggregator_late_admission_grant_never_starts_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposer = _admission_managed_member("p1")
+    aggregator = _admission_managed_member("a1")
+    registry = _FakeRegistry(
+        plans={
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")]
+            ),
+            "a1": _FakePlan(
+                [TextDeltaEvent(text="must not run"), DoneEvent(model="a1")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+
+    class _Lease:
+        wait_ms = 0
+        weight = 1
+
+        def __init__(self) -> None:
+            self.released = False
+
+        def release(self) -> None:
+            self.released = True
+
+    class _LateAggregatorController:
+        def __init__(self) -> None:
+            self.leases: list[_Lease] = []
+
+        async def acquire(self, *, role: str, **_: object) -> _Lease:
+            lease = _Lease()
+            self.leases.append(lease)
+            if role.startswith("aggregator"):
+                await asyncio.sleep(0.03)
+            return lease
+
+    controller = _LateAggregatorController()
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=[proposer],
+        aggregator=aggregator,
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        aggregator_recovery_mode="off",
+        shuffle_candidates=False,
+        selection_plan=_managed_selection_plan([proposer], aggregator),
+        _admission_controller=controller,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer")],
+            config=ChatConfig(max_tokens=64, thinking=False, timeout=0.02),
+        )
+    ]
+
+    assert [call["model"] for call in registry.calls] == ["p1"]
+    terminal = next(
+        event
+        for event in events
+        if isinstance(event, ErrorEvent)
+        and event.code == "ensemble_aggregator_timeout"
+    )
+    # The composite terminal still carries the one successful proposer
+    # request. The final-request and recovery evidence prove that admission
+    # itself did not add an aggregator request to the physical ledger.
+    assert terminal.physical_request_count == 1
+    assert terminal.ensemble_trace["final_request"]["request_started"] is False
+    failed_attempt = terminal.ensemble_trace["aggregator_recovery"]["attempts"][-1]
+    assert failed_attempt["request_started"] is False
+    assert failed_attempt["physical_request_count"] == 0
+    assert controller.leases
+    assert all(lease.released for lease in controller.leases)
+
+
+@pytest.mark.asyncio
+async def test_fallback_single_admission_timeout_is_zero_request_then_recovers() -> None:
+    class _Fallback:
+        provider_name = "fallback"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+            self.calls += 1
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                yield TextDeltaEvent(text="fallback")
+                yield DoneEvent(model="fallback")
+
+            return _stream()
+
+    fallback = _Fallback()
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=1,
+            provider_default_max_in_flight=1,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=0.01,
+        )
+    )
+    holder = await controller.acquire(
+        provider="other",
+        model="holder",
+        role="another_turn",
+    )
+    provider = EnsembleProvider(
+        profile_name="fallback-admission",
+        proposers=[],
+        aggregator=_member("unused", thinking=None),
+        fallback_provider=fallback,
+        fallback_provider_name="fallback",
+        fallback_model="fallback",
+        all_failed_policy="fallback_single",
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+        _admission_controller=controller,
+    )
+
+    blocked = await _collect(provider)
+
+    assert fallback.calls == 0
+    blocked_error = next(
+        event for event in blocked if isinstance(event, ErrorEvent)
+    )
+    assert blocked_error.code == "ensemble_provider_admission_timeout"
+    assert blocked_error.request_started is False
+    assert blocked_error.physical_request_count == 0
+    assert blocked_error.usage_missing_count == 0
+    assert blocked_error.ensemble_trace["final_request"]["request_started"] is False
+
+    holder.release()
+    recovered = await _collect(provider)
+    assert fallback.calls == 1
+    assert any(isinstance(event, DoneEvent) for event in recovered)
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if controller.active_leases == 0:
+            break
+    assert controller.active_leases == 0
+
+
+@pytest.mark.asyncio
+async def test_fallback_single_consumer_cancel_releases_admission() -> None:
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    class _BlockingFallback:
+        provider_name = "fallback"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                    yield DoneEvent(model="unreachable")
+                finally:
+                    closed.set()
+
+            return _stream()
+
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=1,
+            provider_default_max_in_flight=1,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=1,
+        )
+    )
+    provider = EnsembleProvider(
+        profile_name="fallback-cancel",
+        proposers=[],
+        aggregator=_member("unused", thinking=None),
+        fallback_provider=_BlockingFallback(),
+        fallback_provider_name="fallback",
+        fallback_model="fallback",
+        all_failed_policy="fallback_single",
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+        _admission_controller=controller,
+    )
+
+    consume = asyncio.create_task(_collect(provider))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    consume.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consume
+    await asyncio.wait_for(closed.wait(), timeout=1)
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if controller.active_leases == 0:
+            break
+    assert controller.active_leases == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_health_is_settled_before_admission_drains_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad = replace(_admission_managed_member("bad"), k=2)
+    good = _admission_managed_member("good")
+    aggregator = _admission_managed_member("agg")
+    registry = _FakeRegistry(
+        {
+            "bad": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="upstream gateway overloaded",
+                        code="503",
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                ]
+            ),
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final answer"),
+                    DoneEvent(model="agg", stop_reason="end_turn"),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=1,
+            provider_default_max_in_flight=1,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=1,
+        )
+    )
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    provider = EnsembleProvider(
+        profile_name="health-before-admission-release",
+        proposers=[bad, good],
+        aggregator=aggregator,
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        aggregator_recovery_mode="off",
+        shuffle_candidates=False,
+        selection_plan=_managed_selection_plan(
+            [bad, good],
+            aggregator,
+        ),
+        _provider_health_ledger=ledger,
+        _admission_controller=controller,
+    )
+
+    events = await _collect(provider)
+
+    assert isinstance(events[-1], DoneEvent)
+    primary_admission_roles = {
+        row["execution"]["admission"]["role"]
+        for row in events[-1].ensemble_trace["candidates"]
+    }
+    assert primary_admission_roles == {"proposer"}
+    assert [call["model"] for call in registry.calls].count("bad") == 1
+    assert ledger.is_benched("fake", "bad")
+    good_facts = ledger.runtime_facts("fake", "good")
+    assert good_facts["recent_successes"] == 1
+    assert good_facts["recent_failures"] == 0
+    aggregator_facts = ledger.runtime_facts("fake", "agg")
+    assert aggregator_facts["recent_successes"] == 1
+    assert aggregator_facts["recent_failures"] == 0
+    assert controller.active_leases == 0
+    assert controller.snapshot()["global_in_flight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_local_proposer_cancellation_releases_health_and_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    gate = asyncio.Event()
+    proposer = replace(
+        _admission_managed_member("cancelled"),
+        runtime_health_never_strand=True,
+    )
+    aggregator = _admission_managed_member("agg")
+    registry = _FakeRegistry(
+        {
+            "cancelled": _FakePlan(
+                [DoneEvent(model="cancelled", stop_reason="end_turn")],
+                gate=gate,
+                started=started,
+            ),
+            "agg": _FakePlan([DoneEvent(model="agg", stop_reason="end_turn")]),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=1,
+            provider_default_max_in_flight=1,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=1,
+        )
+    )
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    ledger.record_failure(
+        "fake",
+        "cancelled",
+        ProviderFailureKind.RATE_LIMITED,
+    )
+    provider = EnsembleProvider(
+        profile_name="cancel-health-and-admission",
+        proposers=[proposer],
+        aggregator=aggregator,
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        aggregator_recovery_mode="off",
+        shuffle_candidates=False,
+        selection_plan=_managed_selection_plan([proposer], aggregator),
+        _provider_health_ledger=ledger,
+        _admission_controller=controller,
+    )
+
+    consume = asyncio.create_task(_collect(provider))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    consume.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consume
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if controller.active_leases == 0:
+            break
+
+    facts = ledger.runtime_facts("fake", "cancelled")
+    assert facts["recent_successes"] == 0
+    assert facts["recent_failures"] == 1
+    assert facts["half_open_inflight"] is False
+    assert ledger.is_benched("fake", "cancelled")
+    assert controller.active_leases == 0
+
+
+@pytest.mark.asyncio
+async def test_natural_eof_is_benched_before_admission_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad = _admission_managed_member("bad-eof")
+    good = _admission_managed_member("good")
+    aggregator = _admission_managed_member("agg")
+    registry = _FakeRegistry(
+        {
+            "bad-eof": _FakePlan([]),
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final answer"),
+                    DoneEvent(model="agg", stop_reason="end_turn"),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=1,
+            provider_default_max_in_flight=1,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=1,
+        )
+    )
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    provider = EnsembleProvider(
+        profile_name="natural-eof-health-before-release",
+        proposers=[bad, good],
+        aggregator=aggregator,
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        aggregator_recovery_mode="off",
+        shuffle_candidates=False,
+        selection_plan=_managed_selection_plan([bad, good], aggregator),
+        _provider_health_ledger=ledger,
+        _admission_controller=controller,
+    )
+
+    events = await _collect(provider)
+
+    assert isinstance(events[-1], DoneEvent)
+    facts = ledger.runtime_facts("fake", "bad-eof")
+    assert facts["last_failure_kind"] == "transport_transient"
+    assert facts["recent_successes"] == 0
+    assert facts["recent_failures"] == 1
+    assert ledger.is_benched("fake", "bad-eof")
+    assert controller.active_leases == 0
+
+
+@pytest.mark.asyncio
+async def test_physical_proposer_timeout_records_health_before_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slow = _admission_managed_member("slow")
+    good = _admission_managed_member("good")
+    aggregator = _admission_managed_member("agg")
+    registry = _FakeRegistry(
+        {
+            "slow": _FakePlan(
+                [DoneEvent(model="slow", stop_reason="end_turn")],
+                delay=0.05,
+            ),
+            "good": _FakePlan(
+                [
+                    TextDeltaEvent(text="complete draft"),
+                    DoneEvent(model="good", stop_reason="end_turn"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final answer"),
+                    DoneEvent(model="agg", stop_reason="end_turn"),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=2,
+            provider_default_max_in_flight=2,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=1,
+        )
+    )
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    provider = EnsembleProvider(
+        profile_name="physical-timeout-health-before-release",
+        proposers=[slow, good],
+        aggregator=aggregator,
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_timeout_seconds=0.01,
+        aggregator_recovery_mode="off",
+        shuffle_candidates=False,
+        selection_plan=_managed_selection_plan([slow, good], aggregator),
+        _provider_health_ledger=ledger,
+        _admission_controller=controller,
+    )
+
+    events = await _collect(provider)
+
+    assert isinstance(events[-1], DoneEvent)
+    facts = ledger.runtime_facts("fake", "slow")
+    assert facts["last_failure_kind"] == "transport_transient"
+    assert facts["recent_successes"] == 0
+    assert facts["recent_failures"] == 1
+    assert ledger.is_benched("fake", "slow")
+    assert controller.active_leases == 0
+
+
+@pytest.mark.asyncio
+async def test_deferred_fallback_close_holds_capacity_until_health_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    order: list[str] = []
+    next_calls = 0
+
+    class _StubbornFallback:
+        provider_name = "fallback"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                try:
+                    while not release.is_set():
+                        try:
+                            await release.wait()
+                        except asyncio.CancelledError:
+                            continue
+                    yield DoneEvent(model="late")
+                finally:
+                    closed.set()
+
+            return _stream()
+
+    class _NextFallback:
+        provider_name = "fallback"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            nonlocal next_calls
+            del messages, tools, config
+            next_calls += 1
+            order.append("next_chat")
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                yield DoneEvent(model="next")
+
+            return _stream()
+
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=1,
+            provider_default_max_in_flight=1,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=1,
+        )
+    )
+
+    def build(fallback: Any, *, health_hook: bool) -> EnsembleProvider:
+        return EnsembleProvider(
+            profile_name="fallback-deferred-close",
+            proposers=[],
+            aggregator=_member("unused", thinking=None),
+            fallback_provider=fallback,
+            fallback_provider_name="fallback",
+            fallback_model="same",
+            all_failed_policy="fallback_single",
+            min_successful_proposers=1,
+            shuffle_candidates=False,
+            _admission_controller=controller,
+            _admission_before_release=(
+                (lambda role: order.append(f"health:{role}"))
+                if health_hook
+                else None
+            ),
+        )
+
+    first = build(_StubbornFallback(), health_hook=True)
+    second = build(_NextFallback(), health_hook=False)
+    first_events = [
+        event
+        async for event in first.chat(
+            [Message(role="user", content="answer")],
+            config=ChatConfig(timeout=0.05),
+        )
+    ]
+    first_error = next(
+        event for event in first_events if isinstance(event, ErrorEvent)
+    )
+    assert first_error.code == "ensemble_fallback_close_timeout"
+    assert controller.active_leases == 1
+
+    second_task = asyncio.create_task(_collect(second))
+    await asyncio.sleep(0.02)
+    assert next_calls == 0
+    assert second_task.done() is False
+
+    release.set()
+    await asyncio.wait_for(closed.wait(), timeout=1)
+    second_events = await asyncio.wait_for(second_task, timeout=1)
+    assert any(isinstance(event, DoneEvent) for event in second_events)
+    assert order[:2] == ["health:fallback_single", "next_chat"]
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if controller.active_leases == 0:
+            break
+    assert controller.active_leases == 0
+    assert controller.snapshot()["global_in_flight"] == 0
+
+
+@pytest.mark.asyncio
 async def test_safe_preoutput_fallback_preserves_tools_messages_and_tool_choice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12798,6 +13633,14 @@ async def test_tool_enabled_partial_quorum_recovers_strict_slot_before_aggregati
     )
     proposers = [_member("p0"), _member("p1")]
     backups = [_member("backup")]
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=2,
+            provider_default_max_in_flight=2,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=1,
+        )
+    )
     provider = EnsembleProvider(
         profile_name="router_dynamic/c2",
         proposers=proposers,
@@ -12816,6 +13659,7 @@ async def test_tool_enabled_partial_quorum_recovers_strict_slot_before_aggregati
             backups,
             max_additional=1,
         ),
+        _admission_controller=controller,
     )
     scope_id = "router-dynamic-tool-strict-quorum-recovery"
     assert provider.begin_provider_retry_scope(
@@ -12854,6 +13698,14 @@ async def test_tool_enabled_partial_quorum_recovers_strict_slot_before_aggregati
     assert aggregator_call["tools"] is not None
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace["successful_proposers"] == 2
+    backup_candidate = next(
+        row
+        for row in done.ensemble_trace["candidates"]
+        if row["requested_model"] == "backup"
+    )
+    assert backup_candidate["execution"]["admission"]["role"] == (
+        "proposer_recovery"
+    )
     assert (
         done.ensemble_trace["proposer_recovery"][
             "strict_quorum_required_for_tools"

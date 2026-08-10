@@ -6783,6 +6783,47 @@ class TurnRunner:
                             session_key=turn.session_key,
                             ranking_config=ranking_config,
                         )
+                        analyzer_admission_controller = None
+                        analyzer_admission_deadline = None
+                        admission_config = getattr(
+                            ensemble_cfg,
+                            "admission",
+                            None,
+                        )
+                        if (
+                            str(
+                                getattr(
+                                    ensemble_cfg,
+                                    "latency_class",
+                                    "normal",
+                                )
+                                or "normal"
+                            )
+                            != "experiment"
+                            and admission_config is not None
+                            and bool(
+                                getattr(
+                                    admission_config,
+                                    "enabled",
+                                    True,
+                                )
+                            )
+                        ):
+                            from opensquilla.provider.admission import (
+                                get_shared_provider_admission_controller,
+                                provider_admission_settings_from_config,
+                            )
+
+                            analyzer_admission_controller = (
+                                get_shared_provider_admission_controller(
+                                    provider_admission_settings_from_config(
+                                        admission_config
+                                    )
+                                )
+                            )
+                            analyzer_admission_deadline = time.monotonic() + float(
+                                analyzer_policy["timeout_seconds"]
+                            )
                         task_analysis = await analyze_task_with_provider(
                             provider=analyzer_provider,
                             message=turn.semantic_message,
@@ -6796,6 +6837,10 @@ class TurnRunner:
                             analyzer_model_id=analyzer_model_id,
                             ranking_config=ranking_config,
                             decision_id=ensemble_decision_id,
+                            admission_controller=(
+                                analyzer_admission_controller
+                            ),
+                            admission_deadline=analyzer_admission_deadline,
                         )
                         ranking_inputs = {
                             "decision_id": ensemble_decision_id,

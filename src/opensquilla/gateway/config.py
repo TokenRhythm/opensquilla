@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import threading
 import warnings
@@ -459,6 +460,89 @@ class LlmEnsembleCandidateConfig(BaseModel):
         return self
 
 
+class LlmEnsembleAdmissionConfig(BaseModel):
+    """Runtime-only cross-turn capacity limits for physical ensemble calls."""
+
+    enabled: bool = True
+    global_max_in_flight: int = Field(default=24, ge=1, le=1024)
+    provider_default_max_in_flight: int = Field(default=8, ge=1, le=1024)
+    deployment_default_max_in_flight: int = Field(default=4, ge=1, le=1024)
+    queue_timeout_seconds: float = Field(default=5.0, gt=0.0, le=3600.0)
+    provider_limits: dict[str, int] = Field(default_factory=dict)
+    deployment_limits: dict[str, int] = Field(default_factory=dict)
+    deployment_weights: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator(
+        "global_max_in_flight",
+        "provider_default_max_in_flight",
+        "deployment_default_max_in_flight",
+        mode="before",
+    )
+    @classmethod
+    def _validate_capacity(cls, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("admission capacities must be positive integers")
+        return value
+
+    @field_validator("queue_timeout_seconds", mode="before")
+    @classmethod
+    def _validate_queue_timeout(cls, value: object) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(
+                "admission queue_timeout_seconds must be finite and numeric"
+            )
+        return float(value)
+
+    @field_validator("provider_limits", mode="before")
+    @classmethod
+    def _normalize_provider_limits(cls, value: object) -> dict[str, int]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError("provider_limits must be an object")
+        normalized: dict[str, int] = {}
+        for raw_key, raw_limit in value.items():
+            key = str(raw_key or "").strip().casefold()
+            if not key:
+                raise ValueError("provider_limits keys must be non-empty")
+            if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+                raise ValueError("provider_limits values must be positive integers")
+            if raw_limit <= 0:
+                raise ValueError("provider_limits values must be positive integers")
+            normalized[key] = raw_limit
+        return normalized
+
+    @field_validator("deployment_limits", "deployment_weights", mode="before")
+    @classmethod
+    def _normalize_deployment_values(cls, value: object) -> dict[str, int]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError("deployment admission values must be an object")
+        normalized: dict[str, int] = {}
+        for raw_key, raw_limit in value.items():
+            key = str(raw_key or "").strip().casefold()
+            provider, separator, model = key.partition("/")
+            if not separator or not provider or not model:
+                raise ValueError(
+                    "deployment admission keys must use '<provider>/<model>'"
+                )
+            if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+                raise ValueError(
+                    "deployment admission values must be positive integers"
+                )
+            if raw_limit <= 0:
+                raise ValueError(
+                    "deployment admission values must be positive integers"
+                )
+            normalized[f"{provider}/{model}"] = raw_limit
+        return normalized
+
+
 class LlmEnsembleConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_LLM_ENSEMBLE_",
@@ -517,6 +601,12 @@ class LlmEnsembleConfig(BaseSettings):
     # bounds, so benchmark configurations keep their frozen role budgets.
     latency_class: Literal["interactive", "normal", "batch", "experiment"] = (
         "normal"
+    )
+    # Process-local runtime backpressure. Experiment latency class and all
+    # non-dynamic/static modes deliberately bypass it so frozen DRACO/replay
+    # scheduling remains byte-for-byte compatible.
+    admission: LlmEnsembleAdmissionConfig = Field(
+        default_factory=LlmEnsembleAdmissionConfig
     )
     # Serving stops after the first useful recovery action to protect
     # interactive latency. Experiment mode exhausts the frozen Top-3

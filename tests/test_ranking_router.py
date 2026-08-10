@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from typing import Any
@@ -15,6 +16,10 @@ from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
     UsageExecutionContext,
     bind_usage_accounting_scope,
+)
+from opensquilla.provider.admission import (
+    ProviderAdmissionController,
+    ProviderAdmissionSettings,
 )
 from opensquilla.provider.ranking_router import (
     CAPABILITIES,
@@ -2507,6 +2512,225 @@ async def test_task_analyzer_uses_provider_interface_and_validates_json() -> Non
     assert analyzer_payload["allowed_session_intents"] == ["new_task", "continue", "redo"]
     # The profile never reaches the analyzer provider, even when one is supplied.
     assert "user_profile" not in analyzer_payload
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_admission_timeout_is_zero_request_fallback() -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=1,
+            provider_default_max_in_flight=1,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=0.01,
+        )
+    )
+    holder = await controller.acquire(
+        provider=TASK_ANALYZER_PROVIDER_ID,
+        model=TASK_ANALYZER_MODEL_ID,
+        role="analyzer",
+    )
+    try:
+        result = await analyze_task_with_provider(
+            provider=provider,
+            message="implement a parser",
+            user_profile_enabled=False,
+            request_context=_context(),
+            routed_tier="c1",
+            routing_confidence=0.8,
+            analyzer_provider_id=TASK_ANALYZER_PROVIDER_ID,
+            analyzer_model_id=TASK_ANALYZER_MODEL_ID,
+            admission_controller=controller,
+            admission_deadline=time.monotonic() + 1,
+        )
+    finally:
+        holder.release()
+
+    assert result.source == "router_fallback"
+    assert result.schema_valid is False
+    assert result.fallback_reason == "ProviderAdmissionTimeoutError"
+    assert result.usage["attempt_count"] == 0
+    assert result.usage["physical_attempts"] == []
+    assert provider.calls == []
+    assert controller.active_leases == 0
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_late_admission_grant_never_starts_request() -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+
+    class _LateLease:
+        wait_ms = 2
+        weight = 1
+
+        def __init__(self) -> None:
+            self.released = False
+
+        def release(self) -> None:
+            self.released = True
+
+    class _LateController:
+        def __init__(self) -> None:
+            self.lease = _LateLease()
+
+        async def acquire(self, **_: object) -> _LateLease:
+            await asyncio.sleep(0.002)
+            return self.lease
+
+    controller = _LateController()
+    result = await analyze_task_with_provider(
+        provider=provider,
+        message="implement a parser",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c1",
+        routing_confidence=0.8,
+        analyzer_provider_id=TASK_ANALYZER_PROVIDER_ID,
+        analyzer_model_id=TASK_ANALYZER_MODEL_ID,
+        admission_controller=controller,
+        admission_deadline=time.monotonic() + 0.001,
+    )
+
+    assert result.source == "router_fallback"
+    assert result.fallback_reason == "ProviderAdmissionTimeoutError"
+    assert result.usage["attempt_count"] == 0
+    assert provider.calls == []
+    assert controller.lease.released is True
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_absolute_deadline_covers_queue_stream_and_chain() -> None:
+    class _SlowProvider:
+        accounts_physical_usage = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.configs: list[ChatConfig] = []
+            self.closed = asyncio.Event()
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools
+            self.calls += 1
+            assert config is not None
+            self.configs.append(config)
+
+            async def _stream() -> AsyncIterator[Any]:
+                try:
+                    await asyncio.sleep(10)
+                    yield DoneEvent(model="unreachable")
+                finally:
+                    self.closed.set()
+
+            return _stream()
+
+    first = _SlowProvider()
+    second = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    third = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=1,
+            provider_default_max_in_flight=1,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=1,
+        )
+    )
+    holder = await controller.acquire(
+        provider="holder",
+        model="holder",
+        role="another_turn",
+    )
+
+    async def delayed_release() -> None:
+        await asyncio.sleep(0.015)
+        holder.release()
+
+    release_task = asyncio.create_task(delayed_release())
+    started = time.monotonic()
+    absolute_deadline = started + 0.05
+    result = await analyze_task_with_fallback_chain(
+        candidates=_task_analyzer_chain_candidates([first, second, third]),
+        message="classify this task",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        timeout_seconds=1,
+        admission_controller=controller,
+        admission_deadline=absolute_deadline,
+    )
+    elapsed = time.monotonic() - started
+    await release_task
+
+    assert elapsed < 0.12
+    assert first.calls == 1
+    assert first.closed.is_set() is True
+    assert first.configs[0].timeout < 0.05
+    assert second.calls == []
+    assert third.calls == []
+    assert result.source == "router_fallback"
+    assert result.fallback_reason == "TaskAnalyzerAbsoluteDeadlineError"
+    assert result.usage["attempt_count"] == 1
+    assert len(result.usage["physical_attempts"]) == 1
+    assert result.trace()["chain"]["exhausted"] is False
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if controller.active_leases == 0:
+            break
+    assert controller.active_leases == 0
+
+
+@pytest.mark.asyncio
+async def test_task_analyzer_pre_stream_retry_releases_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    controller = ProviderAdmissionController(
+        ProviderAdmissionSettings(
+            global_max_in_flight=1,
+            provider_default_max_in_flight=1,
+            deployment_default_max_in_flight=1,
+            queue_timeout_seconds=0.05,
+        )
+    )
+    config = load_ranking_config()
+    config["task_analyzer"]["max_retries"] = 1
+    original_model_copy = ChatConfig.model_copy
+    projection_calls = 0
+
+    def flaky_model_copy(
+        self: ChatConfig,
+        *args: Any,
+        **kwargs: Any,
+    ) -> ChatConfig:
+        nonlocal projection_calls
+        projection_calls += 1
+        if projection_calls == 1:
+            raise ValueError("synthetic config projection failure")
+        return original_model_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(ChatConfig, "model_copy", flaky_model_copy)
+    result = await analyze_task_with_provider(
+        provider=provider,
+        message="classify this task",
+        user_profile_enabled=False,
+        request_context=_context(),
+        routed_tier="c2",
+        routing_confidence=0.77,
+        ranking_config=config,
+        admission_controller=controller,
+        admission_deadline=time.monotonic() + 0.2,
+    )
+
+    assert result.source == "llm_provider"
+    assert len(provider.calls) == 1
+    assert controller.active_leases == 0
+    assert controller.snapshot()["total_acquired"] == 2
+    assert controller.snapshot()["total_released"] == 2
 
 
 @pytest.mark.asyncio

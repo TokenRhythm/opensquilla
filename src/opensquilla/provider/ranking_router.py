@@ -15,8 +15,9 @@ import hashlib
 import json
 import math
 import re
+import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import cache
 from importlib import resources
@@ -24,6 +25,13 @@ from typing import Any
 
 import structlog
 
+from .admission import (
+    ProviderAdmissionController,
+    ProviderAdmissionError,
+    ProviderAdmissionLease,
+    ProviderAdmissionLeaseGuard,
+    ProviderAdmissionTimeoutError,
+)
 from .protocol import LLMProvider
 from .thinking_execution import THINKING_PHYSICAL_EVIDENCE_SCHEMA
 from .types import ChatConfig, DoneEvent, ErrorEvent, Message, TextDeltaEvent
@@ -224,6 +232,11 @@ class TaskAnalyzerStreamCleanupError(RuntimeError):
 
 class TaskAnalyzerPhysicalEvidenceError(TaskAnalyzerStreamCleanupError):
     """Raised when analyzer physical-request evidence is contradictory."""
+
+
+_TASK_ANALYZER_ABSOLUTE_DEADLINE_REASON = (
+    "TaskAnalyzerAbsoluteDeadlineError"
+)
 
 
 class _ValidatedRankingConfig(dict[str, Any]):
@@ -3947,6 +3960,9 @@ async def _bounded_close_task_analyzer_stream(
     *,
     timeout_seconds: float,
     require_aclose: bool,
+    pending_cleanup_tracker: (
+        Callable[[asyncio.Future[Any], str], None] | None
+    ) = None,
 ) -> bool:
     """Close an analyzer stream without allowing provider cleanup to block routing."""
 
@@ -3957,6 +3973,8 @@ async def _bounded_close_task_analyzer_stream(
         close_task = asyncio.ensure_future(aclose())
     except Exception:
         return False
+    if pending_cleanup_tracker is not None:
+        pending_cleanup_tracker(close_task, "task_analyzer_stream_close")
     try:
         done, _ = await asyncio.wait(
             {close_task},
@@ -3992,6 +4010,9 @@ async def analyze_task_with_provider(
     analyzer_model_id: str = "",
     ranking_config: Mapping[str, Any] | None = None,
     decision_id: str = "",
+    admission_controller: ProviderAdmissionController | None = None,
+    admission_deadline: float | None = None,
+    admission_before_release: Callable[[str], None] | None = None,
     _attempt: int = 1,
     _retry_feedback: str = "",
     _accumulated_usage: Mapping[str, Any] | None = None,
@@ -4148,6 +4169,9 @@ async def analyze_task_with_provider(
     count_current_request = True
     accounting_override: dict[str, Any] | None = None
     normalization_issues: list[str] = []
+    admission_lease: ProviderAdmissionLease | None = None
+    admission_guard: ProviderAdmissionLeaseGuard | None = None
+    attempt_timeout = effective_timeout
     try:
         analyzer_messages = [
             Message(role="user", content=json.dumps(analyzer_input, ensure_ascii=True))
@@ -4172,26 +4196,110 @@ async def analyze_task_with_provider(
             provider_usage_receipt_rows,
         )
 
-        stream = (
-            provider.chat(analyzer_messages, tools=None, config=analyzer_config)
-            if provider_accounts_physical_usage(provider)
-            else account_provider_stream(
-                lambda: provider.chat(
-                    analyzer_messages,
-                    tools=None,
-                    config=analyzer_config,
-                ),
-                provider=provider_id,
-                model=model_id,
+        if admission_controller is not None:
+            try:
+                admission_lease = await admission_controller.acquire(
+                    provider=provider_id,
+                    model=model_id,
+                    role="analyzer",
+                    absolute_deadline=admission_deadline,
+                )
+                admission_guard = ProviderAdmissionLeaseGuard(
+                    admission_lease,
+                    before_release=(
+                        (lambda: admission_before_release("analyzer"))
+                        if admission_before_release is not None
+                        else None
+                    ),
+                )
+                log.debug(
+                    "llm_ensemble.router_dynamic.task_analyzer_admitted",
+                    decision_id=decision_id,
+                    wait_ms=admission_lease.wait_ms,
+                    weight=admission_lease.weight,
+                )
+                # A grant at the deadline boundary is still not permission to
+                # start a physical request. Release the zero-request lease and
+                # fail open to the normal Analyzer fallback without retrying.
+                if (
+                    admission_deadline is not None
+                    and time.monotonic() >= admission_deadline
+                ):
+                    wait_ms = admission_lease.wait_ms
+                    admission_guard.finish()
+                    admission_guard = None
+                    admission_lease = None
+                    count_current_request = False
+                    raise ProviderAdmissionTimeoutError(
+                        role="analyzer",
+                        provider=provider_id,
+                        model=model_id,
+                        wait_ms=wait_ms,
+                    )
+            except ProviderAdmissionError as exc:
+                count_current_request = False
+                log.info(
+                    "llm_ensemble.router_dynamic.task_analyzer_admission_rejected",
+                    decision_id=decision_id,
+                    code=exc.code,
+                    wait_ms=exc.wait_ms,
+                )
+                raise
+        if admission_deadline is not None:
+            remaining_to_deadline = admission_deadline - time.monotonic()
+            if remaining_to_deadline <= 0:
+                count_current_request = False
+                raise ProviderAdmissionTimeoutError(
+                    role="analyzer",
+                    provider=provider_id,
+                    model=model_id,
+                    wait_ms=(admission_lease.wait_ms if admission_lease else 0),
+                )
+            attempt_timeout = min(effective_timeout, remaining_to_deadline)
+            analyzer_config = analyzer_config.model_copy(
+                update={"timeout": attempt_timeout}
             )
-        )
+        try:
+            stream = (
+                provider.chat(analyzer_messages, tools=None, config=analyzer_config)
+                if provider_accounts_physical_usage(provider)
+                else account_provider_stream(
+                    lambda: provider.chat(
+                        analyzer_messages,
+                        tools=None,
+                        config=analyzer_config,
+                    ),
+                    provider=provider_id,
+                    model=model_id,
+                )
+            )
+        except BaseException:
+            if admission_guard is not None:
+                admission_guard.finish()
+                admission_guard = None
+            elif admission_lease is not None:
+                admission_lease.release()
+            if admission_lease is not None:
+                admission_lease = None
+            raise
         text_parts: list[str] = []
         total_chars = 0
         got_done = False
         terminal_observed = False
         stream_exhausted = False
         try:
-            async with asyncio.timeout(effective_timeout):
+            iteration_timeout = attempt_timeout
+            if admission_deadline is not None:
+                remaining_to_deadline = (
+                    admission_deadline - time.monotonic()
+                )
+                if remaining_to_deadline <= 0:
+                    raise TimeoutError
+                iteration_timeout = min(
+                    iteration_timeout,
+                    remaining_to_deadline,
+                )
+            async with asyncio.timeout(iteration_timeout):
                 async for event in stream:
                     if isinstance(event, TextDeltaEvent):
                         total_chars += len(event.text)
@@ -4377,13 +4485,32 @@ async def analyze_task_with_provider(
         finally:
             close_timeout = min(
                 float(configured_policy["stream_close_timeout_seconds"]),
-                max(0.0, effective_timeout),
+                max(0.0, attempt_timeout),
             )
-            closed = await _bounded_close_task_analyzer_stream(
-                stream,
-                timeout_seconds=close_timeout,
-                require_aclose=not (terminal_observed or stream_exhausted),
-            )
+            if admission_deadline is not None:
+                close_timeout = min(
+                    close_timeout,
+                    max(0.0, admission_deadline - time.monotonic()),
+                )
+            try:
+                closed = await _bounded_close_task_analyzer_stream(
+                    stream,
+                    timeout_seconds=close_timeout,
+                    require_aclose=not (terminal_observed or stream_exhausted),
+                    pending_cleanup_tracker=(
+                        admission_guard.track_cleanup
+                        if admission_guard is not None
+                        else None
+                    ),
+                )
+            finally:
+                if admission_guard is not None:
+                    admission_guard.finish()
+                    admission_guard = None
+                elif admission_lease is not None:
+                    admission_lease.release()
+                if admission_lease is not None:
+                    admission_lease = None
             if not closed:
                 log.warning(
                     "llm_ensemble.router_dynamic.task_analyzer_stream_close_failed",
@@ -4424,7 +4551,27 @@ async def analyze_task_with_provider(
         )
         raise
     except Exception as exc:  # noqa: BLE001 - analysis must fail open to a safe profile
-        reason = type(exc).__name__
+        # A failure after admission but before the stream-specific finalizer
+        # (for example request-config projection) must not hold capacity while
+        # a retry waits on the same controller. Deferred stream cleanup has
+        # already transferred ownership and cleared these local references.
+        if admission_guard is not None:
+            admission_guard.finish()
+            admission_guard = None
+        elif admission_lease is not None:
+            admission_lease.release()
+        if admission_lease is not None:
+            admission_lease = None
+        absolute_deadline_exhausted = bool(
+            admission_deadline is not None
+            and time.monotonic() >= admission_deadline
+        )
+        reason = (
+            _TASK_ANALYZER_ABSOLUTE_DEADLINE_REASON
+            if absolute_deadline_exhausted
+            and not isinstance(exc, ProviderAdmissionError)
+            else type(exc).__name__
+        )
         accumulated_usage = (
             _task_analyzer_zero_request_usage(_accumulated_usage)
             if not count_current_request
@@ -4438,7 +4585,11 @@ async def analyze_task_with_provider(
                 unknown_reason=reason,
             )
         )
-        if _attempt <= analyzer_max_retries:
+        if (
+            _attempt <= analyzer_max_retries
+            and not isinstance(exc, ProviderAdmissionError)
+            and not absolute_deadline_exhausted
+        ):
             log.warning(
                 "llm_ensemble.router_dynamic.task_analyzer_retry",
                 decision_id=decision_id,
@@ -4466,6 +4617,9 @@ async def analyze_task_with_provider(
                 analyzer_model_id=configured_model_id,
                 ranking_config=effective_config,
                 decision_id=decision_id,
+                admission_controller=admission_controller,
+                admission_deadline=admission_deadline,
+                admission_before_release=admission_before_release,
                 _attempt=_attempt + 1,
                 _retry_feedback=reason,
                 _accumulated_usage=accumulated_usage,
@@ -4496,6 +4650,16 @@ async def analyze_task_with_provider(
             model_id=model_id,
             normalization_warnings=tuple(normalization_issues),
         )
+    finally:
+        # Cover pre-stream failures (for example config projection) as well as
+        # the normal close path. ``finish`` is idempotent and transfers the
+        # lease to any still-running close proof registered above.
+        if admission_guard is not None:
+            admission_guard.finish()
+            admission_guard = None
+        elif admission_lease is not None:
+            admission_lease.release()
+            admission_lease = None
 
     usage = _merge_task_analyzer_attempt(
         _accumulated_usage,
@@ -4624,6 +4788,9 @@ async def analyze_task_with_fallback_chain(
     session_key: str | None = None,
     ranking_config: Mapping[str, Any] | None = None,
     decision_id: str = "",
+    admission_controller: ProviderAdmissionController | None = None,
+    admission_deadline: float | None = None,
+    admission_before_release: Callable[[str], None] | None = None,
 ) -> TaskAnalysisResult:
     """Try each resolved Analyzer candidate once, in caller-declared order.
 
@@ -4678,6 +4845,9 @@ async def analyze_task_with_fallback_chain(
             analyzer_model_id=candidate.model_id,
             ranking_config=candidate_config,
             decision_id=decision_id,
+            admission_controller=admission_controller,
+            admission_deadline=admission_deadline,
+            admission_before_release=admission_before_release,
             _accumulated_usage=accumulated_usage,
             _allow_provider_stream_fallback=False,
         )
@@ -4712,6 +4882,18 @@ async def analyze_task_with_fallback_chain(
                 usage=copy.deepcopy(accumulated_usage),
                 chain_trace=chain_trace(
                     selected_index=candidate_index,
+                    exhausted=False,
+                ),
+            )
+        if (
+            admission_deadline is not None
+            and time.monotonic() >= admission_deadline
+        ):
+            return replace(
+                result,
+                usage=copy.deepcopy(accumulated_usage),
+                chain_trace=chain_trace(
+                    selected_index=None,
                     exhausted=False,
                 ),
             )

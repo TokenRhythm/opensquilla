@@ -47,6 +47,11 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.aggregator_timeout_seconds == 3600.0
     assert ensemble.aggregator_serving_chain_timeout_seconds == 120.0
     assert ensemble.latency_class == "normal"
+    assert ensemble.admission.enabled is True
+    assert ensemble.admission.global_max_in_flight == 24
+    assert ensemble.admission.provider_default_max_in_flight == 8
+    assert ensemble.admission.deployment_default_max_in_flight == 4
+    assert ensemble.admission.queue_timeout_seconds == 5.0
     assert ensemble.shuffle_candidates is True
     assert ensemble.candidate_order_seed is None
     assert ensemble.record_candidates is False
@@ -78,10 +83,66 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.aggregator_serving_chain_timeout_seconds == 120.0
     assert provider.latency_class == "normal"
+    assert provider._admission_settings is None
     assert provider.shuffle_candidates is False
     assert provider.candidate_order_seed is None
     assert provider.quorum_grace_seconds == 10.0
     assert provider._provider_health_ledger is None
+
+
+def test_llm_ensemble_admission_normalizes_runtime_limit_keys() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "admission": {
+                "global_max_in_flight": 12,
+                "provider_limits": {" OpenRouter ": 5},
+                "deployment_limits": {"OpenRouter/Anthropic/Claude": 3},
+                "deployment_weights": {"OpenRouter/Anthropic/Claude": 2},
+            }
+        }
+    )
+
+    admission = cfg.llm_ensemble.admission
+    assert admission.global_max_in_flight == 12
+    assert admission.provider_limits == {"openrouter": 5}
+    assert admission.deployment_limits == {"openrouter/anthropic/claude": 3}
+    assert admission.deployment_weights == {"openrouter/anthropic/claude": 2}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("provider_limits", {"openrouter": 0}),
+        ("deployment_limits", {"missing-model": 1}),
+        ("deployment_weights", {"openrouter/model": True}),
+    ],
+)
+def test_llm_ensemble_rejects_invalid_admission_limits(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="admission|positive|provider_limits"):
+        GatewayConfig(llm_ensemble={"admission": {field: value}})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("global_max_in_flight", True),
+        ("provider_default_max_in_flight", 2.5),
+        ("deployment_default_max_in_flight", "4"),
+        ("queue_timeout_seconds", True),
+        ("queue_timeout_seconds", "5"),
+        ("queue_timeout_seconds", float("nan")),
+        ("queue_timeout_seconds", float("inf")),
+    ],
+)
+def test_llm_ensemble_rejects_coerced_or_nonfinite_admission_scalars(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="admission|finite|integer"):
+        GatewayConfig(llm_ensemble={"admission": {field: value}})
 
 
 @pytest.mark.parametrize("seed", [0, (1 << 64) - 1])
@@ -220,6 +281,22 @@ def test_router_dynamic_runtime_validates_actual_ranking_input_chain() -> None:
 
     assert provider.selection_plan["aggregator_recovery_top_k"] == 2
     assert len(provider.selection_plan["aggregator_candidates"]) == 2
+    assert provider._admission_settings is not None
+    assert provider._admission_settings.global_max_in_flight == 24
+
+    cfg.llm_ensemble.latency_class = "experiment"
+    experiment_provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c1", "routing_confidence": 0.9},
+        ranking_inputs={"ranking_config": actual_ranking_config},
+    )
+    assert experiment_provider._admission_settings is None
 
 
 def test_llm_ensemble_proposer_recovery_can_be_explicitly_disabled() -> None:

@@ -32,6 +32,16 @@ from opensquilla.usage_evidence import (
     is_missing_usage_placeholder,
 )
 
+from .admission import (
+    ProviderAdmissionController,
+    ProviderAdmissionError,
+    ProviderAdmissionLease,
+    ProviderAdmissionLeaseGuard,
+    ProviderAdmissionSettings,
+    ProviderAdmissionTimeoutError,
+    get_shared_provider_admission_controller,
+    provider_admission_settings_from_config,
+)
 from .anthropic import uses_adaptive_thinking
 from .deployment import (
     CredentialPoolAcquirer,
@@ -376,6 +386,10 @@ class _EnsembleStreamCloseError(RuntimeError):
     def __init__(self, phase: str) -> None:
         self.phase = phase
         super().__init__(f"{phase} stream did not close within the cleanup window")
+
+
+class _EnsemblePreDispatchDeadlineError(TimeoutError):
+    """The absolute budget expired after admission but before provider chat."""
 
 
 @dataclass
@@ -896,10 +910,19 @@ async def _provider_events_with_error_boundary(
     cleanup_deadline: float | None = None,
     dispatch_deadline: float | None = None,
     deadline_code: str = _ENSEMBLE_PROPOSER_PHASE_DEADLINE_CODE,
+    admission_controller: ProviderAdmissionController | None = None,
+    admission_role: str = "proposer",
+    on_admission: Callable[[ProviderAdmissionLease], None] | None = None,
+    before_request_dispatch: Callable[[], ErrorEvent | None] | None = None,
+    on_stream_close: Callable[[bool], None] | None = None,
+    on_local_cancellation: Callable[[], None] | None = None,
+    before_admission_release: Callable[[], None] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """Convert direct provider exceptions into normal terminal error evidence."""
 
     request_started = False
+    admission_lease: ProviderAdmissionLease | None = None
+    admission_guard: ProviderAdmissionLeaseGuard | None = None
     try:
         if (
             dispatch_deadline is not None
@@ -915,6 +938,43 @@ async def _provider_events_with_error_boundary(
                 physical_request_count=0,
             )
             return
+        if admission_controller is not None:
+            try:
+                admission_lease = await admission_controller.acquire(
+                    provider=provider_config.provider,
+                    model=provider_config.model,
+                    role=admission_role,
+                    absolute_deadline=dispatch_deadline,
+                )
+                admission_guard = ProviderAdmissionLeaseGuard(
+                    admission_lease,
+                    pending_cleanup_tracker=pending_cleanup_tracker,
+                    before_release=before_admission_release,
+                )
+                if on_admission is not None:
+                    on_admission(admission_lease)
+            except ProviderAdmissionError as exc:
+                yield ErrorEvent(
+                    message=str(exc),
+                    code=f"ensemble_{exc.code}",
+                    request_started=False,
+                    physical_request_count=0,
+                    ensemble_trace={
+                        "admission": {
+                            "role": admission_role,
+                            "outcome": "timeout"
+                            if isinstance(exc, ProviderAdmissionTimeoutError)
+                            else "rejected",
+                            "wait_ms": exc.wait_ms,
+                        }
+                    },
+                )
+                return
+        if before_request_dispatch is not None:
+            dispatch_error = before_request_dispatch()
+            if dispatch_error is not None:
+                yield dispatch_error
+                return
         provider = _build_provider(provider_config)
         if (
             dispatch_deadline is not None
@@ -936,13 +996,22 @@ async def _provider_events_with_error_boundary(
         async with _closing_async_iterator(
             raw_stream,
             phase=phase,
-            pending_cleanup_tracker=pending_cleanup_tracker,
+            pending_cleanup_tracker=(
+                admission_guard.track_cleanup
+                if admission_guard is not None
+                else pending_cleanup_tracker
+            ),
             terminal_observed=terminal_observed,
+            close_observed=on_stream_close,
             cleanup_deadline=cleanup_deadline,
         ) as provider_stream:
             async for event in provider_stream:
                 yield event
-    except (asyncio.CancelledError, _EnsembleStreamCloseError):
+    except (GeneratorExit, asyncio.CancelledError):
+        if on_local_cancellation is not None and not terminal_observed():
+            on_local_cancellation()
+        raise
+    except _EnsembleStreamCloseError:
         raise
     except Exception as exc:  # noqa: BLE001 - normalize provider boundary failures
         yield ErrorEvent(
@@ -958,6 +1027,11 @@ async def _provider_events_with_error_boundary(
             request_started=request_started,
             physical_request_count=1 if request_started else 0,
         )
+    finally:
+        if admission_guard is not None:
+            admission_guard.finish()
+        elif admission_lease is not None:
+            admission_lease.release()
 
 
 @dataclass(frozen=True)
@@ -1217,6 +1291,18 @@ class _CandidateResult:
     # the physical-call finalizer can release the exact lease it acquired.
     runtime_health_admission: dict[str, Any] = field(
         default_factory=dict,
+        repr=False,
+    )
+    runtime_health_settlement_deferred: bool = field(
+        default=False,
+        repr=False,
+    )
+    runtime_health_local_cancellation: bool = field(
+        default=False,
+        repr=False,
+    )
+    runtime_health_physical_timeout_cancellation: bool = field(
+        default=False,
         repr=False,
     )
     usage_reported: bool = False
@@ -4039,6 +4125,9 @@ class EnsembleProvider:
         | None = None,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
         _provider_health_ledger: Any | None = None,
+        _admission_controller: ProviderAdmissionController | None = None,
+        _admission_settings: ProviderAdmissionSettings | None = None,
+        _admission_before_release: Callable[[str], None] | None = None,
     ) -> None:
         self.profile_name = profile_name
         self.proposers = [
@@ -4072,6 +4161,9 @@ class EnsembleProvider:
         self._current_absolute_deadline: float | None = None
         self._current_proposer_phase_deadline: float | None = None
         self._current_proposer_dispatch_deadline: float | None = None
+        self._admission_controller = _admission_controller
+        self._admission_settings = _admission_settings
+        self._admission_before_release = _admission_before_release
         self.candidate_max_chars = int(candidate_max_chars or 0)
         self.shuffle_candidates = bool(shuffle_candidates)
         if (
@@ -4876,6 +4968,17 @@ class EnsembleProvider:
 
         future.add_done_callback(_cleanup_finished)
 
+    def _before_admission_release(self, role: str) -> None:
+        """Run health/benchmark observation before capacity can drain.
+
+        P0-4 composes its deployment-health write through this hook. Keeping
+        it immediately ahead of ``lease.release`` prevents the next waiter
+        from starting before the failed request is visible to routing health.
+        """
+
+        if self._admission_before_release is not None:
+            self._admission_before_release(role)
+
     def _cleanup_is_pending(self) -> bool:
         # Leave completed futures in the set until their registered callback
         # observes the result and applies close-failure poisoning.  Removing a
@@ -5465,8 +5568,24 @@ class EnsembleProvider:
         admission = result.runtime_health_admission
         if not isinstance(admission, Mapping) or admission.get("tracked") is not True:
             return
+        if admission.get("settled") is True:
+            return
+        if isinstance(admission, dict):
+            admission["settled"] = True
+        health_latency_ms = float(result.elapsed_ms)
+        health_started_at = admission.get("started_at")
+        if (
+            not isinstance(health_started_at, bool)
+            and isinstance(health_started_at, (int, float))
+            and math.isfinite(float(health_started_at))
+            and 0 <= float(health_started_at) <= time.monotonic()
+        ):
+            health_latency_ms = (
+                time.monotonic() - float(health_started_at)
+            ) * 1000
         local_failure = bool(
-            result.execution.get("scheduler_cancellation") is True
+            result.runtime_health_local_cancellation
+            or result.execution.get("scheduler_cancellation") is True
             or result.error_code
             in {
                 "candidate_mode_contract_violation",
@@ -5486,7 +5605,7 @@ class EnsembleProvider:
                 member,
                 admission,
                 success=True,
-                latency_ms=result.elapsed_ms,
+                latency_ms=health_latency_ms,
             )
             return
         message = result.error or "provider stream cleanup did not complete"
@@ -5498,7 +5617,7 @@ class EnsembleProvider:
             message=message,
             code=code,
             retry_after_s=result.retry_after_s,
-            latency_ms=result.elapsed_ms,
+            latency_ms=health_latency_ms,
         )
 
     def _member_request_budget_binding(
@@ -6823,6 +6942,15 @@ class EnsembleProvider:
         *,
         accounting_state: _UsageAccountingSnapshotState,
     ) -> AsyncIterator[StreamEvent]:
+        if (
+            self._admission_controller is None
+            and self._admission_settings is not None
+        ):
+            self._admission_controller = (
+                get_shared_provider_admission_controller(
+                    self._admission_settings
+                )
+            )
         if self._active_chat:
             yield ErrorEvent(
                 message="another ensemble call is still active",
@@ -9714,6 +9842,7 @@ class EnsembleProvider:
                     )
                     else "proposer_phase"
                 ),
+                is_recovery_attempt=True,
             )
         except BaseException:
             physical_attempts = (
@@ -11367,6 +11496,7 @@ class EnsembleProvider:
             "proposer_phase",
             "soft_deadline",
         ] = "proposer_phase",
+        is_recovery_attempt: bool = False,
     ) -> _CandidateResult:
         cfg = member.provider_config
         started = time.monotonic()
@@ -11459,6 +11589,7 @@ class EnsembleProvider:
                     cleanup_deadline=cleanup_deadline,
                     dispatch_deadline=absolute_deadline,
                     deadline_trigger=deadline_trigger,
+                    is_recovery_attempt=is_recovery_attempt,
                 )
             )
             try:
@@ -11471,6 +11602,23 @@ class EnsembleProvider:
                         timeout=effective_timeout_seconds,
                     )
                     if not done:
+                        deadline_exhausted = bool(
+                            absolute_deadline is not None
+                            and time.monotonic() >= absolute_deadline
+                        )
+                        if not deadline_exhausted:
+                            # This is the member's configured physical timeout,
+                            # not a local phase/quorum cancellation. Publish the
+                            # classification before cancellation can release the
+                            # admission and health leases.
+                            result.runtime_health_physical_timeout_cancellation = (
+                                True
+                            )
+                            result.error = (
+                                "proposer timed out after "
+                                f"{effective_timeout_seconds:g}s"
+                            )
+                            result.error_code = "timeout"
                         self._track_pending_cleanup(
                             inner_task,
                             f"proposer_{index}_timeout",
@@ -11552,6 +11700,7 @@ class EnsembleProvider:
                         pass
                 raise
         except asyncio.CancelledError:
+            result.runtime_health_local_cancellation = True
             current_task = asyncio.current_task()
             code = str(getattr(current_task, "_opensquilla_ensemble_cancel_code", "") or "")
             if not code:
@@ -11607,7 +11756,8 @@ class EnsembleProvider:
                     deepcopy(thinking_fallback_bindings),
                 )
             result.elapsed_ms = int((time.monotonic() - started) * 1000)
-            self._record_candidate_runtime_health(member, result)
+            if not result.runtime_health_settlement_deferred:
+                self._record_candidate_runtime_health(member, result)
             if progress is not None:
                 progress(
                     EnsembleProgressEvent(
@@ -11670,6 +11820,7 @@ class EnsembleProvider:
             "proposer_phase",
             "soft_deadline",
         ] = "proposer_phase",
+        is_recovery_attempt: bool = False,
     ) -> _CandidateResult:
         recovery_guard_reason = (
             self._proposer_recovery_plan_guard_reason(recovery_state)
@@ -11779,27 +11930,6 @@ class EnsembleProvider:
             result.error = f"proposer deployment is not ready: {reason}"
             result.error_code = reason
             return result
-        runtime_health_admission = self._begin_member_runtime_health_attempt(
-            member
-        )
-        result.runtime_health_admission = dict(runtime_health_admission)
-        # The opaque lease token is an in-process ownership capability, not
-        # routing evidence.  Persist only the non-sensitive admission state.
-        result.execution["runtime_health_admission"] = {
-            key: _json_safe(runtime_health_admission.get(key))
-            for key in ("state", "reason", "probe", "tracked")
-            if key in runtime_health_admission
-        }
-        if runtime_health_admission.get("allowed") is not True:
-            reason = str(
-                runtime_health_admission.get("reason")
-                or _RUNTIME_HEALTH_BENCHED_REASON
-            )
-            result.error = (
-                "proposer deployment was deferred by fresh runtime health"
-            )
-            result.error_code = reason
-            return result
         text_buffer = _BoundedTextBuffer(self.candidate_max_chars)
         _attach_candidate_text_buffer(result, text_buffer)
         got_done = False
@@ -11864,6 +11994,71 @@ class EnsembleProvider:
                     request_count,
                 )
 
+        def mark_stream_close_result(closed: bool) -> None:
+            if not closed:
+                return
+            result.stream_closed = True
+            if current_physical_attempt is not None:
+                current_physical_attempt["stream_closed"] = True
+
+        def mark_admission(lease: ProviderAdmissionLease) -> None:
+            result.runtime_health_settlement_deferred = True
+            result.execution["admission"] = {
+                "outcome": "admitted",
+                "role": (
+                    "proposer_recovery"
+                    if is_recovery_attempt
+                    else "proposer"
+                ),
+                "wait_ms": lease.wait_ms,
+                "weight": lease.weight,
+            }
+
+        def begin_runtime_health_after_admission() -> ErrorEvent | None:
+            runtime_health_admission = (
+                self._begin_member_runtime_health_attempt(member)
+            )
+            result.runtime_health_admission = dict(
+                runtime_health_admission
+            )
+            # The opaque lease token is an in-process ownership capability,
+            # not routing evidence. Persist only non-sensitive state.
+            result.execution["runtime_health_admission"] = {
+                key: _json_safe(runtime_health_admission.get(key))
+                for key in ("state", "reason", "probe", "tracked")
+                if key in runtime_health_admission
+            }
+            if runtime_health_admission.get("allowed") is True:
+                return None
+            reason = str(
+                runtime_health_admission.get("reason")
+                or _RUNTIME_HEALTH_BENCHED_REASON
+            )
+            return ErrorEvent(
+                message=(
+                    "proposer deployment was deferred by fresh runtime health"
+                ),
+                code=reason,
+                request_started=False,
+                physical_request_count=0,
+            )
+
+        def settle_candidate_runtime_health() -> None:
+            result.elapsed_ms = int((time.monotonic() - started) * 1000)
+            if (
+                result.request_started
+                and not terminal_event_observed
+                and not result.runtime_health_local_cancellation
+                and not result.error
+            ):
+                result.error = "provider stream ended before terminal event"
+                result.error_code = "incomplete_stream"
+            self._record_candidate_runtime_health(member, result)
+
+        def mark_local_cancellation() -> None:
+            if not result.runtime_health_physical_timeout_cancellation:
+                result.runtime_health_local_cancellation = True
+
         # Keep this guard immediately adjacent to the lazy provider boundary.
         # ``_provider_events_with_error_boundary`` does not build the provider
         # until its first iteration, and no await occurs between this check and
@@ -11882,6 +12077,16 @@ class EnsembleProvider:
             member.thinking_policy_managed
             or self._router_dynamic_selection()
         ):
+            admission_role = (
+                "proposer_recovery"
+                if is_recovery_attempt
+                else "proposer"
+            )
+
+            def before_admission_release() -> None:
+                settle_candidate_runtime_health()
+                self._before_admission_release(admission_role)
+
             raw_stream = _provider_events_with_error_boundary(
                 provider_config=_proposer_provider_config(member),
                 messages=messages,
@@ -11894,20 +12099,27 @@ class EnsembleProvider:
                 cleanup_deadline=cleanup_deadline,
                 dispatch_deadline=dispatch_deadline,
                 deadline_code=deadline_code,
+                admission_controller=self._admission_controller,
+                admission_role=admission_role,
+                on_admission=mark_admission,
+                before_request_dispatch=begin_runtime_health_after_admission,
+                on_stream_close=mark_stream_close_result,
+                on_local_cancellation=mark_local_cancellation,
+                before_admission_release=before_admission_release,
             )
         else:
+            runtime_health_error = begin_runtime_health_after_admission()
+            if runtime_health_error is not None:
+                result.error = runtime_health_error.message
+                result.error_code = runtime_health_error.code
+                result.request_started = False
+                result.physical_request_count = 0
+                return result
             provider = _build_provider(_proposer_provider_config(member))
             if stop_before_dispatch_if_expired():
                 return result
             raw_stream = provider.chat(messages, tools=tools, config=chat_cfg)
             mark_request_started()
-
-        def mark_stream_close_result(closed: bool) -> None:
-            if not closed:
-                return
-            result.stream_closed = True
-            if current_physical_attempt is not None:
-                current_physical_attempt["stream_closed"] = True
 
         async with _closing_async_iterator(
             raw_stream,
@@ -12408,6 +12620,7 @@ class EnsembleProvider:
                     cleanup_deadline=cleanup_deadline,
                     dispatch_deadline=dispatch_deadline,
                     deadline_trigger=deadline_trigger,
+                    is_recovery_attempt=is_recovery_attempt,
                 )
             except BaseException:
                 merge_retry_evidence(interrupted=True)
@@ -14341,96 +14554,6 @@ class EnsembleProvider:
                     execution.update(refreshed_execution)
                 else:
                     final_request["execution"] = refreshed_execution
-            runtime_health_attempt_started_at = time.monotonic()
-            runtime_health_admission = (
-                self._begin_member_runtime_health_attempt(active_member)
-            )
-            if runtime_health_admission.get("allowed") is not True:
-                health_reason = str(
-                    runtime_health_admission.get("reason")
-                    or _RUNTIME_HEALTH_BENCHED_REASON
-                )
-                health_error = ErrorEvent(
-                    message=(
-                        "aggregator deployment was deferred by fresh runtime "
-                        "health"
-                    ),
-                    code=health_reason,
-                    request_started=False,
-                    physical_request_count=0,
-                )
-                current_attempt_recorded_sequence = append_recovery_attempt(
-                    {
-                        "kind": attempt_kind,
-                        "fallback_index": active_fallback_index,
-                        "trigger": attempt_trigger,
-                        "request_started": False,
-                        "outcome": "runtime_health_deferred",
-                        "code": health_reason,
-                        "requested_provider": (
-                            active_member.provider_config.provider
-                        ),
-                        "requested_model": active_member.provider_config.model,
-                    }
-                )
-                if activate_next_fallback(trigger=health_reason):
-                    attempt += 1
-                    trace.setdefault("final_request", {})["retry_count"] = attempt
-                    continue
-                yield aggregator_progress(
-                    "aggregator_finish",
-                    error=health_error.message,
-                )
-                yield partial_error(health_error)
-                return
-            # Admission can take the sole half-open lease.  Re-check the
-            # absolute deadline immediately afterwards so integration with
-            # deadline/backpressure guards cannot strand that lease without
-            # ever crossing the physical provider boundary.
-            post_admission_deadline = absolute_deadline
-            if attempt_deadline is not None and (
-                post_admission_deadline is None
-                or attempt_deadline < post_admission_deadline
-            ):
-                post_admission_deadline = attempt_deadline
-            if post_admission_deadline is not None:
-                remaining_to_deadline = (
-                    post_admission_deadline - time.monotonic()
-                )
-                if remaining_to_deadline <= 0:
-                    self._cancel_member_runtime_health_attempt(
-                        active_member,
-                        runtime_health_admission,
-                    )
-                    if (
-                        absolute_deadline_kind == "hard"
-                        and absolute_deadline is not None
-                        and absolute_deadline <= time.monotonic()
-                    ):
-                        self._mark_deadline_triggered("aggregator")
-                        trace["deadline"] = self._deadline_trace_snapshot()
-                    deadline_error = ErrorEvent(
-                        message=(
-                            "ensemble aggregator reached its absolute deadline"
-                        ),
-                        code="ensemble_aggregator_timeout",
-                        request_started=False,
-                        physical_request_count=0,
-                    )
-                    yield aggregator_progress(
-                        "aggregator_finish",
-                        error=deadline_error.message,
-                    )
-                    yield partial_error(deadline_error)
-                    return
-                attempt_timeout_seconds = (
-                    remaining_to_deadline
-                    if attempt_timeout_seconds <= 0
-                    else min(
-                        attempt_timeout_seconds,
-                        remaining_to_deadline,
-                    )
-                )
             content_streamed = False
             attempt_text_parts: list[str] = []
             pending_visible_events: list[TextDeltaEvent] = []
@@ -14444,9 +14567,95 @@ class EnsembleProvider:
             completed_provider_event: DoneEvent | None = None
             heartbeat_stream: AsyncIterator[StreamEvent] | None = None
             heartbeat_close_status: _StreamCloseStatus | None = None
+            admission_lease: ProviderAdmissionLease | None = None
+            admission_guard: ProviderAdmissionLeaseGuard | None = None
+            admission_role = (
+                "aggregator" if attempt == 0 else "aggregator_recovery"
+            )
+            runtime_health_attempt_started_at = time.monotonic()
+            runtime_health_admission: dict[str, Any] = {
+                "allowed": True,
+                "tracked": False,
+            }
+            runtime_health_settled = False
             stream_closed = True
             external_close_requested = False
             attempt_request_started = False
+
+            def settle_runtime_health() -> None:
+                nonlocal runtime_health_settled
+                if runtime_health_settled:
+                    return
+                runtime_health_settled = True
+                if external_close_requested:
+                    self._cancel_member_runtime_health_attempt(
+                        active_member,
+                        runtime_health_admission,
+                    )
+                    return
+                if not attempt_request_started:
+                    self._cancel_member_runtime_health_attempt(
+                        active_member,
+                        runtime_health_admission,
+                    )
+                    return
+                if completed_provider_event is not None and stream_closed:
+                    self._record_member_runtime_health(
+                        active_member,
+                        runtime_health_admission,
+                        success=True,
+                        latency_ms=(
+                            (
+                                time.monotonic()
+                                - runtime_health_attempt_started_at
+                            )
+                            * 1000
+                        ),
+                    )
+                    return
+                health_error = retry_error or terminal_stream_error
+                if health_error is None:
+                    health_error = ErrorEvent(
+                        message=(
+                            "aggregator provider stream ended before "
+                            "DoneEvent"
+                        ),
+                        code="incomplete_stream",
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                self._record_member_runtime_health(
+                    active_member,
+                    runtime_health_admission,
+                    success=False,
+                    message=(
+                        "aggregator provider stream did not close"
+                        if not stream_closed
+                        else str(getattr(health_error, "message", "") or "")
+                    ),
+                    code=(
+                        "ensemble_aggregator_close_timeout"
+                        if not stream_closed
+                        else str(getattr(health_error, "code", "") or "")
+                    ),
+                    retry_after_s=getattr(
+                        health_error,
+                        "retry_after_s",
+                        None,
+                    ),
+                    latency_ms=(
+                        (
+                            time.monotonic()
+                            - runtime_health_attempt_started_at
+                        )
+                        * 1000
+                    ),
+                )
+
+            def before_admission_release() -> None:
+                settle_runtime_health()
+                self._before_admission_release(admission_role)
+
             # Keep the final deadline guard adjacent to the lazy physical
             # boundary.  Trace construction and progress delivery above are
             # synchronous today, but callers may instrument either path; an
@@ -14462,10 +14671,6 @@ class EnsembleProvider:
                     physical_dispatch_deadline - time.monotonic()
                 )
                 if remaining_to_deadline <= 0:
-                    self._cancel_member_runtime_health_attempt(
-                        active_member,
-                        runtime_health_admission,
-                    )
                     if (
                         absolute_deadline_kind == "hard"
                         and absolute_deadline is not None
@@ -14503,6 +14708,117 @@ class EnsembleProvider:
                         execution["timeout_seconds"] = attempt_timeout_seconds
                         execution["effective_timeout"] = attempt_timeout_seconds
             try:
+                if self._admission_controller is not None:
+                    admission_lease = await self._admission_controller.acquire(
+                        provider=active_member.provider_config.provider,
+                        model=active_member.provider_config.model,
+                        role=admission_role,
+                        absolute_deadline=physical_dispatch_deadline,
+                    )
+                    admission_guard = ProviderAdmissionLeaseGuard(
+                        admission_lease,
+                        pending_cleanup_tracker=self._track_pending_cleanup,
+                        before_release=before_admission_release,
+                    )
+                    final_request = trace.get("final_request")
+                    if isinstance(final_request, dict):
+                        execution = final_request.get("execution")
+                        if isinstance(execution, dict):
+                            execution["admission"] = {
+                                "outcome": "admitted",
+                                "role": (
+                                    "aggregator"
+                                    if attempt == 0
+                                    else "aggregator_recovery"
+                                ),
+                                "wait_ms": admission_lease.wait_ms,
+                                "weight": admission_lease.weight,
+                            }
+                # Queue admission precedes health admission so a deployment
+                # benched while this attempt waited cannot dispatch with stale
+                # health state. The final deadline guard remains adjacent to
+                # the physical provider boundary.
+                runtime_health_attempt_started_at = time.monotonic()
+                runtime_health_admission = dict(
+                    self._begin_member_runtime_health_attempt(active_member)
+                )
+                if runtime_health_admission.get("allowed") is not True:
+                    health_reason = str(
+                        runtime_health_admission.get("reason")
+                        or _RUNTIME_HEALTH_BENCHED_REASON
+                    )
+                    health_error = ErrorEvent(
+                        message=(
+                            "aggregator deployment was deferred by fresh "
+                            "runtime health"
+                        ),
+                        code=health_reason,
+                        request_started=False,
+                        physical_request_count=0,
+                    )
+                    current_attempt_recorded_sequence = (
+                        append_recovery_attempt(
+                            {
+                                "kind": attempt_kind,
+                                "fallback_index": active_fallback_index,
+                                "trigger": attempt_trigger,
+                                "request_started": False,
+                                "outcome": "runtime_health_deferred",
+                                "code": health_reason,
+                                "requested_provider": (
+                                    active_member.provider_config.provider
+                                ),
+                                "requested_model": (
+                                    active_member.provider_config.model
+                                ),
+                            }
+                        )
+                    )
+                    if activate_next_fallback(trigger=health_reason):
+                        attempt += 1
+                        trace.setdefault("final_request", {})[
+                            "retry_count"
+                        ] = attempt
+                        continue
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=health_error.message,
+                    )
+                    yield partial_error(health_error)
+                    return
+                if (
+                    physical_dispatch_deadline is not None
+                    and time.monotonic() >= physical_dispatch_deadline
+                ):
+                    if (
+                        absolute_deadline_kind == "hard"
+                        and absolute_deadline is not None
+                        and time.monotonic() >= absolute_deadline
+                    ):
+                        self._mark_deadline_triggered("aggregator")
+                        trace["deadline"] = self._deadline_trace_snapshot()
+                    raise _EnsemblePreDispatchDeadlineError
+                if physical_dispatch_deadline is not None:
+                    remaining_to_deadline = (
+                        physical_dispatch_deadline - time.monotonic()
+                    )
+                    attempt_timeout_seconds = min(
+                        attempt_timeout_seconds,
+                        remaining_to_deadline,
+                    )
+                    active_config = active_config.model_copy(
+                        update={"timeout": attempt_timeout_seconds}
+                    )
+                    final_request = trace.get("final_request")
+                    if isinstance(final_request, dict):
+                        execution = final_request.get("execution")
+                        if isinstance(execution, dict):
+                            execution["timeout_seconds"] = (
+                                attempt_timeout_seconds
+                            )
+                            execution["effective_timeout"] = (
+                                attempt_timeout_seconds
+                            )
                 stream = provider.chat(
                     active_messages,
                     tools=active_tools,
@@ -14544,7 +14860,11 @@ class EnsembleProvider:
                         absolute_deadline_kind == "hard"
                     ),
                     close_status=heartbeat_close_status,
-                    pending_cleanup_tracker=self._track_pending_cleanup,
+                    pending_cleanup_tracker=(
+                        admission_guard.track_cleanup
+                        if admission_guard is not None
+                        else self._track_pending_cleanup
+                    ),
                 )
                 async for event in heartbeat_stream:
                     if isinstance(event, DoneEvent):
@@ -14689,6 +15009,16 @@ class EnsembleProvider:
             except (GeneratorExit, asyncio.CancelledError):
                 external_close_requested = True
                 raise
+            except _EnsemblePreDispatchDeadlineError:
+                terminal_stream_error = ErrorEvent(
+                    message=(
+                        "ensemble aggregator reached its absolute deadline "
+                        "before physical dispatch"
+                    ),
+                    code="ensemble_aggregator_timeout",
+                    request_started=False,
+                    physical_request_count=0,
+                )
             except TimeoutError:
                 if (
                     absolute_deadline_kind == "hard"
@@ -14711,6 +15041,26 @@ class EnsembleProvider:
                     diagnostic_done=(
                         deadline_event if isinstance(deadline_event, DoneEvent) else None
                     ),
+                )
+            except ProviderAdmissionError as exc:
+                terminal_stream_error = ErrorEvent(
+                    message=str(exc),
+                    code=f"ensemble_{exc.code}",
+                    request_started=False,
+                    physical_request_count=0,
+                    ensemble_trace={
+                        "admission": {
+                            "role": (
+                                "aggregator"
+                                if attempt == 0
+                                else "aggregator_recovery"
+                            ),
+                            "outcome": "timeout"
+                            if isinstance(exc, ProviderAdmissionTimeoutError)
+                            else "rejected",
+                            "wait_ms": exc.wait_ms,
+                        }
+                    },
                 )
             except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
                 safe_message = redact_upstream_error_text(
@@ -14763,80 +15113,37 @@ class EnsembleProvider:
                         code="ensemble_aggregator_error",
                     )
             finally:
-                if heartbeat_stream is not None:
-                    relay_closed = await _close_async_iterator(
-                        heartbeat_stream,
-                        phase="ensemble_aggregator_heartbeat_relay",
-                        pending_cleanup_tracker=self._track_pending_cleanup,
-                    )
-                    stream_closed = relay_closed and (
-                        heartbeat_close_status is None or heartbeat_close_status.closed is not False
-                    )
-                if not stream_closed:
-                    self._mark_cleanup_unproven("ensemble_aggregator_close_unproven")
-                if external_close_requested:
-                    self._cancel_member_runtime_health_attempt(
-                        active_member,
-                        runtime_health_admission,
-                    )
-                if external_close_requested and not stream_closed:
-                    raise _EnsembleStreamCloseError("ensemble_aggregator_external_close")
-            if attempt_request_started:
-                if completed_provider_event is not None and stream_closed:
-                    self._record_member_runtime_health(
-                        active_member,
-                        runtime_health_admission,
-                        success=True,
-                        latency_ms=(
-                            (time.monotonic() - runtime_health_attempt_started_at)
-                            * 1000
-                        ),
-                    )
-                else:
-                    health_error = retry_error or terminal_stream_error
-                    if health_error is None:
-                        # A request-started stream that naturally reaches EOF
-                        # without DoneEvent or ErrorEvent is a physical
-                        # deployment failure even though the iterator closed
-                        # cleanly. Keep the existing recovery/delivery path
-                        # below, but classify this attempt before health
-                        # accounting so a repeatedly incomplete deployment is
-                        # benched across turns.
-                        health_error = ErrorEvent(
-                            message="aggregator provider stream ended before DoneEvent",
-                            code="incomplete_stream",
-                            request_started=True,
-                            physical_request_count=1,
+                try:
+                    if heartbeat_stream is not None:
+                        relay_closed = await _close_async_iterator(
+                            heartbeat_stream,
+                            phase="ensemble_aggregator_heartbeat_relay",
+                            pending_cleanup_tracker=(
+                                admission_guard.track_cleanup
+                                if admission_guard is not None
+                                else self._track_pending_cleanup
+                            ),
                         )
-                    self._record_member_runtime_health(
-                        active_member,
-                        runtime_health_admission,
-                        success=False,
-                        message=(
-                            "aggregator provider stream did not close"
-                            if not stream_closed
-                            else str(getattr(health_error, "message", "") or "")
-                        ),
-                        code=(
-                            "ensemble_aggregator_close_timeout"
-                            if not stream_closed
-                            else str(getattr(health_error, "code", "") or "")
-                        ),
-                        retry_after_s=getattr(
-                            health_error,
-                            "retry_after_s",
-                            None,
-                        ),
-                        latency_ms=(
-                            (time.monotonic() - runtime_health_attempt_started_at)
-                            * 1000
-                        ),
-                    )
-            else:
-                self._cancel_member_runtime_health_attempt(
-                    active_member,
-                    runtime_health_admission,
-                )
+                        stream_closed = relay_closed and (
+                            heartbeat_close_status is None
+                            or heartbeat_close_status.closed is not False
+                        )
+                    if not stream_closed:
+                        self._mark_cleanup_unproven(
+                            "ensemble_aggregator_close_unproven"
+                        )
+                    if external_close_requested and not stream_closed:
+                        raise _EnsembleStreamCloseError(
+                            "ensemble_aggregator_external_close"
+                        )
+                finally:
+                    if admission_guard is not None:
+                        admission_guard.finish()
+                    elif admission_lease is not None:
+                        before_admission_release()
+                        admission_lease.release()
+                    else:
+                        settle_runtime_health()
             if completed_provider_event is not None:
                 aggregator_elapsed_ms = int((time.monotonic() - aggregator_started) * 1000)
                 attempt_visible_text = "".join(attempt_text_parts)
@@ -17041,7 +17348,78 @@ class EnsembleProvider:
         physical_close_status = fallback_close_status or _StreamCloseStatus()
         completed_fallback_event: DoneEvent | None = None
         terminal_fallback_error: ErrorEvent | None = None
+        admission_lease: ProviderAdmissionLease | None = None
+        admission_guard: ProviderAdmissionLeaseGuard | None = None
         try:
+            if self._admission_controller is not None:
+                requested_fallback_provider = str(
+                    self.fallback_provider_name
+                    or getattr(self.fallback_provider, "provider_name", "")
+                    or "fallback"
+                )
+                requested_fallback_model = str(
+                    self.fallback_model
+                    or _provider_model_id(self.fallback_provider)
+                    or "fallback"
+                )
+                admission_lease = await self._admission_controller.acquire(
+                    provider=requested_fallback_provider,
+                    model=requested_fallback_model,
+                    role="fallback_single",
+                    absolute_deadline=absolute_deadline,
+                )
+                admission_guard = ProviderAdmissionLeaseGuard(
+                    admission_lease,
+                    pending_cleanup_tracker=self._track_pending_cleanup,
+                    before_release=lambda: self._before_admission_release(
+                        "fallback_single"
+                    ),
+                )
+                final_request = trace.get("final_request")
+                if isinstance(final_request, dict):
+                    execution = final_request.get("execution")
+                    if isinstance(execution, dict):
+                        execution["admission"] = {
+                            "outcome": "admitted",
+                            "role": "fallback_single",
+                            "wait_ms": admission_lease.wait_ms,
+                            "weight": admission_lease.weight,
+                        }
+            # Capacity may become available exactly as the hard budget ends.
+            # Keep that boundary a zero-request timeout and release/transfer
+            # the lease through the same finalizer as a started stream.
+            if (
+                absolute_deadline is not None
+                and time.monotonic() >= absolute_deadline
+            ):
+                self._mark_deadline_triggered("fallback")
+                trace["deadline"] = self._deadline_trace_snapshot()
+                yield partial_error(
+                    ErrorEvent(
+                        message=(
+                            "ensemble absolute deadline was exhausted before "
+                            "the fallback request could start"
+                        ),
+                        code="ensemble_absolute_deadline",
+                        request_started=False,
+                        physical_request_count=0,
+                    )
+                )
+                return
+            if absolute_deadline is not None:
+                fallback_timeout_seconds = min(
+                    fallback_timeout_seconds,
+                    max(0.0, absolute_deadline - time.monotonic()),
+                )
+                fallback_config = (
+                    fallback_config or ChatConfig()
+                ).model_copy(update={"timeout": fallback_timeout_seconds})
+                final_request = trace.get("final_request")
+                if isinstance(final_request, dict):
+                    execution = final_request.get("execution")
+                    if isinstance(execution, dict):
+                        execution["timeout_seconds"] = fallback_timeout_seconds
+                        execution["effective_timeout"] = fallback_timeout_seconds
             fallback_stream = self.fallback_provider.chat(
                 fallback_messages,
                 tools=fallback_tools,
@@ -17064,12 +17442,20 @@ class EnsembleProvider:
                 reset_deadline_on_event=True,
                 absolute_deadline=absolute_deadline,
                 close_status=physical_close_status,
-                pending_cleanup_tracker=self._track_pending_cleanup,
+                pending_cleanup_tracker=(
+                    admission_guard.track_cleanup
+                    if admission_guard is not None
+                    else self._track_pending_cleanup
+                ),
             )
             async with _closing_async_iterator(
                 heartbeat_stream,
                 phase="ensemble_fallback_heartbeat_relay",
-                pending_cleanup_tracker=self._track_pending_cleanup,
+                pending_cleanup_tracker=(
+                    admission_guard.track_cleanup
+                    if admission_guard is not None
+                    else self._track_pending_cleanup
+                ),
             ) as child_stream:
                 async for event in child_stream:
                     if isinstance(event, DoneEvent):
@@ -17141,6 +17527,31 @@ class EnsembleProvider:
                     )
                 yield partial_error(terminal_fallback_error)
                 return
+        except ProviderAdmissionError as exc:
+            admission_trace = {
+                "role": "fallback_single",
+                "outcome": (
+                    "timeout"
+                    if isinstance(exc, ProviderAdmissionTimeoutError)
+                    else "rejected"
+                ),
+                "wait_ms": exc.wait_ms,
+            }
+            final_request = trace.get("final_request")
+            if isinstance(final_request, dict):
+                execution = final_request.get("execution")
+                if isinstance(execution, dict):
+                    execution["admission"] = admission_trace
+            yield partial_error(
+                ErrorEvent(
+                    message=str(exc),
+                    code=f"ensemble_{exc.code}",
+                    request_started=False,
+                    physical_request_count=0,
+                    ensemble_trace={"admission": admission_trace},
+                )
+            )
+            return
         except _EnsembleStreamCloseError:
             # `_closing_async_iterator` deliberately withholds a terminal Done
             # until the physical stream closes.  If that close proof times out,
@@ -17256,6 +17667,11 @@ class EnsembleProvider:
                 )
             yield partial_error(fallback_error)
             return
+        finally:
+            if admission_guard is not None:
+                admission_guard.finish()
+            elif admission_lease is not None:
+                admission_lease.release()
         incomplete_error = ErrorEvent(
             message="ensemble fallback stream ended before DoneEvent",
             code="ensemble_fallback_incomplete",
@@ -21012,6 +21428,18 @@ def build_ensemble_provider_from_config(
         )
         else None
     )
+    admission_settings: ProviderAdmissionSettings | None = None
+    admission_config = getattr(ensemble_cfg, "admission", None)
+    if (
+        selection_mode == "router_dynamic"
+        and str(getattr(ensemble_cfg, "latency_class", "normal") or "normal")
+        != "experiment"
+        and admission_config is not None
+        and bool(getattr(admission_config, "enabled", True))
+    ):
+        admission_settings = provider_admission_settings_from_config(
+            admission_config
+        )
     provider = EnsembleProvider(
         profile_name=profile_name,
         proposers=proposers,
@@ -21071,6 +21499,7 @@ def build_ensemble_provider_from_config(
         _member_request_budget_bindings=request_budget_bindings,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
         _provider_health_ledger=live_provider_health_ledger,
+        _admission_settings=admission_settings,
     )
     if selection_mode == "router_dynamic":
         if router_dynamic_retry_factory is None:
