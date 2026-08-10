@@ -1,0 +1,226 @@
+"""Contract tests for the comment-preserving TOML patcher.
+
+``patch_import_config`` runs on every Gateway boot (``lossless_patch_sandbox_fields``
+stamps ``sandbox.run_mode``), so a config it refuses to scan is a config the
+Gateway refuses to start on. The scanner is line-oriented, which makes values
+that span several physical lines — arrays of inline tables, nested arrays,
+triple-quoted strings — the interesting cases.
+"""
+
+from __future__ import annotations
+
+import tomllib
+
+import pytest
+
+from opensquilla.lossless_toml import LosslessTomlPatchError, patch_import_config
+
+
+def _patched(raw: bytes, transform) -> str:
+    original = tomllib.loads(raw.decode("utf-8"))
+    transformed = tomllib.loads(raw.decode("utf-8"))
+    transform(transformed)
+    return patch_import_config(raw, original, transformed).decode("utf-8")
+
+
+def _rejects(raw: bytes, transform) -> str:
+    original = tomllib.loads(raw.decode("utf-8"))
+    transformed = tomllib.loads(raw.decode("utf-8"))
+    transform(transformed)
+    with pytest.raises(LosslessTomlPatchError) as excinfo:
+        patch_import_config(raw, original, transformed)
+    return str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Single-line values: the patcher's core contract
+# ---------------------------------------------------------------------------
+
+
+def test_unchanged_payload_returns_the_source_bytes_verbatim() -> None:
+    raw = b'port = 1\n# keep me\nname = "x"\n'
+    original = tomllib.loads(raw.decode("utf-8"))
+    assert patch_import_config(raw, original, dict(original)) is raw
+
+
+def test_scalar_replacement_keeps_layout_and_trailing_comment() -> None:
+    raw = b'# header\nport   =   1   # why\n\n[gateway]\nhost = "127.0.0.1"\n'
+    patched = _patched(raw, lambda payload: payload.update(port=2))
+    assert patched == '# header\nport   =   2   # why\n\n[gateway]\nhost = "127.0.0.1"\n'
+
+
+def test_insertion_lands_in_the_owning_table() -> None:
+    raw = b'[gateway]\nhost = "127.0.0.1"\n'
+    patched = _patched(raw, lambda payload: payload["gateway"].update(port=8080))
+    assert patched == '[gateway]\nhost = "127.0.0.1"\nport = 8080\n'
+
+
+def test_removal_preserves_a_trailing_comment_on_the_removed_line() -> None:
+    raw = b'port = 1  # keep the note\nname = "x"\n'
+
+    def drop_port(payload: dict) -> None:
+        del payload["port"]
+
+    assert _patched(raw, drop_port) == '# keep the note\nname = "x"\n'
+
+
+def test_array_of_tables_headers_still_track_context() -> None:
+    raw = b'[[server]]\nhost = "a"\n\n[[server]]\nhost = "b"\n'
+    patched = _patched(raw, lambda payload: payload["server"][1].update(host="c"))
+    assert patched == '[[server]]\nhost = "a"\n\n[[server]]\nhost = "c"\n'
+
+
+# ---------------------------------------------------------------------------
+# Values that span physical lines (issue #1106 and neighbours)
+# ---------------------------------------------------------------------------
+
+
+AGENTS_CONFIG = b"""# profile config
+port = 18792
+
+agents = [
+    { id = "qa-agent", name = "QA Agent", enabled = true },
+]
+
+[gateway]
+host = "127.0.0.1"
+"""
+
+
+def test_untouched_array_of_inline_tables_does_not_block_the_patch() -> None:
+    """Regression for #1106.
+
+    The Control UI writes ``agents`` as a multi-line array of inline tables. The
+    boot migration only stamps ``sandbox.run_mode``, but the scan aborted on the
+    array's rows before reaching that edit, so the Gateway never started again.
+    """
+    patched = _patched(AGENTS_CONFIG, lambda payload: payload.update(port=18793))
+    assert patched == AGENTS_CONFIG.decode("utf-8").replace("18792", "18793")
+
+
+def test_boot_migration_stamps_run_mode_next_to_an_agents_array() -> None:
+    from opensquilla.sandbox.upgrade_migration import lossless_patch_sandbox_fields
+
+    patched, mode = lossless_patch_sandbox_fields(AGENTS_CONFIG)
+    payload = tomllib.loads(patched.decode("utf-8"))
+    assert payload["sandbox"]["run_mode"] == mode
+    assert payload["agents"] == [{"id": "qa-agent", "name": "QA Agent", "enabled": True}]
+    assert b'{ id = "qa-agent", name = "QA Agent", enabled = true },' in patched
+
+
+def test_nested_multi_line_array_rows_are_not_read_as_table_headers() -> None:
+    raw = b"port = 1\nmatrix = [\n  [1, 2],\n  [3, 4],\n]\n"
+    patched = _patched(raw, lambda payload: payload.update(port=2))
+    assert patched == "port = 2\nmatrix = [\n  [1, 2],\n  [3, 4],\n]\n"
+
+
+def test_multi_line_array_may_close_with_a_trailing_comment() -> None:
+    raw = b'agents = [\n  { id = "a" },\n]  # the roster\nport = 1\n'
+    patched = _patched(raw, lambda payload: payload.update(port=2))
+    assert patched == 'agents = [\n  { id = "a" },\n]  # the roster\nport = 2\n'
+
+
+def test_tables_after_a_multi_line_array_keep_their_own_context() -> None:
+    patched = _patched(
+        AGENTS_CONFIG,
+        lambda payload: payload["gateway"].update(host="0.0.0.0"),
+    )
+    assert patched.endswith('[gateway]\nhost = "0.0.0.0"\n')
+    assert '{ id = "qa-agent"' in patched
+
+
+def test_insertion_after_a_trailing_multi_line_array_lands_below_it() -> None:
+    raw = b'agents = [\n  { id = "a" },\n]\n'
+    patched = _patched(raw, lambda payload: payload.update(port=1))
+    assert patched == 'agents = [\n  { id = "a" },\n]\nport = 1\n'
+
+
+def test_crlf_config_with_a_multi_line_array_keeps_its_line_endings() -> None:
+    raw = AGENTS_CONFIG.replace(b"\n", b"\r\n")
+    patched = _patched(raw, lambda payload: payload.update(port=18793))
+    assert patched == raw.decode("utf-8").replace("18792", "18793")
+    assert "\r\n" in patched
+
+
+# ---------------------------------------------------------------------------
+# Triple-quoted strings: their bodies are not TOML
+# ---------------------------------------------------------------------------
+
+
+def test_assignment_inside_a_multi_line_string_is_not_a_second_assignment() -> None:
+    raw = b'key = "real"\nprompt = """\nkey = "phantom"\n"""\n'
+    patched = _patched(raw, lambda payload: payload.update(key="changed"))
+    assert patched == 'key = "changed"\nprompt = """\nkey = "phantom"\n"""\n'
+
+
+def test_bracketed_line_inside_a_literal_string_is_not_a_table_header() -> None:
+    raw = b"notes = '''\n[not a table]\n'''\nport = 1\n"
+    patched = _patched(raw, lambda payload: payload.update(port=2))
+    assert patched == "notes = '''\n[not a table]\n'''\nport = 2\n"
+
+
+def test_hash_inside_a_multi_line_string_is_not_a_comment() -> None:
+    raw = b'notes = """\n# not a comment\n"""\nport = 1\n'
+    assert tomllib.loads(raw.decode("utf-8"))["notes"] == "# not a comment\n"
+    patched = _patched(raw, lambda payload: payload.update(port=2))
+    assert patched == 'notes = """\n# not a comment\n"""\nport = 2\n'
+
+
+def test_escaped_quotes_do_not_close_a_multi_line_string_early() -> None:
+    raw = b'notes = """\na \\""" b\n"""\nport = 1\n'
+    assert tomllib.loads(raw.decode("utf-8"))["notes"] == 'a """ b\n'
+    patched = _patched(raw, lambda payload: payload.update(port=2))
+    assert patched == 'notes = """\na \\""" b\n"""\nport = 2\n'
+
+
+# ---------------------------------------------------------------------------
+# Edits that reach *into* a multi-line value stay refused — and say why
+# ---------------------------------------------------------------------------
+
+
+def test_replacing_a_leaf_inside_a_multi_line_array_is_refused_by_path() -> None:
+    message = _rejects(
+        AGENTS_CONFIG,
+        lambda payload: payload["agents"][0].update(name="Renamed"),
+    )
+    assert "cannot replace ('agents', 0, 'name')" in message
+    assert "multi-line TOML value at ('agents',)" in message
+
+
+def test_removing_a_leaf_inside_a_multi_line_array_is_refused_by_path() -> None:
+    def drop_name(payload: dict) -> None:
+        del payload["agents"][0]["name"]
+
+    message = _rejects(AGENTS_CONFIG, drop_name)
+    assert "cannot remove ('agents', 0, 'name')" in message
+    assert "multi-line TOML value at ('agents',)" in message
+
+
+def test_adding_a_leaf_inside_a_multi_line_array_is_refused_by_path() -> None:
+    message = _rejects(
+        AGENTS_CONFIG,
+        lambda payload: payload["agents"][0].update(role="reviewer"),
+    )
+    assert "cannot add ('agents', 0, 'role')" in message
+    assert "multi-line TOML value at ('agents',)" in message
+
+
+def test_rewriting_a_multi_line_string_is_refused_rather_than_spliced() -> None:
+    raw = b'prompt = """\nhello\n"""\n'
+    message = _rejects(raw, lambda payload: payload.update(prompt="goodbye"))
+    assert "('prompt',)" in message
+
+
+# ---------------------------------------------------------------------------
+# Guards the patcher already owned
+# ---------------------------------------------------------------------------
+
+
+def test_source_bytes_must_match_the_validated_payload() -> None:
+    with pytest.raises(LosslessTomlPatchError, match="no longer match"):
+        patch_import_config(b"port = 1\n", {"port": 2}, {"port": 3})
+
+
+def test_invalid_source_toml_is_rejected() -> None:
+    with pytest.raises(LosslessTomlPatchError, match="not valid UTF-8 TOML"):
+        patch_import_config(b"port = \n", {}, {"port": 1})

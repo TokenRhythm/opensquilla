@@ -89,6 +89,7 @@
       "tests/test_engine/turn_runner/test_tool_surface_levers_bootstrap_unit.py",
       "tests/test_execution_status_contract.py",
       "tests/test_github_issue_link_sync.py",
+      "tests/test_lossless_toml.py",
       "tests/test_memory/test_profile_import.py",
       "tests/test_meta_skill_openclaw_lifestyle_comparison.py",
       "tests/test_model_router_behavior.py",

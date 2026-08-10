@@ -541,6 +541,7 @@
     "tests/test_live_multi_provider_matrix.py": 0.01,
     "tests/test_live_tokenrhythm_billing_audit.py": 0.20,
     "tests/test_llm_ensemble_config.py": 0.527,
+    "tests/test_lossless_toml.py": 0.01,
     "tests/test_mcp/test_discovery_lifecycle.py": 0.168,
     "tests/test_mcp/test_sse_client.py": 0.714,
     "tests/test_mcp/test_stdio_client.py": 1.249,
