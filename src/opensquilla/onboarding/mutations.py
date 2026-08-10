@@ -11,7 +11,10 @@ from typing import Any, Literal, cast, get_args
 from pydantic import ValidationError
 
 from opensquilla.channels.registry import discover_all, parse_channel_entry
-from opensquilla.ensemble_plan import ensemble_selection_configured
+from opensquilla.ensemble_plan import (
+    effective_ensemble_selection_mode,
+    ensemble_selection_configured,
+)
 from opensquilla.gateway.config import (
     STATIC_B5_SELECTION_MODE_PROVIDERS,
     AudioConfig,
@@ -74,7 +77,8 @@ from opensquilla.router_tiers import (
     TEXT_TIERS,
     TierConfig,
     normalize_text_tier,
-    tier_provider_is_dormant,
+    router_dynamic_tier_members_active,
+    tier_provider_role,
 )
 from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS, MAX_SEARCH_RESULTS
 from opensquilla.secrets import clean_header_secret
@@ -427,6 +431,8 @@ def _cross_provider_tier_warnings(
     tiers: dict[str, Any],
     active_provider: str,
     *,
+    shared_selection_mode: str = "",
+    ensemble_globally_enabled: bool = False,
     cross_provider_enabled: bool = False,
     tier_provider_mismatch: str = "route",
     llm_profiles: dict[str, Any] | None = None,
@@ -443,9 +449,29 @@ def _cross_provider_tier_warnings(
     if not active_provider:
         return []
     warnings: list[str] = []
+    dynamic_members_active = router_dynamic_tier_members_active(
+        tiers,
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=ensemble_globally_enabled,
+    )
     for tier_name in sorted(tiers):
         tier = tiers.get(tier_name)
         if not isinstance(tier, dict):
+            continue
+        provider_role = tier_provider_role(
+            tier_name,
+            tier,
+            shared_selection_mode=shared_selection_mode,
+            router_dynamic_members_active=dynamic_members_active,
+        )
+        if provider_role == "dormant_draft":
+            continue
+        if provider_role == "blocked":
+            warnings.append(
+                f"Router tier '{tier_name}' uses a shared multi-model plan that cannot "
+                "be resolved. Choose a supported llm_ensemble.selection_mode before "
+                "routing requests to this tier."
+            )
             continue
         tier_provider = str(tier.get("provider") or "").strip().lower()
         if not tier_provider or tier_provider == active_provider:
@@ -580,6 +606,8 @@ def _implicit_primary_and_router(config: GatewayConfig) -> bool:
 def _router_provider_conflicts(
     config: GatewayConfig,
     target_provider: str,
+    *,
+    shared_selection_mode: str | None = None,
 ) -> tuple[str, ...]:
     """Foreign providers that would be vetoed/misrouted after a primary swap."""
 
@@ -589,13 +617,31 @@ def _router_provider_conflicts(
     if bool(getattr(router, "cross_provider_tiers", False)):
         return ()
     target = str(target_provider or "").strip().lower()
-    conflicts: set[str] = set()
+    effective_shared_mode = (
+        effective_ensemble_selection_mode(config)
+        if shared_selection_mode is None
+        else str(shared_selection_mode or "").strip()
+    )
     tiers = getattr(router, "tiers", {}) or {}
+    dynamic_members_active = router_dynamic_tier_members_active(
+        tiers if isinstance(tiers, Mapping) else {},
+        shared_selection_mode=effective_shared_mode,
+        ensemble_globally_enabled=bool(
+            getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+        ),
+    )
+    conflicts: set[str] = set()
     if isinstance(tiers, Mapping):
         for tier_name, tier in tiers.items():
             if not isinstance(tier, Mapping):
                 continue
-            if tier_provider_is_dormant(tier_name, tier):
+            provider_role = tier_provider_role(
+                tier_name,
+                tier,
+                shared_selection_mode=effective_shared_mode,
+                router_dynamic_members_active=dynamic_members_active,
+            )
+            if provider_role not in {"direct", "dynamic_member"}:
                 continue
             provider = str(tier.get("provider") or "").strip().lower()
             if provider and provider != target:
@@ -681,7 +727,11 @@ def _apply_primary_provider_router_policy(
     if not primary_changed:
         return
 
-    conflicts = _router_provider_conflicts(source, target_provider)
+    conflicts = _router_provider_conflicts(
+        source,
+        target_provider,
+        shared_selection_mode=effective_ensemble_selection_mode(candidate),
+    )
     if conflicts:
         joined = ", ".join(conflicts)
         raise LlmProfileActivationError(
@@ -1142,6 +1192,10 @@ def upsert_router(
         warnings = _cross_provider_tier_warnings(
             cast(dict[str, Any], router_payload.get("tiers") or {}),
             provider,
+            shared_selection_mode=effective_ensemble_selection_mode(config),
+            ensemble_globally_enabled=bool(
+                getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+            ),
             cross_provider_enabled=bool(router_payload.get("cross_provider_tiers")),
             tier_provider_mismatch=str(
                 router_payload.get("tier_provider_mismatch") or "route"
@@ -1305,6 +1359,9 @@ def upsert_llm_ensemble(
             min_successful_proposers, label="min_successful_proposers"
         )
         explicit_fields.add("min_successful_proposers")
+    deprecated_all_failed_policy = str(
+        current.get("all_failed_policy", "fallback_single") or "fallback_single"
+    ) == "error"
     if all_failed_policy is not None:
         policy_clean = str(all_failed_policy).strip()
         if policy_clean not in _LLM_ENSEMBLE_ALL_FAILED_POLICIES:
@@ -1312,7 +1369,18 @@ def upsert_llm_ensemble(
                 "all_failed_policy must be one of: "
                 + ", ".join(_LLM_ENSEMBLE_ALL_FAILED_POLICIES)
             )
-        merged["all_failed_policy"] = policy_clean
+        deprecated_all_failed_policy = deprecated_all_failed_policy or policy_clean == "error"
+        # ``error`` remains accepted on the wire so older clients do not
+        # break, but every new write canonicalizes the one supported runtime
+        # outcome: use the configured fixed/direct fallback deployment.
+        merged["all_failed_policy"] = "fallback_single"
+        explicit_fields.add("all_failed_policy")
+
+    # Saving any part of an old Ensemble section is also its compatibility
+    # migration point.  Config loading remains lossless; the next intentional
+    # write removes the deprecated execution policy.
+    if str(merged.get("all_failed_policy") or "fallback_single") == "error":
+        merged["all_failed_policy"] = "fallback_single"
         explicit_fields.add("all_failed_policy")
 
     if (
@@ -1372,6 +1440,8 @@ def upsert_llm_ensemble(
         new_cfg.mark_force_persist("llm_ensemble.selection_mode")
     if candidates is not None or "candidates" in generated_fields:
         new_cfg.mark_force_persist("llm_ensemble.candidates")
+    if deprecated_all_failed_policy:
+        new_cfg.mark_force_persist("llm_ensemble.all_failed_policy")
 
     payload: dict[str, Any] = {
         "enabled": new_ensemble.enabled,
@@ -1392,7 +1462,14 @@ def upsert_llm_ensemble(
             or bool(routing_changes)
         ),
         restart_required=False,
-        warnings=[],
+        warnings=(
+            [
+                "llm_ensemble.all_failed_policy=error is deprecated; "
+                "fusion failures now use the configured fixed/direct model"
+            ]
+            if deprecated_all_failed_policy
+            else []
+        ),
         public_payload=payload,
     )
 

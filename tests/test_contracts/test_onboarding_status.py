@@ -110,7 +110,12 @@ SECTION_DETAIL_REQUIRED_KEYS = frozenset(
 SECTION_EXTRA_KEYS = {
     "llm": frozenset({"providerResolution"}),
     "router": frozenset(
-        {"routerMode", "routerBinding", "routerProviderConflicts"}
+        {
+            "routerMode",
+            "routerBinding",
+            "routerProviderConflicts",
+            "routerProviderRoles",
+        }
     ),
     "ensemble": frozenset(
         {
@@ -125,6 +130,9 @@ SECTION_EXTRA_KEYS = {
             "perTurnCallCount",
             "perTurnCallCountRange",
             "memberProviders",
+            "configuredAllFailedPolicy",
+            "effectiveAllFailedPolicy",
+            "policyDeprecated",
         }
     ),
 }
@@ -132,6 +140,9 @@ SECTION_EXTRA_KEYS = {
 # Every mode value the router card may carry; matched verbatim by clients.
 ROUTER_MODE_VALUES = frozenset({"recommended", "openrouter-mix", "custom", "disabled"})
 ROUTER_BINDING_VALUES = frozenset({"follow_primary", "custom", "legacy"})
+ROUTER_PROVIDER_ROLE_VALUES = frozenset(
+    {"direct", "dormant_draft", "dynamic_member", "blocked"}
+)
 
 # Shape of one env-recovery command row shown when a configured env key is
 # not visible in the running shell.
@@ -303,6 +314,9 @@ async def test_router_section_carries_an_explicit_router_mode(tmp_path) -> None:
     assert isinstance(
         payload["sectionDetails"]["router"]["routerProviderConflicts"], list
     )
+    provider_roles = payload["sectionDetails"]["router"]["routerProviderRoles"]
+    assert isinstance(provider_roles, dict)
+    assert set(provider_roles.values()) <= ROUTER_PROVIDER_ROLE_VALUES
 
 
 async def test_router_provider_conflicts_ignore_only_dormant_shared_c3(tmp_path) -> None:
@@ -331,6 +345,56 @@ async def test_router_provider_conflicts_ignore_only_dormant_shared_c3(tmp_path)
     assert payload["sectionDetails"]["router"]["routerProviderConflicts"] == [
         "openai"
     ]
+    assert payload["sectionDetails"]["router"]["routerProviderRoles"]["c3"] == (
+        "dormant_draft"
+    )
+
+
+async def test_router_provider_conflicts_include_dynamic_shared_c3(tmp_path) -> None:
+    cfg = _synthetic_config(
+        tmp_path,
+        llm=LlmProviderConfig(provider="deepseek", model="deepseek-chat"),
+        llm_ensemble={"selection_mode": "router_dynamic"},
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": False,
+            "tiers": {
+                "c0": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c1": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c2": {"provider": "deepseek", "model": "deepseek-reasoner"},
+                "c3": {
+                    "provider": "openrouter",
+                    "model": "synthetic/model",
+                    "ensemble_enabled": True,
+                },
+            },
+        },
+    )
+
+    payload = _status_payload(RpcContext(conn_id="contract", config=cfg))
+    router = payload["sectionDetails"]["router"]
+
+    assert router["routerProviderConflicts"] == ["openrouter"]
+    assert router["routerProviderRoles"]["c3"] == "dynamic_member"
+    assert {
+        router["routerProviderRoles"][tier]
+        for tier in ("c0", "c1", "c2", "c3")
+    } == {"dynamic_member"}
+
+
+async def test_ensemble_status_exposes_effective_failure_policy(tmp_path) -> None:
+    cfg = _synthetic_config(
+        tmp_path,
+        llm_ensemble={"enabled": False, "all_failed_policy": "error"},
+    )
+
+    payload = _status_payload(RpcContext(conn_id="contract", config=cfg))
+    ensemble = payload["sectionDetails"]["ensemble"]
+
+    assert ensemble["configuredAllFailedPolicy"] == "error"
+    assert ensemble["effectiveAllFailedPolicy"] == "fallback_single"
+    assert ensemble["policyDeprecated"] is True
 
 
 async def test_sparse_disabled_router_follows_primary_without_claiming_explicit_tiers(

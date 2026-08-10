@@ -35,6 +35,7 @@ from opensquilla.engine.routing import (
 )
 from opensquilla.engine.routing.policy_data import DEFAULT_CONTEXT_WINDOW_TOKENS
 from opensquilla.engine.steps.router_decision_record import stage_router_decision
+from opensquilla.ensemble_plan import effective_ensemble_selection_mode
 from opensquilla.provider.context_capabilities import provider_state_continuity_diagnostic
 from opensquilla.provider.model_catalog import shared_catalog
 from opensquilla.provider.types import ModelCapabilities
@@ -50,8 +51,10 @@ from opensquilla.router_tiers import (
     TEXT_TIERS,
     TierConfig,
     normalize_text_tier,
+    router_dynamic_tier_members_active,
     tier_ensemble_active,
     tier_index,
+    tier_provider_role,
 )
 from opensquilla.squilla_router.controller import (
     derive_prompt_policy,
@@ -636,6 +639,7 @@ def _record_thinking_metadata(ctx: TurnContext, router_cfg: object, tier_cfg: di
         return
     ctx.metadata["thinking_requested"] = True
     ctx.metadata["thinking_level"] = level
+    ctx.metadata["thinking_source"] = "squilla_router_tier"
 
 
 def _record_controller_thinking_metadata(
@@ -654,6 +658,7 @@ def _record_controller_thinking_metadata(
         return
     ctx.metadata["thinking_requested"] = True
     ctx.metadata["thinking_level"] = level
+    ctx.metadata["thinking_source"] = "squilla_router_tier"
 
 
 def _inject_prompt_hint(message: str, hint: str) -> str:
@@ -926,6 +931,25 @@ def _flag_tier_provider_mismatch(
     adapter re-assesses (and normally records a clean match for) the
     rebound tier.
     """
+    provider_role = tier_provider_role(
+        tier_name,
+        tiers.get(tier_name),
+        shared_selection_mode=effective_ensemble_selection_mode(ctx.config),
+        router_dynamic_members_active=router_dynamic_tier_members_active(
+            tiers,
+            shared_selection_mode=effective_ensemble_selection_mode(ctx.config),
+            ensemble_globally_enabled=bool(
+                getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
+            ),
+        ),
+    )
+    ctx.metadata["router_tier_provider_role"] = provider_role
+    if provider_role in {"dormant_draft", "blocked"}:
+        # Static/custom shared plans do not execute the stored C3 deployment;
+        # an unknown shared plan is rejected later by the ensemble boundary.
+        # Neither state may claim that the draft provider was routed.
+        return
+
     outcome = provider_mismatch(
         tiers=tiers,
         tier_name=tier_name,
@@ -984,12 +1008,46 @@ def _apply_provider_mismatch_veto(
     mode = str(getattr(router_cfg, "tier_provider_mismatch", "route") or "route").strip().lower()
     if mode != "veto" or not routing_applied:
         return decision, thinking_mode, prompt_policy
+    shared_selection_mode = effective_ensemble_selection_mode(ctx.config)
+    dynamic_members_active = router_dynamic_tier_members_active(
+        tiers,
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=bool(
+            getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
+        ),
+    )
+    selected_role = tier_provider_role(
+        decision.tier,
+        tiers.get(decision.tier),
+        shared_selection_mode=shared_selection_mode,
+        router_dynamic_members_active=dynamic_members_active,
+    )
+    if selected_role in {"dormant_draft", "blocked"}:
+        return decision, thinking_mode, prompt_policy
+
+    active_provider = str(
+        getattr(getattr(ctx.config, "llm", None), "provider", "") or ""
+    )
+    policy_tiers = {name: dict(value) for name, value in tiers.items()}
+    policy_valid_tiers: list[str] = []
+    for tier_name in valid_tiers:
+        role = tier_provider_role(
+            tier_name,
+            policy_tiers.get(tier_name),
+            shared_selection_mode=shared_selection_mode,
+            router_dynamic_members_active=dynamic_members_active,
+        )
+        if role == "blocked":
+            continue
+        if role == "dormant_draft":
+            policy_tiers[tier_name]["provider"] = active_provider
+        policy_valid_tiers.append(tier_name)
     veto = provider_mismatch_veto(
-        tiers=tiers,
+        tiers=policy_tiers,
         tier_name=decision.tier,
-        valid_tiers=valid_tiers,
+        valid_tiers=policy_valid_tiers,
         routing_applied=routing_applied,
-        active_provider=str(getattr(getattr(ctx.config, "llm", None), "provider", "") or ""),
+        active_provider=active_provider,
         cross_provider_tiers=bool(getattr(router_cfg, "cross_provider_tiers", False)),
         default_tier=getattr(router_cfg, "default_tier", None),
     )

@@ -571,7 +571,9 @@ def test_static_b5_supports_score_target_above_resilient_floor() -> None:
     assert provider.min_successful_proposers == 3
     assert provider.target_successful_proposers == 4
     assert provider.proposer_max_retries == 2
-    assert provider.all_failed_policy == "error"
+    # Legacy ``error`` remains loadable, but runtime has one effective
+    # contract: fall back through the configured fixed deployment.
+    assert provider.all_failed_policy == "fallback_single"
     assert provider.selection_plan["configured_target_successful_proposers"] == 4
     assert provider.selection_plan["effective_target_successful_proposers"] == 4
     assert provider.selection_plan["proposer_max_retries"] == 2

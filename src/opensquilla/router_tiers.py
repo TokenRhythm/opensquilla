@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 TEXT_TIERS: tuple[str, str, str, str] = ("c0", "c1", "c2", "c3")
 DEFAULT_TEXT_TIER = "c1"
@@ -20,6 +20,13 @@ ROUTER_TIER_ENSEMBLE_SELECTION_MODES = frozenset(
         "router_dynamic",
     }
 )
+
+TierProviderRole = Literal[
+    "direct",
+    "dormant_draft",
+    "dynamic_member",
+    "blocked",
+]
 
 LEGACY_TEXT_TIER_ALIASES: dict[str, str] = {
     "t0": "c0",
@@ -157,19 +164,111 @@ class TierConfig:
         )
 
 
-def tier_provider_is_dormant(tier: object, value: object) -> bool:
-    """Whether a stored tier provider is only the inactive C3 single-model draft.
+def tier_provider_role(
+    tier: object,
+    value: object,
+    *,
+    shared_selection_mode: str,
+    router_dynamic_members_active: bool = False,
+) -> TierProviderRole:
+    """Return the execution role owned by one stored tier provider.
 
-    Shared fusion owns C3's physical deployment and falls back through the
-    global direct/fallback model.  The provider/model retained on that tier is
-    therefore not an execution dependency until the user explicitly switches
-    C3 back to one model.  Legacy tier-local fusion still owns its provider as
-    a fallback, and C0-C2 remain ordinary provider-backed tiers.
+    C3's shared-plan flag does not by itself make the retained provider/model
+    dormant. Static and custom shared plans own their complete lineup, so the
+    C3 deployment is only a single-model draft. An active ``router_dynamic``
+    plan instead derives members from every text Router tier, so those rows
+    are execution dependencies. Legacy tier-local plans and ordinary tiers
+    remain direct dependencies. An absent or unknown shared plan is blocked;
+    treating it as dormant would hide the configuration error, while treating
+    it as direct would accidentally execute a draft deployment.
+    """
+
+    normalized_tier = normalize_text_tier(tier)
+    config = TierConfig.from_value(value)
+    if router_dynamic_members_active and normalized_tier in TEXT_TIERS:
+        return "dynamic_member"
+    if (
+        normalized_tier != HIGHEST_TEXT_TIER
+        or config.ensemble_enabled is not True
+    ):
+        return "direct"
+
+    selection_mode = str(shared_selection_mode or "").strip()
+    if selection_mode == "router_dynamic":
+        return "dynamic_member"
+    if selection_mode in {
+        "static_openrouter_b5",
+        "static_tokenrhythm_b5",
+        "custom_b5",
+    }:
+        return "dormant_draft"
+    return "blocked"
+
+
+def router_tier_provider_roles(
+    tiers: Mapping[str, Any] | None,
+    *,
+    shared_selection_mode: str,
+    ensemble_globally_enabled: bool = False,
+) -> dict[str, TierProviderRole]:
+    """Return canonical tier ids mapped to their provider ownership roles."""
+
+    normalized = normalize_tier_mapping(tiers)
+    dynamic_members_active = router_dynamic_tier_members_active(
+        normalized,
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=ensemble_globally_enabled,
+    )
+    return {
+        tier: tier_provider_role(
+            tier,
+            value,
+            shared_selection_mode=shared_selection_mode,
+            router_dynamic_members_active=dynamic_members_active,
+        )
+        for tier, value in normalized.items()
+    }
+
+
+def router_dynamic_tier_members_active(
+    tiers: Mapping[str, Any] | None,
+    *,
+    shared_selection_mode: str,
+    ensemble_globally_enabled: bool = False,
+) -> bool:
+    """Whether the current effective plan consumes Router text tiers as members."""
+
+    normalized = normalize_tier_mapping(tiers)
+    c3 = TierConfig.from_value(normalized.get(HIGHEST_TEXT_TIER))
+    return (
+        str(shared_selection_mode or "").strip() == "router_dynamic"
+        and (ensemble_globally_enabled or c3.ensemble_enabled is True)
+    ) or any(
+        TierConfig.from_value(value).ensemble_selection_mode == "router_dynamic"
+        for value in normalized.values()
+    )
+
+
+def tier_provider_is_dormant(
+    tier: object,
+    value: object,
+    *,
+    shared_selection_mode: str = "",
+) -> bool:
+    """Whether a stored provider is only the inactive C3 single-model draft.
+
+    ``shared_selection_mode`` is optional for source compatibility, but an
+    omitted mode is intentionally treated as blocked rather than dormant.
+    Callers deciding execution readiness must pass the effective shared plan.
     """
 
     return (
-        normalize_text_tier(tier) == HIGHEST_TEXT_TIER
-        and TierConfig.from_value(value).ensemble_enabled is True
+        tier_provider_role(
+            tier,
+            value,
+            shared_selection_mode=shared_selection_mode,
+        )
+        == "dormant_draft"
     )
 
 

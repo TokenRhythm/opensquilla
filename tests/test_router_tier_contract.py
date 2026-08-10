@@ -8,7 +8,12 @@ from opensquilla.engine.selector_override import apply_model_override
 from opensquilla.engine.steps.squilla_router import _flag_tier_provider_mismatch
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.mutations import _cross_provider_tier_warnings, upsert_router
-from opensquilla.router_tiers import TierConfig, tier_ensemble_execution
+from opensquilla.router_tiers import (
+    TierConfig,
+    router_tier_provider_roles,
+    tier_ensemble_execution,
+    tier_provider_role,
+)
 
 # ---------------------------------------------------------------------------
 # TierConfig
@@ -79,6 +84,109 @@ def test_missing_shared_flag_preserves_legacy_tier_mode() -> None:
         "c3",
         shared_selection_mode="custom_b5",
     ) == ("static_tokenrhythm_b5", "legacy")
+
+
+def test_tier_provider_role_is_mode_aware_for_shared_c3() -> None:
+    shared_c3 = {
+        "provider": "openrouter",
+        "model": "synthetic/model",
+        "ensemble_enabled": True,
+    }
+
+    assert (
+        tier_provider_role(
+            "c3",
+            shared_c3,
+            shared_selection_mode="static_openrouter_b5",
+        )
+        == "dormant_draft"
+    )
+    assert (
+        tier_provider_role(
+            "c3",
+            shared_c3,
+            shared_selection_mode="custom_b5",
+        )
+        == "dormant_draft"
+    )
+    assert (
+        tier_provider_role(
+            "c3",
+            shared_c3,
+            shared_selection_mode="router_dynamic",
+        )
+        == "dynamic_member"
+    )
+    assert (
+        tier_provider_role("c3", shared_c3, shared_selection_mode="unknown")
+        == "blocked"
+    )
+
+
+def test_tier_provider_role_keeps_single_and_legacy_tiers_direct() -> None:
+    assert (
+        tier_provider_role(
+            "c3",
+            {"ensemble_enabled": False},
+            shared_selection_mode="router_dynamic",
+        )
+        == "direct"
+    )
+    assert (
+        tier_provider_role(
+            "c3",
+            {"ensemble_selection_mode": "router_dynamic"},
+            shared_selection_mode="static_openrouter_b5",
+        )
+        == "direct"
+    )
+    assert (
+        tier_provider_role(
+            "c2",
+            {"ensemble_enabled": True},
+            shared_selection_mode="router_dynamic",
+        )
+        == "direct"
+    )
+
+
+def test_router_tier_provider_roles_normalizes_legacy_keys() -> None:
+    roles = router_tier_provider_roles(
+        {
+            "c0": {"provider": "openrouter", "model": "fast"},
+            "t3": {
+                "provider": "openrouter",
+                "model": "quality",
+                "ensemble_enabled": True,
+            },
+            "image_model": {"provider": "openrouter", "model": "vision"},
+        },
+        shared_selection_mode="router_dynamic",
+    )
+
+    assert roles == {
+        "c0": "dynamic_member",
+        "c3": "dynamic_member",
+        "image_model": "direct",
+    }
+
+
+def test_router_tier_provider_roles_marks_all_text_tiers_for_global_dynamic_plan() -> None:
+    roles = router_tier_provider_roles(
+        {
+            "c0": {"provider": "openrouter", "model": "fast"},
+            "c1": {"provider": "openrouter", "model": "balanced"},
+            "image_model": {"provider": "openrouter", "model": "vision"},
+        },
+        shared_selection_mode="router_dynamic",
+        ensemble_globally_enabled=True,
+    )
+
+    assert roles == {
+        "c0": "dynamic_member",
+        "c1": "dynamic_member",
+        "image_model": "direct",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +314,40 @@ def test_cross_provider_tier_warning_preserves_legacy_route_semantics() -> None:
     assert len(warnings) == 1
     assert "model will be requested from 'openrouter'" in warnings[0]
     assert "choice is vetoed" not in warnings[0]
+
+
+def test_cross_provider_warning_uses_shared_c3_provider_role() -> None:
+    tiers = {
+        "c3": {
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "ensemble_enabled": True,
+        }
+    }
+
+    assert (
+        _cross_provider_tier_warnings(
+            tiers,
+            "openrouter",
+            shared_selection_mode="custom_b5",
+        )
+        == []
+    )
+    dynamic_warnings = _cross_provider_tier_warnings(
+        tiers,
+        "openrouter",
+        shared_selection_mode="router_dynamic",
+    )
+    assert len(dynamic_warnings) == 1
+    assert "model will be requested from 'openrouter'" in dynamic_warnings[0]
+
+    blocked_warnings = _cross_provider_tier_warnings(
+        tiers,
+        "openrouter",
+        shared_selection_mode="unknown",
+    )
+    assert len(blocked_warnings) == 1
+    assert "shared multi-model plan" in blocked_warnings[0]
 
 
 def test_cross_provider_warning_flips_to_credential_check_when_enabled(monkeypatch) -> None:

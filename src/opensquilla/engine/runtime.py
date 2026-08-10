@@ -8206,21 +8206,80 @@ class TurnRunner:
                 turn.metadata.get("routed_tier"),
                 shared_selection_mode=configured_selection_mode,
             )
-        shared_tier_ensemble = tier_ensemble_binding == "shared"
         ensemble_globally_enabled = bool(getattr(ensemble_cfg, "enabled", False))
         selection_mode = tier_ensemble_mode or configured_selection_mode
-        # A globally enabled Ensemble owns every request's physical baseline,
-        # including the legitimate router_dynamic state where Router remains
-        # enabled to choose the lineup. Retained tier-local selection modes are
-        # the compatibility exception: those old configs continue to use the
-        # routed tier as their fallback deployment.
-        fixed_baseline_ensemble = shared_tier_ensemble or (
-            ensemble_globally_enabled and tier_ensemble_binding != "legacy"
+        # Every active Ensemble uses the configured fixed/direct deployment as
+        # its physical baseline and all-failed fallback. Legacy tier-local
+        # selection modes remain readable and still choose their historical
+        # plan/lineup, but they no longer own a second hidden fallback model.
+        fixed_baseline_ensemble = bool(
+            ensemble_globally_enabled or tier_ensemble_mode
         )
-        dynamic_plan_provider_config = None
+        if fixed_baseline_ensemble:
+            fixed_provider = str(
+                getattr(initial_provider_config, "provider", "") or ""
+            ).strip()
+            fixed_model = str(
+                getattr(initial_provider_config, "model", "") or ""
+            ).strip()
+            if not fixed_provider or not fixed_model:
+                log.error(
+                    "llm_ensemble.missing_fixed_fallback",
+                    provider=fixed_provider,
+                    model_configured=bool(fixed_model),
+                )
+                turn.metadata["ensemble_wrap_skipped_reason"] = "missing_fixed_fallback"
+                raise RuntimeError(
+                    "missing_fixed_fallback: configure a non-empty fixed/direct "
+                    "provider and model before enabling multi-model fusion"
+                )
+            turn.metadata["ensemble_fallback_provider"] = fixed_provider
+            turn.metadata["ensemble_fallback_model"] = fixed_model
+
+            # Static/custom plans own their members' reasoning policy.  The
+            # tier value remains stored as the reversible single-model draft,
+            # but must not leak into the shared plan.  Legacy router_dynamic
+            # continues to derive per-member thinking from its tier rows.
+            if (
+                selection_mode != "router_dynamic"
+                and turn.metadata.get("thinking_source") == "squilla_router_tier"
+            ):
+                turn.metadata.pop("thinking_requested", None)
+                turn.metadata.pop("thinking_level", None)
+                turn.metadata.pop("thinking_source", None)
+
+        routed_plan_provider_config = None
+        routed_plan_blocked_reason = ""
+
+        def _record_fixed_ensemble_execution(reason: str) -> None:
+            """Stamp a wrapper skip as an actual fixed-model execution."""
+
+            if not fixed_baseline_ensemble or initial_provider_config is None:
+                return
+            provider_id = str(
+                getattr(initial_provider_config, "provider", "") or ""
+            )
+            model_id = str(getattr(initial_provider_config, "model", "") or "")
+            turn.metadata["executed_provider"] = provider_id
+            turn.metadata["executed_model"] = model_id
+            turn.metadata["ensemble_fallback_provider"] = provider_id
+            turn.metadata["ensemble_fallback_model"] = model_id
+            turn.metadata["ensemble_fallback_reason"] = reason
+            turn.metadata["routed_provider_fallback_provider"] = provider_id
+            turn.metadata["routed_provider_fallback_model"] = model_id
+            for key in (
+                "savings_pct",
+                "savings_max_price_per_m",
+                "savings_routed_price_per_m",
+            ):
+                if key in turn.metadata:
+                    turn.metadata[key] = 0.0
+        routed_plan_owns_tier = (
+            selection_mode == "router_dynamic" or tier_ensemble_binding == "legacy"
+        )
         if (
             fixed_baseline_ensemble
-            and selection_mode == "router_dynamic"
+            and routed_plan_owns_tier
             and turn.metadata.get("routing_applied") is True
             and turn.model
             and initial_provider_config is not None
@@ -8238,10 +8297,28 @@ class TurnRunner:
                 session_key=turn.session_key,
             )
             if turn.metadata.get("routed_provider_blocked"):
-                # Match apply_model_override's fail-closed boundary: an
-                # unresolved/vetoed foreign route keeps both the configured
-                # provider and its fixed model as the dynamic anchor.
-                dynamic_plan_provider_config = initial_provider_config
+                # A blocked foreign route is not a fixed-model dynamic anchor.
+                # Skip this turn's wrapper and execute the fixed deployment
+                # directly; otherwise the trace would claim a dynamic plan ran
+                # even though its Router-selected member was unavailable.
+                routed_plan_blocked_reason = str(
+                    turn.metadata.get("routed_provider_blocked")
+                    or "routed_plan_provider_blocked"
+                )
+                turn.metadata["ensemble_anchor_blocked_reason"] = (
+                    routed_plan_blocked_reason
+                )
+                turn.metadata["ensemble_anchor_provider_resolution"] = (
+                    turn.metadata.get("routed_provider_resolution")
+                    or {
+                        "provider": str(
+                            turn.metadata.get("routed_provider") or ""
+                        ),
+                        "model": str(turn.model or ""),
+                        "ready": False,
+                        "reason": routed_plan_blocked_reason,
+                    }
+                )
                 turn.metadata["routed_provider_fallback_provider"] = str(
                     getattr(initial_provider_config, "provider", "") or ""
                 )
@@ -8249,17 +8326,49 @@ class TurnRunner:
                     getattr(initial_provider_config, "model", "") or ""
                 )
             elif routed_plan_config is not None:
-                dynamic_plan_provider_config = routed_plan_config
+                routed_plan_provider_config = routed_plan_config
             else:
                 # Same-provider and the default cross-provider flag-only
                 # policy execute the final routed model on the active
                 # deployment. Build that plan identity without mutating the
                 # selector, whose head remains the global fixed fallback.
-                dynamic_plan_provider_config = replace(
+                routed_plan_provider_config = replace(
                     initial_provider_config,
                     model=str(turn.model),
                     provider_routing=dict(initial_provider_config.provider_routing),
                 )
+            if routed_plan_provider_config is not None:
+                turn.metadata["ensemble_anchor_provider"] = str(
+                    getattr(routed_plan_provider_config, "provider", "") or ""
+                )
+                turn.metadata["ensemble_anchor_model"] = str(
+                    getattr(routed_plan_provider_config, "model", "") or ""
+                )
+                if turn.metadata.get("routed_provider_resolution") is not None:
+                    turn.metadata["ensemble_anchor_provider_resolution"] = (
+                        turn.metadata.get("routed_provider_resolution")
+                    )
+                else:
+                    routed_provider = str(
+                        turn.metadata.get("routed_provider") or ""
+                    ).strip().lower()
+                    active_provider = str(
+                        getattr(initial_provider_config, "provider", "") or ""
+                    ).strip().lower()
+                    turn.metadata["ensemble_anchor_provider_resolution"] = {
+                        "provider": str(
+                            getattr(routed_plan_provider_config, "provider", "") or ""
+                        ),
+                        "model": str(
+                            getattr(routed_plan_provider_config, "model", "") or ""
+                        ),
+                        "ready": True,
+                        "reason": (
+                            "same_provider"
+                            if not routed_provider or routed_provider == active_provider
+                            else "active_provider_route"
+                        ),
+                    }
         if fixed_baseline_ensemble:
             routed_model = str(turn.model or "").strip()
             if routed_model:
@@ -8271,9 +8380,7 @@ class TurnRunner:
                 # identity aligned with the selector/provider that will really
                 # serve the direct fallback; ``routed_model`` above preserves
                 # the logical Router decision for RouterDecisionEvent.
-                turn.model = str(
-                    getattr(initial_provider_config, "model", "") or turn.model
-                )
+                turn.model = str(getattr(initial_provider_config, "model", "") or "")
 
         # Apply a routed model back to the cloned selector only when the tier
         # owns a physical single-model deployment. Shared and globally enabled
@@ -8326,8 +8433,8 @@ class TurnRunner:
                 and initial_provider_config is not None
                 else current_provider_config
             )
-            if dynamic_plan_provider_config is not None:
-                plan_provider_config = dynamic_plan_provider_config
+            if routed_plan_provider_config is not None:
+                plan_provider_config = routed_plan_provider_config
             if static_b5_profile(selection_mode) is None and selection_mode not in {
                 CUSTOM_B5_SELECTION_MODE,
                 "router_dynamic",
@@ -8338,6 +8445,26 @@ class TurnRunner:
                 )
                 turn.metadata["ensemble_wrap_skipped_reason"] = (
                     f"unsupported_tier_selection_mode:{selection_mode}"
+                )
+                _record_fixed_ensemble_execution(
+                    str(turn.metadata["ensemble_wrap_skipped_reason"])
+                )
+                return turn, provider
+            if routed_plan_blocked_reason:
+                blocked_prefix = (
+                    "router_dynamic_not_ready"
+                    if selection_mode == "router_dynamic"
+                    else "tier_ensemble_not_ready"
+                )
+                log.warning(
+                    "llm_ensemble.wrap_skipped",
+                    reason=f"{blocked_prefix}:{routed_plan_blocked_reason}",
+                )
+                turn.metadata["ensemble_wrap_skipped_reason"] = (
+                    f"{blocked_prefix}:{routed_plan_blocked_reason}"
+                )
+                _record_fixed_ensemble_execution(
+                    str(turn.metadata["ensemble_wrap_skipped_reason"])
                 )
                 return turn, provider
             # The shared deployment resolver marks an unexecutable member
@@ -8361,6 +8488,12 @@ class TurnRunner:
                     "llm_ensemble.wrap_skipped",
                     reason="missing_provider_selector_current_config",
                 )
+                turn.metadata["ensemble_wrap_skipped_reason"] = (
+                    "missing_provider_selector_current_config"
+                )
+                _record_fixed_ensemble_execution(
+                    str(turn.metadata["ensemble_wrap_skipped_reason"])
+                )
             elif not getattr(current_provider_config, "provider", None) or not getattr(
                 current_provider_config,
                 "model",
@@ -8369,6 +8502,12 @@ class TurnRunner:
                 log.warning(
                     "llm_ensemble.wrap_skipped",
                     reason="incomplete_provider_selector_current_config",
+                )
+                turn.metadata["ensemble_wrap_skipped_reason"] = (
+                    "incomplete_provider_selector_current_config"
+                )
+                _record_fixed_ensemble_execution(
+                    str(turn.metadata["ensemble_wrap_skipped_reason"])
                 )
             elif static_b5_profile(selection_mode) is not None and not (
                 static_b5_credential_available(
@@ -8391,6 +8530,9 @@ class TurnRunner:
                 turn.metadata["ensemble_wrap_skipped_reason"] = (
                     f"{selection_mode}_no_credential"
                 )
+                _record_fixed_ensemble_execution(
+                    str(turn.metadata["ensemble_wrap_skipped_reason"])
+                )
             elif not custom_has_proposer:
                 log.warning(
                     "llm_ensemble.wrap_skipped",
@@ -8398,6 +8540,9 @@ class TurnRunner:
                 )
                 turn.metadata["ensemble_wrap_skipped_reason"] = (
                     f"{selection_mode}_not_ready:no_proposers"
+                )
+                _record_fixed_ensemble_execution(
+                    str(turn.metadata["ensemble_wrap_skipped_reason"])
                 )
             else:
                 turn.metadata["ensemble_enabled"] = True
@@ -8411,7 +8556,8 @@ class TurnRunner:
                     "routed_model_before_ensemble",
                     turn.model or getattr(current_provider_config, "model", ""),
                 )
-                provider = build_ensemble_provider_from_config(
+                fixed_provider = provider
+                ensemble_provider = build_ensemble_provider_from_config(
                     config=self._turn_config(),
                     inherited_provider_config=current_provider_config,
                     fallback_provider=provider,
@@ -8429,7 +8575,46 @@ class TurnRunner:
                     _fallback_selector=cloned_selector,
                     _selection_mode_override=selection_mode,
                     _plan_provider_config=plan_provider_config,
+                    _dynamic_baseline_provider_config=initial_provider_config,
                 )
+                blocked_dynamic_candidates = (
+                    list(
+                        getattr(ensemble_provider, "selection_plan", {}).get(
+                            "blocked_tier_candidates",
+                            [],
+                        )
+                    )
+                    if selection_mode == "router_dynamic"
+                    else []
+                )
+                unavailable_dynamic_candidates = [
+                    row
+                    for row in blocked_dynamic_candidates
+                    if isinstance(row, dict)
+                    and str(row.get("reason") or "") != "cross_provider_veto"
+                ]
+                if unavailable_dynamic_candidates:
+                    blocked_reason = str(
+                        unavailable_dynamic_candidates[0].get("reason")
+                        or "dynamic_member_unavailable"
+                    )
+                    skip_reason = f"router_dynamic_not_ready:{blocked_reason}"
+                    log.warning(
+                        "llm_ensemble.wrap_skipped",
+                        reason=skip_reason,
+                    )
+                    turn.metadata["ensemble_anchor_blocked_reason"] = blocked_reason
+                    turn.metadata["ensemble_dynamic_blocked_candidates"] = (
+                        unavailable_dynamic_candidates
+                    )
+                    turn.metadata["ensemble_wrap_skipped_reason"] = skip_reason
+                    turn.metadata.pop("ensemble_enabled", None)
+                    turn.metadata.pop("ensemble_activation_source", None)
+                    turn.metadata.pop("ensemble_tier_binding", None)
+                    _record_fixed_ensemble_execution(skip_reason)
+                    provider = fixed_provider
+                else:
+                    provider = ensemble_provider
 
         return turn, provider
 

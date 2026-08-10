@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from opensquilla.provider.registry import get_provider_spec
+from opensquilla.provider.registry import get_provider_spec, list_provider_specs
 
 
 def test_provider_spec_requires_api_key_for_openrouter():
@@ -46,6 +46,15 @@ def test_provider_spec_requires_base_url_for_vllm():
 def test_provider_spec_does_not_require_base_url_for_openrouter():
     spec = get_provider_spec("openrouter")
     assert spec.requires_base_url() is False
+
+
+def test_every_runtime_provider_requires_a_non_empty_fixed_model() -> None:
+    """The universal Ensemble fallback may never rely on a model-optional provider."""
+
+    runtime_specs = [spec for spec in list_provider_specs() if spec.runtime_supported]
+
+    assert runtime_specs
+    assert all("model" in spec.required_fields for spec in runtime_specs)
 
 
 # --------------- ProviderSetupSpec catalog ---------------

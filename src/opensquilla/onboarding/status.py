@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from opensquilla.ensemble_plan import effective_ensemble_selection_mode
 from opensquilla.gateway.config import (
     LEGACY_OPENROUTER_MODEL_OPTIONS,
     STATIC_B5_SELECTION_MODE_PROVIDERS,
@@ -56,7 +57,11 @@ from opensquilla.provider.image_generation_credentials import (
     resolve_image_generation_credential,
 )
 from opensquilla.provider.preset_registry import get_preset
-from opensquilla.router_tiers import tier_provider_is_dormant
+from opensquilla.router_tiers import (
+    router_dynamic_tier_members_active,
+    router_tier_provider_roles,
+    tier_provider_role,
+)
 
 
 @dataclass(frozen=True)
@@ -182,6 +187,9 @@ _ENSEMBLE_ONBOARDING_STATUS_KEYS = (
     "perTurnCallCount",
     "perTurnCallCountRange",
     "memberProviders",
+    "configuredAllFailedPolicy",
+    "effectiveAllFailedPolicy",
+    "policyDeprecated",
 )
 
 
@@ -193,6 +201,10 @@ def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
     enabled or disable the router editor in older WebUI clients.
     """
     globally_enabled = bool(getattr(getattr(cfg, "llm_ensemble", None), "enabled", False))
+    configured_policy = str(
+        getattr(getattr(cfg, "llm_ensemble", None), "all_failed_policy", "fallback_single")
+        or "fallback_single"
+    ).strip()
     if not globally_enabled:
         selection_mode = str(
             getattr(getattr(cfg, "llm_ensemble", None), "selection_mode", "") or ""
@@ -209,6 +221,9 @@ def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
             "perTurnCallCount": 0,
             "perTurnCallCountRange": None,
             "memberProviders": [],
+            "configuredAllFailedPolicy": configured_policy,
+            "effectiveAllFailedPolicy": "fallback_single",
+            "policyDeprecated": configured_policy != "fallback_single",
         }
     else:
         # Runtime readiness may resolve several provider credentials. Avoid
@@ -217,6 +232,12 @@ def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
         from opensquilla.provider.ensemble import ensemble_runtime_status
 
         runtime = ensemble_runtime_status(cfg)
+        runtime.setdefault("configuredAllFailedPolicy", configured_policy)
+        runtime.setdefault("effectiveAllFailedPolicy", "fallback_single")
+        runtime.setdefault(
+            "policyDeprecated",
+            configured_policy != str(runtime["effectiveAllFailedPolicy"]),
+        )
     return {key: runtime.get(key) for key in _ENSEMBLE_ONBOARDING_STATUS_KEYS}
 
 
@@ -227,7 +248,12 @@ def _ensemble_detail(cfg: GatewayConfig) -> str:
     mode = str(runtime["selectionMode"])
     proposer_count = runtime.get("proposerCount")
     if proposer_count is None:
-        proposer_range = runtime.get("proposerCountRange") or []
+        raw_proposer_range = runtime.get("proposerCountRange")
+        proposer_range = (
+            raw_proposer_range
+            if isinstance(raw_proposer_range, list | tuple)
+            else []
+        )
         count_text = (
             f"{proposer_range[0]}-{proposer_range[1]} proposers"
             if len(proposer_range) == 2
@@ -798,11 +824,26 @@ def _router_provider_conflicts(cfg: GatewayConfig) -> tuple[str, ...]:
     active = str(getattr(getattr(cfg, "llm", None), "provider", "") or "").strip().lower()
     conflicts: set[str] = set()
     tiers = getattr(router, "tiers", {}) or {}
+    shared_selection_mode = effective_ensemble_selection_mode(cfg)
+    ensemble_globally_enabled = bool(
+        getattr(getattr(cfg, "llm_ensemble", None), "enabled", False)
+    )
+    dynamic_members_active = router_dynamic_tier_members_active(
+        tiers if isinstance(tiers, dict) else {},
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=ensemble_globally_enabled,
+    )
     if isinstance(tiers, dict):
         for tier_name, tier in tiers.items():
             if not isinstance(tier, dict):
                 continue
-            if tier_provider_is_dormant(tier_name, tier):
+            provider_role = tier_provider_role(
+                tier_name,
+                tier,
+                shared_selection_mode=shared_selection_mode,
+                router_dynamic_members_active=dynamic_members_active,
+            )
+            if provider_role not in {"direct", "dynamic_member"}:
                 continue
             provider = str(tier.get("provider") or "").strip().lower()
             if provider and provider != active:
@@ -1116,6 +1157,13 @@ def get_onboarding_status(
         section_details["router"]["routerBinding"] = _router_binding(config)
         section_details["router"]["routerProviderConflicts"] = list(
             _router_provider_conflicts(config)
+        )
+        section_details["router"]["routerProviderRoles"] = router_tier_provider_roles(
+            getattr(config.squilla_router, "tiers", {}) or {},
+            shared_selection_mode=effective_ensemble_selection_mode(config),
+            ensemble_globally_enabled=bool(
+                getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+            ),
         )
     if "ensemble" in section_details:
         section_details["ensemble"].update(_ensemble_onboarding_status(config))

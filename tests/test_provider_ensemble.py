@@ -6163,6 +6163,124 @@ def test_ensemble_runtime_status_counts_static_custom_and_dynamic() -> None:
     assert dynamic_status["perTurnCallCountRange"] == [3, 5]
 
 
+@pytest.mark.parametrize(
+    (
+        "cross_provider_tiers",
+        "mismatch_policy",
+        "foreign_ready",
+        "continuity_decision",
+        "expected_provider",
+        "expected_blocked_reason",
+    ),
+    [
+        (False, "route", False, "", "tokenrhythm", None),
+        (False, "veto", False, "", None, "cross_provider_veto"),
+        (True, "route", True, "", "openrouter", None),
+        (True, "route", False, "", None, "missing_credential"),
+        (
+            True,
+            "route",
+            True,
+            "discard_provider_state",
+            None,
+            "provider_state_continuity",
+        ),
+    ],
+    ids=["route", "veto", "cross-ready", "cross-unready", "continuity-blocked"],
+)
+def test_router_dynamic_applies_provider_policy_to_every_tier_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    cross_provider_tiers: bool,
+    mismatch_policy: str,
+    foreign_ready: bool,
+    continuity_decision: str,
+    expected_provider: str | None,
+    expected_blocked_reason: str | None,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    baseline = ProviderConfig(
+        provider="tokenrhythm",
+        model="fixed-model",
+        api_key="sk-tr-synthetic",
+        base_url="https://tokenrhythm.example/v1",
+    )
+    profiles = (
+        {
+            "openrouter": {
+                "provider": "openrouter",
+                "model": "foreign-model",
+                "api_key": "sk-or-synthetic",
+            }
+        }
+        if foreign_ready
+        else {}
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": baseline.provider,
+            "model": baseline.model,
+            "api_key": baseline.api_key,
+            "base_url": baseline.base_url,
+        },
+        llm_profiles=profiles,
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": cross_provider_tiers,
+            "tier_provider_mismatch": mismatch_policy,
+            "tiers": {
+                "c0": {
+                    "provider": "openrouter",
+                    "model": "foreign-model",
+                },
+                "c1": {
+                    "provider": "tokenrhythm",
+                    "model": "fixed-model",
+                },
+            },
+        },
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=baseline,
+        fallback_provider=None,
+        turn_metadata={
+            "routed_tier": "c1",
+            "provider_state_continuity": (
+                {"decision": continuity_decision}
+                if continuity_decision
+                else {}
+            ),
+        },
+        _plan_provider_config=baseline,
+        _dynamic_baseline_provider_config=baseline,
+    )
+
+    tier_candidates = [
+        candidate
+        for candidate in provider.selection_plan["candidate_pool"]
+        if candidate["source"] == "router_tier:c0"
+    ]
+    blocked_candidates = [
+        candidate
+        for candidate in provider.selection_plan["blocked_tier_candidates"]
+        if candidate["source"] == "router_tier:c0"
+    ]
+    if expected_provider is not None:
+        assert len(tier_candidates) == 1
+        assert tier_candidates[0]["provider"] == expected_provider
+        assert tier_candidates[0]["model"] == "foreign-model"
+        assert blocked_candidates == []
+    else:
+        assert tier_candidates == []
+        assert len(blocked_candidates) == 1
+        assert blocked_candidates[0]["provider"] == "openrouter"
+        assert blocked_candidates[0]["model"] == "foreign-model"
+        assert blocked_candidates[0]["reason"] == expected_blocked_reason
+
+
 def test_ensemble_runtime_status_checks_inherited_custom_aggregator_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

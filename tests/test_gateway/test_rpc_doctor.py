@@ -496,6 +496,53 @@ def test_router_payload_deep_mode_loads_runtime_and_classifies_native_error(
     assert "libomp.dylib" in deep["error"]
 
 
+def test_router_payload_reports_mode_aware_provider_roles() -> None:
+    def config_for(selection_mode: str) -> GatewayConfig:
+        return GatewayConfig(
+            llm={"provider": "deepseek", "model": "deepseek-chat"},
+            llm_ensemble={"selection_mode": selection_mode},
+            squilla_router={
+                "enabled": True,
+                "tiers": {
+                    "c3": {
+                        "provider": "openrouter",
+                        "model": "synthetic/model",
+                        "ensemble_enabled": True,
+                    }
+                },
+            },
+        )
+
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    static = rpc_doctor._router_payload(
+        RpcContext(conn_id="static", config=config_for("static_openrouter_b5"))
+    )
+    dynamic = rpc_doctor._router_payload(
+        RpcContext(conn_id="dynamic", config=config_for("router_dynamic"))
+    )
+
+    assert static["routerProviderRoles"]["c3"] == "dormant_draft"
+    assert static["mismatchedTierProviders"] == {}
+    assert dynamic["routerProviderRoles"]["c3"] == "dynamic_member"
+    assert dynamic["mismatchedTierProviders"] == {"c3": "openrouter"}
+
+
+def test_llm_ensemble_payload_exposes_effective_failure_policy() -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    payload = rpc_doctor._llm_ensemble_payload(
+        RpcContext(
+            conn_id="deprecated-policy",
+            config=GatewayConfig(llm_ensemble={"all_failed_policy": "error"}),
+        )
+    )
+
+    assert payload["configuredAllFailedPolicy"] == "error"
+    assert payload["effectiveAllFailedPolicy"] == "fallback_single"
+    assert payload["policyDeprecated"] is True
+
+
 @pytest.mark.asyncio
 async def test_doctor_status_accepts_deep_memory_flag(monkeypatch) -> None:
     import opensquilla.gateway.rpc_doctor as rpc_doctor

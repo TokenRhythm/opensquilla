@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import random
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
@@ -1553,7 +1553,7 @@ class EnsembleProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncGenerator[StreamEvent, None]:
         validation_error = self.validate_chat_request(messages)
         if validation_error is not None:
             yield validation_error
@@ -3744,9 +3744,14 @@ def _candidate_pool(
     config: Any,
     *,
     inherited_provider_config: ProviderConfig,
+    baseline_provider_config: ProviderConfig,
     routed_tier: str,
-) -> list[_DynamicCandidate]:
+    credential_pool_acquirer: CredentialPoolAcquirer | None = None,
+    session_key: str = "",
+    turn_metadata: Mapping[str, Any] | None = None,
+) -> tuple[list[_DynamicCandidate], list[dict[str, str]]]:
     pool: list[_DynamicCandidate] = []
+    blocked_tier_candidates: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
     def add(candidate: _DynamicCandidate) -> None:
@@ -3806,6 +3811,23 @@ def _candidate_pool(
 
     router_cfg = getattr(config, "squilla_router", None)
     tiers = getattr(router_cfg, "tiers", {}) or {}
+    cross_provider_tiers = bool(
+        getattr(router_cfg, "cross_provider_tiers", False)
+    )
+    mismatch_policy = str(
+        getattr(router_cfg, "tier_provider_mismatch", "route") or "route"
+    ).strip().lower()
+    baseline_provider = str(baseline_provider_config.provider or "").strip().lower()
+    continuity = (
+        turn_metadata.get("provider_state_continuity")
+        if isinstance(turn_metadata, Mapping)
+        else None
+    )
+    continuity_decision = (
+        str(continuity.get("decision") or "").strip().lower()
+        if isinstance(continuity, Mapping)
+        else ""
+    )
     if isinstance(tiers, dict):
         for tier_name, tier_cfg in tiers.items():
             if not isinstance(tier_cfg, dict):
@@ -3813,11 +3835,54 @@ def _candidate_pool(
             model = str(tier_cfg.get("model") or "").strip()
             if not model:
                 continue
+            configured_provider = str(
+                tier_cfg.get("provider") or baseline_provider
+            ).strip().lower()
+            effective_provider = configured_provider or baseline_provider
+            blocked_reason = ""
+            if effective_provider != baseline_provider:
+                if not cross_provider_tiers:
+                    if mismatch_policy == "veto":
+                        blocked_reason = "cross_provider_veto"
+                    else:
+                        # Compatibility route mode sends the tier's model id
+                        # through the active fixed provider.  The plan member
+                        # owns a model choice, not a provider switch.
+                        effective_provider = baseline_provider
+                else:
+                    if continuity_decision == "discard_provider_state":
+                        blocked_reason = "provider_state_continuity"
+                    else:
+                        resolution = _resolve_member_deployment(
+                            _DynamicModelRef(
+                                provider=effective_provider,
+                                model=model,
+                                thinking=_coerce_thinking_level(
+                                    tier_cfg.get("thinking_level")
+                                ),
+                            ),
+                            baseline_provider_config,
+                            config=config,
+                            credential_pool_acquirer=credential_pool_acquirer,
+                            session_key=session_key,
+                        )
+                        if not resolution.ready:
+                            blocked_reason = str(
+                                resolution.reason or "deployment_unavailable"
+                            )
+            if blocked_reason:
+                blocked_tier_candidates.append(
+                    {
+                        "source": f"router_tier:{tier_name}",
+                        "provider": configured_provider,
+                        "model": model,
+                        "reason": blocked_reason,
+                    }
+                )
+                continue
             add(
                 _dynamic_candidate(
-                    provider=str(
-                        tier_cfg.get("provider") or inherited_provider_config.provider
-                    ),
+                    provider=effective_provider,
                     model=model,
                     tier_hint=str(tier_name),
                     thinking=_coerce_thinking_level(tier_cfg.get("thinking_level")),
@@ -3825,7 +3890,7 @@ def _candidate_pool(
                     pool_index=len(pool),
                 )
             )
-    return pool
+    return pool, blocked_tier_candidates
 
 
 def _router_affinity_score(
@@ -4084,6 +4149,7 @@ def _build_router_dynamic_members(
     *,
     config: Any,
     inherited_provider_config: ProviderConfig,
+    baseline_provider_config: ProviderConfig,
     turn_metadata: Mapping[str, Any] | None,
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
     session_key: str = "",
@@ -4102,10 +4168,14 @@ def _build_router_dynamic_members(
     except (TypeError, ValueError):
         routing_confidence = 0.0
 
-    pool = _candidate_pool(
+    pool, blocked_tier_candidates = _candidate_pool(
         config,
         inherited_provider_config=inherited_provider_config,
+        baseline_provider_config=baseline_provider_config,
         routed_tier=routed_tier,
+        credential_pool_acquirer=credential_pool_acquirer,
+        session_key=session_key,
+        turn_metadata=turn_metadata,
     )
     if not pool:
         raise ValueError("llm_ensemble router_dynamic candidate pool is empty")
@@ -4185,6 +4255,7 @@ def _build_router_dynamic_members(
         "aggregator": aggregator_trace,
         "candidate_pool_size": len(pool),
         "candidate_pool": [_candidate_trace(candidate) for candidate in pool],
+        "blocked_tier_candidates": blocked_tier_candidates,
         "proposer_count": len(proposers),
         "duplicate_policy": "selected_penalty",
         "tier_index": _tier_index(routed_tier),
@@ -4193,7 +4264,12 @@ def _build_router_dynamic_members(
 
 
 def _static_b5_ref(provider_id: str, model: str) -> _DynamicModelRef:
-    return _DynamicModelRef(provider=provider_id, model=model, thinking=None)
+    # Thinking belongs to the shared plan, not to the C3 tier that happened to
+    # activate it.  OpenRouter's shipped B5 plan preserves the historical C3
+    # high-reasoning default. TokenRhythm rejects thinking-toggle request
+    # fields, so leaving this unset preserves the provider's default payload.
+    thinking = "high" if provider_id == "openrouter" else None
+    return _DynamicModelRef(provider=provider_id, model=model, thinking=thinking)
 
 
 def _static_default_if_legacy(
@@ -4310,7 +4386,13 @@ def _build_custom_b5_members(
         raise ValueError("llm_ensemble custom_b5 lineup has no enabled proposers")
     proposers = [
         _member_from_ref(
-            _DynamicModelRef(provider=row.provider, model=row.model, thinking=row.thinking),
+            _DynamicModelRef(
+                provider=row.provider,
+                model=row.model,
+                # An empty custom-member override means provider-default
+                # behavior. It must not inherit C3's dormant tier setting.
+                thinking=row.thinking,
+            ),
             config=config,
             inherited=inherited_provider_config,
             label=row.role or f"proposer_{index + 1}",
@@ -4518,6 +4600,10 @@ def ensemble_runtime_status(config: Any) -> dict[str, Any]:
         else {}
     )
     enabled = globally_enabled or bool(tier_selection_modes)
+    configured_all_failed_policy = str(
+        getattr(ensemble, "all_failed_policy", "fallback_single") or "fallback_single"
+    )
+    policy_deprecated = configured_all_failed_policy != "fallback_single"
     selection_mode = configured_selection_mode
     if not globally_enabled and tier_selection_modes:
         selection_mode = next(iter(tier_selection_modes.values()))
@@ -4539,6 +4625,9 @@ def ensemble_runtime_status(config: Any) -> dict[str, Any]:
         "perTurnCallCount": 0,
         "perTurnCallCountRange": None,
         "memberProviders": [],
+        "configuredAllFailedPolicy": configured_all_failed_policy,
+        "effectiveAllFailedPolicy": "fallback_single",
+        "policyDeprecated": policy_deprecated,
     }
     if not enabled:
         return base
@@ -4586,18 +4675,59 @@ def ensemble_runtime_status(config: Any) -> dict[str, Any]:
         }
 
     if selection_mode == "router_dynamic":
-        tiers = getattr(getattr(config, "squilla_router", None), "tiers", {}) or {}
-        providers = {
-            str((tier or {}).get("provider") or "").strip().lower()
-            for tier in tiers.values()
-            if isinstance(tier, dict)
-        }
-        providers.discard("")
+        router_cfg = getattr(config, "squilla_router", None)
+        tiers = getattr(router_cfg, "tiers", {}) or {}
         inherited_provider = str(
             getattr(getattr(config, "llm", None), "provider", "") or ""
         ).strip().lower()
+        inherited_model = str(
+            getattr(getattr(config, "llm", None), "model", "") or ""
+        ).strip()
+        inherited_cfg = ProviderConfig(
+            provider=inherited_provider,
+            model=inherited_model,
+            api_key=str(getattr(getattr(config, "llm", None), "api_key", "") or ""),
+            base_url=str(
+                getattr(getattr(config, "llm", None), "base_url", "") or ""
+            ),
+        )
+        dynamic_providers: set[str] = set()
         if inherited_provider:
-            providers.add(inherited_provider)
+            dynamic_providers.add(inherited_provider)
+        cross_provider = bool(getattr(router_cfg, "cross_provider_tiers", False))
+        mismatch_policy = str(
+            getattr(router_cfg, "tier_provider_mismatch", "route") or "route"
+        ).strip().lower()
+        if isinstance(tiers, dict):
+            for tier in tiers.values():
+                if not isinstance(tier, dict):
+                    continue
+                model = str(tier.get("model") or "").strip()
+                configured_provider = str(
+                    tier.get("provider") or inherited_provider
+                ).strip().lower()
+                if not model or not configured_provider:
+                    continue
+                if configured_provider == inherited_provider:
+                    dynamic_providers.add(inherited_provider)
+                elif not cross_provider:
+                    if mismatch_policy != "veto" and inherited_provider:
+                        dynamic_providers.add(inherited_provider)
+                else:
+                    resolution = resolve_provider_deployment(
+                        config,
+                        configured_provider,
+                        model,
+                        inherited_provider_config=inherited_cfg,
+                    )
+                    if resolution.ready:
+                        dynamic_providers.add(configured_provider)
+        for row in getattr(ensemble, "candidates", []) or []:
+            if getattr(row, "enabled", True) is False:
+                continue
+            provider = str(getattr(row, "provider", "") or "").strip().lower()
+            if provider:
+                dynamic_providers.add(provider)
         return {
             **base,
             "runtimeStatus": "conditional",
@@ -4607,7 +4737,7 @@ def ensemble_runtime_status(config: Any) -> dict[str, Any]:
             "aggregatorCount": 1,
             "perTurnCallCount": None,
             "perTurnCallCountRange": [3, 5],
-            "memberProviders": sorted(providers),
+            "memberProviders": sorted(dynamic_providers),
         }
 
     return {
@@ -4768,6 +4898,7 @@ def build_ensemble_provider_from_config(
     _fallback_selector: Any | None = None,
     _selection_mode_override: str | None = None,
     _plan_provider_config: ProviderConfig | None = None,
+    _dynamic_baseline_provider_config: ProviderConfig | None = None,
 ) -> EnsembleProvider:
     ensemble_cfg = getattr(config, "llm_ensemble", None)
     if ensemble_cfg is None:
@@ -4798,6 +4929,9 @@ def build_ensemble_provider_from_config(
         profile_name, proposers, aggregator, selection_plan = _build_router_dynamic_members(
             config=config,
             inherited_provider_config=plan_provider_config,
+            baseline_provider_config=(
+                _dynamic_baseline_provider_config or inherited_provider_config
+            ),
             turn_metadata=turn_metadata,
             credential_pool_acquirer=_credential_pool_acquirer,
             session_key=_session_key,
@@ -4978,7 +5112,10 @@ def build_ensemble_provider_from_config(
         min_successful_proposers=min_successful_proposers,
         target_successful_proposers=target_successful_proposers,
         proposer_max_retries=proposer_max_retries,
-        all_failed_policy=getattr(ensemble_cfg, "all_failed_policy", "fallback_single"),
+        # ``error`` remains loadable for upgrade compatibility, but the
+        # product contract now has one deterministic outcome: every failed
+        # fusion attempt uses the configured fixed/direct deployment.
+        all_failed_policy="fallback_single",
         proposer_timeout_seconds=proposer_timeout_seconds,
         aggregator_timeout_seconds=aggregator_timeout_seconds,
         total_timeout_seconds=total_timeout_seconds,

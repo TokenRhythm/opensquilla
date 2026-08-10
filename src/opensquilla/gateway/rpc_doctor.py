@@ -229,6 +229,7 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
             "runtimeValid": True,
             "requireRouterRuntime": False,
             "runtimeErrorKind": None,
+            "routerProviderRoles": {},
         }
 
     router = config.squilla_router
@@ -242,6 +243,7 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
             "runtimeValid": True,
             "requireRouterRuntime": False,
             "runtimeErrorKind": None,
+            "routerProviderRoles": {},
         }
 
     runtime_valid = True
@@ -267,13 +269,44 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
     active_provider = str(getattr(getattr(config, "llm", None), "provider", "") or "")
     mismatched_tier_providers: dict[str, str] = {}
     tiers = getattr(router, "tiers", {}) or {}
-    if isinstance(tiers, dict) and active_provider.strip():
-        from opensquilla.router_tiers import TierConfig
+    from opensquilla.ensemble_plan import effective_ensemble_selection_mode
+    from opensquilla.router_tiers import (
+        TierConfig,
+        router_dynamic_tier_members_active,
+        router_tier_provider_roles,
+        tier_provider_role,
+    )
 
+    shared_selection_mode = effective_ensemble_selection_mode(config)
+    provider_roles = router_tier_provider_roles(
+        tiers if isinstance(tiers, dict) else {},
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=bool(
+            getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+        ),
+    )
+    dynamic_members_active = router_dynamic_tier_members_active(
+        tiers if isinstance(tiers, dict) else {},
+        shared_selection_mode=shared_selection_mode,
+        ensemble_globally_enabled=bool(
+            getattr(getattr(config, "llm_ensemble", None), "enabled", False)
+        ),
+    )
+    if isinstance(tiers, dict) and active_provider.strip():
         active_l = active_provider.strip().lower()
         for tier_name, tier_value in tiers.items():
             tier = TierConfig.from_value(tier_value)
-            if tier.provider and tier.provider.lower() != active_l:
+            provider_role = tier_provider_role(
+                tier_name,
+                tier_value,
+                shared_selection_mode=shared_selection_mode,
+                router_dynamic_members_active=dynamic_members_active,
+            )
+            if (
+                provider_role in {"direct", "dynamic_member"}
+                and tier.provider
+                and tier.provider.lower() != active_l
+            ):
                 mismatched_tier_providers[str(tier_name)] = tier.provider
 
     return {
@@ -292,6 +325,7 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
             getattr(router, "tier_provider_mismatch", "route") or "route"
         ),
         "mismatchedTierProviders": mismatched_tier_providers,
+        "routerProviderRoles": provider_roles,
     }
 
 
@@ -328,6 +362,9 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
             "activeProvider": "",
             "runtimeStatus": "disabled",
             "configurationReady": None,
+            "configuredAllFailedPolicy": "fallback_single",
+            "effectiveAllFailedPolicy": "fallback_single",
+            "policyDeprecated": False,
         }
 
     from opensquilla.provider.ensemble import ensemble_runtime_status, static_b5_profile
@@ -336,6 +373,16 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
         **ensemble_runtime_status(config),
         "activeProvider": str(getattr(config.llm, "provider", "") or ""),
     }
+    configured_policy = str(
+        getattr(config.llm_ensemble, "all_failed_policy", "fallback_single")
+        or "fallback_single"
+    ).strip()
+    payload.setdefault("configuredAllFailedPolicy", configured_policy)
+    payload.setdefault("effectiveAllFailedPolicy", "fallback_single")
+    payload.setdefault(
+        "policyDeprecated",
+        configured_policy != str(payload["effectiveAllFailedPolicy"]),
+    )
     static_profile = static_b5_profile(str(payload["selectionMode"]))
     if static_profile is not None and payload["enabled"]:
         from opensquilla.provider.registry import get_provider_spec

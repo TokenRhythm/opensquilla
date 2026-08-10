@@ -563,12 +563,12 @@ async def test_ensemble_configure_accepts_full_camel_case_payload(
         "selection_mode": "router_dynamic",
         "model_options": ["custom/model-a", "custom/model-b"],
         "min_successful_proposers": 2,
-        "all_failed_policy": "error",
+        "all_failed_policy": "fallback_single",
     }
     persisted = tomllib.loads((tmp_path / "c.toml").read_text())
     assert persisted["llm_ensemble"]["selection_mode"] == "router_dynamic"
     assert persisted["llm_ensemble"]["min_successful_proposers"] == 2
-    assert persisted["llm_ensemble"]["all_failed_policy"] == "error"
+    assert persisted["llm_ensemble"]["all_failed_policy"] == "fallback_single"
 
 
 @pytest.mark.asyncio
