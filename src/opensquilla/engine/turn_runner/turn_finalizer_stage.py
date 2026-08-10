@@ -34,6 +34,7 @@ No ``TurnHook.after_turn`` fan-out today.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -354,7 +355,27 @@ def _turn_usage_payload(
         ]
     ensemble_trace = getattr(done_event, "ensemble_trace", None)
     if isinstance(ensemble_trace, dict) and ensemble_trace:
-        payload["ensemble_trace"] = dict(ensemble_trace)
+        payload["ensemble_trace"] = deepcopy(ensemble_trace)
+    ensemble_traces = getattr(done_event, "ensemble_traces", None)
+    if isinstance(ensemble_traces, list) and ensemble_traces:
+        payload["ensemble_traces"] = [
+            deepcopy(trace) for trace in ensemble_traces if isinstance(trace, dict)
+        ]
+    model_usage_ledger = getattr(done_event, "model_usage_ledger", None)
+    if isinstance(model_usage_ledger, list) and model_usage_ledger:
+        payload["model_usage_ledger"] = [
+            deepcopy(row) for row in model_usage_ledger if isinstance(row, dict)
+        ]
+    ensemble_calls = getattr(done_event, "ensemble_calls", None)
+    if isinstance(ensemble_calls, list) and ensemble_calls:
+        payload["ensemble_calls"] = [
+            deepcopy(call) for call in ensemble_calls if isinstance(call, dict)
+        ]
+    physical_audit_schema = str(
+        getattr(done_event, "physical_audit_schema", "") or ""
+    ).strip()
+    if physical_audit_schema:
+        payload["physical_audit_schema"] = physical_audit_schema
     return payload
 
 @runtime_checkable

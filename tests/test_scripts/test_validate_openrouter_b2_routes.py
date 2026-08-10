@@ -57,7 +57,13 @@ def test_formal_registry_snapshot_selects_by_version_and_hash(
         "snapshot_version": "same-version",
         "models": [{"raw": False}],
     }
-    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", lambda: raw)
+    requested_versions: list[str | None] = []
+
+    def load_snapshot(*, base_version: str | None = None):
+        requested_versions.append(base_version)
+        return raw
+
+    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", load_snapshot)
     monkeypatch.setattr(
         ranking_router,
         "_legacy_registry_snapshot_projection",
@@ -66,6 +72,7 @@ def test_formal_registry_snapshot_selects_by_version_and_hash(
 
     assert validator.formal_registry_snapshot(_registry_contract(raw)) is raw
     assert validator.formal_registry_snapshot(_registry_contract(legacy)) is legacy
+    assert requested_versions == ["same-version", "same-version"]
 
 
 def test_formal_registry_snapshot_fails_closed_without_exact_candidate(
@@ -73,7 +80,11 @@ def test_formal_registry_snapshot_fails_closed_without_exact_candidate(
 ) -> None:
     raw = {"snapshot_version": "same-version", "models": [{"raw": True}]}
     legacy = {"snapshot_version": "same-version", "models": [{"raw": False}]}
-    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", lambda: raw)
+    def load_snapshot(*, base_version: str | None = None):
+        assert base_version is not None
+        return raw
+
+    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", load_snapshot)
     monkeypatch.setattr(
         ranking_router,
         "_legacy_registry_snapshot_projection",

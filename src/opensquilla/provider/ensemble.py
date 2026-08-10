@@ -8291,6 +8291,7 @@ class EnsembleProvider:
         state: _ProposerRecoveryScopeState,
     ) -> dict[str, Any]:
         quorum = self.min_successful_proposers
+        attempts_before_count = len(state.receipts)
         return {
             "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
             "selection_plan_fingerprint": provider_retry_roster_fingerprint(
@@ -8331,6 +8332,12 @@ class EnsembleProvider:
                 for index in sorted(state.effective_members)
             ],
             "executed_proposer_roster_after": [],
+            # ``attempts`` remains the cumulative run-turn view for backward
+            # compatibility. The explicit range and delta let multi-chat
+            # consumers attribute only receipts created by this provider call.
+            "attempts_before_count": attempts_before_count,
+            "attempts_after_count": attempts_before_count,
+            "attempts_delta": [],
             "attempts": deepcopy(state.receipts),
         }
 
@@ -8340,6 +8347,20 @@ class EnsembleProvider:
         state: _ProposerRecoveryScopeState,
         candidates: Sequence[_CandidateResult],
     ) -> None:
+        try:
+            attempts_before_count = int(trace.get("attempts_before_count") or 0)
+        except (TypeError, ValueError):
+            attempts_before_count = 0
+        attempts_before_count = min(
+            max(0, attempts_before_count),
+            len(state.receipts),
+        )
+        trace["attempts_before_count"] = attempts_before_count
+        trace["attempts_after_count"] = len(state.receipts)
+        trace["attempts_delta"] = deepcopy(
+            state.receipts[attempts_before_count:]
+        )
+        trace["attempts"] = deepcopy(state.receipts)
         trace["additional_physical_requests_started"] = (
             state.additional_physical_requests_started
         )
@@ -8882,7 +8903,10 @@ class EnsembleProvider:
                 "quorum_required": self.min_successful_proposers,
                 "quorum_reached": False,
                 "quorum_reached_once": state.quorum_reached_once,
-                "attempts": [],
+                "attempts_before_count": len(state.receipts),
+                "attempts_after_count": len(state.receipts),
+                "attempts_delta": [],
+                "attempts": deepcopy(state.receipts),
                 "plan_guard_reason": recovery_guard_reason,
             }
             self._set_proposer_recovery_terminal(

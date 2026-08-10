@@ -12941,6 +12941,13 @@ async def test_proposer_recovery_downgrades_once_and_stops_at_quorum(
         attempt["kind"]
         for attempt in provider._current_proposer_recovery_trace["attempts"]
     ] == ["thinking_downgrade"]
+    first_trace = deepcopy(provider._current_proposer_recovery_trace)
+    assert first_trace["attempts_before_count"] == 0
+    assert first_trace["attempts_after_count"] == 1
+    assert [
+        attempt["physical_attempt_id"]
+        for attempt in first_trace["attempts_delta"]
+    ] == ["a" * 32]
 
     second_candidates = [
         _slot_candidate(
@@ -12976,6 +12983,12 @@ async def test_proposer_recovery_downgrades_once_and_stops_at_quorum(
     assert sum(candidate.ok for candidate in second_recovered) == 2
     assert state.additional_physical_requests_started == 2
     assert len(second_trace["attempts"]) == 2
+    assert second_trace["attempts_before_count"] == 1
+    assert second_trace["attempts_after_count"] == 2
+    assert [
+        attempt["physical_attempt_id"]
+        for attempt in second_trace["attempts_delta"]
+    ] == ["b" * 32]
     assert sum(
         attempt["physical_request_count"]
         for attempt in second_trace["attempts"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -8,6 +9,8 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from opensquilla.provider import ranking_router
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
@@ -237,11 +240,16 @@ def test_reconciles_physical_calls_and_neutralizes_framework_tool_removal(
         },
     )
 
-    collection = updater.collect_observations([tmp_path], allow_incomplete=True)
+    collection = updater.collect_observations(
+        [tmp_path],
+        allow_incomplete=True,
+        max_unknown_outcome_rate=1.0,
+    )
     assert collection.physical_requests_seen == 7
     assert collection.framework_excluded == 1
     assert collection.duplicate_attempts == 1
-    assert len(collection.observations) == 6
+    assert collection.unknown_outcomes == 2
+    assert len(collection.observations) == 4
 
     updated, summary = updater.update_profiles(
         _profiles(),
@@ -253,7 +261,7 @@ def test_reconciles_physical_calls_and_neutralizes_framework_tool_removal(
     rows = {row["registry_facts"]["model_id"]: row for row in updated["models"]}
     assert rows["model-a"]["online_profile"]["role_reliability"] == {
         "window_size": 50,
-        "proposer": {"success": 3, "failure": 1},
+        "proposer": {"success": 1, "failure": 1},
         "aggregator": {"success": 0, "failure": 0},
         "source": "aef_experiment_artifacts",
     }
@@ -273,16 +281,32 @@ def test_reconciles_physical_calls_and_neutralizes_framework_tool_removal(
         "observed_models": 3,
         "raw_physical_calls": 7,
         "framework_neutral_calls": 1,
-        "attributable_calls": 6,
-        "window_calls": 6,
+        "attributable_calls": 4,
+        "unknown_outcome_calls": 2,
+        "window_calls": 4,
         "unclassified_requests": 0,
     }
     snapshot = updated["role_reliability_snapshot"]
-    assert snapshot["observation_policy"] == "aef-physical-model-calls-v4"
+    assert snapshot["schema_version"] == "role-reliability-snapshot-v2"
+    assert snapshot["observation_policy"] == "aef-physical-model-calls-v5"
     assert snapshot["completion_gate"] == "fixture_without_final_audit"
     assert snapshot["ordering_granularity"] == "task_aggregate"
+    assert snapshot["unknown_outcome_calls"] == 2
+    assert snapshot["max_unknown_outcome_rate"] == 1.0
+    assert {row["kind"] for row in snapshot["source_evidence_file_hashes"]} == {
+        "timing_metadata"
+    }
     assert snapshot["base_snapshot_version"] == "base-snapshot"
-    assert updated["snapshot_version"] == "base-snapshot-reliability-20260805T020000Z"
+    assert snapshot["source_artifacts"] == ["artifact-root://0"]
+    assert all(
+        value.startswith("artifact-sha256://")
+        for value in snapshot["source_output_files"]
+    )
+    assert str(tmp_path) not in json.dumps(snapshot)
+    assert updated["snapshot_version"] == (
+        "base-snapshot-reliability-20260805T020000Z-"
+        f"{snapshot['content_sha256'][:12]}"
+    )
 
 
 def test_legacy_complete_length_capped_proposer_counts_as_failure(
@@ -587,7 +611,18 @@ def test_output_records_deduplicate_by_stable_identity_and_reject_conflicts(
         run_id="same-run",
         task_id="same-task",
         breakdown=[_breakdown_row("model-a", "proposer", 1)],
-        trace={"physical_request_count": 1, "candidates": []},
+        trace={
+            "physical_request_count": 1,
+            "candidates": [
+                _candidate(
+                    "model-a",
+                    "audit-gate-success",
+                    ok=True,
+                    outcome="succeeded",
+                    usage_reported=True,
+                )
+            ],
+        },
     )
     duplicate = tmp_path / "two" / "attempt-1.json"
     duplicate.parent.mkdir(parents=True)
@@ -612,7 +647,18 @@ def test_completion_gate_requires_clean_final_audit(tmp_path: Path) -> None:
         run_id="run-1",
         task_id="task-1",
         breakdown=[_breakdown_row("model-a", "proposer", 1)],
-        trace={"physical_request_count": 1, "candidates": []},
+        trace={
+            "physical_request_count": 1,
+            "candidates": [
+                _candidate(
+                    "model-a",
+                    "audit-gate-success",
+                    ok=True,
+                    outcome="succeeded",
+                    usage_reported=True,
+                )
+            ],
+        },
     )
     with pytest.raises(ValueError, match="no summary/final-audit.json"):
         updater.collect_observations([tmp_path / "outputs" / "G1"])
@@ -635,7 +681,7 @@ def test_completion_gate_requires_clean_final_audit(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="experiment is not complete"):
         updater.collect_observations(
             [tmp_path / "outputs" / "G1"],
-            allow_audit_issues=True,
+            allowed_audit_issue_codes=("still_running",),
         )
 
     audit_path.write_text(
@@ -654,10 +700,11 @@ def test_completion_gate_requires_clean_final_audit(tmp_path: Path) -> None:
         updater.collect_observations([tmp_path / "outputs" / "G1"])
     overridden = updater.collect_observations(
         [tmp_path / "outputs" / "G1"],
-        allow_audit_issues=True,
+        allowed_audit_issue_codes=("usage_artifact_missing",),
     )
     assert overridden.physical_requests_seen == 1
-    assert overridden.completion_gate == "complete_with_audit_override"
+    assert overridden.completion_gate == "complete_with_audit_issue_allowlist"
+    assert overridden.allowed_audit_issue_codes == ("usage_artifact_missing",)
 
     audit_path.write_text(
         json.dumps(
@@ -674,6 +721,10 @@ def test_completion_gate_requires_clean_final_audit(tmp_path: Path) -> None:
     collection = updater.collect_observations([tmp_path / "outputs" / "G1"])
     assert collection.physical_requests_seen == 1
     assert collection.completion_gate == "clean_final_audit"
+    assert {kind for kind, _path, _digest in collection.evidence_file_hashes} == {
+        "final_audit",
+        "timing_metadata",
+    }
 
 
 def test_cli_defaults_to_a_new_file_and_requires_explicit_in_place(
@@ -689,7 +740,18 @@ def test_cli_defaults_to_a_new_file_and_requires_explicit_in_place(
         run_id="run-1",
         task_id="task-1",
         breakdown=[_breakdown_row("model-a", "proposer", 1)],
-        trace={"physical_request_count": 1, "candidates": []},
+        trace={
+            "physical_request_count": 1,
+            "candidates": [
+                _candidate(
+                    "model-a",
+                    "cli-success",
+                    ok=True,
+                    outcome="succeeded",
+                    usage_reported=True,
+                )
+            ],
+        },
     )
     summary = tmp_path / "summary"
     summary.mkdir()
@@ -710,7 +772,8 @@ def test_cli_defaults_to_a_new_file_and_requires_explicit_in_place(
         str(tmp_path),
         "--profiles",
         str(profiles_path),
-        "--allow-audit-issues",
+        "--allow-audit-issue-code",
+        "usage_artifact_missing",
         "--generated-at",
         "2026-08-05T02:00:00+00:00",
     ]
@@ -726,8 +789,569 @@ def test_cli_defaults_to_a_new_file_and_requires_explicit_in_place(
     assert proposer == {"success": 1, "failure": 0}
     assert (
         in_place["role_reliability_snapshot"]["completion_gate"]
-        == "complete_with_audit_override"
+        == "complete_with_audit_issue_allowlist"
     )
 
     with pytest.raises(SystemExit):
         updater.build_parser().parse_args([str(tmp_path), "--allow-incomplete"])
+
+
+def test_repeated_updates_preserve_base_version_and_portable_provenance(
+    tmp_path: Path,
+) -> None:
+    updater = _load_module()
+    run_root = tmp_path / "reports" / "pinch-bench" / "run-1"
+    output = run_root / "outputs" / "G1" / "001" / "attempt-1.json"
+    output.parent.mkdir(parents=True)
+    output.write_text("{}", encoding="utf-8")
+    output_hash = hashlib.sha256(output.read_bytes()).hexdigest()
+    collection = updater.CollectionResult(
+        observations=(),
+        output_files=(str(output),),
+        physical_requests_seen=0,
+        framework_excluded=0,
+        duplicate_attempts=0,
+        unclassified_requests=0,
+        completion_gate="clean_final_audit",
+        output_file_hashes=((str(output), output_hash),),
+    )
+
+    first, _ = updater.update_profiles(
+        _profiles(),
+        collection,
+        generated_at="2026-08-05T02:00:00+00:00",
+        source_artifacts=[str(run_root)],
+    )
+    second, _ = updater.update_profiles(
+        first,
+        collection,
+        generated_at="2026-08-06T02:00:00+00:00",
+        source_artifacts=[str(run_root)],
+    )
+
+    assert first["snapshot_version"] == (
+        "base-snapshot-reliability-20260805T020000Z-"
+        f"{first['role_reliability_snapshot']['content_sha256'][:12]}"
+    )
+    assert second["snapshot_version"] == (
+        "base-snapshot-reliability-20260806T020000Z-"
+        f"{second['role_reliability_snapshot']['content_sha256'][:12]}"
+    )
+    assert second["role_reliability_snapshot"]["base_snapshot_version"] == (
+        "base-snapshot"
+    )
+    assert second["role_reliability_snapshot"]["source_artifacts"] == [
+        "aef-report://pinch-bench/run-1"
+    ]
+    assert second["role_reliability_snapshot"]["source_output_files"] == [
+        "aef-report://pinch-bench/run-1/outputs/G1/001/attempt-1.json"
+    ]
+    assert second["role_reliability_snapshot"]["source_output_file_hashes"] == [
+        {
+            "uri": "aef-report://pinch-bench/run-1/outputs/G1/001/attempt-1.json",
+            "sha256": output_hash,
+        }
+    ]
+    assert second["role_reliability_snapshot"]["source_evidence_file_hashes"] == []
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        [],
+        {"schema_version": "wrong", "base_snapshot_version": "base-snapshot"},
+        {"schema_version": "role-reliability-snapshot-v1"},
+    ],
+)
+def test_repeated_update_rejects_invalid_reliability_provenance(
+    provenance: object,
+) -> None:
+    updater = _load_module()
+    profiles = _profiles()
+    profiles["role_reliability_snapshot"] = provenance
+    collection = updater.CollectionResult((), (), 0, 0, 0, 0, "clean_final_audit")
+
+    with pytest.raises(ValueError, match="role_reliability_snapshot"):
+        updater.update_profiles(
+            profiles,
+            collection,
+            generated_at="2026-08-05T02:00:00+00:00",
+            source_artifacts=[],
+        )
+
+
+def test_residual_ledger_rows_are_unknown_outcomes_not_successes(
+    tmp_path: Path,
+) -> None:
+    updater = _load_module()
+    output = tmp_path / "outputs" / "G1" / "001" / "attempt-1.json"
+    _write_output(
+        output,
+        finished_at="2026-08-05T01:00:00+00:00",
+        run_id="run-residual",
+        task_id="task-residual",
+        breakdown=[_breakdown_row("model-a", "proposer", 1)],
+        trace={"physical_request_count": 1, "candidates": []},
+    )
+
+    with pytest.raises(ValueError, match="unknown outcomes exceed"):
+        updater.collect_observations([tmp_path], allow_incomplete=True)
+
+    collection = updater.collect_observations(
+        [tmp_path],
+        allow_incomplete=True,
+        max_unknown_outcome_rate=1.0,
+    )
+    assert collection.observations == ()
+    assert collection.unknown_outcomes == 1
+    assert collection.physical_requests_seen == 1
+    assert collection.output_file_hashes == (
+        (str(output.resolve()), hashlib.sha256(output.read_bytes()).hexdigest()),
+    )
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan"), float("inf"), True, "0"])
+def test_unknown_outcome_threshold_is_strictly_validated(value: object) -> None:
+    updater = _load_module()
+    with pytest.raises(ValueError, match="max_unknown_outcome_rate"):
+        updater.collect_observations(
+            [],
+            allow_incomplete=True,
+            max_unknown_outcome_rate=value,
+        )
+
+
+def test_attempt_id_reuse_across_output_files_fails_closed(tmp_path: Path) -> None:
+    updater = _load_module()
+    for index in range(2):
+        _write_output(
+            tmp_path / "outputs" / "G1" / f"{index:03d}" / "attempt-1.json",
+            finished_at=f"2026-08-05T01:0{index}:00+00:00",
+            run_id=f"run-{index}",
+            task_id=f"task-{index}",
+            breakdown=[_breakdown_row("model-a", "proposer", 1)],
+            trace={
+                "physical_request_count": 1,
+                "candidates": [
+                    _candidate(
+                        "model-a",
+                        "reused-attempt-id",
+                        ok=True,
+                        outcome="succeeded",
+                        usage_reported=True,
+                    )
+                ],
+            },
+        )
+
+    with pytest.raises(ValueError, match="reused across usage records"):
+        updater.collect_observations([tmp_path], allow_incomplete=True)
+
+
+def test_conflicting_duplicate_attempt_evidence_fails_closed(tmp_path: Path) -> None:
+    updater = _load_module()
+    output = tmp_path / "outputs" / "G1" / "001" / "attempt-1.json"
+    _write_output(
+        output,
+        finished_at="2026-08-05T01:00:00+00:00",
+        run_id="run-conflict",
+        task_id="task-conflict",
+        breakdown=[_breakdown_row("model-a", "proposer", 1)],
+        trace={
+            "physical_request_count": 1,
+            "candidates": [
+                _candidate(
+                    "model-a",
+                    "conflicting-attempt",
+                    ok=True,
+                    outcome="succeeded",
+                    usage_reported=True,
+                )
+            ],
+            "proposer_recovery": {
+                "attempts": [
+                    {
+                        "target_identity": "openrouter:model-a",
+                        "physical_attempt_id": "conflicting-attempt",
+                        "request_started": True,
+                        "outcome": "failed",
+                    }
+                ]
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="conflicting duplicate evidence"):
+        updater.collect_observations([tmp_path], allow_incomplete=True)
+
+
+def test_audit_issue_allowlist_rejects_any_unlisted_or_malformed_issue(
+    tmp_path: Path,
+) -> None:
+    updater = _load_module()
+    output = tmp_path / "outputs" / "G1" / "001" / "attempt-1.json"
+    _write_output(
+        output,
+        finished_at="2026-08-05T01:00:00+00:00",
+        run_id="run-audit",
+        task_id="task-audit",
+        breakdown=[_breakdown_row("model-a", "proposer", 1)],
+        trace={
+            "physical_request_count": 1,
+            "candidates": [
+                _candidate(
+                    "model-a",
+                    "audit-attempt",
+                    ok=True,
+                    outcome="succeeded",
+                    usage_reported=True,
+                )
+            ],
+        },
+    )
+    audit_path = tmp_path / "summary" / "final-audit.json"
+    audit_path.parent.mkdir()
+    audit = {
+        "complete": True,
+        "ok": False,
+        "integrity_ok": False,
+        "issue_count": 2,
+        "issues": [
+            {"code": "usage_artifact_missing"},
+            {"code": "score_mismatch"},
+        ],
+    }
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="score_mismatch"):
+        updater.collect_observations(
+            [tmp_path],
+            allowed_audit_issue_codes=("usage_artifact_missing",),
+        )
+    allowed = updater.collect_observations(
+        [tmp_path],
+        allowed_audit_issue_codes=("score_mismatch", "usage_artifact_missing"),
+    )
+    assert allowed.allowed_audit_issue_codes == (
+        "score_mismatch",
+        "usage_artifact_missing",
+    )
+
+    audit["issue_count"] = 1
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    with pytest.raises(ValueError, match="issue_count disagrees"):
+        updater.collect_observations(
+            [tmp_path],
+            allowed_audit_issue_codes=("score_mismatch", "usage_artifact_missing"),
+        )
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-time", "2026-08-05T01:00:00", ""])
+def test_output_timestamps_must_be_valid_and_timezone_aware(
+    tmp_path: Path,
+    timestamp: str,
+) -> None:
+    updater = _load_module()
+    output = tmp_path / "outputs" / "G1" / "001" / "attempt-1.json"
+    _write_output(
+        output,
+        finished_at=timestamp,
+        run_id="run-time",
+        task_id="task-time",
+        breakdown=[_breakdown_row("model-a", "proposer", 1)],
+        trace={
+            "physical_request_count": 1,
+            "candidates": [
+                _candidate(
+                    "model-a",
+                    "time-attempt",
+                    ok=True,
+                    outcome="succeeded",
+                    usage_reported=True,
+                )
+            ],
+        },
+    )
+
+    with pytest.raises(ValueError, match="timestamp|finished_at/started_at"):
+        updater.collect_observations([tmp_path], allow_incomplete=True)
+
+
+def test_missing_timing_metadata_fails_closed(tmp_path: Path) -> None:
+    updater = _load_module()
+    output = tmp_path / "outputs" / "G1" / "001" / "attempt-1.json"
+    _write_output(
+        output,
+        finished_at="2026-08-05T01:00:00+00:00",
+        run_id="run-no-meta",
+        task_id="task-no-meta",
+        breakdown=[_breakdown_row("model-a", "proposer", 1)],
+        trace={
+            "physical_request_count": 1,
+            "candidates": [
+                _candidate(
+                    "model-a",
+                    "no-meta-attempt",
+                    ok=True,
+                    outcome="succeeded",
+                    usage_reported=True,
+                )
+            ],
+        },
+    )
+    output.with_name(f"{output.stem}.meta.json").unlink()
+
+    with pytest.raises(ValueError, match="timing metadata"):
+        updater.collect_observations([tmp_path], allow_incomplete=True)
+
+
+def test_custom_snapshot_version_preserves_original_base_across_refreshes() -> None:
+    updater = _load_module()
+    collection = updater.CollectionResult((), (), 0, 0, 0, 0, "clean_final_audit")
+    first, _ = updater.update_profiles(
+        _profiles(),
+        collection,
+        generated_at="2026-08-05T10:00:00+08:00",
+        source_artifacts=[],
+        snapshot_version="base-snapshot-reliability-manual.1",
+    )
+    second, _ = updater.update_profiles(
+        first,
+        collection,
+        generated_at="2026-08-06T10:00:00+08:00",
+        source_artifacts=[],
+        snapshot_version="base-snapshot-reliability-manual.2",
+    )
+
+    assert first["role_reliability_snapshot"]["generated_at"] == (
+        "2026-08-05T02:00:00+00:00"
+    )
+    assert second["snapshot_version"] == "base-snapshot-reliability-manual.2"
+    assert second["role_reliability_snapshot"]["base_snapshot_version"] == (
+        "base-snapshot"
+    )
+    assert second["role_reliability_snapshot"]["schema_version"] == (
+        "role-reliability-snapshot-v2"
+    )
+
+
+@pytest.mark.parametrize(
+    "snapshot_version",
+    [
+        "other-base-reliability-manual",
+        "base-snapshot-reliability-",
+        "base-snapshot-reliability-invalid/path",
+        " base-snapshot-reliability-space inside ",
+    ],
+)
+def test_custom_snapshot_version_rejects_wrong_base_or_nonportable_value(
+    snapshot_version: str,
+) -> None:
+    updater = _load_module()
+    collection = updater.CollectionResult((), (), 0, 0, 0, 0, "clean_final_audit")
+
+    with pytest.raises(ValueError, match="snapshot_version"):
+        updater.update_profiles(
+            _profiles(),
+            collection,
+            generated_at="2026-08-05T02:00:00+00:00",
+            source_artifacts=[],
+            snapshot_version=snapshot_version,
+        )
+
+
+def test_v1_snapshot_provenance_remains_refreshable() -> None:
+    updater = _load_module()
+    profiles = _profiles()
+    profiles["snapshot_version"] = "base-snapshot-reliability-legacy"
+    profiles["role_reliability_snapshot"] = {
+        "schema_version": "role-reliability-snapshot-v1",
+        "base_snapshot_version": "base-snapshot",
+    }
+    collection = updater.CollectionResult((), (), 0, 0, 0, 0, "clean_final_audit")
+
+    updated, _ = updater.update_profiles(
+        profiles,
+        collection,
+        generated_at="2026-08-05T02:00:00+00:00",
+        source_artifacts=[],
+    )
+
+    assert updated["snapshot_version"] == (
+        "base-snapshot-reliability-20260805T020000Z-"
+        f"{updated['role_reliability_snapshot']['content_sha256'][:12]}"
+    )
+    assert updated["role_reliability_snapshot"]["schema_version"] == (
+        "role-reliability-snapshot-v2"
+    )
+
+
+def test_output_hash_manifest_rejects_post_collection_tampering(tmp_path: Path) -> None:
+    updater = _load_module()
+    output = tmp_path / "reports" / "pinch-bench" / "run-1" / "result.json"
+    output.parent.mkdir(parents=True)
+    output.write_text("original", encoding="utf-8")
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    collection = updater.CollectionResult(
+        (),
+        (str(output),),
+        0,
+        0,
+        0,
+        0,
+        "clean_final_audit",
+        output_file_hashes=((str(output), digest),),
+    )
+    output.write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="changed after collection"):
+        updater.update_profiles(
+            _profiles(),
+            collection,
+            generated_at="2026-08-05T02:00:00+00:00",
+            source_artifacts=[],
+        )
+
+
+def test_evidence_hash_manifest_rejects_timing_metadata_tampering(
+    tmp_path: Path,
+) -> None:
+    updater = _load_module()
+    output = tmp_path / "outputs" / "G1" / "001" / "attempt-1.json"
+    _write_output(
+        output,
+        finished_at="2026-08-05T01:00:00+00:00",
+        run_id="run-evidence",
+        task_id="task-evidence",
+        breakdown=[_breakdown_row("model-a", "proposer", 1)],
+        trace={
+            "physical_request_count": 1,
+            "candidates": [
+                _candidate(
+                    "model-a",
+                    "evidence-attempt",
+                    ok=True,
+                    outcome="succeeded",
+                    usage_reported=True,
+                )
+            ],
+        },
+    )
+    collection = updater.collect_observations([tmp_path], allow_incomplete=True)
+    metadata_path = output.with_name(f"{output.stem}.meta.json")
+    metadata_path.write_text(
+        json.dumps({"finished_at": "2026-08-06T01:00:00+00:00"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="evidence file changed after collection"):
+        updater.update_profiles(
+            _profiles(),
+            collection,
+            generated_at="2026-08-05T02:00:00+00:00",
+            source_artifacts=[],
+        )
+
+
+def test_repeated_real_snapshot_refresh_preserves_historical_base_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updater = _load_module()
+    profiles = json.loads(updater.default_profiles_path().read_text(encoding="utf-8"))
+    original_historical = ranking_router.load_model_registry_snapshot(
+        base_version="curated-openrouter-step2-2026-07-31.1"
+    )
+    collection = updater.CollectionResult((), (), 0, 0, 0, 0, "clean_final_audit")
+    first, _ = updater.update_profiles(
+        profiles,
+        collection,
+        generated_at="2026-08-05T02:00:00+00:00",
+        source_artifacts=[],
+    )
+    second, _ = updater.update_profiles(
+        first,
+        collection,
+        generated_at="2026-08-06T02:00:00+00:00",
+        source_artifacts=[],
+    )
+    monkeypatch.setattr(ranking_router, "_packaged_registry_snapshot", lambda: second)
+
+    replayed = ranking_router.load_model_registry_snapshot(
+        base_version="curated-openrouter-step2-2026-07-31.1"
+    )
+    assert replayed == original_historical
+
+
+def test_default_snapshot_versions_bind_content_and_reject_same_content_collision() -> None:
+    updater = _load_module()
+    collection = updater.CollectionResult((), (), 0, 0, 0, 0, "clean_final_audit")
+    generated_at = "2026-08-05T02:00:00+00:00"
+    first, _ = updater.update_profiles(
+        _profiles(),
+        collection,
+        generated_at=generated_at,
+        source_artifacts=[],
+    )
+
+    with pytest.raises(ValueError, match="must differ from the input"):
+        updater.update_profiles(
+            first,
+            collection,
+            generated_at=generated_at,
+            source_artifacts=[],
+        )
+
+    different, _ = updater.update_profiles(
+        first,
+        collection,
+        generated_at=generated_at,
+        source_artifacts=["different-artifact-set"],
+    )
+    assert different["snapshot_version"] != first["snapshot_version"]
+    assert different["snapshot_version"].endswith(
+        different["role_reliability_snapshot"]["content_sha256"][:12]
+    )
+
+
+def test_explicit_snapshot_version_cannot_reuse_current_version() -> None:
+    updater = _load_module()
+    collection = updater.CollectionResult((), (), 0, 0, 0, 0, "clean_final_audit")
+    first, _ = updater.update_profiles(
+        _profiles(),
+        collection,
+        generated_at="2026-08-05T02:00:00+00:00",
+        source_artifacts=[],
+        snapshot_version="base-snapshot-reliability-manual.1",
+    )
+
+    with pytest.raises(ValueError, match="must differ from the input"):
+        updater.update_profiles(
+            first,
+            collection,
+            generated_at="2026-08-06T02:00:00+00:00",
+            source_artifacts=[],
+            snapshot_version=first["snapshot_version"],
+        )
+
+
+def test_repeated_update_rejects_snapshot_content_tampering() -> None:
+    updater = _load_module()
+    collection = updater.CollectionResult((), (), 0, 0, 0, 0, "clean_final_audit")
+    first, _ = updater.update_profiles(
+        _profiles(),
+        collection,
+        generated_at="2026-08-05T02:00:00+00:00",
+        source_artifacts=[],
+    )
+    tampered = json.loads(json.dumps(first))
+    tampered["models"][0]["online_profile"]["role_reliability"]["proposer"][
+        "success"
+    ] = 1
+
+    with pytest.raises(ValueError, match="content_sha256 differs"):
+        updater.update_profiles(
+            tampered,
+            collection,
+            generated_at="2026-08-06T02:00:00+00:00",
+            source_artifacts=[],
+        )

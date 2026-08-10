@@ -230,7 +230,9 @@ def _formal_registry_snapshot(contract: Any) -> dict[str, Any]:
         load_model_registry_snapshot,
     )
 
-    raw_snapshot = load_model_registry_snapshot()
+    raw_snapshot = load_model_registry_snapshot(
+        base_version=contract.source_registry_snapshot_version
+    )
     candidates = (raw_snapshot, _legacy_registry_snapshot_projection(raw_snapshot))
     version_matches: list[dict[str, Any]] = []
     for snapshot in candidates:
@@ -317,10 +319,15 @@ def _effective_ranking_resolution(experiment: Any) -> dict[str, Any]:
 
     from opensquilla.provider.ranking_router import ranking_config_resolution
 
+    contract = experiment.g1_routing
     resolution = ranking_config_resolution(
+        base_version=(
+            contract.expected_ranking_config_version
+            if contract is not None
+            else None
+        ),
         override=(experiment.router_dynamic_ranking_override or None),
     )
-    contract = experiment.g1_routing
     if contract is None:
         return resolution
     base = resolution.get("base_config")
