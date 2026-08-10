@@ -1329,6 +1329,65 @@ async def test_heartbeat_wrapper_records_final_event_completed_after_deadline(
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_wrapper_does_not_start_source_after_absolute_deadline() -> None:
+    source_started = False
+
+    async def _source() -> AsyncIterator[StreamEvent]:
+        nonlocal source_started
+        source_started = True
+        yield DoneEvent(model="must-not-start")
+
+    wrapped = _stream_with_heartbeats(
+        _source(),
+        phase="unit",
+        message="waiting",
+        timeout_seconds=None,
+        absolute_deadline=time.monotonic() - 0.001,
+    )
+    with pytest.raises(TimeoutError):
+        await wrapped.__anext__()
+
+    assert source_started is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_wrapper_never_starts_next_event_past_deadline() -> None:
+    eager_task_factory = getattr(asyncio, "eager_task_factory", None)
+    if eager_task_factory is None:
+        pytest.skip("requires asyncio eager task factory")
+
+    source_iterations = 0
+
+    async def _source() -> AsyncIterator[StreamEvent]:
+        nonlocal source_iterations
+        source_iterations += 1
+        yield TextDeltaEvent(text="first")
+        source_iterations += 1
+        yield DoneEvent(model="must-not-start")
+
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    loop.set_task_factory(eager_task_factory)
+    try:
+        wrapped = _stream_with_heartbeats(
+            _source(),
+            phase="unit",
+            message="waiting",
+            timeout_seconds=None,
+            absolute_deadline=time.monotonic() + 0.02,
+        )
+        first = await wrapped.__anext__()
+        assert isinstance(first, TextDeltaEvent)
+        await asyncio.sleep(0.03)
+        with pytest.raises(TimeoutError):
+            await wrapped.__anext__()
+    finally:
+        loop.set_task_factory(previous_factory)
+
+    assert source_iterations == 1
+
+
+@pytest.mark.asyncio
 async def test_aggregator_timeout_preserves_late_done_usage_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2172,7 +2231,12 @@ async def test_ensemble_image_validation_routes_only_to_configured_fallback() ->
     assert [call["model"] for call in registry.calls] == ["fallback"]
     assert registry.calls[0]["messages"] == messages
     assert registry.calls[0]["tools"] == tools
-    assert registry.calls[0]["config"] is config
+    fallback_config = registry.calls[0]["config"]
+    assert fallback_config is not config
+    assert 0 < fallback_config.timeout <= config.timeout
+    assert fallback_config.model_dump(exclude={"timeout"}) == config.model_dump(
+        exclude={"timeout"}
+    )
 
 
 @pytest.mark.asyncio
@@ -3210,7 +3274,7 @@ async def test_ensemble_aggregator_only_skips_proposers_and_uses_original_reques
     assert aggregator_call["tools"] is not None
     assert aggregator_call["config"].candidate_output_mode == "normal"
     assert aggregator_call["config"].ensemble_execution_mode == "full"
-    assert aggregator_call["config"].timeout == 0.5
+    assert 0 < aggregator_call["config"].timeout <= 0.5
     assert aggregator_call["config"].thinking is False
     assert aggregator_call["config"].thinking_level is None
     assert outer_config.ensemble_execution_mode == "aggregator_only"
@@ -3258,10 +3322,11 @@ async def test_ensemble_aggregator_only_outer_timeout_caps_aggregator(
     ]
 
     assert [call["model"] for call in registry.calls] == ["agg"]
-    assert registry.calls[0]["config"].timeout == 0.01
+    assert 0 < registry.calls[0]["config"].timeout <= 0.01
     error = next(event for event in events if isinstance(event, ErrorEvent))
     assert error.code == "ensemble_aggregator_timeout"
-    assert "timed out after 0.01s" in error.message
+    assert "timed out after " in error.message
+    assert error.ensemble_trace["deadline"]["triggered_stage"] == "aggregator"
 
 
 @pytest.mark.asyncio
@@ -7411,8 +7476,12 @@ async def test_rebinding_never_changes_fallback_chat_config(
     ]
 
     assert any(isinstance(event, TextDeltaEvent) and event.text == "fallback" for event in events)
-    assert fallback.configs == [outer]
-    assert fallback.configs[0] is outer
+    assert len(fallback.configs) == 1
+    assert fallback.configs[0] is not outer
+    assert 0 < fallback.configs[0].timeout <= outer.timeout
+    assert fallback.configs[0].model_dump(exclude={"timeout"}) == (
+        outer.model_dump(exclude={"timeout"})
+    )
     assert outer.provider_request_max_chars == 367_200
     assert any(
         call["config"].provider_request_max_chars != outer.provider_request_max_chars
@@ -7590,10 +7659,10 @@ async def test_fallback_timeout_is_idle_based_and_cleanup_is_bounded(
 
 
 @pytest.mark.asyncio
-async def test_fallback_stream_survives_past_request_timeout_while_events_flow(
+async def test_fallback_stream_cannot_reset_the_ensemble_absolute_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """config.timeout is a per-request idle budget, not a total wall-clock cap."""
+    """Streaming progress resets idle timeouts, never the full-call budget."""
 
     registry = _FakeRegistry({"p1": _FakePlan([ErrorEvent(message="nope", code="boom")])})
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
@@ -7631,6 +7700,7 @@ async def test_fallback_stream_survives_past_request_timeout_while_events_flow(
         shuffle_candidates=False,
     )
 
+    started = time.monotonic()
     events = [
         event
         async for event in provider.chat(
@@ -7638,13 +7708,265 @@ async def test_fallback_stream_survives_past_request_timeout_while_events_flow(
             config=ChatConfig(timeout=0.05),
         )
     ]
+    elapsed = time.monotonic() - started
 
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
-        f"chunk{index}" for index in range(6)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_absolute_deadline"
+    assert elapsed < 0.15
+    assert len(
+        [event for event in events if isinstance(event, TextDeltaEvent)]
+    ) < 6
+    assert error.ensemble_trace["deadline"]["triggered_stage"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_fallback_heartbeat_cannot_dispatch_after_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="nope",
+                        code="boom",
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                ]
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    fallback_chat_calls = 0
+
+    class _FallbackMustNotStart:
+        provider_name = "fallback"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            nonlocal fallback_chat_calls
+            fallback_chat_calls += 1
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                yield DoneEvent(model="must-not-start")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    provider = EnsembleProvider(
+        profile_name="fallback-predispatch-deadline",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=_FallbackMustNotStart(),
+        min_successful_proposers=1,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    events: list[StreamEvent] = []
+    async for event in provider.chat(
+        [Message(role="user", content="answer this")],
+        config=ChatConfig(timeout=0.05),
+    ):
+        events.append(event)
+        if (
+            isinstance(event, ProviderHeartbeatEvent)
+            and event.phase == "ensemble_fallback"
+        ):
+            await asyncio.sleep(0.06)
+
+    assert fallback_chat_calls == 0
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_absolute_deadline"
+    assert error.ensemble_trace["llm_request_count"] == 1
+    assert error.ensemble_trace["physical_request_count"] == 1
+    assert error.ensemble_trace["final_request"]["request_started"] is False
+    assert error.ensemble_trace["deadline"]["triggered_stage"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_full_ensemble_reserves_aggregator_time_inside_caller_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="late"), DoneEvent(model="p1")],
+                delay=0.2,
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="must not run"), DoneEvent(model="agg")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="absolute-deadline",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_timeout_seconds=3600,
+        aggregator_timeout_seconds=3600,
+        latency_class="normal",
+        shuffle_candidates=False,
+    )
+
+    started = time.monotonic()
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer")],
+            config=ChatConfig(timeout=0.05),
+        )
     ]
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.model_usage_breakdown[-1]["role"] == "fallback_single"
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.15
+    assert [call["model"] for call in registry.calls] == ["p1"]
+    assert 0 < registry.calls[0]["config"].timeout <= 0.03
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    trace = error.ensemble_trace
+    assert trace["deadline"]["schema"] == "opensquilla.ensemble-deadline/v1"
+    assert trace["deadline"]["latency_class"] == "normal"
+    assert trace["deadline"]["aggregator_reserve_seconds"] == pytest.approx(
+        0.025
+    )
+    assert trace["deadline"]["triggered_stage"] == "proposer_phase"
+    assert trace["deadline"]["proposer_dispatch_remaining_seconds"] == 0.0
+    assert 0.0 <= trace["deadline"]["proposer_phase_remaining_seconds"] <= (
+        trace["deadline"]["proposer_cleanup_reserve_seconds"]
+    )
+    assert trace["candidates"][0]["error_code"] == (
+        "ensemble_proposer_phase_deadline"
+    )
+    assert provider._pending_cleanup_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_proposer_build_that_exhausts_budget_never_dispatches_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_calls = 0
+
+    class _MustNotStart:
+        provider_name = "fake"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            nonlocal chat_calls
+            chat_calls += 1
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                yield DoneEvent(model="must-not-start")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    def _slow_build(_cfg: ProviderConfig) -> _MustNotStart:
+        time.sleep(0.03)
+        return _MustNotStart()
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        _slow_build,
+    )
+    provider = EnsembleProvider(
+        profile_name="proposer-predispatch-deadline",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer")],
+            config=ChatConfig(timeout=0.05),
+        )
+    ]
+
+    assert chat_calls == 0
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.ensemble_trace["llm_request_count"] == 0
+    assert error.ensemble_trace["physical_request_count"] == 0
+    [candidate] = error.ensemble_trace["candidates"]
+    assert candidate["request_started"] is False
+    assert candidate["error_code"] == "ensemble_proposer_phase_deadline"
+
+
+def test_experiment_deadline_preserves_explicit_draco_role_caps() -> None:
+    provider = EnsembleProvider(
+        profile_name="experiment",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        proposer_timeout_seconds=907.5,
+        aggregator_timeout_seconds=2662.5,
+        aggregator_recovery_mode="experiment",
+        latency_class="experiment",
+    )
+
+    chat_started = time.monotonic()
+    absolute_deadline, proposer_deadline = provider._chat_deadline_budget(
+        chat_started=chat_started,
+        config=ChatConfig(timeout=7200.0),
+    )
+
+    assert absolute_deadline == pytest.approx(chat_started + 7200.0)
+    assert proposer_deadline == pytest.approx(chat_started + 4537.5)
+    assert provider._effective_phase_timeout_seconds(
+        provider.proposer_timeout_seconds,
+        absolute_deadline=proposer_deadline,
+    ) == pytest.approx(907.5)
+    assert provider._current_deadline_trace["aggregator_reserve_seconds"] == (
+        2662.5
+    )
+
+
+def test_serving_deadline_reserve_is_capped_by_serving_chain_timeout() -> None:
+    provider = EnsembleProvider(
+        profile_name="batch-serving",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        proposer_timeout_seconds=3600,
+        aggregator_timeout_seconds=3600,
+        aggregator_serving_chain_timeout_seconds=120,
+        aggregator_recovery_mode="serving",
+        latency_class="batch",
+    )
+
+    chat_started = time.monotonic()
+    _, proposer_deadline = provider._chat_deadline_budget(
+        chat_started=chat_started,
+        config=ChatConfig(timeout=1800.0),
+    )
+
+    assert proposer_deadline == pytest.approx(chat_started + 1680.0)
+    assert provider._current_deadline_trace["aggregator_reserve_seconds"] == 120.0
 
 
 @pytest.mark.asyncio
@@ -8557,6 +8879,104 @@ async def test_aggregator_transient_error_is_retried_in_place(
     ]
     assert len(finishes) == 1
     assert not finishes[0].error
+
+
+@pytest.mark.asyncio
+async def test_aggregator_retry_uses_shrinking_physical_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {"p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")])}
+    )
+    aggregator_timeouts: list[float] = []
+
+    class _TimedAggregator:
+        provider_name = "fake"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            assert config is not None
+            aggregator_timeouts.append(float(config.timeout))
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                if len(aggregator_timeouts) == 1:
+                    yield ErrorEvent(message="temporary overload", code="503")
+                    return
+                yield TextDeltaEvent(text="final")
+                yield DoneEvent(model="agg")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    def build_provider(cfg: ProviderConfig) -> Any:
+        if cfg.model == "agg":
+            return _TimedAggregator()
+        return registry.provider_for(cfg)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        build_provider,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS",
+        (0.01,),
+    )
+    provider = _retry_test_provider()
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer")],
+            config=ChatConfig(timeout=0.2),
+        )
+    ]
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert len(aggregator_timeouts) == 2
+    assert 0 < aggregator_timeouts[1] < aggregator_timeouts[0] <= 0.2
+
+
+@pytest.mark.asyncio
+async def test_aggregator_retry_backoff_cannot_cross_hard_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, call_count = _flaky_aggregator_harness(
+        monkeypatch,
+        [
+            [
+                ErrorEvent(
+                    message="upstream asks for a long retry",
+                    code="429",
+                    retry_after_s=1.0,
+                )
+            ],
+            [TextDeltaEvent(text="must not run"), DoneEvent(model="agg")],
+        ],
+    )
+    provider = _retry_test_provider()
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer")],
+            config=ChatConfig(timeout=0.1),
+        )
+    ]
+
+    assert call_count[0] == 1
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_aggregator_timeout"
+    assert error.ensemble_trace is not None
+    assert error.ensemble_trace["deadline"]["triggered_stage"] == (
+        "aggregator_retry"
+    )
+    assert error.ensemble_trace["llm_request_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -9684,6 +10104,98 @@ async def test_required_cancel_resistant_proposer_respects_its_timeout(
 
 
 @pytest.mark.asyncio
+async def test_absolute_deadline_bounds_cancel_resistant_proposer_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    chat_calls = 0
+
+    class _CancellationResistantProposer:
+        provider_name = "fake"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            nonlocal chat_calls
+            chat_calls += 1
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                try:
+                    while not release.is_set():
+                        try:
+                            await release.wait()
+                        except asyncio.CancelledError:
+                            continue
+                    yield DoneEvent(model="straggler")
+                finally:
+                    closed.set()
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda _cfg: _CancellationResistantProposer(),
+    )
+    provider = EnsembleProvider(
+        profile_name="absolute-deadline-cleanup",
+        proposers=[_member("straggler")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_timeout_seconds=10,
+        aggregator_timeout_seconds=10,
+        shuffle_candidates=False,
+    )
+
+    try:
+        started = time.monotonic()
+        events = [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="answer")],
+                config=ChatConfig(timeout=0.05),
+            )
+        ]
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.2
+        error = next(event for event in events if isinstance(event, ErrorEvent))
+        assert error.code == "ensemble_proposer_close_timeout"
+        assert error.ensemble_trace is not None
+        assert error.ensemble_trace["deadline"]["triggered_stage"] == (
+            "proposer_phase"
+        )
+
+        retry_events = [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="retry")],
+                config=ChatConfig(timeout=0.05),
+            )
+        ]
+        retry_error = next(
+            event for event in retry_events if isinstance(event, ErrorEvent)
+        )
+        assert retry_error.code == "ensemble_cleanup_in_progress"
+        assert retry_error.request_started is False
+        assert chat_calls == 1
+    finally:
+        release.set()
+    await asyncio.wait_for(closed.wait(), timeout=1.0)
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if not provider._cleanup_is_pending():
+            break
+    assert provider._cleanup_is_pending() is False
+
+
+@pytest.mark.asyncio
 async def test_contract_violation_unclosed_proposer_stops_before_aggregator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9962,7 +10474,7 @@ async def test_failed_proposer_does_not_start_grace_before_success_quorum(
         **kwargs: Any,
     ) -> tuple[set[asyncio.Task[Any]], set[asyncio.Task[Any]]]:
         timeout = kwargs.get("timeout")
-        if timeout is None and len(futures) == 2:
+        if timeout != 0.02 and len(futures) == 2:
             waiting_below_quorum.set()
         elif timeout == 0.02:
             grace_started.set()
@@ -10801,6 +11313,88 @@ async def test_soft_deadline_replaces_early_fallback_after_closing_first_stream(
     assert done.ensemble_trace["physical_request_count"] == 2
     assert done.ensemble_trace["soft_deadline_triggered"] is True
     assert done.ensemble_trace["soft_deadline_replacement_reason"] == ("fallback_timeout")
+
+
+@pytest.mark.asyncio
+async def test_soft_deadline_without_hard_timeout_allows_bounded_stream_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
+        0.005,
+    )
+    first_closed = asyncio.Event()
+    calls: list[dict[str, Any]] = []
+
+    class _DelayedCloseFallback:
+        provider_name = "fallback"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            call_index = len(calls)
+            calls.append(
+                {
+                    "config": config,
+                    "first_closed_before_start": first_closed.is_set(),
+                }
+            )
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                if call_index == 0:
+                    try:
+                        yield TextDeltaEvent(text="discarded")
+                        await asyncio.Event().wait()
+                    finally:
+                        # Closing a real HTTP stream can require one event-loop
+                        # turn after the soft cutoff.  With no hard deadline it
+                        # still owns the normal bounded cleanup window.
+                        await asyncio.sleep(0.01)
+                        first_closed.set()
+                    return
+                yield TextDeltaEvent(text="direct-final")
+                yield DoneEvent(model="fallback")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    provider = EnsembleProvider(
+        profile_name="soft-only-cleanup",
+        proposers=[],
+        aggregator=_member("agg"),
+        fallback_provider=_DelayedCloseFallback(),
+        all_failed_policy="fallback_single",
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer")],
+            config=ChatConfig(
+                timeout=0,
+                ensemble_soft_deadline_seconds=0.02,
+                ensemble_soft_deadline_disable_tools=True,
+                ensemble_soft_deadline_disable_thinking=True,
+            ),
+        )
+    ]
+
+    assert first_closed.is_set() is True
+    assert len(calls) == 2
+    assert calls[1]["first_closed_before_start"] is True
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert not any(
+        isinstance(event, ErrorEvent)
+        and event.code == "ensemble_fallback_close_timeout"
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

@@ -512,6 +512,12 @@ class LlmEnsembleConfig(BaseSettings):
     proposer_timeout_seconds: float = Field(default=3600.0, gt=0.0)
     aggregator_timeout_seconds: float = Field(default=3600.0, gt=0.0)
     aggregator_serving_chain_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    # Selects the fraction of the caller's absolute request budget reserved
+    # for final aggregation.  Explicit proposer/aggregator caps remain upper
+    # bounds, so benchmark configurations keep their frozen role budgets.
+    latency_class: Literal["interactive", "normal", "batch", "experiment"] = (
+        "normal"
+    )
     # Serving stops after the first useful recovery action to protect
     # interactive latency. Experiment mode exhausts the frozen Top-3
     # aggregator chain for strict benchmark completeness. Off preserves the

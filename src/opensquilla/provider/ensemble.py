@@ -83,6 +83,7 @@ AGGREGATOR_CANDIDATE_BINDING_SCHEMA = (
 _UINT64_MAX = (1 << 64) - 1
 _ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS = 15.0
 _ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS = 5.0
+_ENSEMBLE_PROPOSER_CLEANUP_RESERVE_RATIO = 0.10
 # The aggregator leg is retried in-place on transient upstream errors: the
 # proposer drafts are already collected and reusable, and the composite call
 # is never replayed by the agent (retry_failed_call_safe=False), so without
@@ -104,11 +105,19 @@ _PROPOSER_TRANSIENT_FAILURE_KINDS = frozenset(
     }
 )
 _PROPOSER_TRANSIENT_RETRY_BACKOFF_SECONDS = 1.0
+_ENSEMBLE_AGGREGATOR_RESERVE_RATIO: dict[str, float] = {
+    "interactive": 0.60,
+    "normal": 0.50,
+    "batch": 0.40,
+    "experiment": 0.40,
+}
+_ENSEMBLE_PROPOSER_PHASE_DEADLINE_CODE = "ensemble_proposer_phase_deadline"
 _PROPOSER_LOCAL_SCHEDULING_CANCELLATION_CODES = frozenset(
     {
         "quorum_cancelled",
         "quorum_unreachable",
         "soft_deadline",
+        _ENSEMBLE_PROPOSER_PHASE_DEADLINE_CODE,
     }
 )
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE = "ensemble_multimodal_unsupported"
@@ -469,11 +478,16 @@ async def _bounded_task_cleanup(
     active = {task for task in tasks if not task.done()}
     if not active:
         return set()
-    cleanup_timeout = (
-        max(0.0, cleanup_deadline - time.monotonic())
-        if cleanup_deadline is not None
-        else max(0.0, float(_ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS))
+    cleanup_window = max(
+        0.0,
+        float(_ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS),
     )
+    cleanup_timeout = cleanup_window
+    if cleanup_deadline is not None:
+        cleanup_timeout = min(
+            cleanup_window,
+            max(0.0, cleanup_deadline - time.monotonic()),
+        )
     _, lingering = await asyncio.wait(
         active,
         timeout=cleanup_timeout,
@@ -559,6 +573,7 @@ async def _closing_async_iterator(
     pending_cleanup_tracker: Callable[[asyncio.Future[Any], str], None] | None = None,
     terminal_observed: Callable[[], bool] | None = None,
     close_observed: Callable[[bool], None] | None = None,
+    cleanup_deadline: float | None = None,
 ) -> AsyncIterator[AsyncIterator[StreamEvent]]:
     """Relay an async stream and synchronously close the lower iterator.
 
@@ -576,6 +591,7 @@ async def _closing_async_iterator(
             phase=phase,
             require_aclose=True,
             pending_cleanup_tracker=pending_cleanup_tracker,
+            cleanup_deadline=cleanup_deadline,
         )
         if close_observed is not None:
             close_observed(closed)
@@ -595,6 +611,7 @@ async def _closing_async_iterator(
             # proof and must retain the strict close requirement.
             require_aclose=not bool(terminal_observed is not None and terminal_observed()),
             pending_cleanup_tracker=pending_cleanup_tracker,
+            cleanup_deadline=cleanup_deadline,
         )
         if close_observed is not None:
             close_observed(closed)
@@ -611,6 +628,8 @@ async def _stream_with_heartbeats(
     reset_deadline_on_event: bool = False,
     close_status: _StreamCloseStatus | None = None,
     absolute_deadline: float | None = None,
+    cleanup_deadline: float | None = None,
+    use_absolute_deadline_for_cleanup: bool = True,
     pending_cleanup_tracker: Callable[[asyncio.Future[Any], str], None] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     try:
@@ -621,6 +640,13 @@ async def _stream_with_heartbeats(
             phase=phase,
             require_aclose=True,
             pending_cleanup_tracker=pending_cleanup_tracker,
+            cleanup_deadline=(
+                cleanup_deadline
+                if cleanup_deadline is not None
+                else absolute_deadline
+                if use_absolute_deadline_for_cleanup
+                else None
+            ),
         )
         if close_status is not None:
             close_status.closed = closed
@@ -630,6 +656,15 @@ async def _stream_with_heartbeats(
     completion_times: dict[asyncio.Future[StreamEvent], float] = {}
 
     def _start_next_event() -> asyncio.Future[StreamEvent]:
+        deadline = _effective_deadline()
+        if deadline is not None and time.monotonic() >= deadline:
+            if (
+                close_status is not None
+                and absolute_deadline is not None
+                and absolute_deadline <= deadline
+            ):
+                close_status.absolute_deadline_triggered = True
+            raise TimeoutError
         future: asyncio.Future[StreamEvent] = asyncio.ensure_future(stream_iter.__anext__())
         future.add_done_callback(lambda done: completion_times.setdefault(done, time.monotonic()))
         return future
@@ -688,12 +723,14 @@ async def _stream_with_heartbeats(
                     except StopAsyncIteration:
                         return
                     completion_times.pop(pending, None)
-                    pending = _start_next_event()
                     if reset_deadline_on_event and timeout_budget is not None:
                         timeout_deadline = time.monotonic() + timeout_budget
                     if isinstance(event, (DoneEvent, ErrorEvent)):
                         terminal_event_observed = True
                     yield event
+                    if terminal_event_observed:
+                        return
+                    pending = _start_next_event()
                     continue
                 wait_seconds = min(wait_seconds, remaining)
             done, _ = await asyncio.wait({pending}, timeout=wait_seconds)
@@ -723,16 +760,28 @@ async def _stream_with_heartbeats(
             yield event
             pending = _start_next_event()
     finally:
-        cleanup_deadline = time.monotonic() + max(
+        effective_cleanup_deadline = time.monotonic() + max(
             0.0,
             float(_ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS),
         )
+        cleanup_limit = (
+            cleanup_deadline
+            if cleanup_deadline is not None
+            else absolute_deadline
+            if use_absolute_deadline_for_cleanup
+            else None
+        )
+        if cleanup_limit is not None:
+            effective_cleanup_deadline = min(
+                effective_cleanup_deadline,
+                cleanup_limit,
+            )
         closed = False
         if pending is None:
             closed = await _close_async_iterator(
                 stream_iter,
                 phase=phase,
-                cleanup_deadline=cleanup_deadline,
+                cleanup_deadline=effective_cleanup_deadline,
                 require_aclose=not terminal_event_observed,
                 pending_cleanup_tracker=pending_cleanup_tracker,
             )
@@ -786,7 +835,7 @@ async def _stream_with_heartbeats(
                     lingering = await _bounded_task_cleanup(
                         [pending],
                         phase=f"{phase}_stream",
-                        cleanup_deadline=cleanup_deadline,
+                        cleanup_deadline=effective_cleanup_deadline,
                     )
                 except BaseException:
                     deferred_close_needed = True
@@ -809,7 +858,7 @@ async def _stream_with_heartbeats(
                 closed = await _close_async_iterator(
                     stream_iter,
                     phase=phase,
-                    cleanup_deadline=cleanup_deadline,
+                    cleanup_deadline=effective_cleanup_deadline,
                     require_aclose=not terminal_event_observed,
                     pending_cleanup_tracker=pending_cleanup_tracker,
                 )
@@ -835,12 +884,43 @@ async def _provider_events_with_error_boundary(
     on_request_started: Callable[[], None],
     pending_cleanup_tracker: Callable[[asyncio.Future[Any], str], None] | None,
     terminal_observed: Callable[[], bool],
+    cleanup_deadline: float | None = None,
+    dispatch_deadline: float | None = None,
+    deadline_code: str = _ENSEMBLE_PROPOSER_PHASE_DEADLINE_CODE,
 ) -> AsyncIterator[StreamEvent]:
     """Convert direct provider exceptions into normal terminal error evidence."""
 
     request_started = False
     try:
+        if (
+            dispatch_deadline is not None
+            and time.monotonic() >= dispatch_deadline
+        ):
+            yield ErrorEvent(
+                message=(
+                    "proposer execution budget was exhausted before "
+                    "physical dispatch"
+                ),
+                code=deadline_code,
+                request_started=False,
+                physical_request_count=0,
+            )
+            return
         provider = _build_provider(provider_config)
+        if (
+            dispatch_deadline is not None
+            and time.monotonic() >= dispatch_deadline
+        ):
+            yield ErrorEvent(
+                message=(
+                    "proposer execution budget was exhausted before "
+                    "physical dispatch"
+                ),
+                code=deadline_code,
+                request_started=False,
+                physical_request_count=0,
+            )
+            return
         raw_stream = provider.chat(messages, tools=tools, config=chat_config)
         on_request_started()
         request_started = True
@@ -849,6 +929,7 @@ async def _provider_events_with_error_boundary(
             phase=phase,
             pending_cleanup_tracker=pending_cleanup_tracker,
             terminal_observed=terminal_observed,
+            cleanup_deadline=cleanup_deadline,
         ) as provider_stream:
             async for event in provider_stream:
                 yield event
@@ -3656,6 +3737,9 @@ class EnsembleProvider:
         proposer_timeout_seconds: float = 3600.0,
         aggregator_timeout_seconds: float = 3600.0,
         aggregator_serving_chain_timeout_seconds: float = 120.0,
+        latency_class: Literal[
+            "interactive", "normal", "batch", "experiment"
+        ] = "normal",
         candidate_max_chars: int = 24_000,
         shuffle_candidates: bool = True,
         candidate_order_seed: int | None = None,
@@ -3701,6 +3785,16 @@ class EnsembleProvider:
         )
         if self.aggregator_serving_chain_timeout_seconds <= 0:
             raise ValueError("aggregator_serving_chain_timeout_seconds must be positive")
+        normalized_latency_class = str(latency_class or "normal").strip().lower()
+        if normalized_latency_class not in _ENSEMBLE_AGGREGATOR_RESERVE_RATIO:
+            raise ValueError(
+                "latency_class must be one of interactive, normal, batch, experiment"
+            )
+        self.latency_class = normalized_latency_class
+        self._current_deadline_trace: dict[str, Any] | None = None
+        self._current_absolute_deadline: float | None = None
+        self._current_proposer_phase_deadline: float | None = None
+        self._current_proposer_dispatch_deadline: float | None = None
         self.candidate_max_chars = int(candidate_max_chars or 0)
         self.shuffle_candidates = bool(shuffle_candidates)
         if (
@@ -3912,6 +4006,174 @@ class EnsembleProvider:
                 dict[str, Any]
             ] = []
             self._thinking_execution_guard_started = False
+
+    def _chat_deadline_budget(
+        self,
+        *,
+        chat_started: float,
+        config: ChatConfig | None,
+    ) -> tuple[float | None, float | None]:
+        """Freeze one absolute request deadline and an aggregator reserve.
+
+        Role-level timeouts remain caps.  They never reset the caller's
+        request budget, and retries/backoff consume the same monotonic clock.
+        """
+
+        raw_timeout = getattr(config, "timeout", ChatConfig().timeout)
+        try:
+            caller_timeout = float(raw_timeout)
+        except (TypeError, ValueError):
+            caller_timeout = 0.0
+        if not math.isfinite(caller_timeout) or caller_timeout <= 0:
+            self._current_absolute_deadline = None
+            self._current_proposer_phase_deadline = None
+            self._current_proposer_dispatch_deadline = None
+            self._current_deadline_trace = {
+                "schema": "opensquilla.ensemble-deadline/v1",
+                "latency_class": self.latency_class,
+                "caller_timeout_seconds": caller_timeout,
+                "absolute_deadline_enabled": False,
+                "triggered_stage": "",
+            }
+            return None, None
+
+        absolute_deadline = chat_started + caller_timeout
+        reserve_ratio = _ENSEMBLE_AGGREGATOR_RESERVE_RATIO[
+            self.latency_class
+        ]
+        configured_aggregator_cap = max(
+            0.0,
+            float(self.aggregator_timeout_seconds),
+        )
+        if self.aggregator_recovery_mode == "serving":
+            configured_aggregator_cap = min(
+                configured_aggregator_cap,
+                max(
+                    0.0,
+                    float(self.aggregator_serving_chain_timeout_seconds),
+                ),
+            )
+        aggregator_reserve = caller_timeout * reserve_ratio
+        if configured_aggregator_cap > 0:
+            aggregator_reserve = min(
+                aggregator_reserve,
+                configured_aggregator_cap,
+            )
+        aggregator_reserve = min(caller_timeout, max(0.0, aggregator_reserve))
+        proposer_budget = max(0.0, caller_timeout - aggregator_reserve)
+        proposer_phase_deadline = chat_started + proposer_budget
+        self._current_absolute_deadline = absolute_deadline
+        self._current_proposer_phase_deadline = proposer_phase_deadline
+        self._current_deadline_trace = {
+            "schema": "opensquilla.ensemble-deadline/v1",
+            "latency_class": self.latency_class,
+            "caller_timeout_seconds": caller_timeout,
+            "absolute_deadline_enabled": True,
+            "aggregator_reserve_ratio": reserve_ratio,
+            "aggregator_reserve_seconds": aggregator_reserve,
+            "proposer_phase_budget_seconds": proposer_budget,
+            "configured_proposer_timeout_seconds": (
+                self.proposer_timeout_seconds
+            ),
+            "configured_aggregator_timeout_seconds": (
+                self.aggregator_timeout_seconds
+            ),
+            "triggered_stage": "",
+        }
+        return absolute_deadline, proposer_phase_deadline
+
+    @staticmethod
+    def _deadline_remaining_seconds(
+        absolute_deadline: float | None,
+    ) -> float | None:
+        if absolute_deadline is None:
+            return None
+        return max(0.0, absolute_deadline - time.monotonic())
+
+    @classmethod
+    def _effective_phase_timeout_seconds(
+        cls,
+        configured_timeout: float | None,
+        *,
+        absolute_deadline: float | None,
+    ) -> float | None:
+        remaining = cls._deadline_remaining_seconds(absolute_deadline)
+        configured = float(configured_timeout or 0.0)
+        if remaining is None:
+            return configured if configured > 0 else None
+        if configured <= 0:
+            return remaining
+        return min(configured, remaining)
+
+    def _proposer_dispatch_and_cleanup_deadlines(
+        self,
+        *,
+        phase_deadline: float | None,
+        soft_deadline: float | None,
+    ) -> tuple[float | None, float | None]:
+        """Reserve bounded cleanup time inside the proposer phase budget."""
+
+        candidates = [
+            deadline
+            for deadline in (phase_deadline, soft_deadline)
+            if deadline is not None
+        ]
+        if not candidates:
+            return None, None
+        cleanup_deadline = min(candidates)
+        remaining = max(0.0, cleanup_deadline - time.monotonic())
+        cleanup_reserve = min(
+            max(0.0, float(_ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS)),
+            remaining * _ENSEMBLE_PROPOSER_CLEANUP_RESERVE_RATIO,
+        )
+        dispatch_deadline = cleanup_deadline - cleanup_reserve
+        self._current_proposer_dispatch_deadline = dispatch_deadline
+        if self._current_deadline_trace is not None:
+            self._current_deadline_trace.update(
+                {
+                    "proposer_dispatch_budget_seconds": max(
+                        0.0,
+                        dispatch_deadline - time.monotonic(),
+                    ),
+                    "proposer_cleanup_reserve_seconds": cleanup_reserve,
+                    "proposer_cleanup_budget_seconds": max(
+                        0.0,
+                        cleanup_deadline - dispatch_deadline,
+                    ),
+                }
+            )
+        return dispatch_deadline, cleanup_deadline
+
+    def _mark_deadline_triggered(self, stage: str) -> None:
+        if self._current_deadline_trace is None:
+            return
+        if not self._current_deadline_trace.get("triggered_stage"):
+            self._current_deadline_trace["triggered_stage"] = stage
+
+    def _deadline_trace_snapshot(self) -> dict[str, Any]:
+        trace = deepcopy(self._current_deadline_trace or {})
+        if not trace:
+            return trace
+        # ``remaining_seconds`` is refreshed at every trace publication.  It
+        # is diagnostic only; the immutable deadline is kept in local state.
+        remaining = self._deadline_remaining_seconds(
+            self._current_absolute_deadline
+        )
+        if remaining is not None:
+            trace["remaining_seconds"] = remaining
+        proposer_remaining = self._deadline_remaining_seconds(
+            self._current_proposer_phase_deadline
+        )
+        if proposer_remaining is not None:
+            trace["proposer_phase_remaining_seconds"] = proposer_remaining
+        dispatch_remaining = self._deadline_remaining_seconds(
+            self._current_proposer_dispatch_deadline
+        )
+        if dispatch_remaining is not None:
+            trace["proposer_dispatch_remaining_seconds"] = (
+                dispatch_remaining
+            )
+        return trace
 
     def _thinking_policy_active(self) -> bool:
         """Return whether every execution path must honor a routed T value."""
@@ -6195,6 +6457,10 @@ class EnsembleProvider:
                         post_chat_guard_reason
                     )
             self._active_chat = False
+            self._current_deadline_trace = None
+            self._current_absolute_deadline = None
+            self._current_proposer_phase_deadline = None
+            self._current_proposer_dispatch_deadline = None
 
     async def _chat_owned(
         self,
@@ -6203,6 +6469,10 @@ class EnsembleProvider:
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
         chat_started = time.monotonic()
+        absolute_deadline, proposer_phase_deadline = self._chat_deadline_budget(
+            chat_started=chat_started,
+            config=config,
+        )
         aggregator_only = bool(
             config is not None
             and config.ensemble_execution_mode == "aggregator_only"
@@ -6276,6 +6546,7 @@ class EnsembleProvider:
                         reason=validation_error.message,
                         code=validation_error.code,
                         candidates=[],
+                        absolute_deadline=absolute_deadline,
                     ),
                     phase="ensemble_multimodal_fallback_relay",
                 ) as child_stream:
@@ -6291,6 +6562,7 @@ class EnsembleProvider:
                     messages,
                     tools=tools,
                     config=config,
+                    absolute_deadline=absolute_deadline,
                 ),
                 phase="ensemble_aggregator_only_relay",
             ) as child_stream:
@@ -6306,8 +6578,21 @@ class EnsembleProvider:
                 else 0.0
             ),
         )
-        soft_deadline = chat_started + soft_deadline_seconds if soft_deadline_seconds > 0 else None
+        soft_deadline = (
+            chat_started + soft_deadline_seconds
+            if soft_deadline_seconds > 0
+            else None
+        )
+        if soft_deadline is not None and absolute_deadline is not None:
+            soft_deadline = min(soft_deadline, absolute_deadline)
         soft_deadline_triggered = asyncio.Event()
+        (
+            proposer_dispatch_deadline,
+            proposer_cleanup_deadline,
+        ) = self._proposer_dispatch_and_cleanup_deadlines(
+            phase_deadline=proposer_phase_deadline,
+            soft_deadline=soft_deadline,
+        )
 
         def _soft_deadline_reached() -> bool:
             return soft_deadline is not None and (
@@ -6351,6 +6636,7 @@ class EnsembleProvider:
                     reason="llm ensemble profile has no proposers",
                     code="ensemble_no_proposers",
                     candidates=[],
+                    absolute_deadline=absolute_deadline,
                     allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
                     soft_deadline=soft_deadline,
                     soft_deadline_seconds=soft_deadline_seconds,
@@ -6487,6 +6773,7 @@ class EnsembleProvider:
                             },
                         },
                         allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
+                        absolute_deadline=absolute_deadline,
                         soft_deadline=soft_deadline,
                         soft_deadline_seconds=soft_deadline_seconds,
                         soft_deadline_triggered=soft_deadline_triggered,
@@ -6526,6 +6813,8 @@ class EnsembleProvider:
                     tools=tools,
                     config=config,
                     progress=progress_queue.put_nowait,
+                    phase_deadline=proposer_dispatch_deadline,
+                    cleanup_deadline=proposer_cleanup_deadline,
                     soft_deadline=soft_deadline,
                     soft_deadline_triggered=soft_deadline_triggered,
                     recovery_state=proposer_recovery_state,
@@ -6694,6 +6983,8 @@ class EnsembleProvider:
                 tools=tools,
                 config=config,
                 require_strict_quorum=strict_proposer_quorum_required,
+                phase_deadline=proposer_dispatch_deadline,
+                cleanup_deadline=proposer_cleanup_deadline,
                 soft_deadline=soft_deadline,
                 soft_deadline_triggered=soft_deadline_triggered,
             )
@@ -6914,6 +7205,7 @@ class EnsembleProvider:
                     candidates=candidates,
                     allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
                     trace_overrides=insufficient_soft_trace,
+                    absolute_deadline=absolute_deadline,
                     soft_deadline=soft_deadline,
                     soft_deadline_seconds=soft_deadline_seconds,
                     soft_deadline_triggered=soft_deadline_triggered,
@@ -6951,6 +7243,12 @@ class EnsembleProvider:
             else self.aggregator_timeout_seconds
             if self.aggregator_timeout_seconds > 0
             else None
+        )
+        aggregator_chain_timeout_seconds = (
+            self._effective_phase_timeout_seconds(
+                aggregator_chain_timeout_seconds,
+                absolute_deadline=absolute_deadline,
+            )
         )
         ordered_candidates = self._ordered_candidates(
             successful,
@@ -7243,6 +7541,7 @@ class EnsembleProvider:
                             self.aggregator_recovery_mode != "experiment"
                             and not aggregation_isolated
                         ),
+                        absolute_deadline=absolute_deadline,
                         soft_deadline=soft_deadline,
                         soft_deadline_seconds=soft_deadline_seconds,
                         soft_deadline_triggered=soft_deadline_triggered,
@@ -7334,6 +7633,7 @@ class EnsembleProvider:
                     code=event.code or "ensemble_aggregator_error",
                     candidates=candidates,
                     trace_overrides=fallback_trace_overrides,
+                    absolute_deadline=absolute_deadline,
                     soft_deadline=soft_deadline,
                     soft_deadline_seconds=soft_deadline_seconds,
                     soft_deadline_triggered=soft_deadline_triggered,
@@ -7368,6 +7668,7 @@ class EnsembleProvider:
                     trace=request_trace,
                     timeout_seconds=timeout_seconds,
                     absolute_deadline=absolute_deadline,
+                    cleanup_deadline=absolute_deadline,
                     initial_member=initial_aggregator_member,
                     initial_fallback_index=initial_aggregator_fallback_index,
                     initial_trigger=initial_aggregator_trigger,
@@ -7418,6 +7719,7 @@ class EnsembleProvider:
                     request_config=aggregator_cfg,
                     request_trace=trace,
                     timeout_seconds=aggregator_chain_timeout_seconds,
+                    absolute_deadline=absolute_deadline,
                 ),
                 phase="ensemble_final_aggregator_relay",
             ) as child_stream:
@@ -7460,7 +7762,18 @@ class EnsembleProvider:
                 prior_missing_count=_candidate_missing_usage_count(candidates),
                 trace=trace,
                 timeout_seconds=first_attempt_timeout,
-                absolute_deadline=soft_deadline,
+                absolute_deadline=(
+                    min(soft_deadline, absolute_deadline)
+                    if absolute_deadline is not None
+                    else soft_deadline
+                ),
+                absolute_deadline_kind=(
+                    "hard"
+                    if absolute_deadline is not None
+                    and absolute_deadline <= soft_deadline
+                    else "soft"
+                ),
+                cleanup_deadline=absolute_deadline,
                 initial_member=initial_aggregator_member,
                 initial_fallback_index=initial_aggregator_fallback_index,
                 initial_trigger=initial_aggregator_trigger,
@@ -7643,6 +7956,8 @@ class EnsembleProvider:
                 ),
                 trace=trace,
                 timeout_seconds=aggregator_chain_timeout_seconds,
+                absolute_deadline=absolute_deadline,
+                cleanup_deadline=absolute_deadline,
                 initial_member=initial_aggregator_member,
                 initial_fallback_index=initial_aggregator_fallback_index,
                 initial_trigger=initial_aggregator_trigger,
@@ -7734,6 +8049,7 @@ class EnsembleProvider:
         *,
         tools: list[ToolDefinition] | None,
         config: ChatConfig,
+        absolute_deadline: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Finalize the supplied conversation with only the aggregator member."""
 
@@ -7905,6 +8221,7 @@ class EnsembleProvider:
                         },
                     },
                     allow_single_fallback=(self.aggregator_recovery_mode != "experiment"),
+                    absolute_deadline=absolute_deadline,
                 ),
                 phase="ensemble_aggregator_only_build_fallback_relay",
             ) as child_stream:
@@ -7921,6 +8238,8 @@ class EnsembleProvider:
                 prior_missing_count=0,
                 trace=trace,
                 timeout_seconds=aggregator_timeout_seconds,
+                absolute_deadline=absolute_deadline,
+                cleanup_deadline=absolute_deadline,
                 initial_member=initial_member,
                 initial_fallback_index=initial_fallback_index,
                 initial_trigger=initial_trigger,
@@ -8613,6 +8932,8 @@ class EnsembleProvider:
         backoff_s: float = 0.0,
         thinking_before: str = "",
         thinking_after: str = "",
+        phase_deadline: float | None = None,
+        cleanup_deadline: float | None = None,
         soft_deadline: float | None = None,
         soft_deadline_triggered: asyncio.Event | None = None,
     ) -> _CandidateResult | None:
@@ -8628,20 +8949,53 @@ class EnsembleProvider:
         target_identity = self._member_identity(member)
 
         def deadline_reached() -> bool:
-            return soft_deadline is not None and (
+            now = time.monotonic()
+            return bool(
                 (
-                    soft_deadline_triggered is not None
-                    and soft_deadline_triggered.is_set()
+                    soft_deadline is not None
+                    and (
+                        (
+                            soft_deadline_triggered is not None
+                            and soft_deadline_triggered.is_set()
+                        )
+                        or now >= soft_deadline
+                    )
                 )
-                or time.monotonic() >= soft_deadline
+                or (
+                    phase_deadline is not None
+                    and now >= phase_deadline
+                )
             )
 
+        def deadline_reason() -> str:
+            if (
+                soft_deadline is not None
+                and cleanup_deadline == soft_deadline
+            ):
+                return "soft_deadline"
+            if (
+                phase_deadline is not None
+                and time.monotonic() >= phase_deadline
+                and (
+                    soft_deadline is None
+                    or phase_deadline <= soft_deadline
+                )
+            ):
+                return "proposer_phase_deadline"
+            return "soft_deadline"
+
         def record_deadline_not_started(phase: str) -> None:
-            if soft_deadline_triggered is not None:
+            terminal_reason = deadline_reason()
+            if (
+                terminal_reason == "soft_deadline"
+                and soft_deadline_triggered is not None
+            ):
                 soft_deadline_triggered.set()
-            trace["terminal_reason"] = "soft_deadline"
+            if terminal_reason == "proposer_phase_deadline":
+                self._mark_deadline_triggered("proposer_recovery")
+            trace["terminal_reason"] = terminal_reason
             if any(
-                attempt.get("terminal_reason") == "soft_deadline"
+                attempt.get("terminal_reason") == terminal_reason
                 for attempt in trace["attempts"]
                 if isinstance(attempt, Mapping)
             ):
@@ -8661,7 +9015,7 @@ class EnsembleProvider:
                 "usage_reported": False,
                 "usage_missing_count": 0,
                 "outcome": "not_started",
-                "terminal_reason": "soft_deadline",
+                "terminal_reason": terminal_reason,
                 "deadline_phase": phase,
             }
             if kind == "thinking_downgrade":
@@ -8808,10 +9162,15 @@ class EnsembleProvider:
             return None
         if backoff_s > 0:
             sleep_seconds = backoff_s
-            if soft_deadline is not None:
+            pending_deadlines = [
+                deadline
+                for deadline in (soft_deadline, phase_deadline)
+                if deadline is not None
+            ]
+            if pending_deadlines:
                 sleep_seconds = min(
                     sleep_seconds,
-                    max(0.0, soft_deadline - time.monotonic()),
+                    max(0.0, min(pending_deadlines) - time.monotonic()),
                 )
             if sleep_seconds > 0:
                 await asyncio.sleep(sleep_seconds)
@@ -8860,6 +9219,24 @@ class EnsembleProvider:
                 config=config,
                 progress=None,
                 recovery_state=state,
+                absolute_deadline=(
+                    min(
+                        deadline
+                        for deadline in (phase_deadline, soft_deadline)
+                        if deadline is not None
+                    )
+                    if phase_deadline is not None or soft_deadline is not None
+                    else None
+                ),
+                cleanup_deadline=cleanup_deadline,
+                deadline_trigger=(
+                    "soft_deadline"
+                    if (
+                        soft_deadline is not None
+                        and cleanup_deadline == soft_deadline
+                    )
+                    else "proposer_phase"
+                ),
             )
         except BaseException:
             physical_attempts = (
@@ -9015,6 +9392,8 @@ class EnsembleProvider:
         tools: list[ToolDefinition] | None,
         config: ChatConfig | None,
         require_strict_quorum: bool = False,
+        phase_deadline: float | None = None,
+        cleanup_deadline: float | None = None,
         soft_deadline: float | None = None,
         soft_deadline_triggered: asyncio.Event | None = None,
     ) -> list[_CandidateResult]:
@@ -9343,10 +9722,15 @@ class EnsembleProvider:
                             member.effective_thinking_level or ""
                         ),
                         thinking_after=lower_unified,
+                        phase_deadline=phase_deadline,
+                        cleanup_deadline=cleanup_deadline,
                         soft_deadline=soft_deadline,
                         soft_deadline_triggered=soft_deadline_triggered,
                     )
-                    if trace.get("terminal_reason") == "soft_deadline":
+                    if trace.get("terminal_reason") in {
+                        "soft_deadline",
+                        "proposer_phase_deadline",
+                    }:
                         break
                     if attempt is not None:
                         current = _merge_candidate_attempt_evidence(
@@ -9398,10 +9782,15 @@ class EnsembleProvider:
                         backoff_s=(
                             _PROPOSER_TRANSIENT_RETRY_BACKOFF_SECONDS
                         ),
+                        phase_deadline=phase_deadline,
+                        cleanup_deadline=cleanup_deadline,
                         soft_deadline=soft_deadline,
                         soft_deadline_triggered=soft_deadline_triggered,
                     )
-                    if trace.get("terminal_reason") == "soft_deadline":
+                    if trace.get("terminal_reason") in {
+                        "soft_deadline",
+                        "proposer_phase_deadline",
+                    }:
                         break
                     if attempt is not None:
                         current = _merge_candidate_attempt_evidence(
@@ -9473,10 +9862,15 @@ class EnsembleProvider:
                     messages=messages,
                     tools=tools,
                     config=config,
+                    phase_deadline=phase_deadline,
+                    cleanup_deadline=cleanup_deadline,
                     soft_deadline=soft_deadline,
                     soft_deadline_triggered=soft_deadline_triggered,
                 )
-                if trace.get("terminal_reason") == "soft_deadline":
+                if trace.get("terminal_reason") in {
+                    "soft_deadline",
+                    "proposer_phase_deadline",
+                }:
                     break
                 if attempt is None:
                     break
@@ -9572,10 +9966,15 @@ class EnsembleProvider:
                             backup.effective_thinking_level or ""
                         ),
                         thinking_after=lower_unified,
+                        phase_deadline=phase_deadline,
+                        cleanup_deadline=cleanup_deadline,
                         soft_deadline=soft_deadline,
                         soft_deadline_triggered=soft_deadline_triggered,
                     )
-                    if trace.get("terminal_reason") == "soft_deadline":
+                    if trace.get("terminal_reason") in {
+                        "soft_deadline",
+                        "proposer_phase_deadline",
+                    }:
                         break
                     if downgraded is not None:
                         current = _merge_candidate_attempt_evidence(
@@ -9629,10 +10028,15 @@ class EnsembleProvider:
                         backoff_s=(
                             _PROPOSER_TRANSIENT_RETRY_BACKOFF_SECONDS
                         ),
+                        phase_deadline=phase_deadline,
+                        cleanup_deadline=cleanup_deadline,
                         soft_deadline=soft_deadline,
                         soft_deadline_triggered=soft_deadline_triggered,
                     )
-                    if trace.get("terminal_reason") == "soft_deadline":
+                    if trace.get("terminal_reason") in {
+                        "soft_deadline",
+                        "proposer_phase_deadline",
+                    }:
                         break
                     if retried is not None:
                         current = _merge_candidate_attempt_evidence(
@@ -9685,11 +10089,21 @@ class EnsembleProvider:
         tools: list[ToolDefinition] | None,
         config: ChatConfig | None,
         progress: Callable[[EnsembleProgressEvent], None] | None = None,
+        phase_deadline: float | None = None,
+        cleanup_deadline: float | None = None,
         soft_deadline: float | None = None,
         soft_deadline_triggered: asyncio.Event | None = None,
         recovery_state: _ProposerRecoveryScopeState | None = None,
         require_strict_quorum: bool = False,
     ) -> list[_CandidateResult]:
+        dispatch_deadline_trigger = (
+            "soft_deadline"
+            if (
+                soft_deadline is not None
+                and cleanup_deadline == soft_deadline
+            )
+            else "proposer_phase"
+        )
         tasks: list[asyncio.Task[_CandidateResult]] = []
         task_meta: dict[
             asyncio.Task[_CandidateResult],
@@ -9751,6 +10165,9 @@ class EnsembleProvider:
                 progress=progress,
                 recovery_state=recovery_state,
                 pre_dispatch_guard_reason=recovery_guard_reason,
+                absolute_deadline=phase_deadline,
+                cleanup_deadline=cleanup_deadline,
+                deadline_trigger=dispatch_deadline_trigger,
             )
 
         index = 0
@@ -9943,9 +10360,14 @@ class EnsembleProvider:
             while pending:
                 if cancel_code:
                     break
+                deadlines = [
+                    deadline
+                    for deadline in (soft_deadline, phase_deadline)
+                    if deadline is not None
+                ]
                 wait_timeout = (
-                    max(0.0, soft_deadline - time.monotonic())
-                    if soft_deadline is not None
+                    max(0.0, min(deadlines) - time.monotonic())
+                    if deadlines
                     else None
                 )
                 done, pending = await asyncio.wait(
@@ -9992,6 +10414,30 @@ class EnsembleProvider:
                 if (
                     pending
                     and not cancel_code
+                    and phase_deadline is not None
+                    and time.monotonic() >= phase_deadline
+                ):
+                    if dispatch_deadline_trigger == "soft_deadline":
+                        cancel_code = "soft_deadline"
+                        cancel_message = (
+                            "proposer cancelled before the ensemble soft "
+                            "deadline so cleanup can finish safely"
+                        )
+                        if soft_deadline_triggered is not None:
+                            soft_deadline_triggered.set()
+                    else:
+                        cancel_code = (
+                            _ENSEMBLE_PROPOSER_PHASE_DEADLINE_CODE
+                        )
+                        cancel_message = (
+                            "proposer cancelled when its phase budget expired; "
+                            "preserving the aggregator reserve"
+                        )
+                        self._mark_deadline_triggered("proposer_phase")
+                    break
+                if (
+                    pending
+                    and not cancel_code
                     and soft_deadline is not None
                     and time.monotonic() >= soft_deadline
                 ):
@@ -10030,10 +10476,15 @@ class EnsembleProvider:
 
             if pending and not cancel_code:
                 grace_timeout = self.quorum_grace_seconds
-                if soft_deadline is not None:
+                grace_deadlines = [
+                    deadline
+                    for deadline in (soft_deadline, phase_deadline)
+                    if deadline is not None
+                ]
+                if grace_deadlines:
                     grace_timeout = min(
                         grace_timeout,
-                        max(0.0, soft_deadline - time.monotonic()),
+                        max(0.0, min(grace_deadlines) - time.monotonic()),
                     )
                 grace_started = time.monotonic()
                 if quorum_trace is not None:
@@ -10046,6 +10497,18 @@ class EnsembleProvider:
                     quorum_trace["completed_during_grace"] = len(done)
                 for task in done:
                     results.append(await task)
+                if (
+                    pending
+                    and not cancel_code
+                    and phase_deadline is not None
+                    and time.monotonic() >= phase_deadline
+                ):
+                    cancel_code = _ENSEMBLE_PROPOSER_PHASE_DEADLINE_CODE
+                    cancel_message = (
+                        "proposer cancelled when its phase budget expired; "
+                        "preserving the aggregator reserve"
+                    )
+                    self._mark_deadline_triggered("proposer_phase")
                 if (
                     pending
                     and not cancel_code
@@ -10085,7 +10548,11 @@ class EnsembleProvider:
                     task.cancel()
                 for task in remaining:
                     self._track_pending_cleanup(task, "proposers")
-                lingering = await _bounded_task_cleanup(remaining, phase="proposers")
+                lingering = await _bounded_task_cleanup(
+                    remaining,
+                    phase="proposers",
+                    cleanup_deadline=cleanup_deadline,
+                )
                 if quorum_trace is not None:
                     quorum_trace["cleanup"].update(
                         {
@@ -10386,6 +10853,7 @@ class EnsembleProvider:
                 lingering = await _bounded_task_cleanup(
                     list(pending),
                     phase="proposers_external_cancel",
+                    cleanup_deadline=cleanup_deadline,
                 )
                 for task in pending:
                     if task.done():
@@ -10416,6 +10884,12 @@ class EnsembleProvider:
         progress: Callable[[EnsembleProgressEvent], None] | None = None,
         recovery_state: _ProposerRecoveryScopeState | None = None,
         pre_dispatch_guard_reason: str = "",
+        absolute_deadline: float | None = None,
+        cleanup_deadline: float | None = None,
+        deadline_trigger: Literal[
+            "proposer_phase",
+            "soft_deadline",
+        ] = "proposer_phase",
     ) -> _CandidateResult:
         cfg = member.provider_config
         started = time.monotonic()
@@ -10452,6 +10926,31 @@ class EnsembleProvider:
                     result,
                     pre_dispatch_guard_reason,
                 )
+            effective_timeout_seconds = self._effective_phase_timeout_seconds(
+                self.proposer_timeout_seconds,
+                absolute_deadline=absolute_deadline,
+            )
+            if (
+                absolute_deadline is not None
+                and (effective_timeout_seconds or 0.0) <= 0
+            ):
+                if deadline_trigger == "proposer_phase":
+                    self._mark_deadline_triggered("proposer_phase")
+                result.error = (
+                    "proposer execution budget was exhausted before physical dispatch"
+                )
+                result.error_code = (
+                    "soft_deadline"
+                    if deadline_trigger == "soft_deadline"
+                    else _ENSEMBLE_PROPOSER_PHASE_DEADLINE_CODE
+                )
+                result.execution = {
+                    "request_started": False,
+                    "physical_attempts": [],
+                    "timeout_seconds": 0.0,
+                    "deadline_triggered_stage": deadline_trigger,
+                }
+                return result
             request_task = asyncio.current_task()
             if request_task is not None and (
                 member.thinking_policy_managed
@@ -10479,13 +10978,20 @@ class EnsembleProvider:
                     physical_attempts=physical_attempts,
                     thinking_fallback_bindings=thinking_fallback_bindings,
                     recovery_state=recovery_state,
+                    timeout_seconds=effective_timeout_seconds,
+                    cleanup_deadline=cleanup_deadline,
+                    dispatch_deadline=absolute_deadline,
+                    deadline_trigger=deadline_trigger,
                 )
             )
             try:
-                if self.proposer_timeout_seconds > 0:
+                if (
+                    effective_timeout_seconds is not None
+                    and effective_timeout_seconds > 0
+                ):
                     done, _ = await asyncio.wait(
                         {inner_task},
-                        timeout=self.proposer_timeout_seconds,
+                        timeout=effective_timeout_seconds,
                     )
                     if not done:
                         self._track_pending_cleanup(
@@ -10496,6 +11002,7 @@ class EnsembleProvider:
                         lingering = await _bounded_task_cleanup(
                             [inner_task],
                             phase=f"proposer_{index}_timeout",
+                            cleanup_deadline=cleanup_deadline,
                         )
                         if inner_task.done():
                             try:
@@ -10517,9 +11024,27 @@ class EnsembleProvider:
                         _finalize_candidate_text_buffer(result)
                         result = replace(result)
                         result.error = (
-                            f"proposer timed out after {self.proposer_timeout_seconds:g}s"
+                            "proposer timed out after "
+                            f"{effective_timeout_seconds:g}s"
                         )
-                        result.error_code = "timeout"
+                        if (
+                            absolute_deadline is not None
+                            and time.monotonic() >= absolute_deadline
+                        ):
+                            if deadline_trigger == "proposer_phase":
+                                self._mark_deadline_triggered(
+                                    "proposer_phase"
+                                )
+                            result.error_code = (
+                                "soft_deadline"
+                                if deadline_trigger == "soft_deadline"
+                                else _ENSEMBLE_PROPOSER_PHASE_DEADLINE_CODE
+                            )
+                            result.execution[
+                                "deadline_triggered_stage"
+                            ] = deadline_trigger
+                        else:
+                            result.error_code = "timeout"
                         return result
                     result = inner_task.result()
                     return result
@@ -10535,6 +11060,7 @@ class EnsembleProvider:
                     lingering = await _bounded_task_cleanup(
                         [inner_task],
                         phase=f"proposer_{index}_external_cancel",
+                        cleanup_deadline=cleanup_deadline,
                     )
                     if lingering:
                         raise _EnsembleStreamCloseError(
@@ -10659,6 +11185,13 @@ class EnsembleProvider:
         physical_attempts: list[dict[str, Any]],
         thinking_fallback_bindings: list[dict[str, Any]],
         recovery_state: _ProposerRecoveryScopeState | None = None,
+        timeout_seconds: float | None = None,
+        cleanup_deadline: float | None = None,
+        dispatch_deadline: float | None = None,
+        deadline_trigger: Literal[
+            "proposer_phase",
+            "soft_deadline",
+        ] = "proposer_phase",
     ) -> _CandidateResult:
         recovery_guard_reason = (
             self._proposer_recovery_plan_guard_reason(recovery_state)
@@ -10668,6 +11201,31 @@ class EnsembleProvider:
                 result,
                 recovery_guard_reason,
             )
+        deadline_code = (
+            "soft_deadline"
+            if deadline_trigger == "soft_deadline"
+            else _ENSEMBLE_PROPOSER_PHASE_DEADLINE_CODE
+        )
+
+        def stop_before_dispatch_if_expired() -> bool:
+            if (
+                dispatch_deadline is None
+                or time.monotonic() < dispatch_deadline
+            ):
+                return False
+            if deadline_trigger == "proposer_phase":
+                self._mark_deadline_triggered("proposer_phase")
+            result.error = (
+                "proposer execution budget was exhausted before physical dispatch"
+            )
+            result.error_code = deadline_code
+            result.request_started = False
+            result.physical_request_count = 0
+            result.execution["deadline_triggered_stage"] = (
+                deadline_trigger
+            )
+            result.execution["timeout_seconds"] = 0.0
+            return True
         if self._router_dynamic_selection():
             chat_cfg, proposer_output_budget = _proposer_chat_config(
                 config,
@@ -10702,14 +11260,14 @@ class EnsembleProvider:
         ):
             proposer_updates["allow_provider_stream_fallback"] = False
         chat_cfg = chat_cfg.model_copy(update=proposer_updates)
-        if self.proposer_timeout_seconds > 0:
-            chat_cfg = chat_cfg.model_copy(update={"timeout": self.proposer_timeout_seconds})
+        if timeout_seconds is not None and timeout_seconds > 0:
+            chat_cfg = chat_cfg.model_copy(update={"timeout": timeout_seconds})
         result.execution = _member_execution_trace(
             member,
             role="proposer",
             chat_config=chat_cfg,
             tools=tools,
-            timeout_seconds=self.proposer_timeout_seconds,
+            timeout_seconds=timeout_seconds,
             request_budget_binding=self._member_request_budget_binding(member),
         )
         if proposer_output_budget:
@@ -10819,6 +11377,8 @@ class EnsembleProvider:
                 result,
                 recovery_guard_reason,
             )
+        if stop_before_dispatch_if_expired():
+            return result
         if (
             member.thinking_policy_managed
             or self._router_dynamic_selection()
@@ -10832,9 +11392,14 @@ class EnsembleProvider:
                 on_request_started=mark_request_started,
                 pending_cleanup_tracker=self._track_pending_cleanup,
                 terminal_observed=lambda: terminal_event_observed,
+                cleanup_deadline=cleanup_deadline,
+                dispatch_deadline=dispatch_deadline,
+                deadline_code=deadline_code,
             )
         else:
             provider = _build_provider(_proposer_provider_config(member))
+            if stop_before_dispatch_if_expired():
+                return result
             raw_stream = provider.chat(messages, tools=tools, config=chat_cfg)
             mark_request_started()
 
@@ -10851,6 +11416,7 @@ class EnsembleProvider:
             pending_cleanup_tracker=self._track_pending_cleanup,
             terminal_observed=lambda: terminal_event_observed,
             close_observed=mark_stream_close_result,
+            cleanup_deadline=cleanup_deadline,
         ) as provider_stream:
             async for event in provider_stream:
                 if isinstance(event, TextDeltaEvent):
@@ -11033,6 +11599,8 @@ class EnsembleProvider:
                         api_key=member.provider_config.api_key,
                     )
                     result.retry_after_s = event.retry_after_s
+                    if result.error_code == deadline_code:
+                        self._mark_deadline_triggered(deadline_trigger)
                     result.message_limit_proof = event.message_limit_proof
                     result.model_usage_breakdown = [
                         _canonicalize_usage_row(item)
@@ -11116,12 +11684,13 @@ class EnsembleProvider:
                             or {}
                         )
                         current_physical_attempt["outcome"] = "failed"
-                    self._report_member_credential_failure(
-                        member,
-                        message=result.error,
-                        code=result.error_code,
-                        retry_after_s=result.retry_after_s,
-                    )
+                    if result.error_code != deadline_code:
+                        self._report_member_credential_failure(
+                            member,
+                            message=result.error,
+                            code=result.error_code,
+                            retry_after_s=result.retry_after_s,
+                        )
                     _publish_candidate_attempt_snapshot(
                         request_task,
                         result,
@@ -11337,6 +11906,9 @@ class EnsembleProvider:
                     physical_attempts=physical_attempts,
                     thinking_fallback_bindings=thinking_fallback_bindings,
                     recovery_state=recovery_state,
+                    cleanup_deadline=cleanup_deadline,
+                    dispatch_deadline=dispatch_deadline,
+                    deadline_trigger=deadline_trigger,
                 )
             except BaseException:
                 merge_retry_evidence(interrupted=True)
@@ -11543,6 +12115,8 @@ class EnsembleProvider:
             "aggregator_tools": self.aggregator_tools,
             "proposer_timeout_seconds": self.proposer_timeout_seconds,
             "aggregator_timeout_seconds": self.aggregator_timeout_seconds,
+            "latency_class": self.latency_class,
+            "deadline": self._deadline_trace_snapshot(),
             "aggregator_serving_chain_timeout_seconds": (
                 self.aggregator_serving_chain_timeout_seconds
             ),
@@ -11685,6 +12259,8 @@ class EnsembleProvider:
         trace: dict[str, Any],
         timeout_seconds: float | None = None,
         absolute_deadline: float | None = None,
+        absolute_deadline_kind: Literal["hard", "soft"] = "hard",
+        cleanup_deadline: float | None = None,
         initial_member: EnsembleMemberConfig | None = None,
         initial_fallback_index: int = 0,
         initial_trigger: str = "",
@@ -11848,6 +12424,11 @@ class EnsembleProvider:
             # retry independently. This bounds interactive tail latency and
             # also makes experiment attempts comparable.
             absolute_deadline = aggregator_started + effective_timeout_seconds
+        if (
+            cleanup_deadline is None
+            and absolute_deadline_kind == "hard"
+        ):
+            cleanup_deadline = absolute_deadline
         recovery_trace = trace.get("aggregator_recovery")
         if not isinstance(recovery_trace, dict):
             recovery_trace = {
@@ -11951,7 +12532,7 @@ class EnsembleProvider:
             if not isinstance(final_request, dict):
                 return
             final_request["role"] = "aggregator"
-            final_request["execution"] = _member_execution_trace(
+            refreshed_execution = _member_execution_trace(
                 active_member,
                 role="aggregator",
                 chat_config=active_config,
@@ -11959,6 +12540,11 @@ class EnsembleProvider:
                 timeout_seconds=effective_timeout_seconds,
                 request_budget_binding=self._member_request_budget_binding(active_member),
             )
+            execution = final_request.get("execution")
+            if isinstance(execution, dict):
+                execution.update(refreshed_execution)
+            else:
+                final_request["execution"] = refreshed_execution
             final_request["input"] = _messages_trace(
                 active_messages,
                 max_chars=TRACE_CONTENT_MAX_CHARS,
@@ -13210,6 +13796,9 @@ class EnsembleProvider:
             if absolute_deadline is not None:
                 remaining_to_deadline = absolute_deadline - time.monotonic()
                 if remaining_to_deadline <= 0:
+                    if absolute_deadline_kind == "hard":
+                        self._mark_deadline_triggered("aggregator")
+                        trace["deadline"] = self._deadline_trace_snapshot()
                     deadline_error = ErrorEvent(
                         message="ensemble aggregator reached its absolute deadline",
                         code="ensemble_aggregator_timeout",
@@ -13225,6 +13814,27 @@ class EnsembleProvider:
                     if attempt_timeout_seconds <= 0
                     else min(attempt_timeout_seconds, remaining_to_deadline)
                 )
+            if attempt_timeout_seconds > 0:
+                active_config = active_config.model_copy(
+                    update={"timeout": attempt_timeout_seconds}
+                )
+            final_request = trace.get("final_request")
+            if isinstance(final_request, dict):
+                refreshed_execution = _member_execution_trace(
+                    active_member,
+                    role="aggregator",
+                    chat_config=active_config,
+                    tools=active_tools,
+                    timeout_seconds=attempt_timeout_seconds,
+                    request_budget_binding=(
+                        self._member_request_budget_binding(active_member)
+                    ),
+                )
+                execution = final_request.get("execution")
+                if isinstance(execution, dict):
+                    execution.update(refreshed_execution)
+                else:
+                    final_request["execution"] = refreshed_execution
             content_streamed = False
             attempt_text_parts: list[str] = []
             pending_visible_events: list[TextDeltaEvent] = []
@@ -13241,6 +13851,45 @@ class EnsembleProvider:
             stream_closed = True
             external_close_requested = False
             attempt_request_started = False
+            # Keep the final deadline guard adjacent to the lazy physical
+            # boundary.  Trace construction and progress delivery above are
+            # synchronous today, but callers may instrument either path; an
+            # expired budget must never start another billable request.
+            if absolute_deadline is not None:
+                remaining_to_deadline = absolute_deadline - time.monotonic()
+                if remaining_to_deadline <= 0:
+                    if absolute_deadline_kind == "hard":
+                        self._mark_deadline_triggered("aggregator")
+                        trace["deadline"] = self._deadline_trace_snapshot()
+                    deadline_error = ErrorEvent(
+                        message=(
+                            "ensemble aggregator reached its absolute "
+                            "deadline before physical dispatch"
+                        ),
+                        code="ensemble_aggregator_timeout",
+                        request_started=False,
+                        physical_request_count=0,
+                    )
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=deadline_error.message,
+                    )
+                    yield partial_error(deadline_error)
+                    return
+                attempt_timeout_seconds = (
+                    remaining_to_deadline
+                    if attempt_timeout_seconds <= 0
+                    else min(attempt_timeout_seconds, remaining_to_deadline)
+                )
+                active_config = active_config.model_copy(
+                    update={"timeout": attempt_timeout_seconds}
+                )
+                final_request = trace.get("final_request")
+                if isinstance(final_request, dict):
+                    execution = final_request.get("execution")
+                    if isinstance(execution, dict):
+                        execution["timeout_seconds"] = attempt_timeout_seconds
+                        execution["effective_timeout"] = attempt_timeout_seconds
             try:
                 stream = provider.chat(
                     active_messages,
@@ -13277,6 +13926,11 @@ class EnsembleProvider:
                     phase="ensemble_aggregator_wait",
                     message="Still waiting for ensemble aggregator response",
                     timeout_seconds=attempt_timeout_seconds,
+                    absolute_deadline=absolute_deadline,
+                    cleanup_deadline=cleanup_deadline,
+                    use_absolute_deadline_for_cleanup=(
+                        absolute_deadline_kind == "hard"
+                    ),
                     close_status=heartbeat_close_status,
                     pending_cleanup_tracker=self._track_pending_cleanup,
                 )
@@ -13424,13 +14078,23 @@ class EnsembleProvider:
                 external_close_requested = True
                 raise
             except TimeoutError:
+                if (
+                    absolute_deadline_kind == "hard"
+                    and absolute_deadline is not None
+                    and time.monotonic() >= absolute_deadline
+                ):
+                    self._mark_deadline_triggered("aggregator")
+                    trace["deadline"] = self._deadline_trace_snapshot()
                 deadline_event = (
                     heartbeat_close_status.deadline_event
                     if heartbeat_close_status is not None
                     else None
                 )
                 terminal_stream_error = ErrorEvent(
-                    message=(f"ensemble aggregator timed out after {effective_timeout_seconds:g}s"),
+                    message=(
+                        "ensemble aggregator timed out after "
+                        f"{attempt_timeout_seconds:g}s"
+                    ),
                     code="ensemble_aggregator_timeout",
                     diagnostic_done=(
                         deadline_event if isinstance(deadline_event, DoneEvent) else None
@@ -14855,6 +15519,9 @@ class EnsembleProvider:
                     max(0.0, float(retry_error.retry_after_s or 0.0)),
                 )
             if absolute_deadline is not None and time.monotonic() + delay >= absolute_deadline:
+                if absolute_deadline_kind == "hard":
+                    self._mark_deadline_triggered("aggregator_retry")
+                    trace["deadline"] = self._deadline_trace_snapshot()
                 deadline_error = ErrorEvent(
                     message=("ensemble aggregator retry budget reached the absolute deadline"),
                     code="ensemble_aggregator_timeout",
@@ -14893,7 +15560,7 @@ class EnsembleProvider:
                         update={"timeout": effective_timeout_seconds}
                     )
                 if isinstance(final_request, dict):
-                    final_request["execution"] = _member_execution_trace(
+                    refreshed_execution = _member_execution_trace(
                         active_member,
                         role="aggregator",
                         chat_config=active_config,
@@ -14901,6 +15568,11 @@ class EnsembleProvider:
                         timeout_seconds=effective_timeout_seconds,
                         request_budget_binding=(self._member_request_budget_binding(active_member)),
                     )
+                    execution = final_request.get("execution")
+                    if isinstance(execution, dict):
+                        execution.update(refreshed_execution)
+                    else:
+                        final_request["execution"] = refreshed_execution
                 begin_thinking_fallback(
                     rejected_member=rejected_member,
                     rejected_unified_level=(
@@ -14939,6 +15611,7 @@ class EnsembleProvider:
         code: str,
         candidates: Sequence[_CandidateResult],
         trace_overrides: Mapping[str, Any] | None = None,
+        absolute_deadline: float | None = None,
         soft_deadline: float | None = None,
         soft_deadline_seconds: float = 0.0,
         soft_deadline_triggered: asyncio.Event | None = None,
@@ -15047,6 +15720,7 @@ class EnsembleProvider:
                         code=code,
                         candidates=candidates,
                         trace_overrides=effective_trace_overrides,
+                        absolute_deadline=absolute_deadline,
                         prior_final_rows=prior_final_rows,
                         prior_final_missing_count=prior_final_missing_count,
                         prior_final_request_count=prior_final_request_count,
@@ -15058,6 +15732,8 @@ class EnsembleProvider:
                     timeout_seconds=None,
                     close_status=first_close_status,
                     absolute_deadline=soft_deadline,
+                    cleanup_deadline=absolute_deadline,
+                    use_absolute_deadline_for_cleanup=False,
                     pending_cleanup_tracker=self._track_pending_cleanup,
                 )
                 async for event in first_relay:
@@ -15257,6 +15933,7 @@ class EnsembleProvider:
                     code=code,
                     candidates=candidates,
                     trace_overrides=deadline_overrides,
+                    absolute_deadline=absolute_deadline,
                     prior_final_rows=[
                         *prior_final_rows,
                         *abandoned_rows,
@@ -15385,6 +16062,31 @@ class EnsembleProvider:
             if fallback_config is not None
             else ChatConfig().timeout
         )
+        effective_fallback_timeout = self._effective_phase_timeout_seconds(
+            fallback_timeout_seconds,
+            absolute_deadline=absolute_deadline,
+        )
+        if effective_fallback_timeout is not None:
+            fallback_timeout_seconds = effective_fallback_timeout
+        if absolute_deadline is not None and fallback_timeout_seconds <= 0:
+            self._mark_deadline_triggered("fallback")
+            error_trace["deadline"] = self._deadline_trace_snapshot()
+            yield proposer_error(
+                ErrorEvent(
+                    message=(
+                        "ensemble absolute deadline was exhausted before the "
+                        "fallback request could start"
+                    ),
+                    code="ensemble_absolute_deadline",
+                    request_started=False,
+                    physical_request_count=0,
+                )
+            )
+            return
+        if fallback_timeout_seconds > 0:
+            fallback_config = (fallback_config or ChatConfig()).model_copy(
+                update={"timeout": fallback_timeout_seconds}
+            )
         trace = self._trace_payload(
             candidates,
             successful_count=sum(
@@ -15608,6 +16310,44 @@ class EnsembleProvider:
                 usage_missing_count=proposer_missing_count,
             )
             return
+        if absolute_deadline is not None:
+            remaining_to_deadline = (
+                absolute_deadline - time.monotonic()
+            )
+            if remaining_to_deadline <= 0:
+                self._mark_deadline_triggered("fallback")
+                trace["deadline"] = self._deadline_trace_snapshot()
+                yield partial_error(
+                    ErrorEvent(
+                        message=(
+                            "ensemble absolute deadline was exhausted "
+                            "before the fallback request could start"
+                        ),
+                        code="ensemble_absolute_deadline",
+                        request_started=False,
+                        physical_request_count=0,
+                    )
+                )
+                return
+            fallback_timeout_seconds = min(
+                fallback_timeout_seconds,
+                remaining_to_deadline,
+            )
+            fallback_config = (
+                fallback_config or ChatConfig()
+            ).model_copy(
+                update={"timeout": fallback_timeout_seconds}
+            )
+            final_request = trace.get("final_request")
+            if isinstance(final_request, dict):
+                execution = final_request.get("execution")
+                if isinstance(execution, dict):
+                    execution["timeout_seconds"] = (
+                        fallback_timeout_seconds
+                    )
+                    execution["effective_timeout"] = (
+                        fallback_timeout_seconds
+                    )
         physical_close_status = fallback_close_status or _StreamCloseStatus()
         completed_fallback_event: DoneEvent | None = None
         terminal_fallback_error: ErrorEvent | None = None
@@ -15632,6 +16372,7 @@ class EnsembleProvider:
                 # stall — the condition the HTTP layer itself would flag —
                 # expires the fallback.
                 reset_deadline_on_event=True,
+                absolute_deadline=absolute_deadline,
                 close_status=physical_close_status,
                 pending_cleanup_tracker=self._track_pending_cleanup,
             )
@@ -15760,11 +16501,24 @@ class EnsembleProvider:
             return
         except TimeoutError:
             deadline_event = physical_close_status.deadline_event
+            absolute_timeout = bool(
+                physical_close_status.absolute_deadline_triggered
+            )
+            if absolute_timeout:
+                self._mark_deadline_triggered("fallback")
+                trace["deadline"] = self._deadline_trace_snapshot()
             timeout_error = ErrorEvent(
                 message=(
-                    f"ensemble fallback stalled: no stream events for {fallback_timeout_seconds:g}s"
+                    "ensemble absolute deadline was reached during fallback"
+                    if absolute_timeout
+                    else "ensemble fallback stalled: no stream events for "
+                    f"{fallback_timeout_seconds:g}s"
                 ),
-                code="ensemble_fallback_timeout",
+                code=(
+                    "ensemble_absolute_deadline"
+                    if absolute_timeout
+                    else "ensemble_fallback_timeout"
+                ),
                 diagnostic_done=(deadline_event if isinstance(deadline_event, DoneEvent) else None),
             )
             if physical_close_status.closed is not True:
@@ -19289,6 +20043,9 @@ def build_ensemble_provider_from_config(
     selection_plan["effective_proposer_timeout_seconds"] = proposer_timeout_seconds
     selection_plan["configured_aggregator_timeout_seconds"] = configured_aggregator_timeout_seconds
     selection_plan["effective_aggregator_timeout_seconds"] = aggregator_timeout_seconds
+    selection_plan["latency_class"] = str(
+        getattr(ensemble_cfg, "latency_class", "normal") or "normal"
+    )
     selection_plan["aggregator_serving_chain_timeout_seconds"] = float(
         getattr(ensemble_cfg, "aggregator_serving_chain_timeout_seconds", 120.0) or 120.0
     )
@@ -19478,6 +20235,9 @@ def build_ensemble_provider_from_config(
         aggregator_timeout_seconds=aggregator_timeout_seconds,
         aggregator_serving_chain_timeout_seconds=float(
             getattr(ensemble_cfg, "aggregator_serving_chain_timeout_seconds", 120.0) or 120.0
+        ),
+        latency_class=str(
+            getattr(ensemble_cfg, "latency_class", "normal") or "normal"
         ),
         candidate_max_chars=int(getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0),
         shuffle_candidates=shuffle_candidates,

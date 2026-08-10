@@ -46,6 +46,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.proposer_timeout_seconds == 3600.0
     assert ensemble.aggregator_timeout_seconds == 3600.0
     assert ensemble.aggregator_serving_chain_timeout_seconds == 120.0
+    assert ensemble.latency_class == "normal"
     assert ensemble.shuffle_candidates is True
     assert ensemble.candidate_order_seed is None
     assert ensemble.record_candidates is False
@@ -75,6 +76,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.aggregator_serving_chain_timeout_seconds == 120.0
+    assert provider.latency_class == "normal"
     assert provider.shuffle_candidates is False
     assert provider.candidate_order_seed is None
     assert provider.quorum_grace_seconds == 10.0
@@ -1209,6 +1211,7 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "effective_proposer_timeout_seconds": 300.0,
             "configured_aggregator_timeout_seconds": 3600.0,
             "effective_aggregator_timeout_seconds": 480.0,
+            "latency_class": "normal",
             "aggregator_serving_chain_timeout_seconds": 120.0,
             "configured_shuffle_candidates": False,
             "effective_shuffle_candidates": False,
