@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import time
 import uuid
@@ -38,7 +39,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from opensquilla.cli.gateway_rpc import default_gateway_token
 from opensquilla.gateway_client import GatewayRPCClient, GatewayRPCError
@@ -79,6 +80,40 @@ _TERMINAL_EVENTS = {
 }
 _TEXT_DELTA = "session.event.text_delta"
 _STREAM_FRAME_TIMEOUT_S = 300.0
+
+# Agent 内部的路由标记（[[reply_to_current]] / [[reply_to:<id>]]）不属于
+# OpenAI 协议内容，必须在输出边界剥除，否则外部客户端会把它当正文渲染。
+_REPLY_TAG_RE = re.compile(r"\[\[reply_to[^\]]*\]\]")
+
+
+def _strip_reply_tags(text: str) -> str:
+    return _REPLY_TAG_RE.sub("", text)
+
+
+def _filter_stream_delta(carry: str, chunk: str) -> tuple[str, str]:
+    """跨 SSE 增量剥除路由标记，返回 (可输出文本, 新 carry)。
+
+    gateway 的 text_delta 可能在标记中间切分（实测出现过 '[[reply_to' +
+    '_current]]' 分两个增量到达），因此对未闭合的 '[[' 尾部做暂存，
+    等下一个增量到达再判定；已闭合但非路由标记的 [[...]] 原样放行。
+    """
+    carry += chunk
+    out_parts: list[str] = []
+    while True:
+        m = _REPLY_TAG_RE.search(carry)
+        if m:
+            out_parts.append(carry[: m.start()])
+            carry = carry[m.end():]
+            continue
+        idx = carry.rfind("[[")
+        if idx == -1 or "]]" in carry[idx:]:
+            out_parts.append(carry)
+            carry = ""
+        else:
+            out_parts.append(carry[:idx])
+            carry = carry[idx:]
+        break
+    return "".join(out_parts), carry
 
 
 def _normalize_event_frame(frame: dict[str, Any]) -> dict[str, Any]:
@@ -238,7 +273,7 @@ def _extract_final_text(events: list[dict[str, Any]]) -> str:
             t = ev.get("payload", {}).get("text")
             if isinstance(t, str) and t:
                 parts.append(t)
-    return "".join(parts)
+    return _strip_reply_tags("".join(parts))
 
 
 # --------------------------------------------------------------------------
@@ -364,6 +399,26 @@ def json_dumps(obj: Any) -> str:
 app = FastAPI(title="OpenSquilla OpenAI Bridge", version="0.1.0")
 
 
+@app.exception_handler(HTTPException)
+async def openai_error_envelope(_: Request, exc: HTTPException) -> JSONResponse:
+    """按 OpenAI 协议输出错误体（{"error": {...}}）。
+
+    FastAPI 默认的 {"detail": ...} 形状会让按 error.message 解析的
+    SDK 类客户端（Cherry Studio 等）拿不到失败原因。
+    """
+    if isinstance(exc.detail, dict) and "error" in exc.detail:
+        payload = exc.detail
+    else:
+        payload = {
+            "error": {
+                "message": str(exc.detail),
+                "type": "invalid_request_error" if exc.status_code < 500 else "server_error",
+                "code": "invalid_api_key" if exc.status_code == 401 else None,
+            }
+        }
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
 async def require_bridge_token(authorization: str | None = Header(None)) -> str | None:
     if NO_AUTH:
         return None
@@ -474,6 +529,7 @@ async def chat_completions(
                         },
                     )
                     yield _chunk(chat_id, created, model, {"role": "assistant"}, None)
+                    carry = ""
                     while True:
                         frame = await c.recv_event(timeout=_STREAM_FRAME_TIMEOUT_S)
                         norm = _normalize_event_frame(frame)
@@ -484,8 +540,14 @@ async def chat_completions(
                         if name == _TEXT_DELTA:
                             t = payload.get("text")
                             if isinstance(t, str) and t:
-                                yield _chunk(chat_id, created, model, {"content": t}, None)
+                                clean, carry = _filter_stream_delta(carry, t)
+                                if clean:
+                                    yield _chunk(chat_id, created, model, {"content": clean}, None)
                         if name in _TERMINAL_EVENTS:
+                            if carry:
+                                tail = _strip_reply_tags(carry)
+                                if tail:
+                                    yield _chunk(chat_id, created, model, {"content": tail}, None)
                             yield _chunk(chat_id, created, model, {}, "stop")
                             yield "data: [DONE]\n\n"
                             return
