@@ -26,6 +26,16 @@ def test_unknown_error_remains_failed() -> None:
     assert outcome.retryable is False
 
 
+def test_provider_failure_kind_is_preserved_in_durable_outcome() -> None:
+    outcome = outcome_from_error(
+        code="usage_limit_reached",
+        message="provider quota exhausted",
+        failure_kind="insufficient_credits",
+    )
+
+    assert outcome.to_dict()["failure_kind"] == "insufficient_credits"
+
+
 def test_ensemble_multimodal_rejection_is_failed_and_not_retryable() -> None:
     outcome = outcome_from_error(
         code="ensemble_multimodal_unsupported",

@@ -16,7 +16,9 @@ root release README with task-oriented guides.
 7. [`web-ui.md`](web-ui.md) - local control console and chat UI.
 8. [`sessions.md`](sessions.md) - session continuity, export, resume, abort,
    and cleanup.
-9. [`glossary.md`](glossary.md) - user-facing terminology.
+9. [`goal-mode.md`](goal-mode.md) - persistent multi-turn Goals, progress,
+   guardrails, pause/resume, and Plan-mode interaction.
+10. [`glossary.md`](glossary.md) - user-facing terminology.
 
 ## Feature Guides
 
@@ -38,6 +40,8 @@ root release README with task-oriented guides.
   authoring.
 - [`features/compaction-and-cache.md`](features/compaction-and-cache.md) -
   long-session compaction and prompt-cache continuity.
+- [`goal-mode.md`](goal-mode.md) - durable session Goals and safe automatic
+  continuation.
 
 ## Surfaces and Operations
 

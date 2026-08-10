@@ -57,6 +57,103 @@ def test_gateway_session_context_mirrors_state_to_legacy_scope() -> None:
     assert context.scope["model"] == "gateway/slash-model"
 
 
+def test_external_turn_fence_advances_pending_identity_without_idle_gap() -> None:
+    from opensquilla.cli.repl import gateway_runtime
+
+    idle = asyncio.Event()
+    idle.set()
+    state: dict[str, str | None] = {"turn_id": None, "session_key": None}
+    fence = gateway_runtime._ExternalTurnFence(idle, state)
+
+    fence.discover(session_key="agent:main:shared", turn_id="turn-a")
+    fence.discover(session_key="agent:main:shared", turn_id="turn-b")
+    assert fence.current("agent:main:shared") == gateway_runtime._ExternalTurnIdentity(
+        session_key="agent:main:shared",
+        turn_id="turn-a",
+    )
+    assert idle.is_set() is False
+
+    fence.settle("turn-a")
+    assert fence.current("agent:main:shared") == gateway_runtime._ExternalTurnIdentity(
+        session_key="agent:main:shared",
+        turn_id="turn-b",
+    )
+    assert state == {"turn_id": "turn-b", "session_key": "agent:main:shared"}
+    assert idle.is_set() is False
+
+    fence.settle("turn-b")
+    assert fence.current("agent:main:shared") is None
+    assert state == {"turn_id": None, "session_key": None}
+    assert idle.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_external_turn_discovery_error_releases_pending_fence() -> None:
+    from opensquilla.cli.repl import gateway_runtime
+
+    class _Discovery:
+        def __init__(self) -> None:
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> dict[str, Any]:
+            if self._sent:
+                raise StopAsyncIteration
+            self._sent = True
+            return {
+                "event": "session.event.text_delta",
+                "payload": {
+                    "turn_id": "turn-with-broken-subscription",
+                    "client_message_id": "message-with-broken-subscription",
+                    "surface_id": "web:browser",
+                    "stream_seq": 9,
+                    "text": "partial",
+                },
+            }
+
+    class _Client:
+        surface_id = "tui:local"
+
+        async def subscribe_session_events(self, *args, **kwargs):
+            raise RuntimeError("subscription failed")
+
+    local_idle = asyncio.Event()
+    local_idle.set()
+    external_idle = asyncio.Event()
+    external_idle.set()
+    state: dict[str, str | None] = {"turn_id": None, "session_key": None}
+
+    with pytest.raises(RuntimeError, match="subscription failed"):
+        await gateway_runtime._mirror_external_turns(
+            _Discovery(),
+            client=_Client(),
+            session_key="agent:main:shared",
+            session_context=gateway_runtime.GatewaySessionContext.create(
+                ChatSessionState(
+                    session_key="agent:main:shared",
+                    model="gateway/model",
+                )
+            ),
+            deps=gateway_runtime.GatewayRuntimeDependencies(
+                stream_response=cast(Any, None),
+                handle_slash_command=cast(Any, None),
+                run_input_loop=cast(Any, None),
+                get_tui_output=lambda _scope: None,
+                is_exit_command=lambda _value: False,
+                notify=lambda _notice: None,
+            ),
+            elevated_state={"mode": None},
+            local_turn_idle=local_idle,
+            external_turn_idle=external_idle,
+            external_turn_state=state,
+        )
+
+    assert external_idle.is_set() is True
+    assert state == {"turn_id": None, "session_key": None}
+
+
 @pytest.mark.asyncio
 async def test_gateway_runtime_connects_to_configured_gateway_target(
     monkeypatch: pytest.MonkeyPatch,
@@ -831,6 +928,335 @@ async def test_local_dispatch_parked_behind_external_turn_notifies_queued(
 
 
 @pytest.mark.asyncio
+async def test_mirrored_goal_turn_steers_exact_identity_then_race_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.repl import gateway_runtime
+
+    class _Subscription:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> dict[str, Any]:
+            item = await self.queue.get()
+            if item is None:
+                raise StopAsyncIteration
+            return item
+
+        async def close(self) -> None:
+            self.queue.put_nowait(None)
+
+    class _Client:
+        instances: list[_Client] = []
+
+        def __init__(self) -> None:
+            self.surface_id = "tui:local"
+            self.session_events = _Subscription()
+            self.turn_events: list[_Subscription] = []
+            self.steers: list[tuple[str, str, str]] = []
+            _Client.instances.append(self)
+
+        async def connect(self, url: str, *, token: str | None = None) -> None:
+            return None
+
+        async def create_session(self, model: str | None = None) -> str:
+            return "agent:main:goal-steer"
+
+        async def bootstrap_session(self, key: str, *, limit: int = 200) -> dict[str, Any]:
+            return {
+                "session": {"session_key": key, "model": "gateway/model"},
+                "history": {"messages": [], "history_scope": "complete"},
+                "stream_cursor": 7,
+            }
+
+        async def subscribe_session_events(
+            self,
+            key: str,
+            *,
+            since_stream_seq: int | None = None,
+        ) -> _Subscription:
+            assert key == "agent:main:goal-steer"
+            if not self.turn_events and since_stream_seq == 7:
+                return self.session_events
+            turn_events = _Subscription()
+            self.turn_events.append(turn_events)
+            return turn_events
+
+        async def steer_session(
+            self,
+            key: str,
+            message: str,
+            *,
+            expected_turn_id: str,
+        ) -> dict[str, Any]:
+            self.steers.append((key, message, expected_turn_id))
+            if message == "steer the active goal":
+                return {"accepted": True, "task_id": expected_turn_id}
+            return {
+                "accepted": False,
+                "failure_code": "ACTIVE_TURN_CHANGED",
+                "fallback_safe": True,
+            }
+
+        async def resolve_session(self, key: str) -> dict[str, str]:
+            return {"session_key": key, "model": "gateway/model"}
+
+        async def close(self) -> None:
+            return None
+
+    class _Output:
+        async def send_message(self, kind: str, payload: dict[str, object]) -> None:
+            return None
+
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    external_started = asyncio.Event()
+    release_external = asyncio.Event()
+    streamed: list[str] = []
+    notices: list[gateway_runtime.GatewayRuntimeNotice] = []
+
+    async def stream_response(
+        client: object,
+        session_key: str,
+        message: str,
+        elevated_state: dict[str, str | None] | None = None,
+        attachments: list[dict] | None = None,
+        *,
+        tui_output: object | None = None,
+    ) -> TurnResult:
+        del session_key, elevated_state, attachments, tui_output
+        streamed.append(message)
+        if client is not _Client.instances[-1]:
+            assert message == ""
+            external_started.set()
+            await release_external.wait()
+            return TurnResult(text="goal progress", model_after="gateway/model")
+        return TurnResult(text="ordinary reply", model_after="gateway/model")
+
+    async def input_loop(*, scope, dispatch, abort_active_turn=None) -> None:
+        del scope, abort_active_turn
+        client = _Client.instances[-1]
+        await client.session_events.queue.put(
+            {
+                "event": "session.event.text_delta",
+                "payload": {
+                    "session_key": "agent:main:goal-steer",
+                    "turn_id": "goal-turn-exact",
+                    "client_message_id": "goal-turn-exact",
+                    "surface_id": "goal:goal-exact",
+                    "input_mode": "system_event",
+                    "stream_seq": 8,
+                    "text": "working",
+                },
+            }
+        )
+        await asyncio.wait_for(external_started.wait(), timeout=2.0)
+
+        assert await dispatch("steer the active goal") is True
+        fallback = asyncio.create_task(dispatch("send after terminal race"))
+
+        async def both_steers_attempted() -> None:
+            while len(client.steers) < 2:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(both_steers_attempted(), timeout=2.0)
+        assert fallback.done() is False
+        assert streamed == [""]
+        release_external.set()
+        assert await asyncio.wait_for(fallback, timeout=2.0) is True
+
+    await gateway_runtime.run_gateway_chat(
+        model=None,
+        session_id=None,
+        deps=gateway_runtime.GatewayRuntimeDependencies(
+            stream_response=stream_response,
+            handle_slash_command=cast(Any, None),
+            run_input_loop=input_loop,
+            get_tui_output=lambda _scope: cast(Any, _Output()),
+            is_exit_command=lambda _value: False,
+            notify=notices.append,
+        ),
+    )
+
+    client = _Client.instances[-1]
+    assert client.steers == [
+        (
+            "agent:main:goal-steer",
+            "steer the active goal",
+            "goal-turn-exact",
+        ),
+        (
+            "agent:main:goal-steer",
+            "send after terminal race",
+            "goal-turn-exact",
+        ),
+    ]
+    assert streamed == ["", "send after terminal race"]
+    assert [notice.kind for notice in notices].count("queued_behind_external") == 1
+
+
+@pytest.mark.asyncio
+async def test_discovered_external_turn_is_steerable_before_projection_queue_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.repl import gateway_runtime
+
+    class _Subscription:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> dict[str, Any]:
+            item = await self.queue.get()
+            if item is None:
+                raise StopAsyncIteration
+            return item
+
+        async def close(self) -> None:
+            self.queue.put_nowait(None)
+
+    turn_subscription_started = asyncio.Event()
+    release_turn_subscription = asyncio.Event()
+    projected = asyncio.Event()
+
+    class _Client:
+        instances: list[_Client] = []
+
+        def __init__(self) -> None:
+            self.surface_id = "tui:local"
+            self.session_events = _Subscription()
+            self.subscription_calls = 0
+            self.steers: list[tuple[str, str, str]] = []
+            _Client.instances.append(self)
+
+        async def connect(self, url: str, *, token: str | None = None) -> None:
+            return None
+
+        async def create_session(self, model: str | None = None) -> str:
+            return "agent:main:discovery-steer"
+
+        async def bootstrap_session(self, key: str, *, limit: int = 200) -> dict[str, Any]:
+            return {
+                "session": {"session_key": key, "model": "gateway/model"},
+                "history": {"messages": [], "history_scope": "complete"},
+                "stream_cursor": 7,
+            }
+
+        async def subscribe_session_events(
+            self,
+            key: str,
+            *,
+            since_stream_seq: int | None = None,
+        ) -> _Subscription:
+            assert key == "agent:main:discovery-steer"
+            self.subscription_calls += 1
+            if self.subscription_calls == 1:
+                assert since_stream_seq == 7
+                return self.session_events
+            turn_subscription_started.set()
+            await release_turn_subscription.wait()
+            return _Subscription()
+
+        async def steer_session(
+            self,
+            key: str,
+            message: str,
+            *,
+            expected_turn_id: str,
+        ) -> dict[str, Any]:
+            self.steers.append((key, message, expected_turn_id))
+            return {"accepted": True, "task_id": expected_turn_id}
+
+        async def close(self) -> None:
+            return None
+
+    class _Output:
+        async def send_message(self, kind: str, payload: dict[str, object]) -> None:
+            return None
+
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    local_streams: list[str] = []
+
+    async def stream_response(
+        client: object,
+        session_key: str,
+        message: str,
+        elevated_state: dict[str, str | None] | None = None,
+        attachments: list[dict] | None = None,
+        *,
+        tui_output: object | None = None,
+    ) -> TurnResult:
+        del session_key, elevated_state, attachments, tui_output
+        if client is _Client.instances[-1]:
+            local_streams.append(message)
+            return TurnResult(text="unexpected local reply", model_after="gateway/model")
+        projected.set()
+        return TurnResult(text="external reply", model_after="gateway/model")
+
+    async def input_loop(
+        *,
+        scope,
+        dispatch,
+        abort_active_turn=None,
+        steer_active_turn=None,
+    ) -> None:
+        del scope, abort_active_turn
+        client = _Client.instances[-1]
+        await client.session_events.queue.put(
+            {
+                "event": "session.event.text_delta",
+                "payload": {
+                    "session_key": "agent:main:discovery-steer",
+                    "turn_id": "goal-turn-before-queue",
+                    "client_message_id": "goal-turn-before-queue",
+                    "surface_id": "goal:goal-before-queue",
+                    "input_mode": "system_event",
+                    "stream_seq": 8,
+                    "text": "working",
+                },
+            }
+        )
+        # The discovery coroutine has published the identity, but is stalled
+        # before it can enqueue the projection for the renderer.
+        await asyncio.wait_for(turn_subscription_started.wait(), timeout=2.0)
+        assert steer_active_turn is not None
+        assert await steer_active_turn("steer through active-input callback") is True
+        assert await dispatch("steer before renderer dequeue") is True
+        assert client.steers == [
+            (
+                "agent:main:discovery-steer",
+                "steer through active-input callback",
+                "goal-turn-before-queue",
+            ),
+            (
+                "agent:main:discovery-steer",
+                "steer before renderer dequeue",
+                "goal-turn-before-queue",
+            ),
+        ]
+        assert local_streams == []
+        release_turn_subscription.set()
+        await asyncio.wait_for(projected.wait(), timeout=2.0)
+
+    await gateway_runtime.run_gateway_chat(
+        model=None,
+        session_id=None,
+        deps=gateway_runtime.GatewayRuntimeDependencies(
+            stream_response=stream_response,
+            handle_slash_command=cast(Any, None),
+            run_input_loop=input_loop,
+            get_tui_output=lambda _scope: cast(Any, _Output()),
+            is_exit_command=lambda _value: False,
+            notify=lambda _notice: None,
+        ),
+    )
+
+
+@pytest.mark.asyncio
 async def test_local_dispatch_with_idle_external_turns_emits_no_queued_notice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -893,6 +1319,104 @@ async def test_local_dispatch_with_idle_external_turns_emits_no_queued_notice(
     )
 
     assert not any(notice.kind == "queued_behind_external" for notice in notices)
+
+
+@pytest.mark.asyncio
+async def test_terminal_race_steer_false_falls_back_to_normal_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.repl import gateway_runtime
+
+    class _Client:
+        instances: list[_Client] = []
+
+        def __init__(self) -> None:
+            self.steers: list[tuple[str, str]] = []
+            _Client.instances.append(self)
+
+        async def connect(self, url: str, *, token: str | None = None) -> None:
+            return None
+
+        async def create_session(self, model: str | None = None) -> str:
+            return "agent:main:steer-race"
+
+        async def bootstrap_session(self, key: str, *, limit: int = 200) -> dict[str, Any]:
+            return {
+                "session": {"session_key": key, "model": "gateway/model"},
+                "history": {"messages": [], "history_scope": "complete"},
+                "queue": {"running_count": 0, "queued_count": 0},
+            }
+
+        async def steer_session(self, key: str, message: str) -> dict[str, Any]:
+            self.steers.append((key, message))
+            return {
+                "accepted": False,
+                "failure_code": "ACTIVE_TURN_CHANGED",
+                "fallback_safe": True,
+            }
+
+        async def close(self) -> None:
+            return None
+
+    class _Output:
+        async def send_message(self, kind: str, payload: dict[str, object]) -> None:
+            return None
+
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _Client)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    streamed: list[str] = []
+
+    async def stream_response(
+        client: object,
+        session_key: str,
+        message: str,
+        elevated_state: dict[str, str | None] | None = None,
+        attachments: list[dict] | None = None,
+        *,
+        tui_output: object | None = None,
+    ) -> TurnResult:
+        del client, session_key, elevated_state, attachments, tui_output
+        streamed.append(message)
+        if message == "first":
+            first_started.set()
+            await release_first.wait()
+        return TurnResult(text=f"answer:{message}", model_after="gateway/model")
+
+    async def input_loop(
+        *,
+        scope: object,
+        dispatch: Any,
+        abort_active_turn: Any = None,
+        steer_active_turn: Any = None,
+    ) -> None:
+        del scope, abort_active_turn
+        assert steer_active_turn is not None
+        first = asyncio.create_task(dispatch("first"))
+        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+        # The Gateway observed the old turn as terminal before the local stream
+        # finalizer ran. False is the safe handoff to the ordinary send path.
+        assert await steer_active_turn("run next") is False
+        release_first.set()
+        assert await asyncio.wait_for(first, timeout=2.0) is True
+        assert await dispatch("run next") is True
+
+    await gateway_runtime.run_gateway_chat(
+        model=None,
+        session_id=None,
+        deps=gateway_runtime.GatewayRuntimeDependencies(
+            stream_response=stream_response,
+            handle_slash_command=cast(Any, None),
+            run_input_loop=input_loop,
+            get_tui_output=lambda _scope: cast(Any, _Output()),
+            is_exit_command=lambda _value: False,
+            notify=lambda _notice: None,
+        ),
+    )
+
+    client = _Client.instances[-1]
+    assert client.steers == [("agent:main:steer-race", "run next")]
+    assert streamed == ["first", "run next"]
 
 
 @pytest.mark.asyncio
@@ -1156,6 +1680,132 @@ async def test_external_turn_discovery_routes_interleaved_turns_once(
         "turn-a",
         "turn-b",
     }
+
+    mirror.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await mirror
+    await discovery.close()
+
+
+@pytest.mark.asyncio
+async def test_goal_system_event_mirror_has_no_fake_user_prompt_and_dedupes_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.gateway_client import GatewayClient
+    from opensquilla.cli.repl import gateway_runtime
+
+    session_key = "agent:main:goal"
+    client = GatewayClient()
+    bootstrap_calls = 0
+
+    async def call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        nonlocal bootstrap_calls
+        if method == "sessions.messages.subscribe":
+            return {"replay_complete": True, "current_stream_seq": 0}
+        if method == "sessions.bootstrap":
+            bootstrap_calls += 1
+            return {"history": {"messages": []}}
+        return {}
+
+    monkeypatch.setattr(client, "_call", call)
+    discovery = await client.subscribe_session_events(session_key)
+    state = ChatSessionState(session_key=session_key, model="gateway/model")
+    context = gateway_runtime.GatewaySessionContext.create(state)
+
+    class _Output:
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, dict[str, object]]] = []
+
+        async def send_message(self, kind: str, payload: dict[str, object]) -> None:
+            self.messages.append((kind, payload))
+
+    output = _Output()
+    projected = asyncio.Event()
+    stream_messages: list[str] = []
+    captured_events: list[dict[str, Any]] = []
+    stream_calls = 0
+
+    async def stream_response(
+        turn_client: object,
+        key: str,
+        message: str,
+        elevated_state: dict[str, str | None] | None = None,
+        attachments: list[dict] | None = None,
+        *,
+        tui_output: object | None = None,
+    ) -> TurnResult:
+        nonlocal stream_calls
+        del elevated_state, attachments, tui_output
+        stream_calls += 1
+        stream_messages.append(message)
+        captured_events.extend(
+            [event async for event in turn_client.send_message(key, message)]
+        )
+        projected.set()
+        return TurnResult(text="automatic goal progress", model_after="gateway/model")
+
+    local_idle = asyncio.Event()
+    local_idle.set()
+    external_idle = asyncio.Event()
+    external_idle.set()
+    mirror = asyncio.create_task(
+        gateway_runtime._mirror_external_turns(
+            discovery,
+            client=client,
+            session_key=session_key,
+            session_context=context,
+            deps=gateway_runtime.GatewayRuntimeDependencies(
+                stream_response=stream_response,
+                handle_slash_command=cast(Any, None),
+                run_input_loop=cast(Any, None),
+                get_tui_output=lambda _scope: cast(Any, output),
+                is_exit_command=lambda _value: False,
+                notify=lambda _notice: None,
+            ),
+            elevated_state={"mode": None},
+            local_turn_idle=local_idle,
+            external_turn_idle=external_idle,
+        )
+    )
+    identity = {
+        "session_key": session_key,
+        "turn_id": "goal-turn-1",
+        "client_message_id": "goal-turn-1",
+        "surface_id": "goal:goal-1",
+        "input_mode": "system_event",
+    }
+    for seq, event, text in (
+        (1, "session.event.text_delta", "automatic "),
+        (2, "session.event.text_delta", "goal progress"),
+        (3, "session.event.done", ""),
+    ):
+        client._publish_event(  # noqa: SLF001
+            {
+                "type": "event",
+                "event": event,
+                "payload": {**identity, "stream_seq": seq, "text": text},
+            }
+        )
+
+    await asyncio.wait_for(projected.wait(), timeout=2.0)
+    for _ in range(100):
+        if context.state.transcript.turns:
+            break
+        await asyncio.sleep(0)
+
+    assert stream_calls == 1
+    assert stream_messages == [""]
+    assert [event["event"] for event in captured_events] == [
+        "session.event.text_delta",
+        "session.event.text_delta",
+        "session.event.done",
+    ]
+    assert bootstrap_calls == 0
+    assert not any(kind == "prompt.echo" for kind, _payload in output.messages)
+    assert [(turn.role, turn.content) for turn in context.state.transcript.turns] == [
+        ("assistant", "automatic goal progress")
+    ]
+    assert "Message from goal:" not in context.state.transcript.to_markdown()
 
     mirror.cancel()
     with pytest.raises(asyncio.CancelledError):

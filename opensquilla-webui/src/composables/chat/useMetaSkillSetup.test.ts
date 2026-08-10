@@ -1658,6 +1658,39 @@ describe('useMetaSkillSetup', () => {
     api.dispose()
   })
 
+  it('drops a delayed persisted-job result after the user switches sessions', async () => {
+    let resolveStatus: ((value: unknown) => void) | undefined
+    const status = new Promise(resolve => { resolveStatus = resolve })
+    const storage = memoryStorage({
+      [metaSetupStorageKey(SESSION)]: 'job-1',
+    })
+    const call = vi.fn(async (method: string) => {
+      if (method === 'meta.setup.status') return status
+      throw new Error(`Unexpected RPC: ${method}`)
+    })
+    const { api, currentSessionKey, dispatchHidden } = harness(call, {
+      autoRestore: false,
+      storage,
+    })
+
+    const request = api.requestSetup('meta-paper-write', readiness(), SESSION)
+    await flushPromises()
+    expect(api.setupState.value).toBeNull()
+
+    currentSessionKey.value = 'agent:main:webchat:goal-session'
+    await flushPromises()
+    resolveStatus?.({ job: job() })
+    expect(await request).toBe('deferred')
+    await flushPromises()
+
+    expect(api.setupState.value).toBeNull()
+    expect(dispatchHidden).not.toHaveBeenCalled()
+    expect(storage.getItem(metaSetupStorageKey(SESSION))).toBe('job-1')
+    await vi.advanceTimersByTimeAsync(750)
+    expect(call.mock.calls.filter(([method]) => method === 'meta.setup.status')).toHaveLength(1)
+    api.dispose()
+  })
+
   it('never resumes into a session that is no longer current', async () => {
     const call = vi.fn(async (method: string) => {
       if (method === 'meta.setup.install') return { job: job() }

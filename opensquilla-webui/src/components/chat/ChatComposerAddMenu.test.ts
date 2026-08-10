@@ -1,9 +1,16 @@
 // @vitest-environment happy-dom
+import { readFileSync } from 'node:fs'
 import { createApp, h, nextTick } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import ChatComposerAddMenu from './ChatComposerAddMenu.vue'
+import addMenuSource from './ChatComposerAddMenu.vue?raw'
+
+const chatViewStyles = readFileSync(
+  'src/styles/chat-view.css',
+  'utf8',
+)
 
 const mountedApps: ReturnType<typeof createApp>[] = []
 const i18n = createI18n({
@@ -19,6 +26,12 @@ const i18n = createI18n({
           readOnly: 'Read-only planning',
           turnOn: 'Turn plan mode on',
         },
+        goal: {
+          modeLabel: 'Goal mode',
+          modeReady: 'Ready for a goal',
+          modeDescription: 'Start a long-running goal',
+          activeTitle: 'Goal in progress',
+        },
       },
     },
   },
@@ -27,16 +40,22 @@ const i18n = createI18n({
 function mountMenu(overrides: Record<string, unknown> = {}) {
   const attachFiles = vi.fn()
   const activatePlanMode = vi.fn()
+  const activateGoalMode = vi.fn()
   const close = vi.fn()
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp({
     render: () => h(ChatComposerAddMenu, {
       attachmentsDisabled: false,
+      goalModeActive: false,
+      goalModeAvailable: true,
+      goalModeBusy: false,
+      goalModeExisting: false,
       planModeActive: false,
       planModeAvailable: true,
       planModeBusy: false,
       onActivatePlanMode: activatePlanMode,
+      onActivateGoalMode: activateGoalMode,
       onAttachFiles: attachFiles,
       onClose: close,
       ...overrides,
@@ -45,7 +64,7 @@ function mountMenu(overrides: Record<string, unknown> = {}) {
   mountedApps.push(app)
   app.use(i18n)
   app.mount(host)
-  return { activatePlanMode, attachFiles, close, host }
+  return { activateGoalMode, activatePlanMode, attachFiles, close, host }
 }
 
 afterEach(() => {
@@ -54,19 +73,33 @@ afterEach(() => {
 })
 
 describe('ChatComposerAddMenu', () => {
-  it('offers file attachment and an on-demand Plan mode entry', async () => {
-    const { activatePlanMode, attachFiles, close, host } = mountMenu()
+  it('escapes the Composer stacking context and renders above Goal progress', () => {
+    expect(chatViewStyles).toContain('.chat-composer-dock > .chat-composer')
+    expect(chatViewStyles).toContain('z-index: auto')
+    expect(chatViewStyles).toContain('.goal-run-dock')
+    expect(chatViewStyles).toContain('z-index: 3')
+    expect(addMenuSource).toContain('.composer-add-menu')
+    expect(addMenuSource).toContain('z-index: 30')
+  })
+
+  it('offers file attachment plus on-demand Plan and Goal mode entries', async () => {
+    const { activateGoalMode, activatePlanMode, attachFiles, close, host } = mountMenu()
     await nextTick()
 
     const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
     expect(items.map(item => item.textContent?.trim())).toEqual([
       'Attach files',
       'Plan modeTurn plan mode on',
+      'Goal modeStart a long-running goal',
     ])
 
     items[1].click()
     expect(activatePlanMode).toHaveBeenCalledOnce()
     expect(close).toHaveBeenCalledOnce()
+
+    items[2].click()
+    expect(activateGoalMode).toHaveBeenCalledOnce()
+    expect(close).toHaveBeenCalledTimes(2)
 
     items[0].click()
     expect(attachFiles).toHaveBeenCalledOnce()
@@ -86,7 +119,25 @@ describe('ChatComposerAddMenu', () => {
     const { host } = mountMenu({ planModeAvailable: false })
     await nextTick()
 
-    expect(host.querySelectorAll('[role="menuitem"]')).toHaveLength(1)
+    expect(host.querySelectorAll('[role="menuitem"]')).toHaveLength(2)
     expect(host.textContent).not.toContain('Plan mode')
+  })
+
+  it('hides Goal mode for gateways without the Goal RPC contract', async () => {
+    const { host } = mountMenu({ goalModeAvailable: false })
+    await nextTick()
+
+    expect(host.querySelectorAll('[role="menuitem"]')).toHaveLength(2)
+    expect(host.textContent).not.toContain('Goal mode')
+  })
+
+  it('does not allow Goal draft mode to overwrite an unfinished Goal', async () => {
+    const { host } = mountMenu({ goalModeExisting: true })
+    await nextTick()
+
+    const goalItem = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(item => item.textContent?.includes('Goal mode'))
+    expect(goalItem?.disabled).toBe(true)
+    expect(goalItem?.textContent).toContain('Goal in progress')
   })
 })

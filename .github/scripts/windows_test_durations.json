@@ -1268,6 +1268,14 @@
     "tests/test_sandbox/test_destructive_backup.py": 0.01,
     "tests/test_session/test_runtime_preferences.py": 0.01,
     "tests/test_thinking_level_propagation.py": 0.01,
-    "tests/test_tools/test_filesystem_destructive_backup.py": 0.01
+    "tests/test_tools/test_filesystem_destructive_backup.py": 0.01,
+    "tests/test_engine/test_goal_context_prompt.py": 0.01,
+    "tests/test_engine/test_goal_routing_hint.py": 0.01,
+    "tests/test_gateway/test_goal_registry_cleanup.py": 0.01,
+    "tests/test_gateway/test_goal_rpc.py": 0.01,
+    "tests/test_migrations/test_v033_goal_runs.py": 0.01,
+    "tests/test_migrations/test_v034_goal_message_anchor.py": 0.01,
+    "tests/test_session/test_goal_storage.py": 0.01,
+    "tests/test_session/test_goals.py": 0.01
   }
 }

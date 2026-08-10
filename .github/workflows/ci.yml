@@ -257,9 +257,14 @@ jobs:
         working-directory: opensquilla-webui
         run: npx playwright install --with-deps chromium
 
-      - name: Run production-dist chat recovery browser contract
+      - name: Run production-dist chat and Goal recovery browser contracts
         working-directory: opensquilla-webui
-        run: npm run test:e2e -- history-hydration.spec.ts --project=chromium --workers=1
+        run: >-
+          npm run test:e2e --
+          history-hydration.spec.ts
+          goal-mode.spec.ts
+          --project=chromium
+          --workers=1
 
       - name: Upload chat recovery traces
         if: ${{ failure() }}
