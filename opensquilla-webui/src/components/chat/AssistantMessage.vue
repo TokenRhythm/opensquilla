@@ -403,7 +403,7 @@ const props = defineProps<{
   sessionKey?: string
   authToken?: string
   workbenchEnabled?: boolean
-  /** True on the thread's last assistant message — the only place the whole-conversation fork action renders. */
+  /** True for a durable completed turn tip, or the legacy current-tip fallback. */
   isTip?: boolean
   forkBusy?: boolean
   planActionPending?: PlanCardAction | null
@@ -455,7 +455,7 @@ function onFeedbackClick(rating: 'up' | 'down') {
 const now = useRelativeNow()
 const timeIso = computed(() => isoTime(props.message.ts))
 const timeAbs = computed(() => absoluteTime(props.message.ts))
-const timeRel = computed(() => relativeTime(props.message.ts, now.value))
+const timeRel = computed(() => relativeTime(props.message.ts, now.value, t))
 const timeFull = computed(() => fullTime(props.message.ts))
 
 // Reasoning still comes from the normalized parts surface. The visible answer

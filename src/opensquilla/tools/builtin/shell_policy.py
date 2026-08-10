@@ -13,7 +13,9 @@ DEFAULT_DENYLIST: list[str] = [
     r"dd\s+if=",  # raw disk writes
     r"shutdown\b",  # system shutdown
     r"reboot\b",  # system reboot
-    r"halt\b",  # system halt
+    # Match the executable token, but not benign option names such as
+    # XeLaTeX's ``-halt-on-error``.
+    r"(?<!-)\bhalt\b",  # system halt
     r":\(\)\s*\{.*:\|:.*\}",  # fork bomb
     r">\s*/dev/sda",  # overwrite block device
     r"chmod\s+-R\s+777\s+/",  # world-writable root

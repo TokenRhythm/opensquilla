@@ -370,6 +370,35 @@ def test_meta_paper_write_declares_pdf_compile_binaries() -> None:
     assert own_requirements["requires_bins"] == ["xelatex", "bibtex"]
 
 
+def test_meta_payload_marks_only_trusted_provider_backed_plans_for_launch_check() -> None:
+    bundled = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "opensquilla"
+        / "skills"
+        / "bundled"
+    )
+    loader = SkillLoader(bundled_dir=bundled)
+    skills = loader.load_all()
+    skill_index = {skill.name: skill for skill in skills}
+    ctx = rpc_skills.EligibilityContext.auto()
+
+    def payload(name: str) -> dict[str, object]:
+        spec = skill_index[name]
+        return rpc_skills._skill_to_dict(
+            spec,
+            rpc_skills.diagnose_eligibility(spec, ctx),
+            ctx.os_name,
+            skill_index=skill_index,
+            eligibility_ctx=ctx,
+        )
+
+    assert payload("meta-short-drama")["provider_check_at_launch"] is True
+    assert payload("AwesomeWebpageMetaSkill")["provider_check_at_launch"] is True
+    assert payload("meta-paper-write")["provider_check_at_launch"] is False
+    assert payload("meta-skill-creator")["provider_check_at_launch"] is False
+
+
 @pytest.mark.asyncio
 async def test_rpc_skills_list_exposes_meta_skill_dependency_rollup(
     tmp_path: Path,

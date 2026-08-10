@@ -2282,6 +2282,31 @@ def test_desktop_second_launch_retries_lock_and_logs_instead_of_silent_quit() ->
     assert "showErrorBox" in giveup
 
 
+def test_desktop_renderer_logging_is_trusted_bounded_and_lifecycle_aware() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    renderer_log = _read("desktop/electron/src/desktop-renderer-log.ts")
+    log_file = _read("desktop/electron/src/desktop-log-file.ts")
+    create_window = _section(
+        main_ts,
+        "async function createMainWindow(): Promise<BrowserWindow>",
+        "async function loadControlUi",
+    )
+
+    assert "details.frame !== window.webContents.mainFrame" in create_window
+    assert "new RendererConsoleLogLimiter()" in create_window
+    assert "app.getPath('home')" in create_window
+    assert "webContents.on('render-process-gone'" in create_window
+    assert "webContents.on('unresponsive'" in create_window
+    assert "webContents.on('responsive'" in create_window
+    assert "'error'" in renderer_log
+    assert "'warning'," not in renderer_log
+    assert "renderer_console_suppressed" in renderer_log
+    assert "redactRendererLogText" in renderer_log
+    assert "DESKTOP_LOG_MAX_BYTES" in log_file
+    assert "DESKTOP_LOG_BACKUP_COUNT" in log_file
+    assert "appendDesktopLogRecord" in main_ts
+
+
 def test_desktop_quit_drains_gateway_before_exit_on_every_platform() -> None:
     # The daily close path on every platform must wait for the owned gateway's
     # graceful drain. Otherwise Electron can exit first and leave the gateway

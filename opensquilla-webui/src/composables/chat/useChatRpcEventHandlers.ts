@@ -24,6 +24,10 @@ import type {
   WarningPayload,
 } from '@/types/rpc'
 import type { ChatRpcSubscriptionHandlers } from '@/composables/chat/useChatRpcSubscriptions'
+import {
+  isAuthoritativeSessionSubscription,
+  type SessionSubscriptionOutcome,
+} from '@/composables/chat/useChatSessionSubscription'
 import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
 import type { FrameInput } from '@/types/turnlog'
 import type { StatusPart } from '@/types/parts'
@@ -122,7 +126,14 @@ export interface UseChatRpcEventHandlersOptions {
   popAllPendingIntoComposer: () => boolean
   restoreSteerIntoComposer?: (text: string) => void
   saveWidgetState: () => void
-  handleSessionConnectionState: (state: string) => SessionBootstrapRun | undefined
+  subscribeSession?: () =>
+    | boolean
+    | void
+    | SessionSubscriptionOutcome
+    | Promise<boolean | void | SessionSubscriptionOutcome>
+  onSessionSubscribed?: () => void | Promise<void>
+  loadHistory?: () => void
+  handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void
   refreshRunModePreference?: () => void | Promise<void>
 }
@@ -1464,10 +1475,23 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function handleRpcConnectionState(state: string) {
     const stateGeneration = ++connectionStateGeneration
-    const recovery = options.handleSessionConnectionState(state)
+    const recovery = options.handleSessionConnectionState?.(state)
     if (state === 'connected') {
       clearConnectionLostStatus()
       stream.hideThinkingIndicator()
+      const subscription = recovery?.live ?? options.subscribeSession?.()
+      void Promise.resolve(subscription)
+        .then((subscribed) => {
+          if (isAuthoritativeSessionSubscription(subscribed)) {
+            return options.onSessionSubscribed?.()
+          }
+        })
+        .catch((error: unknown) => {
+          console.warn(
+            'Session recovery after reconnect failed:',
+            error instanceof Error ? error.message : error,
+          )
+        })
       if (sessionKey.value) {
         const connectedSessionKey = sessionKey.value
         // Preserve critical frame ordering after reconnect without waiting for a
@@ -1483,6 +1507,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
             void options.refreshRunModePreference?.()
           }
         })
+      }
+      if (!recovery) {
+        options.loadCurrentSessionUsage()
+        options.loadHistory?.()
       }
       if (stream.isStreaming.value) stream.resetStreamIdleTimer()
     }

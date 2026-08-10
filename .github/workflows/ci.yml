@@ -35,6 +35,7 @@ jobs:
       python_changed: ${{ steps.classify.outputs.python_changed }}
       platform_sensitive_changed: ${{ steps.classify.outputs.platform_sensitive_changed }}
       build_wheel_required: ${{ steps.classify.outputs.build_wheel_required }}
+      toolchain_artifact_changed: ${{ steps.classify.outputs.toolchain_artifact_changed }}
       full_required: ${{ steps.classify.outputs.full_required }}
     steps:
       - name: Check out repository
@@ -360,6 +361,7 @@ jobs:
           node scripts/test-desktop-window-lifecycle.mjs
           node scripts/test-bundled-runtimes.mjs
           node scripts/test-desktop-cleanup-contract.mjs
+          node scripts/test-desktop-renderer-log.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
           node ../../.github/scripts/verify-sandbox-package.mjs --source
@@ -872,13 +874,28 @@ jobs:
           retention-days: 14
 
   desktop-recovery-e2e:
-    name: Desktop recovery E2E (${{ matrix.os }})
+    # Windows hosted runners can retain Chromium network resources briefly
+    # after a heavy Electron test process exits.  Run the independent recovery
+    # groups on fresh Windows runners so an earlier test cannot starve a later
+    # one of local socket buffers. Linux and macOS retain the full serial
+    # contract, which is useful for their native recovery coverage.
+    name: Desktop recovery E2E (${{ matrix.os }}, ${{ matrix.shard }})
     needs: [classify-changes, frontend-check]
     if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            shard: all
+          - os: macos-latest
+            shard: all
+          - os: windows-latest
+            shard: profiles
+          - os: windows-latest
+            shard: ownership
+          - os: windows-latest
+            shard: workbench
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
 
@@ -1009,18 +1026,52 @@ jobs:
             fi
           }
 
-          for entry in \
-            'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs' \
-            'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs' \
-            'profile-import-flow:scripts/test-profile-import-flow.mjs' \
-            'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs' \
-            'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs' \
-            'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
-            'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
-            'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs' \
-            'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs' \
-            'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs' \
-            'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
+          case "${{ matrix.shard }}" in
+            all)
+              entries=(
+                'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
+                'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
+                'profile-import-flow:scripts/test-profile-import-flow.mjs'
+                'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
+                'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
+                'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
+                'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
+                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
+              )
+              ;;
+            profiles)
+              entries=(
+                'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
+                'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
+                'profile-import-flow:scripts/test-profile-import-flow.mjs'
+                'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
+              )
+              ;;
+            ownership)
+              entries=(
+                'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
+                'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
+                'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+              )
+              ;;
+            workbench)
+              entries=(
+                'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
+                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
+              )
+              ;;
+            *)
+              echo "ERROR: unknown Desktop recovery E2E shard: ${{ matrix.shard }}" >&2
+              exit 2
+              ;;
+          esac
+
+          for entry in "${entries[@]}"
           do
             name="${entry%%:*}"
             script="${entry#*:}"
@@ -1035,7 +1086,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-recovery-e2e-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          name: desktop-recovery-e2e-${{ matrix.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/desktop-recovery-e2e
           if-no-files-found: error
           retention-days: 14
@@ -1101,6 +1152,12 @@ jobs:
         working-directory: opensquilla-webui
         run: node scripts/check-readme-locales.mjs
 
+  managed-toolchain-artifacts:
+    name: Managed Toolchain Artifact E2E
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.toolchain_artifact_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    uses: ./.github/workflows/managed-toolchain-artifacts.yml
+
   ci-result:
     name: CI result
     needs:
@@ -1118,6 +1175,7 @@ jobs:
       - macos-recovery
       - desktop-recovery-e2e
       - release-packaging
+      - managed-toolchain-artifacts
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1163,6 +1221,7 @@ jobs:
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
           RESULT_RELEASE: ${{ needs.release-packaging.result }}
+          RESULT_MANAGED_TOOLCHAIN_ARTIFACTS: ${{ needs.managed-toolchain-artifacts.result }}
           FLAG_DOCS_ONLY: ${{ needs.classify-changes.outputs.docs_only }}
           FLAG_RUNTIME_CHANGED: ${{ needs.classify-changes.outputs.runtime_changed }}
           FLAG_TEST_CHANGED: ${{ needs.classify-changes.outputs.test_changed }}
@@ -1176,5 +1235,6 @@ jobs:
           FLAG_PYTHON_CHANGED: ${{ needs.classify-changes.outputs.python_changed }}
           FLAG_PLATFORM_SENSITIVE_CHANGED: ${{ needs.classify-changes.outputs.platform_sensitive_changed }}
           FLAG_BUILD_WHEEL_REQUIRED: ${{ needs.classify-changes.outputs.build_wheel_required }}
+          FLAG_TOOLCHAIN_ARTIFACT_CHANGED: ${{ needs.classify-changes.outputs.toolchain_artifact_changed }}
           FLAG_FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
         run: python .github/scripts/check_ci_results.py

@@ -779,6 +779,29 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
     0 18px 42px -26px color-mix(in srgb, var(--text) 34%, transparent);
 }
 
+/* Only the opted-in conversation composer is translucent. Landing and other
+   ChatComposer consumers retain the established opaque surface. */
+#app .chat .chat-composer--floating .chat-input-panel {
+  background: color-mix(in srgb, var(--bg-surface) 72%, transparent);
+}
+
+#app .chat .chat-composer--floating .chat-input-panel:focus-within {
+  background: color-mix(in srgb, var(--bg-surface) 85%, transparent);
+}
+
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  #app .chat .chat-composer--floating .chat-input-panel {
+    background: var(--bg-surface);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  #app .chat .chat-composer--floating .chat-input-panel,
+  #app .chat .chat-composer--floating .chat-input-panel:focus-within {
+    background: var(--bg-surface);
+  }
+}
+
 #app .chat .chat-textarea,
 #app .chat .chat-textarea:focus {
   background: transparent;

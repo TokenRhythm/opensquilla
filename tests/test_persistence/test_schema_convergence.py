@@ -31,6 +31,9 @@ TABLES = (
     "usage_billing_receipt_state",
     "usage_ledger_state",
     "usage_legacy_baselines",
+    "meta_control_intents",
+    "meta_launch_drafts",
+    "meta_launch_discard_tombstones",
     "plan_revisions",
     "plan_runs",
 )

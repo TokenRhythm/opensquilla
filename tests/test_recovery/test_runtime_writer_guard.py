@@ -43,6 +43,46 @@ def _hold_runtime_writer(
         raise
 
 
+def _hold_isolated_runtime_writer(
+    home: str,
+    gateway_state: str,
+    user_state: str,
+    cwd: str,
+    label: str,
+    ready: Any,
+    release: Any,
+) -> None:
+    """Resolve child-local state and hold its universal writer lease."""
+
+    os.environ["OPENSQUILLA_STATE_DIR"] = home
+    os.environ["OPENSQUILLA_GATEWAY_STATE_DIR"] = gateway_state
+    os.environ["OPENSQUILLA_USER_STATE_DIR"] = user_state
+    os.environ["OPENSQUILLA_TEST_PROFILE_LOCK_ROOT"] = "1"
+    os.environ.pop("OPENSQUILLA_GATEWAY_CONFIG_PATH", None)
+    os.environ.pop("OPENSQUILLA_PROFILE_KIND", None)
+    os.environ.pop("OPENSQUILLA_DESKTOP", None)
+    os.chdir(cwd)
+
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.recovery import guarded_desktop_profile
+
+    try:
+        config = GatewayConfig.load()
+        with guarded_desktop_profile(Path(home)):
+            ready.put(
+                {
+                    "label": label,
+                    "home": home,
+                    "state_dir": config.state_dir,
+                }
+            )
+            if not release.wait(timeout=15):
+                raise TimeoutError("test did not release the isolated runtime writer")
+    except BaseException as exc:
+        ready.put({"label": label, "error": f"{type(exc).__name__}:{exc}"})
+        raise
+
+
 def _profile(home: Path) -> None:
     workspace = home / "workspace"
     workspace.mkdir(parents=True)
@@ -229,3 +269,68 @@ def test_runtime_writer_lock_keeps_read_only_cli_available_and_rejects_agent(
             writer.join(timeout=5)
 
     assert writer.exitcode == 0
+
+
+def test_distinct_profile_and_gateway_state_dirs_run_concurrently_across_processes(
+    tmp_path: Path,
+) -> None:
+    """Per-child home and gateway-state overrides bypass a shared cwd state path."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "opensquilla.toml").write_text(
+        'state_dir = "shared-state"\n',
+        encoding="utf-8",
+    )
+    user_state = tmp_path / "user-state"
+    profiles = {
+        "a": (tmp_path / "profile-a", tmp_path / "profile-a" / "state"),
+        "b": (tmp_path / "profile-b", tmp_path / "profile-b" / "state"),
+    }
+    context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
+    ready = context.Queue()
+    release = context.Event()
+    writers = [
+        context.Process(
+            target=_hold_isolated_runtime_writer,
+            args=(
+                str(home),
+                str(gateway_state),
+                str(user_state),
+                str(project),
+                label,
+                ready,
+                release,
+            ),
+        )
+        for label, (home, gateway_state) in profiles.items()
+    ]
+
+    for writer in writers:
+        writer.start()
+
+    try:
+        resolved = [ready.get(timeout=15), ready.get(timeout=15)]
+        assert all("error" not in result for result in resolved), resolved
+        assert {result["label"] for result in resolved} == set(profiles)
+        assert {
+            result["label"]: Path(result["state_dir"])
+            for result in resolved
+        } == {
+            label: gateway_state
+            for label, (_home, gateway_state) in profiles.items()
+        }
+        assert all(writer.is_alive() for writer in writers)
+        assert project / "shared-state" not in {
+            Path(result["state_dir"])
+            for result in resolved
+        }
+    finally:
+        release.set()
+        for writer in writers:
+            writer.join(timeout=10)
+            if writer.is_alive():
+                writer.terminate()
+                writer.join(timeout=5)
+
+    assert [writer.exitcode for writer in writers] == [0, 0]

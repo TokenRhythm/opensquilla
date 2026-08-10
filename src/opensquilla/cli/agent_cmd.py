@@ -17,6 +17,7 @@ from rich.panel import Panel
 from rich.text import Text
 from typer.models import OptionInfo
 
+from opensquilla.cli.agent_event_stream import AgentEventSink, StderrAgentEventSink
 from opensquilla.cli.attachments import attachments_from_paths
 from opensquilla.cli.ui import console
 
@@ -135,6 +136,7 @@ async def run_agent_once(
     length_capped_continuations: int | None = None,
     transcript_path: str | None = None,
     usage_path: str | None = None,
+    event_sink: AgentEventSink | None = None,
     config: Any | None = None,
     session_db_path: str = ":memory:",
     no_memory_capture: bool = False,
@@ -391,6 +393,9 @@ async def run_agent_once(
             attachments=run_attachments,
             bootstrap_context_mode=bootstrap_context_mode,
         ):
+            if event_sink is not None:
+                event_sink(event)
+
             if isinstance(event, TextDeltaEvent):
                 text_parts.append(event.text)
             elif isinstance(event, ErrorEvent):
@@ -852,6 +857,11 @@ def run_agent_command(
         "", "--transcript-path", help="Write benchmark-compatible JSONL transcript"
     ),
     usage_path: str = typer.Option("", "--usage-path", help="Write usage JSON to this file"),
+    event_stream_stderr: bool = typer.Option(
+        False,
+        "--event-stream-stderr",
+        help="Write stable v1 progress event JSONL to stderr",
+    ),
     session_db_path: str = typer.Option(
         ":memory:",
         "--session-db-path",
@@ -921,6 +931,7 @@ def run_agent_command(
     thinking = _unwrap_typer_default(thinking)
     transcript_path = _unwrap_typer_default(transcript_path)
     usage_path = _unwrap_typer_default(usage_path)
+    event_stream_stderr = _unwrap_typer_default(event_stream_stderr)
     session_db_path = _unwrap_typer_default(session_db_path)
     no_memory_capture = _unwrap_typer_default(no_memory_capture)
     file_paths = _unwrap_typer_default(file_paths)
@@ -953,6 +964,7 @@ def run_agent_command(
             length_capped_continuations=length_capped_continuations,
             transcript_path=transcript_path or None,
             usage_path=usage_path or None,
+            event_sink=StderrAgentEventSink() if event_stream_stderr else None,
             session_db_path=session_db_path,
             no_memory_capture=no_memory_capture,
             attachment_paths=list(file_paths or []),

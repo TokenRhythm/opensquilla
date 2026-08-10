@@ -646,6 +646,10 @@ async function uninstallSkillAndClose(name: string) {
 .sk-card__dot.is-unverified {
   background: var(--text-dim);
 }
+.sk-card__dot.is-provider-check {
+  background: var(--text-dim);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--text-dim) 18%, transparent);
+}
 .sk-card__emoji {
   font-size: 14px;
   line-height: 1;
@@ -701,6 +705,20 @@ async function uninstallSkillAndClose(name: string) {
 .sk-card__dep--advisory {
   border-style: dashed;
   color: var(--text-muted);
+}
+.sk-card__provider-status {
+  align-self: flex-start;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 40%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  background: var(--bg-elevated);
+  font-size: 10px;
+  font-weight: 600;
 }
 .sk-card__sub-row {
   display: flex;
@@ -935,6 +953,7 @@ async function uninstallSkillAndClose(name: string) {
   align-items: center;
   gap: var(--sp-2);
   flex-wrap: wrap;
+  flex: 1 1 auto;
   min-width: 0;
 }
 .sk-detail__emoji {
@@ -945,11 +964,14 @@ async function uninstallSkillAndClose(name: string) {
   font-family: inherit;
   font-size: 16px;
   font-weight: 600;
+  overflow-wrap: anywhere;
   line-height: 22px;
 }
 .sk-detail__chips {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
 }
 .sk-detail__body {
   padding: var(--sp-4);
@@ -1056,6 +1078,13 @@ async function uninstallSkillAndClose(name: string) {
   font-size: 13px;
   line-height: 20px;
 }
+.sk-detail__install-row--toolchain {
+  align-items: flex-start;
+  flex-direction: column;
+}
+.sk-detail__toolchain-guidance {
+  line-height: 1.45;
+}
 .sk-detail__link {
   color: var(--accent);
   text-decoration: none;
@@ -1110,6 +1139,7 @@ async function uninstallSkillAndClose(name: string) {
   border-radius: var(--radius-md);
   color: var(--text-muted);
   cursor: pointer;
+  flex: 0 0 32px;
   transition: color var(--transition), border-color var(--transition);
 }
 .sk-iconbtn:hover {
@@ -1242,6 +1272,23 @@ async function uninstallSkillAndClose(name: string) {
 
 /* Responsive */
 @media (max-width: 720px) {
+  .sk-dialog {
+    width: calc(100vw - 24px);
+    max-height: calc(100dvh - 24px);
+  }
+  .sk-detail {
+    max-height: calc(100dvh - 24px);
+  }
+  .sk-detail__header {
+    align-items: flex-start;
+    padding: var(--sp-3);
+  }
+  .sk-detail__chips {
+    flex-basis: 100%;
+  }
+  .sk-detail__body {
+    padding: var(--sp-3);
+  }
   .sk-stage__header {
     flex-direction: column;
     align-items: stretch;

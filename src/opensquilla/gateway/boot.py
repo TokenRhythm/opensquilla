@@ -3804,6 +3804,12 @@ async def start_gateway_server(
     from opensquilla.tools.builtin.sessions import set_task_runtime
 
     set_task_runtime(task_runtime)
+    recovered_meta_controls = await task_runtime.recover_durable_meta_controls()
+    if recovered_meta_controls:
+        log.info(
+            "task_runtime.meta_controls_recovered",
+            count=recovered_meta_controls,
+        )
     recover_stranded_steers = getattr(task_runtime, "recover_stranded_steers", None)
     if callable(recover_stranded_steers):
         steer_recovery = await recover_stranded_steers()

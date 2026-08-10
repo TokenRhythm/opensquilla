@@ -17,6 +17,8 @@ const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
   ndjson: 'data', pdf: 'document', sql: 'code', tsv: 'data', txt: 'document',
 }
 
+const VIDEO_EXTENSIONS = new Set(['m4v', 'mov', 'mp4', 'ogv', 'webm'])
+
 export function artifactMime(artifact: ArtifactPayload): string {
   return artifact?.mime
     ? String(artifact.mime).split(';', 1)[0].trim().toLowerCase()
@@ -32,6 +34,13 @@ export function artifactExtension(name: string): string {
   const idx = trimmed.lastIndexOf('.')
   if (idx < 0 || idx === trimmed.length - 1) return ''
   return trimmed.slice(idx + 1)
+}
+
+export function isVideoArtifact(artifact: ArtifactPayload): boolean {
+  const mime = artifactMime(artifact)
+  if (mime.startsWith('video/')) return true
+  if (mime && mime !== 'application/octet-stream') return false
+  return VIDEO_EXTENSIONS.has(artifactExtension(artifactName(artifact)))
 }
 
 export function artifactCategory(artifact: ArtifactPayload): string {

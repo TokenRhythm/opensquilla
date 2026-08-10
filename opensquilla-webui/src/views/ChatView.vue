@@ -3,8 +3,11 @@
     class="chat"
     :class="{
       'chat--new-landing': isNewChatLanding,
+      'chat--meta-setup': Boolean(setupState),
       'chat--drag-over': threadDragOver,
       'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
+      'chat--composer-floating': composerFxEnabled && !isNewChatLanding,
+      'chat--composer-collapsed': composerCollapsed && composerFxEnabled && !isNewChatLanding,
     }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
@@ -74,13 +77,60 @@
       </div>
       <div class="chat-thread-shell">
         <div
+          v-if="forkTransition"
+          class="chat-fork-transition-overlay"
+          data-testid="chat-fork-transition-overlay"
+        >
+          <div
+            class="chat-fork-transition-status"
+            :class="{ 'chat-fork-transition-status--error': forkTransition.phase === 'error' }"
+            :role="forkTransition.phase === 'error' ? 'alert' : 'status'"
+            :aria-live="forkTransition.phase === 'error' ? 'assertive' : 'polite'"
+            aria-atomic="true"
+            data-testid="chat-fork-transition-status"
+          >
+            <span
+              v-if="forkTransition.phase !== 'error'"
+              class="chat-fork-transition-status__spinner"
+              aria-hidden="true"
+            />
+            <Icon v-else name="info" :size="15" aria-hidden="true" />
+            <span class="chat-fork-transition-status__copy">{{ forkTransition.phase === 'error'
+              ? t('chat.forkOpenFailed')
+              : forkTransition.phase === 'creating'
+                ? t('chat.forkCreating')
+                : forkTransition.phase === 'returning'
+                  ? t('chat.forkReturning')
+                  : t('chat.forkOpening') }}</span>
+            <template v-if="forkTransition.phase === 'error'">
+              <button
+                type="button"
+                class="btn btn--ghost chat-fork-transition-status__action"
+                data-testid="chat-fork-retry"
+                @click="retryForkTransition"
+              >{{ t('chat.reloadSession') }}</button>
+              <button
+                type="button"
+                class="btn btn--ghost chat-fork-transition-status__action"
+                data-testid="chat-fork-return"
+                @click="returnToForkParent"
+              >{{ t('chat.forkReturnOriginal') }}</button>
+            </template>
+          </div>
+        </div>
+        <div
           ref="threadRef"
           class="chat-thread"
           role="region"
           tabindex="0"
           :aria-label="t('chat.conversation')"
-          :aria-busy="isStreaming"
+          :aria-busy="isStreaming || forkInFlight"
           @scroll="onThreadScroll"
+          @wheel.passive="onThreadWheel"
+          @touchmove.passive="markThreadScrollIntent('either')"
+          @pointerdown="markThreadScrollIntent('either')"
+          @pointermove="onThreadPointerMove"
+          @keydown="onThreadScrollKeydown"
         >
         <template v-if="isNewChatLanding">
           <div class="chat-landing-brand" :aria-label="t('chat.newChatBrand')">
@@ -94,25 +144,25 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="visibleHistoryRecoveryState"
+          v-if="!forkTransition && visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
           :state="visibleHistoryRecoveryState"
           @retry="retryHistory"
         />
         <ChatSessionRecoveryStatus
-          v-if="liveRecoveryState"
+          v-if="!forkTransition && liveRecoveryState"
           :key="`${sessionKey}:live`"
           :state="liveRecoveryState"
           @retry="retryLive"
         />
         <div
-          v-if="showConfirmedEmptySession"
+          v-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
         >
           {{ t('chat.noMessagesYet') }}
         </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding"
+          v-if="!isNewChatLanding && !forkTransition"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
           :loading="historyState.loadingEarlier"
@@ -126,9 +176,16 @@
           @retry="retryHistory"
         />
 
+        <div
+          class="chat-message-surface"
+          :class="{ 'chat-message-surface--preview': forkTransition }"
+          :inert="forkTransition ? true : undefined"
+          :aria-hidden="forkTransition ? 'true' : undefined"
+          :data-preview-session="forkTransition?.parentKey"
+        >
         <ChatMessageList
-          :messages="renderedMessages"
-          :session-key="sessionKey"
+          :messages="forkTransition?.previewMessages || renderedMessages"
+          :session-key="forkTransition?.parentKey || sessionKey"
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
           :workbench-enabled="workbenchEnabled"
@@ -173,6 +230,7 @@
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
         </ChatMessageList>
+        </div>
 
         <!-- Manual or turn-boundary compaction has no assistant turn to own
              it. Keep one quiet transcript maintenance row instead of a
@@ -390,7 +448,7 @@
         </template>
         </div>
         <ConversationMinimap
-          v-if="!isNewChatLanding && !shareMode"
+          v-if="!isNewChatLanding && !shareMode && !forkTransition"
           :messages="renderedMessages"
           :scroll-container="threadRef"
           :strip-time-prefix="stripTimePrefix"
@@ -402,6 +460,15 @@
       </div>
     </div>
 
+    <MetaSkillSetupCard
+      v-if="setupState"
+      :state="setupState"
+      :provider-navigation-pending="metaSetupProviderNavigationPending"
+      @confirm="confirmSetup"
+      @retry="retrySetup"
+      @cancel="cancelSetup"
+      @configure="openMetaSetupProviderSettings"
+    />
     <!-- Composer dock: positioning context so the slash menu anchors directly
          above the composer in any layout. The new-chat landing centers the
          composer instead of pinning it to the bottom, so the menu must not
@@ -446,6 +513,10 @@
         @click="completeSlashCmd(cmd)"
       >
         <span class="chat-slash-cmd">{{ cmd.cmd }}</span>
+        <span
+          v-if="cmd.metaStatus === 'needs_setup'"
+          class="chat-slash-status"
+        >{{ t('chat.metaRuns.needsSetup') }}</span>
         <span class="chat-slash-desc" :title="cmd.desc">{{ cmd.desc }}</span>
       </div>
     </div>
@@ -489,7 +560,7 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
-      :input-disabled="Boolean(dockedPlanQuestionnaire)"
+      :input-disabled="Boolean(dockedPlanQuestionnaire) || Boolean(forkTransition)"
       :run-mode="runMode"
       :allowed-run-modes="composerAllowedRunModes"
       :safe-setup-available="composerSafeSetupAvailable"
@@ -516,6 +587,9 @@
       :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
       :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
       :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
+      :collapsed="composerCollapsed && composerFxEnabled && !isNewChatLanding"
+      :floating="composerFxEnabled && !isNewChatLanding"
+      @expand="expandComposer"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -636,6 +710,7 @@ import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
+import MetaSkillSetupCard from '@/components/chat/MetaSkillSetupCard.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
@@ -655,6 +730,11 @@ import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
+import {
+  createChatMetaDraftRecovery,
+  listServerMetaDrafts,
+  queryServerMetaDrafts,
+} from '@/composables/chat/useChatMetaDraftRecovery'
 import {
   useChatPendingQueue,
   type PendingQueueOwnerContext,
@@ -680,6 +760,7 @@ import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecov
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
+import { useMetaSkillSetup } from '@/composables/chat/useMetaSkillSetup'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import {
@@ -701,12 +782,17 @@ import {
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionSubscription } from '@/composables/chat/useChatSessionSubscription'
-import { useChatSlashCommands } from '@/composables/chat/useChatSlashCommands'
+import {
+  useChatSlashCommands,
+  type DurableMetaDraft,
+} from '@/composables/chat/useChatSlashCommands'
 import { useChatStream } from '@/composables/chat/useChatStream'
+import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
 import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
+import { navigateMetaSetupProviderSettings } from '@/composables/chat/metaSetupProviderNavigation'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { hasOpenDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
@@ -733,10 +819,21 @@ import type {
   ChatStreamTimelineItem,
   ChatToolCall,
   DisplayAttachment,
+  HiddenControlDispatchResult,
   ToolResultContext,
 } from '@/types/chat'
+import {
+  createForkTransitionLifetime,
+  forkNavigationPhase,
+  forkRouteHandoffAction,
+  forkRpcRequest,
+  snapshotForkPreviewMessages,
+  validatedForkChildKey,
+  type ForkRpcResponse,
+} from '@/utils/chat/forkTransition'
 import type {
   ArtifactPayload,
+  MetaDraftDiscardResponse,
   SessionEventPayload,
   SessionMessagesSnapshotResponse,
 } from '@/types/rpc'
@@ -772,7 +869,16 @@ import {
 } from '@/utils/workbench/artifactPreview'
 import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
+import {
+  persistDeferredMetaDraft,
+  takeDeferredMetaDrafts,
+} from '@/utils/chat/metaDraftOutbox'
+import { listPendingMetaDiscards } from '@/utils/chat/metaDiscardOutbox'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
+import {
+  createComposerRetractionController,
+  type ComposerScrollIntent,
+} from '@/utils/chat/composerRetraction'
 import {
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
@@ -813,6 +919,7 @@ import {
 
 interface ChatComposerHandle {
   composerElement: () => HTMLElement | null
+  canCollapse: () => boolean
   focusTextarea: () => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
@@ -893,11 +1000,23 @@ const landingPrefilled = ref(false)
 // send ("Start task"). Flushed in onMounted once the draft subscription is live
 // so the first turn streams into this view. Empty string = nothing pending.
 const pendingAutoSend = ref('')
+const pendingAutoSendSessionKey = ref('')
 
 /* ── DOM refs ──────────────────────────────────────────────────────── */
 
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
+/* Floating-composer retract: a pure controller accumulates slow user travel
+   while ignoring scrollTop changes caused by history, minimap, and layout. */
+const composerRetraction = createComposerRetractionController()
+const composerCollapsed = ref(false)
+let pendingComposerScrollIntent: ComposerScrollIntent = null
+let composerScrollIntentTimer: number | null = null
+
+// Settings → Appearance "Floating composer" toggle. Off: the composer docks in
+// the normal layout and never retracts; on (default): it floats over the
+// transcript and collapses to a single line while scrolling up.
+const { enabled: composerFxEnabled } = useComposerFloatingPreference()
 type ChatHeaderActionsHandle = {
   focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
 }
@@ -906,6 +1025,43 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+
+function clearPendingComposerScrollIntent() {
+  pendingComposerScrollIntent = null
+  if (composerScrollIntentTimer !== null) {
+    window.clearTimeout(composerScrollIntentTimer)
+    composerScrollIntentTimer = null
+  }
+}
+
+function resetComposerRetraction() {
+  clearPendingComposerScrollIntent()
+  composerCollapsed.value = composerRetraction.reset()
+}
+
+function expandComposer() {
+  clearPendingComposerScrollIntent()
+  composerCollapsed.value = composerRetraction.expand(threadRef.value?.scrollTop ?? null)
+}
+
+function markThreadScrollIntent(intent: Exclude<ComposerScrollIntent, null>) {
+  pendingComposerScrollIntent = intent
+  if (composerScrollIntentTimer !== null) window.clearTimeout(composerScrollIntentTimer)
+  // Wheel scrolling can land one frame after its input event. A short token
+  // covers that browser scheduling gap; direction matching still rejects a
+  // history-prepend correction that moves opposite to the gesture.
+  composerScrollIntentTimer = window.setTimeout(() => {
+    pendingComposerScrollIntent = null
+    composerScrollIntentTimer = null
+  }, 120)
+}
+
+function currentThreadScrollIntent(): ComposerScrollIntent {
+  return pendingComposerScrollIntent
+}
+
+watch(composerFxEnabled, resetComposerRetraction, { flush: 'sync' })
+watch(sessionKey, resetComposerRetraction, { flush: 'sync' })
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
@@ -920,6 +1076,26 @@ const autoScroll = ref(true)
 const historyNavigationScrollLock = createHistoryNavigationScrollLock(autoScroll)
 const composing = ref(false)
 const messages = ref<Message[]>([])
+
+type ForkTransitionPhase = 'creating' | 'opening' | 'returning' | 'error'
+
+interface ForkTransitionState {
+  generation: number
+  parentKey: string
+  childKey: string
+  targetKey: string
+  throughTurnId?: string
+  phase: ForkTransitionPhase
+  errorReason?: 'navigation' | 'history' | 'live'
+  /** Render-only snapshot; never becomes the child session's canonical messages. */
+  previewMessages: ChatRenderedMessage[]
+}
+
+const forkTransition = ref<ForkTransitionState | null>(null)
+const forkInFlight = computed(() => (
+  forkTransition.value !== null && forkTransition.value.phase !== 'error'
+))
+const forkTransitionLifetime = createForkTransitionLifetime()
 
 // Session / UI
 const lastHeaderRole = ref('')
@@ -1173,22 +1349,40 @@ let sendCurrentInput: () => void = () => {}
 let sendAutomaticInput: () => void = () => {}
 // Late-bound: dispatchHiddenSend is created below (useChatSend) but the /meta
 // slash handler (useChatSlashCommands, created earlier) needs it at call time.
-let dispatchHiddenForMeta: (providerText: string, displayText: string) => void = () => {}
+let dispatchHiddenForMeta: (
+  providerText: string,
+  displayText: string,
+  clientRequestId?: string,
+  targetSessionKey?: string,
+) => Promise<HiddenControlDispatchResult> = (
+  _providerText,
+  _displayText,
+  clientRequestId = '',
+  targetSessionKey = '',
+) => (
+  Promise.resolve({
+    status: 'rejected',
+    reason: 'invalid_request',
+    clientRequestId,
+    sessionKey: targetSessionKey || sessionKey.value,
+  })
+)
 let dispatchPlanComposerPrompt: (prompt: string, composerText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
 let isQueuedDeliveryBlocked: () => boolean = () => false
 let isLiveDeliveryBlocked: () => boolean = () => true
-let dispatchHiddenControl: (
-  providerText: string,
-  displayText: string,
-  ownerSessionKey?: string,
-  queuedItem?: ChatPendingItem,
+let dispatchQueuedHiddenControl: (
+  item: ChatPendingItem,
+  ownerSessionKey: string,
 ) => Promise<ChatSendOutcome> = async () => 'not_sent'
 let dispatchQueuedItem: (
   item: ChatPendingItem,
   ownerSessionKey?: string,
 ) => Promise<ChatSendOutcome> = async () => 'not_sent'
 const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
+let handleHiddenControlDispatchResult: (result: HiddenControlDispatchResult) => void = () => {}
+let discardHiddenControlOutbox: (sessionKey: string, clientRequestId: string) => boolean = () => false
+let forgetHiddenControlOutbox: (sessionKey: string, clientRequestId: string) => void = () => {}
 const chatPendingQueue = useChatPendingQueue({
   sessionKey,
   ownerContext: pendingQueueOwnerContext,
@@ -1211,12 +1405,21 @@ const chatPendingQueue = useChatPendingQueue({
   resetInputHistory: () => resetComposerInputHistory(),
   hasComposer: () => Boolean(composerRef.value),
   dispatchHiddenControl: (item, ownerSessionKey) =>
-    dispatchHiddenControl(
-      item.text,
-      item.displayTextOverride || '',
-      ownerSessionKey,
-      item,
-    ),
+    dispatchQueuedHiddenControl(item, ownerSessionKey),
+  onHiddenControlDispatchResult: (result) => {
+    if (result.reason === 'discarded') {
+      const discardPersisted = discardHiddenControlOutbox(
+        result.sessionKey,
+        result.clientRequestId,
+      )
+      if (!discardPersisted) {
+        pushToast(t('chat.metaRuns.cancelNotSaved'), { tone: 'danger' })
+        return false
+      }
+    }
+    handleHiddenControlDispatchResult(result)
+    return true
+  },
   dispatchPendingItem: (item, ownerSessionKey) =>
     dispatchQueuedItem(item, ownerSessionKey),
 })
@@ -1227,6 +1430,7 @@ const {
   maxPending,
   enqueuePendingPayload,
   enqueuePendingInput,
+  enqueueRecoveredInput,
   enqueueHiddenControl,
   enqueuePendingSteerRetry,
   removePendingChip,
@@ -1244,6 +1448,45 @@ const {
 watch(attachmentWorkBusy, (busy) => {
   if (!busy) flushDeferredPendingDrain()
 })
+
+function restoreMetaLaunchDraft(launchText: string, targetSessionKey: string): void {
+  const restored = String(launchText || '').trim()
+  const target = String(targetSessionKey || '').trim()
+  if (!restored || !target) return
+  if (target !== sessionKey.value) {
+    if (!persistDeferredMetaDraft({ sessionKey: target, launchText: restored })) {
+      pushToast(t('chat.metaRuns.couldNotRunSkill', { skill: restored.split(/\s+/, 3)[1] || 'MetaSkill' }), {
+        tone: 'danger',
+      })
+    }
+    return
+  }
+
+  const currentDraft = inputText.value.trim()
+  if (!currentDraft) {
+    inputText.value = restored
+    autoResizeTextarea()
+    nextTick(() => composerRef.value?.focusTextarea())
+    return
+  }
+  if (currentDraft === restored) return
+  if (!enqueueRecoveredInput(restored)) {
+    // Preserve the newer composer verbatim. A durable deferred copy is safer
+    // than concatenating two independently sendable requests into one turn.
+    persistDeferredMetaDraft({ sessionKey: target, launchText: restored })
+  }
+}
+
+function restoreDeferredMetaDrafts(
+  targetSessionKey: string,
+  skipLaunchTexts: ReadonlySet<string> = new Set(),
+): void {
+  if (sessionKey.value !== targetSessionKey) return
+  for (const launchText of takeDeferredMetaDrafts(targetSessionKey)) {
+    if (skipLaunchTexts.has(launchText)) continue
+    restoreMetaLaunchDraft(launchText, targetSessionKey)
+  }
+}
 
 const chatCompaction = useChatCompaction({
   sessionKey,
@@ -1401,6 +1644,7 @@ const {
   isDraftRoute,
   persistSession,
   readProjectFromUrl,
+  readSessionFromUrl,
   resolveInitialSession,
 } = chatSessionRoute
 
@@ -1453,6 +1697,7 @@ const chatRenderedMessages = useChatRenderedMessages({
   stripGeneratedArtifactMarkers,
   stripTimePrefix,
   isSubagentCompletionMessage,
+  timeTranslator: t,
 })
 const { renderedMessages, routerDecisionCells } = chatRenderedMessages
 
@@ -1544,6 +1789,7 @@ const chatHistory = useChatHistory({
   scrollToBottom,
 })
 const {
+  historySessionKey,
   historyState,
   loadHistory,
   loadEarlierHistory,
@@ -1899,15 +2145,66 @@ const {
   startDraftSession,
   switchToSession: switchRuntimeToSession,
   adoptResponseSession,
+  rebindDraftSession,
 } = chatSessionRuntime
 switchToPlanSession = switchToSession
 
-function switchToSession(nextSessionKey: string) {
+async function switchToSession(nextSessionKey: string) {
   if (nextSessionKey !== sessionKey.value) {
     activeProjectWorkspace.beginSessionResolution(nextSessionKey)
   }
-  return switchRuntimeToSession(nextSessionKey)
+  const outcome = await switchRuntimeToSession(nextSessionKey)
+  if (outcome?.authoritative) {
+    await handleAuthoritativeSessionSubscription(nextSessionKey)
+  }
+  return outcome
 }
+
+const metaSkillSetup = useMetaSkillSetup({
+  rpc,
+  currentSessionKey: sessionKey,
+  dispatchHidden: (providerText: string, displayText: string, clientRequestId?: string) => (
+    dispatchHiddenForMeta(providerText, displayText, clientRequestId)
+  ),
+  autoRestore: false,
+  restoreDraft: restoreMetaLaunchDraft,
+  discardDraft: async (draftSessionKey: string, clientRequestId: string) => {
+    const result = await rpc.call<MetaDraftDiscardResponse>('meta.drafts.discard', {
+      sessionKey: draftSessionKey,
+      clientRequestId,
+    })
+    if (result?.accepted === true) {
+      forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
+      return 'accepted'
+    }
+    if (result?.discarded !== true) return 'unconfirmed'
+    // Only after the server confirms atomic discard may the setup flow restore
+    // plain composer text. Remove the matching browser hidden-control copy too,
+    // otherwise a later session restore could replay the old stable id beside
+    // the newly restored composer request.
+    forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
+    return 'discarded'
+  },
+  onDraftAlreadyAccepted: () => {
+    pushToast(t('chat.metaRuns.cancelAlreadyAccepted'), { tone: 'info', duration: 7000 })
+  },
+  forgetHiddenControl: (draftSessionKey: string, clientRequestId: string) => {
+    forgetHiddenControlOutbox(draftSessionKey, clientRequestId)
+  },
+})
+const {
+  setupState,
+  requestSetup: requestMetaSetup,
+  confirmSetup,
+  beginProviderHandoff,
+  cancelProviderHandoff,
+  retrySetup,
+  cancelSetup,
+  restoreSetupJob: restoreMetaSetupJob,
+  handleHiddenDispatchResult,
+} = metaSkillSetup
+handleHiddenControlDispatchResult = handleHiddenDispatchResult
+const metaSetupProviderNavigationPending = ref(false)
 
 const chatSlashCommands = useChatSlashCommands({
   rpc,
@@ -1928,7 +2225,19 @@ const chatSlashCommands = useChatSlashCommands({
   showCompactStatus,
   showCompactionToast,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
-  dispatchHidden: (providerText: string, displayText: string) => dispatchHiddenForMeta(providerText, displayText),
+  dispatchHidden: (
+    providerText: string,
+    displayText: string,
+    clientRequestId?: string,
+    targetSessionKey?: string,
+  ) => dispatchHiddenForMeta(
+    providerText,
+    displayText,
+    clientRequestId,
+    targetSessionKey,
+  ),
+  restoreDraft: restoreMetaLaunchDraft,
+  requestMetaSetup,
   dispatchPlanPrompt: (prompt: string, composerText: string) => {
     dispatchPlanComposerPrompt(prompt, composerText)
   },
@@ -1947,6 +2256,7 @@ const {
   completeSlashCmd,
   activateSlashCmd,
   executeSlashCommand,
+  restoreDurableMetaDrafts: restoreServerMetaDrafts,
 } = chatSlashCommands
 
 const chatComposerShortcuts = useChatComposerShortcuts({
@@ -2044,14 +2354,161 @@ const chatSend = useChatSend({
   scrollToBottom,
 })
 const {
-  onSend,
+  onSend: dispatchCurrentInput,
   onStop,
   sendQueuedSteer,
   sendQueuedFollowup,
   dispatchComposerPrompt,
   dispatchHiddenSend,
+  dispatchQueuedHiddenSend,
+  discardHiddenControl,
+  forgetHiddenControl,
+  flushPendingMetaDiscards,
+  restoreHiddenControls,
   sendHiddenMetaPreflightConfirmation,
 } = chatSend
+async function onSend(
+  sendOptions?: Parameters<typeof dispatchCurrentInput>[0],
+): Promise<void> {
+  markProvisionalDraftUsed()
+  if (pendingAutoSendSessionKey.value === sessionKey.value) {
+    pendingAutoSend.value = ''
+    pendingAutoSendSessionKey.value = ''
+  }
+  await dispatchCurrentInput(sendOptions)
+}
+sendCurrentInput = onSend
+dispatchHiddenForMeta = dispatchHiddenSend
+discardHiddenControlOutbox = discardHiddenControl
+forgetHiddenControlOutbox = forgetHiddenControl
+
+async function restoreDurableMetaControls(
+  targetSessionKey: string,
+  prefetchedServerDrafts?: DurableMetaDraft[],
+  isCurrent: () => boolean = () => true,
+): Promise<void> {
+  // Setup owns a matching cancellation tombstone so it can clear its recovery
+  // checkpoint without ever re-entering launch. Queue-only tombstones are then
+  // retried here before any server draft is considered.
+  const pendingDiscardIds = new Set(
+    listPendingMetaDiscards(targetSessionKey).map(item => item.clientRequestId),
+  )
+  await restoreMetaSetupJob(targetSessionKey)
+  if (!isCurrent()) return
+  const setupDiscardRequestId = setupState.value?.retryMode === 'discard'
+    ? setupState.value.resumeRequestId || ''
+    : ''
+  const flushedDiscardIds = await flushPendingMetaDiscards(
+    targetSessionKey,
+    setupDiscardRequestId ? [setupDiscardRequestId] : [],
+  )
+  if (!isCurrent()) return
+  for (const requestId of flushedDiscardIds) {
+    pendingDiscardIds.add(requestId)
+  }
+  const serverDrafts = (prefetchedServerDrafts
+    ?? await listServerMetaDrafts(rpc, { sessionKey: targetSessionKey }))
+    .filter(draft => !pendingDiscardIds.has(draft.clientRequestId))
+  if (!isCurrent()) return
+  restoreDeferredMetaDrafts(
+    targetSessionKey,
+    new Set(serverDrafts.map(draft => draft.launchText)),
+  )
+  const activeSetupRequestId = setupState.value?.sessionKey === targetSessionKey
+    ? setupState.value.resumeRequestId || setupState.value.providerHandoff?.clientRequestId || ''
+    : ''
+  const matchingServerDrafts = serverDrafts.filter(
+    draft => draft.sessionKey === targetSessionKey,
+  )
+  const setupHandledRequestIds = activeSetupRequestId
+    ? matchingServerDrafts
+        .filter(draft => draft.clientRequestId === activeSetupRequestId)
+        .map(draft => draft.clientRequestId)
+    : []
+  const attemptedServerRequestIds = await restoreServerMetaDrafts(
+    matchingServerDrafts.filter(
+      draft => draft.clientRequestId !== activeSetupRequestId,
+    ),
+    isCurrent,
+  )
+  if (!isCurrent()) return
+  await restoreHiddenControls(
+    targetSessionKey,
+    [...setupHandledRequestIds, ...attemptedServerRequestIds],
+    isCurrent,
+  )
+}
+
+function flushPendingAutoSend(targetSessionKey: string): boolean {
+  if (
+    !pendingAutoSend.value
+    || pendingAutoSendSessionKey.value !== targetSessionKey
+    || sessionKey.value !== targetSessionKey
+  ) {
+    return false
+  }
+  const text = pendingAutoSend.value
+  pendingAutoSend.value = ''
+  pendingAutoSendSessionKey.value = ''
+  // The handoff is no longer automatic once the user edits its prefill while
+  // waiting for an authoritative reconnect.
+  if (inputText.value !== text) return false
+  sendComposerText(text)
+  return true
+}
+
+async function handleAuthoritativeSessionSubscription(
+  targetSessionKey: string,
+  prefetchedServerDrafts?: DurableMetaDraft[],
+): Promise<void> {
+  const attempt = ++durableRecoveryGeneration
+  const isCurrent = () => (
+    chatViewActive
+    && attempt === durableRecoveryGeneration
+    && sessionKey.value === targetSessionKey
+  )
+  if (!isCurrent()) return
+  // Ordinary Sessions Hub handoffs must never wait behind optional Meta
+  // recovery. Durable controls remain persisted for the next reconnect.
+  if (flushPendingAutoSend(targetSessionKey)) return
+  await Promise.all([
+    metaRuns.hydrateRecovery(),
+    restoreDurableMetaControls(targetSessionKey, prefetchedServerDrafts, isCurrent),
+  ])
+}
+
+function isPristineDraftForRecovery(expectedSessionKey: string, agentId: string): boolean {
+  return !provisionalDraftUsed
+    && sessionKey.value === expectedSessionKey
+    && isDraftRoute()
+    && draftAgentId() === agentId
+    && agentIdFromSessionKey(expectedSessionKey) === agentId
+    && pendingSessionIntent.value === 'new_chat'
+    && messages.value.length === 0
+    && inputText.value.length === 0
+    && pendingAttachments.value.length === 0
+    && pendingQueue.value.length === 0
+    && pendingAutoSend.value.length === 0
+    && !isStreaming.value
+    && setupState.value?.sessionKey !== expectedSessionKey
+}
+
+const metaDraftRecovery = createChatMetaDraftRecovery({
+  currentSessionKey: () => sessionKey.value,
+  listDrafts: query => queryServerMetaDrafts(rpc, query),
+  isPristineDraft: isPristineDraftForRecovery,
+  rebindDraftSession,
+  onAuthoritativeSubscription: handleAuthoritativeSessionSubscription,
+})
+
+let provisionalDraftUsed = false
+let durableRecoveryGeneration = 0
+
+function markProvisionalDraftUsed(): void {
+  if (provisionalDraftUsed) return
+  provisionalDraftUsed = true
+  metaDraftRecovery.invalidate()
+}
 const sameTurnSteerAvailable = computed(() => (
   isStreaming.value
   && chatSend.supportsSameTurnSteer()
@@ -2099,7 +2556,7 @@ dispatchHiddenForMeta = dispatchHiddenSend
 dispatchPlanComposerPrompt = (prompt, composerText) => {
   void dispatchComposerPrompt(prompt, composerText)
 }
-dispatchHiddenControl = dispatchHiddenSend
+dispatchQueuedHiddenControl = dispatchQueuedHiddenSend
 dispatchQueuedItem = sendQueuedFollowup
 
 function takeVisiblePendingItem(index: number) {
@@ -2127,12 +2584,7 @@ async function steerPendingMessage(index: number) {
   let outcome: ChatSendOutcome = 'retryable_failure'
   try {
     outcome = item.hiddenControl
-      ? await dispatchHiddenSend(
-          item.text,
-          item.displayTextOverride || '',
-          item.ownerSessionKey || sessionKey.value,
-          item,
-        )
+      ? await dispatchQueuedHiddenSend(item, item.ownerSessionKey || sessionKey.value)
       : await sendQueuedSteer(item)
   } finally {
     settlePendingDelivery(item, outcome)
@@ -2202,6 +2654,10 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   popAllPendingIntoComposer,
   restoreSteerIntoComposer: text => appendComposerText(text),
   saveWidgetState,
+  onSessionSubscribed: () => {
+    if (isDraftRoute()) metaDraftRecovery.retry(draftAgentId())
+    return handleAuthoritativeSessionSubscription(sessionKey.value)
+  },
   handleSessionConnectionState: state =>
     handleSessionConnectionState(state, !isDraftRoute()),
   loadCurrentSessionUsage,
@@ -2417,6 +2873,9 @@ const metaRuns = useMetaRuns({
   currentEpoch,
   lastStreamSeq,
   sendHiddenConfirmation: sendHiddenMetaPreflightConfirmation,
+  sendHiddenReplay: (providerText: string, displayText: string) => (
+    dispatchHiddenForMeta(providerText, displayText)
+  ),
   scrollToStepCard,
   sendComposerText,
   lastUserMessageText,
@@ -2499,7 +2958,9 @@ watch(messages, () => attachTurnReasoning())
 // Unsubscribers
 let unsubs: (() => void)[] = []
 let chatViewDisposed = false
-let composerResizeObserver: ResizeObserver | null = null
+let composerDockResizeObserver: ResizeObserver | null = null
+let composerDockPinFrame: number | null = null
+let lastComposerDockHeight = -1
 
 /* ── Computed ──────────────────────────────────────────────────────── */
 
@@ -2514,6 +2975,8 @@ const isNewChatLanding = computed(() => {
     pendingQueue.value.length === 0 &&
     !compactStatus.value.visible
 })
+
+watch(isNewChatLanding, resetComposerRetraction, { flush: 'sync' })
 
 const historyRecoveryState = computed(() => {
   return resolveChatHistoryRecoveryState({
@@ -2687,7 +3150,18 @@ const activeProjectComposerBlockMessage = computed(() => {
 })
 
 const composerSendBlockedMessage = computed(() =>
-  modelImageSendBlockedMessage.value
+  (forkTransition.value
+    ? t(
+        forkTransition.value.phase === 'error'
+          ? 'chat.forkOpenFailed'
+          : forkTransition.value.phase === 'creating'
+            ? 'chat.forkCreating'
+            : forkTransition.value.phase === 'returning'
+              ? 'chat.forkReturning'
+              : 'chat.forkOpening',
+      )
+    : '')
+  || modelImageSendBlockedMessage.value
   || liveSendBlockedReason.value
   || activeProjectComposerBlockMessage.value,
 )
@@ -2870,6 +3344,32 @@ function onVoiceInput() {
 function onVoiceSetup() {
   pushToast(t('chat.toast.voiceSetupNeeded'), { tone: 'info' })
   router.push('/settings/capabilities').catch(() => {})
+}
+
+async function openMetaSetupProviderSettings(providerId: string) {
+  if (metaSetupProviderNavigationPending.value) return
+  metaSetupProviderNavigationPending.value = true
+  try {
+    const opened = await navigateMetaSetupProviderSettings({
+      providerId,
+      sessionKey: setupState.value?.sessionKey || '',
+      currentRouteSession: route.query.session,
+      router,
+      beginHandoff: beginProviderHandoff,
+      cancelHandoff: cancelProviderHandoff,
+      materializeSession: (handoffSessionKey) => {
+        persistSession(handoffSessionKey, {
+          updateRoute: false,
+          source: 'chatView.metaSetupProviderHandoff',
+        })
+      },
+    })
+    if (!opened) {
+      pushToast(t('chat.metaSetup.providerNavigationFailed'), { tone: 'danger' })
+    }
+  } finally {
+    metaSetupProviderNavigationPending.value = false
+  }
 }
 
 function normalizeRunStatus(status: string): ChatRunStatusState {
@@ -3100,26 +3600,167 @@ function closeDeliverables() {
 
 /* ── Fork ──────────────────────────────────────────────────────────── */
 
-// Whole-conversation fork from the tip: the backend copies the transcript
-// into a sibling session, then we navigate there the same way the session
-// switcher does (route query change → switchToSession).
-const forkInFlight = ref(false)
+function clearForkTransition(generation?: number) {
+  if (
+    generation !== undefined
+    && forkTransition.value?.generation !== generation
+  ) return
+  const clearedGeneration = generation ?? forkTransition.value?.generation
+  forkTransition.value = null
+  forkTransitionLifetime.invalidate(clearedGeneration)
+}
 
-async function forkConversation() {
-  const parentKey = sessionKey.value
-  if (!parentKey || forkInFlight.value) return
-  if (pendingSessionIntent.value === 'new_chat') return
-  forkInFlight.value = true
+function isForkTransitionActive(generation: number): boolean {
+  return Boolean(
+    chatViewActive
+    && !chatViewDisposed
+    && forkTransitionLifetime.isCurrent(generation)
+    && forkTransition.value?.generation === generation
+  )
+}
+
+function failForkTransition(
+  generation: number,
+  reason: NonNullable<ForkTransitionState['errorReason']>,
+  error: unknown,
+) {
+  if (!isForkTransitionActive(generation)) return
+  const transition = forkTransition.value!
+  console.warn('Fork child hand-off failed:', error instanceof Error ? error.message : error)
+  const firstFailure = transition.phase !== 'error'
+  forkTransition.value = {
+    ...transition,
+    phase: 'error',
+    errorReason: reason,
+  }
+  if (firstFailure) pushToast(t('chat.toast.forkOpenFailed'), { tone: 'warn' })
+}
+
+async function retryForkTransition() {
+  const transition = forkTransition.value
+  if (
+    !transition?.targetKey
+    || transition.phase !== 'error'
+    || !isForkTransitionActive(transition.generation)
+  ) return
+  const retryPhase = forkNavigationPhase(transition.targetKey, transition.parentKey)
+  forkTransition.value = {
+    ...transition,
+    phase: retryPhase,
+    errorReason: undefined,
+  }
   try {
-    const res = await rpc.call<{ key?: string }>('sessions.fork', { key: parentKey })
-    const childKey = typeof res?.key === 'string' ? res.key : ''
-    if (!childKey) throw new Error('sessions.fork returned no key')
-    router.push({ path: '/chat', query: { session: childKey } }).catch(() => {})
+    if (
+      sessionKey.value !== transition.targetKey
+      || readSessionFromUrl() !== transition.targetKey
+    ) {
+      const navigationFailure = await router.push({
+        path: '/chat',
+        query: { session: transition.targetKey },
+      })
+      if (!isForkTransitionActive(transition.generation)) return
+      if (navigationFailure && readSessionFromUrl() !== transition.targetKey) {
+        throw navigationFailure
+      }
+      return
+    }
+    if (livePhase.value === 'degraded') void retryLive()
+    void retryHistory()
+  } catch (error) {
+    failForkTransition(transition.generation, 'navigation', error)
+  }
+}
+
+async function returnToForkParent() {
+  const transition = forkTransition.value
+  if (!transition || !isForkTransitionActive(transition.generation)) return
+  if (
+    sessionKey.value === transition.parentKey
+    && readSessionFromUrl() === transition.parentKey
+  ) {
+    if (
+      transition.targetKey === transition.parentKey
+      && historySessionKey.value === transition.parentKey
+      && historyState.value.initialLoadStatus !== 'ready'
+    ) {
+      if (transition.phase === 'error') {
+        await retryForkTransition()
+        if (!isForkTransitionActive(transition.generation)) return
+      }
+      return
+    }
+    clearForkTransition(transition.generation)
+    return
+  }
+  forkTransition.value = {
+    ...transition,
+    targetKey: transition.parentKey,
+    phase: 'returning',
+    errorReason: undefined,
+  }
+  try {
+    const navigationFailure = await router.push({
+      path: '/chat',
+      query: { session: transition.parentKey },
+    })
+    if (!isForkTransitionActive(transition.generation)) return
+    if (navigationFailure && readSessionFromUrl() !== transition.parentKey) {
+      throw navigationFailure
+    }
+  } catch (error) {
+    failForkTransition(transition.generation, 'navigation', error)
+  }
+}
+
+async function forkConversation(throughTurnId?: string) {
+  const parentKey = sessionKey.value
+  if (!parentKey || forkTransition.value) return
+  if (pendingSessionIntent.value === 'new_chat' || isStreaming.value) return
+  const normalizedTurnId = throughTurnId?.trim() || undefined
+  const generation = forkTransitionLifetime.begin()
+  if (!generation) return
+  forkTransition.value = {
+    generation,
+    parentKey,
+    childKey: '',
+    targetKey: parentKey,
+    ...(normalizedTurnId ? { throughTurnId: normalizedTurnId } : {}),
+    phase: 'creating',
+    previewMessages: snapshotForkPreviewMessages(renderedMessages.value, normalizedTurnId),
+  }
+  try {
+    const request = forkRpcRequest(parentKey, normalizedTurnId)
+    const res = await rpc.call<ForkRpcResponse>(request.method, request.params)
+    if (!isForkTransitionActive(generation)) return
+    const childKey = validatedForkChildKey(res, normalizedTurnId)
+    if (sessionKey.value !== parentKey) {
+      clearForkTransition(generation)
+      return
+    }
+    forkTransition.value = {
+      ...forkTransition.value,
+      childKey,
+      targetKey: childKey,
+      phase: 'opening',
+    }
+    const navigationFailure = await router.push({
+      path: '/chat',
+      query: { session: childKey },
+    })
+    if (!isForkTransitionActive(generation)) return
+    if (navigationFailure && readSessionFromUrl() !== childKey) {
+      throw navigationFailure
+    }
   } catch (err) {
-    console.warn('Fork failed:', err)
-    pushToast(t('chat.toast.forkFailed'), { tone: 'danger' })
-  } finally {
-    forkInFlight.value = false
+    if (!isForkTransitionActive(generation)) return
+    const childCreated = Boolean(forkTransition.value?.childKey)
+    if (childCreated) {
+      failForkTransition(generation, 'navigation', err)
+    } else if (forkTransition.value?.generation === generation) {
+      console.warn('Fork failed:', err)
+      clearForkTransition(generation)
+      pushToast(t('chat.toast.forkFailed'), { tone: 'danger' })
+    }
   }
 }
 
@@ -3310,21 +3951,76 @@ function scrollToBottom() {
 }
 
 function onThreadScroll() {
-  if (!threadRef.value) return
-  const gap = threadRef.value.scrollHeight - threadRef.value.scrollTop - threadRef.value.clientHeight
+  const el = threadRef.value
+  if (!el) return
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
   historyNavigationScrollLock.updateFromScroll(gap)
+  if (isNewChatLanding.value || !composerFxEnabled.value) {
+    resetComposerRetraction()
+    return
+  }
+  const wasCollapsed = composerCollapsed.value
+  composerCollapsed.value = composerRetraction.observe({
+    scrollTop: el.scrollTop,
+    bottomGap: gap,
+    intent: currentThreadScrollIntent(),
+    canCollapse: !slashOpen.value && (composerRef.value?.canCollapse() ?? true),
+    navigationLocked: historyNavigationScrollLock.locked,
+  })
+  if (composerCollapsed.value !== wasCollapsed) clearPendingComposerScrollIntent()
+}
+
+function onThreadWheel(event: WheelEvent) {
+  if (event.deltaY === 0) return
+  markThreadScrollIntent(event.deltaY < 0 ? 'up' : 'down')
+}
+
+function onThreadPointerMove(event: PointerEvent) {
+  if (event.buttons !== 0 || event.pointerType === 'touch') {
+    markThreadScrollIntent('either')
+  }
+}
+
+function onThreadScrollKeydown(event: KeyboardEvent) {
+  if (event.target !== event.currentTarget) return
+  const up = event.key === 'ArrowUp'
+    || event.key === 'PageUp'
+    || event.key === 'Home'
+    || (event.key === ' ' && event.shiftKey)
+  const down = event.key === 'ArrowDown'
+    || event.key === 'PageDown'
+    || event.key === 'End'
+    || (event.key === ' ' && !event.shiftKey)
+  if (up || down) markThreadScrollIntent(up ? 'up' : 'down')
+}
+
+function syncComposerRetractionFromThread() {
+  const el = threadRef.value
+  if (!el) return
+  clearPendingComposerScrollIntent()
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
+  historyNavigationScrollLock.updateFromScroll(gap)
+  composerCollapsed.value = composerRetraction.observe({
+    scrollTop: el.scrollTop,
+    bottomGap: gap,
+    intent: null,
+    canCollapse: !slashOpen.value && (composerRef.value?.canCollapse() ?? true),
+    navigationLocked: false,
+  })
 }
 
 function onHistoryNavigate() {
   cancelAnchorStabilization()
+  syncComposerRetractionFromThread()
   historyNavigationScrollLock.start()
 }
 
 function onHistoryNavigateEnd() {
   historyNavigationScrollLock.finish()
-  // Reconcile once at the final position: scroll events emitted during the
-  // smooth transition were intentionally ignored while the lock was active.
-  onThreadScroll()
+  // Smooth-scroll frames and the final arrival are navigation, not transcript
+  // browsing gestures. Establish a baseline without toggling the composer.
+  syncComposerRetractionFromThread()
+  if (autoScroll.value) expandComposer()
 }
 
 // Show the jump-to-latest affordance whenever the reader has scrolled up off the
@@ -3334,6 +4030,7 @@ const showJumpToLatest = computed(() => !autoScroll.value && messages.value.leng
 function jumpToLatest() {
   cancelAnchorStabilization()
   historyNavigationScrollLock.finish()
+  expandComposer()
   autoScroll.value = true
   scrollToBottom()
 }
@@ -3474,7 +4171,10 @@ function consumeDraftPrefill() {
   landingPrefilled.value = true
   // A Sessions Hub "Start task" hand-off also asks the draft to send the
   // prefill in one step; the actual flush waits for the subscription in onMounted.
-  if (state?.autosend === true) pendingAutoSend.value = prefill
+  if (state?.autosend === true) {
+    pendingAutoSend.value = prefill
+    pendingAutoSendSessionKey.value = sessionKey.value
+  }
   try {
     window.history.replaceState({ ...window.history.state, prefill: undefined, autosend: undefined }, '')
   } catch { /* ignore */ }
@@ -3649,6 +4349,7 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
 // provisional key stays out of the URL and storage until the first send.
 function enterDraft() {
   landingPrefilled.value = false
+  provisionalDraftUsed = false
   const agentId = draftAgentId()
   const isFreshDraft = pendingSessionIntent.value === 'new_chat'
     && messages.value.length === 0
@@ -3659,7 +4360,10 @@ function enterDraft() {
   if (isDesktopViewport.value) composerRef.value?.focusTextarea()
 }
 
+let chatViewActive = false
+
 onMounted(async () => {
+  chatViewActive = true
   chatViewDisposed = false
   const initialRouteFullPath = route.fullPath
   // Initialize session key. Without an explicit ?session= the view opens as a
@@ -3714,14 +4418,50 @@ onMounted(async () => {
     : sessionBootstrap.live.then(() =>
         syncDraftProjectFromRoute(initialDraftProjectGeneration!),
       )
-  // Composer resize observer
-  const composerEl = composerRef.value?.composerElement()
-  if (composerEl) {
-    composerResizeObserver = new ResizeObserver(() => {
-      const h = composerRef.value?.composerElement()?.getBoundingClientRect().height || 0
-      document.documentElement.style.setProperty('--composer-h', h + 'px')
-    })
-    composerResizeObserver.observe(composerEl)
+
+  // Provisional Meta draft discovery is detached from the critical bootstrap.
+  // It may rebind only an untouched draft and never delays ordinary chat.
+  if (initialSession.draft) metaDraftRecovery.start(draftAgentId())
+  const initialMetaSessionKey = sessionKey.value
+  void sessionBootstrap.live.then((outcome) => {
+    if (
+      outcome.authoritative
+      && chatViewActive
+      && sessionKey.value === initialMetaSessionKey
+    ) {
+      if (initialSession.draft) metaDraftRecovery.retry(draftAgentId())
+      return Promise.all([
+        metaRuns.hydrateRecovery(),
+        restoreDurableMetaControls(initialMetaSessionKey),
+      ])
+    }
+  }).catch((error: unknown) => {
+    console.warn(
+      'Initial Meta recovery failed:',
+      error instanceof Error ? error.message : error,
+    )
+  })
+  // The entire dock can grow through attachments, pending work, and textarea
+  // autoresize. Publish its real height locally so the thread always reserves
+  // exactly enough clearance for the floating surface.
+  const composerDock = composerRef.value?.composerElement()?.parentElement ?? null
+  if (composerDock && typeof ResizeObserver !== 'undefined') {
+    const publishComposerDockHeight = () => {
+      const height = Math.ceil(composerDock.getBoundingClientRect().height)
+      if (height === lastComposerDockHeight) return
+      lastComposerDockHeight = height
+      threadRef.value?.style.setProperty('--composer-dock-h', `${height}px`)
+      if (autoScroll.value && composerDockPinFrame === null) {
+        composerDockPinFrame = requestAnimationFrame(() => {
+          composerDockPinFrame = null
+          const thread = threadRef.value
+          if (thread && autoScroll.value) thread.scrollTop = thread.scrollHeight
+        })
+      }
+    }
+    composerDockResizeObserver = new ResizeObserver(publishComposerDockHeight)
+    composerDockResizeObserver.observe(composerDock)
+    publishComposerDockHeight()
   }
 
   // Focus textarea on desktop
@@ -3777,7 +4517,12 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  chatViewActive = false
   chatViewDisposed = true
+  forkTransitionLifetime.dispose()
+  forkTransition.value = null
+  durableRecoveryGeneration += 1
+  metaDraftRecovery.invalidate()
   draftProjectHydration.invalidate()
   cancelSessionBootstrap()
   releaseOptionalRpcAdmission?.()
@@ -3794,8 +4539,16 @@ onUnmounted(() => {
   cleanupVoiceInput()
   chatApprovals.cleanup()
   metaRuns.cleanup()
-  if (composerResizeObserver) { composerResizeObserver.disconnect(); composerResizeObserver = null }
-  document.documentElement.style.removeProperty('--composer-h')
+  if (composerDockResizeObserver) {
+    composerDockResizeObserver.disconnect()
+    composerDockResizeObserver = null
+  }
+  if (composerDockPinFrame !== null) {
+    cancelAnimationFrame(composerDockPinFrame)
+    composerDockPinFrame = null
+  }
+  clearPendingComposerScrollIntent()
+  threadRef.value?.style.removeProperty('--composer-dock-h')
   // Drop any live share-preview object URL so the blob can be reclaimed.
   if (sharePreview.value) {
     URL.revokeObjectURL(sharePreview.value.url)
@@ -3807,24 +4560,103 @@ useDocumentEvent('paste', onDocumentPaste)
 useDocumentEvent('keydown', onDocumentKeydown)
 
 // Watch for route changes
-watch(() => route.query.session, (newSession) => {
+watch(() => route.query.session, async (newSession) => {
+  durableRecoveryGeneration += 1
+  metaDraftRecovery.invalidate()
+  const transition = forkTransition.value
+  if (transition) {
+    const handoffAction = forkRouteHandoffAction(newSession, transition)
+    if (handoffAction === 'returning') {
+      forkTransition.value = {
+        ...transition,
+        targetKey: transition.parentKey,
+        phase: 'returning',
+        errorReason: undefined,
+      }
+    } else if (handoffAction === 'clear') {
+      clearForkTransition(transition.generation)
+    }
+  }
   if (newSession && typeof newSession === 'string') {
     recordSessionNavigationDiag('route.query.session', {
       from: sessionKey.value,
       to: newSession,
       routeSession: newSession,
     })
-    switchToSession(newSession)
+    await switchToSession(newSession)
   }
 })
 
+// A route switch briefly retains the parent's terminal history status. Require
+// the history composable to bind to the child key before treating `ready` as
+// hand-off completion, otherwise the preview would disappear one tick early.
+watch(
+  () => [
+    sessionKey.value,
+    historySessionKey.value,
+    historyState.value.initialLoadStatus,
+  ] as const,
+  ([activeKey, loadedKey, status]) => {
+    const transition = forkTransition.value
+    if (
+      !transition
+      || transition.phase === 'creating'
+      || !transition.targetKey
+      || activeKey !== transition.targetKey
+      || loadedKey !== transition.targetKey
+    ) return
+    if (status === 'ready') {
+      clearForkTransition(transition.generation)
+    } else if (status === 'error') {
+      failForkTransition(
+        transition.generation,
+        'history',
+        new Error('Child history failed to load'),
+      )
+    }
+  },
+)
+
+watch(
+  () => [sessionKey.value, livePhase.value] as const,
+  ([activeKey, phase]) => {
+    const transition = forkTransition.value
+    if (
+      transition?.phase !== 'creating'
+      && transition?.targetKey === activeKey
+      && phase === 'degraded'
+    ) {
+      failForkTransition(
+        transition.generation,
+        'live',
+        new Error('Child live subscription unavailable'),
+      )
+    }
+  },
+)
+
 // Entering the draft route resets to a clean draft for the requested agent.
 watch(() => [route.path, route.query.agent, route.query.project], async () => {
+  durableRecoveryGeneration += 1
+  metaDraftRecovery.invalidate()
   const generation = draftProjectHydration.begin()
   if (!isDraftRoute()) return
   if (!await syncDraftProjectFromRoute(generation)) return
   enterDraft()
+  metaDraftRecovery.start(draftAgentId())
 })
+
+watch(inputText, (value) => {
+  if (value.length > 0) markProvisionalDraftUsed()
+}, { flush: 'sync' })
+
+watch(() => pendingAttachments.value.length, (count) => {
+  if (count > 0) markProvisionalDraftUsed()
+}, { flush: 'sync' })
+
+watch(() => pendingQueue.value.length, (count) => {
+  if (count > 0) markProvisionalDraftUsed()
+}, { flush: 'sync' })
 
 // Explicit new-task actions must reset even when navigation targets the exact
 // draft URL already on screen (for example, clicking the same project pencil).

@@ -222,9 +222,10 @@ literal value `none` for empty `ON_SCREEN_TEXT`.
 User wrote the request in Chinese, so every field is Chinese — including
 IMAGE_PROMPT and VIDEO_PROMPT. Seedance 2.0 and Gemini 3.1 image both
 handle these prompts natively. Note the RENDER_STYLE is photoreal
-cinematic (an opt-in style — downstream seedance moderation MAY refuse
-photoreal human faces; the meta-skill's video step retries twice then
-falls back to a Ken-Burns clip if the model persistently refuses).
+cinematic (an explicit opt-in style — downstream Seedance moderation MAY
+refuse photoreal human references; a provider-policy refusal stops
+immediately without another paid submission, then the workflow falls back
+to a degraded Ken-Burns clip).
 
 Caller passes:
 - `with.identity_anchor` = `陆,28岁东亚男性,背头黑发,无框眼镜,深灰色定制西装,气场冷峻;张,35岁东亚女性,波浪长卷发,浓妆,白色职业套装,神情傲慢`

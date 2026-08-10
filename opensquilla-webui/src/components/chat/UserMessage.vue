@@ -153,7 +153,7 @@ const { copyState, copyIconName, copyTitle, copyLiveText, onCopyClick } = useCop
 const now = useRelativeNow()
 const timeIso = computed(() => isoTime(props.message.ts))
 const timeAbs = computed(() => absoluteTime(props.message.ts))
-const timeRel = computed(() => relativeTime(props.message.ts, now.value))
+const timeRel = computed(() => relativeTime(props.message.ts, now.value, t))
 const timeFull = computed(() => fullTime(props.message.ts))
 const STEER_WAIT_DETAIL_DELAY_MS = 700
 const showSteerWaitDetail = ref(false)

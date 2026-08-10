@@ -271,6 +271,7 @@ from opensquilla.session.terminal_reply import (
     build_terminal_reply,
     sanitize_agent_error,
 )
+from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
 from opensquilla.token_estimation import estimate_tokens
 from opensquilla.tools.description_overrides import resolve_tool_description_overrides
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
@@ -290,7 +291,7 @@ _DEFAULT_AGENT_RUNTIME_TIMEOUT_SECONDS: float = 48 * 60 * 60
 _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS: float = 120.0
 _DEFAULT_LLM_TIMEOUT_SECONDS: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
 _WEB_CHAT_META_EXEMPT_KEYS: Final[frozenset[str]] = frozenset(
-    {"meta_match", "meta_launch", "meta_resume"}
+    {"meta_match", "meta_launch", "meta_resume", "meta_replay", "meta_replay_error"}
 )
 _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
@@ -3566,6 +3567,7 @@ class TurnRunner:
                 else None
             ),
         )
+        configured_state_dir = getattr(self._turn_config(), "state_dir", None)
         # Planning is deliberately ephemeral analysis: it may inspect durable
         # memory, but the planning conversation itself must not be harvested
         # into long-lived memory. The frozen collaboration mode is authoritative
@@ -3584,51 +3586,7 @@ class TurnRunner:
         if _caller_holds_lock:
             # Same call chain already serializes this turn.
             try:
-                async for event in self._run_turn(
-                    message,
-                    session_key,
-                    agent_id,
-                    model,
-                    attachments or [],
-                    effective_tool_context,
-                    timeout=timeout,
-                    max_iterations=max_iterations,
-                    iteration_timeout=iteration_timeout,
-                    tool_timeout=tool_timeout,
-                    request_timeout=request_timeout,
-                    max_provider_retries=max_provider_retries,
-                    length_capped_continuations=length_capped_continuations,
-                    input_mode=input_mode,
-                    persist_input=persist_input,
-                    input_provenance=normalized_input_provenance,
-                    history_has_persisted_user=history_has_persisted_user,
-                    fresh_user_session=fresh_user_session,
-                    session_intent=session_intent,
-                    semantic_message=semantic_message,
-                    pending_input_provider=pending_input_provider,
-                    run_kind=run_kind,
-                    heartbeat_ack_max_chars=heartbeat_ack_max_chars,
-                    bootstrap_context_mode=bootstrap_context_mode,
-                    no_memory_capture=no_memory_capture,
-                    ingress_pipeline_steps=ingress_pipeline_steps,
-                    router_control_replay_depth=router_control_replay_depth,
-                    bound_user_message_id=bound_user_message_id,
-                    assistant_message_sink=assistant_message_sink,
-                    root_turn_id=root_turn_id,
-                    provider_request_correlation=provider_request_correlation,
-                ):
-                    yield event
-            finally:
-                self.clear_compaction_turn_state(session_key)
-        else:
-            async with lock:
-                # Record this Task as the lock owner in the ContextVar so that
-                # any nested call to run() within the same Task can detect re-entry.
-                _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})
-                if current_task is not None:
-                    _map[id(lock)] = current_task
-                _token = _SESSION_LOCK_OWNER.set(_map)
-                try:
+                with managed_toolchain_state_scope(configured_state_dir):
                     async for event in self._run_turn(
                         message,
                         session_key,
@@ -3663,6 +3621,52 @@ class TurnRunner:
                         provider_request_correlation=provider_request_correlation,
                     ):
                         yield event
+            finally:
+                self.clear_compaction_turn_state(session_key)
+        else:
+            async with lock:
+                # Record this Task as the lock owner in the ContextVar so that
+                # any nested call to run() within the same Task can detect re-entry.
+                _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})
+                if current_task is not None:
+                    _map[id(lock)] = current_task
+                _token = _SESSION_LOCK_OWNER.set(_map)
+                try:
+                    with managed_toolchain_state_scope(configured_state_dir):
+                        async for event in self._run_turn(
+                            message,
+                            session_key,
+                            agent_id,
+                            model,
+                            attachments or [],
+                            effective_tool_context,
+                            timeout=timeout,
+                            max_iterations=max_iterations,
+                            iteration_timeout=iteration_timeout,
+                            tool_timeout=tool_timeout,
+                            request_timeout=request_timeout,
+                            max_provider_retries=max_provider_retries,
+                            length_capped_continuations=length_capped_continuations,
+                            input_mode=input_mode,
+                            persist_input=persist_input,
+                            input_provenance=normalized_input_provenance,
+                            history_has_persisted_user=history_has_persisted_user,
+                            fresh_user_session=fresh_user_session,
+                            session_intent=session_intent,
+                            semantic_message=semantic_message,
+                            pending_input_provider=pending_input_provider,
+                            run_kind=run_kind,
+                            heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                            bootstrap_context_mode=bootstrap_context_mode,
+                            no_memory_capture=no_memory_capture,
+                            ingress_pipeline_steps=ingress_pipeline_steps,
+                            router_control_replay_depth=router_control_replay_depth,
+                            bound_user_message_id=bound_user_message_id,
+                            assistant_message_sink=assistant_message_sink,
+                            root_turn_id=root_turn_id,
+                            provider_request_correlation=provider_request_correlation,
+                        ):
+                            yield event
                 finally:
                     self.clear_compaction_turn_state(session_key)
                     _SESSION_LOCK_OWNER.reset(_token)
@@ -6904,6 +6908,14 @@ class TurnRunner:
             from opensquilla.skills.loader import PinnedSkillLoader
 
             agent_skill_loader = PinnedSkillLoader(skill_catalog, self._skill_loader)
+        from opensquilla.skills.meta.readiness import (
+            META_READINESS_ENV_ALIASES_METADATA_KEY,
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
+            configured_meta_readiness_env_aliases,
+            configured_meta_skill_runtime_env,
+        )
+
+        turn_config = self._turn_config()
         initial_metadata: dict[str, Any] = {
             # Agent-side skill_view coercion, meta execution, and child
             # orchestrators must resolve against the same generation used for
@@ -6941,6 +6953,31 @@ class TurnRunner:
                     )
                     if tool_context is not None
                     else ""
+                )
+            ),
+            # Opaque callable only: credential bytes never enter metadata,
+            # transcripts, persisted inputs, or manifest-rendered arguments.
+            # The Agent must supply the current parent spec and the exact plan
+            # it is about to execute; the callable fails closed for any
+            # workspace/project parent or paid-step contract drift.
+            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY: (
+                lambda parent_spec, plan: configured_meta_skill_runtime_env(
+                    turn_config,
+                    parent_spec=parent_spec,
+                    plan=plan,
+                    session_key=session_key,
+                    skill_resolver=agent_skill_loader,
+                )
+            ),
+            # Names only, likewise parent+plan scoped. A global alias would
+            # make an untrusted MetaSkill appear executable even though no
+            # capability lease could safely be injected into its child.
+            META_READINESS_ENV_ALIASES_METADATA_KEY: (
+                lambda parent_spec, plan: configured_meta_readiness_env_aliases(
+                    turn_config,
+                    parent_spec=parent_spec,
+                    plan=plan,
+                    skill_resolver=agent_skill_loader,
                 )
             ),
         }
@@ -7046,7 +7083,7 @@ class TurnRunner:
         turn = TurnContext(
             message=message,
             session_key=session_key,
-            config=self._turn_config(),
+            config=turn_config,
             provider=provider,
             model="",
             tool_defs=tool_defs,
