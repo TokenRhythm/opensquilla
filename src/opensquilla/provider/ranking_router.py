@@ -37,8 +37,9 @@ RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-05.1"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-05.1"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-10.1"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-10.1"
+_PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-05.1"
 _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-27.1"
 _PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-22.1"
 _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
@@ -50,10 +51,19 @@ _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
     }
 )
 _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
-    {"step2-ranking-2026-08-02.2"}
+    {
+        "step2-ranking-2026-08-02.2",
+        _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION,
+    }
 )
 _HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset(
     {"curated-openrouter-step2-2026-07-31.1"}
+)
+_ROLE_RELIABILITY_SNAPSHOT_SCHEMA_VERSIONS = frozenset(
+    {"role-reliability-snapshot-v1", "role-reliability-snapshot-v2"}
+)
+_TRUSTED_PACKAGED_RELIABILITY_POLICIES = frozenset(
+    {"aef-physical-model-calls-v5", "legacy-statistics-invalidated-v1"}
 )
 _PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-27.1"
 _LEGACY_PACKAGED_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-24.3"
@@ -1993,7 +2003,14 @@ def _ranking_config_for_base_version(
         )
     historical = copy.deepcopy(dict(packaged))
     historical["config_version"] = requested
-    historical.pop("role_reliability", None)
+    if requested == _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION:
+        historical["role_reliability"] = {
+            "penalty_weight": 0.40,
+            "prior_success": 9,
+            "prior_failure": 1,
+        }
+    else:
+        historical.pop("role_reliability", None)
     return _validate_ranking_config(historical)
 
 
@@ -4523,7 +4540,111 @@ def _packaged_registry_snapshot() -> dict[str, Any]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001 - surfaced as a precise startup/build error
         raise DynamicRankingError("router_dynamic model registry snapshot unavailable") from exc
-    return _validate_registry_snapshot(payload)
+    validated = _validate_registry_snapshot(payload)
+    _validate_packaged_role_reliability_provenance(validated)
+    return validated
+
+
+def _validate_packaged_role_reliability_provenance(
+    snapshot: Mapping[str, Any],
+) -> None:
+    """Reject packaged reliability counts produced by obsolete attribution rules."""
+
+    models = snapshot.get("models")
+    rows = models if isinstance(models, list) else []
+    has_reliability = any(
+        isinstance(row, Mapping)
+        and isinstance(row.get("online_profile"), Mapping)
+        and "role_reliability" in row["online_profile"]
+        for row in rows
+    )
+    provenance = snapshot.get("role_reliability_snapshot")
+    if not has_reliability and provenance is None:
+        return
+    if not isinstance(provenance, Mapping):
+        raise DynamicRankingError(
+            "router_dynamic packaged reliability profiles lack snapshot provenance"
+        )
+    schema = str(provenance.get("schema_version") or "").strip()
+    if schema not in _ROLE_RELIABILITY_SNAPSHOT_SCHEMA_VERSIONS:
+        raise DynamicRankingError(
+            "router_dynamic packaged reliability provenance schema is unsupported"
+        )
+    policy = str(provenance.get("observation_policy") or "").strip()
+    if policy not in _TRUSTED_PACKAGED_RELIABILITY_POLICIES:
+        raise DynamicRankingError(
+            "router_dynamic packaged reliability observation policy is obsolete"
+        )
+    if policy == "aef-physical-model-calls-v5":
+        _validate_role_reliability_snapshot_content_hash(snapshot, provenance)
+        return
+    if provenance.get("completion_gate") != "legacy_statistics_invalidated":
+        raise DynamicRankingError(
+            "router_dynamic invalidated reliability snapshot has an invalid gate"
+        )
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        online_profile = row.get("online_profile")
+        reliability = (
+            online_profile.get("role_reliability")
+            if isinstance(online_profile, Mapping)
+            else None
+        )
+        if not isinstance(reliability, Mapping):
+            raise DynamicRankingError(
+                "router_dynamic invalidated reliability snapshot lacks zero profiles"
+            )
+        if reliability.get("source") != "legacy_statistics_invalidated":
+            raise DynamicRankingError(
+                "router_dynamic invalidated reliability snapshot has an invalid source"
+            )
+        for role in _MODEL_ROLES:
+            counts = reliability.get(role)
+            if not isinstance(counts, Mapping) or any(
+                counts.get(field) != 0 for field in ("success", "failure")
+            ):
+                raise DynamicRankingError(
+                    "router_dynamic invalidated reliability snapshot has nonzero counts"
+                )
+    if schema == "role-reliability-snapshot-v2":
+        _validate_role_reliability_snapshot_content_hash(snapshot, provenance)
+
+
+def _role_reliability_snapshot_content_sha256(
+    models: Sequence[Any],
+    provenance: Mapping[str, Any],
+) -> str:
+    provenance_without_hash = dict(provenance)
+    provenance_without_hash.pop("content_sha256", None)
+    return _canonical_hash(
+        {
+            "models": list(models),
+            "role_reliability_snapshot": provenance_without_hash,
+        }
+    )
+
+
+def _validate_role_reliability_snapshot_content_hash(
+    snapshot: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> None:
+    if provenance.get("schema_version") != "role-reliability-snapshot-v2":
+        raise DynamicRankingError(
+            "router_dynamic trusted reliability statistics require content-bound provenance"
+        )
+    recorded = str(provenance.get("content_sha256") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", recorded) is None:
+        raise DynamicRankingError(
+            "router_dynamic reliability provenance lacks a valid content_sha256"
+        )
+    models = snapshot.get("models")
+    if not isinstance(models, list) or (
+        _role_reliability_snapshot_content_sha256(models, provenance) != recorded
+    ):
+        raise DynamicRankingError(
+            "router_dynamic reliability provenance content_sha256 differs"
+        )
 
 
 def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, Any]:
@@ -4552,8 +4673,13 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
         raise DynamicRankingError(
             "router_dynamic model registry cannot reconstruct the requested base snapshot"
         )
+    provenance_schema = str(provenance.get("schema_version") or "").strip()
+    if provenance_schema not in _ROLE_RELIABILITY_SNAPSHOT_SCHEMA_VERSIONS:
+        raise DynamicRankingError(
+            "router_dynamic model registry reliability provenance schema is unsupported"
+        )
     recorded_base = str(provenance.get("base_snapshot_version") or "").strip()
-    if recorded_base and recorded_base != requested:
+    if recorded_base != requested:
         raise DynamicRankingError(
             "router_dynamic model registry reliability provenance has a different base"
         )
@@ -5533,11 +5659,8 @@ def _role_reliability_score(
     observed = success + failure
     prior_success = _ranking_int(ranking_config, "role_reliability", "prior_success")
     prior_failure = _ranking_int(ranking_config, "role_reliability", "prior_failure")
-    failure_rate = (
-        0.0
-        if observed == 0
-        else (failure + prior_failure)
-        / (observed + prior_success + prior_failure)
+    failure_rate = (failure + prior_failure) / (
+        observed + prior_success + prior_failure
     )
     penalty_weight = _ranking_number(
         ranking_config,

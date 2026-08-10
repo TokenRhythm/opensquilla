@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-07-31.1-reliability-20260805T103209Z",
+  "snapshot_version": "curated-openrouter-step2-2026-07-31.1-reliability-20260809T173647Z-2032e23bdc3a",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -120,7 +120,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -242,7 +242,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -374,7 +374,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -498,7 +498,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -619,7 +619,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -740,7 +740,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -861,7 +861,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -987,14 +987,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 4,
+            "success": 0,
             "failure": 0
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -1119,14 +1119,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 9,
-            "failure": 1
+            "success": 0,
+            "failure": 0
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -1245,7 +1245,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -1368,7 +1368,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -1482,7 +1482,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -1598,7 +1598,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -1712,7 +1712,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -1835,7 +1835,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -1958,7 +1958,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -2091,7 +2091,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -2217,14 +2217,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 26,
-            "failure": 4
-          },
-          "aggregator": {
-            "success": 30,
+            "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "aggregator": {
+            "success": 0,
+            "failure": 0
+          },
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -2345,14 +2345,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 1,
+            "success": 0,
             "failure": 0
           },
           "aggregator": {
-            "success": 41,
+            "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -2475,14 +2475,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 50,
+            "success": 0,
             "failure": 0
           },
           "aggregator": {
             "success": 0,
-            "failure": 3
+            "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -2606,14 +2606,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 7,
+            "success": 0,
             "failure": 0
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -2744,7 +2744,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -2870,14 +2870,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 28,
-            "failure": 1
+            "success": 0,
+            "failure": 0
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -3010,7 +3010,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -3142,7 +3142,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -3265,7 +3265,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -3399,7 +3399,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -3522,7 +3522,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -3646,7 +3646,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -3769,14 +3769,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 39,
+            "success": 0,
             "failure": 0
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -3904,7 +3904,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -4025,7 +4025,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -4153,7 +4153,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -4274,7 +4274,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -4397,7 +4397,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -4511,7 +4511,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -4632,7 +4632,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -4755,7 +4755,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -4876,7 +4876,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -4998,7 +4998,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -5122,7 +5122,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -5246,7 +5246,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -5362,7 +5362,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -5485,7 +5485,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -5607,7 +5607,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -5722,10 +5722,10 @@
             "failure": 0
           },
           "aggregator": {
-            "success": 4,
+            "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -5844,7 +5844,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -5970,7 +5970,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -6087,7 +6087,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -6213,14 +6213,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 2,
+            "success": 0,
             "failure": 0
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -6343,7 +6343,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -6466,7 +6466,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -6589,7 +6589,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -6710,7 +6710,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -6824,7 +6824,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -6944,7 +6944,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -7065,7 +7065,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -7185,7 +7185,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -7306,7 +7306,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -7427,7 +7427,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -7550,7 +7550,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -7672,7 +7672,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -7792,7 +7792,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -7912,7 +7912,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -8036,7 +8036,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -8156,7 +8156,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -8280,7 +8280,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -8397,7 +8397,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -8527,7 +8527,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -8643,7 +8643,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -8765,7 +8765,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -8885,7 +8885,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -9002,7 +9002,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -9125,7 +9125,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -9246,7 +9246,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -9372,7 +9372,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -9488,7 +9488,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -9606,7 +9606,7 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     },
@@ -9723,50 +9723,35 @@
             "success": 0,
             "failure": 0
           },
-          "source": "aef_experiment_artifacts"
+          "source": "legacy_statistics_invalidated"
         }
       }
     }
   ],
   "role_reliability_snapshot": {
-    "schema_version": "role-reliability-snapshot-v1",
-    "generated_at": "2026-08-05T10:32:09Z",
+    "schema_version": "role-reliability-snapshot-v2",
+    "generated_at": "2026-08-09T17:36:47+00:00",
     "base_snapshot_version": "curated-openrouter-step2-2026-07-31.1",
     "window_size": 50,
-    "source_artifacts": [
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1"
-    ],
-    "source_output_files": [
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/001-task_log_apache_error_summary/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/002-task_csv_cities_filter/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/003-task_events/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/004-task_meeting_council_neighborhood/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/005-task_browser_automation/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/006-task_calendar/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/007-task_meeting_council_contact_info/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/008-task_meeting_tech_product_features/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/009-task_stock/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/010-task_meeting_tech_competitors/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/011-task_pdf_to_calendar/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/012-task_csv_gdp_ranking/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/013-task_meeting_gov_speaker_summary/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/014-task_log_apache_top_errors/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/015-task_clawdhub/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/016-task_byok_best_practices/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/017-task_daily_summary/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/018-task_csv_stock_volatility/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/019-task_gws_cross_service/attempt-1.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/019-task_gws_cross_service/attempt-2.json",
-      "aef-report://pinch-bench/opensquilla-pinch-random20-20260805-003111/outputs/G1/020-task_meeting_executive_summary/attempt-1.json"
-    ],
-    "observation_policy": "aef-physical-model-calls-v3",
-    "completion_gate": "complete_with_audit_override",
+    "source_artifacts": [],
+    "source_output_files": [],
+    "source_output_file_hashes": [],
+    "source_evidence_file_hashes": [],
+    "observation_policy": "legacy-statistics-invalidated-v1",
+    "completion_gate": "legacy_statistics_invalidated",
+    "allowed_audit_issue_codes": [],
     "ordering_granularity": "task_aggregate",
-    "raw_physical_calls": 280,
-    "framework_neutral_calls": 8,
-    "attributable_calls": 272,
-    "window_calls": 250,
-    "duplicate_attempts_excluded": 1,
-    "unclassified_requests": 0
+    "raw_physical_calls": 0,
+    "framework_neutral_calls": 0,
+    "attributable_calls": 0,
+    "unknown_outcome_calls": 0,
+    "max_unknown_outcome_rate": 0.0,
+    "window_calls": 0,
+    "duplicate_attempts_excluded": 0,
+    "unclassified_requests": 0,
+    "invalidated_snapshot_version": "curated-openrouter-step2-2026-07-31.1-reliability-20260805T103209Z",
+    "invalidated_observation_policy": "aef-physical-model-calls-v3",
+    "invalidation_reason": "residual_ledger_rows_lacked_authenticated_outcomes",
+    "content_sha256": "2032e23bdc3a937d0225700cf81e4ac8e0dd0afaa58a683decb100bd0d930a08"
   }
 }

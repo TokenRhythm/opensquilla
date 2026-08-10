@@ -599,7 +599,33 @@ def _usage_from_done(
             ]
         ensemble_trace = getattr(source, "ensemble_trace", None)
         if isinstance(ensemble_trace, dict) and ensemble_trace:
-            usage["ensemble_trace"] = dict(ensemble_trace)
+            usage["ensemble_trace"] = copy.deepcopy(ensemble_trace)
+        ensemble_traces = getattr(source, "ensemble_traces", None)
+        if isinstance(ensemble_traces, list) and ensemble_traces:
+            usage["ensemble_traces"] = [
+                copy.deepcopy(trace)
+                for trace in ensemble_traces
+                if isinstance(trace, dict)
+            ]
+        model_usage_ledger = getattr(source, "model_usage_ledger", None)
+        if isinstance(model_usage_ledger, list) and model_usage_ledger:
+            usage["model_usage_ledger"] = [
+                copy.deepcopy(row)
+                for row in model_usage_ledger
+                if isinstance(row, dict)
+            ]
+        ensemble_calls = getattr(source, "ensemble_calls", None)
+        if isinstance(ensemble_calls, list) and ensemble_calls:
+            usage["ensemble_calls"] = [
+                copy.deepcopy(call)
+                for call in ensemble_calls
+                if isinstance(call, dict)
+            ]
+        physical_audit_schema = str(
+            getattr(source, "physical_audit_schema", "") or ""
+        ).strip()
+        if physical_audit_schema:
+            usage["physical_audit_schema"] = physical_audit_schema
     return usage
 
 

@@ -184,6 +184,13 @@ class ErrorEvent:
     model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
     ensemble_trace: dict[str, Any] | None = None
     usage_missing_count: int = 0
+    # Ordered, per-provider-call audit evidence. ``ensemble_trace`` remains the
+    # backward-compatible terminal/cumulative view, while these additive fields
+    # preserve earlier ensemble calls and their physical-attempt receipts.
+    ensemble_traces: list[dict[str, Any]] = field(default_factory=list)
+    model_usage_ledger: list[dict[str, Any]] = field(default_factory=list)
+    ensemble_calls: list[dict[str, Any]] = field(default_factory=list)
+    physical_audit_schema: str = ""
 
 
 @dataclass
@@ -252,6 +259,13 @@ class DoneEvent:
     # identity in ``model``/``provider``.
     requested_model: str = ""
     requested_provider: str = ""
+    # Ordered, per-provider-call audit evidence. ``ensemble_trace`` and
+    # ``model_usage_breakdown`` remain the backward-compatible aggregate views.
+    # The ledger is intentionally unaggregated so physical_attempt_id survives.
+    ensemble_traces: list[dict[str, Any]] = field(default_factory=list)
+    model_usage_ledger: list[dict[str, Any]] = field(default_factory=list)
+    ensemble_calls: list[dict[str, Any]] = field(default_factory=list)
+    physical_audit_schema: str = ""
 
     @property
     def upstream_cost_usd(self) -> float:

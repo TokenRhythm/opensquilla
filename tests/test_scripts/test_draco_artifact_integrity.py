@@ -46,7 +46,13 @@ def test_sealer_registry_snapshot_selects_by_version_and_hash(
         "snapshot_version": "same-version",
         "models": [{"raw": False}],
     }
-    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", lambda: raw)
+    requested_versions: list[str | None] = []
+
+    def load_snapshot(*, base_version: str | None = None):
+        requested_versions.append(base_version)
+        return raw
+
+    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", load_snapshot)
     monkeypatch.setattr(
         ranking_router,
         "_legacy_registry_snapshot_projection",
@@ -63,6 +69,7 @@ def test_sealer_registry_snapshot_selects_by_version_and_hash(
 
     assert module._formal_registry_snapshot(raw_contract) is raw
     assert module._formal_registry_snapshot(legacy_contract) is legacy
+    assert requested_versions == ["same-version", "same-version"]
 
 
 def test_sealer_registry_snapshot_fails_closed_without_exact_candidate(
@@ -71,7 +78,11 @@ def test_sealer_registry_snapshot_fails_closed_without_exact_candidate(
     module = _load(SEAL_ARTIFACTS, "seal_draco_artifacts_registry_reject_test")
     raw = {"snapshot_version": "same-version", "models": [{"raw": True}]}
     legacy = {"snapshot_version": "same-version", "models": [{"raw": False}]}
-    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", lambda: raw)
+    def load_snapshot(*, base_version: str | None = None):
+        assert base_version is not None
+        return raw
+
+    monkeypatch.setattr(ranking_router, "load_model_registry_snapshot", load_snapshot)
     monkeypatch.setattr(
         ranking_router,
         "_legacy_registry_snapshot_projection",
