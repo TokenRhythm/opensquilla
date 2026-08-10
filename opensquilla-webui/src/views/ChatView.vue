@@ -680,8 +680,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { chatSessionTitlesKey, resolveChatHeaderTitle } from '@/composables/chat/useChatSessionTitles'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useRpcStore } from '@/stores/rpc'
@@ -744,7 +745,6 @@ import type { ShareExportTheme } from '@/composables/chat/useChatShareExport'
 import { useMediaQuery } from '@/composables/chat/useMediaQuery'
 import {
   fmtTok,
-  truncate,
   useChatRenderedMessages,
 } from '@/composables/chat/useChatRenderedMessages'
 import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDecisionRuntime'
@@ -3221,15 +3221,13 @@ function setCollaborationMode(mode: CollaborationMode) {
   void chatPlans.setMode(mode)
 }
 
-const currentChatTitle = computed(() => {
-  const firstUser = messages.value.find(msg => msg.role === 'user' && stripTimePrefix(msg.text || '').trim())
-  if (firstUser) {
-    return truncate(stripTimePrefix(firstUser.text).replace(/\s+/g, ' ').trim(), 28)
-  }
-  const suffix = sessionKey.value.split(':').pop() || ''
-  if (!suffix || suffix === 'default') return t('chat.newChat')
-  return t('chat.chatWithSuffix', { suffix })
-})
+// The session's stored title (manual rename / LLM-generated, display_name
+// first) wins via the App-provided map; the first user message summary is
+// only a fallback for sessions without a meaningful title yet.
+const sessionTitles = inject(chatSessionTitlesKey, computed<Record<string, string>>(() => ({})))
+const currentChatTitle = computed(() =>
+  resolveChatHeaderTitle(sessionKey.value, sessionTitles.value, messages.value, stripTimePrefix)
+)
 
 const chatMarkdownExport = useChatMarkdownExport({
   messages: renderedMessages,

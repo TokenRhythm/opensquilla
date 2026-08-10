@@ -397,10 +397,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
+import { chatSessionTitlesKey } from '@/composables/chat/useChatSessionTitles'
 import { getPlatform } from '@/platform'
 import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { useRpcStore } from './stores/rpc'
@@ -595,6 +596,21 @@ const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: 
 // Pending optimistic renames, keyed by session key; cleared after the next list
 // reload returns the backend's canonical title.
 const renameOverrides = ref<Record<string, string>>({})
+
+// Chat header title source: the backend session list (display_name first) plus
+// local drafts and the optimistic rename override, so the active chat header
+// and the sidebar stay on the same title while a rename is in flight.
+const chatSessionTitles = computed<Record<string, string>>(() => {
+  const titles: Record<string, string> = {}
+  for (const item of allSessions.value) {
+    if (item.key && item.title) titles[item.key] = item.title
+  }
+  for (const [key, local] of Object.entries(localChatSessions.value)) {
+    if (local.title) titles[key] = local.title
+  }
+  return { ...titles, ...renameOverrides.value }
+})
+provide(chatSessionTitlesKey, chatSessionTitles)
 
 const brandMarkUrl = computed(() => {
   if (import.meta.env.DEV) return '/opensquilla-mark.png'
