@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-07-31.1-reliability-20260810T093908Z-7514379532e9",
+  "snapshot_version": "curated-openrouter-step2-2026-07-31.1-reliability-20260810T093908Z-199bd26b2821",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -1141,7 +1141,7 @@
         "provider": "openrouter",
         "vendor": "poolside",
         "family": "laguna-xs",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -1260,7 +1260,7 @@
         "provider": "openrouter",
         "vendor": "tencent",
         "family": "hy3",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -1383,7 +1383,7 @@
         "provider": "openrouter",
         "vendor": "kwaipilot",
         "family": "kat-coder-v2.5",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -1613,7 +1613,7 @@
         "provider": "openrouter",
         "vendor": "kwaipilot",
         "family": "kat-coder-v2.5",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -2628,7 +2628,7 @@
         "provider": "openrouter",
         "vendor": "google",
         "family": "gemini-3.5",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -3025,7 +3025,7 @@
         "provider": "openrouter",
         "vendor": "anthropic",
         "family": "claude-5",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -3791,7 +3791,7 @@
         "provider": "openrouter",
         "vendor": "moonshotai",
         "family": "kimi-k3",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -4168,7 +4168,7 @@
         "provider": "openrouter",
         "vendor": "meituan",
         "family": "longcat-2",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -4647,7 +4647,7 @@
         "provider": "openrouter",
         "vendor": "inclusionai",
         "family": "ring-2",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -4770,7 +4770,7 @@
         "provider": "openrouter",
         "vendor": "z-ai",
         "family": "glm-5",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -5377,7 +5377,7 @@
         "provider": "openrouter",
         "vendor": "google",
         "family": "gemma-4",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -5740,7 +5740,7 @@
         "provider": "openrouter",
         "vendor": "poolside",
         "family": "laguna-s",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -6235,7 +6235,7 @@
         "provider": "openrouter",
         "vendor": "qwen",
         "family": "qwen3",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -6959,7 +6959,7 @@
         "provider": "openrouter",
         "vendor": "deepseek",
         "family": "deepseek-v3",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -8171,7 +8171,7 @@
         "provider": "openrouter",
         "vendor": "tencent",
         "family": "hy3",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -8542,7 +8542,7 @@
         "provider": "openrouter",
         "vendor": "inclusionai",
         "family": "ling-2",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -8658,7 +8658,7 @@
         "provider": "openrouter",
         "vendor": "nex-agi",
         "family": "nex-n2",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -8780,7 +8780,7 @@
         "provider": "openrouter",
         "vendor": "arcee-ai",
         "family": "trinity",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -9387,7 +9387,7 @@
         "provider": "openrouter",
         "vendor": "meta-llama",
         "family": "llama-3",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -9621,7 +9621,7 @@
         "provider": "openrouter",
         "vendor": "google",
         "family": "gemma-3",
-        "status": "enabled",
+        "status": "disabled",
         "roles": [
           "proposer",
           "aggregator"
@@ -9735,6 +9735,6 @@
     "window_size": 50,
     "observation_policy": "aef-physical-model-calls-v5",
     "completion_gate": "manual_thresholded_draco_audit",
-    "content_sha256": "7514379532e93edce91d589c97da9f314ea68412a1cfc83f134206860534631b"
+    "content_sha256": "199bd26b28215c9f751c723e0655fe06784d6aa991eb1b1879752f267fcacfd6"
   }
 }

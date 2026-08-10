@@ -59,6 +59,30 @@ _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
 _HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset(
     {"curated-openrouter-step2-2026-07-31.1"}
 )
+_POST_BASE_DISABLED_MODEL_IDS = frozenset(
+    {
+        "anthropic/claude-fable-5",
+        "arcee-ai/trinity-large-thinking",
+        "deepseek/deepseek-v3.1-terminus",
+        "google/gemini-3.5-flash",
+        "google/gemma-3-27b-it",
+        "google/gemma-4-26b-a4b-it",
+        "inclusionai/ling-2.6-1t",
+        "inclusionai/ring-2.6-1t",
+        "kwaipilot/kat-coder-air-v2.5",
+        "kwaipilot/kat-coder-pro-v2.5",
+        "meituan/longcat-2.0",
+        "meta-llama/llama-3.3-70b-instruct",
+        "moonshotai/kimi-k3",
+        "nex-agi/nex-n2-pro",
+        "poolside/laguna-s-2.1",
+        "poolside/laguna-xs-2.1",
+        "qwen/qwen3.6-27b",
+        "tencent/hy3",
+        "tencent/hy3-preview",
+        "z-ai/glm-5.1",
+    }
+)
 _ROLE_RELIABILITY_SNAPSHOT_SCHEMA_VERSIONS = frozenset(
     {"role-reliability-snapshot-v1", "role-reliability-snapshot-v2"}
 )
@@ -4939,6 +4963,13 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
         online_profile = row.get("online_profile")
         if isinstance(online_profile, dict):
             online_profile.pop("role_reliability", None)
+        facts = row.get("registry_facts")
+        if (
+            isinstance(facts, dict)
+            and str(facts.get("model_id") or "").strip()
+            in _POST_BASE_DISABLED_MODEL_IDS
+        ):
+            facts["status"] = "enabled"
     return _validate_registry_snapshot(historical)
 
 

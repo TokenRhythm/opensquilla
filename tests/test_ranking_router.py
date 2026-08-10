@@ -1115,6 +1115,32 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
     ]
     assert len(curated_models) == 79
     by_model_id = {model["registry_facts"]["model_id"]: model for model in curated_models}
+    assert {
+        model_id
+        for model_id, model in by_model_id.items()
+        if model["registry_facts"]["status"] == "disabled"
+    } == {
+        "anthropic/claude-fable-5",
+        "arcee-ai/trinity-large-thinking",
+        "deepseek/deepseek-v3.1-terminus",
+        "google/gemini-3.5-flash",
+        "google/gemma-3-27b-it",
+        "google/gemma-4-26b-a4b-it",
+        "inclusionai/ling-2.6-1t",
+        "inclusionai/ring-2.6-1t",
+        "kwaipilot/kat-coder-air-v2.5",
+        "kwaipilot/kat-coder-pro-v2.5",
+        "meituan/longcat-2.0",
+        "meta-llama/llama-3.3-70b-instruct",
+        "moonshotai/kimi-k3",
+        "nex-agi/nex-n2-pro",
+        "poolside/laguna-s-2.1",
+        "poolside/laguna-xs-2.1",
+        "qwen/qwen3.6-27b",
+        "tencent/hy3",
+        "tencent/hy3-preview",
+        "z-ai/glm-5.1",
+    }
     assert by_model_id["deepseek/deepseek-v4-flash"]["registry_facts"][
         "supported_thinking_levels"
     ] == ["xhigh", "high", "off"]
@@ -1203,6 +1229,34 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     assert all(
         "role_reliability" not in row["online_profile"]
         for row in historical["models"]
+    )
+    historical_by_model = {
+        row["registry_facts"]["model_id"]: row for row in historical["models"]
+    }
+    assert all(
+        historical_by_model[model_id]["registry_facts"]["status"] == "enabled"
+        for model_id in {
+            "anthropic/claude-fable-5",
+            "arcee-ai/trinity-large-thinking",
+            "deepseek/deepseek-v3.1-terminus",
+            "google/gemini-3.5-flash",
+            "google/gemma-3-27b-it",
+            "google/gemma-4-26b-a4b-it",
+            "inclusionai/ling-2.6-1t",
+            "inclusionai/ring-2.6-1t",
+            "kwaipilot/kat-coder-air-v2.5",
+            "kwaipilot/kat-coder-pro-v2.5",
+            "meituan/longcat-2.0",
+            "meta-llama/llama-3.3-70b-instruct",
+            "moonshotai/kimi-k3",
+            "nex-agi/nex-n2-pro",
+            "poolside/laguna-s-2.1",
+            "poolside/laguna-xs-2.1",
+            "qwen/qwen3.6-27b",
+            "tencent/hy3",
+            "tencent/hy3-preview",
+            "z-ai/glm-5.1",
+        }
     )
     assert frozen["schema_version"] == "step2-model-registry-v1"
     assert canonical_json_sha256(frozen) == (
@@ -3385,6 +3439,19 @@ def test_hard_filter_availability_states_are_config_driven() -> None:
     )
 
     assert decision.proposers[0].model_id == "maintenance-model"
+
+
+def test_canary_status_is_eligible_by_default() -> None:
+    decision = _decision(
+        _model("canary-model", status="canary"),
+        analysis=_analysis(tier=1),
+    )
+
+    proposer_row = decision.trace["hard_filter"]["proposer_results"][0]
+    aggregator_row = decision.trace["hard_filter"]["aggregator_results"][0]
+    assert "status_unavailable" not in proposer_row["reasons"]
+    assert "status_unavailable" not in aggregator_row["reasons"]
+    assert decision.proposers[0].model_id == "canary-model"
 
 
 def test_user_risk_permission_is_a_hard_filter() -> None:
