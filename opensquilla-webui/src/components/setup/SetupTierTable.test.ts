@@ -100,6 +100,8 @@ async function mountTableWithAsyncCatalog() {
 beforeEach(() => {
   i18n.global.locale.value = 'en'
   document.body.innerHTML = ''
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 })
+  Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 })
 })
 
 describe('SetupTierTable — editable routing rows', () => {
@@ -260,6 +262,204 @@ describe('SetupTierTable — editable routing rows', () => {
       '',
     )
     expect(onUpdateTierField).toHaveBeenCalledWith('c3', 'model', 'test-vendor/alpha')
+    app.unmount()
+  })
+
+  it('keeps the C3 details tooltip inside the compact viewport while the table scrolls', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 })
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 300 })
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        model: 'glm-5.2',
+        ensembleEnabled: true,
+      }],
+      routerProviderRoles: { c3: 'dormant_draft' },
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'deepseek/deepseek-v4-pro',
+      ensemblePlanStatus: 'ready',
+    })
+
+    const trigger = el.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show C3 fusion details"]',
+    )!
+    const tooltip = el.querySelector<HTMLElement>('[role="tooltip"]')!
+    let triggerLeft = 20
+    vi.spyOn(trigger, 'getBoundingClientRect').mockImplementation(() => ({
+      bottom: 174,
+      height: 24,
+      left: triggerLeft,
+      right: triggerLeft + 24,
+      top: 150,
+      width: 24,
+      x: triggerLeft,
+      y: 150,
+      toJSON: () => ({}),
+    }))
+    vi.spyOn(tooltip, 'getBoundingClientRect').mockImplementation(() => ({
+      bottom: 0,
+      height: 90,
+      left: 0,
+      right: 280,
+      top: 0,
+      width: 280,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    }))
+
+    trigger.focus()
+    await nextTick()
+    await nextTick()
+    await nextTick()
+
+    expect(el.querySelector('[role="tooltip"]')).toBeNull()
+    expect(tooltip.parentElement).toBe(document.body)
+    expect(tooltip.classList.contains('is-viewport-positioned')).toBe(true)
+    expect(tooltip.classList.contains('is-open')).toBe(true)
+    expect(trigger.getAttribute('aria-describedby')).toBe(tooltip.id)
+    expect(tooltip.style.left).toBe('12px')
+    expect(tooltip.style.top).toBe('53px')
+    expect(tooltip.style.maxWidth).toBe('296px')
+    expect(tooltip.dataset.placement).toBe('top')
+
+    // Horizontal scrolling moves the anchor to the viewport's far edge. The
+    // fixed tooltip follows it, while its right edge remains at the 12px inset.
+    triggerLeft = 290
+    window.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(tooltip.style.left).toBe('28px')
+    expect(Number.parseFloat(tooltip.style.left) + 280).toBeLessThanOrEqual(308)
+
+    app.unmount()
+  })
+
+  it('keeps the compact tooltip capped at 340px and remeasures after a closed resize', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 600 })
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 300 })
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        model: 'glm-5.2',
+        ensembleEnabled: true,
+      }],
+      routerProviderRoles: { c3: 'dormant_draft' },
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'a-very-long-fixed-fallback-model-id-that-must-wrap',
+      ensemblePlanStatus: 'ready',
+    })
+
+    const trigger = el.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show C3 fusion details"]',
+    )!
+    const tooltip = el.querySelector<HTMLElement>('[role="tooltip"]')!
+    vi.spyOn(trigger, 'getBoundingClientRect').mockImplementation(() => ({
+      bottom: 174,
+      height: 24,
+      left: 20,
+      right: 44,
+      top: 150,
+      width: 24,
+      x: 20,
+      y: 150,
+      toJSON: () => ({}),
+    }))
+    vi.spyOn(tooltip, 'getBoundingClientRect').mockImplementation(() => {
+      const width = Number.parseFloat(tooltip.style.maxWidth) || 340
+      const height = width < 300 ? 140 : 90
+      return {
+        bottom: 0,
+        height,
+        left: 0,
+        right: width,
+        top: 0,
+        width,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      }
+    })
+
+    trigger.focus()
+    await nextTick()
+    await nextTick()
+    expect(tooltip.style.maxWidth).toBe('340px')
+
+    trigger.blur()
+    await nextTick()
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 200 })
+    trigger.focus()
+    await nextTick()
+    await nextTick()
+    await nextTick()
+
+    expect(tooltip.style.maxWidth).toBe('176px')
+    expect(tooltip.style.left).toBe('12px')
+    // The narrower cap wraps to 140px high. A stale pre-resize measurement
+    // would leave this at 53px instead of clamping it to the top margin.
+    expect(tooltip.style.top).toBe('12px')
+
+    app.unmount()
+  })
+
+  it('toggles compact C3 details on pointer activation and closes on blur or Escape', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 })
+    const { app, el } = await mountTable({
+      rows: [{
+        ...ROWS[1],
+        name: 'c3',
+        model: 'glm-5.2',
+        ensembleEnabled: true,
+      }],
+      routerProviderRoles: { c3: 'dormant_draft' },
+      fixedFallbackProvider: 'OpenRouter',
+      fixedFallbackModel: 'fallback-model',
+      ensemblePlanStatus: 'ready',
+    })
+
+    const trigger = el.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show C3 fusion details"]',
+    )!
+    const pointerClick = () => {
+      trigger.dispatchEvent(new Event('pointerdown', { bubbles: true }))
+      trigger.focus()
+      trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    }
+
+    pointerClick()
+    await nextTick()
+    await nextTick()
+    expect(trigger.dataset.open).toBe('true')
+    expect(trigger.getAttribute('aria-expanded')).toBe('true')
+
+    pointerClick()
+    await nextTick()
+    expect(trigger.dataset.open).toBe('false')
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+
+    pointerClick()
+    await nextTick()
+    expect(trigger.dataset.open).toBe('true')
+    trigger.blur()
+    await nextTick()
+    expect(trigger.dataset.open).toBe('false')
+
+    trigger.focus()
+    await nextTick()
+    expect(trigger.dataset.open).toBe('true')
+    const escape = new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      key: 'Escape',
+    })
+    trigger.dispatchEvent(escape)
+    await nextTick()
+    expect(escape.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(trigger)
+    expect(trigger.dataset.open).toBe('false')
+
     app.unmount()
   })
 

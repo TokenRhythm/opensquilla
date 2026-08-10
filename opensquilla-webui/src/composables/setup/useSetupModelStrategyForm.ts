@@ -19,6 +19,7 @@ interface EnsembleTierCandidate {
 
 interface ModelStrategyPanelContext {
   hasSavedProvider: ComputedRef<boolean>
+  profileSaveSupported: ComputedRef<boolean>
   providerLabel: ComputedRef<string>
   routerPanel: ComputedRef<RouterPanel>
   ensemblePanel: ComputedRef<EnsemblePanel>
@@ -125,6 +126,7 @@ export function useSetupModelStrategyForm(
       return {
       activeStrategy: activeStrategy.value,
       hasSavedProvider: context.hasSavedProvider.value,
+      profileSaveSupported: context.profileSaveSupported.value,
       providerLabel: context.providerLabel.value,
       routerTemplateState: context.routerTemplateState.value,
       router: {

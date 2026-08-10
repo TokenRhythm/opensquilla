@@ -75,6 +75,12 @@ export function useSettingsPromotedForm() {
   }
 
   function initFromConfig(config: PromotedConfigData) {
+    initProviderFromConfig(config)
+    initMemoryCaptureFromConfig(config)
+    initAudioFromConfig(config)
+  }
+
+  function initProviderFromConfig(config: PromotedConfigData) {
     const timeout = Number(config.llm_request_timeout_seconds)
     llmTimeoutSeconds.value = Number.isFinite(timeout) && timeout >= 1 ? timeout : DEFAULT_LLM_TIMEOUT_SECONDS
     // Seed the context-window field from the saved provider+model override.
@@ -84,8 +90,6 @@ export function useSettingsPromotedForm() {
       String(config.llm?.model || ''),
     )
     commitProviderBaselines()
-    initMemoryCaptureFromConfig(config)
-    initAudioFromConfig(config)
   }
 
   function initMemoryCaptureFromConfig(config: PromotedConfigData) {
@@ -201,6 +205,7 @@ export function useSettingsPromotedForm() {
     captureDirty,
     audioDirty,
     initFromConfig,
+    initProviderFromConfig,
     initMemoryCaptureFromConfig,
     initAudioFromConfig,
     setLlmTimeoutSeconds,

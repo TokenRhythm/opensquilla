@@ -3187,9 +3187,299 @@ describe('useSetupCatalog configured provider management', () => {
       model: 'deepseek-reasoner',
       keepCurrentSecret: true,
     })
-    expect(api.providerPanel.value.providerSelected).toBe('openai')
-    expect(api.providerPanel.value.selectedStoredProfile).toBe(false)
+    expect(api.providerPanel.value.providerSelected).toBe('deepseek')
+    expect(api.providerPanel.value.selectedStoredProfile).toBe(true)
+    expect(api.providerPanel.value.editingPrimary).toBe(false)
     expect(api.providerPanel.value.configuredProviders.map(row => row.providerId)).toContain('deepseek')
+    app.unmount()
+  })
+
+  it('preserves dirty settings sections while rebasing a saved non-primary profile', async () => {
+    let saved = false
+    const configForState = () => ({
+      ...configWithProfiles('deepseek'),
+      naming: { enabled: false },
+      privacy: { disable_network_observability: false },
+      search_provider: 'duckduckgo',
+      search_max_results: 10,
+      memory: {
+        auto_capture_enabled: true,
+        embedding: {
+          provider: 'auto',
+          remote: { model: saved ? 'server-refreshed-model' : '' },
+        },
+      },
+      image_generation: { size: '1024x1024', output_format: 'png' },
+      audio: { enabled: false, tts: { voice: '' } },
+    })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return statusWithDeepSeek()
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return configForState()
+      if (method === 'onboarding.llmProfile.upsert') {
+        saved = true
+        return { changed: true }
+      }
+      if (
+        method === 'onboarding.models.discover'
+        || method === 'onboarding.llmProfile.models.discover'
+      ) return { ok: true, source: 'none', models: [] }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.setAutoSessionTitles(true)
+    api.setDisableNetworkObservability(true)
+    api.setMemoryAutoCapture(false)
+    api.updateCapabilityField('search', 'maxResults', 25)
+    api.updateCapabilityField('image', 'size', '512x512')
+    api.updateCapabilityField('audio', 'ttsVoice', 'draft-voice')
+    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('capabilities')).toBe(true)
+
+    await api.requestSelectConfiguredProvider('deepseek')
+    api.updateProviderField('model', 'deepseek-reasoner')
+    await expect(api.saveProvider()).resolves.toBe(true)
+
+    expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
+    expect(api.privacyPanel.value).toMatchObject({
+      disableNetworkObservability: true,
+      memoryAutoCapture: false,
+    })
+    expect(api.capabilitiesPanel.value.form).toMatchObject({
+      searchMaxResults: 25,
+      memoryModel: 'server-refreshed-model',
+      imageSize: '512x512',
+      audioTtsVoice: 'draft-voice',
+    })
+    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('capabilities')).toBe(true)
+    expect(api.providerDraftDirty.value).toBe(false)
+    expect(api.providerPanel.value.providerSelected).toBe('deepseek')
+    app.unmount()
+  })
+
+  it('preserves active-primary routing drafts and rebases Provider-owned fields after save', async () => {
+    let saved = false
+    const configForState = () => ({
+      llm: { provider: 'openai', model: 'gpt-4.1-mini' },
+      llm_request_timeout_seconds: saved ? 321 : 120,
+      models: saved
+        ? { openai: { 'draft-provider-model': { context_window: 65536 } } }
+        : {},
+      llm_profiles: { deepseek: { model: 'deepseek-chat' } },
+      squilla_router: {
+        enabled: true,
+        preset_binding: 'custom',
+        tiers: {
+          c0: { provider: 'openai', model: 'gpt-4.1-mini' },
+          c1: { provider: 'openai', model: 'gpt-4.1-mini' },
+        },
+      },
+      llm_ensemble: {
+        enabled: false,
+        selection_mode: 'custom_b5',
+        candidates: [
+          { provider: 'openai', model: 'gpt-4.1-mini' },
+          { provider: 'openai', model: 'gpt-4.1' },
+        ],
+        min_successful_proposers: 1,
+      },
+    })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') {
+        return {
+          ...statusWithDeepSeek(),
+          sectionDetails: { router: { routerBinding: 'custom' } },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return configForState()
+      if (method === 'onboarding.provider.configure') {
+        saved = true
+        return { changed: true }
+      }
+      if (method === 'config.patch') return { restartRequired: false }
+      if (method === 'onboarding.models.discover') {
+        return { ok: true, source: 'none', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.updateTierField('c0', 'model', 'draft-router-model')
+    api.setEnsembleMinSuccessful(2)
+    api.updateProviderField('model', 'draft-provider-model')
+    api.updateLlmTimeout(321)
+    api.updateContextWindow('65536')
+    expect(api.providerDraftDirty.value).toBe(true)
+
+    await expect(api.saveProvider()).resolves.toBe(true)
+
+    expect(api.routerPanel.value.tierRows.find(row => row.name === 'c0')?.model)
+      .toBe('draft-router-model')
+    expect(api.ensemblePanel.value.minSuccessfulProposers).toBe(2)
+    expect(api.modelStrategyPanel.value.single.model).toBe('draft-provider-model')
+    expect(api.providerPanel.value.llmTimeoutSeconds).toBe(321)
+    expect(api.providerPanel.value.contextWindowTokens).toBe('65536')
+    expect(api.providerDraftDirty.value).toBe(false)
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    expect(api.providerPanel.value.providerSelected).toBe('openai')
+    expect(api.providerPanel.value.editingPrimary).toBe(true)
+    expect(api.providerPanel.value.selectedStoredProfile).toBe(false)
+    app.unmount()
+  })
+
+  it('rebases active-primary context against a retained Model Routing model draft', async () => {
+    let saved = false
+    const configForState = () => ({
+      ...configWithProfiles('deepseek'),
+      llm_request_timeout_seconds: saved ? 321 : 120,
+      models: {
+        openai: {
+          'gpt-4.1-mini': { context_window: 8192 },
+          'draft-router-model': { context_window: saved ? 65536 : 32768 },
+        },
+      },
+      squilla_router: { enabled: false },
+      llm_ensemble: { enabled: false },
+    })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return statusWithDeepSeek()
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return configForState()
+      if (method === 'onboarding.provider.configure') {
+        saved = true
+        return { changed: true }
+      }
+      if (method === 'config.patch') return { restartRequired: false }
+      if (method === 'onboarding.models.discover') {
+        return { ok: true, source: 'none', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.setFixedModel('draft-router-model')
+    expect(api.providerPanel.value.contextWindowTokens).toBe('32768')
+    api.updateLlmTimeout(321)
+
+    await expect(api.saveProvider()).resolves.toBe(true)
+
+    expect(api.modelStrategyPanel.value.single).toMatchObject({
+      providerId: 'openai',
+      model: 'draft-router-model',
+    })
+    expect(api.providerPanel.value.contextWindowTokens).toBe('65536')
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    expect(api.providerDraftDirty.value).toBe(false)
+    app.unmount()
+  })
+
+  it('keeps active context scoped and restores a foreign fixed identity on cancel', async () => {
+    const config = {
+      ...configWithProfiles('deepseek'),
+      llm_request_timeout_seconds: 120,
+      models: {
+        openai: { 'gpt-4.1-mini': { context_window: 8192 } },
+        deepseek: { 'deepseek-reasoner': { context_window: 131072 } },
+      },
+      squilla_router: { enabled: false },
+      llm_ensemble: { enabled: false },
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return statusWithDeepSeek()
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return config
+      if (method === 'onboarding.provider.configure') return { changed: true }
+      if (method === 'config.patch') return { restartRequired: false }
+      if (
+        method === 'onboarding.models.discover'
+        || method === 'onboarding.llmProfile.models.discover'
+      ) {
+        return { ok: true, source: 'none', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.setFixedProvider('deepseek')
+    api.setFixedModel('deepseek-reasoner')
+    api.updateLlmTimeout(321)
+    await expect(api.saveProvider()).resolves.toBe(true)
+
+    expect(api.modelStrategyPanel.value.single).toMatchObject({
+      providerId: 'deepseek',
+      model: 'deepseek-reasoner',
+    })
+    // The active Provider editor still describes OpenAI's persisted model,
+    // never the foreign fixed-fallback identity.
+    expect(api.providerPanel.value.contextWindowTokens).toBe('8192')
+
+    await api.requestSelectConfiguredProvider('openai')
+    api.updateProviderField('model', 'gpt-provider-draft')
+    expect(api.modelStrategyPanel.value.single).toMatchObject({
+      providerId: 'openai',
+      model: 'gpt-provider-draft',
+    })
+
+    api.cancelProviderEdit()
+
+    expect(api.modelStrategyPanel.value.single).toMatchObject({
+      providerId: 'deepseek',
+      model: 'deepseek-reasoner',
+    })
+    expect(api.providerPanel.value.contextWindowTokens).toBe('8192')
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    app.unmount()
+  })
+
+  it('preserves a settings draft created while the Provider reload is in flight', async () => {
+    let configReads = 0
+    let releaseReload!: () => void
+    const reloadGate = new Promise<void>(resolve => {
+      releaseReload = resolve
+    })
+    const config = {
+      llm: { provider: 'openai', model: 'gpt-4.1-mini' },
+      naming: { enabled: false },
+      squilla_router: { enabled: false },
+      llm_ensemble: { enabled: false },
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return statusWithDeepSeek()
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        configReads += 1
+        if (configReads > 1) await reloadGate
+        return config
+      }
+      if (method === 'onboarding.provider.configure') return { changed: true }
+      if (method === 'config.patch') return { restartRequired: false }
+      if (method === 'onboarding.models.discover') {
+        return { ok: true, source: 'none', models: [] }
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.updateLlmTimeout(321)
+    const save = api.saveProvider()
+    await vi.waitFor(() => expect(configReads).toBe(2))
+    api.setAutoSessionTitles(true)
+    releaseReload()
+    await expect(save).resolves.toBe(true)
+
+    expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
+    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.providerDraftDirty.value).toBe(false)
     app.unmount()
   })
 
@@ -3246,6 +3536,239 @@ describe('useSetupCatalog configured provider management', () => {
     reopened.app.unmount()
   })
 
+  it('keeps router and ensemble drafts when a new routing provider is saved', async () => {
+    let saved = false
+    const baseConfig = {
+      llm: { provider: 'openai', model: 'gpt-4.1-mini' },
+      squilla_router: {
+        enabled: true,
+        tiers: {
+          c0: { provider: 'openai', model: 'gpt-4.1-mini' },
+          c1: { provider: 'openai', model: 'gpt-4.1-mini' },
+        },
+      },
+      llm_ensemble: {
+        enabled: false,
+        selection_mode: 'custom_b5',
+        candidates: [
+          { provider: 'openai', model: 'gpt-4.1-mini' },
+          { provider: 'openai', model: 'gpt-4.1' },
+        ],
+        min_successful_proposers: 1,
+      },
+    }
+    const initialStatus = {
+      ...statusWithDeepSeek(),
+      llmProfileStatus: statusWithDeepSeek().llmProfileStatus.filter(
+        profile => profile.provider === 'openai',
+      ),
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return saved ? statusWithDeepSeek() : initialStatus
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') {
+        return saved
+          ? { ...baseConfig, llm_profiles: { deepseek: { model: 'deepseek-chat' } } }
+          : { ...baseConfig, llm_profiles: {} }
+      }
+      if (method === 'onboarding.llmProfile.upsert') {
+        saved = true
+        return { changed: true }
+      }
+      if (
+        method === 'onboarding.models.discover'
+        || method === 'onboarding.llmProfile.models.discover'
+      ) return { ok: true, source: 'none', models: [] }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.updateTierField('c0', 'model', 'draft-router-model')
+    api.setEnsembleMinSuccessful(2)
+    api.setFixedModel('draft-fallback-model')
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+
+    await api.requestAddProvider('deepseek')
+    api.updateProviderField('api_key', 'test-secret')
+    api.updateProviderField('model', 'deepseek-chat')
+    await api.saveProvider()
+
+    expect(api.routerPanel.value.tierRows.find(row => row.name === 'c0')?.model)
+      .toBe('draft-router-model')
+    expect(api.ensemblePanel.value.minSuccessfulProposers).toBe(2)
+    expect(api.modelStrategyPanel.value.single.model).toBe('draft-fallback-model')
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    expect(api.providerDraftDirty.value).toBe(false)
+    expect(api.providerPanel.value.configuredProviders.map(row => row.providerId))
+      .toContain('deepseek')
+    expect(api.providerPanel.value.providerSelected).toBe('deepseek')
+    expect(api.providerPanel.value.selectedStoredProfile).toBe(true)
+    expect(api.providerPanel.value.editingPrimary).toBe(false)
+    app.unmount()
+  })
+
+  it.each([
+    {
+      name: 'blocked to ready',
+      before: {
+        runtimeStatus: 'blocked',
+        configurationReady: false,
+        blockedReason: 'missing_credentials:deepseek',
+      },
+      after: {
+        runtimeStatus: 'ready',
+        configurationReady: true,
+        blockedReason: '',
+      },
+    },
+    {
+      name: 'ready to blocked',
+      before: {
+        runtimeStatus: 'ready',
+        configurationReady: true,
+        blockedReason: '',
+      },
+      after: {
+        runtimeStatus: 'blocked',
+        configurationReady: false,
+        blockedReason: 'missing_credentials:deepseek',
+      },
+    },
+  ])('refreshes C3 runtime readiness after a stored profile save: $name', async ({ before, after }) => {
+    let saved = false
+    const config = {
+      llm: { provider: 'openai', model: 'gpt-4.1-mini' },
+      llm_profiles: { deepseek: { model: 'deepseek-chat' } },
+      squilla_router: {
+        enabled: true,
+        tiers: {
+          c3: {
+            provider: 'deepseek',
+            model: 'deepseek-chat',
+            ensemble_enabled: true,
+          },
+        },
+      },
+      llm_ensemble: { enabled: false, selection_mode: 'router_dynamic' },
+    }
+    const runtimeStatus = (state: typeof before) => ({
+      ...statusWithDeepSeek(),
+      sectionDetails: {
+        router: {
+          routerBinding: 'custom',
+          routerProviderRoles: { c3: 'dynamic_member' },
+          tierEnsembleStatuses: {
+            c3: {
+              selectionMode: 'router_dynamic',
+              activationTiers: ['c3'],
+              tierSelectionModes: { c3: 'router_dynamic' },
+              runtimeStatus: state.runtimeStatus,
+              configurationReady: state.configurationReady,
+              blockedReason: state.blockedReason,
+              blockedTierCandidates: [],
+              fixedFallbackReady: true,
+              fixedFallbackBlockedReason: '',
+            },
+          },
+        },
+      },
+    })
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') return runtimeStatus(saved ? after : before)
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return config
+      if (method === 'onboarding.llmProfile.upsert') {
+        saved = true
+        return { changed: true }
+      }
+      if (
+        method === 'onboarding.models.discover'
+        || method === 'onboarding.llmProfile.models.discover'
+      ) return { ok: true, source: 'none', models: [] }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toMatchObject(before)
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+
+    await api.requestSelectConfiguredProvider('deepseek')
+    api.updateProviderField('api_key', 'replacement-secret')
+    await expect(api.saveProvider()).resolves.toBe(true)
+
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toMatchObject(after)
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+    expect(api.providerPanel.value.providerSelected).toBe('deepseek')
+    expect(api.providerPanel.value.selectedStoredProfile).toBe(true)
+    expect(api.providerPanel.value.editingPrimary).toBe(false)
+    app.unmount()
+  })
+
+  it('keeps draft Provider roles coherent when only the ensemble mode is dirty', async () => {
+    const config = {
+      llm: { provider: 'openai', model: 'gpt-4.1-mini' },
+      llm_profiles: { deepseek: { model: 'deepseek-chat' } },
+      squilla_router: {
+        enabled: true,
+        preset_binding: 'custom',
+        tiers: {
+          c0: { provider: 'openai', model: 'gpt-4.1-mini' },
+          c3: {
+            provider: 'deepseek',
+            model: 'deepseek-chat',
+            ensemble_enabled: true,
+          },
+        },
+      },
+      llm_ensemble: { enabled: true, selection_mode: 'static_openrouter_b5' },
+    }
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return { providers }
+      if (method === 'onboarding.status') {
+        return {
+          ...statusWithDeepSeek(),
+          sectionDetails: {
+            router: {
+              routerBinding: 'custom',
+              routerProviderRoles: { c0: 'dormant_draft', c3: 'dormant_draft' },
+            },
+          },
+        }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      if (method === 'config.get') return config
+      if (method === 'onboarding.llmProfile.upsert') return { changed: true }
+      if (
+        method === 'onboarding.models.discover'
+        || method === 'onboarding.llmProfile.models.discover'
+      ) return { ok: true, source: 'none', models: [] }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { api, app } = await mountCatalog()
+
+    api.setEnsembleSelectionMode('router_dynamic')
+    expect(api.routerPanel.value.routerProviderRoles).toEqual({
+      c0: 'dynamic_member',
+      c3: 'dynamic_member',
+    })
+
+    await api.requestSelectConfiguredProvider('deepseek')
+    api.updateProviderField('model', 'deepseek-reasoner')
+    await expect(api.saveProvider()).resolves.toBe(true)
+
+    expect(api.ensemblePanel.value.selectionMode).toBe('router_dynamic')
+    expect(api.routerPanel.value.routerProviderRoles).toEqual({
+      c0: 'dynamic_member',
+      c3: 'dynamic_member',
+    })
+    expect(api.sectionDirty('modelStrategy')).toBe(true)
+    app.unmount()
+  })
+
   it('replaces the active provider through the legacy configure RPC on an older Gateway', async () => {
     let activeProvider = 'openai'
     let activeModel = 'gpt-4.1-mini'
@@ -3267,6 +3790,21 @@ describe('useSetupCatalog configured provider management', () => {
         return {
           llm: { provider: activeProvider, model: activeModel },
           llm_profiles: {},
+          naming: { enabled: false },
+          privacy: { disable_network_observability: false },
+          search_provider: 'duckduckgo',
+          search_max_results: 10,
+          memory: {
+            auto_capture_enabled: true,
+            embedding: {
+              provider: 'auto',
+              remote: {
+                model: activeProvider === 'deepseek' ? 'server-refreshed-model' : '',
+              },
+            },
+          },
+          image_generation: { size: '1024x1024', output_format: 'png' },
+          audio: { enabled: false, tts: { voice: '' } },
         }
       }
       if (method === 'onboarding.provider.probe') return { ok: true, latencyMs: 18 }
@@ -3282,9 +3820,17 @@ describe('useSetupCatalog configured provider management', () => {
     })
     const { api, app } = await mountCatalog()
 
+    api.updateProviderField('model', 'old-primary-draft')
+    api.setAutoSessionTitles(true)
+    api.setDisableNetworkObservability(true)
+    api.setMemoryAutoCapture(false)
+    api.updateCapabilityField('search', 'maxResults', 25)
+    api.updateCapabilityField('image', 'size', '512x512')
+    api.updateCapabilityField('audio', 'ttsVoice', 'draft-voice')
     await api.requestAddProvider('deepseek')
     api.updateProviderField('api_key', 'draft-secret')
     expect(api.providerPanel.value.profileSaveSupported).toBe(false)
+    expect(api.modelStrategyPanel.value.profileSaveSupported).toBe(false)
 
     await expect(api.saveProvider()).resolves.toBe(false)
     expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.provider.configure')).toBe(false)
@@ -3301,6 +3847,25 @@ describe('useSetupCatalog configured provider management', () => {
     expect(api.providerPanel.value.configuredProviders.map(row => row.providerId))
       .toEqual(['deepseek'])
     expect(api.providerDraftDirty.value).toBe(false)
+    expect(api.modelStrategyPanel.value.single).toMatchObject({
+      providerId: 'deepseek',
+      model: 'deepseek-chat',
+    })
+    expect(api.sectionDirty('modelStrategy')).toBe(false)
+    expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
+    expect(api.privacyPanel.value).toMatchObject({
+      disableNetworkObservability: true,
+      memoryAutoCapture: false,
+    })
+    expect(api.capabilitiesPanel.value.form).toMatchObject({
+      searchMaxResults: 25,
+      memoryModel: 'server-refreshed-model',
+      imageSize: '512x512',
+      audioTtsVoice: 'draft-voice',
+    })
+    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('capabilities')).toBe(true)
     app.unmount()
   })
 

@@ -8,7 +8,7 @@
 //   • combobox   — that same input gains a provider-scoped catalog only when
 //                  a verified live listing exists (no remount on async arrival);
 //   • readonly   — preset preview: no editable controls at all.
-import { computed, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import Icon from '@/components/Icon.vue'
@@ -62,8 +62,19 @@ const emit = defineEmits<{
 const THINKING_LEVELS = ['', 'off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const ENSEMBLE_CHOICE = '__shared_ensemble__'
 const EMPTY_CATALOG: DiscoveredModelCatalog = { models: [], source: 'none' }
+const COMPACT_VIEWPORT_MAX_WIDTH = 760
+const ENSEMBLE_TOOLTIP_MAX_WIDTH = 340
+const ENSEMBLE_TOOLTIP_GAP = 7
+const ENSEMBLE_TOOLTIP_MARGIN = 12
 const hoveredEnsembleDetails = ref('')
 const focusedEnsembleDetails = ref('')
+const clickedEnsembleDetails = ref('')
+const pointerActivationDetails = ref('')
+const pointerActivationWasOpen = ref(false)
+const ensembleDetailsAnchor = ref<HTMLElement | null>(null)
+const ensembleTooltipUsesViewport = ref(false)
+const ensembleTooltipPlacement = ref<'top' | 'bottom'>('top')
+const ensembleTooltipStyle = ref<Record<string, string>>({})
 
 function catalogFor(row: SetupTierRow): DiscoveredModelCatalog {
   const provider = row.provider.trim().toLowerCase()
@@ -310,20 +321,223 @@ function ensembleDescriptionId(row: SetupTierRow): string | undefined {
 
 function ensembleDetailsOpen(row: SetupTierRow): boolean {
   const id = ensembleDetailsId(row)
-  return hoveredEnsembleDetails.value === id || focusedEnsembleDetails.value === id
+  return clickedEnsembleDetails.value === id
+    || hoveredEnsembleDetails.value === id
+    || focusedEnsembleDetails.value === id
 }
 
-function showEnsembleDetails(row: SetupTierRow, source: 'hover' | 'focus') {
+const openEnsembleDetailsId = computed(() => (
+  clickedEnsembleDetails.value
+  || focusedEnsembleDetails.value
+  || hoveredEnsembleDetails.value
+))
+
+function compactEnsembleTooltip(): boolean {
+  return typeof window !== 'undefined' && window.innerWidth <= COMPACT_VIEWPORT_MAX_WIDTH
+}
+
+function ensembleHoverAvailable(): boolean {
+  return typeof window === 'undefined'
+    || typeof window.matchMedia !== 'function'
+    || window.matchMedia('(hover: hover)').matches
+}
+
+function ensembleDetailsTrigger(event: Event): HTMLElement | null {
+  const target = event.currentTarget
+  if (!(target instanceof HTMLElement)) return null
+  if (target.matches('.setup-tier-table__ensemble-details-trigger')) return target
+  return target.querySelector<HTMLElement>('.setup-tier-table__ensemble-details-trigger')
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(Math.max(value, minimum), Math.max(minimum, maximum))
+}
+
+// At the compact breakpoint the tier table becomes a horizontal scrollport.
+// Portal the tooltip to <body> and clamp it to the viewport so scrolling to
+// the Thinking/Image columns cannot crop a left-aligned C3 explanation.
+function updateEnsembleTooltipPosition() {
+  if (!openEnsembleDetailsId.value) return
+
+  const viewportWidth = window.innerWidth
+  const viewportHeight = window.innerHeight
+  const useViewport = viewportWidth <= COMPACT_VIEWPORT_MAX_WIDTH
+  const viewportModeChanged = ensembleTooltipUsesViewport.value !== useViewport
+  if (viewportModeChanged) {
+    ensembleTooltipUsesViewport.value = useViewport
+  }
+  if (!useViewport) {
+    ensembleTooltipStyle.value = {}
+    ensembleTooltipPlacement.value = 'top'
+    return
+  }
+
+  const availableWidth = Math.max(1, viewportWidth - (2 * ENSEMBLE_TOOLTIP_MARGIN))
+  const effectiveMaxWidth = Math.min(ENSEMBLE_TOOLTIP_MAX_WIDTH, availableWidth)
+  const maxWidth = `${effectiveMaxWidth}px`
+  const maxWidthChanged = ensembleTooltipStyle.value.maxWidth !== maxWidth
+  if (viewportModeChanged || maxWidthChanged) {
+    // Apply the final cap after Teleport moves the tooltip, then measure its
+    // wrapped height and actual max-content width in that final layout.
+    ensembleTooltipStyle.value = { maxWidth }
+    void nextTick(updateEnsembleTooltipPosition)
+    return
+  }
+
+  const anchor = ensembleDetailsAnchor.value
+  const tooltip = document.getElementById(openEnsembleDetailsId.value)
+  if (!anchor || !tooltip) return
+
+  const anchorRect = anchor.getBoundingClientRect()
+  const tooltipRect = tooltip.getBoundingClientRect()
+  const tooltipWidth = Math.min(
+    tooltipRect.width || effectiveMaxWidth,
+    effectiveMaxWidth,
+  )
+  const tooltipHeight = tooltipRect.height
+  const preferredLeft = anchorRect.right - tooltipWidth
+  const left = clamp(
+    preferredLeft,
+    ENSEMBLE_TOOLTIP_MARGIN,
+    viewportWidth - tooltipWidth - ENSEMBLE_TOOLTIP_MARGIN,
+  )
+
+  const topPosition = anchorRect.top - tooltipHeight - ENSEMBLE_TOOLTIP_GAP
+  const bottomPosition = anchorRect.bottom + ENSEMBLE_TOOLTIP_GAP
+  const fitsAbove = topPosition >= ENSEMBLE_TOOLTIP_MARGIN
+  const fitsBelow = bottomPosition + tooltipHeight <= viewportHeight - ENSEMBLE_TOOLTIP_MARGIN
+  const spaceAbove = anchorRect.top - ENSEMBLE_TOOLTIP_GAP - ENSEMBLE_TOOLTIP_MARGIN
+  const spaceBelow = viewportHeight
+    - anchorRect.bottom
+    - ENSEMBLE_TOOLTIP_GAP
+    - ENSEMBLE_TOOLTIP_MARGIN
+  const placeBelow = !fitsAbove && (fitsBelow || spaceBelow > spaceAbove)
+  const maximumTop = viewportHeight - tooltipHeight - ENSEMBLE_TOOLTIP_MARGIN
+  const top = clamp(
+    placeBelow ? bottomPosition : topPosition,
+    ENSEMBLE_TOOLTIP_MARGIN,
+    maximumTop,
+  )
+
+  ensembleTooltipPlacement.value = placeBelow ? 'bottom' : 'top'
+  ensembleTooltipStyle.value = {
+    left: `${left}px`,
+    maxWidth,
+    top: `${top}px`,
+  }
+}
+
+function showEnsembleDetails(
+  row: SetupTierRow,
+  source: 'hover' | 'focus',
+  event: Event,
+) {
   const id = ensembleDetailsId(row)
+  if (source === 'hover' && compactEnsembleTooltip() && !ensembleHoverAvailable()) return
+  ensembleDetailsAnchor.value = ensembleDetailsTrigger(event)
+  if (
+    source === 'focus'
+    && compactEnsembleTooltip()
+    && pointerActivationDetails.value === id
+  ) return
   if (source === 'hover') hoveredEnsembleDetails.value = id
   else focusedEnsembleDetails.value = id
+}
+
+function clearEnsembleDetails(id: string) {
+  if (hoveredEnsembleDetails.value === id) hoveredEnsembleDetails.value = ''
+  if (focusedEnsembleDetails.value === id) focusedEnsembleDetails.value = ''
+  if (clickedEnsembleDetails.value === id) clickedEnsembleDetails.value = ''
+  if (pointerActivationDetails.value === id) {
+    pointerActivationDetails.value = ''
+    pointerActivationWasOpen.value = false
+  }
+  if (!openEnsembleDetailsId.value) ensembleDetailsAnchor.value = null
 }
 
 function hideEnsembleDetails(row: SetupTierRow, source: 'hover' | 'focus') {
   const id = ensembleDetailsId(row)
   if (source === 'hover' && hoveredEnsembleDetails.value === id) hoveredEnsembleDetails.value = ''
-  if (source === 'focus' && focusedEnsembleDetails.value === id) focusedEnsembleDetails.value = ''
+  if (source === 'focus') {
+    if (focusedEnsembleDetails.value === id) focusedEnsembleDetails.value = ''
+    if (clickedEnsembleDetails.value === id) clickedEnsembleDetails.value = ''
+    if (pointerActivationDetails.value === id) {
+      pointerActivationDetails.value = ''
+      pointerActivationWasOpen.value = false
+    }
+  }
+  if (!openEnsembleDetailsId.value) {
+    ensembleDetailsAnchor.value = null
+  }
 }
+
+function beginEnsembleDetailsPointerActivation(row: SetupTierRow, event: Event) {
+  if (!compactEnsembleTooltip()) return
+  const id = ensembleDetailsId(row)
+  ensembleDetailsAnchor.value = ensembleDetailsTrigger(event)
+  pointerActivationDetails.value = id
+  pointerActivationWasOpen.value = ensembleDetailsOpen(row)
+}
+
+function cancelEnsembleDetailsPointerActivation(row: SetupTierRow) {
+  const id = ensembleDetailsId(row)
+  if (pointerActivationDetails.value !== id) return
+  pointerActivationDetails.value = ''
+  pointerActivationWasOpen.value = false
+}
+
+function toggleEnsembleDetails(row: SetupTierRow, event: MouseEvent) {
+  if (!compactEnsembleTooltip()) return
+  const id = ensembleDetailsId(row)
+  const trigger = ensembleDetailsTrigger(event)
+  ensembleDetailsAnchor.value = trigger
+  const pointerActivation = pointerActivationDetails.value === id
+  const keyboardActivation = event.detail === 0 && !pointerActivation
+  const shouldClose = clickedEnsembleDetails.value === id
+    || (pointerActivation && pointerActivationWasOpen.value)
+    || (keyboardActivation && ensembleDetailsOpen(row))
+
+  if (shouldClose) {
+    clearEnsembleDetails(id)
+    if (!keyboardActivation) trigger?.blur()
+    return
+  }
+
+  clickedEnsembleDetails.value = id
+  if (trigger && document.activeElement !== trigger) trigger.focus({ preventScroll: true })
+  pointerActivationDetails.value = ''
+  pointerActivationWasOpen.value = false
+}
+
+function onEnsembleDetailsKeydown(row: SetupTierRow, event: KeyboardEvent) {
+  if (event.key !== 'Escape' || !ensembleDetailsOpen(row)) return
+  event.preventDefault()
+  event.stopPropagation()
+  clearEnsembleDetails(ensembleDetailsId(row))
+}
+
+function startEnsembleTooltipTracking() {
+  updateEnsembleTooltipPosition()
+  window.addEventListener('scroll', updateEnsembleTooltipPosition, {
+    capture: true,
+    passive: true,
+  })
+  window.addEventListener('resize', updateEnsembleTooltipPosition)
+}
+
+function stopEnsembleTooltipTracking() {
+  window.removeEventListener('scroll', updateEnsembleTooltipPosition, { capture: true })
+  window.removeEventListener('resize', updateEnsembleTooltipPosition)
+}
+
+watch(openEnsembleDetailsId, id => {
+  stopEnsembleTooltipTracking()
+  if (!id) return
+  startEnsembleTooltipTracking()
+  void nextTick(updateEnsembleTooltipPosition)
+})
+
+onBeforeUnmount(stopEnsembleTooltipTracking)
 
 function c3StateAnnouncement(row: SetupTierRow): string {
   if (tierEnsembleActive(row)) {
@@ -455,7 +669,7 @@ const allowsFloatingContent = computed(() => (
             <span
               v-if="compactSharedTierEnsembleActive(tier)"
               class="setup-tier-table__ensemble-details"
-              @mouseenter="showEnsembleDetails(tier, 'hover')"
+              @mouseenter="showEnsembleDetails(tier, 'hover', $event)"
               @mouseleave="hideEnsembleDetails(tier, 'hover')"
             >
               <button
@@ -463,23 +677,36 @@ const allowsFloatingContent = computed(() => (
                 class="setup-tier-table__ensemble-details-trigger"
                 :aria-label="t('setup.router.tierEnsembleDetailsAria')"
                 :aria-describedby="ensembleDetailsId(tier)"
+                :aria-expanded="ensembleDetailsOpen(tier) ? 'true' : 'false'"
                 :data-open="ensembleDetailsOpen(tier) ? 'true' : 'false'"
-                @focus="showEnsembleDetails(tier, 'focus')"
+                @pointerdown="beginEnsembleDetailsPointerActivation(tier, $event)"
+                @pointercancel="cancelEnsembleDetailsPointerActivation(tier)"
+                @pointerleave="cancelEnsembleDetailsPointerActivation(tier)"
+                @focus="showEnsembleDetails(tier, 'focus', $event)"
                 @blur="hideEnsembleDetails(tier, 'focus')"
+                @click="toggleEnsembleDetails(tier, $event)"
+                @keydown="onEnsembleDetailsKeydown(tier, $event)"
               >
                 <Icon name="info" :size="13" aria-hidden="true" />
               </button>
-              <span
-                :id="ensembleDetailsId(tier)"
-                class="setup-tier-table__ensemble-tooltip"
-                :class="{ 'is-open': ensembleDetailsOpen(tier) }"
-                role="tooltip"
-              >
-                <strong>{{ ensemblePlanStatusLabel() }}</strong>
-                <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
-                <span>{{ ensembleSummary(tier) }}</span>
-                <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
-              </span>
+              <Teleport to="body" :disabled="!ensembleTooltipUsesViewport">
+                <span
+                  :id="ensembleDetailsId(tier)"
+                  class="setup-tier-table__ensemble-tooltip"
+                  :class="{
+                    'is-open': ensembleDetailsOpen(tier),
+                    'is-viewport-positioned': ensembleTooltipUsesViewport,
+                  }"
+                  :data-placement="ensembleTooltipPlacement"
+                  :style="ensembleTooltipUsesViewport ? ensembleTooltipStyle : undefined"
+                  role="tooltip"
+                >
+                  <strong>{{ ensemblePlanStatusLabel() }}</strong>
+                  <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
+                  <span>{{ ensembleSummary(tier) }}</span>
+                  <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
+                </span>
+              </Teleport>
             </span>
           </div>
           <small
@@ -532,7 +759,7 @@ const allowsFloatingContent = computed(() => (
             <span
               v-if="compactSharedTierEnsembleActive(tier)"
               class="setup-tier-table__ensemble-details"
-              @mouseenter="showEnsembleDetails(tier, 'hover')"
+              @mouseenter="showEnsembleDetails(tier, 'hover', $event)"
               @mouseleave="hideEnsembleDetails(tier, 'hover')"
             >
               <button
@@ -540,23 +767,36 @@ const allowsFloatingContent = computed(() => (
                 class="setup-tier-table__ensemble-details-trigger"
                 :aria-label="t('setup.router.tierEnsembleDetailsAria')"
                 :aria-describedby="ensembleDetailsId(tier)"
+                :aria-expanded="ensembleDetailsOpen(tier) ? 'true' : 'false'"
                 :data-open="ensembleDetailsOpen(tier) ? 'true' : 'false'"
-                @focus="showEnsembleDetails(tier, 'focus')"
+                @pointerdown="beginEnsembleDetailsPointerActivation(tier, $event)"
+                @pointercancel="cancelEnsembleDetailsPointerActivation(tier)"
+                @pointerleave="cancelEnsembleDetailsPointerActivation(tier)"
+                @focus="showEnsembleDetails(tier, 'focus', $event)"
                 @blur="hideEnsembleDetails(tier, 'focus')"
+                @click="toggleEnsembleDetails(tier, $event)"
+                @keydown="onEnsembleDetailsKeydown(tier, $event)"
               >
                 <Icon name="info" :size="13" aria-hidden="true" />
               </button>
-              <span
-                :id="ensembleDetailsId(tier)"
-                class="setup-tier-table__ensemble-tooltip"
-                :class="{ 'is-open': ensembleDetailsOpen(tier) }"
-                role="tooltip"
-              >
-                <strong>{{ ensemblePlanStatusLabel() }}</strong>
-                <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
-                <span>{{ ensembleSummary(tier) }}</span>
-                <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
-              </span>
+              <Teleport to="body" :disabled="!ensembleTooltipUsesViewport">
+                <span
+                  :id="ensembleDetailsId(tier)"
+                  class="setup-tier-table__ensemble-tooltip"
+                  :class="{
+                    'is-open': ensembleDetailsOpen(tier),
+                    'is-viewport-positioned': ensembleTooltipUsesViewport,
+                  }"
+                  :data-placement="ensembleTooltipPlacement"
+                  :style="ensembleTooltipUsesViewport ? ensembleTooltipStyle : undefined"
+                  role="tooltip"
+                >
+                  <strong>{{ ensemblePlanStatusLabel() }}</strong>
+                  <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
+                  <span>{{ ensembleSummary(tier) }}</span>
+                  <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
+                </span>
+              </Teleport>
             </span>
           </div>
           <small
@@ -750,9 +990,14 @@ const allowsFloatingContent = computed(() => (
   z-index: 40;
 }
 
-.setup-tier-table__ensemble-tooltip.is-open,
-.setup-tier-table__ensemble-details:hover .setup-tier-table__ensemble-tooltip,
-.setup-tier-table__ensemble-details:focus-within .setup-tier-table__ensemble-tooltip {
+.setup-tier-table__ensemble-tooltip.is-viewport-positioned {
+  bottom: auto;
+  inset: auto;
+  position: fixed;
+  z-index: 440;
+}
+
+.setup-tier-table__ensemble-tooltip.is-open {
   opacity: 1;
   visibility: visible;
 }

@@ -943,7 +943,6 @@
       "fallbackTierLabel": "Wenn das Routing unsicher ist",
       "fallbackTierDesc": "Wird verwendet, wenn das Routing die Stufe nicht sicher bestimmen kann.",
       "modelRolesTitle": "Modellrollen",
-      "addProvider": "Anbieter hinzufügen",
       "addProviderHint": "Füge einen weiteren Modellanbieter hinzu, um für jede Stufe einen anderen Anbieter auswählen zu können.",
       "advancedTitle": "Erweiterte Optionen",
       "advancedDesc": "Fallback-Stufe und Darstellung des Routings im Chat.",

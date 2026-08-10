@@ -55,6 +55,7 @@ function panel(overrides: Record<string, unknown> = {}) {
   const base = {
     activeStrategy: 'router',
     hasSavedProvider: true,
+    profileSaveSupported: true,
     providerLabel: 'OpenRouter',
     routerTemplateState: 'recommended',
     cards: [
@@ -295,9 +296,13 @@ describe('SetupModelStrategyPanel', () => {
 
     const shortcut = el.querySelector<HTMLButtonElement>('[data-testid="router-add-provider"]')
     const hint = 'Add another model provider to choose a different provider for each tier.'
-    expect(shortcut?.textContent).toContain('Add provider')
+    expect(shortcut?.textContent?.trim()).toBe('Add provider')
+    expect(shortcut?.hasAttribute('aria-label')).toBe(false)
     expect(shortcut?.getAttribute('title')).toBe(hint)
-    expect(shortcut?.getAttribute('aria-label')).toBe(hint)
+    expect(shortcut?.getAttribute('aria-describedby')).toBe('router-add-provider-hint')
+    const description = el.querySelector<HTMLElement>('#router-add-provider-hint')
+    expect(description?.textContent?.trim()).toBe(hint)
+    expect(description?.classList.contains('setup-model-strategy__sr-only')).toBe(true)
     expect(el.querySelector('[aria-label="c0 request entry"]')).toBeNull()
 
     shortcut?.click()
@@ -315,6 +320,19 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.querySelector('.setup-tier-table__row.is-head')?.textContent)
       .toContain('Request entry')
 
+    app.unmount()
+  })
+
+  it('does not offer an add-provider shortcut on a legacy Gateway', async () => {
+    const { app, el } = await mountPanel({
+      activeStrategy: 'router',
+      profileSaveSupported: false,
+      router: {
+        providerOptions: [{ providerId: 'openrouter', label: 'OpenRouter' }],
+      },
+    })
+
+    expect(el.querySelector('[data-testid="router-add-provider"]')).toBeNull()
     app.unmount()
   })
 

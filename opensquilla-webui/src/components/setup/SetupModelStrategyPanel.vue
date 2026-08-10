@@ -87,6 +87,7 @@ interface SinglePanelContract {
 interface ModelStrategyPanelContract {
   activeStrategy: ModelStrategy
   hasSavedProvider: boolean
+  profileSaveSupported: boolean
   providerLabel: string
   routerTemplateState: string
   cards: readonly StrategyCard[]
@@ -199,7 +200,10 @@ const configuredProviderIds = computed(() => new Set(
     .map(option => String(option.providerId || '').trim().toLowerCase())
     .filter(Boolean),
 ))
-const showAddProviderShortcut = computed(() => configuredProviderIds.value.size === 1)
+const showAddProviderShortcut = computed(() => (
+  props.panel.profileSaveSupported
+  && configuredProviderIds.value.size === 1
+))
 const fixedProviderOptions = computed(() => providerOptionsFor(props.panel.single.providerId))
 const selectedFixedProviderOption = computed(() => (
   fixedProviderOptions.value.find(option => option.providerId === props.panel.single.providerId)
@@ -768,13 +772,20 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             type="button"
             class="setup-inline-link setup-model-strategy__add-provider"
             data-testid="router-add-provider"
-            :aria-label="t('setup.modelStrategy.addProviderHint')"
+            aria-describedby="router-add-provider-hint"
             :title="t('setup.modelStrategy.addProviderHint')"
             @click="emit('goToSection', 'provider')"
           >
             <Icon name="plus" :size="13" aria-hidden="true" />
-            {{ t('setup.modelStrategy.addProvider') }}
+            {{ t('setup.provider.addProvider') }}
           </button>
+          <span
+            v-if="showAddProviderShortcut"
+            id="router-add-provider-hint"
+            class="setup-model-strategy__sr-only"
+          >
+            {{ t('setup.modelStrategy.addProviderHint') }}
+          </span>
         </div>
 
         <SetupTierTable
@@ -2012,6 +2023,17 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-inline-link.setup-model-strategy__add-provider {
   flex: 0 0 auto;
   font-size: var(--fs-xs);
+}
+
+.setup-model-strategy__sr-only {
+  clip: rect(0, 0, 0, 0);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
 }
 
 .setup-model-strategy__candidate-list {

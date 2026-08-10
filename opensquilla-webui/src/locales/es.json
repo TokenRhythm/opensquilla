@@ -943,7 +943,6 @@
       "fallbackTierLabel": "Cuando el enrutamiento no esté seguro",
       "fallbackTierDesc": "Se usa cuando el enrutado no puede determinar el nivel.",
       "modelRolesTitle": "Roles de los modelos",
-      "addProvider": "Añadir proveedor",
       "addProviderHint": "Añade otro proveedor de modelos para elegir un proveedor distinto en cada nivel.",
       "advancedTitle": "Opciones avanzadas",
       "advancedDesc": "Nivel de respaldo y presentación del enrutado en el chat.",

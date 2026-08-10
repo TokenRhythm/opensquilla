@@ -340,6 +340,14 @@ export function useSetupRouterForm() {
   })
   const isDirty = computed(() => routingDirty.value || visualModeDirty.value)
 
+  function refreshRuntimeMetadata(
+    providerRoles?: unknown,
+    currentTierEnsembleStatus?: unknown,
+  ) {
+    persistedRouterProviderRoles.value = normalizeRouterProviderRoles(providerRoles)
+    tierEnsembleStatus.value = normalizeTierEnsembleRuntimeStatus(currentTierEnsembleStatus)
+  }
+
   function initFromConfig(
     router: RouterConfig,
     profileTiers: Record<string, TierConfig>,
@@ -353,11 +361,10 @@ export function useSetupRouterForm() {
     activeProvider.value = provider.toLowerCase()
     crossProviderTiers.value = router.cross_provider_tiers === true
     tierProviderMismatch.value = router.tier_provider_mismatch === 'veto' ? 'veto' : 'route'
-    persistedRouterProviderRoles.value = normalizeRouterProviderRoles(providerRoles)
+    refreshRuntimeMetadata(providerRoles, currentTierEnsembleStatus)
     sharedSelectionMode.value = String(currentSharedSelectionMode || '').trim()
     ensembleGloballyEnabled.value = currentEnsembleGloballyEnabled === true
     providerRoleContextDirty.value = false
-    tierEnsembleStatus.value = normalizeTierEnsembleRuntimeStatus(currentTierEnsembleStatus)
     // Ownership is a server contract, not a shape inferred from tier_profile.
     // Missing ownership is an historical/older-Gateway config and must be
     // treated conservatively: editing it may explicitly adopt `custom`, but it
@@ -558,6 +565,7 @@ export function useSetupRouterForm() {
     routingDirty,
     visualModeDirty,
     isDirty,
+    refreshRuntimeMetadata,
     initFromConfig,
     setRouterMode,
     enableFromSavedBinding,

@@ -93,6 +93,7 @@ describe('useSetupModelStrategyForm', () => {
     })
     const strategyPanel = strategy.createPanel({
       hasSavedProvider: computed(() => true),
+      profileSaveSupported: computed(() => true),
       providerLabel: computed(() => 'OpenRouter'),
       routerPanel,
       ensemblePanel,
@@ -304,6 +305,7 @@ describe('useSetupModelStrategyForm', () => {
     })
     const panel = strategy.createPanel({
       hasSavedProvider: computed(() => true),
+      profileSaveSupported: computed(() => true),
       providerLabel: computed(() => 'OpenAI'),
       routerPanel,
       ensemblePanel,
