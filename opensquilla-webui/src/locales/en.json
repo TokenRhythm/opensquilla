@@ -2643,6 +2643,7 @@
       "toastNameRequired": "Name is required",
       "toastWorkspaceRequired": "Choose a project workspace for this task",
       "toastIntervalInvalid": "Interval must be an integer number of seconds",
+      "toastCronRequired": "Cron expression is required",
       "toastIsoTimeRequired": "ISO time is required",
       "toastCurrentSessionRequired": "Current session ID is required",
       "toastNamedSessionRequired": "Specific session ID is required",

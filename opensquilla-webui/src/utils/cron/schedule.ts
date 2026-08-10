@@ -1,5 +1,13 @@
 import i18n from '@/i18n'
 
+/**
+ * The schedule the friendly picker shows before the user touches anything.
+ * The form model has to start here too — the picker reads its own state back
+ * out of the expression, so a default that only exists on screen is a schedule
+ * the Gateway never receives.
+ */
+export const DEFAULT_CRON_EXPRESSION = '0 9 * * *'
+
 interface ParsedField {
   all: boolean
   set?: Set<number>

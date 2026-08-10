@@ -6,7 +6,7 @@ import { useToasts } from '@/composables/useToasts'
 import { useProjectWorkspaces } from '@/composables/useProjectWorkspaces'
 import type { CronJob, CronJobFormModel, CronPanelTemplate } from '@/types/cron'
 import { buildDeliveryFromValues, normalizeDeliveryFields } from '@/utils/cron/delivery'
-import { explainCron, nextRuns, parseCron } from '@/utils/cron/schedule'
+import { DEFAULT_CRON_EXPRESSION, explainCron, nextRuns, parseCron } from '@/utils/cron/schedule'
 import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
 
 interface UseCronFormOptions {
@@ -98,7 +98,13 @@ export function useCronForm(options: UseCronFormOptions) {
     form.name = job ? (job.name || '') : (tpl.name || '')
     form.message = job ? (job.message || job.prompt || '') : (tpl.message || '')
     form.type = job ? (job.scheduleKind || job.schedule_kind || 'cron') : (tpl.scheduleKind || tpl.schedule_kind || 'cron')
-    form.cron = job ? (job.expression || '') : (tpl.expression || '')
+    // The friendly picker derives "Daily / 09:00" from this expression and falls
+    // back to that reading when it is empty. Leaving it empty for a new job puts
+    // a schedule on screen that the model does not hold, so saving without first
+    // touching the frequency select posts an empty expr for the Gateway to reject.
+    form.cron = job
+      ? (job.expression || '')
+      : (tpl.expression || (form.type === 'cron' ? DEFAULT_CRON_EXPRESSION : ''))
     form.enabled = job ? !!job.enabled : true
     form.agentId = job ? (job.agentId || 'main') : (tpl.agentId || 'main')
     form.workspaceId = job ? (job.workspaceId || '') : (tpl.workspaceId || '')
@@ -205,7 +211,12 @@ export function useCronForm(options: UseCronFormOptions) {
     }
 
     if (form.type === 'cron') {
-      payload.schedule = { kind: 'cron', expr: form.cron.trim() }
+      const expr = form.cron.trim()
+      if (!expr) {
+        pushToast(t('cronSkills.form.toastCronRequired'), { tone: 'danger' })
+        return
+      }
+      payload.schedule = { kind: 'cron', expr }
     } else if (form.type === 'every') {
       const everySeconds = Number(form.every)
       if (!Number.isInteger(everySeconds) || everySeconds < 1) {

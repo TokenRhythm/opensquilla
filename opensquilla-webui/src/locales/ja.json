@@ -2592,6 +2592,7 @@
       "toastNameRequired": "名前は必須です",
       "toastWorkspaceRequired": "このタスクのプロジェクトワークスペースを選択してください",
       "toastIntervalInvalid": "間隔は整数の秒数である必要があります",
+      "toastCronRequired": "cron 式は必須です",
       "toastIsoTimeRequired": "ISO 時刻は必須です",
       "toastCurrentSessionRequired": "現在のセッション ID は必須です",
       "toastNamedSessionRequired": "指定したセッション ID は必須です",

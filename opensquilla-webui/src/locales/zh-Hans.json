@@ -2643,6 +2643,7 @@
       "toastNameRequired": "名称为必填项",
       "toastWorkspaceRequired": "请为该任务选择项目空间",
       "toastIntervalInvalid": "间隔必须为整数秒",
+      "toastCronRequired": "Cron 表达式为必填项",
       "toastIsoTimeRequired": "ISO 时间为必填项",
       "toastCurrentSessionRequired": "当前会话 ID 为必填项",
       "toastNamedSessionRequired": "指定会话 ID 为必填项",
