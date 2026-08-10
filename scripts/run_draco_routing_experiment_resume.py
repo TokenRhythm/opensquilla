@@ -94,6 +94,7 @@ from opensquilla.eval.draco_experiment_config import (
     validate_formal_draco_gateway_credential_binding,
     validate_reference_input,
 )
+from opensquilla.eval.draco_task_supervisor import DracoTaskSupervisor
 from opensquilla.execution_status import compact_provider_status
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.llm_runtime import (
@@ -22115,60 +22116,98 @@ async def amain(args: argparse.Namespace) -> int:
         for group in groups
         if (group, str(task["id"])) in scheduled_keys
     ]
+    supervisor = DracoTaskSupervisor(pending)
+    rows_persisted = 0
     repair_failures: list[dict[str, Any]] = []
-    with (
-        jsonl_path.open("w", encoding="utf-8") as fh,
-        trace_path.open("w", encoding="utf-8") as trace_fh,
-    ):
-        for row_index, coro in enumerate(asyncio.as_completed(pending), start=1):
-            row = await coro
-            row["row_index"] = row_index
-            resume_completion = row.get("resume_completion")
-            if (
-                isinstance(resume_completion, dict)
-                and resume_completion.get("status") == "incomplete"
-            ):
-                repair_failures.append(
-                    {
-                        "stage": "resume_repair",
-                        "group": row.get("group"),
-                        "task_id": row.get("task_id"),
-                        "action": resume_completion.get("action"),
-                        "reasons": list(resume_completion.get("incomplete_reasons") or []),
-                        "model_or_judge_started": bool(resume_completion.get("judge_reran")),
-                    }
-                )
-            if getattr(
-                args,
-                "require_openrouter_non_byok",
-                False,
-            ) and not getattr(args, "dry_run", False):
-                audit = openrouter_non_byok_audit(
-                    row,
-                    provider_routing=_openrouter_audit_provider_routing(
-                        inherited.provider_routing,
-                        (
-                            getattr(args, "_g1_registry_contract", None)
-                            if row.get("group") == "G1"
-                            else None
+    try:
+        with (
+            jsonl_path.open("w", encoding="utf-8") as fh,
+            trace_path.open("w", encoding="utf-8") as trace_fh,
+        ):
+            for row_index, coro in enumerate(asyncio.as_completed(pending), start=1):
+                row = await coro
+                row["row_index"] = row_index
+                resume_completion = row.get("resume_completion")
+                if (
+                    isinstance(resume_completion, dict)
+                    and resume_completion.get("status") == "incomplete"
+                ):
+                    repair_failures.append(
+                        {
+                            "stage": "resume_repair",
+                            "group": row.get("group"),
+                            "task_id": row.get("task_id"),
+                            "action": resume_completion.get("action"),
+                            "reasons": list(
+                                resume_completion.get("incomplete_reasons") or []
+                            ),
+                            "model_or_judge_started": bool(
+                                resume_completion.get("judge_reran")
+                            ),
+                        }
+                    )
+                if getattr(
+                    args,
+                    "require_openrouter_non_byok",
+                    False,
+                ) and not getattr(args, "dry_run", False):
+                    audit = openrouter_non_byok_audit(
+                        row,
+                        provider_routing=_openrouter_audit_provider_routing(
+                            inherited.provider_routing,
+                            (
+                                getattr(args, "_g1_registry_contract", None)
+                                if row.get("group") == "G1"
+                                else None
+                            ),
                         ),
-                    ),
+                    )
+                    row["openrouter_non_byok_audit"] = audit
+                    row["audit_status"] = row_audit_status(
+                        row,
+                        non_byok_audit=audit,
+                    )
+                row = seal_result_row(row)
+                trace_value = trace_row(row)
+                result_line = json.dumps(row, ensure_ascii=False, allow_nan=False)
+                trace_line = json.dumps(trace_value, ensure_ascii=False, allow_nan=False)
+                rows.append(row)
+                fh.write(result_line + "\n")
+                fh.flush()
+                trace_fh.write(trace_line + "\n")
+                trace_fh.flush()
+                rows_persisted += 1
+                print(
+                    f"{row['group']} {row['task_id']} error={bool(row['error'])}",
+                    flush=True,
                 )
-                row["openrouter_non_byok_audit"] = audit
-                row["audit_status"] = row_audit_status(
-                    row,
-                    non_byok_audit=audit,
-                )
-            row = seal_result_row(row)
-            trace_value = trace_row(row)
-            result_line = json.dumps(row, ensure_ascii=False, allow_nan=False)
-            trace_line = json.dumps(trace_value, ensure_ascii=False, allow_nan=False)
-            rows.append(row)
-            fh.write(result_line + "\n")
-            fh.flush()
-            trace_fh.write(trace_line + "\n")
-            trace_fh.flush()
-            print(f"{row['group']} {row['task_id']} error={bool(row['error'])}", flush=True)
+    except BaseException as exc:
+        await supervisor.cancel_and_wait()
+        failure = supervisor.failure_payload(exc, rows_written=rows_persisted)
+        try:
+            write_manifest(
+                manifest_path,
+                args=args,
+                stamp=stamp,
+                status="aborted",
+                started_at=run_started_at,
+                finished_at=time.time(),
+                tasks=tasks,
+                groups=groups,
+                artifacts=artifacts,
+                rows_written=rows_persisted,
+                tool_policy=manifest_tool_policy,
+                command=command,
+                failure=failure,
+            )
+        except Exception as manifest_exc:
+            print(
+                "Failed to publish aborted manifest: "
+                f"{type(manifest_exc).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+        raise
     result_failures: list[dict[str, Any]] = []
     for row in rows:
         completion = row.get("completion_status")

@@ -7340,6 +7340,85 @@ def test_recovery_cli_arguments_are_manifested_and_reconstructed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_worker_failure_cancels_siblings_and_publishes_aborted_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        "\n".join(
+            json.dumps({"id": task_id, "prompt": task_id})
+            for task_id in ("task-a", "task-b")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+            "--concurrency",
+            "2",
+        ]
+    )
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    slow_started = asyncio.Event()
+    slow_cancelled = asyncio.Event()
+
+    async def failing_or_slow_run_one(*_args, **kwargs):
+        if kwargs["task"]["id"] == "task-b":
+            slow_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                slow_cancelled.set()
+                await asyncio.sleep(0)
+                raise
+        await slow_started.wait()
+        raise RuntimeError("sensitive provider detail must not enter manifest")
+
+    monkeypatch.setattr(runner, "run_one", failing_or_slow_run_one)
+
+    with pytest.raises(RuntimeError, match="sensitive provider detail"):
+        await runner.amain(args)
+
+    assert slow_cancelled.is_set()
+    manifest_paths = list(output_dir.glob("draco_run_*.manifest.json"))
+    assert len(manifest_paths) == 1
+    manifest_text = manifest_paths[0].read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    assert manifest["status"] == "aborted"
+    assert manifest["rows_written"] == 0
+    assert manifest["finished_at"] is not None
+    assert manifest["failure"] == {
+        "schema": "opensquilla.draco-task-supervisor-failure/v1",
+        "stage": "task_execution",
+        "exception_type": "RuntimeError",
+        "scheduled_task_count": 2,
+        "rows_written": 0,
+        "model_or_judge_started": True,
+        "cleanup": {
+            "complete": True,
+            "cancel_requested_count": 1,
+            "cancelled_count": 1,
+            "remaining_task_count": 0,
+            "exception_types": ["RuntimeError"],
+        },
+    }
+    assert "sensitive provider detail" not in manifest_text
+    result_path = next(output_dir.glob("draco_ensemble_*.jsonl"))
+    trace_path = next(output_dir.glob("draco_run_*.trace.jsonl"))
+    assert result_path.read_text(encoding="utf-8") == ""
+    assert trace_path.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.asyncio
 async def test_preflight_failure_writes_audit_manifest_before_any_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
