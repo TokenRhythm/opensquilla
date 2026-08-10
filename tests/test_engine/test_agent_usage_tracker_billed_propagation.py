@@ -27,6 +27,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult
+from opensquilla.engine.agent import _model_usage_ledger
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
 from opensquilla.engine.types import ToolCall
 from opensquilla.engine.usage import UsageTracker
@@ -252,8 +253,35 @@ def test_ensemble_breakdown_accumulates_each_underlying_model() -> None:
     assert usage.billed_cost == 0.03
 
 
+def test_physical_ledger_preserves_sub_microdollar_precision() -> None:
+    rows = [
+        {
+            "provider": "openrouter",
+            "model": "vendor/model",
+            "billed_cost": 0.0000006,
+            "cost_source": "provider_billed",
+            "physical_attempt_id": attempt_id,
+        }
+        for attempt_id in ("a" * 32, "b" * 32)
+    ]
+
+    ledger = _model_usage_ledger(rows)
+
+    assert [row["billed_cost"] for row in ledger] == [0.0000006, 0.0000006]
+    assert [row["billed_cost_usd"] for row in ledger] == [
+        0.0000006,
+        0.0000006,
+    ]
+    assert sum(row["billed_cost"] for row in ledger) == 0.0000012
+
+
 class _TwoStepEnsembleBreakdownProvider:
     provider_name = "fake"
+
+    _CALL_1_PROPOSER_ID = "1" * 32
+    _CALL_1_AGGREGATOR_ID = "2" * 32
+    _CALL_2_PROPOSER_ID = "3" * 32
+    _CALL_2_AGGREGATOR_ID = "4" * 32
 
     def __init__(self) -> None:
         self.calls = 0
@@ -281,7 +309,34 @@ class _TwoStepEnsembleBreakdownProvider:
                 output_tokens=3,
                 billed_cost=0.03,
                 model="z-ai/glm-5.2",
-                ensemble_trace={"profile": "default", "llm_request_count": 2},
+                ensemble_trace={
+                    "profile": "default",
+                    "llm_request_count": 2,
+                    "selection_plan": {
+                        "routed_tier": "c1",
+                        "candidate_pool": [
+                            {
+                                "source": "router_anchor",
+                                "provider": "openrouter",
+                                "model": "vendor/route-a",
+                            }
+                        ],
+                    },
+                    "physical_attempts": [
+                        {"physical_attempt_id": self._CALL_1_PROPOSER_ID},
+                        {"physical_attempt_id": self._CALL_1_AGGREGATOR_ID},
+                    ],
+                    "proposer_recovery": {
+                        "attempts_before_count": 0,
+                        "attempts_after_count": 1,
+                        "attempts": [
+                            {"physical_attempt_id": self._CALL_1_PROPOSER_ID}
+                        ],
+                        "attempts_delta": [
+                            {"physical_attempt_id": self._CALL_1_PROPOSER_ID}
+                        ],
+                    },
+                },
                 model_usage_breakdown=[
                     {
                         "role": "proposer",
@@ -292,6 +347,10 @@ class _TwoStepEnsembleBreakdownProvider:
                         "output_tokens": 1,
                         "billed_cost": 0.01,
                         "cost_source": "provider_billed",
+                        "physical_attempt_id": self._CALL_1_PROPOSER_ID,
+                        "provider_usage": {
+                            "physical_attempt_id": self._CALL_1_PROPOSER_ID
+                        },
                     },
                     {
                         "role": "aggregator",
@@ -302,6 +361,10 @@ class _TwoStepEnsembleBreakdownProvider:
                         "output_tokens": 2,
                         "billed_cost": 0.02,
                         "cost_source": "provider_billed",
+                        "physical_attempt_id": self._CALL_1_AGGREGATOR_ID,
+                        "provider_usage": {
+                            "physical_attempt_id": self._CALL_1_AGGREGATOR_ID
+                        },
                     },
                 ],
             )
@@ -313,7 +376,35 @@ class _TwoStepEnsembleBreakdownProvider:
             output_tokens=4,
             billed_cost=0.04,
             model="z-ai/glm-5.2",
-            ensemble_trace={"profile": "default", "llm_request_count": 2},
+            ensemble_trace={
+                "profile": "default",
+                "llm_request_count": 2,
+                "selection_plan": {
+                    "routed_tier": "c3",
+                    "candidate_pool": [
+                        {
+                            "source": "router_anchor",
+                            "provider": "openrouter",
+                            "model": "vendor/route-b",
+                        }
+                    ],
+                },
+                "physical_attempts": [
+                    {"physical_attempt_id": self._CALL_2_PROPOSER_ID},
+                    {"physical_attempt_id": self._CALL_2_AGGREGATOR_ID},
+                ],
+                "proposer_recovery": {
+                    "attempts_before_count": 1,
+                    "attempts_after_count": 2,
+                    "attempts": [
+                        {"physical_attempt_id": self._CALL_1_PROPOSER_ID},
+                        {"physical_attempt_id": self._CALL_2_PROPOSER_ID},
+                    ],
+                    "attempts_delta": [
+                        {"physical_attempt_id": self._CALL_2_PROPOSER_ID}
+                    ],
+                },
+            },
             model_usage_breakdown=[
                 {
                     "role": "proposer",
@@ -324,6 +415,10 @@ class _TwoStepEnsembleBreakdownProvider:
                     "output_tokens": 1,
                     "billed_cost": 0.02,
                     "cost_source": "provider_billed",
+                    "physical_attempt_id": self._CALL_2_PROPOSER_ID,
+                    "provider_usage": {
+                        "physical_attempt_id": self._CALL_2_PROPOSER_ID
+                    },
                 },
                 {
                     "role": "aggregator",
@@ -334,6 +429,10 @@ class _TwoStepEnsembleBreakdownProvider:
                     "output_tokens": 3,
                     "billed_cost": 0.02,
                     "cost_source": "provider_billed",
+                    "physical_attempt_id": self._CALL_2_AGGREGATOR_ID,
+                    "provider_usage": {
+                        "physical_attempt_id": self._CALL_2_AGGREGATOR_ID
+                    },
                 },
             ],
         )
@@ -390,6 +489,75 @@ def test_agent_final_done_summarizes_ensemble_breakdown_across_tool_iterations()
     assert aggregator_row["request_count"] == 2
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["llm_request_count"] == 4
+    assert [trace["llm_request_count"] for trace in done.ensemble_traces] == [2, 2]
+    assert done.ensemble_traces[0]["proposer_recovery"]["attempts"][0][
+        "physical_attempt_id"
+    ] == ("1" * 32)
+    assert [
+        attempt["physical_attempt_id"]
+        for attempt in done.ensemble_traces[1]["proposer_recovery"]["attempts"]
+    ] == ["1" * 32, "3" * 32]
+    assert [row["physical_attempt_id"] for row in done.model_usage_ledger] == [
+        "1" * 32,
+        "2" * 32,
+        "3" * 32,
+        "4" * 32,
+    ]
+    assert [row["ensemble_call_index"] for row in done.model_usage_ledger] == [
+        0,
+        0,
+        1,
+        1,
+    ]
+    assert len({row["agent_call_id"] for row in done.model_usage_ledger}) == 2
+    assert [call["routing"] for call in done.ensemble_calls] == [
+        {
+            "routed_tier": "c1",
+            "routed_model": "vendor/route-a",
+            "requested_provider": "fake",
+        },
+        {
+            "routed_tier": "c3",
+            "routed_model": "vendor/route-b",
+            "requested_provider": "fake",
+        },
+    ]
+    assert done.physical_audit_schema == "opensquilla.agent-physical-ledger/v1"
+    assert [call["ensemble_call_index"] for call in done.ensemble_calls] == [0, 1]
+    assert all(
+        call["schema"] == "opensquilla.agent-ensemble-call/v1"
+        for call in done.ensemble_calls
+    )
+    assert {call["index_base"] for call in done.ensemble_calls} == {0}
+    assert [
+        attempt["physical_attempt_id"]
+        for attempt in done.ensemble_calls[1]["trace"]["proposer_recovery"][
+            "attempts"
+        ]
+    ] == ["3" * 32]
+    assert [
+        attempt["physical_attempt_id"]
+        for attempt in done.ensemble_calls[1]["trace"]["proposer_recovery"][
+            "cumulative_attempts"
+        ]
+    ] == ["1" * 32, "3" * 32]
+    for call in done.ensemble_calls:
+        assert call["raw_trace_index"] == call["ensemble_call_index"]
+        assert call["trace"]["selection_plan"] == done.ensemble_traces[
+            call["raw_trace_index"]
+        ]["selection_plan"]
+        trace_attempt_ids = {
+            row["physical_attempt_id"]
+            for row in call["trace"]["physical_attempts"]
+        }
+        ledger_attempt_ids = {
+            row["physical_attempt_id"] for row in call["model_usage_ledger"]
+        }
+        assert trace_attempt_ids == ledger_attempt_ids
+        assert {
+            row["ensemble_call_index"] for row in call["model_usage_ledger"]
+        } == {call["ensemble_call_index"]}
+    assert sum(row["billed_cost"] for row in done.model_usage_ledger) == 0.07
     assert done.input_tokens == 70
     assert done.output_tokens == 7
     assert done.billed_cost == 0.07

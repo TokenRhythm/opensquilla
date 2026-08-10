@@ -310,6 +310,22 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
 @pytest.mark.asyncio
 async def test_turn_usage_persists_ensemble_breakdown_and_trace() -> None:
     stage, recs = _make_stage()
+    proposer_attempt_id = "a" * 32
+    aggregator_attempt_id = "b" * 32
+    trace = {
+        "mode": "b5_fusion",
+        "profile": "default",
+        "llm_request_count": 2,
+        "fallback_used": False,
+        "physical_attempts": [
+            {"physical_attempt_id": proposer_attempt_id},
+            {"physical_attempt_id": aggregator_attempt_id},
+        ],
+    }
+    ledger = [
+        {"physical_attempt_id": proposer_attempt_id, "ensemble_call_index": 0},
+        {"physical_attempt_id": aggregator_attempt_id, "ensemble_call_index": 0},
+    ]
     done = DoneEvent(
         text="ensemble answer",
         input_tokens=11,
@@ -335,12 +351,23 @@ async def test_turn_usage_persists_ensemble_breakdown_and_trace() -> None:
                 "billed_cost": 0.02,
             },
         ],
-        ensemble_trace={
-            "mode": "b5_fusion",
-            "profile": "default",
-            "llm_request_count": 2,
-            "fallback_used": False,
-        },
+        ensemble_trace=trace,
+        ensemble_traces=[trace],
+        model_usage_ledger=ledger,
+        ensemble_calls=[
+            {
+                "ensemble_call_index": 0,
+                "agent_call_index": 0,
+                "agent_call_id": "1.0",
+                "routing": {
+                    "routed_tier": "c2",
+                    "routed_model": "vendor/anchor",
+                },
+                "trace": trace,
+                "model_usage_ledger": ledger,
+            }
+        ],
+        physical_audit_schema="opensquilla.agent-physical-ledger/v1",
     )
     inp = _make_input(final_text_parts=["ensemble answer"], done_event=done)
 
@@ -351,6 +378,14 @@ async def test_turn_usage_persists_ensemble_breakdown_and_trace() -> None:
     assert usage["model_usage_breakdown"][1]["role"] == "aggregator"
     assert usage["ensemble_trace"]["profile"] == "default"
     assert usage["ensemble_trace"]["llm_request_count"] == 2
+    assert usage["ensemble_traces"] == [trace]
+    assert usage["model_usage_ledger"] == ledger
+    assert usage["ensemble_calls"][0]["routing"] == {
+        "routed_tier": "c2",
+        "routed_model": "vendor/anchor",
+    }
+    assert usage["ensemble_calls"][0]["model_usage_ledger"] == ledger
+    assert usage["physical_audit_schema"] == "opensquilla.agent-physical-ledger/v1"
 
 
 @pytest.mark.asyncio

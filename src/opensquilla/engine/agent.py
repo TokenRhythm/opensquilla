@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import functools
 import hashlib
 import json
@@ -900,6 +901,166 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
         row["costSource"] = row["cost_source"]
         summarized.append(row)
     return summarized
+
+
+def _model_usage_ledger(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return detached, unaggregated physical-call evidence.
+
+    ``model_usage_breakdown`` is intentionally grouped for cost reporting, so
+    it cannot also serve as an audit ledger: grouping drops per-attempt IDs and
+    makes two ensemble calls with the same role/model indistinguishable.
+    """
+
+    ledger: list[dict[str, Any]] = []
+    for raw_row in rows:
+        row = copy.deepcopy(raw_row)
+        provider_cost_source = str(
+            row.get("cost_source") or row.get("costSource") or "none"
+        ).strip().lower()
+        reported_billed_cost = _usage_float(
+            row.get("billed_cost")
+            or row.get("billedCost")
+            or row.get("billed_cost_usd")
+            or row.get("billedCostUsd")
+        )
+        trusted_billed_cost, billed_is_trusted = (
+            _canonical_provider_billed_cost(row)
+        )
+        # The physical ledger is an accounting/audit artifact, not the rounded
+        # display projection used by model_usage_breakdown. Keep receipt-derived
+        # values at their original precision so summing many tiny calls cannot
+        # drift past the downstream reconciliation tolerance.
+        row["provider_reported_billed_cost"] = reported_billed_cost
+        row["provider_cost_source"] = provider_cost_source
+        row["billed_cost"] = trusted_billed_cost
+        row["billed_cost_usd"] = trusted_billed_cost
+        row["billedCostUsd"] = trusted_billed_cost
+        if billed_is_trusted:
+            row["cost_source"] = "provider_billed"
+            row["costSource"] = "provider_billed"
+            row["cost_usd"] = trusted_billed_cost
+            row["costUsd"] = trusted_billed_cost
+            row["estimated_cost_usd"] = 0.0
+            row["estimatedCostUsd"] = 0.0
+        elif _usage_field(
+            row,
+            "billing_receipt",
+            "billingReceipt",
+            default=None,
+        ) is not None:
+            row["cost_source"] = (
+                provider_cost_source
+                if provider_cost_source.startswith("opensquilla_")
+                else "unavailable"
+            )
+            row["costSource"] = row["cost_source"]
+        provider_usage = row.get("provider_usage")
+        provider_attempt_id = (
+            str(provider_usage.get("physical_attempt_id") or "").strip()
+            if isinstance(provider_usage, Mapping)
+            else ""
+        )
+        row_attempt_id = str(row.get("physical_attempt_id") or "").strip()
+        if row_attempt_id and provider_attempt_id and row_attempt_id != provider_attempt_id:
+            # Preserve both conflicting values and make the contradiction
+            # explicit. Downstream strict audit can fail closed without the
+            # engine silently choosing one receipt identity.
+            row["physical_attempt_id_conflict"] = True
+        row["physical_attempt_id"] = row_attempt_id or provider_attempt_id or None
+        ledger.append(row)
+    return ledger
+
+
+_AGENT_PHYSICAL_LEDGER_SCHEMA = "opensquilla.agent-physical-ledger/v1"
+_AGENT_ENSEMBLE_CALL_SCHEMA = "opensquilla.agent-ensemble-call/v1"
+
+
+def _call_local_ensemble_trace(trace: Mapping[str, Any]) -> dict[str, Any]:
+    """Project cumulative recovery evidence into one provider-call view."""
+
+    projected = copy.deepcopy(dict(trace))
+    recovery = projected.get("proposer_recovery")
+    if not isinstance(recovery, dict):
+        return projected
+    attempts_delta = recovery.get("attempts_delta")
+    if not isinstance(attempts_delta, list):
+        return projected
+    cumulative_attempts = recovery.get("attempts")
+    recovery["cumulative_attempts"] = (
+        copy.deepcopy(cumulative_attempts)
+        if isinstance(cumulative_attempts, list)
+        else []
+    )
+    recovery["attempts"] = [
+        copy.deepcopy(attempt)
+        for attempt in attempts_delta
+        if isinstance(attempt, dict)
+    ]
+    recovery["attempts_scope"] = "provider_call"
+    return projected
+
+
+def _ensemble_call_routing_snapshot(
+    trace: Mapping[str, Any],
+    *,
+    requested_model: str,
+    requested_provider: str,
+) -> dict[str, Any]:
+    """Bind one ensemble trace to the route that produced its selection plan."""
+
+    plan: Mapping[str, Any] | None = None
+    for key in ("effective_selection_plan", "selection_plan"):
+        candidate = trace.get(key)
+        if isinstance(candidate, Mapping):
+            plan = candidate
+            break
+
+    routed_tier = str(
+        (plan.get("routed_tier") if plan is not None else None)
+        or trace.get("routed_tier")
+        or ""
+    ).strip()
+    anchor_models: list[str] = []
+    if plan is not None:
+        candidate_pool = plan.get("candidate_pool")
+        if isinstance(candidate_pool, list):
+            for candidate in candidate_pool:
+                if not isinstance(candidate, Mapping):
+                    continue
+                if str(candidate.get("source") or "").strip() != "router_anchor":
+                    continue
+                model = str(candidate.get("model") or "").strip()
+                if model and model not in anchor_models:
+                    anchor_models.append(model)
+    routed_model = anchor_models[0] if len(anchor_models) == 1 else requested_model.strip()
+    routing_source = str(
+        (plan.get("routing_source") if plan is not None else None)
+        or trace.get("routing_source")
+        or ""
+    ).strip()
+    routing: dict[str, Any] = {
+        "routed_tier": routed_tier or None,
+        "routed_model": routed_model,
+    }
+    if routing_source:
+        routing["routing_source"] = routing_source
+    if requested_provider.strip():
+        routing["requested_provider"] = requested_provider.strip()
+    return routing
+
+
+def _finalize_ensemble_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    finalized: list[dict[str, Any]] = []
+    for raw_call in calls:
+        call = copy.deepcopy(raw_call)
+        raw_ledger = call.get("model_usage_ledger")
+        call["model_usage_ledger"] = _model_usage_ledger(
+            [row for row in raw_ledger if isinstance(row, dict)]
+            if isinstance(raw_ledger, list)
+            else []
+        )
+        finalized.append(call)
+    return finalized
 
 
 def _camel_usage_key(field: str) -> str:
@@ -5079,11 +5240,81 @@ class Agent:
             or ""
         )
         turn_model_usage_breakdown: list[dict[str, Any]] = []
+        turn_model_usage_ledger: list[dict[str, Any]] = []
         last_ensemble_trace: dict[str, Any] | None = None
+        turn_ensemble_traces: list[dict[str, Any]] = []
+        turn_ensemble_calls: list[dict[str, Any]] = []
         turn_ensemble_request_count = 0
         turn_ensemble_physical_request_count = 0
         turn_ensemble_usage_missing_count = 0
         terminal_error: ErrorEvent | None = None
+
+        def _record_ensemble_trace(
+            trace: Any,
+            *,
+            agent_call_index: int,
+            agent_call_id: str,
+            requested_model: str,
+            requested_provider: str,
+        ) -> int | None:
+            nonlocal last_ensemble_trace
+            nonlocal turn_ensemble_request_count
+            nonlocal turn_ensemble_physical_request_count
+            nonlocal turn_ensemble_usage_missing_count
+            if not isinstance(trace, dict):
+                return None
+            trace_snapshot = copy.deepcopy(trace)
+            ensemble_call_index = len(turn_ensemble_traces)
+            turn_ensemble_traces.append(trace_snapshot)
+            last_ensemble_trace = copy.deepcopy(trace_snapshot)
+            turn_ensemble_request_count += _usage_int(
+                trace_snapshot.get("llm_request_count") or 0
+            )
+            turn_ensemble_physical_request_count += _usage_int(
+                trace_snapshot.get("physical_request_count")
+                or trace_snapshot.get("llm_request_count")
+                or 0
+            )
+            turn_ensemble_usage_missing_count += _usage_int(
+                trace_snapshot.get("usage_missing_count") or 0
+            )
+            turn_ensemble_calls.append(
+                {
+                    "schema": _AGENT_ENSEMBLE_CALL_SCHEMA,
+                    "index_base": 0,
+                    "ensemble_call_index": ensemble_call_index,
+                    "agent_call_index": agent_call_index,
+                    "agent_call_id": agent_call_id,
+                    "routing": _ensemble_call_routing_snapshot(
+                        trace_snapshot,
+                        requested_model=requested_model,
+                        requested_provider=requested_provider,
+                    ),
+                    "trace": _call_local_ensemble_trace(trace_snapshot),
+                    "raw_trace_index": ensemble_call_index,
+                    "model_usage_ledger": [],
+                }
+            )
+            return ensemble_call_index
+
+        def _append_model_usage_ledger(
+            rows: list[dict[str, Any]],
+            *,
+            agent_call_index: int,
+            agent_call_id: str,
+            ensemble_call_index: int | None,
+        ) -> None:
+            for raw_row in rows:
+                row = copy.deepcopy(raw_row)
+                row["agent_call_index"] = agent_call_index
+                row["agent_call_id"] = agent_call_id
+                if ensemble_call_index is not None:
+                    row["ensemble_call_index"] = ensemble_call_index
+                turn_model_usage_ledger.append(row)
+                if ensemble_call_index is not None:
+                    turn_ensemble_calls[ensemble_call_index][
+                        "model_usage_ledger"
+                    ].append(copy.deepcopy(row))
 
         def _terminal_error_usage_fields(
             provider_error: ProviderErrorEvent | None = None,
@@ -5104,6 +5335,31 @@ class Agent:
                 error_trace = getattr(diagnostic_done, "ensemble_trace", None)
             if not isinstance(error_trace, dict):
                 error_trace = last_ensemble_trace
+            terminal_traces = copy.deepcopy(turn_ensemble_traces)
+            terminal_calls = _finalize_ensemble_calls(turn_ensemble_calls)
+            if isinstance(error_trace, dict) and (
+                not terminal_traces or terminal_traces[-1] != error_trace
+            ):
+                trace_snapshot = copy.deepcopy(error_trace)
+                ensemble_call_index = len(terminal_traces)
+                terminal_traces.append(trace_snapshot)
+                terminal_calls.append(
+                    {
+                        "schema": _AGENT_ENSEMBLE_CALL_SCHEMA,
+                        "index_base": 0,
+                        "ensemble_call_index": ensemble_call_index,
+                        "agent_call_index": max(0, turn_llm_calls - 1),
+                        "agent_call_id": "terminal_error",
+                        "routing": _ensemble_call_routing_snapshot(
+                            trace_snapshot,
+                            requested_model=last_requested_model,
+                            requested_provider=last_requested_provider,
+                        ),
+                        "trace": _call_local_ensemble_trace(trace_snapshot),
+                        "raw_trace_index": ensemble_call_index,
+                        "model_usage_ledger": [],
+                    }
+                )
             if total_provider_billed_entries and total_unbilled_entries:
                 error_cost_source = "mixed"
             elif total_provider_billed_entries:
@@ -5150,8 +5406,14 @@ class Agent:
                     turn_model_usage_breakdown
                 ),
                 "ensemble_trace": (
-                    dict(error_trace) if isinstance(error_trace, dict) else None
+                    copy.deepcopy(error_trace)
+                    if isinstance(error_trace, dict)
+                    else None
                 ),
+                "ensemble_traces": terminal_traces,
+                "model_usage_ledger": _model_usage_ledger(turn_model_usage_ledger),
+                "ensemble_calls": terminal_calls,
+                "physical_audit_schema": _AGENT_PHYSICAL_LEDGER_SCHEMA,
                 "usage_missing_count": max(
                     turn_ensemble_usage_missing_count,
                     int(
@@ -6795,6 +7057,13 @@ class Agent:
                                     if isinstance(usage_breakdown, list)
                                     else []
                                 )
+                                ensemble_call_index = _record_ensemble_trace(
+                                    getattr(raw_ev, "ensemble_trace", None),
+                                    agent_call_index=max(0, turn_llm_calls - 1),
+                                    agent_call_id=call_id,
+                                    requested_model=requested_model_id,
+                                    requested_provider=requested_provider_id,
+                                )
                                 for usage_row in valid_usage_breakdown:
                                     if not str(
                                         usage_row.get("requested_model") or ""
@@ -6902,6 +7171,12 @@ class Agent:
                                 # live context-window gauge below.
                                 if valid_usage_breakdown:
                                     turn_model_usage_breakdown.extend(valid_usage_breakdown)
+                                    _append_model_usage_ledger(
+                                        valid_usage_breakdown,
+                                        agent_call_index=max(0, turn_llm_calls - 1),
+                                        agent_call_id=call_id,
+                                        ensemble_call_index=ensemble_call_index,
+                                    )
                                 if self._usage_tracker and self._session_key:
                                     # Forward the provider's real per-call billed_cost so
                                     # the per-model breakdown can show actual numbers
@@ -6990,21 +7265,6 @@ class Agent:
                                                 )
                                             ),
                                         )
-                                ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
-                                if isinstance(ensemble_trace, dict):
-                                    last_ensemble_trace = dict(ensemble_trace)
-                                    turn_ensemble_request_count += _usage_int(
-                                        ensemble_trace.get("llm_request_count") or 0
-                                    )
-                                    turn_ensemble_physical_request_count += _usage_int(
-                                        ensemble_trace.get("physical_request_count")
-                                        or ensemble_trace.get("llm_request_count")
-                                        or 0
-                                    )
-                                    turn_ensemble_usage_missing_count += _usage_int(
-                                        ensemble_trace.get("usage_missing_count") or 0
-                                    )
-
                             elif isinstance(raw_ev, ProviderErrorEvent):
                                 provider_error_for_log = raw_ev
                                 if str(raw_ev.code or "").endswith("_close_timeout"):
@@ -7017,20 +7277,24 @@ class Agent:
                                         self._cleanup_poisoned_reason = str(
                                             raw_ev.code or "provider_stream_close_timeout"
                                         )
-                                ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
-                                if isinstance(ensemble_trace, dict):
-                                    last_ensemble_trace = dict(ensemble_trace)
-                                    turn_ensemble_request_count += _usage_int(
-                                        ensemble_trace.get("llm_request_count") or 0
+                                error_ensemble_trace = getattr(
+                                    raw_ev, "ensemble_trace", None
+                                )
+                                diagnostic_done = getattr(raw_ev, "diagnostic_done", None)
+                                if (
+                                    not isinstance(error_ensemble_trace, dict)
+                                    and diagnostic_done is not None
+                                ):
+                                    error_ensemble_trace = getattr(
+                                        diagnostic_done, "ensemble_trace", None
                                     )
-                                    turn_ensemble_physical_request_count += _usage_int(
-                                        ensemble_trace.get("physical_request_count")
-                                        or ensemble_trace.get("llm_request_count")
-                                        or 0
-                                    )
-                                    turn_ensemble_usage_missing_count += _usage_int(
-                                        ensemble_trace.get("usage_missing_count") or 0
-                                    )
+                                error_ensemble_call_index = _record_ensemble_trace(
+                                    error_ensemble_trace,
+                                    agent_call_index=max(0, turn_llm_calls - 1),
+                                    agent_call_id=call_id,
+                                    requested_model=last_requested_model,
+                                    requested_provider=last_requested_provider,
+                                )
                                 usage_unknown_reason = provider_error_usage_reason(raw_ev.code)
                                 explicit_physical_request_count = (
                                     max(0, int(raw_ev.physical_request_count))
@@ -7302,6 +7566,14 @@ class Agent:
                                         else:
                                             total_unbilled_entries += 1
                                     turn_model_usage_breakdown.extend(error_rows)
+                                    _append_model_usage_ledger(
+                                        error_rows,
+                                        agent_call_index=max(0, turn_llm_calls - 1),
+                                        agent_call_id=call_id,
+                                        ensemble_call_index=(
+                                            error_ensemble_call_index
+                                        ),
+                                    )
                                     last_actual_model = error_actual_model
                                     last_actual_provider = error_actual_provider
                                     if self._usage_tracker and self._session_key:
@@ -11724,8 +11996,13 @@ class Agent:
         summarized_model_usage_breakdown = _summarize_model_usage_breakdown(
             turn_model_usage_breakdown
         )
+        final_model_usage_ledger = _model_usage_ledger(turn_model_usage_ledger)
+        final_ensemble_traces = copy.deepcopy(turn_ensemble_traces)
+        final_ensemble_calls = _finalize_ensemble_calls(turn_ensemble_calls)
         final_ensemble_trace = (
-            dict(last_ensemble_trace) if isinstance(last_ensemble_trace, dict) else None
+            copy.deepcopy(last_ensemble_trace)
+            if isinstance(last_ensemble_trace, dict)
+            else None
         )
         if final_ensemble_trace is not None and turn_ensemble_request_count > 0:
             final_ensemble_trace["llm_request_count"] = turn_ensemble_request_count
@@ -11804,6 +12081,10 @@ class Agent:
                 session_totals=session_totals,
                 model_usage_breakdown=summarized_model_usage_breakdown,
                 ensemble_trace=final_ensemble_trace,
+                ensemble_traces=final_ensemble_traces,
+                model_usage_ledger=final_model_usage_ledger,
+                ensemble_calls=final_ensemble_calls,
+                physical_audit_schema=_AGENT_PHYSICAL_LEDGER_SCHEMA,
                 estimate_basis=estimate_basis,
                 text_snapshot="".join(final_text_parts),
             )

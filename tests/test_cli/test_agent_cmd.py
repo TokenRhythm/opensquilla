@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 from opensquilla.cli.agent_cmd import (
     AgentRunResult,
     _to_benchmark_transcript,
+    _usage_from_done,
     run_agent_command,
     run_agent_once,
 )
@@ -57,6 +58,41 @@ _OPERATIONAL_ERROR = {
     "retryable": True,
     "terminal": True,
 }
+
+
+def test_usage_from_done_preserves_detached_per_ensemble_call_evidence() -> None:
+    attempt_id = "a" * 32
+    trace = {
+        "llm_request_count": 1,
+        "physical_attempts": [{"physical_attempt_id": attempt_id}],
+    }
+    ledger = [{"physical_attempt_id": attempt_id, "ensemble_call_index": 0}]
+    call = {
+        "ensemble_call_index": 0,
+        "routing": {"routed_tier": "c2", "routed_model": "vendor/model"},
+        "trace": trace,
+        "model_usage_ledger": ledger,
+    }
+    done = DoneEvent(
+        ensemble_trace=trace,
+        ensemble_traces=[trace],
+        model_usage_ledger=ledger,
+        ensemble_calls=[call],
+        physical_audit_schema="opensquilla.agent-physical-ledger/v1",
+    )
+
+    usage = _usage_from_done(done, None)
+
+    assert usage["ensemble_traces"] == [trace]
+    assert usage["model_usage_ledger"] == ledger
+    assert usage["ensemble_calls"] == [call]
+    assert usage["physical_audit_schema"] == "opensquilla.agent-physical-ledger/v1"
+    done.ensemble_traces[0]["llm_request_count"] = 9
+    done.model_usage_ledger[0]["physical_attempt_id"] = "b" * 32
+    done.ensemble_calls[0]["routing"]["routed_tier"] = "c9"
+    assert usage["ensemble_traces"][0]["llm_request_count"] == 1
+    assert usage["model_usage_ledger"][0]["physical_attempt_id"] == attempt_id
+    assert usage["ensemble_calls"][0]["routing"]["routed_tier"] == "c2"
 
 
 def test_benchmark_transcript_preserves_tool_result_execution_status() -> None:

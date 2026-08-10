@@ -490,8 +490,8 @@ def test_packaged_ranking_config_is_versioned_validated_and_isolated() -> None:
     assert first["rerank"]["similarity_penalty_weight"] == pytest.approx(0.25)
     assert first["role_reliability"] == {
         "penalty_weight": pytest.approx(0.40),
-        "prior_success": 9,
-        "prior_failure": 1,
+        "prior_success": 10,
+        "prior_failure": 0,
     }
     assert first["proposer_count"]["backup_count"] == 2
     assert first["aggregator"]["candidate_count"] == 3
@@ -530,14 +530,14 @@ def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(
         (
             False,
             "step2-ranking-config-v3",
-            "step2-ranking-2026-08-05.1",
-            "2f823a6bf5f45cf9a972931d145118661d2b8d411fb3b68e8ece421616e5e26f",
+            "step2-ranking-2026-08-10.1",
+            "4dbefbec7ebae151e68937b73acef8b8e173862e84af474e143a6b013264879e",
         ),
         (
             True,
             "step2-ranking-config-v4",
-            "step2-ranking-2026-08-05.1",
-            "376a2c93ee67fe69c9b004ee899c61868509f8000c51f4c537c519f1c988c5f0",
+            "step2-ranking-2026-08-10.1",
+            "d1fbd224d7a1d4ffb100122d63623370cd73dee0b1dd341c10aa6f6cc8fe940a",
         ),
     ],
 )
@@ -589,8 +589,18 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert historical["base_sha256"] == (
         "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
-    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-05.1"
+    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-10.1"
     assert "role_reliability" in default["base_config"]
+
+    previous_reliability = ranking_config_resolution(
+        thinking_assignment_enabled=False,
+        base_version="step2-ranking-2026-08-05.1",
+    )
+    assert previous_reliability["base_config"]["role_reliability"] == {
+        "penalty_weight": pytest.approx(0.40),
+        "prior_success": 9,
+        "prior_failure": 1,
+    }
 
 
 def test_ranking_base_selector_rejects_unallowlisted_version() -> None:
@@ -613,7 +623,7 @@ def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
     }
     assert snapshot == resolution["effective_config"]
     assert resolution["effective_config"]["config_version"] == (
-        "step2-ranking-2026-08-05.1+override."
+        "step2-ranking-2026-08-10.1+override."
         f"{resolution['override_sha256'][:12]}"
     )
     assert resolution["effective_sha256"] != resolution["base_sha256"]
@@ -785,10 +795,10 @@ def test_ranking_config_override_resolves_against_selected_thinking_base() -> No
     assert "thinking_assignment" in thinking["effective_config"]
     suffix = legacy["override_sha256"][:12]
     assert legacy["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-05.1+override.{suffix}"
+        f"step2-ranking-2026-08-10.1+override.{suffix}"
     )
     assert thinking["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-05.1+override.{suffix}"
+        f"step2-ranking-2026-08-10.1+override.{suffix}"
     )
 
 
@@ -1043,9 +1053,35 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
         "curated-openrouter-step2-2026-07-31.1-reliability-"
     )
     assert "role_reliability_snapshot" in current
+    provenance = current["role_reliability_snapshot"]
+    assert provenance["schema_version"] == "role-reliability-snapshot-v2"
+    assert provenance["observation_policy"] == "legacy-statistics-invalidated-v1"
+    assert provenance["completion_gate"] == "legacy_statistics_invalidated"
+    assert provenance["invalidated_observation_policy"] == (
+        "aef-physical-model-calls-v3"
+    )
     assert all(
         "role_reliability" in row["online_profile"] for row in current["models"]
     )
+    assert all(
+        row["online_profile"]["role_reliability"]
+        == {
+            "window_size": 50,
+            "proposer": {"success": 0, "failure": 0},
+            "aggregator": {"success": 0, "failure": 0},
+            "source": "legacy_statistics_invalidated",
+        }
+        for row in current["models"]
+    )
+    current_model = ranking_router._normalize_model(
+        current["models"][0],
+        load_ranking_config(),
+    )
+    assert ranking_router._role_reliability_score(
+        current_model,
+        "proposer",
+        load_ranking_config(),
+    )["penalty"] == 0.0
     assert historical["snapshot_version"] == "curated-openrouter-step2-2026-07-31.1"
     assert "role_reliability_snapshot" not in historical
     assert all(
@@ -1056,6 +1092,105 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     assert canonical_json_sha256(frozen) == (
         "9f76c7f96e5cb22c05b615f69b71ca633965e5039fbec9673f0a5edf9b45078a"
     )
+
+
+def test_packaged_registry_rejects_obsolete_or_nonzero_invalidated_statistics() -> None:
+    current = load_model_registry_snapshot()
+    obsolete = deepcopy(current)
+    obsolete["role_reliability_snapshot"]["observation_policy"] = (
+        "aef-physical-model-calls-v3"
+    )
+    with pytest.raises(DynamicRankingError, match="observation policy is obsolete"):
+        ranking_router._validate_packaged_role_reliability_provenance(obsolete)
+
+    nonzero = deepcopy(current)
+    nonzero["models"][0]["online_profile"]["role_reliability"]["proposer"][
+        "success"
+    ] = 1
+    with pytest.raises(DynamicRankingError, match="nonzero counts"):
+        ranking_router._validate_packaged_role_reliability_provenance(nonzero)
+
+
+def test_packaged_v5_reliability_statistics_are_content_bound() -> None:
+    current = load_model_registry_snapshot()
+    trusted = deepcopy(current)
+    provenance = trusted["role_reliability_snapshot"]
+    provenance["observation_policy"] = "aef-physical-model-calls-v5"
+    provenance["completion_gate"] = "clean_final_audit"
+    provenance.pop("invalidated_observation_policy", None)
+    provenance.pop("invalidated_snapshot_version", None)
+    provenance.pop("invalidation_reason", None)
+    provenance["content_sha256"] = (
+        ranking_router._role_reliability_snapshot_content_sha256(
+            trusted["models"], provenance
+        )
+    )
+    ranking_router._validate_packaged_role_reliability_provenance(trusted)
+
+    tampered = deepcopy(trusted)
+    tampered["models"][0]["online_profile"]["role_reliability"]["proposer"][
+        "success"
+    ] = 1
+    with pytest.raises(DynamicRankingError, match="content_sha256 differs"):
+        ranking_router._validate_packaged_role_reliability_provenance(tampered)
+
+    missing_hash = deepcopy(trusted)
+    missing_hash["role_reliability_snapshot"].pop("content_sha256")
+    with pytest.raises(DynamicRankingError, match="valid content_sha256"):
+        ranking_router._validate_packaged_role_reliability_provenance(missing_hash)
+
+    unbound_v1 = deepcopy(trusted)
+    unbound_v1["role_reliability_snapshot"]["schema_version"] = (
+        "role-reliability-snapshot-v1"
+    )
+    with pytest.raises(DynamicRankingError, match="content-bound provenance"):
+        ranking_router._validate_packaged_role_reliability_provenance(unbound_v1)
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    ["role-reliability-snapshot-v1", "role-reliability-snapshot-v2"],
+)
+def test_historical_registry_base_accepts_versioned_reliability_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    schema_version: str,
+) -> None:
+    current = load_model_registry_snapshot()
+    current["role_reliability_snapshot"]["schema_version"] = schema_version
+    monkeypatch.setattr(ranking_router, "_packaged_registry_snapshot", lambda: current)
+
+    historical = load_model_registry_snapshot(
+        base_version="curated-openrouter-step2-2026-07-31.1"
+    )
+    assert historical["snapshot_version"] == "curated-openrouter-step2-2026-07-31.1"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("unsupported_schema", "provenance schema is unsupported"),
+        ("missing_base", "provenance has a different base"),
+        ("wrong_snapshot_prefix", "cannot reconstruct"),
+    ],
+)
+def test_historical_registry_base_rejects_unauthenticated_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    current = load_model_registry_snapshot()
+    if mutation == "unsupported_schema":
+        current["role_reliability_snapshot"]["schema_version"] = "unknown"
+    elif mutation == "missing_base":
+        current["role_reliability_snapshot"].pop("base_snapshot_version")
+    else:
+        current["snapshot_version"] = "unrelated-snapshot"
+    monkeypatch.setattr(ranking_router, "_packaged_registry_snapshot", lambda: current)
+
+    with pytest.raises(DynamicRankingError, match=message):
+        load_model_registry_snapshot(
+            base_version="curated-openrouter-step2-2026-07-31.1"
+        )
 
 
 def test_registry_base_selector_rejects_unallowlisted_version() -> None:
@@ -2949,6 +3084,34 @@ def test_zero_role_reliability_observations_have_no_penalty() -> None:
     assert aggregator_score["role_reliability"]["penalty"] == 0.0
 
 
+def test_reliability_cold_start_penalty_is_monotonic() -> None:
+    def failure_rate(*, success: int, failure: int) -> float:
+        model = _with_role_reliability(
+            _model(f"model-{success}-{failure}"),
+            proposer=(success, failure),
+        )
+        decision = _decision(
+            model,
+            analysis=_analysis(tier=1),
+            user_profile_enabled=False,
+        )
+        return decision.trace["model_scores"][0]["role_reliability"][
+            "failure_rate"
+        ]
+
+    cold_start = failure_rate(success=0, failure=0)
+    after_success = failure_rate(success=1, failure=0)
+    after_failure = failure_rate(success=0, failure=1)
+    after_recovery = failure_rate(success=1, failure=1)
+
+    assert cold_start == 0.0
+    assert after_success == 0.0
+    assert after_failure == pytest.approx(1 / 11, abs=1e-6)
+    assert cold_start < after_failure
+    assert after_recovery == pytest.approx(1 / 12, abs=1e-6)
+    assert after_recovery < after_failure
+
+
 def test_archived_config_without_reliability_policy_keeps_legacy_trace_shape() -> None:
     config = load_ranking_config()
     config["config_version"] = "step2-ranking-2026-08-02.2"
@@ -3010,12 +3173,12 @@ def test_role_reliability_is_isolated_between_proposer_and_aggregator() -> None:
     )
     assert proposer_trace["role_reliability"]["role"] == "proposer"
     assert proposer_trace["role_reliability"]["failure_rate"] == pytest.approx(
-        1 / 60,
+        0.0,
         abs=1e-6,
     )
     assert aggregator_trace["role_reliability"]["role"] == "aggregator"
     assert aggregator_trace["role_reliability"]["failure_rate"] == pytest.approx(
-        1 / 60,
+        0.0,
         abs=1e-6,
     )
 
@@ -3058,8 +3221,8 @@ def test_reliability_penalty_changes_initial_order_and_quality_floor() -> None:
     unreliable_trace = next(
         row for row in penalized.trace["model_scores"] if row["model"] == "unreliable"
     )
-    assert unreliable_trace["role_reliability"]["failure_rate"] == pytest.approx(0.85)
-    assert unreliable_trace["role_reliability"]["penalty"] == pytest.approx(0.34)
+    assert unreliable_trace["role_reliability"]["failure_rate"] == pytest.approx(5 / 6)
+    assert unreliable_trace["role_reliability"]["penalty"] == pytest.approx(1 / 3)
 
 
 def test_reliability_penalty_changes_greedy_marginal_selection() -> None:
@@ -3105,7 +3268,7 @@ def test_reliability_penalty_changes_greedy_marginal_selection() -> None:
         for row in penalized.trace["selection_steps"][1]["top_candidates"]
         if row["identity"] == "provider-b:unreliable"
     )
-    assert unstable_candidate["reliability_penalty"] == pytest.approx(0.34)
+    assert unstable_candidate["reliability_penalty"] == pytest.approx(1 / 3)
 
 
 def test_reliability_penalty_orders_proposer_and_aggregator_fallbacks() -> None:
@@ -3758,7 +3921,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     assert disabled.trace["ranking_version"] == "step2-ranking-v2"
     assert (
         disabled.trace["ranking_config_hash"]
-        == "2f823a6bf5f45cf9a972931d145118661d2b8d411fb3b68e8ece421616e5e26f"
+        == "4dbefbec7ebae151e68937b73acef8b8e173862e84af474e143a6b013264879e"
     )
     for field in (
         "ranking_thinking_assignment_enabled",
