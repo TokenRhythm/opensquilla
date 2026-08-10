@@ -1398,6 +1398,7 @@ def _report_credential_pool_failure(
             pool_provider,
             str(pool_info.get("session_key") or ""),
             kind,
+            retry_after_seconds=getattr(event, "retry_after_s", None),
         )
     except Exception:  # noqa: BLE001 — credential bookkeeping only
         log.debug("credential_pool.report_failed", provider=pool_provider)

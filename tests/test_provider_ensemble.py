@@ -68,6 +68,7 @@ from opensquilla.provider.ensemble import (
     build_ensemble_provider_from_config,
     openrouter_static_capabilities,
 )
+from opensquilla.provider.failures import ProviderFailureKind
 from opensquilla.provider.protocol import (
     provider_retry_expanded_proposer_identities,
 )
@@ -8447,6 +8448,72 @@ def _retry_test_provider() -> EnsembleProvider:
         aggregator_recovery_mode="off",
         shuffle_candidates=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_proposer_retry_after_reaches_candidate_and_credential_reporter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "bad": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="upstream rate limit",
+                        code="429",
+                        retry_after_s=17.0,
+                    )
+                ]
+            ),
+            "good": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="good")]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="agg")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    reports: list[tuple[str, str, ProviderFailureKind, float | None]] = []
+
+    def report_failure(
+        provider: str,
+        session_key: str,
+        kind: ProviderFailureKind,
+        retry_after_s: float | None,
+    ) -> None:
+        reports.append((provider, session_key, kind, retry_after_s))
+
+    pooled_bad = replace(
+        _member("bad"),
+        credential_pool_provider="openrouter",
+        credential_pool_session_key="session-1",
+    )
+    provider = EnsembleProvider(
+        profile_name="default",
+        proposers=[pooled_bad, _member("good")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        proposer_recovery_max_additional_calls=0,
+        shuffle_candidates=False,
+        _credential_pool_failure_reporter=report_failure,
+    )
+
+    events = await _collect(provider)
+
+    assert reports == [
+        ("openrouter", "session-1", ProviderFailureKind.RATE_LIMITED, 17.0)
+    ]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    bad_candidate = next(
+        row for row in done.ensemble_trace["candidates"] if row["label"] == "bad"
+    )
+    assert bad_candidate["retry_after_s"] == 17.0
 
 
 @pytest.mark.asyncio

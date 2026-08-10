@@ -11,6 +11,8 @@ All env vars and key values here are synthetic test dummies.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,6 +28,9 @@ from opensquilla.gateway.config import (
 from opensquilla.gateway.llm_runtime import (
     INSUFFICIENT_CREDITS_COOLDOWN_SECONDS,
     RATE_LIMITED_COOLDOWN_SECONDS,
+    RATE_LIMITED_RETRY_AFTER_JITTER_RATIO,
+    RATE_LIMITED_RETRY_AFTER_MAX_SECONDS,
+    RATE_LIMITED_RETRY_AFTER_MIN_SECONDS,
     ProfileCredentialPools,
     masked_key_id,
     profile_credential_pools,
@@ -37,6 +42,7 @@ from opensquilla.provider.types import ErrorEvent
 
 _SECRET_A = "sk-test-000-aaaaaaaaaaaaaaaa"
 _SECRET_B = "sk-test-000-bbbbbbbbbbbbbbbb"
+_SECRET_ROTATED = "sk-test-000-rotated-cccccccc"
 _ENV_A = "OPENSQUILLA_TEST_POOL_KEY_A"
 _ENV_B = "OPENSQUILLA_TEST_POOL_KEY_B"
 _ENV_UNSET = "OPENSQUILLA_TEST_POOL_KEY_UNSET"
@@ -195,6 +201,57 @@ def test_session_pinning_reuses_key_across_turns(pool_env) -> None:
     assert len(keys) == 1  # same session -> same key -> warm prompt cache
 
 
+def test_same_env_secret_rotation_clears_pin_and_old_cooldown(monkeypatch) -> None:
+    clock = _FakeClock()
+    pools = ProfileCredentialPools(clock=clock, jitter=lambda: 0.0)
+    monkeypatch.setenv(_ENV_A, _SECRET_A)
+
+    first = pools.acquire_for_session("openai", [_ENV_A], "sticky")
+    assert first is not None and first.api_key == _SECRET_A
+    assert pools.acquire_for_session("openai", [_ENV_A], "sticky") == first
+
+    monkeypatch.setenv(_ENV_A, _SECRET_B)
+    rotated = pools.acquire_for_session("openai", [_ENV_A], "sticky")
+    assert rotated is not None and rotated.api_key == _SECRET_B
+    assert rotated.key_id == masked_key_id(_SECRET_B)
+
+    pools.report_failure(
+        "openai",
+        "sticky",
+        ProviderFailureKind.RATE_LIMITED,
+        retry_after_seconds=RATE_LIMITED_RETRY_AFTER_MAX_SECONDS,
+    )
+    with pytest.raises(NoCredentialsAvailable):
+        pools.acquire_for_session("openai", [_ENV_A], "sticky")
+
+    monkeypatch.setenv(_ENV_A, _SECRET_ROTATED)
+    refreshed = pools.acquire_for_session("openai", [_ENV_A], "sticky")
+    assert refreshed is not None and refreshed.api_key == _SECRET_ROTATED
+    fingerprint_repr = repr(pools._pool_fingerprints)
+    assert _SECRET_A not in fingerprint_repr
+    assert _SECRET_B not in fingerprint_repr
+    assert _SECRET_ROTATED not in fingerprint_repr
+
+
+def test_concurrent_acquire_after_secret_rotation_never_returns_stale_key(
+    monkeypatch,
+) -> None:
+    pools = ProfileCredentialPools(jitter=lambda: 0.0)
+    monkeypatch.setenv(_ENV_A, _SECRET_A)
+    assert pools.acquire_for_session("openai", [_ENV_A], "before") is not None
+    monkeypatch.setenv(_ENV_A, _SECRET_B)
+
+    def acquire(index: int) -> str:
+        resolved = pools.acquire_for_session("openai", [_ENV_A], f"session-{index}")
+        assert resolved is not None
+        return resolved.api_key
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        keys = list(executor.map(acquire, range(32)))
+
+    assert set(keys) == {_SECRET_B}
+
+
 def test_pool_stamps_non_secret_metadata(pool_env) -> None:
     cfg = _config(LlmProviderProfile(api_key_env_pool=[_ENV_A, _ENV_B]))
     metadata: dict = {}
@@ -233,7 +290,7 @@ def test_429_cooldown_rotates_then_reinstates(monkeypatch) -> None:
 
 def test_retry_after_hint_overrides_default_cooldown(monkeypatch) -> None:
     clock = _FakeClock()
-    pools = ProfileCredentialPools(clock=clock)
+    pools = ProfileCredentialPools(clock=clock, jitter=lambda: 0.0)
     monkeypatch.setenv(_ENV_A, _SECRET_A)
     acquired = pools.acquire_for_session("openai", [_ENV_A], "s1")
     assert acquired is not None
@@ -245,7 +302,77 @@ def test_retry_after_hint_overrides_default_cooldown(monkeypatch) -> None:
     )
     with pytest.raises(NoCredentialsAvailable):
         pools.acquire_for_session("openai", [_ENV_A], "s1")
-    clock.now += 6.0
+    clock.now += 4.99
+    with pytest.raises(NoCredentialsAvailable):
+        pools.acquire_for_session("openai", [_ENV_A], "s1")
+    clock.now += 0.02
+    assert pools.acquire_for_session("openai", [_ENV_A], "s1") is not None
+
+
+@pytest.mark.parametrize(
+    ("hint", "expected_cooldown"),
+    [
+        (-10.0, RATE_LIMITED_RETRY_AFTER_MIN_SECONDS),
+        (10_000.0, RATE_LIMITED_RETRY_AFTER_MAX_SECONDS),
+    ],
+)
+def test_retry_after_hint_is_clamped_to_safe_bounds(
+    monkeypatch,
+    hint: float,
+    expected_cooldown: float,
+) -> None:
+    clock = _FakeClock()
+    pools = ProfileCredentialPools(clock=clock, jitter=lambda: 0.0)
+    monkeypatch.setenv(_ENV_A, _SECRET_A)
+    assert pools.acquire_for_session("openai", [_ENV_A], "s1") is not None
+    pools.report_failure(
+        "openai",
+        "s1",
+        ProviderFailureKind.RATE_LIMITED,
+        retry_after_seconds=hint,
+    )
+    clock.now += expected_cooldown - 0.01
+    with pytest.raises(NoCredentialsAvailable):
+        pools.acquire_for_session("openai", [_ENV_A], "s1")
+    clock.now += 0.02
+    assert pools.acquire_for_session("openai", [_ENV_A], "s1") is not None
+
+
+def test_retry_after_jitter_is_positive_bounded_and_deterministic(monkeypatch) -> None:
+    clock = _FakeClock()
+    pools = ProfileCredentialPools(clock=clock, jitter=lambda: 1.0)
+    monkeypatch.setenv(_ENV_A, _SECRET_A)
+    assert pools.acquire_for_session("openai", [_ENV_A], "s1") is not None
+    hint = 20.0
+    pools.report_failure(
+        "openai",
+        "s1",
+        ProviderFailureKind.RATE_LIMITED,
+        retry_after_seconds=hint,
+    )
+    expected = hint * (1.0 + RATE_LIMITED_RETRY_AFTER_JITTER_RATIO)
+    clock.now += expected - 0.01
+    with pytest.raises(NoCredentialsAvailable):
+        pools.acquire_for_session("openai", [_ENV_A], "s1")
+    clock.now += 0.02
+    assert pools.acquire_for_session("openai", [_ENV_A], "s1") is not None
+
+
+def test_retry_after_hint_does_not_change_non_rate_limit_cooldown(monkeypatch) -> None:
+    clock = _FakeClock()
+    pools = ProfileCredentialPools(clock=clock, jitter=lambda: 1.0)
+    monkeypatch.setenv(_ENV_A, _SECRET_A)
+    assert pools.acquire_for_session("openai", [_ENV_A], "s1") is not None
+    pools.report_failure(
+        "openai",
+        "s1",
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        retry_after_seconds=1.0,
+    )
+    clock.now += INSUFFICIENT_CREDITS_COOLDOWN_SECONDS - 0.01
+    with pytest.raises(NoCredentialsAvailable):
+        pools.acquire_for_session("openai", [_ENV_A], "s1")
+    clock.now += 0.02
     assert pools.acquire_for_session("openai", [_ENV_A], "s1") is not None
 
 
@@ -339,7 +466,9 @@ def test_pool_with_no_resolvable_names_degrades_to_single_key(
 # ---------------------------------------------------------------------------
 
 
-def test_no_secret_values_in_rotation_or_cooldown_logs(pool_env, log_recorder) -> None:
+def test_no_secret_values_in_rotation_or_cooldown_logs(
+    pool_env, log_recorder, monkeypatch
+) -> None:
     cfg = _config(LlmProviderProfile(api_key_env_pool=[_ENV_A, _ENV_B]))
     assert _resolve(cfg, "s1") is not None
     assert _resolve(cfg, "s1") is not None  # pin reuse (debug event)
@@ -347,15 +476,23 @@ def test_no_secret_values_in_rotation_or_cooldown_logs(pool_env, log_recorder) -
     pools = profile_credential_pools()
     pools.report_failure("openai", "s1", ProviderFailureKind.RATE_LIMITED)
     pools.report_failure("openai", "s2", ProviderFailureKind.AUTH_INVALID)
+    monkeypatch.setenv(_ENV_A, _SECRET_ROTATED)
+    rotated = pools.acquire_for_session("openai", [_ENV_A, _ENV_B], "s3")
+    assert rotated is not None and rotated.api_key in {_SECRET_ROTATED, _SECRET_B}
     captured = log_recorder.events
     everything = repr(captured)
     assert _SECRET_A not in everything
     assert _SECRET_B not in everything
+    assert _SECRET_ROTATED not in everything
     rotations = [e for e in captured if e["event"] == "credential_pool.rotation"]
     assert rotations
     for event in rotations:
         assert set(event) >= {"provider", "session_key", "env_name", "key_id", "pool_size"}
-        assert event["key_id"] in {masked_key_id(_SECRET_A), masked_key_id(_SECRET_B)}
+        assert event["key_id"] in {
+            masked_key_id(_SECRET_A),
+            masked_key_id(_SECRET_B),
+            masked_key_id(_SECRET_ROTATED),
+        }
     cooldowns = [e for e in captured if e["event"] == "credential_pool.cooldown"]
     assert len(cooldowns) == 2
     for event in cooldowns:
@@ -390,6 +527,32 @@ def test_stream_error_hook_parks_pinned_key(pool_env) -> None:
     rotated = _resolve(cfg, "s1", metadata)
     assert rotated is not None
     assert rotated.api_key != first.api_key
+
+
+def test_stream_error_hook_forwards_retry_after_to_pool(monkeypatch) -> None:
+    clock = _FakeClock()
+    reset_profile_credential_pools(clock=clock, jitter=lambda: 0.0)
+    monkeypatch.setenv(_ENV_A, _SECRET_A)
+    cfg = _config(LlmProviderProfile(api_key_env_pool=[_ENV_A]))
+    metadata: dict = {}
+    first = _resolve(cfg, "s1", metadata)
+    assert first is not None
+    metadata["routed_provider_applied"] = "openai"
+
+    _report_credential_pool_failure(
+        "openai",
+        metadata,
+        ErrorEvent(
+            message="rate limit exceeded",
+            code="429",
+            retry_after_s=7.0,
+        ),
+    )
+
+    clock.now += 6.99
+    assert _resolve(cfg, "s1", metadata) is None
+    clock.now += 0.02
+    assert _resolve(cfg, "s1", metadata) is not None
 
 
 def test_stream_error_hook_ignores_unapplied_tier(pool_env) -> None:

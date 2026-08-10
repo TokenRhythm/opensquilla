@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -279,8 +281,15 @@ def resolve_llm_runtime_config(config: Any) -> LlmRuntimeConfig:
 # ---------------------------------------------------------------------------
 
 #: Cooldown applied on RATE_LIMITED when the caller has no Retry-After hint
-#: (the provider error event carries no header data today).
+#: or the provider header cannot be parsed safely.
 RATE_LIMITED_COOLDOWN_SECONDS = 60.0
+#: Provider Retry-After values are bounded before a small positive jitter is
+#: added. The lower bound prevents immediate retry storms; the ceiling keeps
+#: malformed or hostile headers from parking a credential indefinitely.
+RATE_LIMITED_RETRY_AFTER_MIN_SECONDS = 1.0
+RATE_LIMITED_RETRY_AFTER_MAX_SECONDS = 900.0
+RATE_LIMITED_RETRY_AFTER_JITTER_RATIO = 0.10
+RATE_LIMITED_RETRY_AFTER_JITTER_MAX_SECONDS = 5.0
 #: INSUFFICIENT_CREDITS parks much longer than a 429: credits do not refill
 #: on a rate-limit window, but the account may be topped up mid-process, so
 #: the key is parked rather than permanently retired.
@@ -302,6 +311,23 @@ def masked_key_id(secret: str) -> str:
     key substrings (no prefixes/last-4), only a truncated SHA-256 digest.
     """
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12]
+
+
+def _resolved_pool_entries(names: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    """Resolve env values once so fingerprinting and pool rebuild are atomic."""
+
+    return tuple((name, environment_value(name).strip()) for name in names)
+
+
+def _pool_fingerprint(
+    entries: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, bytes], ...]:
+    """Return an irreversible, never-logged fingerprint of names and values."""
+
+    return tuple(
+        (name, hashlib.sha256(secret.encode("utf-8")).digest())
+        for name, secret in entries
+    )
 
 
 @dataclass(frozen=True)
@@ -336,19 +362,25 @@ class ProfileCredentialPools:
       (or a default), INSUFFICIENT_CREDITS parks long, AUTH_INVALID parks
       permanently for the process. Every report drops the session pin so the
       next turn re-acquires (rotating to another key).
-    - **Config-change rebuilds** — the pool is rebuilt (and its pins and
-      parked state reset) when the profile's configured name list changes,
-      e.g. after a config hot-apply.
+    - **Config/secret-change rebuilds** — the pool is rebuilt (and its pins
+      and parked state reset) when the configured names or their resolved
+      values change, e.g. after a config hot-apply or environment rotation.
 
     Telemetry contract: every event logs only the env-var NAME and the
     masked ``key_id`` — never the resolved secret value.
     """
 
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
         self._clock = clock
+        self._jitter = jitter
         self._lock = threading.Lock()
         self._pools: dict[str, CredentialPool] = {}
-        self._pool_fingerprints: dict[str, tuple[str, ...]] = {}
+        self._pool_fingerprints: dict[str, tuple[tuple[str, bytes], ...]] = {}
         self._creds_by_id: dict[str, dict[str, Credential]] = {}
         self._key_ids: dict[str, dict[str, str]] = {}
         self._pins: dict[str, dict[str, str]] = {}
@@ -429,11 +461,7 @@ class ProfileCredentialPools:
             elif kind is ProviderFailureKind.INSUFFICIENT_CREDITS:
                 cooldown = INSUFFICIENT_CREDITS_COOLDOWN_SECONDS
             else:
-                cooldown = (
-                    retry_after_seconds
-                    if retry_after_seconds is not None and retry_after_seconds >= 0
-                    else RATE_LIMITED_COOLDOWN_SECONDS
-                )
+                cooldown = self._rate_limited_cooldown(retry_after_seconds)
             pool.report_429(cred_id, cooldown_seconds=cooldown)
             # Drop every other session pinned to the now-parked key so they
             # rotate on their next turn instead of failing the same way.
@@ -449,6 +477,38 @@ class ProfileCredentialPools:
                 cooldown_seconds=cooldown,
                 permanent=cooldown == float("inf"),
             )
+
+    def _rate_limited_cooldown(
+        self,
+        retry_after_seconds: float | None,
+    ) -> float:
+        if retry_after_seconds is None:
+            return RATE_LIMITED_COOLDOWN_SECONDS
+        try:
+            hint = float(retry_after_seconds)
+        except (TypeError, ValueError):
+            return RATE_LIMITED_COOLDOWN_SECONDS
+        if math.isnan(hint):
+            return RATE_LIMITED_COOLDOWN_SECONDS
+        bounded = min(
+            max(hint, RATE_LIMITED_RETRY_AFTER_MIN_SECONDS),
+            RATE_LIMITED_RETRY_AFTER_MAX_SECONDS,
+        )
+        try:
+            jitter_draw = float(self._jitter())
+        except (TypeError, ValueError, OverflowError):
+            jitter_draw = 0.0
+        if not math.isfinite(jitter_draw):
+            jitter_draw = 0.0
+        jitter_draw = min(max(jitter_draw, 0.0), 1.0)
+        jitter_window = min(
+            bounded * RATE_LIMITED_RETRY_AFTER_JITTER_RATIO,
+            RATE_LIMITED_RETRY_AFTER_JITTER_MAX_SECONDS,
+        )
+        return min(
+            bounded + jitter_window * jitter_draw,
+            RATE_LIMITED_RETRY_AFTER_MAX_SECONDS,
+        )
 
     def peek_available(
         self,
@@ -470,7 +530,13 @@ class ProfileCredentialPools:
         if not provider_id or not names:
             return None
         with self._lock:
-            if self._pool_fingerprints.get(provider_id) != names:
+            fingerprint = self._pool_fingerprints.get(provider_id)
+            fingerprint_names = (
+                tuple(name for name, _digest in fingerprint)
+                if fingerprint is not None
+                else ()
+            )
+            if fingerprint_names != names:
                 for env_name in names:
                     secret = environment_value(env_name).strip()
                     if secret:
@@ -517,15 +583,17 @@ class ProfileCredentialPools:
         provider_id: str,
         names: tuple[str, ...],
     ) -> CredentialPool | None:
-        if self._pool_fingerprints.get(provider_id) == names:
+        resolved_entries = _resolved_pool_entries(names)
+        fingerprint = _pool_fingerprint(resolved_entries)
+        if self._pool_fingerprints.get(provider_id) == fingerprint:
             return self._pools.get(provider_id)
 
-        # Configured name list changed (or first use): rebuild. Parked state
-        # and pins reset by design — a config edit is an operator action.
+        # Configured names or resolved secret values changed (or first use):
+        # rebuild. Parked state and pins reset because rotation is an operator
+        # action and state attached to the old secret must not survive it.
         credentials: list[Credential] = []
         key_ids: dict[str, str] = {}
-        for env_name in names:
-            secret = environment_value(env_name).strip()
+        for env_name, secret in resolved_entries:
             if not secret:
                 log.warning(
                     "credential_pool.env_unset",
@@ -536,7 +604,7 @@ class ProfileCredentialPools:
             credentials.append(Credential(cred_id=env_name, secret=secret))
             key_ids[env_name] = masked_key_id(secret)
 
-        self._pool_fingerprints[provider_id] = names
+        self._pool_fingerprints[provider_id] = fingerprint
         self._pins.pop(provider_id, None)
         if not credentials:
             self._pools.pop(provider_id, None)
@@ -573,11 +641,12 @@ def profile_credential_pools() -> ProfileCredentialPools:
 def reset_profile_credential_pools(
     *,
     clock: Callable[[], float] = time.monotonic,
+    jitter: Callable[[], float] = random.random,
 ) -> ProfileCredentialPools:
     """Replace the process-wide manager (test hook; also clears all pins)."""
     global _profile_pools
     with _profile_pools_lock:
-        _profile_pools = ProfileCredentialPools(clock=clock)
+        _profile_pools = ProfileCredentialPools(clock=clock, jitter=jitter)
         return _profile_pools
 
 
@@ -590,6 +659,10 @@ __all__ = [
     "INSUFFICIENT_CREDITS_COOLDOWN_SECONDS",
     "OPENROUTER_DEFAULT_PROVIDER_ROUTING",
     "RATE_LIMITED_COOLDOWN_SECONDS",
+    "RATE_LIMITED_RETRY_AFTER_JITTER_MAX_SECONDS",
+    "RATE_LIMITED_RETRY_AFTER_JITTER_RATIO",
+    "RATE_LIMITED_RETRY_AFTER_MAX_SECONDS",
+    "RATE_LIMITED_RETRY_AFTER_MIN_SECONDS",
     "LlmRuntimeConfig",
     "NoCredentialsAvailable",
     "PooledCredential",

@@ -1000,7 +1000,9 @@ def _proposer_recovery_runtime_guard_snapshot(
     )
 
 
-CredentialPoolFailureReporter = Callable[[str, str, ProviderFailureKind], None]
+CredentialPoolFailureReporter = Callable[
+    [str, str, ProviderFailureKind, float | None], None
+]
 
 
 @dataclass(frozen=True)
@@ -1110,6 +1112,7 @@ class _CandidateResult:
     ttft_ms: int | None = None
     error: str = ""
     error_code: str = ""
+    retry_after_s: float | None = None
     message_limit_proof: ProviderMessageLimitProof | None = None
     execution: dict[str, Any] = field(default_factory=dict)
     usage_reported: bool = False
@@ -1258,6 +1261,8 @@ class _CandidateResult:
         if self.error:
             row["error"] = self.error
             row["error_code"] = self.error_code
+            if self.retry_after_s is not None:
+                row["retry_after_s"] = self.retry_after_s
         if self.diagnostic_model_usage_breakdown:
             row["diagnostic_model_usage_breakdown"] = [
                 dict(item) for item in self.diagnostic_model_usage_breakdown
@@ -4733,6 +4738,7 @@ class EnsembleProvider:
         *,
         message: str,
         code: str,
+        retry_after_s: float | None = None,
     ) -> None:
         """Classify and report one pool-backed member failure; never raises."""
         if not member.credential_pool_provider or self._credential_pool_failure_reporter is None:
@@ -4748,6 +4754,7 @@ class EnsembleProvider:
                 member.credential_pool_provider,
                 member.credential_pool_session_key,
                 kind,
+                retry_after_s,
             )
         except Exception:  # noqa: BLE001 - credential bookkeeping only
             log.debug(
@@ -11025,6 +11032,7 @@ class EnsembleProvider:
                         event.code,
                         api_key=member.provider_config.api_key,
                     )
+                    result.retry_after_s = event.retry_after_s
                     result.message_limit_proof = event.message_limit_proof
                     result.model_usage_breakdown = [
                         _canonicalize_usage_row(item)
@@ -11112,6 +11120,7 @@ class EnsembleProvider:
                         member,
                         message=result.error,
                         code=result.error_code,
+                        retry_after_s=result.retry_after_s,
                     )
                     _publish_candidate_attempt_snapshot(
                         request_task,
@@ -13329,6 +13338,7 @@ class EnsembleProvider:
                             active_member,
                             message=safe_event.message,
                             code=safe_event.code,
+                            retry_after_s=safe_event.retry_after_s,
                         )
                         if (
                             not content_streamed
