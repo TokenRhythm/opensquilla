@@ -39,10 +39,21 @@ export type { SidebarSection as SidebarSectionType }
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch, type ComponentPublicInstance } from 'vue'
+import {
+  computed,
+  nextTick,
+  onMounted,
+  onUnmounted,
+  ref,
+  watch,
+  type ComponentPublicInstance,
+} from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 import Icon from './Icon.vue'
+import SidebarSessionHoverCard, {
+  sessionPreviewPosition,
+} from './SidebarSessionHoverCard.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
@@ -338,7 +349,7 @@ function reorderScope(row: SidebarDisplayRow): string {
 
 function canDragRow(row: SidebarDisplayRow): boolean {
   return row.rowKind === 'session'
-    && row.sessionKind === 'chat'
+    && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
     && !row.provisional
     && !selectionMode.value
     && !agentFilter.value
@@ -564,6 +575,45 @@ function closeMenu() {
   openMenuEl.value = null
   menuTriggerEl.value = null
 }
+
+const sessionPreview = ref<{
+  row: SidebarDisplayRow
+  position: { left: string; top: string }
+} | null>(null)
+
+function openSessionPreview(row: SidebarDisplayRow, event: Event) {
+  if (
+    row.rowKind !== 'session'
+    || selectionMode.value
+    || openMenuKey.value
+    || renamingKey.value === row.key
+  ) return
+  const anchor = event.currentTarget
+  if (!(anchor instanceof HTMLElement)) return
+  sessionPreview.value = {
+    row,
+    position: sessionPreviewPosition(
+      anchor.getBoundingClientRect(),
+      { width: window.innerWidth, height: window.innerHeight },
+    ),
+  }
+}
+
+function closeSessionPreview() {
+  sessionPreview.value = null
+}
+
+function onSessionFocusOut(event: FocusEvent) {
+  const row = event.currentTarget
+  const next = event.relatedTarget
+  if (row instanceof HTMLElement && next instanceof Node && row.contains(next)) return
+  closeSessionPreview()
+}
+
+watch([selectionMode, openMenuKey], closeSessionPreview)
+useDocumentEvent('scroll', closeSessionPreview, true)
+onMounted(() => window.addEventListener('resize', closeSessionPreview))
+onUnmounted(() => window.removeEventListener('resize', closeSessionPreview))
 
 // Escape closes and returns focus to the row's ⋯ trigger; arrows rove between
 // the menu items, wrapping at the ends.
@@ -918,6 +968,10 @@ function onSelectRow(row: SidebarConversationItem) {
             :data-session-key="row.rowKind === 'session' ? row.key : undefined"
             :style="{ '--row-depth': row.depth }"
             @pointerdown="onRowPointerDown(row, $event)"
+            @mouseenter="openSessionPreview(row, $event)"
+            @mouseleave="closeSessionPreview"
+            @focusin="openSessionPreview(row, $event)"
+            @focusout="onSessionFocusOut"
           >
             <div
               v-if="row.rowKind === 'workspace'"
@@ -1022,6 +1076,7 @@ function onSelectRow(row: SidebarConversationItem) {
               :class="{ 'is-current': row.key === currentKey }"
               :title="row.title"
               :aria-pressed="selectionMode && !row.provisional ? isRowSelected(row.key) : undefined"
+              :aria-describedby="sessionPreview?.row.key === row.key ? 'sidebar-session-preview' : undefined"
               @click="onSelectRow(row)"
             >
               <span
@@ -1211,5 +1266,14 @@ function onSelectRow(row: SidebarConversationItem) {
         </div>
       </div>
     </div>
+    <Teleport to="body">
+      <SidebarSessionHoverCard
+        v-if="sessionPreview"
+        :title="sessionPreview.row.title"
+        :updated-at="sessionPreview.row.updatedAt"
+        :project-name="sessionPreview.row.displayProjectName"
+        :position="sessionPreview.position"
+      />
+    </Teleport>
   </div>
 </template>

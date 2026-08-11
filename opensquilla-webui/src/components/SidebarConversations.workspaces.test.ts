@@ -296,6 +296,106 @@ describe('SidebarConversations project workspaces', () => {
     })
   })
 
+  it('keeps pinned chats and automations in one reorderable collection', async () => {
+    const { host, events } = await mountSidebar([
+      taskRow({ key: 'chat-pin', workspaceId: undefined, depth: 0, pinned: true }),
+      taskRow({
+        key: 'cron-pin',
+        workspaceId: undefined,
+        depth: 0,
+        sessionKind: 'cron',
+        pinned: true,
+      }),
+    ], false, false, ['chat-pin', 'cron-pin'])
+    const source = host.querySelector<HTMLElement>('[data-session-key="chat-pin"]')
+    const target = host.querySelector<HTMLElement>('[data-session-key="cron-pin"]')
+
+    expect(target?.classList.contains('is-reorderable')).toBe(true)
+    vi.spyOn(document, 'elementFromPoint').mockReturnValue(target || null)
+    source?.dispatchEvent(new MouseEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientX: 10,
+      clientY: 10,
+    }))
+    document.dispatchEvent(new MouseEvent('pointermove', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 20,
+      clientY: 20,
+    }))
+    document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }))
+    await nextTick()
+
+    expect(events.reorder).toHaveBeenCalledWith({
+      draggedKey: 'chat-pin',
+      targetKey: 'cron-pin',
+      position: 'after',
+    })
+  })
+
+  it('shows a project session hover card outside the sidebar with its project name', async () => {
+    const { host } = await mountSidebar([projectRow(), taskRow()])
+    const row = host.querySelector<HTMLElement>(
+      '[data-session-key="agent:main:webchat:task-a"]',
+    )
+    Object.defineProperty(row, 'getBoundingClientRect', {
+      value: () => ({ left: 12, right: 280, top: 40 }),
+    })
+
+    row?.dispatchEvent(new MouseEvent('mouseenter'))
+    await nextTick()
+
+    const preview = document.body.querySelector('.sidebar-session-preview')
+    expect(preview?.querySelector('.sidebar-session-preview__title')?.textContent)
+      .toBe('Project task')
+    expect(preview?.querySelector('[data-testid="sidebar-session-project"]')?.textContent)
+      .toContain('Project A')
+    expect(host.querySelector('.sidebar-session-preview')).toBeNull()
+  })
+
+  it('keeps the hover card but omits the project row for an unbound session', async () => {
+    const { host } = await mountSidebar([
+      taskRow({
+        key: 'recent-task',
+        title: 'Recent task',
+        workspaceId: undefined,
+        depth: 0,
+      }),
+    ])
+    const row = host.querySelector<HTMLElement>('[data-session-key="recent-task"]')
+    Object.defineProperty(row, 'getBoundingClientRect', {
+      value: () => ({ left: 12, right: 280, top: 40 }),
+    })
+
+    row?.dispatchEvent(new MouseEvent('mouseenter'))
+    await nextTick()
+
+    const preview = document.body.querySelector('.sidebar-session-preview')
+    expect(preview?.querySelector('.sidebar-session-preview__title')?.textContent)
+      .toBe('Recent task')
+    expect(preview?.querySelector('[data-testid="sidebar-session-project"]')).toBeNull()
+  })
+
+  it('opens the session card on keyboard focus and closes it on focus loss', async () => {
+    const { host } = await mountSidebar([projectRow(), taskRow()])
+    const row = host.querySelector<HTMLElement>(
+      '[data-session-key="agent:main:webchat:task-a"]',
+    )
+    Object.defineProperty(row, 'getBoundingClientRect', {
+      value: () => ({ left: 12, right: 280, top: 40 }),
+    })
+
+    row?.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+    await nextTick()
+    expect(document.body.querySelector('.sidebar-session-preview')).toBeTruthy()
+
+    row?.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+    await nextTick()
+    expect(document.body.querySelector('.sidebar-session-preview')).toBeNull()
+  })
+
   it('emits a reorder when one recent chat is dragged onto another', async () => {
     const first = taskRow({
       key: 'agent:main:webchat:first',

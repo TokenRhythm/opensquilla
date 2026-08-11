@@ -1045,7 +1045,11 @@ function onReorderSidebarSession(payload: {
 }) {
   const orderedKeys = sidebarSections.value
     .flatMap(section => section.rows)
-    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
+    .filter(row =>
+      row.rowKind === 'session'
+      && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
+      && !row.provisional,
+    )
     .map(row => row.key)
   const from = orderedKeys.indexOf(payload.draggedKey)
   if (from < 0 || !orderedKeys.includes(payload.targetKey) || payload.draggedKey === payload.targetKey) return
