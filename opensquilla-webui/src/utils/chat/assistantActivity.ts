@@ -428,23 +428,6 @@ function timelineTextAggregates(
 interface TerminalAnswerCandidate {
   text: string
   indexes: Set<number>
-  activityPrefix?: Extract<ChatStreamTimelineItem, { type: 'text' }>
-}
-
-function splitTerminalMarkdownAnswer(
-  text: string,
-): { activityText: string, answerText: string } | null {
-  const normalized = text.replace(/\r\n?/g, '\n')
-  const thematicBreak = /^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})[ \t]*$/gm
-
-  for (const match of normalized.matchAll(thematicBreak)) {
-    const index = match.index
-    if (index === undefined) continue
-    const activityText = normalized.slice(0, index).trim()
-    const answerText = normalized.slice(index + match[0].length).trim()
-    if (activityText && answerText) return { activityText, answerText }
-  }
-  return null
 }
 
 /**
@@ -488,25 +471,9 @@ function terminalTimelineAnswerCandidate(
   const text = chunks.join('')
   if (!text.trim()) return null
 
-  // Some providers finish the last tool call with a short transition and the
-  // final answer in the same text item, separated by a Markdown thematic
-  // break. Preserve that transition in the activity chronology and expose
-  // only the content after the explicit boundary as the answer.
-  const markdownSplit = splitTerminalMarkdownAnswer(text)
-  if (markdownSplit) {
-    const firstIndex = Math.min(...indexes)
-    const firstItem = timeline[firstIndex]
-    return {
-      text: markdownSplit.answerText,
-      indexes,
-      activityPrefix: {
-        type: 'text',
-        key: `${firstItem?.key || 'terminal'}:activity-prefix`,
-        rawText: markdownSplit.activityText,
-        html: '',
-      },
-    }
-  }
+  // Markdown thematic breaks are ordinary answer formatting, not reliable
+  // protocol boundaries. Keep the complete terminal text visible as the
+  // answer instead of folding everything before the first horizontal rule.
   return { text, indexes }
 }
 
@@ -616,9 +583,6 @@ export function resolveAssistantAnswer(
         !timelineCandidate.indexes.has(index)
         && !isSuccessfulAnswerTransparentControlGroup(item),
     )
-    if (timelineCandidate.activityPrefix) {
-      activityItems.push(timelineCandidate.activityPrefix)
-    }
     return {
       text: timelineCandidate.text,
       source: 'terminal-timeline-boundary',

@@ -224,7 +224,7 @@ describe('projectAssistantActivity', () => {
     ])
   })
 
-  it('folds the transition before a terminal Markdown answer boundary', () => {
+  it('keeps Markdown thematic breaks inside the terminal answer', () => {
     const projection = projectAssistantActivity(
       message({
         text: 'Inspecting.\n\nPreparing the report.\n\n---\n\n## Final report\nResult.',
@@ -248,16 +248,13 @@ describe('projectAssistantActivity', () => {
     )
 
     expect(projection.answerSource).toBe('terminal-timeline-boundary')
-    expect(projection.answerPart?.rawText).toBe('## Final report\nResult.')
+    expect(projection.answerPart?.rawText).toBe(
+      'Preparing the report.\n\n---\n\n## Final report\nResult.',
+    )
     expect(projection.activityItems.map(item => item.key)).toEqual([
       'opening',
       'weather',
-      'terminal:activity-prefix',
     ])
-    expect(projection.activityItems[2]).toMatchObject({
-      rawText: 'Preparing the report.',
-      html: '<rendered>Preparing the report.</rendered>',
-    })
   })
 
   it('separates an aggregated PlanRun answer at a successful terminal control boundary', () => {
