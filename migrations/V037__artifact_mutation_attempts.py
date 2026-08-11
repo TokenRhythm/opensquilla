@@ -1,10 +1,10 @@
-"""V035 - durable idempotency receipts for artifact-writing tool calls."""
+"""V037 - durable idempotency receipts for artifact-writing tool calls."""
 
 from __future__ import annotations
 
 from yoyo import step
 
-__depends__: set[str] = {"V034__artifact_prompt_annotations"}
+__depends__: set[str] = {"V036__artifact_prompt_annotations"}
 
 CREATE_STATEMENTS: tuple[str, ...] = (
     """

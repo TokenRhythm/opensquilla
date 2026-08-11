@@ -1,4 +1,4 @@
-"""Upgrade and rollback coverage for the V033 ArtifactSession schema."""
+"""Upgrade and rollback coverage for the V035 ArtifactSession schema."""
 
 from __future__ import annotations
 
@@ -13,7 +13,13 @@ from opensquilla.artifact_session.schema import SCHEMA_OBJECTS, SCHEMA_STATEMENT
 from opensquilla.persistence.migrator import apply_pending
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATION_ID = "V033__artifact_sessions"
+MIGRATION_ID = "V035__artifact_sessions"
+ARTIFACT_MIGRATION_IDS = (
+    MIGRATION_ID,
+    "V036__artifact_prompt_annotations",
+    "V037__artifact_mutation_attempts",
+    "V038__document_resources",
+)
 
 TABLES = {
     "artifact_documents",
@@ -38,7 +44,34 @@ def _artifact_schema(conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
     }
 
 
-def test_v033_creates_complete_artifact_session_schema_and_guards_revisions(
+def _apply_origin_main_profile(db_path: Path) -> None:
+    backend = get_backend("sqlite:///" + str(db_path))
+    try:
+        migrations = read_migrations(str(MIGRATIONS_DIR)).filter(
+            lambda item: item.id not in ARTIFACT_MIGRATION_IDS
+        )
+        with backend.lock():
+            backend.apply_migrations(backend.to_apply(migrations))
+    finally:
+        backend.connection.close()
+
+
+def test_v035_through_v038_upgrade_origin_main_goal_profile(tmp_path: Path) -> None:
+    db_path = tmp_path / "sessions.db"
+    _apply_origin_main_profile(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        applied_before = {
+            str(row[0])
+            for row in conn.execute("SELECT migration_id FROM _yoyo_migration").fetchall()
+        }
+    assert "V034__goal_message_anchor" in applied_before
+    assert not set(ARTIFACT_MIGRATION_IDS) & applied_before
+
+    assert apply_pending(str(db_path), MIGRATIONS_DIR) == list(ARTIFACT_MIGRATION_IDS)
+
+
+def test_v035_creates_complete_artifact_session_schema_and_guards_revisions(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "sessions.db"
@@ -111,7 +144,7 @@ def test_v033_creates_complete_artifact_session_schema_and_guards_revisions(
             )
 
 
-def test_v033_and_runtime_initializer_create_the_same_schema(tmp_path: Path) -> None:
+def test_v035_and_runtime_initializer_create_the_same_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     apply_pending(str(db_path), MIGRATIONS_DIR)
 
@@ -125,20 +158,14 @@ def test_v033_and_runtime_initializer_create_the_same_schema(tmp_path: Path) -> 
     assert migrated_schema == runtime_schema
 
 
-def test_v033_rolls_back_only_artifact_session_objects(tmp_path: Path) -> None:
+def test_v035_rolls_back_only_artifact_session_objects(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     apply_pending(str(db_path), MIGRATIONS_DIR)
 
     backend = get_backend("sqlite:///" + str(db_path))
     try:
         migration = read_migrations(str(MIGRATIONS_DIR)).filter(
-            lambda item: item.id
-            in {
-                MIGRATION_ID,
-                "V034__artifact_prompt_annotations",
-                "V035__artifact_mutation_attempts",
-                "V036__document_resources",
-            }
+            lambda item: item.id in ARTIFACT_MIGRATION_IDS
         )
         with backend.lock():
             backend.rollback_migrations(migration)
@@ -160,6 +187,6 @@ def test_v033_rolls_back_only_artifact_session_objects(tmp_path: Path) -> None:
     assert not TABLES & tables
     assert "V032__meta_launch_discard_tombstones" in applied
     assert MIGRATION_ID not in applied
-    assert "V034__artifact_prompt_annotations" not in applied
-    assert "V035__artifact_mutation_attempts" not in applied
-    assert "V036__document_resources" not in applied
+    assert "V036__artifact_prompt_annotations" not in applied
+    assert "V037__artifact_mutation_attempts" not in applied
+    assert "V038__document_resources" not in applied

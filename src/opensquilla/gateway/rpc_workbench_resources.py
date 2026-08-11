@@ -225,7 +225,7 @@ def _conflict(exc: Exception) -> RpcHandlerError:
 
 
 def _resource_ref_payload(resource_type: str, resource_id: str) -> dict[str, str]:
-    """Serialize the public discriminated ref while retaining the V036 id alias."""
+    """Serialize the public discriminated ref with its generic id alias."""
 
     id_field = _RESOURCE_ID_FIELDS.get(resource_type)
     if id_field is None:
@@ -254,7 +254,7 @@ def _resource_ref(params: dict[str, Any] | None, name: str = "resource") -> tupl
 def _resource_ref_with_legacy_alias(
     params: dict[str, Any] | None,
 ) -> tuple[str, str]:
-    """Read the canonical resourceRef field while accepting the V036 alias."""
+    """Read the canonical resourceRef field while accepting the resource alias."""
 
     if isinstance(params, dict) and isinstance(params.get("resourceRef"), dict):
         return _resource_ref(params, "resourceRef")

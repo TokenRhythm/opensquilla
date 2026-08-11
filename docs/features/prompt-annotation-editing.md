@@ -183,20 +183,24 @@ admitted commit may advance the head.
 
 ## Persistence and migrations
 
-Two additive migrations provide the durable substrate:
+Four additive migrations provide the durable substrate:
 
-- `V033__artifact_sessions` creates documents, immutable revisions, change
+- `V035__artifact_sessions` creates documents, immutable revisions, change
   sets, anchors, writer leases, edit sessions, and audit events. It also adds
   immutability triggers and document/turn indexes.
-- `V034__artifact_prompt_annotations` creates durable annotation drafts with
-  `draft`, `sent`, and `discarded` states. It depends on V033 and enforces body,
+- `V036__artifact_prompt_annotations` creates durable annotation drafts with
+  `draft`, `sent`, and `discarded` states. It depends on V035 and enforces body,
   send-linkage, session, document, and revision indexes.
+- `V037__artifact_mutation_attempts` adds the durable, proposal-bound commit
+  receipt used for idempotency and restart reconciliation.
+- `V038__document_resources` adds source bindings plus import and immutable
+  publication journals for Workbench resources.
 
 Before an upgrade, take the normal profile/database backup and verify it is
 readable. Migrations must be exercised from both a fresh database and the
 oldest supported upgrade database. Do not manually delete the tables or run
-down migrations on a profile that may contain artifact history: V034 rollback
-deletes annotation drafts and V033 rollback deletes artifact revision history.
+down migrations on a profile that may contain artifact history: V036 rollback
+deletes annotation drafts and V035 rollback deletes artifact revision history.
 
 The operational rollback is to turn the feature gate off while retaining the
 additive schema. If a binary downgrade is required, restore a compatible
@@ -245,9 +249,10 @@ Run all commands from the repository root unless the command changes directory.
 ```sh
 uv run pytest -q \
   tests/test_artifact_session \
-  tests/test_migrations/test_v033_artifact_sessions.py \
-  tests/test_migrations/test_v034_artifact_prompt_annotations.py \
-  tests/test_gateway/test_artifact_contexts.py \
+  tests/test_migrations/test_v035_artifact_sessions.py \
+  tests/test_migrations/test_v036_artifact_prompt_annotations.py \
+  tests/test_migrations/test_v037_artifact_mutation_attempts.py \
+  tests/test_migrations/test_v038_document_resources.py \
   tests/test_gateway/test_artifact_tool_context.py \
   tests/test_gateway/test_desktop_artifact_bridge.py \
   tests/test_gateway/test_prompt_annotations.py \
@@ -257,7 +262,6 @@ uv run pytest -q \
   tests/test_engine/test_artifact_ensemble_policy.py \
   tests/test_session/test_artifact_session_lifecycle.py \
   tests/test_tools/test_artifact_range_grants.py \
-  tests/test_tools/test_artifact_editing_tools.py \
   tests/test_tools/test_document_format_adapters.py \
   tests/test_tools/test_document_editing_tools.py
 ```
