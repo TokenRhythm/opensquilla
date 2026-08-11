@@ -79,6 +79,9 @@ _COMPACT_TERMINAL_STATUSES = frozenset(
         "result_incomplete",
     }
 )
+DRACO_RESUME_SOURCE_ARTIFACT_EVIDENCE_SCHEMA = (
+    "opensquilla.draco-resume-source-artifact-evidence/v1"
+)
 
 
 def _file_signature(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -434,6 +437,96 @@ class ResumeSourceIndex:
                 f"resume source index is not unique for source {source_index}"
             )
         return matches[0].compact_bundle is not None
+
+    def source_artifact_evidence(self, *, source_index: int) -> dict[str, Any]:
+        """Return bounded metadata already authenticated by a sealed scan.
+
+        This accessor performs no I/O, expansion, hashing, or pack scan.  Its
+        detached primitive values let downstream consumers bind their own
+        reads to this exact source lifecycle without exposing descriptors,
+        readers, object locations, or unbounded row identities.
+        """
+
+        self._require_open()
+        if (
+            isinstance(source_index, bool)
+            or not isinstance(source_index, int)
+            or source_index < 0
+        ):
+            raise DracoResumeSourceError("resume source index must be non-negative")
+        if self._active_source_id is not None:
+            raise DracoResumeSourceError(
+                "cannot inspect artifact evidence during a source scan"
+            )
+        if not self._sealed:
+            raise DracoResumeSourceError(
+                "resume source index must be sealed before reading artifact evidence"
+            )
+        matches = [
+            snapshot
+            for snapshot in self._sources.values()
+            if snapshot.source_index == source_index
+        ]
+        if not matches:
+            raise DracoResumeSourceError(
+                f"resume source index has no completed source {source_index}"
+            )
+        if len(matches) != 1:
+            raise DracoResumeSourceError(
+                f"resume source index is not unique for source {source_index}"
+            )
+        snapshot = matches[0]
+        if not snapshot.sha256:
+            raise DracoResumeSourceError(
+                f"resume source index has no completed digest for source {source_index}"
+            )
+        bundle = snapshot.compact_bundle
+        compact_evidence: dict[str, Any] | None = None
+        if bundle is not None:
+            durable_hashes: dict[str, str] = {}
+            for key in (
+                "results_sha256",
+                "trace_sha256",
+                "checkpoint_sha256",
+            ):
+                value = bundle.durable_verification.get(key)
+                if not isinstance(value, str):
+                    raise DracoResumeSourceError(
+                        "compact resume durable hash evidence is malformed"
+                    )
+                durable_hashes[key] = value
+            path_signatures: dict[str, tuple[int, ...]] = {}
+            for key in (
+                "results_jsonl",
+                "trace_jsonl",
+                "checkpoint_json",
+            ):
+                signature = bundle.artifact_path_snapshots.get(key)
+                if not isinstance(signature, tuple):
+                    raise DracoResumeSourceError(
+                        "compact resume path signature evidence is malformed"
+                    )
+                path_signatures[key] = tuple(int(item) for item in signature)
+            compact_evidence = {
+                "durable_hashes": durable_hashes,
+                "path_signatures": path_signatures,
+                "manifest_snapshot": {
+                    "signature": tuple(
+                        int(item) for item in bundle.manifest_signature
+                    ),
+                    "sha256": str(bundle.manifest_sha256),
+                },
+            }
+        return {
+            "schema": DRACO_RESUME_SOURCE_ARTIFACT_EVIDENCE_SCHEMA,
+            "source_index": source_index,
+            "result_snapshot": {
+                "signature": tuple(int(item) for item in snapshot.signature),
+                "sha256": str(snapshot.sha256),
+            },
+            "compact_authenticated": bundle is not None,
+            "compact_artifact_evidence": compact_evidence,
+        }
 
     def _require_open(self) -> None:
         if self._closed:

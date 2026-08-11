@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -13,6 +14,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from opensquilla.eval import draco_artifact_integrity as artifact_integrity
+from opensquilla.eval import draco_artifact_io as artifact_io
+from opensquilla.eval import draco_selection_plan_evidence as plan_evidence
 from opensquilla.provider.ranking_router import (
     build_request_context,
     fallback_task_profile,
@@ -61,6 +65,194 @@ def sealed_result(task_id: str) -> dict[str, object]:
         }
     )
     return row
+
+
+def write_compact_dry_bundle(
+    root: Path,
+    *,
+    task_ids: tuple[str, ...] = ("task-0", "task-1"),
+    stamp: str = "20260811-230000",
+    plan_marker: str = "A",
+) -> SimpleNamespace:
+    root.mkdir(parents=True, exist_ok=True)
+    results_path = root / f"draco_ensemble_{stamp}.jsonl"
+    trace_path = root / f"draco_run_{stamp}.trace.jsonl"
+    checkpoint_path = root / f"draco_run_{stamp}.checkpoint.json"
+    manifest_path = root / f"draco_run_{stamp}.manifest.json"
+    pack_path = root / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    capability = artifact_io.durable_artifact_capability_contract()
+    compact_rows: list[dict[str, object]] = []
+    inline_plans: dict[str, dict[str, object]] = {}
+    with plan_evidence.SelectionPlanPackAppender(pack_path) as appender:
+        for row_index, task_id in enumerate(task_ids, start=1):
+            selection_plan: dict[str, object] = {
+                "task_profile_pre_escalation": {
+                    "complexity": "medium",
+                    "task_id": task_id,
+                    "bundle_marker": plan_marker,
+                },
+                "task_analyzer": {
+                    "source": "frozen_replay",
+                    "usage": {},
+                    "replay": {"physical_request_count": 0},
+                },
+                "selected_P": ["openrouter:test-proposer"],
+                "selected_A": "openrouter:test-aggregator",
+            }
+            inline_plans[task_id] = copy.deepcopy(selection_plan)
+            row: dict[str, object] = {
+                "row_index": row_index,
+                "task_id": task_id,
+                "group": "G1",
+                "routing_trace": {
+                    "dry_run": True,
+                    "selection_plan": selection_plan,
+                },
+                "ensemble_trace": {
+                    "calls": [
+                        {"selection_plan": copy.deepcopy(selection_plan)}
+                    ]
+                },
+            }
+            compact = plan_evidence.compact_selection_plan_evidence_row(
+                row,
+                appender=appender,
+            )
+            compact[artifact_io.DRACO_DURABLE_RESULT_ROW_FIELD] = capability
+            compact_rows.append(artifact_integrity.seal_result_row(compact))
+    with artifact_io.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        for row in compact_rows:
+            assert writer.append(row, artifact_integrity.trace_row_from_result(row))
+    verification = artifact_io.verify_durable_draco_artifacts(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+    with plan_evidence.SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        binding = plan_evidence.selection_plan_evidence_manifest_binding(
+            pack_index=reader.index,
+            durable_artifact_verification=verification,
+            compact_row_count=sum(
+                plan_evidence.selection_plan_reference_signal(row)
+                for row in compact_rows
+            ),
+        )
+    manifest = {
+        "schema": artifact_io.DRACO_RUN_MANIFEST_SCHEMA_V2,
+        "stamp": stamp,
+        "status": "complete",
+        "dry_run": True,
+        "groups": ["G1"],
+        "durable_artifact_capability": capability,
+        "run_compatibility": {
+            "contracts": {
+                "G1": {"durable_artifact_capability": capability},
+            }
+        },
+        "artifacts": {
+            "results_jsonl": str(results_path),
+            "trace_jsonl": str(trace_path),
+            "checkpoint_json": str(checkpoint_path),
+            "manifest_json": str(manifest_path),
+            plan_evidence.SELECTION_PLAN_PACK_ARTIFACT_FIELD: str(pack_path),
+        },
+        plan_evidence.SELECTION_PLAN_EVIDENCE_ROW_FIELD: (
+            plan_evidence.selection_plan_evidence_capability_contract()
+        ),
+        plan_evidence.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD: binding,
+    }
+    write_json(manifest_path, manifest)
+    return SimpleNamespace(
+        results=results_path,
+        trace=trace_path,
+        checkpoint=checkpoint_path,
+        manifest=manifest_path,
+        pack=pack_path,
+        plans=inline_plans,
+    )
+
+
+def write_inline_dry_bundle(
+    root: Path,
+    *,
+    task_ids: tuple[str, ...] = ("task-0", "task-1"),
+    stamp: str = "20260811-230000",
+    plan_marker: str = "legacy",
+) -> SimpleNamespace:
+    root.mkdir(parents=True, exist_ok=True)
+    results_path = root / f"draco_ensemble_{stamp}.jsonl"
+    trace_path = root / f"draco_run_{stamp}.trace.jsonl"
+    checkpoint_path = root / f"draco_run_{stamp}.checkpoint.json"
+    manifest_path = root / f"draco_run_{stamp}.manifest.json"
+    capability = artifact_io.durable_artifact_capability_contract()
+    rows: list[dict[str, object]] = []
+    inline_plans: dict[str, dict[str, object]] = {}
+    for row_index, task_id in enumerate(task_ids, start=1):
+        selection_plan: dict[str, object] = {
+            "task_profile_pre_escalation": {
+                "complexity": "medium",
+                "task_id": task_id,
+                "bundle_marker": plan_marker,
+            },
+            "task_analyzer": {
+                "source": "frozen_replay",
+                "usage": {},
+                "replay": {"physical_request_count": 0},
+            },
+            "selected_P": ["openrouter:test-proposer"],
+            "selected_A": "openrouter:test-aggregator",
+        }
+        inline_plans[task_id] = copy.deepcopy(selection_plan)
+        row: dict[str, object] = {
+            "row_index": row_index,
+            "task_id": task_id,
+            "group": "G1",
+            "routing_trace": {
+                "dry_run": True,
+                "selection_plan": selection_plan,
+            },
+            artifact_io.DRACO_DURABLE_RESULT_ROW_FIELD: capability,
+        }
+        rows.append(artifact_integrity.seal_result_row(row))
+    with artifact_io.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        for row in rows:
+            assert writer.append(row, artifact_integrity.trace_row_from_result(row))
+    manifest = {
+        "schema": artifact_io.DRACO_RUN_MANIFEST_SCHEMA_V2,
+        "stamp": stamp,
+        "status": "complete",
+        "dry_run": True,
+        "groups": ["G1"],
+        "durable_artifact_capability": capability,
+        "run_compatibility": {
+            "contracts": {
+                "G1": {"durable_artifact_capability": capability},
+            }
+        },
+        "artifacts": {
+            "results_jsonl": str(results_path),
+            "trace_jsonl": str(trace_path),
+            "checkpoint_json": str(checkpoint_path),
+            "manifest_json": str(manifest_path),
+        },
+    }
+    write_json(manifest_path, manifest)
+    return SimpleNamespace(
+        results=results_path,
+        trace=trace_path,
+        checkpoint=checkpoint_path,
+        manifest=manifest_path,
+        pack=None,
+        plans=inline_plans,
+    )
 
 
 class ControllerTests(unittest.TestCase):
@@ -1917,6 +2109,481 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
                 schedule["anchor_by_arm_id"][arm.arm_id],
             )
 
+    def test_source_selection_plans_materializes_bound_compact_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            bundle = write_compact_dry_bundle(Path(raw))
+            artifact_evidence: dict[str, str] = {}
+
+            observed = controller._source_selection_plans(
+                bundle.trace,
+                terminal_manifest_path=bundle.manifest,
+                expected_task_ids=set(bundle.plans),
+                require_dry_replay=True,
+                artifact_evidence_out=artifact_evidence,
+            )
+
+            self.assertEqual(observed, bundle.plans)
+            self.assertEqual(
+                artifact_evidence,
+                {
+                    "trace_raw_sha256": controller.file_sha256(bundle.trace),
+                    "manifest_raw_sha256": controller.file_sha256(bundle.manifest),
+                },
+            )
+            for selection in observed.values():
+                self.assertEqual(selection["task_analyzer"]["source"], "frozen_replay")
+                self.assertFalse(
+                    plan_evidence.selection_plan_reference_signal(selection)
+                )
+                self.assertFalse(
+                    plan_evidence.selection_plan_row_capability_signal(selection)
+                )
+
+    def test_source_selection_plans_accepts_bound_standard_inline_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            bundle = write_inline_dry_bundle(Path(raw))
+            artifact_evidence: dict[str, str] = {}
+
+            observed = controller._source_selection_plans(
+                bundle.trace,
+                terminal_manifest_path=bundle.manifest,
+                expected_task_ids=set(bundle.plans),
+                require_dry_replay=True,
+                artifact_evidence_out=artifact_evidence,
+            )
+
+            self.assertEqual(observed, bundle.plans)
+            self.assertEqual(
+                artifact_evidence,
+                {
+                    "trace_raw_sha256": controller.file_sha256(bundle.trace),
+                    "manifest_raw_sha256": controller.file_sha256(bundle.manifest),
+                },
+            )
+
+    def test_source_selection_plans_rejects_legacy_manifest_compact_signal_race(
+        self,
+    ) -> None:
+        from opensquilla.eval.draco_resume_source_index import ResumeSourceIndex
+
+        for mutation in ("partial_capability", "coherent_zero_ref_binding"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                bundle = write_inline_dry_bundle(Path(raw))
+                manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+                if mutation == "partial_capability":
+                    manifest[plan_evidence.SELECTION_PLAN_EVIDENCE_ROW_FIELD] = (
+                        plan_evidence.selection_plan_evidence_capability_contract()
+                    )
+                else:
+                    pack_path = bundle.manifest.with_name(
+                        "draco_run_20260811-230000.selection-plan.pack.jsonl"
+                    )
+                    with plan_evidence.SelectionPlanPackAppender(pack_path):
+                        pass
+                    verification = artifact_io.verify_durable_draco_artifacts(
+                        results_path=bundle.results,
+                        trace_path=bundle.trace,
+                        checkpoint_path=bundle.checkpoint,
+                    )
+                    with plan_evidence.SelectionPlanPackReader(
+                        pack_path,
+                        owner_only=True,
+                    ) as reader:
+                        binding = plan_evidence.selection_plan_evidence_manifest_binding(
+                            pack_index=reader.index,
+                            durable_artifact_verification=verification,
+                            compact_row_count=0,
+                        )
+                    manifest["artifacts"][
+                        plan_evidence.SELECTION_PLAN_PACK_ARTIFACT_FIELD
+                    ] = str(pack_path)
+                    manifest[plan_evidence.SELECTION_PLAN_EVIDENCE_ROW_FIELD] = (
+                        plan_evidence.selection_plan_evidence_capability_contract()
+                    )
+                    manifest[
+                        plan_evidence.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD
+                    ] = binding
+                original = ResumeSourceIndex.source_artifact_evidence
+                replaced = False
+
+                def replace_manifest(
+                    index: ResumeSourceIndex,
+                    *,
+                    source_index: int,
+                ) -> dict[str, object]:
+                    nonlocal replaced
+                    evidence = original(index, source_index=source_index)
+                    if not replaced:
+                        write_json(bundle.manifest, manifest)
+                        replaced = True
+                    return evidence
+
+                artifact_evidence: dict[str, str] = {}
+                with (
+                    mock.patch.object(
+                        ResumeSourceIndex,
+                        "source_artifact_evidence",
+                        replace_manifest,
+                    ),
+                    self.assertRaisesRegex(
+                        controller.ControllerError,
+                        "undeclared compact manifest evidence",
+                    ),
+                ):
+                    controller._source_selection_plans(
+                        bundle.trace,
+                        terminal_manifest_path=bundle.manifest,
+                        expected_task_ids=set(bundle.plans),
+                        require_dry_replay=True,
+                        artifact_evidence_out=artifact_evidence,
+                    )
+                self.assertTrue(replaced)
+                self.assertEqual(artifact_evidence, {})
+
+    def test_dry_run_artifact_discovery_does_not_open_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            trace = root / "draco_run_20260811-230000.trace.jsonl"
+            manifest = root / "draco_run_20260811-230000.manifest.json"
+            trace.write_text("not-json", encoding="utf-8")
+            manifest.write_text("not-json", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    controller,
+                    "require_regular_file",
+                    side_effect=AssertionError("discovery opened trace"),
+                ),
+                mock.patch.object(
+                    controller,
+                    "load_json",
+                    side_effect=AssertionError("discovery opened manifest"),
+                ),
+            ):
+                self.assertEqual(
+                    controller._dry_run_output_artifacts(root),
+                    (trace, manifest),
+                )
+
+    def test_source_selection_plans_keeps_inline_and_rejects_undeclared_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            trace = root / "formal-trace.jsonl"
+            selection = {
+                "task_analyzer": {
+                    "source": "frozen_replay",
+                    "usage": {},
+                    "replay": {"physical_request_count": 0},
+                }
+            }
+            inline_row = {
+                "task_id": "task-0",
+                "group": "G1",
+                "routing_trace": {
+                    "dry_run": True,
+                    "selection_plan": selection,
+                },
+            }
+            trace.write_text(json.dumps(inline_row) + "\n", encoding="utf-8")
+            self.assertEqual(
+                controller._source_selection_plans(
+                    trace,
+                    expected_task_ids={"task-0"},
+                    require_dry_replay=True,
+                ),
+                {"task-0": selection},
+            )
+
+            inline_row["routing_trace"]["selection_plan"] = {
+                "schema": plan_evidence.SELECTION_PLAN_REF_SCHEMA,
+            }
+            trace.write_text(json.dumps(inline_row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                controller.ControllerError,
+                "undeclared compact selection-plan evidence",
+            ):
+                controller._source_selection_plans(
+                    trace,
+                    expected_task_ids={"task-0"},
+                    require_dry_replay=True,
+                )
+
+    def test_source_selection_plans_rejects_compact_bundle_corruption(self) -> None:
+        for mutation in (
+            "missing_pack",
+            "tampered_pack",
+            "downgrade",
+            "manifest_not_dry",
+            "manifest_incomplete",
+            "trace_ref_substitution",
+            "trace_ahead",
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                bundle = write_compact_dry_bundle(Path(raw))
+                if mutation == "missing_pack":
+                    bundle.pack.unlink()
+                elif mutation == "tampered_pack":
+                    payload = bytearray(bundle.pack.read_bytes())
+                    payload[-2] ^= 1
+                    bundle.pack.write_bytes(payload)
+                elif mutation == "downgrade":
+                    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+                    manifest.pop(plan_evidence.SELECTION_PLAN_EVIDENCE_ROW_FIELD)
+                    manifest.pop(plan_evidence.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD)
+                    manifest["artifacts"].pop(
+                        plan_evidence.SELECTION_PLAN_PACK_ARTIFACT_FIELD
+                    )
+                    write_json(bundle.manifest, manifest)
+                elif mutation in {"manifest_not_dry", "manifest_incomplete"}:
+                    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+                    if mutation == "manifest_not_dry":
+                        manifest["dry_run"] = False
+                    else:
+                        manifest["status"] = "result_incomplete"
+                    write_json(bundle.manifest, manifest)
+                elif mutation == "trace_ref_substitution":
+                    trace_rows = [
+                        json.loads(line)
+                        for line in bundle.trace.read_text(encoding="utf-8").splitlines()
+                    ]
+                    trace_rows[0]["routing_trace"]["selection_plan"] = copy.deepcopy(
+                        trace_rows[1]["routing_trace"]["selection_plan"]
+                    )
+                    bundle.trace.write_text(
+                        "".join(json.dumps(row) + "\n" for row in trace_rows),
+                        encoding="utf-8",
+                    )
+                else:
+                    bundle.trace.write_bytes(bundle.trace.read_bytes() + b" ")
+
+                with self.assertRaises(controller.ControllerError):
+                    controller._source_selection_plans(
+                        bundle.trace,
+                        terminal_manifest_path=bundle.manifest,
+                        expected_task_ids=set(bundle.plans),
+                        require_dry_replay=True,
+                    )
+
+    def test_source_selection_plans_rejects_manifest_replacement_after_bind(self) -> None:
+        from opensquilla.eval.draco_resume_source_index import ResumeSourceIndex
+
+        with tempfile.TemporaryDirectory() as raw:
+            bundle = write_compact_dry_bundle(Path(raw))
+            original = ResumeSourceIndex.source_artifact_evidence
+            replaced = False
+
+            def replace_manifest(
+                index: ResumeSourceIndex,
+                *,
+                source_index: int,
+            ) -> dict[str, object]:
+                nonlocal replaced
+                result = original(index, source_index=source_index)
+                if not replaced:
+                    replacement = bundle.manifest.with_name("replacement.manifest.json")
+                    replacement.write_bytes(bundle.manifest.read_bytes())
+                    os.replace(replacement, bundle.manifest)
+                    replaced = True
+                return result
+
+            with (
+                mock.patch.object(
+                    ResumeSourceIndex,
+                    "source_artifact_evidence",
+                    replace_manifest,
+                ),
+                self.assertRaises(controller.ControllerError),
+            ):
+                controller._source_selection_plans(
+                    bundle.trace,
+                    terminal_manifest_path=bundle.manifest,
+                    expected_task_ids=set(bundle.plans),
+                    require_dry_replay=True,
+                )
+            self.assertTrue(replaced)
+
+    def test_source_selection_plans_rejects_coherent_bundle_replacement(self) -> None:
+        from opensquilla.eval.draco_resume_source_index import ResumeSourceIndex
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = write_compact_dry_bundle(root / "target", plan_marker="A")
+            replacement = write_compact_dry_bundle(
+                root / "replacement",
+                plan_marker="B",
+            )
+            replacement_manifest = json.loads(
+                replacement.manifest.read_text(encoding="utf-8")
+            )
+            for key, path in (
+                ("results_jsonl", target.results),
+                ("trace_jsonl", target.trace),
+                ("checkpoint_json", target.checkpoint),
+                ("manifest_json", target.manifest),
+                (plan_evidence.SELECTION_PLAN_PACK_ARTIFACT_FIELD, target.pack),
+            ):
+                replacement_manifest["artifacts"][key] = str(path)
+            write_json(replacement.manifest, replacement_manifest)
+            original = ResumeSourceIndex.source_artifact_evidence
+            replaced = False
+
+            def replace_bundle(
+                index: ResumeSourceIndex,
+                *,
+                source_index: int,
+            ) -> dict[str, object]:
+                nonlocal replaced
+                if not replaced:
+                    for source, destination in (
+                        (replacement.pack, target.pack),
+                        (replacement.trace, target.trace),
+                        (replacement.checkpoint, target.checkpoint),
+                        (replacement.results, target.results),
+                        (replacement.manifest, target.manifest),
+                    ):
+                        os.replace(source, destination)
+                    replaced = True
+                return original(index, source_index=source_index)
+
+            with (
+                mock.patch.object(
+                    ResumeSourceIndex,
+                    "source_artifact_evidence",
+                    replace_bundle,
+                ),
+                self.assertRaises(controller.ControllerError),
+            ):
+                controller._source_selection_plans(
+                    target.trace,
+                    terminal_manifest_path=target.manifest,
+                    expected_task_ids=set(target.plans),
+                    require_dry_replay=True,
+                )
+            self.assertTrue(replaced)
+
+    def test_source_selection_plans_rejects_compact_to_legacy_replacement(self) -> None:
+        from opensquilla.eval.draco_resume_source_index import ResumeSourceIndex
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = write_compact_dry_bundle(root / "target", plan_marker="A")
+            replacement = write_inline_dry_bundle(
+                root / "replacement",
+                plan_marker="legacy-B",
+            )
+            replacement_manifest = json.loads(
+                replacement.manifest.read_text(encoding="utf-8")
+            )
+            for key, path in (
+                ("results_jsonl", target.results),
+                ("trace_jsonl", target.trace),
+                ("checkpoint_json", target.checkpoint),
+                ("manifest_json", target.manifest),
+            ):
+                replacement_manifest["artifacts"][key] = str(path)
+            write_json(replacement.manifest, replacement_manifest)
+            original = ResumeSourceIndex.source_artifact_evidence
+            replaced = False
+
+            def replace_bundle(
+                index: ResumeSourceIndex,
+                *,
+                source_index: int,
+            ) -> dict[str, object]:
+                nonlocal replaced
+                if not replaced:
+                    target.pack.unlink()
+                    for source, destination in (
+                        (replacement.trace, target.trace),
+                        (replacement.checkpoint, target.checkpoint),
+                        (replacement.results, target.results),
+                        (replacement.manifest, target.manifest),
+                    ):
+                        os.replace(source, destination)
+                    replaced = True
+                return original(index, source_index=source_index)
+
+            with (
+                mock.patch.object(
+                    ResumeSourceIndex,
+                    "source_artifact_evidence",
+                    replace_bundle,
+                ),
+                self.assertRaises(controller.ControllerError),
+            ):
+                controller._source_selection_plans(
+                    target.trace,
+                    terminal_manifest_path=target.manifest,
+                    expected_task_ids=set(target.plans),
+                    require_dry_replay=True,
+                )
+            self.assertTrue(replaced)
+
+    def test_source_selection_plans_rejects_read_then_restore_manifest_substitution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = write_compact_dry_bundle(root / "target", plan_marker="A")
+            replacement = write_compact_dry_bundle(
+                root / "replacement",
+                plan_marker="B",
+            )
+            replacement_manifest = json.loads(
+                replacement.manifest.read_text(encoding="utf-8")
+            )
+            for key, path in (
+                ("results_jsonl", target.results),
+                ("trace_jsonl", target.trace),
+                ("checkpoint_json", target.checkpoint),
+                ("manifest_json", target.manifest),
+                (plan_evidence.SELECTION_PLAN_PACK_ARTIFACT_FIELD, target.pack),
+            ):
+                replacement_manifest["artifacts"][key] = str(path)
+            write_json(replacement.manifest, replacement_manifest)
+            original = controller._read_terminal_file_snapshot
+            substituted = False
+
+            def read_substituted_manifest(
+                path: Path,
+                *,
+                label: str,
+                max_bytes: int | None = None,
+            ) -> tuple[bytes, tuple[int, ...], str]:
+                nonlocal substituted
+                if path == target.manifest and not substituted:
+                    backup = target.manifest.with_name("bound-A.manifest.json")
+                    os.replace(target.manifest, backup)
+                    os.replace(replacement.manifest, target.manifest)
+                    try:
+                        observed = original(
+                            path,
+                            label=label,
+                            max_bytes=max_bytes,
+                        )
+                    finally:
+                        os.replace(target.manifest, replacement.manifest)
+                        os.replace(backup, target.manifest)
+                    substituted = True
+                    return observed
+                return original(path, label=label, max_bytes=max_bytes)
+
+            with (
+                mock.patch.object(
+                    controller,
+                    "_read_terminal_file_snapshot",
+                    read_substituted_manifest,
+                ),
+                self.assertRaises(controller.ControllerError),
+            ):
+                controller._source_selection_plans(
+                    target.trace,
+                    terminal_manifest_path=target.manifest,
+                    expected_task_ids=set(target.plans),
+                    require_dry_replay=True,
+                )
+            self.assertTrue(substituted)
+
     def test_main_dry_replay_blanks_network_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -1947,6 +2614,21 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
             fake_trace.write_text("{}\n", encoding="utf-8")
             fake_manifest.write_text("{}\n", encoding="utf-8")
             plans = {f"task-{index}": {} for index in range(10)}
+
+            def fake_source_selection_plans(
+                _trace_path: Path,
+                **kwargs: object,
+            ) -> dict[str, dict[str, object]]:
+                artifact_evidence = kwargs["artifact_evidence_out"]
+                assert isinstance(artifact_evidence, dict)
+                artifact_evidence.update(
+                    {
+                        "trace_raw_sha256": "a" * 64,
+                        "manifest_raw_sha256": "b" * 64,
+                    }
+                )
+                return plans
+
             with (
                 mock.patch.object(controller, "validate_runtime_freeze"),
                 mock.patch.object(controller.subprocess, "run", side_effect=fake_run),
@@ -1958,7 +2640,12 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
                 mock.patch.object(
                     controller,
                     "_source_selection_plans",
-                    return_value=plans,
+                    side_effect=fake_source_selection_plans,
+                ),
+                mock.patch.object(
+                    controller,
+                    "file_sha256",
+                    side_effect=AssertionError("run_main performed a post-close hash"),
                 ),
             ):
                 observed, evidence = controller.run_main_dry_replay(
@@ -1970,6 +2657,8 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
                     label="fixture",
                 )
             self.assertEqual(set(observed), set(plans))
+            self.assertEqual(evidence["trace_raw_sha256"], "a" * 64)
+            self.assertEqual(evidence["manifest_raw_sha256"], "b" * 64)
             command = captured["command"]
             self.assertIn("--dry-run", command)
             env = captured["env"]

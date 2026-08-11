@@ -2949,15 +2949,129 @@ def _runtime_helpers(snapshot: Path) -> dict[str, Any]:
     return helpers
 
 
-def _source_selection_plans(
+_STANDARD_DRACO_TRACE_NAME_RE = re.compile(
+    r"^draco_run_(?P<stamp>[0-9]{8}-[0-9]{6})\.trace\.jsonl$"
+)
+_STANDARD_DRACO_MANIFEST_NAME_RE = re.compile(
+    r"^draco_run_(?P<stamp>[0-9]{8}-[0-9]{6})\.manifest\.json$"
+)
+_MAX_TERMINAL_MANIFEST_BYTES = 64 * 1024 * 1024
+
+
+def _terminal_file_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_terminal_file_snapshot(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int | None = None,
+) -> tuple[bytes, tuple[int, ...], str]:
+    """Read one path-bound regular file without a pathname hash follow-up."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ControllerError(f"cannot open {label}: {path}") from exc
+    primary_error = False
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ControllerError(f"{label} is not a regular file: {path}")
+        signature = _terminal_file_signature(before)
+        if max_bytes is not None and not 0 < int(before.st_size) <= max_bytes:
+            raise ControllerError(f"{label} is outside its byte bound")
+        chunks: list[bytes] = []
+        while block := os.read(fd, 1024 * 1024):
+            chunks.append(block)
+        payload = b"".join(chunks)
+        if (
+            len(payload) != int(before.st_size)
+            or _terminal_file_signature(os.fstat(fd)) != signature
+        ):
+            raise ControllerError(f"{label} changed while it was read")
+        path_fd = os.open(path, flags)
+        try:
+            if _terminal_file_signature(os.fstat(path_fd)) != signature:
+                raise ControllerError(f"{label} path changed while it was read")
+        finally:
+            os.close(path_fd)
+        return payload, signature, hashlib.sha256(payload).hexdigest()
+    except BaseException:
+        primary_error = True
+        raise
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            if not primary_error:
+                raise
+
+
+def _verify_terminal_file_snapshot(
+    path: Path,
+    *,
+    label: str,
+    expected_signature: tuple[int, ...],
+    expected_sha256: str,
+) -> None:
+    payload, signature, sha256 = _read_terminal_file_snapshot(path, label=label)
+    if signature != expected_signature or sha256 != expected_sha256:
+        raise ControllerError(f"{label} changed after authentication")
+
+
+def _validate_replay_selection_plan(
+    task_id: str,
+    selection: Mapping[str, Any],
+    *,
+    require_dry_replay: bool,
+) -> None:
+    if not require_dry_replay:
+        return
+    analyzer = selection.get("task_analyzer")
+    replay = analyzer.get("replay") if isinstance(analyzer, Mapping) else None
+    if (
+        not isinstance(analyzer, Mapping)
+        or analyzer.get("source") != "frozen_replay"
+        or analyzer.get("usage") != {}
+        or not isinstance(replay, Mapping)
+        or replay.get("physical_request_count") != 0
+    ):
+        raise ControllerError(
+            f"dry trace task {task_id} did not materialize zero-call replay"
+        )
+
+
+def _inline_source_selection_plans(
     trace_path: Path,
     *,
     expected_task_ids: set[str],
     require_dry_replay: bool,
+    trace_payload: bytes | None = None,
 ) -> dict[str, Mapping[str, Any]]:
-    require_regular_file(trace_path)
-    plans: dict[str, Mapping[str, Any]] = {}
-    with trace_path.open(encoding="utf-8") as handle:
+    """Read one legacy inline trace and reject every reserved compact signal."""
+
+    from opensquilla.eval.draco_selection_plan_evidence import (
+        selection_plan_reference_signal,
+        selection_plan_row_capability_signal,
+    )
+
+    def parse_lines(handle: Iterable[str]) -> dict[str, Mapping[str, Any]]:
+        plans: dict[str, Mapping[str, Any]] = {}
         for line_number, line in enumerate(handle, start=1):
             try:
                 row = json.loads(line)
@@ -2965,6 +3079,12 @@ def _source_selection_plans(
                 raise ControllerError(f"invalid routing trace row {line_number}") from exc
             if not isinstance(row, Mapping) or row.get("group") != "G1":
                 raise ControllerError(f"routing trace row {line_number} is not G1")
+            if selection_plan_reference_signal(
+                row
+            ) or selection_plan_row_capability_signal(row):
+                raise ControllerError(
+                    "inline routing trace contains undeclared compact selection-plan evidence"
+                )
             task_id = str(row.get("task_id") or "")
             if task_id not in expected_task_ids or task_id in plans:
                 raise ControllerError(f"routing trace has invalid/duplicate task {task_id!r}")
@@ -2976,23 +3096,369 @@ def _source_selection_plans(
             selection = routing.get("selection_plan")
             if not isinstance(selection, Mapping):
                 raise ControllerError(f"routing trace task {task_id} lacks selection plan")
-            if require_dry_replay:
-                analyzer = selection.get("task_analyzer")
-                replay = analyzer.get("replay") if isinstance(analyzer, Mapping) else None
+            _validate_replay_selection_plan(
+                task_id,
+                selection,
+                require_dry_replay=require_dry_replay,
+            )
+            plans[task_id] = copy.deepcopy(dict(selection))
+        if set(plans) != expected_task_ids:
+            raise ControllerError("routing trace task coverage differs")
+        return plans
+
+    if trace_payload is not None:
+        try:
+            trace_text = trace_payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ControllerError("routing trace is not valid UTF-8") from exc
+        return parse_lines(io.StringIO(trace_text))
+    require_regular_file(trace_path)
+    with trace_path.open(encoding="utf-8") as handle:
+        return parse_lines(handle)
+
+
+def _standard_terminal_source_selection_plans(
+    trace_path: Path,
+    *,
+    terminal_manifest_path: Path,
+    expected_task_ids: set[str],
+    require_dry_replay: bool,
+    artifact_evidence_out: dict[str, str] | None,
+) -> dict[str, Mapping[str, Any]]:
+    """Choose compact versus inline from one result-source FD lifecycle."""
+
+    from opensquilla.eval.draco_artifact_io import (
+        DRACO_RUN_MANIFEST_SCHEMA_V2,
+        DracoArtifactDurabilityError,
+        durable_artifact_capability_contract,
+        verify_durable_artifact_path_snapshots,
+        verify_durable_draco_artifacts,
+    )
+    from opensquilla.eval.draco_resume_source_index import (
+        DracoResumeSourceError,
+        ResumeRowLocator,
+        ResumeSourceIndex,
+    )
+    from opensquilla.eval.draco_selection_plan_evidence import (
+        SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
+        SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+        SELECTION_PLAN_PACK_ARTIFACT_FIELD,
+        selection_plan_reference_signal,
+        selection_plan_row_capability_signal,
+    )
+
+    if artifact_evidence_out:
+        raise ControllerError("routing artifact evidence output must start empty")
+    match = _STANDARD_DRACO_TRACE_NAME_RE.fullmatch(trace_path.name)
+    if match is None:
+        raise ControllerError(
+            "routing trace lacks its standard sibling terminal manifest"
+        )
+    stamp = match.group("stamp")
+    parent = Path(os.path.abspath(trace_path.parent))
+    expected_trace_path = parent / f"draco_run_{stamp}.trace.jsonl"
+    expected_manifest_path = parent / f"draco_run_{stamp}.manifest.json"
+    if (
+        Path(os.path.abspath(trace_path)) != expected_trace_path
+        or Path(os.path.abspath(terminal_manifest_path))
+        != expected_manifest_path
+    ):
+        raise ControllerError(
+            "routing trace is not stamp-bound to its terminal manifest"
+        )
+    trace_path = expected_trace_path
+    terminal_manifest_path = expected_manifest_path
+    results_path = parent / f"draco_ensemble_{stamp}.jsonl"
+    checkpoint_path = parent / f"draco_run_{stamp}.checkpoint.json"
+    locators: list[ResumeRowLocator] = []
+    result_task_ids: set[str] = set()
+    plans: dict[str, Mapping[str, Any]] = {}
+    authenticated_evidence: dict[str, str] | None = None
+    try:
+        with ResumeSourceIndex([results_path]) as source_index:
+            with source_index.open_source(results_path, source_index=0) as lines:
+                for indexed_line in lines:
+                    try:
+                        row = (
+                            indexed_line.parsed_row
+                            if indexed_line.parsed_row is not None
+                            else json.loads(indexed_line.payload.decode("utf-8"))
+                        )
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ControllerError(
+                            "compact routing result row is invalid JSON at "
+                            f"line {indexed_line.locator.line_number}"
+                        ) from exc
+                    if not isinstance(row, dict) or row.get("group") != "G1":
+                        raise ControllerError(
+                            "routing result row "
+                            f"{indexed_line.locator.line_number} is not G1"
+                        )
+                    task_id = str(row.get("task_id") or "")
+                    if task_id not in expected_task_ids or task_id in result_task_ids:
+                        raise ControllerError(
+                            "routing result has invalid/duplicate task "
+                            f"{task_id!r}"
+                        )
+                    result_task_ids.add(task_id)
+                    locators.append(
+                        indexed_line.locator.bind(
+                            group="G1",
+                            task_id=task_id,
+                        )
+                    )
+            if result_task_ids != expected_task_ids:
+                raise ControllerError("routing result task coverage differs")
+            source_index.seal()
+            source_evidence = source_index.source_artifact_evidence(source_index=0)
+            compact = source_evidence.get("compact_authenticated") is True
+            artifact_path_snapshots: dict[str, tuple[int, ...]] = {}
+            durable_verification = verify_durable_draco_artifacts(
+                results_path=results_path,
+                trace_path=trace_path,
+                checkpoint_path=checkpoint_path,
+                path_snapshot_out=artifact_path_snapshots,
+            )
+            result_snapshot = source_evidence.get("result_snapshot")
+            if (
+                not isinstance(result_snapshot, Mapping)
+                or tuple(result_snapshot.get("signature") or ())
+                != artifact_path_snapshots.get("results_jsonl")
+                or result_snapshot.get("sha256")
+                != durable_verification.get("results_sha256")
+            ):
+                raise ControllerError(
+                    "durable verification differs from its bound result source"
+                )
+            manifest_payload, manifest_signature, manifest_sha256 = (
+                _read_terminal_file_snapshot(
+                    terminal_manifest_path,
+                    label="routing terminal manifest",
+                    max_bytes=_MAX_TERMINAL_MANIFEST_BYTES,
+                )
+            )
+            try:
+                manifest = json.loads(manifest_payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ControllerError("routing terminal manifest is invalid JSON") from exc
+            manifest_args = manifest.get("args") if isinstance(manifest, Mapping) else None
+            expected_durable_capability = durable_artifact_capability_contract()
+            compatibility = (
+                manifest.get("run_compatibility")
+                if isinstance(manifest, Mapping)
+                else None
+            )
+            contracts = (
+                compatibility.get("contracts")
+                if isinstance(compatibility, Mapping)
+                else None
+            )
+            g1_contract = (
+                contracts.get("G1") if isinstance(contracts, Mapping) else None
+            )
+            if (
+                not isinstance(manifest, Mapping)
+                or manifest.get("schema") != DRACO_RUN_MANIFEST_SCHEMA_V2
+                or manifest.get("stamp") != stamp
+                or manifest.get("status") != "complete"
+                or manifest.get("groups") != ["G1"]
+                or (
+                    manifest.get("dry_run") is not True
+                    and (
+                        not isinstance(manifest_args, Mapping)
+                        or manifest_args.get("dry_run") is not True
+                    )
+                )
+                or manifest.get("durable_artifact_capability")
+                != expected_durable_capability
+                or not isinstance(g1_contract, Mapping)
+                or g1_contract.get("durable_artifact_capability")
+                != expected_durable_capability
+            ):
+                raise ControllerError(
+                    "routing terminal manifest is not a complete dry-run v2 artifact"
+                )
+            artifacts = manifest.get("artifacts")
+            if not isinstance(artifacts, Mapping):
+                raise ControllerError("routing terminal manifest lacks artifact paths")
+            if not compact and (
+                SELECTION_PLAN_EVIDENCE_ROW_FIELD in manifest
+                or SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD in manifest
+                or SELECTION_PLAN_PACK_ARTIFACT_FIELD in artifacts
+            ):
+                raise ControllerError(
+                    "legacy routing source has undeclared compact manifest evidence"
+                )
+            for key, expected_path in (
+                ("results_jsonl", results_path),
+                ("trace_jsonl", trace_path),
+                ("checkpoint_json", checkpoint_path),
+                ("manifest_json", terminal_manifest_path),
+            ):
+                raw_path = artifacts.get(key)
                 if (
-                    not isinstance(analyzer, Mapping)
-                    or analyzer.get("source") != "frozen_replay"
-                    or analyzer.get("usage") != {}
-                    or not isinstance(replay, Mapping)
-                    or replay.get("physical_request_count") != 0
+                    not isinstance(raw_path, str)
+                    or not Path(raw_path).is_absolute()
+                    or Path(os.path.abspath(raw_path)) != expected_path
                 ):
                     raise ControllerError(
-                        f"dry trace task {task_id} did not materialize zero-call replay"
+                        f"routing terminal manifest artifact {key} is not stamp-bound"
                     )
-            plans[task_id] = copy.deepcopy(dict(selection))
+
+            compact_artifact_evidence = source_evidence.get(
+                "compact_artifact_evidence"
+            )
+            if compact:
+                if not isinstance(compact_artifact_evidence, Mapping):
+                    raise ControllerError(
+                        "compact routing source lacks authenticated artifact evidence"
+                    )
+                bound_durable_hashes = compact_artifact_evidence.get(
+                    "durable_hashes"
+                )
+                bound_path_signatures = compact_artifact_evidence.get(
+                    "path_signatures"
+                )
+                bound_manifest_snapshot = compact_artifact_evidence.get(
+                    "manifest_snapshot"
+                )
+                observed_durable_hashes = {
+                    key: durable_verification.get(key)
+                    for key in (
+                        "results_sha256",
+                        "trace_sha256",
+                        "checkpoint_sha256",
+                    )
+                }
+                if (
+                    bound_durable_hashes != observed_durable_hashes
+                    or bound_path_signatures != artifact_path_snapshots
+                    or not isinstance(bound_manifest_snapshot, Mapping)
+                    or tuple(bound_manifest_snapshot.get("signature") or ())
+                    != manifest_signature
+                    or bound_manifest_snapshot.get("sha256") != manifest_sha256
+                ):
+                    raise ControllerError(
+                        "compact routing artifact evidence differs from its bound source"
+                    )
+            elif compact_artifact_evidence is not None:
+                raise ControllerError(
+                    "legacy routing source published compact artifact evidence"
+                )
+
+            if compact:
+                for locator in locators:
+                    row = source_index.consume_row(locator)
+                    task_id = locator.task_id
+                    routing = row.get("routing_trace")
+                    if not isinstance(routing, Mapping):
+                        raise ControllerError(
+                            f"routing trace task {task_id} lacks routing evidence"
+                        )
+                    if require_dry_replay and routing.get("dry_run") is not True:
+                        raise ControllerError(
+                            f"routing trace task {task_id} is not a dry run"
+                        )
+                    selection = routing.get("selection_plan")
+                    if not isinstance(selection, Mapping):
+                        raise ControllerError(
+                            f"routing trace task {task_id} lacks selection plan"
+                        )
+                    materialized = copy.deepcopy(dict(selection))
+                    if selection_plan_reference_signal(
+                        materialized
+                    ) or selection_plan_row_capability_signal(materialized):
+                        raise ControllerError(
+                            f"routing trace task {task_id} retained compact evidence"
+                        )
+                    _validate_replay_selection_plan(
+                        task_id,
+                        materialized,
+                        require_dry_replay=require_dry_replay,
+                    )
+                    plans[task_id] = materialized
+            else:
+                trace_payload, trace_signature, trace_sha256 = (
+                    _read_terminal_file_snapshot(
+                        trace_path,
+                        label="routing trace",
+                    )
+                )
+                if (
+                    trace_signature != artifact_path_snapshots.get("trace_jsonl")
+                    or trace_sha256 != durable_verification.get("trace_sha256")
+                ):
+                    raise ControllerError(
+                        "routing trace snapshot differs from durable verification"
+                    )
+                plans = _inline_source_selection_plans(
+                    trace_path,
+                    expected_task_ids=expected_task_ids,
+                    require_dry_replay=require_dry_replay,
+                    trace_payload=trace_payload,
+                )
+            verify_durable_artifact_path_snapshots(
+                artifact_path_snapshots,
+                results_path=results_path,
+                trace_path=trace_path,
+                checkpoint_path=checkpoint_path,
+            )
+            _verify_terminal_file_snapshot(
+                terminal_manifest_path,
+                label="routing terminal manifest",
+                expected_signature=manifest_signature,
+                expected_sha256=manifest_sha256,
+            )
+            authenticated_evidence = {
+                "trace_raw_sha256": str(
+                    (
+                        compact_artifact_evidence["durable_hashes"]
+                        if compact
+                        else durable_verification
+                    )["trace_sha256"]
+                ),
+                "manifest_raw_sha256": str(
+                    compact_artifact_evidence["manifest_snapshot"]["sha256"]
+                    if compact
+                    else manifest_sha256
+                ),
+            }
+    except (DracoArtifactDurabilityError, DracoResumeSourceError) as exc:
+        raise ControllerError("routing trace evidence binding failed") from exc
     if set(plans) != expected_task_ids:
         raise ControllerError("routing trace task coverage differs")
+    if authenticated_evidence is None:
+        raise ControllerError("routing artifact evidence was not authenticated")
+    if artifact_evidence_out is not None:
+        artifact_evidence_out.update(authenticated_evidence)
     return plans
+
+
+def _source_selection_plans(
+    trace_path: Path,
+    *,
+    expected_task_ids: set[str],
+    require_dry_replay: bool,
+    terminal_manifest_path: Path | None = None,
+    artifact_evidence_out: dict[str, str] | None = None,
+) -> dict[str, Mapping[str, Any]]:
+    if terminal_manifest_path is not None:
+        return _standard_terminal_source_selection_plans(
+            trace_path,
+            terminal_manifest_path=terminal_manifest_path,
+            expected_task_ids=expected_task_ids,
+            require_dry_replay=require_dry_replay,
+            artifact_evidence_out=artifact_evidence_out,
+        )
+    if artifact_evidence_out is not None:
+        raise ControllerError(
+            "routing artifact evidence requires a terminal manifest"
+        )
+    return _inline_source_selection_plans(
+        trace_path,
+        expected_task_ids=expected_task_ids,
+        require_dry_replay=require_dry_replay,
+    )
 
 
 def _dry_run_output_artifacts(directory: Path) -> tuple[Path, Path]:
@@ -3000,14 +3466,16 @@ def _dry_run_output_artifacts(directory: Path) -> tuple[Path, Path]:
     manifests = sorted(directory.glob("draco_run_*.manifest.json"))
     if len(traces) != 1 or len(manifests) != 1:
         raise ControllerError("offline dry run did not publish one trace and manifest")
-    require_regular_file(traces[0])
-    require_regular_file(manifests[0])
-    manifest = load_json(manifests[0])
-    if manifest.get("status") != "complete" or manifest.get("dry_run") is not True:
-        # Older manifests carry dry_run only under run_compatibility. The
-        # trace-level proof remains mandatory; accept status complete here.
-        if manifest.get("status") != "complete":
-            raise ControllerError("offline dry run manifest is not complete")
+    trace_match = _STANDARD_DRACO_TRACE_NAME_RE.fullmatch(traces[0].name)
+    manifest_match = _STANDARD_DRACO_MANIFEST_NAME_RE.fullmatch(manifests[0].name)
+    if (
+        trace_match is None
+        or manifest_match is None
+        or trace_match.group("stamp") != manifest_match.group("stamp")
+    ):
+        raise ControllerError(
+            "offline dry run artifacts are not one standard stamped pair"
+        )
     return traces[0], manifests[0]
 
 
@@ -3089,10 +3557,13 @@ def run_main_dry_replay(
             f"offline main-runner dry replay failed ({completed.returncode}): {detail}"
         )
     trace_path, manifest_path = _dry_run_output_artifacts(output_dir)
+    artifact_evidence: dict[str, str] = {}
     plans = _source_selection_plans(
         trace_path,
         expected_task_ids=expected_task_ids,
         require_dry_replay=True,
+        terminal_manifest_path=manifest_path,
+        artifact_evidence_out=artifact_evidence,
     )
     evidence = {
         "status": "complete",
@@ -3100,9 +3571,9 @@ def run_main_dry_replay(
         "output_dir": str(output_dir),
         "overlay_sha256": overlay_sha,
         "trace_path": str(trace_path),
-        "trace_raw_sha256": file_sha256(trace_path),
+        "trace_raw_sha256": artifact_evidence["trace_raw_sha256"],
         "manifest_path": str(manifest_path),
-        "manifest_raw_sha256": file_sha256(manifest_path),
+        "manifest_raw_sha256": artifact_evidence["manifest_raw_sha256"],
         "command_projection_sha256": canonical_sha256(
             [item for item in command if not item.startswith("sk-or-v1-")]
         ),

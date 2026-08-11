@@ -193,6 +193,124 @@ def test_completed_source_reports_authenticated_compact_state_without_io(
         legacy_index.seal()
 
 
+def test_sealed_source_artifact_evidence_is_bounded_detached_and_no_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_dir = tmp_path / "compact-evidence"
+    compact_dir.mkdir()
+    result_path, manifest_path, _rows = _write_compact_source_bundle(
+        compact_dir,
+        [],
+    )
+    trace_path = compact_dir / "draco_run_20260811-120000.trace.jsonl"
+    checkpoint_path = compact_dir / "draco_run_20260811-120000.checkpoint.json"
+    index = ResumeSourceIndex([result_path], force_spool=False)
+    assert list(index.iter_source(result_path, source_index=0)) == []
+    with pytest.raises(DracoResumeSourceError, match="must be sealed"):
+        index.source_artifact_evidence(source_index=0)
+    index.seal()
+
+    with monkeypatch.context() as isolated:
+        isolated.setattr(
+            resume_source_index,
+            "_hash_fd",
+            lambda *_args, **_kwargs: pytest.fail("artifact evidence performed I/O"),
+        )
+        isolated.setattr(
+            SelectionPlanPackReader,
+            "verify_snapshot",
+            lambda *_args, **_kwargs: pytest.fail("artifact evidence rescanned pack"),
+        )
+        evidence = index.source_artifact_evidence(source_index=0)
+
+    def signature(path: Path) -> tuple[int, ...]:
+        info = path.stat()
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    def sha256(path: Path) -> str:
+        return resume_source_index._sha256(path.read_bytes())
+
+    assert evidence == {
+        "schema": "opensquilla.draco-resume-source-artifact-evidence/v1",
+        "source_index": 0,
+        "result_snapshot": {
+            "signature": signature(result_path),
+            "sha256": sha256(result_path),
+        },
+        "compact_authenticated": True,
+        "compact_artifact_evidence": {
+            "durable_hashes": {
+                "results_sha256": sha256(result_path),
+                "trace_sha256": sha256(trace_path),
+                "checkpoint_sha256": sha256(checkpoint_path),
+            },
+            "path_signatures": {
+                "results_jsonl": signature(result_path),
+                "trace_jsonl": signature(trace_path),
+                "checkpoint_json": signature(checkpoint_path),
+            },
+            "manifest_snapshot": {
+                "signature": signature(manifest_path),
+                "sha256": sha256(manifest_path),
+            },
+        },
+    }
+    evidence["result_snapshot"]["sha256"] = "mutated"
+    evidence["compact_artifact_evidence"]["durable_hashes"][
+        "trace_sha256"
+    ] = "mutated"
+    fresh = index.source_artifact_evidence(source_index=0)
+    assert fresh["result_snapshot"]["sha256"] == sha256(result_path)
+    assert (
+        fresh["compact_artifact_evidence"]["durable_hashes"]["trace_sha256"]
+        == sha256(trace_path)
+    )
+    index.close()
+    with pytest.raises(DracoResumeSourceError, match="closed"):
+        index.source_artifact_evidence(source_index=0)
+
+
+def test_legacy_source_artifact_evidence_and_invalid_lookup_gates(
+    tmp_path: Path,
+) -> None:
+    active_path = tmp_path / "active.jsonl"
+    _write_rows(active_path, [_sealed_row("active")])
+    active_index = ResumeSourceIndex([active_path], force_spool=False)
+    active_rows = active_index.iter_source(active_path, source_index=0)
+    next(active_rows)
+    with pytest.raises(DracoResumeSourceError, match="during a source scan"):
+        active_index.source_artifact_evidence(source_index=0)
+    active_rows.close()
+    active_index.close(verify=False)
+
+    legacy_path = tmp_path / "legacy.jsonl"
+    legacy_path.write_text("", encoding="utf-8")
+    index = ResumeSourceIndex([legacy_path], force_spool=False)
+    rows = index.iter_source(legacy_path, source_index=4)
+    with pytest.raises(DracoResumeSourceError):
+        index.source_artifact_evidence(source_index=4)
+    assert list(rows) == []
+    index.seal()
+    evidence = index.source_artifact_evidence(source_index=4)
+    assert evidence["source_index"] == 4
+    assert evidence["compact_authenticated"] is False
+    assert evidence["compact_artifact_evidence"] is None
+    assert evidence["result_snapshot"]["sha256"] == resume_source_index._sha256(b"")
+    with pytest.raises(DracoResumeSourceError, match="non-negative"):
+        index.source_artifact_evidence(source_index=True)
+    with pytest.raises(DracoResumeSourceError, match="no completed source 0"):
+        index.source_artifact_evidence(source_index=0)
+    index.close()
+
+
 def test_lazy_selection_plan_row_view_resolves_once_and_never_leaks_ref(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
