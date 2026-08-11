@@ -1,11 +1,15 @@
 # Ensemble execution metrics dashboard 与 SLO 契约（v1）
 
-状态：建议契约，面向 vendor-neutral 日志、指标与告警后端。
+状态：v1 producer 已实现；有默认关闭的本地结构化 JSONL transport；dashboard
+与 SLO 仍是建议契约，仓库尚无 collector、指标后端、datasource、ruler 或
+dashboard provisioning。
 
 证据基线：`69cb3088` 中的 `src/opensquilla/observability/ensemble_execution_metrics.py` 及 `tests/test_observability/test_ensemble_execution_metrics.py`。
 
 事件名：`llm_ensemble.execution.metrics`。
 Schema：`opensquilla.ensemble-execution-metrics/v1`。
+
+JSONL transport schema：`opensquilla.ensemble-execution-metrics-jsonl/v1`。
 
 ## 1. 范围与边界
 
@@ -14,6 +18,48 @@ Schema：`opensquilla.ensemble-execution-metrics/v1`。
 因此，本文的比率只描述“成功进入指标后端的 v1 events”，不是全部 ensemble 调用的绝对可用性。当前没有独立 invocation counter 或 delivery acknowledgement，无法量化 metrics event 丢失率。
 
 主要解决：先固定可被现有证据支持的观测边界，避免把日志缺失误判为业务成功。
+
+### 1.1 可选本地 JSONL transport
+
+POSIX gateway 可以显式设置
+`OPENSQUILLA_ENSEMBLE_METRICS_JSONL=1`，将 projector 已生成的同一份固定
+scalar metrics 写入本地 JSONL。默认目录是
+`$OPENSQUILLA_LOG_DIR/ensemble-metrics/`；没有设置共享日志目录时使用
+`$OPENSQUILLA_STATE_DIR/logs/ensemble-metrics/`。也可以用
+`OPENSQUILLA_ENSEMBLE_METRICS_JSONL_DIR` 指定绝对目录。目标的父目录必须由
+当前 uid 所有且不可被 group/world 写入；专用目录固定 `0700`，data、backup
+和 lock files 固定 `0600`。路径按组件拒绝 symlink，regular-file fd、路径
+identity、owner、mode 和 hard-link count 会在锁内复验。
+
+每行是扁平 JSON，包含 `transport_schema`、固定 `event`、UTC
+`emitted_at` value 和本页字段字典允许的 metrics。`emitted_at` 只用于采集时间，
+不得转成 label。sink 再次执行固定字段 allowlist、类型、枚举和数值上界校验；
+它只接收 projector result，不读取原始 trace。未知字段、嵌套 object/list、
+NaN/Inf、identity/hash、原始 selection plan/candidates/final request 都使该 sink
+fail closed，但不影响普通 structlog event 或模型 turn。
+
+单行硬上限为 65,536 bytes。data file 在 5,000,000 bytes 前轮转，最多保留
+3 个 backup，即正常稳态最多约 20 MB 加一行；同进程由 thread lock 串行，
+跨进程以专用 owner-only lock fd 和 `flock` 包住 size check、rename rotation 与
+单次 `os.write`。多线程进程 `fork` 时，child 不获取可能由消失线程持有的锁；
+它按 inode identity 直接关闭继承的 directory、lock 和 active data fd，下一次
+写入再 lazy reopen，避免已轮转或删除的 data inode 被 child 长期占用。它是
+best-effort transport，不 `fsync`、不重试，也没有 delivery acknowledgement；
+轮转后的本地文件不能证明 metrics delivery coverage。
+
+这项 transport **不是 dashboard backend**：仓库仍没有 collector、
+Prometheus/OpenTelemetry exporter、Loki/时序数据库、Grafana datasource、
+alert ruler、通知目标或可加载 dashboard。因此不能把 JSONL 文件本身称为
+“已部署 dashboard/SLO”，也不能新增孤立 dashboard JSON/rules YAML。后续选择
+并接入真实 backend 时，collector 只能消费通过 `transport_schema`、`event` 和
+`schema` 三重过滤且通过同一 allowlist 的 rows。
+
+snapshot build/filter/score latency、snapshot cache hit、metrics delivery
+coverage 与 canary automatic rollback 仍保持 unavailable；本 transport 不增加
+任何这些 producer evidence，也不得为它们建立 query 或 alert。
+
+主要解决：为后续真实采集器提供可解析、低基数、空间有界的本地交接面，同时
+明确它没有越级完成 dashboard、告警或缺失 producer 的观测能力。
 
 ## 2. 证据语义
 

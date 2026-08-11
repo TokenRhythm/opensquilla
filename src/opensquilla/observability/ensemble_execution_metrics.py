@@ -15,9 +15,15 @@ from typing import Any
 
 import structlog
 
+from opensquilla.observability.ensemble_execution_metrics_contract import (
+    ENSEMBLE_EXECUTION_METRICS_SCHEMA,
+)
+from opensquilla.observability.ensemble_execution_metrics_jsonl import (
+    write_ensemble_execution_metrics_jsonl,
+)
+
 log = structlog.get_logger(__name__)
 
-ENSEMBLE_EXECUTION_METRICS_SCHEMA = "opensquilla.ensemble-execution-metrics/v1"
 TRACE_SIZE_CAP_BYTES = 262_144
 TRACE_SIZE_VISIT_CAP = 16_384
 _MAX_CANDIDATE_ROWS = 64
@@ -1901,21 +1907,38 @@ def log_ensemble_execution_metrics(
             trace,
             terminal_outcome=terminal_outcome,
         )
+    except Exception:  # noqa: BLE001 - projection must fail open
+        _warn_ensemble_execution_metrics_failed(terminal_outcome)
+        return
+
+    # The ordinary diagnostic log and the opt-in structured transport are
+    # independent fail-open destinations.  A broken structlog processor must
+    # not suppress a valid JSONL row, and a filesystem failure must not erase
+    # the existing diagnostic event or affect the model turn.
+    try:
         log.info("llm_ensemble.execution.metrics", **metrics)
-    except Exception:  # noqa: BLE001 - observability must fail open
-        try:
-            log.warning(
-                "llm_ensemble.execution.metrics_failed",
-                schema=ENSEMBLE_EXECUTION_METRICS_SCHEMA,
-                terminal_outcome=(
-                    terminal_outcome
-                    if terminal_outcome in _TERMINAL_OUTCOMES
-                    else "invalid"
-                ),
-                exc_info=True,
-            )
-        except Exception:  # noqa: BLE001 - broken processors also fail open
-            pass
+    except Exception:  # noqa: BLE001 - diagnostic logging must fail open
+        _warn_ensemble_execution_metrics_failed(terminal_outcome)
+    try:
+        write_ensemble_execution_metrics_jsonl(metrics)
+    except Exception:  # noqa: BLE001 - retain a final integration guard
+        pass
+
+
+def _warn_ensemble_execution_metrics_failed(terminal_outcome: str) -> None:
+    try:
+        log.warning(
+            "llm_ensemble.execution.metrics_failed",
+            schema=ENSEMBLE_EXECUTION_METRICS_SCHEMA,
+            terminal_outcome=(
+                terminal_outcome
+                if terminal_outcome in _TERMINAL_OUTCOMES
+                else "invalid"
+            ),
+            exc_info=True,
+        )
+    except Exception:  # noqa: BLE001 - broken processors also fail open
+        pass
 
 
 def log_ensemble_execution_metrics_once(
