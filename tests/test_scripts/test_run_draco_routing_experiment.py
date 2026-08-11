@@ -6,8 +6,11 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import os
 import random
+import subprocess
 import sys
+import tracemalloc
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path
@@ -11787,6 +11790,10 @@ async def test_resume_metadata_only_repairs_once_without_generation_or_judge(
     status = await resume_runner.amain(args)
 
     assert status == 0
+    resume_states = args._resume_group_task_states
+    assert resume_states.source_index.materialized_row_count == 1
+    assert resume_states.source_index.closed
+    assert ("B0", "task-a") not in resume_states
     assert call_counts == {"generation": 0, "judge": 0, "metadata": 1}
     result_paths = list(output_dir.glob("draco_ensemble_*.jsonl"))
     assert len(result_paths) == 1
@@ -11811,6 +11818,379 @@ async def test_resume_metadata_only_repairs_once_without_generation_or_judge(
     assert preflight["status"] == "skipped_not_required"
     assert preflight["preflight_calls"] == {"web_search": 0, "web_fetch": 0}
     assert manifest["resume_selection"]["model_regenerate_pair_count"] == 0
+
+
+def _bound_resume_states_for_amain(source_path: Path):
+    source_path.write_text(
+        json.dumps(
+            resume_runner.seal_result_row(
+                {"group": "B1", "task_id": "task-1", "final_text": "accepted"}
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    source_index = resume_runner.ResumeSourceIndex([source_path])
+    indexed_lines = list(source_index.iter_source(source_path, source_index=0))
+    locator = indexed_lines[0].locator.bind(group="B1", task_id="task-1")
+    source_index.seal()
+    states = resume_runner.ResumeGroupTaskStates(
+        {
+            ("B1", "task-1"): {
+                resume_runner.ResumeGroupTaskStates._LOCATOR_KEY: locator,
+            }
+        },
+        source_index=source_index,
+    )
+    bound_fd = source_index._sources[0].fd
+    return states, source_index, locator, bound_fd
+
+
+def _tamper_bound_resume_source(path: Path, *, offset: int) -> None:
+    tamper_fd = os.open(path, os.O_RDWR)
+    try:
+        os.pwrite(tamper_fd, b"Z", offset + 1)
+        os.fsync(tamper_fd)
+    finally:
+        os.close(tamper_fd)
+
+
+@pytest.mark.asyncio
+async def test_resume_amain_cancellation_closes_bound_source_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "prior.jsonl"
+    states, source_index, locator, bound_fd = (
+        _bound_resume_states_for_amain(source_path)
+    )
+    args = SimpleNamespace(_resume_group_task_states=states)
+    started = asyncio.Event()
+
+    async def blocked_amain(_args, *, run_lock_holder):
+        del run_lock_holder
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(resume_runner, "_amain_with_run_lock", blocked_amain)
+    task = asyncio.create_task(resume_runner.amain(args))
+    await started.wait()
+    _tamper_bound_resume_source(source_path, offset=locator.offset)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert source_index.closed
+    assert source_index.materialized_row_count == 0
+    assert bound_fd is not None
+    with pytest.raises(OSError):
+        os.fstat(bound_fd)
+
+
+@pytest.mark.asyncio
+async def test_resume_amain_business_error_survives_source_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BusinessError(RuntimeError):
+        pass
+
+    source_path = tmp_path / "prior.jsonl"
+    states, source_index, locator, bound_fd = (
+        _bound_resume_states_for_amain(source_path)
+    )
+    args = SimpleNamespace(_resume_group_task_states=states)
+
+    async def failing_amain(_args, *, run_lock_holder):
+        del run_lock_holder
+        _tamper_bound_resume_source(source_path, offset=locator.offset)
+        raise BusinessError("primary business failure")
+
+    monkeypatch.setattr(resume_runner, "_amain_with_run_lock", failing_amain)
+    with pytest.raises(BusinessError, match="primary business failure"):
+        await resume_runner.amain(args)
+
+    assert source_index.closed
+    assert bound_fd is not None
+    with pytest.raises(OSError):
+        os.fstat(bound_fd)
+
+
+@pytest.mark.asyncio
+async def test_resume_amain_normal_return_surfaces_source_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "prior.jsonl"
+    states, source_index, locator, bound_fd = (
+        _bound_resume_states_for_amain(source_path)
+    )
+    args = SimpleNamespace(_resume_group_task_states=states)
+
+    async def successful_amain(_args, *, run_lock_holder):
+        del run_lock_holder
+        _tamper_bound_resume_source(source_path, offset=locator.offset)
+        return 0
+
+    monkeypatch.setattr(
+        resume_runner,
+        "_amain_with_run_lock",
+        successful_amain,
+    )
+    with pytest.raises(ValueError, match="changed after indexing"):
+        await resume_runner.amain(args)
+
+    assert source_index.closed
+    assert bound_fd is not None
+    with pytest.raises(OSError):
+        os.fstat(bound_fd)
+
+
+@pytest.mark.skipif(
+    os.environ.get("OPENSQUILLA_RUN_RESUME_SCALE_TESTS") != "1",
+    reason="set OPENSQUILLA_RUN_RESUME_SCALE_TESTS=1 for the 101 MiB gate",
+)
+def test_resume_large_complete_history_keeps_rows_lazy_until_pending_repair(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "large-prior.jsonl"
+    padding = "x" * (1024 * 1024)
+    selected_keys: set[tuple[str, str]] = set()
+    prompt_hashes: dict[str, str] = {}
+    task_input_hashes: dict[str, str] = {}
+    with source_path.open("w", encoding="utf-8") as handle:
+        for index in range(101):
+            task_id = f"task-{index}"
+            selected_keys.add(("B1", task_id))
+            prompt_hashes[task_id] = "sha256:prompt"
+            task_input_hashes[task_id] = f"sha256:task-{index}"
+            row = {
+                "group": "B1",
+                "provider_spec": dict(resume_runner.GROUP_SPECS["B1"]),
+                "routing_trace": {
+                    "applied_model": "model-a",
+                    "fallback_model": "model-a",
+                },
+                "task_id": task_id,
+                "prompt_sha256": "sha256:prompt",
+                "task_input_sha256": f"sha256:task-{index}",
+                "run_compatibility_fingerprint": "sha256:run-contract",
+                "error": None,
+                "final_text": "accepted answer",
+                "llm_request_count": 1,
+                "generation_attempt_budget_used": 1,
+                "usage": {
+                    "provider": "openrouter",
+                    "model": "model-a",
+                    "requested_provider": "openrouter",
+                    "requested_model": "model-a",
+                    "input_tokens": 3,
+                    "output_tokens": 1,
+                    "billed_cost": 0.01,
+                    "cost_source": "provider_billed",
+                    "provider_usage": _openrouter_exact_evidence(
+                        0.01,
+                        f"large-history-{index}",
+                    ),
+                },
+                "quality_total": 80.0,
+                "padding": padding,
+            }
+            if index < 100:
+                row["judge"] = _complete_legacy_judge(
+                    f"large-history-judge-{index}"
+                )
+            handle.write(json.dumps(resume_runner.seal_result_row(row)))
+            handle.write("\n")
+    del padding
+
+    tracemalloc.start()
+    states, audit = resume_runner.load_resume_group_task_states(
+        resume_paths=[source_path],
+        selected_keys=selected_keys,
+        prompt_hashes=prompt_hashes,
+        task_input_hashes=task_input_hashes,
+        run_compatibility_fingerprints={"B1": "sha256:run-contract"},
+    )
+    _, classification_peak = tracemalloc.get_traced_memory()
+
+    assert audit["resume_action_counts"]["complete"] == 100
+    assert audit["resume_action_counts"]["judge_only"] == 1
+    assert all("row" not in state for state in states.values())
+    assert states.source_index.materialized_row_count == 0
+    assert classification_peak < 32 * 1024 * 1024
+
+    pending = states.consume_row(("B1", "task-100"))
+    _, consume_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert pending["task_id"] == "task-100"
+    assert states.source_index.materialized_row_count == 1
+    assert consume_peak < 40 * 1024 * 1024
+    states.close()
+
+
+def _write_resume_rss_history(
+    source_path: Path,
+    *,
+    complete_count: int,
+) -> None:
+    padding = "x" * (1024 * 1024)
+    with source_path.open("w", encoding="utf-8") as handle:
+        for index in range(complete_count + 1):
+            row = {
+                "group": "B1",
+                "provider_spec": dict(resume_runner.GROUP_SPECS["B1"]),
+                "routing_trace": {
+                    "applied_model": "model-a",
+                    "fallback_model": "model-a",
+                },
+                "task_id": f"task-{index}",
+                "prompt_sha256": "sha256:prompt",
+                "task_input_sha256": f"sha256:task-{index}",
+                "run_compatibility_fingerprint": "sha256:run-contract",
+                "error": None,
+                "final_text": "accepted answer",
+                "llm_request_count": 1,
+                "generation_attempt_budget_used": 1,
+                "usage": {
+                    "provider": "openrouter",
+                    "model": "model-a",
+                    "requested_provider": "openrouter",
+                    "requested_model": "model-a",
+                    "input_tokens": 3,
+                    "output_tokens": 1,
+                    "billed_cost": 0.01,
+                    "cost_source": "provider_billed",
+                    "provider_usage": _openrouter_exact_evidence(
+                        0.01,
+                        f"rss-history-{complete_count}-{index}",
+                    ),
+                },
+                "quality_total": 80.0,
+                "padding": padding,
+            }
+            if index < complete_count:
+                row["judge"] = _complete_legacy_judge(
+                    f"rss-history-judge-{complete_count}-{index}"
+                )
+            handle.write(json.dumps(resume_runner.seal_result_row(row)))
+            handle.write("\n")
+
+
+_RESUME_RSS_PROBE = r"""
+import gc
+import importlib.util
+import json
+import resource
+import sys
+from pathlib import Path
+
+script_path = Path(sys.argv[1])
+source_path = Path(sys.argv[2])
+complete_count = int(sys.argv[3])
+spec = importlib.util.spec_from_file_location("resume_rss_probe_runner", script_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError("cannot load resume runner")
+runner = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = runner
+spec.loader.exec_module(runner)
+
+selected_keys = {("B1", f"task-{index}") for index in range(complete_count + 1)}
+prompt_hashes = {f"task-{index}": "sha256:prompt" for index in range(complete_count + 1)}
+task_input_hashes = {
+    f"task-{index}": f"sha256:task-{index}"
+    for index in range(complete_count + 1)
+}
+
+def rss_mib():
+    # Linux reports ru_maxrss in KiB.  This probe is intentionally Linux-only.
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+gc.collect()
+baseline = rss_mib()
+states, audit = runner.load_resume_group_task_states(
+    resume_paths=[source_path],
+    selected_keys=selected_keys,
+    prompt_hashes=prompt_hashes,
+    task_input_hashes=task_input_hashes,
+    run_compatibility_fingerprints={"B1": "sha256:run-contract"},
+)
+gc.collect()
+loaded = rss_mib()
+before_materialized = states.source_index.materialized_row_count
+all_compact = all("row" not in state for state in states.values())
+pending = states.consume_row(("B1", f"task-{complete_count}"))
+gc.collect()
+consumed = rss_mib()
+after_materialized = states.source_index.materialized_row_count
+states.close()
+print(json.dumps({
+    "baseline_mib": baseline,
+    "loaded_mib": loaded,
+    "consumed_mib": consumed,
+    "complete": audit["resume_action_counts"]["complete"],
+    "judge_only": audit["resume_action_counts"]["judge_only"],
+    "all_compact": all_compact,
+    "before_materialized": before_materialized,
+    "after_materialized": after_materialized,
+    "pending_task_id": pending["task_id"],
+}, sort_keys=True))
+"""
+
+
+def _run_resume_rss_probe(
+    source_path: Path,
+    *,
+    complete_count: int,
+) -> dict[str, object]:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _RESUME_RSS_PROBE,
+            str(RESUME_SCRIPT_PATH),
+            str(source_path),
+            str(complete_count),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux"
+    or os.environ.get("OPENSQUILLA_RUN_RESUME_SCALE_TESTS") != "1",
+    reason="set OPENSQUILLA_RUN_RESUME_SCALE_TESTS=1 on Linux for RSS gate",
+)
+def test_resume_large_history_isolated_rss_is_size_bounded(
+    tmp_path: Path,
+) -> None:
+    small_path = tmp_path / "small-prior.jsonl"
+    large_path = tmp_path / "large-prior.jsonl"
+    _write_resume_rss_history(small_path, complete_count=10)
+    _write_resume_rss_history(large_path, complete_count=100)
+
+    small = _run_resume_rss_probe(small_path, complete_count=10)
+    large = _run_resume_rss_probe(large_path, complete_count=100)
+
+    for metrics, expected_complete in ((small, 10), (large, 100)):
+        assert metrics["complete"] == expected_complete
+        assert metrics["judge_only"] == 1
+        assert metrics["all_compact"] is True
+        assert metrics["before_materialized"] == 0
+        assert metrics["after_materialized"] == 1
+        assert metrics["pending_task_id"] == f"task-{expected_complete}"
+
+    small_load_growth = small["loaded_mib"] - small["baseline_mib"]
+    large_load_growth = large["loaded_mib"] - large["baseline_mib"]
+    small_consume_growth = small["consumed_mib"] - small["baseline_mib"]
+    large_consume_growth = large["consumed_mib"] - large["baseline_mib"]
+    assert large_load_growth < 48.0
+    assert large_consume_growth < 64.0
+    assert large_load_growth <= small_load_growth + 16.0
+    assert large_consume_growth <= small_consume_growth + 16.0
 
 
 def test_resume_classifies_generation_judge_and_metadata_independently() -> None:
@@ -12243,7 +12623,7 @@ def test_resume_prefers_cost_complete_duplicate_that_can_converge(
 
     state = states[("B1", "task-1")]
     assert state["action"] == "judge_only"
-    assert state["row"]["source_marker"] == "repairable"
+    assert states.peek_row(("B1", "task-1"))["source_marker"] == "repairable"
     assert audit["strict_invalid_attempt_count"] == 2
     assert set(audit["resume_action_counts"]) == {
         "regenerate",
@@ -12254,6 +12634,7 @@ def test_resume_prefers_cost_complete_duplicate_that_can_converge(
         "policy_violation",
     }
     assert audit["resume_action_counts"]["policy_violation"] == 0
+    states.close()
 
 
 @pytest.mark.parametrize("reverse_order", [False, True])
@@ -12330,7 +12711,10 @@ def test_resume_prefers_latest_generation_within_same_completion_rank(
 
     state = states[("B1", "task-1")]
     assert state["action"] == "complete"
-    assert state["row"]["source_marker"] == "newer"
+    assert "row" not in state
+    assert states.source_index.materialized_row_count == 0
+    assert states.peek_row(("B1", "task-1"))["source_marker"] == "newer"
+    states.close()
 
 
 def test_resume_generation_attempt_budget_is_cumulative() -> None:
@@ -14747,6 +15131,85 @@ def test_resume_strict_attempt_evidence_reconstructs_cumulative_budget(
 
 
 @pytest.mark.parametrize(
+    ("old_required", "new_best_required"),
+    [(True, False), (False, True)],
+)
+def test_resume_g1_lifecycle_requirement_follows_selected_best_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    old_required: bool,
+    new_best_required: bool,
+) -> None:
+    compatibility = _enabled_g1_frozen_lifecycle_contract()
+    fingerprint = "sha256:g1-run-contract"
+    paths: list[Path] = []
+    for wave, required in enumerate(
+        (old_required, new_best_required),
+        start=1,
+    ):
+        row = _strict_attempt_resume_row(
+            attempt_id=f"{wave:032x}",
+            cumulative_budget=wave,
+            generation_completed_at=float(wave),
+        )
+        row.update(
+            {
+                "group": "G1",
+                "provider_spec": dict(resume_runner.GROUP_SPECS["G1"]),
+                "run_compatibility_fingerprint": fingerprint,
+            }
+        )
+        attempt = row["execution"]["generation_attempts"][0]
+        if required:
+            attempt["selection_plan"] = {
+                "decision_id": f"decision-{wave}",
+            }
+        path = tmp_path / f"g1-wave-{wave}.jsonl"
+        path.write_text(
+            json.dumps(resume_runner.seal_result_row(row)) + "\n",
+            encoding="utf-8",
+        )
+        paths.append(path)
+
+    reconstruction_calls: list[list[str]] = []
+
+    def fake_reconstruct(*, attempts, current_run_compatibility_contract):
+        assert current_run_compatibility_contract is compatibility
+        reconstruction_calls.append(
+            [str(attempt["attempt_id"]) for attempt in attempts]
+        )
+        return {"schema": "test-frozen-lifecycle"}
+
+    monkeypatch.setattr(
+        resume_runner,
+        "reconstruct_g1_cross_wave_frozen_lifecycle",
+        fake_reconstruct,
+    )
+    states, _ = resume_runner.load_resume_group_task_states(
+        resume_paths=paths,
+        selected_keys={("G1", "task-1")},
+        prompt_hashes={"task-1": resume_runner.text_sha256("same prompt")},
+        task_input_hashes={"task-1": "sha256:task-input"},
+        run_compatibility_fingerprints={"G1": fingerprint},
+        run_compatibility_contracts={"G1": compatibility},
+    )
+
+    state = states[("G1", "task-1")]
+    assert state["source_index"] == 1
+    assert (
+        state["g1_cross_wave_lifecycle_required"]
+        is new_best_required
+    )
+    assert bool(reconstruction_calls) is new_best_required
+    assert (
+        "g1_frozen_resume_lifecycle" in state
+    ) is new_best_required
+    if new_best_required:
+        assert reconstruction_calls == [[f"{wave:032x}" for wave in (1, 2)]]
+    states.close()
+
+
+@pytest.mark.parametrize(
     ("terminal_kind", "expected_reason"),
     [
         (
@@ -15006,7 +15469,11 @@ def test_resume_strict_attempt_evidence_accepts_monotonic_repair(
     state = states[("B1", "task-1")]
     assert state["prior_generation_attempts_used"] == 1
     assert state["observed_unique_generation_attempt_count"] == 1
-    assert state["row"]["execution"]["generation_attempts"][0]["attempt_id"] == attempt_id
+    assert "row" not in state
+    assert states.source_index.attempt_payload_load_count == 1
+    selected_row = states.peek_row(("B1", "task-1"))
+    assert selected_row["execution"]["generation_attempts"][0]["attempt_id"] == attempt_id
+    states.close()
 
 
 def test_resume_strict_attempt_evidence_allows_cost_confidence_upgrade_only(
@@ -15083,13 +15550,13 @@ def test_resume_strict_attempt_evidence_allows_cost_confidence_upgrade_only(
         task_input_hashes={"task-1": "sha256:task-input"},
         run_compatibility_fingerprints={"B1": "sha256:run-contract"},
     )
-    retained_usage = states[("B1", "task-1")]["row"]["execution"]["generation_attempts"][0]["run"][
-        "usage"
-    ]
+    selected_row = states.peek_row(("B1", "task-1"))
+    retained_usage = selected_row["execution"]["generation_attempts"][0]["run"]["usage"]
     assert retained_usage["estimated_cost_usd"] == pytest.approx(0.002)
     assert retained_usage["cost_usd"] == pytest.approx(0.002)
     assert retained_usage["billed_cost"] == pytest.approx(0.0021)
     assert retained_usage["cost_source"] == "provider_billed"
+    states.close()
 
     conflicting_exact = json.loads(json.dumps(exact))
     conflicting_exact["generation_completed_at"] = 4.0
@@ -21956,9 +22423,13 @@ async def test_resume_amain_never_reruns_blocked_fixed_fallback_generation(
     )
     monkeypatch.setattr(resume_runner.GatewayConfig, "load", lambda _path: config)
 
+    class FakeResumeStates(dict):
+        def consume_row(self, key):
+            return deepcopy(self[key].pop("row"))
+
     def fake_resume_states(**kwargs):
         assert kwargs["selected_keys"] == {("G1", "task-1")}
-        return {("G1", "task-1"): state}, {"source_row_count": 1}
+        return FakeResumeStates({("G1", "task-1"): state}), {"source_row_count": 1}
 
     calls = {"preflight": 0, "provider": 0, "run_one": 0}
 

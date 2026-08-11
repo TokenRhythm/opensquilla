@@ -116,6 +116,11 @@ from opensquilla.eval.draco_result_summary import (
     result_failures_and_coverage,
     summarize_result_facts,
 )
+from opensquilla.eval.draco_resume_source_index import (
+    ResumeGroupTaskStates,
+    ResumeRowLocator,
+    ResumeSourceIndex,
+)
 from opensquilla.eval.draco_task_supervisor import DracoRollingTaskWindow
 from opensquilla.eval.draco_usage_evidence import (
     STABLE_RECEIPT_EVIDENCE_KEY,
@@ -7958,6 +7963,9 @@ def g1_cross_wave_lifecycle_requires_reconstruction(
         return False
     if state.get("generation_auto_retry_blocked") is True:
         return False
+    compact_requirement = state.get("g1_cross_wave_lifecycle_required")
+    if isinstance(compact_requirement, bool):
+        return compact_requirement
     row = state.get("row")
     execution = row.get("execution") if isinstance(row, Mapping) else None
     attempts = (
@@ -20186,8 +20194,9 @@ def strict_resume_row_invalid_reasons(
     ]
 
 
-def load_resume_group_task_states(
+def _load_resume_group_task_states_from_index(
     *,
+    source_rows: ResumeSourceIndex,
     resume_paths: list[Path],
     selected_keys: set[tuple[str, str]],
     prompt_hashes: dict[str, str],
@@ -20197,12 +20206,12 @@ def load_resume_group_task_states(
     require_openrouter_non_byok: bool = False,
     judge_required: bool = True,
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, Any]]:
-    best: dict[tuple[str, str], dict[str, Any]] = {}
+    best = ResumeGroupTaskStates({}, source_index=source_rows)
     declared_attempt_budget_used: dict[tuple[str, str], int] = {}
     attempt_evidence_modes: dict[tuple[str, str], str] = {}
-    strict_attempt_payloads: dict[
+    strict_attempt_locations: dict[
         tuple[str, str],
-        dict[str, dict[str, Any]],
+        dict[str, tuple[ResumeRowLocator, int]],
     ] = {}
     strict_attempt_owners: dict[str, tuple[str, str]] = {}
     legacy_generation_attempts: dict[
@@ -20243,20 +20252,7 @@ def load_resume_group_task_states(
     def _generation_completed_sort_key(
         candidate: Mapping[str, Any],
     ) -> tuple[int, float, int, int]:
-        row = candidate.get("row")
-        raw_timestamp: Any = None
-        if isinstance(row, Mapping):
-            raw_timestamp = row.get("generation_completed_at")
-            if not isinstance(raw_timestamp, int | float) or isinstance(
-                raw_timestamp,
-                bool,
-            ):
-                raw_timestamp = row.get("completed_at")
-            if not isinstance(raw_timestamp, int | float) or isinstance(
-                raw_timestamp,
-                bool,
-            ):
-                raw_timestamp = row.get("started_at")
+        raw_timestamp = candidate.get("_generation_completed_timestamp")
         timestamp = (
             float(raw_timestamp)
             if isinstance(raw_timestamp, int | float)
@@ -20269,6 +20265,26 @@ def load_resume_group_task_states(
             timestamp,
             coerce_metric_int(candidate.get("source_index")),
             coerce_metric_int(candidate.get("source_line")),
+        )
+
+    def _row_generation_completed_timestamp(row: Mapping[str, Any]) -> float:
+        raw_timestamp: Any = row.get("generation_completed_at")
+        if not isinstance(raw_timestamp, int | float) or isinstance(
+            raw_timestamp,
+            bool,
+        ):
+            raw_timestamp = row.get("completed_at")
+        if not isinstance(raw_timestamp, int | float) or isinstance(
+            raw_timestamp,
+            bool,
+        ):
+            raw_timestamp = row.get("started_at")
+        return (
+            float(raw_timestamp)
+            if isinstance(raw_timestamp, int | float)
+            and not isinstance(raw_timestamp, bool)
+            and math.isfinite(float(raw_timestamp))
+            else 0.0
         )
 
     def _selection_rank(
@@ -20478,6 +20494,7 @@ def load_resume_group_task_states(
         key: tuple[str, str],
         path: Path,
         line_number: int,
+        row_locator: ResumeRowLocator,
     ) -> tuple[int, int]:
         location = _attempt_evidence_location(path, line_number)
         schema = row.get("generation_attempt_evidence_schema")
@@ -20525,10 +20542,10 @@ def load_resume_group_task_states(
             raise ValueError(f"generation attempt budget declaration is invalid at {location}")
 
         seen_in_row: set[str] = set()
-        known_payloads = strict_attempt_payloads.setdefault(key, {})
+        known_locations = strict_attempt_locations.setdefault(key, {})
         prior_declared = declared_attempt_budget_used.get(key, 0)
         new_attempt_count = 0
-        for attempt in attempts:
+        for attempt_position, attempt in enumerate(attempts):
             if not isinstance(attempt, Mapping):
                 raise ValueError(f"generation attempt evidence row is invalid at {location}")
             attempt_id = attempt.get("attempt_id")
@@ -20597,8 +20614,8 @@ def load_resume_group_task_states(
                 raise ValueError(
                     f"paid provider-build attempt lacks physical request evidence at {location}"
                 )
-            prior_payload = known_payloads.get(attempt_id)
-            if prior_payload is None:
+            prior_location = known_locations.get(attempt_id)
+            if prior_location is None:
                 new_attempt_count += 1
                 expected_ordinal = prior_declared + new_attempt_count
                 if attempt_index != expected_ordinal:
@@ -20606,19 +20623,27 @@ def load_resume_group_task_states(
                         "generation attempt ordinal is not cumulative at "
                         f"{location}: observed={attempt_index}, "
                         f"expected={expected_ordinal}"
-                    )
-                strict_attempt_owners[attempt_id] = key
-                known_payloads[attempt_id] = copy.deepcopy(dict(attempt))
-            elif not _strict_attempt_payload_is_monotonic_enrichment(
-                prior_payload,
-                attempt,
-            ):
-                raise ValueError(
-                    f"generation attempt identity has conflicting evidence at "
-                    f"{location}: {attempt_id}"
                 )
+                strict_attempt_owners[attempt_id] = key
             else:
-                known_payloads[attempt_id] = copy.deepcopy(dict(attempt))
+                prior_locator, prior_position = prior_location
+                prior_payload = source_rows.load_attempt(
+                    prior_locator,
+                    attempt_index=prior_position,
+                    attempt_id=attempt_id,
+                )
+                try:
+                    if not _strict_attempt_payload_is_monotonic_enrichment(
+                        prior_payload,
+                        attempt,
+                    ):
+                        raise ValueError(
+                            "generation attempt identity has conflicting evidence at "
+                            f"{location}: {attempt_id}"
+                        )
+                finally:
+                    del prior_payload
+            known_locations[attempt_id] = (row_locator, attempt_position)
 
         prior_generation_used = (
             execution.get("prior_generation_attempts_used")
@@ -20661,12 +20686,20 @@ def load_resume_group_task_states(
         path = Path(resume_path)
         if not path.is_file():
             raise ValueError(f"resume JSONL does not exist: {path}")
-        with path.open("r", encoding="utf-8") as resume_fh:
-            for line_number, line in enumerate(resume_fh, start=1):
-                if not line.strip():
+        with source_rows.open_source(path, source_index=source_index) as resume_fh:
+            for indexed_line in resume_fh:
+                line_number = indexed_line.locator.line_number
+                line = indexed_line.payload
+                try:
+                    line_text = line.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        f"invalid resume JSONL at {path}:{line_number}: {exc}"
+                    ) from exc
+                if not line_text.strip():
                     continue
                 try:
-                    prior_row = json.loads(line)
+                    prior_row = json.loads(line_text)
                 except json.JSONDecodeError as exc:
                     raise ValueError(
                         f"invalid resume JSONL at {path}:{line_number}: {exc}"
@@ -20679,6 +20712,10 @@ def load_resume_group_task_states(
                 )
                 if key not in selected_keys:
                     continue
+                row_locator = indexed_line.locator.bind(
+                    group=key[0],
+                    task_id=key[1],
+                )
                 matching_attempts += 1
                 row_attempt_count = _row_generation_attempt_count(prior_row)
                 attempt_schema = prior_row.get("generation_attempt_evidence_schema")
@@ -20732,6 +20769,7 @@ def load_resume_group_task_states(
                         key=key,
                         path=path,
                         line_number=line_number,
+                        row_locator=row_locator,
                     )
                     prior_declared = declared_attempt_budget_used.get(key, 0)
                     expected_cumulative = prior_declared + new_attempt_count
@@ -20829,9 +20867,27 @@ def load_resume_group_task_states(
                     ),
                 ):
                     audit_reason_counts[reason] = audit_reason_counts.get(reason, 0) + 1
+                row_requires_g1_lifecycle = (
+                    g1_cross_wave_lifecycle_requires_reconstruction(
+                        group=key[0],
+                        prior_attempts_used=1,
+                        state={**state, "row": prior_row},
+                        current_run_compatibility_contract=(
+                            run_compatibility_contracts.get(key[0])
+                            if run_compatibility_contracts is not None
+                            else None
+                        ),
+                    )
+                )
                 candidate = {
                     **state,
-                    "row": prior_row,
+                    ResumeGroupTaskStates._LOCATOR_KEY: row_locator,
+                    "_generation_completed_timestamp": (
+                        _row_generation_completed_timestamp(prior_row)
+                    ),
+                    "g1_cross_wave_lifecycle_required": (
+                        row_requires_g1_lifecycle
+                    ),
                     "source_path": str(path),
                     "source_index": source_index,
                     "source_line": line_number,
@@ -20839,6 +20895,7 @@ def load_resume_group_task_states(
                 current = best.get(key)
                 if current is None or _selection_rank(candidate) > _selection_rank(current):
                     best[key] = candidate
+    source_rows.seal()
     for key, state in best.items():
         declared = declared_attempt_budget_used.get(key, 0)
         legacy = sum(legacy_generation_attempts.get(key, {}).values())
@@ -20854,7 +20911,7 @@ def load_resume_group_task_states(
             "legacy",
         )
         state["observed_unique_generation_attempt_count"] = (
-            len(strict_attempt_payloads.get(key, {}))
+            len(strict_attempt_locations.get(key, {}))
             if attempt_evidence_modes.get(key) == "strict_v1"
             else legacy
         )
@@ -20879,7 +20936,17 @@ def load_resume_group_task_states(
                 )
             state["g1_frozen_resume_lifecycle"] = (
                 reconstruct_g1_cross_wave_frozen_lifecycle(
-                    attempts=list(strict_attempt_payloads.get(key, {}).values()),
+                    attempts=[
+                        source_rows.load_attempt(
+                            attempt_locator,
+                            attempt_index=attempt_position,
+                            attempt_id=attempt_id,
+                        )
+                        for attempt_id, (
+                            attempt_locator,
+                            attempt_position,
+                        ) in strict_attempt_locations.get(key, {}).items()
+                    ],
                     current_run_compatibility_contract=current_contract,
                 )
             )
@@ -20899,6 +20966,37 @@ def load_resume_group_task_states(
         "strict_invalid_reason_counts": dict(sorted(invalid_reason_counts.items())),
         "audit_reason_counts": dict(sorted(audit_reason_counts.items())),
     }
+
+
+def load_resume_group_task_states(
+    *,
+    resume_paths: list[Path],
+    selected_keys: set[tuple[str, str]],
+    prompt_hashes: dict[str, str],
+    task_input_hashes: dict[str, str],
+    run_compatibility_fingerprints: dict[str, str],
+    run_compatibility_contracts: Mapping[str, Mapping[str, Any]] | None = None,
+    require_openrouter_non_byok: bool = False,
+    judge_required: bool = True,
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, Any]]:
+    """Classify resume rows while explicitly closing partial indexes on error."""
+
+    source_rows = ResumeSourceIndex(resume_paths)
+    try:
+        return _load_resume_group_task_states_from_index(
+            source_rows=source_rows,
+            resume_paths=resume_paths,
+            selected_keys=selected_keys,
+            prompt_hashes=prompt_hashes,
+            task_input_hashes=task_input_hashes,
+            run_compatibility_fingerprints=run_compatibility_fingerprints,
+            run_compatibility_contracts=run_compatibility_contracts,
+            require_openrouter_non_byok=require_openrouter_non_byok,
+            judge_required=judge_required,
+        )
+    except BaseException:
+        source_rows.close(verify=False)
+        raise
 
 
 def load_strict_completed_group_task_keys(
@@ -20922,7 +21020,12 @@ def load_strict_completed_group_task_keys(
         require_openrouter_non_byok=require_openrouter_non_byok,
         judge_required=judge_required,
     )
-    return {key for key, state in states.items() if state["action"] == "complete"}, audit
+    try:
+        return {
+            key for key, state in states.items() if state["action"] == "complete"
+        }, audit
+    finally:
+        states.close()
 
 
 async def _amain_with_run_lock(
@@ -21157,6 +21260,7 @@ async def _amain_with_run_lock(
         require_openrouter_non_byok=bool(getattr(args, "require_openrouter_non_byok", False)),
         judge_required=judge_required,
     )
+    args._resume_group_task_states = resume_states
     completed_keys = {key for key, state in resume_states.items() if state["action"] == "complete"}
     scheduled_keys = selected_keys - completed_keys
     regenerate_keys = {
@@ -21436,7 +21540,8 @@ async def _amain_with_run_lock(
         group: str,
         state: Mapping[str, Any],
     ) -> dict[str, Any]:
-        row = json.loads(json.dumps(state["row"], ensure_ascii=False))
+        key = (group, str(task["id"]))
+        row = resume_states.consume_row(key)
         prior_used = coerce_metric_int(state.get("prior_generation_attempts_used"))
         if not isinstance(row.get("generation_completed_at"), int | float):
             legacy_completed_at = row.get("completed_at")
@@ -21492,8 +21597,8 @@ async def _amain_with_run_lock(
     ) -> dict[str, Any]:
         """Preserve evidence and refuse a fresh analyzer/plan after paid G1."""
 
-        del task, group
-        row = json.loads(json.dumps(state["row"], ensure_ascii=False))
+        key = (group, str(task["id"]))
+        row = resume_states.consume_row(key)
         prior_used = coerce_metric_int(state.get("prior_generation_attempts_used"))
         row["generation_attempt_budget_limit"] = generation_attempt_budget_limit
         row["generation_attempt_budget_used"] = prior_used
@@ -21552,8 +21657,8 @@ async def _amain_with_run_lock(
     ) -> dict[str, Any]:
         """Preserve one paid terminal attempt without another model call."""
 
-        del task, group
-        row = json.loads(json.dumps(state["row"], ensure_ascii=False))
+        key = (group, str(task["id"]))
+        row = resume_states.consume_row(key)
         prior_used = coerce_metric_int(
             state.get("prior_generation_attempts_used")
         )
@@ -21763,7 +21868,7 @@ async def _amain_with_run_lock(
             return generation_usage_identity_contract(value)
 
         async with semaphore:
-            row = json.loads(json.dumps(state["row"], ensure_ascii=False))
+            row = resume_states.consume_row((group, str(task["id"])))
             action = str(state["action"])
             prior_execution = (
                 row.get("execution") if isinstance(row.get("execution"), Mapping) else {}
@@ -22355,12 +22460,23 @@ async def _amain_with_run_lock(
 
 async def amain(args: argparse.Namespace) -> int:
     run_lock_holder: list[DracoArtifactRunLock | None] = [None]
+    completed_normally = False
     try:
-        return await _amain_with_run_lock(args, run_lock_holder=run_lock_holder)
+        result = await _amain_with_run_lock(
+            args,
+            run_lock_holder=run_lock_holder,
+        )
+        completed_normally = True
+        return result
     finally:
-        run_lock = run_lock_holder[0]
-        if run_lock is not None:
-            run_lock.close()
+        resume_states = getattr(args, "_resume_group_task_states", None)
+        try:
+            if isinstance(resume_states, ResumeGroupTaskStates):
+                resume_states.close(verify=completed_normally)
+        finally:
+            run_lock = run_lock_holder[0]
+            if run_lock is not None:
+                run_lock.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
