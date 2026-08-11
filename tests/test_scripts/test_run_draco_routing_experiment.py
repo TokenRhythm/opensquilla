@@ -9971,7 +9971,28 @@ def test_agent_done_envelope_does_not_create_request_after_explicit_zero(
 
 
 def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
+    from opensquilla.eval import draco_usage_evidence
+
     resume_runner = _load_resume_runner()
+    shared_usage_functions = (
+        "build_stable_receipt_evidence",
+        "deduplicate_stable_usage_receipts",
+        "merge_usage_receipt_provenance",
+        "usage_receipt_fingerprint",
+        "usage_row_is_missing_placeholder",
+        "usage_row_match_priority",
+        "usage_row_response_ids",
+    )
+    assert runner.STABLE_RECEIPT_EVIDENCE_KEY == (
+        draco_usage_evidence.STABLE_RECEIPT_EVIDENCE_KEY
+    )
+    assert resume_runner.STABLE_RECEIPT_EVIDENCE_KEY == (
+        draco_usage_evidence.STABLE_RECEIPT_EVIDENCE_KEY
+    )
+    for name in shared_usage_functions:
+        shared = getattr(draco_usage_evidence, name)
+        assert getattr(runner, name) is shared
+        assert getattr(resume_runner, name) is shared
     critical = (
         "validate_tool_mode_for_runner",
         "configure_benchmark_sandbox_runtime",
