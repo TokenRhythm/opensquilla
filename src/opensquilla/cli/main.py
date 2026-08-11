@@ -1068,40 +1068,55 @@ def agent(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Run a single agent turn for automation."""
-    from opensquilla.recovery import guarded_desktop_profile
+    from opensquilla.cli.output import emit_error
+    from opensquilla.recovery import ProfileLockBusyError, guarded_desktop_profile
 
-    with guarded_desktop_profile():
-        run_agent_command(
-            message=message,
-            agent_id=agent_id,
-            session_id=session_id,
-            model=model,
-            workspace=workspace,
-            workspace_strict=workspace_strict,
-            workspace_lockdown=workspace_lockdown,
-            workspace_lockdown_deny_paths=workspace_lockdown_deny_paths,
-            scratch_dir=scratch_dir,
-            thinking=thinking,
-            timeout=timeout,
-            max_iterations=max_iterations,
-            iteration_timeout_seconds=iteration_timeout_seconds,
-            tool_timeout_seconds=tool_timeout_seconds,
-            request_timeout_seconds=request_timeout_seconds,
-            max_provider_retries=max_provider_retries,
-            length_capped_continuations=length_capped_continuations,
-            transcript_path=transcript_path,
-            usage_path=usage_path,
-            event_stream_stderr=event_stream_stderr,
-            session_db_path=session_db_path,
-            no_memory_capture=no_memory_capture,
-            file_paths=file_paths,
-            unattended=unattended,
-            stateless=stateless,
-            clean_room=clean_room,
-            stateless_keep_project_rules=stateless_keep_project_rules,
-            permissions=permissions,
+    try:
+        with guarded_desktop_profile():
+            run_agent_command(
+                message=message,
+                agent_id=agent_id,
+                session_id=session_id,
+                model=model,
+                workspace=workspace,
+                workspace_strict=workspace_strict,
+                workspace_lockdown=workspace_lockdown,
+                workspace_lockdown_deny_paths=workspace_lockdown_deny_paths,
+                scratch_dir=scratch_dir,
+                thinking=thinking,
+                timeout=timeout,
+                max_iterations=max_iterations,
+                iteration_timeout_seconds=iteration_timeout_seconds,
+                tool_timeout_seconds=tool_timeout_seconds,
+                request_timeout_seconds=request_timeout_seconds,
+                max_provider_retries=max_provider_retries,
+                length_capped_continuations=length_capped_continuations,
+                transcript_path=transcript_path,
+                usage_path=usage_path,
+                event_stream_stderr=event_stream_stderr,
+                session_db_path=session_db_path,
+                no_memory_capture=no_memory_capture,
+                file_paths=file_paths,
+                unattended=unattended,
+                stateless=stateless,
+                clean_room=clean_room,
+                stateless_keep_project_rules=stateless_keep_project_rules,
+                permissions=permissions,
+                json_output=json_output,
+            )
+    except ProfileLockBusyError:
+        emit_error(
+            "This profile is already in use by another OpenSquilla writer. "
+            "The standalone 'opensquilla agent' command cannot share a profile with "
+            "another writer, including an active Desktop Gateway. To use a running "
+            "Gateway, use a Gateway-backed command such as 'opensquilla chat' (set "
+            "OPENSQUILLA_GATEWAY_URL and OPENSQUILLA_GATEWAY_TOKEN when needed); "
+            "otherwise, set both OPENSQUILLA_STATE_DIR and "
+            "OPENSQUILLA_GATEWAY_STATE_DIR to isolated directories for this agent run.",
             json_output=json_output,
+            code="profile_lock_busy",
         )
+        raise typer.Exit(code=1) from None
 
 
 @app.command("chat")
