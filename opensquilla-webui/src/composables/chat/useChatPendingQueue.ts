@@ -3,7 +3,10 @@ import type {
   Attachment,
   ChatPendingItem,
   HiddenControlDispatchResult,
+  PendingSteerPhase,
 } from '@/types/chat'
+import type { SessionSteerV2Params } from '@/types/rpc'
+import { snapshotSteerRequest } from './useChatSteerDelivery'
 
 const MAX_PENDING = 5
 
@@ -29,12 +32,9 @@ export interface PendingQueuePayload {
   intent?: string | null
 }
 
-export interface PendingSteerRetryPayload {
-  text: string
-  clientRequestId: string
-  clientMessageId: string
-  expectedTurnId: string
-  visibleCommitted: boolean
+export interface PendingSteerPayload {
+  request: SessionSteerV2Params
+  phase?: PendingSteerPhase
 }
 
 export interface UseChatPendingQueueOptions {
@@ -73,12 +73,18 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
   let deferredDrainRequested = false
 
-  const canQueueMore = computed(() => pendingQueue.value.length < MAX_PENDING)
+  // A not-yet-durable Steer owns a separate transport slot. It must not
+  // consume one of the five ordinary follow-up slots, regardless of whether
+  // the Steer or the drafts were queued first.
+  const ordinaryPendingCount = computed(() =>
+    pendingQueue.value.filter(item => !item.steerAttempt).length,
+  )
+  const canQueueMore = computed(() => ordinaryPendingCount.value < MAX_PENDING)
   // A direct queued delivery owns its item until it succeeds, is removed, or
   // becomes eligible for another explicit retry.
   const hasDeliveryBarrier = computed(() =>
     pendingQueue.value.some(
-      item => item.deliveryState === 'steering' || item.deliveryState === 'retryable',
+      item => Boolean(item.deliveryState || item.steerAttempt),
     ),
   )
 
@@ -113,7 +119,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     payload: PendingQueuePayload,
     owner?: PendingQueueOwner,
   ) {
-    if (pendingQueue.value.length >= MAX_PENDING) {
+    if (ordinaryPendingCount.value >= MAX_PENDING) {
       console.warn(`Pending queue full (${MAX_PENDING})`)
       return false
     }
@@ -173,7 +179,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         && candidate.hiddenControlSessionKey === hiddenControlSessionKey
       ))
     ) return true
-    if (pendingQueue.value.length >= MAX_PENDING) {
+    if (ordinaryPendingCount.value >= MAX_PENDING) {
       console.warn(`Pending queue full (${MAX_PENDING})`)
       return false
     }
@@ -201,28 +207,47 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return true
   }
 
-  function enqueuePendingSteerRetry(payload: PendingSteerRetryPayload) {
-    if (pendingQueue.value.length >= MAX_PENDING) {
+  function enqueuePendingSteerAttempt(
+    payload: PendingSteerPayload,
+    owner?: PendingQueueOwner,
+  ) {
+    const request = snapshotSteerRequest(payload.request)
+    const existing = pendingQueue.value.find(item => (
+      item.steerAttempt?.request.client_request_id === request.client_request_id
+    ))
+    if (existing) return existing
+    // A direct Steer needs a transport-owned pending row before its RPC can be
+    // sent. Exactly one delivery barrier may own the extra transport slot;
+    // ordinary queue capacity is accounted independently above.
+    if (hasDeliveryBarrier.value) {
       console.warn(`Pending queue full (${MAX_PENDING})`)
-      return false
+      return null
     }
-    pendingQueue.value.push({
-      text: payload.text,
+    const ownerRequestId = resolveOwnerRequestId(owner)
+    const item: ChatPendingItem = {
+      text: request.message,
       attachments: [],
       intent: null,
       ownerSessionKey: options.sessionKey.value,
-      deliveryState: 'retryable',
-      steerClientRequestId: payload.clientRequestId,
-      steerClientMessageId: payload.clientMessageId,
-      steerExpectedTurnId: payload.expectedTurnId,
-      steerVisibleCommitted: payload.visibleCommitted,
-    })
-    return true
+      ...(ownerRequestId ? { ownerRequestId } : {}),
+      steerAttempt: {
+        phase: payload.phase || 'submitting',
+        request,
+      },
+    }
+    pendingQueue.value.push(item)
+    // Return the array-owned reactive proxy. Mutating the raw object after it
+    // was inserted would bypass Vue's phase-change notifications in the UI.
+    return pendingQueue.value[pendingQueue.value.length - 1] || item
   }
 
   function removePendingChip(index: number) {
     const item = pendingQueue.value[index]
-    if (!item || item.deliveryState === 'steering') return false
+    if (
+      !item
+      || item.deliveryState === 'steering'
+      || item.steerAttempt?.phase === 'submitting'
+    ) return false
     if (!notifyDiscardedHiddenControl(item)) return false
     pendingQueue.value.splice(index, 1)
     return true
@@ -237,11 +262,15 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       !item
       || (item.hiddenControl && !allowHiddenControl)
       || item.deliveryState === 'steering'
+      || item.steerAttempt?.phase === 'submitting'
     ) return null
     const otherDelivery = pendingQueue.value.find(
-      candidate => candidate !== item && candidate.deliveryState,
+      candidate => candidate !== item && (candidate.deliveryState || candidate.steerAttempt),
     )
     if (otherDelivery) return null
+    // This generic lease covers the small validation window before a queued
+    // draft becomes a Steer. `steerDelivery.begin` clears it atomically when
+    // the canonical attempt is installed.
     item.deliveryState = 'steering'
     return item
   }
@@ -267,20 +296,26 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       flushDeferredPendingDrain()
       return
     }
-    if (outcome === 'deferred') {
+    if (outcome === 'deferred' && !item.steerAttempt) {
       item.deliveryState = undefined
       deferredDrainRequested = true
       flushDeferredPendingDrain()
       return
     }
-    item.deliveryState = outcome === 'retryable_failure' ? 'retryable' : undefined
+    if (!item.steerAttempt) {
+      item.deliveryState = outcome === 'retryable_failure' ? 'retryable' : undefined
+    }
     flushDeferredPendingDrain()
   }
 
   function clearPendingQueue() {
     clearPendingDrainAfterTerminalTimer()
     pendingQueue.value = pendingQueue.value.filter(
-      item => item.deliveryState === 'steering' || !notifyDiscardedHiddenControl(item),
+      item => (
+        item.deliveryState === 'steering'
+        || item.steerAttempt?.phase === 'submitting'
+        || !notifyDiscardedHiddenControl(item)
+      ),
     )
   }
 
@@ -298,16 +333,18 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function switchPendingQueue(targetSessionKey: string) {
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
-    const sourceHidden = pendingQueue.value.filter(item => item.hiddenControl)
-    if (sourceSessionKey && sourceHidden.length > 0) {
+    const sourceTransportOwned = pendingQueue.value.filter(
+      item => item.hiddenControl || item.steerAttempt,
+    )
+    if (sourceSessionKey && sourceTransportOwned.length > 0) {
       const existing = parkedQueues.get(sourceSessionKey) || []
-      parkedQueues.set(sourceSessionKey, [...existing, ...sourceHidden])
+      parkedQueues.set(sourceSessionKey, [...existing, ...sourceTransportOwned])
     }
     const restored = parkedQueues.get(targetSessionKey) || []
     parkedQueues.delete(targetSessionKey)
     // Explicit navigation keeps its historical behavior of discarding the
-    // active session's ordinary queue. Machine controls remain bound to their
-    // source session and resume with the same durable request identity.
+    // active session's ordinary queue. Machine controls and ambiguous Steers
+    // remain bound to their source session and exact request identity.
     pendingQueue.value = restored
   }
 
@@ -358,6 +395,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       && (
         pendingQueue.value[tailIndex]?.hiddenControl
         || pendingQueue.value[tailIndex]?.deliveryState
+        || pendingQueue.value[tailIndex]?.steerAttempt
       )
     ) tailIndex--
     if (tailIndex < 0) return false
@@ -374,8 +412,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (!options.hasComposer() || pendingQueue.value.length === 0) return false
     // Hidden controls and explicit/ambiguous steer deliveries stay queued;
     // only transport-free visible drafts can safely return to the composer.
-    const visible = pendingQueue.value.filter(p => !p.hiddenControl && !p.deliveryState)
-    const retained = pendingQueue.value.filter(p => p.hiddenControl || p.deliveryState)
+    const visible = pendingQueue.value.filter(
+      p => !p.hiddenControl && !p.deliveryState && !p.steerAttempt,
+    )
+    const retained = pendingQueue.value.filter(
+      p => p.hiddenControl || p.deliveryState || p.steerAttempt,
+    )
     if (visible.length === 0) return false
     const queuedTexts = visible.map(p => p.text).filter(Boolean)
     const queuedAttachments = visible.flatMap(p => p.attachments || [])
@@ -539,7 +581,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     enqueuePendingInput,
     enqueueRecoveredInput,
     enqueueHiddenControl,
-    enqueuePendingSteerRetry,
+    enqueuePendingSteerAttempt,
     removePendingChip,
     beginPendingDelivery,
     settlePendingDelivery,

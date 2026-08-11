@@ -2,6 +2,7 @@ import { marked, type Tokens } from 'marked'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
 import katex from 'katex'
+import { strictStrikethrough } from '@/utils/markdown/strikethrough'
 
 const DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g
 const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*/gi
@@ -39,7 +40,7 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
-marked.use({
+marked.use(strictStrikethrough, {
   renderer: {
     code({ text, lang }: Tokens.Code): string {
       const language = (lang || '').trim().split(/\s+/)[0].toLowerCase()

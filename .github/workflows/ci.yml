@@ -257,9 +257,15 @@ jobs:
         working-directory: opensquilla-webui
         run: npx playwright install --with-deps chromium
 
-      - name: Run production-dist chat recovery browser contract
+      - name: Run production-dist chat and Goal recovery browser contracts
         working-directory: opensquilla-webui
-        run: npm run test:e2e -- history-hydration.spec.ts --project=chromium --workers=1
+        run: >-
+          npm run test:e2e --
+          history-hydration.spec.ts
+          goal-mode.spec.ts
+          queue-steer.spec.ts
+          --project=chromium
+          --workers=1
 
       - name: Upload chat recovery traces
         if: ${{ failure() }}
@@ -418,7 +424,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           uv run pytest \
             tests/unit \
@@ -514,7 +520,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
@@ -748,7 +754,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
           maxfail_args=()
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             maxfail_args+=(--maxfail=3)
@@ -1036,6 +1042,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
@@ -1055,6 +1062,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'theme-flow:scripts/test-desktop-theme-flow.mjs'
               )
               ;;
             workbench)

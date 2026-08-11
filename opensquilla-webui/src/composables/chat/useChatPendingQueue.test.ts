@@ -126,6 +126,72 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('parks an in-flight steer with its source session and exact request snapshot', () => {
+    const { queue, sessionKey } = makeQueue()
+    const item = queue.enqueuePendingSteerAttempt({
+      request: {
+        key: sessionKey.value,
+        message: 'keep this source-bound steer',
+        expected_turn_id: 'turn-source',
+        client_request_id: 'request-source',
+        client_message_id: 'client-source',
+        surface_id: 'webui',
+        _source: { elevated: 'enabled', runMode: 'safe' },
+      },
+      phase: 'submitting',
+    })
+    expect(item).not.toBeNull()
+
+    queue.switchPendingQueue('agent:main:webchat:other')
+    sessionKey.value = 'agent:main:webchat:other'
+    expect(queue.pendingQueue.value).toEqual([])
+
+    queue.switchPendingQueue('agent:main:webchat:test')
+    sessionKey.value = 'agent:main:webchat:test'
+    expect(queue.pendingQueue.value).toEqual([item])
+    expect(queue.pendingQueue.value[0]?.steerAttempt).toMatchObject({
+      phase: 'submitting',
+      request: {
+        key: 'agent:main:webchat:test',
+        message: 'keep this source-bound steer',
+        expected_turn_id: 'turn-source',
+        client_request_id: 'request-source',
+        client_message_id: 'client-source',
+        _source: { elevated: 'enabled', runMode: 'safe' },
+      },
+    })
+    queue.cleanup()
+  })
+
+  it('keeps five ordinary slots plus one independent transport-owned steer slot', () => {
+    const { queue, sessionKey } = makeQueue()
+    const request = {
+      key: sessionKey.value,
+      message: 'transport-owned steer',
+      expected_turn_id: 'turn-capacity',
+      client_request_id: 'request-capacity',
+      client_message_id: 'client-capacity',
+      surface_id: 'webui',
+    }
+
+    expect(queue.enqueuePendingSteerAttempt({ request })).not.toBeNull()
+    for (let index = 0; index < 5; index += 1) {
+      expect(queue.enqueuePendingPayload({ text: `ordinary-${index}` })).toBe(true)
+    }
+
+    expect(queue.pendingQueue.value).toHaveLength(6)
+    expect(queue.canQueueMore.value).toBe(false)
+    expect(queue.enqueuePendingPayload({ text: 'ordinary-overflow' })).toBe(false)
+    expect(queue.enqueuePendingSteerAttempt({
+      request: {
+        ...request,
+        client_request_id: 'request-capacity-second',
+        client_message_id: 'client-capacity-second',
+      },
+    })).toBeNull()
+    queue.cleanup()
+  })
+
   it.each(['steering', 'retryable'] satisfies Array<
     Exclude<ChatPendingItem['deliveryState'], undefined>
   >)('defers automatic drain for any %s item and resumes after the state clears', async (state) => {

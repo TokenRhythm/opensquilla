@@ -34,7 +34,6 @@
         v-if="!isNewChatLanding"
         ref="chatHeaderActionsRef"
         :title="currentChatTitle"
-        :session-key="sessionKey"
         :copy-state="sessionCopyState"
         :copy-icon="sessionCopyIcon"
         :copy-live-text="sessionCopyLiveText"
@@ -77,12 +76,54 @@
       </div>
       <div class="chat-thread-shell">
         <div
+          v-if="forkTransition"
+          class="chat-fork-transition-overlay"
+          data-testid="chat-fork-transition-overlay"
+        >
+          <div
+            class="chat-fork-transition-status"
+            :class="{ 'chat-fork-transition-status--error': forkTransition.phase === 'error' }"
+            :role="forkTransition.phase === 'error' ? 'alert' : 'status'"
+            :aria-live="forkTransition.phase === 'error' ? 'assertive' : 'polite'"
+            aria-atomic="true"
+            data-testid="chat-fork-transition-status"
+          >
+            <span
+              v-if="forkTransition.phase !== 'error'"
+              class="chat-fork-transition-status__spinner"
+              aria-hidden="true"
+            />
+            <Icon v-else name="info" :size="15" aria-hidden="true" />
+            <span class="chat-fork-transition-status__copy">{{ forkTransition.phase === 'error'
+              ? t('chat.forkOpenFailed')
+              : forkTransition.phase === 'creating'
+                ? t('chat.forkCreating')
+                : forkTransition.phase === 'returning'
+                  ? t('chat.forkReturning')
+                  : t('chat.forkOpening') }}</span>
+            <template v-if="forkTransition.phase === 'error'">
+              <button
+                type="button"
+                class="btn btn--ghost chat-fork-transition-status__action"
+                data-testid="chat-fork-retry"
+                @click="retryForkTransition"
+              >{{ t('chat.reloadSession') }}</button>
+              <button
+                type="button"
+                class="btn btn--ghost chat-fork-transition-status__action"
+                data-testid="chat-fork-return"
+                @click="returnToForkParent"
+              >{{ t('chat.forkReturnOriginal') }}</button>
+            </template>
+          </div>
+        </div>
+        <div
           ref="threadRef"
           class="chat-thread"
           role="region"
           tabindex="0"
           :aria-label="t('chat.conversation')"
-          :aria-busy="isStreaming"
+          :aria-busy="isStreaming || forkInFlight"
           @scroll="onThreadScroll"
           @wheel.passive="onThreadWheel"
           @touchmove.passive="markThreadScrollIntent('either')"
@@ -102,25 +143,25 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="visibleHistoryRecoveryState"
+          v-if="!forkTransition && visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
           :state="visibleHistoryRecoveryState"
           @retry="retryHistory"
         />
         <ChatSessionRecoveryStatus
-          v-if="liveRecoveryState"
+          v-if="!forkTransition && liveRecoveryState"
           :key="`${sessionKey}:live`"
           :state="liveRecoveryState"
           @retry="retryLive"
         />
         <div
-          v-if="showConfirmedEmptySession"
+          v-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
         >
           {{ t('chat.noMessagesYet') }}
         </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding"
+          v-if="!isNewChatLanding && !forkTransition"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
           :loading="historyState.loadingEarlier"
@@ -134,9 +175,16 @@
           @retry="retryHistory"
         />
 
+        <div
+          class="chat-message-surface"
+          :class="{ 'chat-message-surface--preview': forkTransition }"
+          :inert="forkTransition ? true : undefined"
+          :aria-hidden="forkTransition ? 'true' : undefined"
+          :data-preview-session="forkTransition?.parentKey"
+        >
         <ChatMessageList
-          :messages="renderedMessages"
-          :session-key="sessionKey"
+          :messages="forkTransition?.previewMessages || renderedMessages"
+          :session-key="forkTransition?.parentKey || sessionKey"
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
           :workbench-enabled="workbenchEnabled"
@@ -159,6 +207,8 @@
           :plan-action-pending="planCardPendingAction"
           :plan-actions-disabled="planActionsDisabled"
           :is-streaming="isStreaming"
+          :goal="currentGoalRun"
+          :goal-elapsed="goalLastElapsed"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
           @regenerate-message="regenerateMessage"
@@ -181,6 +231,7 @@
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
         </ChatMessageList>
+        </div>
 
         <!-- Manual or turn-boundary compaction has no assistant turn to own
              it. Keep one quiet transcript maintenance row instead of a
@@ -208,7 +259,15 @@
             {{ compactStatus.detail }}
           </span>
         </div>
-
+        <!-- Durable goal outcome line at the transcript tail: once a goal
+             reaches a terminal state the ribbon above the composer fades,
+             but the conversation keeps a small "Goal complete · 6m 52s"
+             record where the work ended. -->
+        <GoalOutcomeNotice
+          v-if="goalOutcomeGoal && !goalOutcomeHasMessageAnchor"
+          :goal="goalOutcomeGoal"
+          :elapsed="goalLastElapsed"
+        />
         <PlanCard
           v-if="currentPlan && !currentPlanInHistory"
           :plan="currentPlan"
@@ -398,7 +457,7 @@
         </template>
         </div>
         <ConversationMinimap
-          v-if="!isNewChatLanding && !shareMode"
+          v-if="!isNewChatLanding && !shareMode && !forkTransition"
           :messages="renderedMessages"
           :scroll-container="threadRef"
           :strip-time-prefix="stripTimePrefix"
@@ -426,7 +485,7 @@
     <div class="chat-composer-dock">
     <!-- Durable execution progress belongs to the work surface, not to the
          transcript. Keeping it immediately above the composer also lets a
-         future goal driver reuse this dock across multiple turns. -->
+         execution surfaces reuse this dock across multiple turns. -->
     <Transition name="plan-run-dock">
       <div v-if="executionDockRun" class="plan-run-dock">
         <PlanRunRibbon
@@ -435,6 +494,25 @@
           :disabled="planModeBusy || planActionPending !== null"
           @cancel="cancelActivePlanRun"
           @focus-return="focusComposerAfterPlanRun"
+        />
+      </div>
+    </Transition>
+    <!-- Long-running goal progress lives in the same dock as plan execution so
+         the active objective stays visible above the composer across turns. -->
+    <Transition name="goal-run-dock">
+      <div v-if="activeGoalRun" class="goal-run-dock">
+        <GoalRibbon
+          :goal="activeGoalRun"
+          :elapsed="goalElapsed"
+          :busy="goalBusy"
+          :plan-mode-active="initialCollaborationMode === 'plan'"
+          :connection-takeover-available="goalConnectionTakeoverAvailable"
+          :reattaching="goalReattaching"
+          @edit="editGoalFromRibbon"
+          @pause="pauseGoal"
+          @resume="resumeGoal"
+          @takeover="takeOverGoalConnection"
+          @clear="clearGoal"
         />
       </div>
     </Transition>
@@ -476,6 +554,7 @@
       :max-pending="maxPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
       :steer-available="sameTurnSteerAvailable"
+      :steer-unavailable-message="sameTurnSteerUnavailableMessage"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
       @remove="removePendingChip"
@@ -510,7 +589,7 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
-      :input-disabled="Boolean(dockedPlanQuestionnaire)"
+      :input-disabled="Boolean(dockedPlanQuestionnaire) || Boolean(forkTransition)"
       :run-mode="runMode"
       :allowed-run-modes="composerAllowedRunModes"
       :safe-setup-available="composerSafeSetupAvailable"
@@ -520,6 +599,10 @@
       :model-routing-settings-busy="modelRoutingSettingsBusy"
       :coding-mode-enabled="codingModeEnabled"
       :coding-mode-settings-busy="codingModeSettingsBusy"
+      :goal-draft-armed="goalDraftArmed"
+      :goal-mode-available="goalUiAvailable"
+      :goal-mode-busy="goalBusy || planModeBusy || replanActive"
+      :goal-mode-existing="goalComposerExisting"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -552,6 +635,8 @@
       @set-model-routing-mode="setComposerModelRoutingMode"
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
+      @arm-goal="void activateGoalComposerMode()"
+      @disarm-goal="disarmGoalMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
       @voice-setup="onVoiceSetup"
@@ -661,6 +746,8 @@ import TextPart from '@/components/chat/parts/TextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaSkillSetupCard from '@/components/chat/MetaSkillSetupCard.vue'
+import GoalRibbon from '@/components/chat/GoalRibbon.vue'
+import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
@@ -674,12 +761,22 @@ import { useChatApprovals } from '@/composables/chat/useChatApprovals'
 import { useChatAttachments } from '@/composables/chat/useChatAttachments'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
+import {
+  goalHasRenderedTerminalAnchor,
+  goalStatusIsTerminal,
+  type GoalSetAcceptedPayload,
+  useChatGoals,
+} from '@/composables/chat/useChatGoals'
 import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersistence'
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
+import {
+  resolveChatHeaderTitle,
+  useChatSessionTitles,
+} from '@/composables/chat/useChatSessionTitles'
 import {
   createChatMetaDraftRecovery,
   listServerMetaDrafts,
@@ -694,7 +791,6 @@ import type { ShareExportTheme } from '@/composables/chat/useChatShareExport'
 import { useMediaQuery } from '@/composables/chat/useMediaQuery'
 import {
   fmtTok,
-  truncate,
   useChatRenderedMessages,
 } from '@/composables/chat/useChatRenderedMessages'
 import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDecisionRuntime'
@@ -702,6 +798,7 @@ import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
+import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
 import {
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
@@ -766,17 +863,32 @@ import type {
   ChatRunStatus,
   ChatRunStatusSource,
   ChatRunStatusState,
+  ChatSteerCapability,
   ChatStreamTimelineItem,
   ChatToolCall,
   DisplayAttachment,
   HiddenControlDispatchResult,
   ToolResultContext,
 } from '@/types/chat'
+import {
+  createForkTransitionLifetime,
+  forkNavigationPhase,
+  forkRouteHandoffAction,
+  forkRpcRequest,
+  snapshotForkPreviewMessages,
+  validatedForkChildKey,
+  type ForkRpcResponse,
+} from '@/utils/chat/forkTransition'
+import {
+  steerUnavailableReason,
+  type SteerUnavailableReason,
+} from '@/utils/chat/steerAvailability'
 import type {
   ArtifactPayload,
   MetaDraftDiscardResponse,
   SessionEventPayload,
   SessionMessagesSnapshotResponse,
+  SessionMessagesSubscribeResponse,
 } from '@/types/rpc'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import {
@@ -1017,6 +1129,26 @@ const autoScroll = ref(true)
 const historyNavigationScrollLock = createHistoryNavigationScrollLock(autoScroll)
 const composing = ref(false)
 const messages = ref<Message[]>([])
+
+type ForkTransitionPhase = 'creating' | 'opening' | 'returning' | 'error'
+
+interface ForkTransitionState {
+  generation: number
+  parentKey: string
+  childKey: string
+  targetKey: string
+  throughTurnId?: string
+  phase: ForkTransitionPhase
+  errorReason?: 'navigation' | 'history' | 'live'
+  /** Render-only snapshot; never becomes the child session's canonical messages. */
+  previewMessages: ChatRenderedMessage[]
+}
+
+const forkTransition = ref<ForkTransitionState | null>(null)
+const forkInFlight = computed(() => (
+  forkTransition.value !== null && forkTransition.value.phase !== 'error'
+))
+const forkTransitionLifetime = createForkTransitionLifetime()
 
 // Session / UI
 const lastHeaderRole = ref('')
@@ -1304,6 +1436,7 @@ const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
 let handleHiddenControlDispatchResult: (result: HiddenControlDispatchResult) => void = () => {}
 let discardHiddenControlOutbox: (sessionKey: string, clientRequestId: string) => boolean = () => false
 let forgetHiddenControlOutbox: (sessionKey: string, clientRequestId: string) => void = () => {}
+let disarmGoalDraftForMetaRestore: () => void = () => {}
 const chatPendingQueue = useChatPendingQueue({
   sessionKey,
   ownerContext: pendingQueueOwnerContext,
@@ -1353,7 +1486,7 @@ const {
   enqueuePendingInput,
   enqueueRecoveredInput,
   enqueueHiddenControl,
-  enqueuePendingSteerRetry,
+  enqueuePendingSteerAttempt,
   removePendingChip,
   beginPendingDelivery,
   settlePendingDelivery,
@@ -1383,6 +1516,9 @@ function restoreMetaLaunchDraft(launchText: string, targetSessionKey: string): v
     return
   }
 
+  // A restored /meta launch is an ordinary slash draft, never a Goal
+  // objective. Resolve that precedence before inspecting or queueing text.
+  disarmGoalDraftForMetaRestore()
   const currentDraft = inputText.value.trim()
   if (!currentDraft) {
     inputText.value = restored
@@ -1447,6 +1583,7 @@ watch(compactStatus, (status) => {
     state: transcriptCompactionState(status.status),
     durability: status.durability || '',
     ...(status.detail ? { detail: status.detail } : {}),
+    ...(status.reason ? { reason: status.reason } : {}),
   }
   const index = messages.value.findIndex(message => (
     message.role === 'maintenance'
@@ -1565,6 +1702,7 @@ const {
   isDraftRoute,
   persistSession,
   readProjectFromUrl,
+  readSessionFromUrl,
   resolveInitialSession,
 } = chatSessionRoute
 
@@ -1617,6 +1755,7 @@ const chatRenderedMessages = useChatRenderedMessages({
   stripGeneratedArtifactMarkers,
   stripTimePrefix,
   isSubagentCompletionMessage,
+  timeTranslator: t,
 })
 const { renderedMessages, routerDecisionCells } = chatRenderedMessages
 
@@ -1708,6 +1847,7 @@ const chatHistory = useChatHistory({
   scrollToBottom,
 })
 const {
+  historySessionKey,
   historyState,
   loadHistory,
   loadEarlierHistory,
@@ -1718,6 +1858,19 @@ const {
   cleanup: cleanupHistory,
 } = chatHistory
 planMutationAccepted = () => scheduleHistorySync()
+
+const steerDelivery = useChatSteerDelivery({
+  messages,
+  pendingQueue,
+  checkpointForUserMessage: turnId => chatStream.checkpointForUserMessage?.(turnId),
+  scheduleHistorySync,
+  removePendingItem: item => settlePendingDelivery(item, 'accepted'),
+  restoreSteerIntoComposer: text => appendComposerText(text),
+  onProjected: () => {
+    autoScroll.value = true
+    scrollToBottom()
+  },
+})
 
 // The durable artifact index fills gaps left by the bounded/compacted message
 // history. History and the in-flight ArtifactEvent stream remain live fallback
@@ -1783,6 +1936,7 @@ const {
 } = chatMessageActions
 
 let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
+let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
 const chatSessionSubscription = useChatSessionSubscription({
   rpc,
   sessionKey,
@@ -1834,6 +1988,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onSnapshot: snapshot => {
     chatPlans.applyBootstrap(snapshot)
+    applyGoalSnapshot(snapshot)
     applyPendingUserInputSnapshot(snapshot)
   },
 })
@@ -2124,6 +2279,183 @@ const {
 handleHiddenControlDispatchResult = handleHiddenDispatchResult
 const metaSetupProviderNavigationPending = ref(false)
 
+function projectAcceptedGoalMessage({
+  objective,
+  clientMessageId,
+  response,
+}: GoalSetAcceptedPayload): void {
+  // The callback may settle after a navigation. Never project one session's
+  // accepted transcript row into another session.
+  if (response.sessionKey !== sessionKey.value) return
+
+  const messageId = String(
+    response.userMessageId || response.goal?.sourceMessageId || '',
+  ).trim()
+  if (!messageId) {
+    // Older/malformed responses cannot safely anchor a local row. Re-read the
+    // authoritative transcript instead of inventing an identity.
+    scheduleHistorySync()
+    return
+  }
+
+  const taskId = String(response.taskId || '').trim()
+  const createdAt = Number(response.goal?.createdAt)
+  const timestamp: Message['ts'] = Number.isFinite(createdAt) && createdAt > 0
+    ? createdAt
+    : new Date().toISOString()
+  let index = messages.value.findIndex(message => message.messageId === messageId)
+  if (index < 0) {
+    index = messages.value.findIndex(message => message.clientId === clientMessageId)
+  }
+
+  if (index >= 0) {
+    const current = messages.value[index]!
+    messages.value.splice(index, 1, {
+      ...current,
+      role: 'user',
+      text: current.text || objective,
+      ts: current.ts ?? timestamp,
+      clientId: current.clientId || clientMessageId,
+      messageId,
+      ...(taskId ? { turnId: current.turnId || taskId } : {}),
+    })
+  } else {
+    messages.value.push({
+      role: 'user',
+      text: objective,
+      ts: timestamp,
+      clientId: clientMessageId,
+      messageId,
+      ...(taskId ? { turnId: taskId } : {}),
+    })
+  }
+
+  autoScroll.value = true
+  scrollToBottom()
+  scheduleHistorySync()
+}
+
+const chatGoals = useChatGoals({
+  rpc,
+  sessionKey,
+  currentEpoch,
+  ensureSessionKey: async () => {
+    // A goal needs a durable session before it can be registered. On the
+    // new-chat landing the client already owns a provisional key, including
+    // on the bare /chat route. The durable boundary is the pending intent,
+    // not the route shape: ordinary first sends consume the same intent only
+    // after their atomic acceptance. Materialize Goal sessions explicitly,
+    // then switch and subscribe before goals.set.
+    if (sessionKey.value && pendingSessionIntent.value !== 'new_chat') {
+      return sessionKey.value
+    }
+    const sourceKey = sessionKey.value
+    const sourceIntent = pendingSessionIntent.value
+    const workspaceId = pendingWorkspaceId.value
+    const created = await rpc.call<{ key?: string }>('sessions.create', {
+      agentId: agentIdFromSessionKey(sourceKey),
+      kind: 'webchat',
+      ...(workspaceId ? { workspaceId } : {}),
+    })
+    const key = String(created?.key || '').trim()
+    if (!key) throw new Error('failed to create a session for the goal')
+    // Creating the durable row may outlive this draft. Never let its completion
+    // navigate the operator away from the session/project they chose meanwhile.
+    if (
+      sessionKey.value !== sourceKey
+      || pendingSessionIntent.value !== sourceIntent
+      || pendingWorkspaceId.value !== workspaceId
+    ) return ''
+    if (workspaceId) freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
+    await switchToSession(key)
+    return key
+  },
+  ensureSubscribed: async key => {
+    if (key !== sessionKey.value) return false
+    if (livePhase.value === 'ready') return true
+    const outcome = await subscribeSession()
+    return outcome.authoritative
+  },
+  onSetAccepted: projectAcceptedGoalMessage,
+  notify: message => pushToast(message, { duration: 6000 }),
+})
+applyGoalSnapshot = snapshot => { chatGoals.applyHydration(snapshot) }
+const {
+  draftArmed: goalDraftArmed,
+  goal: currentGoalRun,
+  activeGoal: activeGoalRun,
+  lastGoal: lastGoalRun,
+  busy: goalBusy,
+  connectionTakeoverAvailable: goalConnectionTakeoverAvailable,
+  reattaching: goalReattaching,
+  elapsed: goalElapsed,
+  lastGoalElapsed: goalLastElapsed,
+  arm: armGoalMode,
+  disarm: disarmGoalMode,
+  startGoal,
+  edit: editGoal,
+  pause: pauseGoal,
+  resume: resumeGoal,
+  takeOverConnection: takeOverGoalConnection,
+  clear: clearGoalMutation,
+  status: goalStatus,
+} = chatGoals
+disarmGoalDraftForMetaRestore = disarmGoalMode
+
+async function editGoalFromRibbon(
+  objective: string,
+  settle?: (accepted: boolean) => void,
+) {
+  let accepted = false
+  try {
+    accepted = await editGoal(objective)
+    if (accepted) {
+      pushToast(t('chat.goal.editNextTurn'), { tone: 'info', duration: 6000 })
+    }
+    return accepted
+  } finally {
+    settle?.(accepted)
+  }
+}
+
+async function clearGoal() {
+  const requestedSessionKey = sessionKey.value
+  const requestedGoal = currentGoalRun.value
+  if (!requestedGoal || goalBusy.value) return false
+  const requestedGoalIdentity = {
+    goalId: requestedGoal.goalId,
+    sessionId: requestedGoal.sessionId,
+    epoch: requestedGoal.epoch,
+  }
+  const approved = await confirm({
+    title: t('chat.goal.removeConfirmTitle'),
+    body: t('chat.goal.removeConfirmBody'),
+    primaryLabel: t('chat.goal.removeConfirmPrimary'),
+    primaryClass: 'btn--danger',
+  })
+  if (!approved) return false
+  const current = currentGoalRun.value
+  if (
+    sessionKey.value !== requestedSessionKey
+    || !current
+    || current.goalId !== requestedGoalIdentity.goalId
+    || current.sessionId !== requestedGoalIdentity.sessionId
+    || current.epoch !== requestedGoalIdentity.epoch
+  ) return false
+  return clearGoalMutation()
+}
+
+// The transcript-tail outcome line only renders terminal goals; active and
+// paused goals stay on the ribbon above the composer.
+const goalOutcomeGoal = computed(() => lastGoalRun.value)
+// Settlement follows transcript persistence in the terminal lifecycle, so a
+// normal completed Goal binds directly to its final assistant row. If that row
+// does not exist (for example, a legacy snapshot or failed final summary), keep
+// the compatible transcript-tail outcome instead of hiding it indefinitely.
+const goalOutcomeHasMessageAnchor = computed(() => (
+  goalHasRenderedTerminalAnchor(goalOutcomeGoal.value, renderedMessages.value)
+))
+
 const chatSlashCommands = useChatSlashCommands({
   rpc,
   catalogCallOptions: optionalSessionRpcCallOptions,
@@ -2138,6 +2470,7 @@ const chatSlashCommands = useChatSlashCommands({
     resetCurrentSessionAfterSlash()
     resetSessionArtifacts()
     chatPlans.reset()
+    chatGoals.reset()
   },
   setCompactInFlight,
   showCompactStatus,
@@ -2159,10 +2492,17 @@ const chatSlashCommands = useChatSlashCommands({
   dispatchPlanPrompt: (prompt: string, composerText: string) => {
     dispatchPlanComposerPrompt(prompt, composerText)
   },
-  activatePlanMode: () => chatPlans.setMode('plan'),
+  activatePlanMode: activatePlanComposerMode,
   planModeAvailable: () => planUiAvailable.value,
   codingModeEnabled,
   setCodingModeEnabled,
+  armGoal: activateGoalComposerMode,
+  startGoal,
+  goalStatus,
+  goalEdit: editGoal,
+  goalPause: pauseGoal,
+  goalResume: resumeGoal,
+  goalClear: clearGoal,
 })
 const {
   slashOpen,
@@ -2203,13 +2543,15 @@ const {
 } = chatComposerShortcuts
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
+const activeSteerCapability = computed<ChatSteerCapability | null>(() => {
+  const task = runStatus.value.task
+  return task?.steer_capability || task?.steerCapability || null
+})
+
 const chatSend = useChatSend({
   rpc,
   supportsMethod: method => rpc.supportsMethod(method),
-  activeSteerCapability: computed(() => {
-    const task = runStatus.value.task
-    return task?.steer_capability || task?.steerCapability || null
-  }),
+  activeSteerCapability,
   inputText,
   messages,
   sessionKey,
@@ -2263,7 +2605,8 @@ const chatSend = useChatSend({
   enqueuePendingInput,
   enqueuePendingPayload,
   enqueueHiddenControl,
-  enqueuePendingSteerRetry,
+  enqueuePendingSteerAttempt,
+  steerDelivery,
   restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   executeSlashCommand,
@@ -2431,6 +2774,44 @@ const sameTurnSteerAvailable = computed(() => (
   isStreaming.value
   && chatSend.supportsSameTurnSteer()
 ))
+
+function steerUnavailableReasonMessage(reason: SteerUnavailableReason): string {
+  switch (reason) {
+    case 'gatewayUnsupported':
+      return t('chat.pending.steerUnavailable.gatewayUnsupported')
+    case 'ensemble':
+      return t('chat.pending.steerUnavailable.ensemble')
+    case 'taskType':
+      return t('chat.pending.steerUnavailable.taskType')
+    case 'queueOnly':
+      return t('chat.pending.steerUnavailable.queueOnly')
+    case 'noActiveTurn':
+      return t('chat.pending.steerUnavailable.noActiveTurn')
+    case 'turnClosing':
+      return t('chat.pending.steerUnavailable.turnClosing')
+    case 'capabilityPending':
+      return t('chat.pending.steerUnavailable.capabilityPending')
+    case 'taskMismatch':
+      return t('chat.pending.steerUnavailable.taskMismatch')
+    case 'textUnsupported':
+      return t('chat.pending.steerUnavailable.textUnsupported')
+    default:
+      return t('chat.pending.steerUnavailable.generic')
+  }
+}
+
+const sameTurnSteerUnavailableMessage = computed(() => {
+  if (sameTurnSteerAvailable.value) return ''
+  const reason = steerUnavailableReason({
+    isStreaming: isStreaming.value,
+    methodAvailable: rpc.supportsMethod('sessions.steer.v2'),
+    modelRoutingMode: modelRoutingMode.value,
+    capability: activeSteerCapability.value,
+    activeTaskId: activeStreamTaskId.value,
+  })
+  return reason ? steerUnavailableReasonMessage(reason) : ''
+})
+
 const composerSameTurnSteerAvailable = computed(() => (
   sameTurnSteerAvailable.value
   && pendingAttachments.value.length === 0
@@ -2450,6 +2831,18 @@ async function onComposerSend() {
   // Serialize an existing-session mode mutation before accepting another
   // composer turn, so the send cannot race the collaboration CAS update.
   if (planModeBusy.value) return
+  // Goal draft mode: the composer text is the durable objective and the set
+  // mutation atomically accepts its first ordinary user turn.
+  if (goalDraftArmed.value) {
+    const goalText = inputText.value.trim()
+    if (!goalText) return
+    const started = await startGoal(goalText)
+    if (!started) return
+    disarmGoalMode()
+    inputText.value = ''
+    autoResizeTextarea()
+    return
+  }
   const target = replanTarget.value
   if (!target) {
     onSend()
@@ -2479,7 +2872,7 @@ dispatchQueuedItem = sendQueuedFollowup
 
 function takeVisiblePendingItem(index: number) {
   const item = pendingQueue.value[index]
-  if (!item || item.hiddenControl || item.deliveryState) return null
+  if (!item || item.hiddenControl || item.deliveryState || item.steerAttempt) return null
   pendingQueue.value.splice(index, 1)
   return item
 }
@@ -2494,10 +2887,22 @@ function editPendingMessage(index: number) {
   nextTick(() => composerRef.value?.focusTextarea())
 }
 
+const pendingSteerClicks = new WeakSet<ChatPendingItem>()
+
 async function steerPendingMessage(index: number) {
   const candidate = pendingQueue.value[index]
-  const item = beginPendingDelivery(index, candidate?.hiddenControl === true)
+  if (
+    candidate?.steerAttempt
+    && (
+      candidate.steerAttempt.phase === 'submitting'
+      || pendingSteerClicks.has(candidate)
+    )
+  ) return
+  const item = candidate?.steerAttempt
+    ? candidate
+    : beginPendingDelivery(index, candidate?.hiddenControl === true)
   if (!item) return
+  if (candidate?.steerAttempt) pendingSteerClicks.add(candidate)
 
   let outcome: ChatSendOutcome = 'retryable_failure'
   try {
@@ -2506,6 +2911,7 @@ async function steerPendingMessage(index: number) {
       : await sendQueuedSteer(item)
   } finally {
     settlePendingDelivery(item, outcome)
+    pendingSteerClicks.delete(item)
   }
 }
 
@@ -2552,6 +2958,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   aborted,
   messages,
   pendingQueue,
+  steerDelivery,
   usageAccum,
   usageModel,
   stream: chatStream,
@@ -2930,6 +3337,7 @@ const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession
 const composerPlaceholder = computed(() => {
   if (dockedPlanQuestionnaire.value) return t('chat.clarify.answerPlanQuestionnaire')
   if (replanActive.value) return t('chat.plan.revisePromptPlaceholder')
+  if (goalDraftArmed.value) return t('chat.goal.placeholder')
   if (collaboration.value.mode === 'plan') return t('chat.planMode.placeholder')
   if (isNewChatLanding.value) return t('chat.placeholderLanding')
   return isCompactViewport.value ? t('chat.placeholderCompact') : t('chat.placeholder')
@@ -2948,6 +3356,14 @@ const planUiAvailable = computed(() =>
   rpc.supportsMethod('plans.setMode')
   && rpc.supportsMethod('plans.capabilities'),
 )
+const goalUiAvailable = computed(() =>
+  rpc.supportsMethod('goals.set')
+  && rpc.supportsMethod('goals.capabilities'),
+)
+const goalComposerExisting = computed(() => (
+  currentGoalRun.value !== null
+  && !goalStatusIsTerminal(currentGoalRun.value.status)
+))
 const planCardPendingAction = computed<PlanCardAction | null>(() => {
   const action = planActionPending.value
   if (action === 'revise') return 'replan'
@@ -3068,7 +3484,18 @@ const activeProjectComposerBlockMessage = computed(() => {
 })
 
 const composerSendBlockedMessage = computed(() =>
-  modelImageSendBlockedMessage.value
+  (forkTransition.value
+    ? t(
+        forkTransition.value.phase === 'error'
+          ? 'chat.forkOpenFailed'
+          : forkTransition.value.phase === 'creating'
+            ? 'chat.forkCreating'
+            : forkTransition.value.phase === 'returning'
+              ? 'chat.forkReturning'
+              : 'chat.forkOpening',
+      )
+    : '')
+  || modelImageSendBlockedMessage.value
   || liveSendBlockedReason.value
   || activeProjectComposerBlockMessage.value,
 )
@@ -3124,18 +3551,48 @@ function onComposerStop() {
   onStop()
 }
 
+async function activatePlanComposerMode(): Promise<boolean> {
+  const accepted = await chatPlans.setMode('plan')
+  if (accepted) disarmGoalMode()
+  return accepted
+}
+
+async function activateGoalComposerMode(): Promise<boolean> {
+  if (
+    !goalUiAvailable.value
+    || goalComposerExisting.value
+    || goalBusy.value
+    || planModeBusy.value
+    || replanActive.value
+  ) return false
+  if (collaboration.value.mode === 'plan') {
+    const accepted = await chatPlans.setMode('default')
+    if (!accepted) return false
+  }
+  armGoalMode()
+  return true
+}
+
 function setCollaborationMode(mode: CollaborationMode) {
+  if (mode === 'plan') {
+    void activatePlanComposerMode()
+    return
+  }
   void chatPlans.setMode(mode)
 }
 
+const sessionTitles = useChatSessionTitles()
 const currentChatTitle = computed(() => {
-  const firstUser = messages.value.find(msg => msg.role === 'user' && stripTimePrefix(msg.text || '').trim())
-  if (firstUser) {
-    return truncate(stripTimePrefix(firstUser.text).replace(/\s+/g, ' ').trim(), 28)
-  }
-  const suffix = sessionKey.value.split(':').pop() || ''
-  if (!suffix || suffix === 'default') return t('chat.newChat')
-  return t('chat.chatWithSuffix', { suffix })
+  return resolveChatHeaderTitle(
+    sessionKey.value,
+    sessionTitles.value,
+    messages.value,
+    stripTimePrefix,
+    {
+      newChat: t('chat.newChat'),
+      chatWithSuffix: suffix => t('chat.chatWithSuffix', { suffix }),
+    },
+  )
 })
 
 const chatMarkdownExport = useChatMarkdownExport({
@@ -3507,26 +3964,167 @@ function closeDeliverables() {
 
 /* ── Fork ──────────────────────────────────────────────────────────── */
 
-// Whole-conversation fork from the tip: the backend copies the transcript
-// into a sibling session, then we navigate there the same way the session
-// switcher does (route query change → switchToSession).
-const forkInFlight = ref(false)
+function clearForkTransition(generation?: number) {
+  if (
+    generation !== undefined
+    && forkTransition.value?.generation !== generation
+  ) return
+  const clearedGeneration = generation ?? forkTransition.value?.generation
+  forkTransition.value = null
+  forkTransitionLifetime.invalidate(clearedGeneration)
+}
 
-async function forkConversation() {
-  const parentKey = sessionKey.value
-  if (!parentKey || forkInFlight.value) return
-  if (pendingSessionIntent.value === 'new_chat') return
-  forkInFlight.value = true
+function isForkTransitionActive(generation: number): boolean {
+  return Boolean(
+    chatViewActive
+    && !chatViewDisposed
+    && forkTransitionLifetime.isCurrent(generation)
+    && forkTransition.value?.generation === generation
+  )
+}
+
+function failForkTransition(
+  generation: number,
+  reason: NonNullable<ForkTransitionState['errorReason']>,
+  error: unknown,
+) {
+  if (!isForkTransitionActive(generation)) return
+  const transition = forkTransition.value!
+  console.warn('Fork child hand-off failed:', error instanceof Error ? error.message : error)
+  const firstFailure = transition.phase !== 'error'
+  forkTransition.value = {
+    ...transition,
+    phase: 'error',
+    errorReason: reason,
+  }
+  if (firstFailure) pushToast(t('chat.toast.forkOpenFailed'), { tone: 'warn' })
+}
+
+async function retryForkTransition() {
+  const transition = forkTransition.value
+  if (
+    !transition?.targetKey
+    || transition.phase !== 'error'
+    || !isForkTransitionActive(transition.generation)
+  ) return
+  const retryPhase = forkNavigationPhase(transition.targetKey, transition.parentKey)
+  forkTransition.value = {
+    ...transition,
+    phase: retryPhase,
+    errorReason: undefined,
+  }
   try {
-    const res = await rpc.call<{ key?: string }>('sessions.fork', { key: parentKey })
-    const childKey = typeof res?.key === 'string' ? res.key : ''
-    if (!childKey) throw new Error('sessions.fork returned no key')
-    router.push({ path: '/chat', query: { session: childKey } }).catch(() => {})
+    if (
+      sessionKey.value !== transition.targetKey
+      || readSessionFromUrl() !== transition.targetKey
+    ) {
+      const navigationFailure = await router.push({
+        path: '/chat',
+        query: { session: transition.targetKey },
+      })
+      if (!isForkTransitionActive(transition.generation)) return
+      if (navigationFailure && readSessionFromUrl() !== transition.targetKey) {
+        throw navigationFailure
+      }
+      return
+    }
+    if (livePhase.value === 'degraded') void retryLive()
+    void retryHistory()
+  } catch (error) {
+    failForkTransition(transition.generation, 'navigation', error)
+  }
+}
+
+async function returnToForkParent() {
+  const transition = forkTransition.value
+  if (!transition || !isForkTransitionActive(transition.generation)) return
+  if (
+    sessionKey.value === transition.parentKey
+    && readSessionFromUrl() === transition.parentKey
+  ) {
+    if (
+      transition.targetKey === transition.parentKey
+      && historySessionKey.value === transition.parentKey
+      && historyState.value.initialLoadStatus !== 'ready'
+    ) {
+      if (transition.phase === 'error') {
+        await retryForkTransition()
+        if (!isForkTransitionActive(transition.generation)) return
+      }
+      return
+    }
+    clearForkTransition(transition.generation)
+    return
+  }
+  forkTransition.value = {
+    ...transition,
+    targetKey: transition.parentKey,
+    phase: 'returning',
+    errorReason: undefined,
+  }
+  try {
+    const navigationFailure = await router.push({
+      path: '/chat',
+      query: { session: transition.parentKey },
+    })
+    if (!isForkTransitionActive(transition.generation)) return
+    if (navigationFailure && readSessionFromUrl() !== transition.parentKey) {
+      throw navigationFailure
+    }
+  } catch (error) {
+    failForkTransition(transition.generation, 'navigation', error)
+  }
+}
+
+async function forkConversation(throughTurnId?: string) {
+  const parentKey = sessionKey.value
+  if (!parentKey || forkTransition.value) return
+  if (pendingSessionIntent.value === 'new_chat' || isStreaming.value) return
+  const normalizedTurnId = throughTurnId?.trim() || undefined
+  const generation = forkTransitionLifetime.begin()
+  if (!generation) return
+  forkTransition.value = {
+    generation,
+    parentKey,
+    childKey: '',
+    targetKey: parentKey,
+    ...(normalizedTurnId ? { throughTurnId: normalizedTurnId } : {}),
+    phase: 'creating',
+    previewMessages: snapshotForkPreviewMessages(renderedMessages.value, normalizedTurnId),
+  }
+  try {
+    const request = forkRpcRequest(parentKey, normalizedTurnId)
+    const res = await rpc.call<ForkRpcResponse>(request.method, request.params)
+    if (!isForkTransitionActive(generation)) return
+    const childKey = validatedForkChildKey(res, normalizedTurnId)
+    if (sessionKey.value !== parentKey) {
+      clearForkTransition(generation)
+      return
+    }
+    forkTransition.value = {
+      ...forkTransition.value,
+      childKey,
+      targetKey: childKey,
+      phase: 'opening',
+    }
+    const navigationFailure = await router.push({
+      path: '/chat',
+      query: { session: childKey },
+    })
+    if (!isForkTransitionActive(generation)) return
+    if (navigationFailure && readSessionFromUrl() !== childKey) {
+      throw navigationFailure
+    }
   } catch (err) {
-    console.warn('Fork failed:', err)
-    pushToast(t('chat.toast.forkFailed'), { tone: 'danger' })
-  } finally {
-    forkInFlight.value = false
+    if (!isForkTransitionActive(generation)) return
+    const childCreated = Boolean(forkTransition.value?.childKey)
+    if (childCreated) {
+      failForkTransition(generation, 'navigation', err)
+    } else if (forkTransition.value?.generation === generation) {
+      console.warn('Fork failed:', err)
+      clearForkTransition(generation)
+      pushToast(t('chat.toast.forkFailed'), { tone: 'danger' })
+    }
   }
 }
 
@@ -4285,6 +4883,8 @@ onMounted(async () => {
 onUnmounted(() => {
   chatViewActive = false
   chatViewDisposed = true
+  forkTransitionLifetime.dispose()
+  forkTransition.value = null
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
   draftProjectHydration.invalidate()
@@ -4327,6 +4927,20 @@ useDocumentEvent('keydown', onDocumentKeydown)
 watch(() => route.query.session, async (newSession) => {
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
+  const transition = forkTransition.value
+  if (transition) {
+    const handoffAction = forkRouteHandoffAction(newSession, transition)
+    if (handoffAction === 'returning') {
+      forkTransition.value = {
+        ...transition,
+        targetKey: transition.parentKey,
+        phase: 'returning',
+        errorReason: undefined,
+      }
+    } else if (handoffAction === 'clear') {
+      clearForkTransition(transition.generation)
+    }
+  }
   if (newSession && typeof newSession === 'string') {
     recordSessionNavigationDiag('route.query.session', {
       from: sessionKey.value,
@@ -4336,6 +4950,54 @@ watch(() => route.query.session, async (newSession) => {
     await switchToSession(newSession)
   }
 })
+
+// A route switch briefly retains the parent's terminal history status. Require
+// the history composable to bind to the child key before treating `ready` as
+// hand-off completion, otherwise the preview would disappear one tick early.
+watch(
+  () => [
+    sessionKey.value,
+    historySessionKey.value,
+    historyState.value.initialLoadStatus,
+  ] as const,
+  ([activeKey, loadedKey, status]) => {
+    const transition = forkTransition.value
+    if (
+      !transition
+      || transition.phase === 'creating'
+      || !transition.targetKey
+      || activeKey !== transition.targetKey
+      || loadedKey !== transition.targetKey
+    ) return
+    if (status === 'ready') {
+      clearForkTransition(transition.generation)
+    } else if (status === 'error') {
+      failForkTransition(
+        transition.generation,
+        'history',
+        new Error('Child history failed to load'),
+      )
+    }
+  },
+)
+
+watch(
+  () => [sessionKey.value, livePhase.value] as const,
+  ([activeKey, phase]) => {
+    const transition = forkTransition.value
+    if (
+      transition?.phase !== 'creating'
+      && transition?.targetKey === activeKey
+      && phase === 'degraded'
+    ) {
+      failForkTransition(
+        transition.generation,
+        'live',
+        new Error('Child live subscription unavailable'),
+      )
+    }
+  },
+)
 
 // Entering the draft route resets to a clean draft for the requested agent.
 watch(() => [route.path, route.query.agent, route.query.project], async () => {

@@ -1771,22 +1771,25 @@ class ArtifactStore:
         source_session_id: str,
         target_session_id: str,
         target_session_key: str,
+        artifact_ids: set[str] | frozenset[str] | None = None,
     ) -> int:
-        """Duplicate every artifact owned by ``source_session_id`` into ``target_session_id``.
+        """Duplicate selected artifacts owned by ``source_session_id`` into the target.
 
         Used when a session is forked: the child transcript references each artifact by
         its stable id and a session-less download URL, but the store is session-scoped
         and ``resolve_for_download`` rejects a mismatched session id, so the child needs
-        its own copy. Each artifact keeps its id; the copied ``meta.json`` is rebound to
-        the child's session id/key and the material (plus any thumbnail) is materialized
-        under the child's session bucket. Idempotent and best-effort: already-copied or
-        unreadable artifacts are skipped. Returns the number of artifacts copied.
+        its own copy. ``artifact_ids`` can restrict this to the copied history's reachable
+        subset. Each artifact keeps its id; the copied ``meta.json`` is rebound to the
+        child's session id/key and the material (plus any thumbnail) is materialized under
+        the child's session bucket. Idempotent and best-effort: already-copied or unreadable
+        artifacts are skipped. Returns the number of artifacts copied.
         """
         source_session_id = _validate_non_empty("source_session_id", source_session_id)
         target_session_id = _validate_non_empty("target_session_id", target_session_id)
         target_session_key = _validate_non_empty("target_session_key", target_session_key)
         if target_session_id == source_session_id:
             return 0
+        selected_ids = None if artifact_ids is None else set(artifact_ids)
         copied = 0
         for meta_path in self._iter_session_meta_paths(source_session_id):
             try:
@@ -1794,6 +1797,8 @@ class ArtifactStore:
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if ref.session_id != source_session_id:
+                continue
+            if selected_ids is not None and ref.id not in selected_ids:
                 continue
             try:
                 if self._copy_one_artifact(ref, target_session_id, target_session_key):

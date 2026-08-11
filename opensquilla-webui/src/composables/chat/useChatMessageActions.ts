@@ -6,6 +6,7 @@ import type {
 } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
 import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
+import { turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
@@ -43,14 +44,17 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     if ((message.displayRole || message.role) === 'user') {
       return options.stripTimePrefix(message.text || '').trim()
     }
+    const outcome = turnOutcomePresentation(message.turnOutcome)
     const answer = resolveAssistantAnswer(
       message,
       message.timelineItems ?? [],
-      message.interrupted || message.terminalFailure
+      outcome === 'stopped' || outcome === 'interrupted' || message.interrupted
         ? 'interrupted'
-        : message.isStreaming
-          ? 'working'
-          : 'settled',
+        : outcome === 'timeout' || outcome === 'failed' || message.terminalFailure
+          ? 'failed'
+          : message.isStreaming
+            ? 'working'
+            : 'settled',
     )
     // The same structurally proven PlanRun answer shown outside the collapsed
     // activity must also be what Copy returns. Otherwise the compact completed
@@ -61,9 +65,15 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     ) {
       return options.sanitizeCopyText(answer.text)
     }
+    // Canonical is the fail-open presentation used by the message body. Keep
+    // its exact paragraph spacing instead of rebuilding it from timeline
+    // chunks, which can insert separators that are not visible on screen.
+    if (answer.source === 'canonical') {
+      return options.sanitizeCopyText(answer.text)
+    }
     // Tool-bearing turns render text as separate timeline segments; the raw
-    // message text concatenates them without separators, so rebuild from the
-    // segments to keep paragraph boundaries in the copied markdown.
+    // message text can be absent in older history, so rebuild only that
+    // source-less compatibility case from the available segments.
     const segmentTexts = (message.timelineItems || [])
       .filter((item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> => item.type === 'text')
       .map(item => options.sanitizeCopyText(item.rawText || ''))

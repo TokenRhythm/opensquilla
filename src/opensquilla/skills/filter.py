@@ -22,7 +22,11 @@ from opensquilla.skills.retrieval import HybridRetriever
 from opensquilla.skills.types import SkillSpec
 
 
-def build_skills_prompt(skills: list[SkillSpec]) -> str:
+def build_skills_prompt(
+    skills: list[SkillSpec],
+    *,
+    include_location: bool = False,
+) -> str:
     """Assemble the ``<available_skills>`` XML block.
 
     All skill-provided strings (``name``, ``description``, ``path``) are
@@ -40,7 +44,7 @@ def build_skills_prompt(skills: list[SkillSpec]) -> str:
         lines.append("  <skill>")
         lines.append(f"    <name>{xml_escape(skill.name)}</name>")
         lines.append(f"    <description>{xml_escape(skill.description)}</description>")
-        if skill.path:
+        if include_location and skill.path:
             lines.append(f"    <location>{xml_escape(str(skill.path))}</location>")
         lines.append("  </skill>")
     lines.append("</available_skills>")

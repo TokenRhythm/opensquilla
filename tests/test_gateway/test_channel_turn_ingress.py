@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sqlite3
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+import opensquilla.gateway.channel_dispatch as channel_dispatch_module
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
 from opensquilla.gateway._debounce import _DefaultDebounceCoordinator
 from opensquilla.gateway.attachment_ingest import AttachmentIngestResult
@@ -21,12 +25,25 @@ from opensquilla.gateway.channel_dispatch import (
     _channel_native_request_id,
     _deliver_runtime_channel_reply,
     _RuntimeChannelStreamRelay,
+    run_channel_dispatch,
 )
+from opensquilla.gateway.goal_service import GoalService
 from opensquilla.gateway.routing import RouteEnvelope, build_channel_route_envelope
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.gateway.websocket import get_registry
 from opensquilla.project_workspaces import project_path_key
+from opensquilla.session.goals import (
+    GoalCommandRequest,
+    GoalTurnContext,
+    StartGoalMutation,
+    new_goal,
+)
 from opensquilla.session.manager import SessionIntent, SessionManager
-from opensquilla.session.models import AgentTaskStatus
+from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
+    TranscriptEntry,
+)
 from opensquilla.session.storage import (
     SessionStorage,
     StaleEpochError,
@@ -193,6 +210,102 @@ def _assert_no_runtime_acceptance_state(runtime: TaskRuntime) -> None:
     assert runtime._running_by_session == {}
 
 
+async def _seed_idle_active_goal(stack: _ChannelIngressStack) -> Any:
+    """Create one settled Goal without installing process-local execution authority."""
+
+    session = await stack.manager.create(SESSION_KEY, agent_id="main")
+    task_id = "channel-goal-bootstrap-task"
+    message_id = "channel-goal-bootstrap-message"
+    objective = "Finish the channel-owned follow-up contract."
+    command = GoalCommandRequest(
+        source_scope="web:test-owner",
+        request_session_key=SESSION_KEY,
+        client_request_id=str(uuid.uuid4()),
+        action="set",
+        request_fingerprint=hashlib.sha256(b"channel-goal-bootstrap").hexdigest(),
+    )
+    goal = new_goal(
+        goal_id="channel-goal-id",
+        session_key=SESSION_KEY,
+        session_id=session.session_id,
+        session_epoch=session.epoch,
+        objective=objective,
+        task_id=task_id,
+        created_at_ms=100,
+    )
+    accepted = await stack.storage.accept_turn(
+        TranscriptEntry(
+            session_id=session.session_id,
+            session_key=SESSION_KEY,
+            message_id=message_id,
+            role="user",
+            content=objective,
+            created_at=100,
+        ),
+        expected_epoch=session.epoch,
+        updated_at=100,
+        task_record=AgentTaskRecord(
+            task_id=task_id,
+            session_key=SESSION_KEY,
+            agent_id="main",
+            source_kind="webui",
+            queue_mode="followup",
+            run_kind="session_turn",
+            status=AgentTaskStatus.QUEUED,
+            created_at=100,
+            updated_at=100,
+        ),
+        source_scope=command.source_scope,
+        request_session_key=SESSION_KEY,
+        client_request_id=command.client_request_id,
+        request_fingerprint=command.request_fingerprint,
+        goal_mutation=StartGoalMutation(goal=goal, command=command),
+    )
+    assert accepted.goal_context is not None
+    await stack.storage.update_agent_task(
+        task_id,
+        status=AgentTaskStatus.SUCCEEDED,
+        started_at=110,
+        finished_at=120,
+        terminal_reason="completed",
+    )
+    settled = await stack.storage.settle_goal_task(
+        accepted.goal_context,
+        max_turns=50,
+        runtime_budget_seconds=3_600,
+    )
+    assert settled is not None
+    assert settled.status == "active"
+    assert settled.active_task_id is None
+    return settled
+
+
+def _install_channel_goal_service(stack: _ChannelIngressStack) -> GoalService:
+    async def _discard_event(
+        _session_key: str,
+        _event_name: str,
+        _payload: dict[str, Any],
+    ) -> None:
+        return None
+
+    service = GoalService(
+        storage=stack.storage,
+        session_manager=stack.manager,
+        task_runtime=stack.runtime,
+        event_emitter=_discard_event,
+        subscription_manager=SimpleNamespace(),
+        config=SimpleNamespace(
+            execution_enabled=True,
+            max_turns=50,
+            runtime_budget_seconds=3_600,
+        ),
+    )
+    stack.runtime.set_goal_service(service)
+    stack.runtime.set_activation_listener(service.on_task_activation)
+    stack.runtime.set_lifecycle_listener(service.on_task_lifecycle)
+    return service
+
+
 @pytest.mark.asyncio
 async def test_channel_turn_atomically_creates_delivery_session_message_task_and_receipt(
     tmp_path: Path,
@@ -282,11 +395,7 @@ async def test_channel_reserve_waits_inside_atomic_session_admission(
             "collect_admission",
             observed_admission,
         )
-        admission_lock = stack.runtime._collect_admission_locks.setdefault(
-            SESSION_KEY,
-            asyncio.Lock(),
-        )
-        async with admission_lock:
+        async with original_admission(SESSION_KEY):
             accepting = asyncio.create_task(
                 _accept(stack, "reserve must remain behind admission")
             )
@@ -794,6 +903,118 @@ async def test_channel_project_conflict_precedes_workspace_unavailable(
         assert len(stack.received_runs) == 1
 
 
+@pytest.mark.asyncio
+async def test_channel_default_turn_claims_goal_without_replacing_web_lease(
+    tmp_path: Path,
+) -> None:
+    async with _open_stack(tmp_path / "channel-goal-claim.sqlite") as stack:
+        goal = await _seed_idle_active_goal(stack)
+        service = _install_channel_goal_service(stack)
+        principal = SimpleNamespace(
+            token_public_id="web-owner",
+            guest_owner_id=None,
+            is_owner=True,
+            role="operator",
+            scopes=frozenset({"operator.admin"}),
+        )
+        owner_connection_id = "web-owner-connection"
+        service._subscriptions.get_message_subscribers = lambda _key: {
+            owner_connection_id
+        }
+        get_registry().register(
+            SimpleNamespace(conn_id=owner_connection_id, principal=principal)
+        )
+        owner_lease = service._install_lease(
+            SimpleNamespace(
+                conn_id=owner_connection_id,
+                principal=principal,
+                agent_id="main",
+            ),
+            goal=goal,
+            source_kind="web",
+        )
+        try:
+            handle, _, _, replayed = await _accept(
+                stack,
+                "Apply this channel follow-up to the active Goal.",
+                native_message_id="native-channel-goal-claim",
+            )
+            assert handle is not None
+            assert replayed is False
+            await stack.wait_until_running()
+
+            assert len(stack.received_runs) == 1
+            context = GoalTurnContext.from_task_detail(
+                stack.received_runs[0].goal_context
+            )
+            assert context is not None
+            assert context.goal_id == goal.goal_id
+            assert context.objective_revision == goal.objective_revision
+            claimed = await stack.storage.get_goal(SESSION_KEY)
+            assert claimed is not None
+            assert claimed.active_task_id == handle.task_id
+            assert service._leases[SESSION_KEY] is owner_lease
+
+            stack.release_handler.set()
+            await stack.runtime.wait(handle.task_id, timeout=2.0)
+            settled = await stack.storage.get_goal(SESSION_KEY)
+            assert settled is not None
+            assert settled.active_task_id is None
+            assert settled.status == "active"
+            assert service._leases[SESSION_KEY] is owner_lease
+        finally:
+            stack.runtime.set_lifecycle_listener(None)
+            await service.close()
+            get_registry().unregister(owner_connection_id)
+
+
+@pytest.mark.asyncio
+async def test_channel_claim_without_owner_lease_defers_automatic_continuation(
+    tmp_path: Path,
+) -> None:
+    async with _open_stack(tmp_path / "channel-goal-no-owner.sqlite") as stack:
+        goal = await _seed_idle_active_goal(stack)
+        service = _install_channel_goal_service(stack)
+        stack.runtime.set_idle_listener(service.on_runtime_idle)
+        try:
+            assert service._leases == {}
+            handle, _, _, replayed = await _accept(
+                stack,
+                "Claim the Goal, but do not create channel execution authority.",
+                native_message_id="native-channel-goal-no-owner",
+            )
+            assert handle is not None
+            assert replayed is False
+            await stack.wait_until_running()
+            context = GoalTurnContext.from_task_detail(
+                stack.received_runs[0].goal_context
+            )
+            assert context is not None and context.goal_id == goal.goal_id
+            assert service._leases == {}
+
+            stack.release_handler.set()
+            await stack.runtime.wait(handle.task_id, timeout=2.0)
+            detached = None
+            for _ in range(200):
+                candidate = await stack.storage.get_goal(SESSION_KEY)
+                if candidate is not None and candidate.active_task_id is None:
+                    detached = candidate
+                    break
+                await asyncio.sleep(0.01)
+            assert detached is not None
+            assert detached.status == "active"
+            assert detached.pause_reason is None
+            snapshot = await service.snapshot(detached)
+            assert snapshot is not None
+            assert snapshot["continuationDeferredReason"] == "owner_disconnected"
+            assert service._leases == {}
+            assert len(stack.received_runs) == 1
+        finally:
+            stack.runtime.set_idle_listener(None)
+            stack.runtime.set_lifecycle_listener(None)
+            await service.close()
+
+
 def test_debounced_channel_native_request_id_is_stable_and_order_sensitive() -> None:
     first = _message("combined")
     first.metadata["_opensquilla_debounce_native_message_ids"] = ["message-a", "message-b"]
@@ -858,3 +1079,87 @@ async def test_debounce_partial_native_ids_use_distinct_whole_batch_fallbacks() 
         raw_content=second.message.content,
     )
     assert first_identity.client_request_id != second_identity.client_request_id
+
+
+@pytest.mark.asyncio
+async def test_debounce_registers_user_intent_before_goal_idle_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A received channel message outranks Goal work during its debounce wait."""
+
+    class _QueuedChannel(_FinalOnlyChannel):
+        supports_slash_commands = False
+
+        def __init__(self) -> None:
+            self.inbound: asyncio.Queue[IncomingMessage] = asyncio.Queue()
+
+        async def receive(self) -> IncomingMessage:
+            return await self.inbound.get()
+
+        async def send(self, _message: OutgoingMessage) -> None:
+            return None
+
+    async with _open_stack(tmp_path / "debounce-intent.sqlite") as stack:
+        channel = _QueuedChannel()
+        coordinator = _DefaultDebounceCoordinator()
+        dispatched = asyncio.Event()
+
+        async def _unexpected_fire(*_args: Any, **_kwargs: Any) -> None:
+            dispatched.set()
+
+        monkeypatch.setattr(
+            channel_dispatch_module,
+            "_dispatch_combined_message_after_debounce",
+            _unexpected_fire,
+        )
+        dispatch = asyncio.create_task(
+            run_channel_dispatch(
+                channel=channel,
+                turn_runner=object(),
+                session_manager=stack.manager,
+                session_key_builder=lambda _message: SESSION_KEY,
+                session_prefix="slack",
+                task_runtime=stack.runtime,
+                debounce_coordinator=coordinator,
+                debounce_window_s=60.0,
+            )
+        )
+        try:
+            message = _message("human input waiting in debounce")
+            message.metadata["is_group"] = False
+            await channel.inbound.put(message)
+            for _ in range(100):
+                if SESSION_KEY in coordinator._pending:
+                    break
+                await asyncio.sleep(0)
+            assert SESSION_KEY in coordinator._pending
+
+            followup = _message(
+                "second human input in the same batch",
+                native_message_id="native-message-790",
+            )
+            followup.metadata["is_group"] = False
+            await channel.inbound.put(followup)
+            for _ in range(100):
+                if len(coordinator._pending[SESSION_KEY].buffer) == 2:
+                    break
+                await asyncio.sleep(0)
+            assert len(coordinator._pending[SESSION_KEY].buffer) == 2
+            assert await stack.runtime.has_explicit_ingress_intent(SESSION_KEY)
+
+            # This is the exact gate used by Goal automatic continuation after
+            # a task settles. It must observe the already-arrived channel turn.
+            async with stack.runtime.collect_admission(SESSION_KEY):
+                async with stack.runtime.automatic_ingress_fence(SESSION_KEY) as allowed:
+                    assert allowed is False
+
+            await coordinator.cancel(SESSION_KEY)
+            assert dispatched.is_set() is False
+            assert await stack.runtime.has_explicit_ingress_intent(SESSION_KEY) is False
+            assert stack.runtime._ingress_intent_states == {}
+        finally:
+            dispatch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await dispatch
+            await coordinator.cancel_all()

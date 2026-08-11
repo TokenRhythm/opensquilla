@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.protocol import configured_provider_id
+from opensquilla.tools.types import is_goal_owned_main_default_turn
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
@@ -63,6 +64,9 @@ class RunPipelineRequest:
     base_prompt: str | tuple[str, str]
     attachments: list[dict[str, Any]]
     semantic_message: str | None = None
+    # Process-local semantic hint used only by routing and skill retrieval.
+    # It must never enter prompt text, metadata, transcripts, or wire payloads.
+    routing_hint: str | None = field(default=None, repr=False)
     ingress_pipeline_steps: list[PipelineStepRecord] | None = None
     prev_assistant_text: str | None = None
     prev_assistant_usage: dict[str, Any] | None = None
@@ -426,6 +430,18 @@ class PromptAssemblerStage:
         )
 
         # 3. Run pre-turn pipeline (model routing, skills, prompt cache, etc.)
+        routing_hint: str | None = None
+        goal_context_value = getattr(
+            inp.effective_tool_context,
+            "goal_context",
+            None,
+        )
+        if is_goal_owned_main_default_turn(inp.effective_tool_context):
+            from opensquilla.session.goals import GoalTurnContext
+
+            goal_context = GoalTurnContext.from_task_detail(goal_context_value)
+            if goal_context is not None and goal_context.automatic:
+                routing_hint = goal_context.objective_snapshot
         request = RunPipelineRequest(
             runtime_message=inp.runtime_message,
             session_key=inp.session_key,
@@ -435,6 +451,7 @@ class PromptAssemblerStage:
             base_prompt=base_prompt,
             attachments=inp.attachments,
             semantic_message=inp.semantic_input,
+            routing_hint=routing_hint,
             ingress_pipeline_steps=inp.ingress_pipeline_steps,
             prev_assistant_text=router_context.get("prev_assistant_text"),
             prev_assistant_usage=router_context.get("prev_assistant_usage"),

@@ -336,7 +336,7 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     )
   })
 
-  it('copies only the terminal answer from an ordinary tool transcript', async () => {
+  it('copies the complete terminal Markdown answer from an ordinary tool transcript', async () => {
     const { api } = makeOptions([], text => text, () => 'AI generated')
 
     await api.copyMessage(renderedMessage({
@@ -383,7 +383,77 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     }))
 
     expect(copyTextWithFallback).toHaveBeenCalledWith(
-      '## Final answer\n\nAI generated',
+      'Preparing.\n\n---\n\n## Final answer\n\nAI generated',
+    )
+  })
+
+  it('fails open to the complete visible transcript when the turn timed out', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Working.Partial delivery.',
+      turnOutcome: { turnId: 'turn-timeout', status: 'timeout' },
+      timelineItems: [
+        { type: 'text', key: 'work', html: 'Working.', rawText: 'Working.' },
+        {
+          type: 'tool-group',
+          key: 'request',
+          group: {
+            groupId: 'request',
+            operationKey: 'web.read',
+            label: 'Read',
+            iconName: 'search',
+            calls: [{
+              toolId: 'request',
+              renderKey: 'request',
+              name: 'http_request',
+              displayName: 'Request',
+              inputRaw: '{}',
+              inputPreview: '',
+              isRunning: false,
+              status: 'success',
+              isError: false,
+              result: 'ok',
+              resultPreview: 'ok',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: false,
+            status: 'success',
+          },
+        },
+        {
+          type: 'text',
+          key: 'partial',
+          html: 'Partial delivery.',
+          rawText: 'Partial delivery.',
+        },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith(
+      'Working.Partial delivery.\n\nAI generated',
+    )
+  })
+
+  it('does not add paragraph breaks when canonical text already owns spacing', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Working.\n\nPartial delivery.',
+      timelineItems: [
+        { type: 'text', key: 'work', html: 'Working.', rawText: 'Working.\n\n' },
+        { type: 'text', key: 'partial', html: 'Partial delivery.', rawText: 'Partial delivery.' },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith(
+      'Working.\n\nPartial delivery.\n\nAI generated',
     )
   })
 })

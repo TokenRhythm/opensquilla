@@ -176,6 +176,25 @@ async def test_collaboration_mode_is_user_controlled_with_cas(
         )
 
 
+async def test_current_plan_hides_goal_internal_revision(
+    storage: SessionStorage,
+) -> None:
+    revision = await storage.create_plan_revision(
+        _revision(),
+        expected_parent_revision_id=None,
+    )
+    await storage.start_plan_run(
+        _run(
+            "run-goal-internal-plan",
+            revision.revision_id,
+            driver_kind="goal",
+            driver_id="goal-1",
+        )
+    )
+
+    assert await storage.get_current_plan_revision(SESSION_KEY) is None
+
+
 async def test_append_plan_revision_is_atomic_immutable_and_idempotent(
     storage: SessionStorage,
 ) -> None:

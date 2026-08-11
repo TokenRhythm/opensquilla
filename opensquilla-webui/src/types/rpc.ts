@@ -125,6 +125,11 @@ export type RawSessionListEntry = RawSessionItem | string
 export interface SessionsListResponse {
   sessions?: RawSessionListEntry[]
   keys?: RawSessionListEntry[]
+  /** Number of rows returned in this page. */
+  count?: number
+  /** Exact number of sessions visible to the caller, independent of page size. */
+  totalCount?: number
+  total_count?: number
 }
 
 export interface ProjectWorkspaceItem {
@@ -405,6 +410,9 @@ export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   current_plan?: unknown
   activePlanRun?: import('./plans').PlanRunSnapshot | null
   active_plan_run?: unknown
+  goal?: unknown
+  goalSnapshotStreamSeq?: number | null
+  goal_snapshot_stream_seq?: number | null
   pendingUserInputs?: unknown[]
   pending_user_inputs?: unknown[]
 }
@@ -654,6 +662,8 @@ export interface CompactionPayload extends SessionEventPayload {
     | (string & {})
   compacted?: boolean
   detail?: string
+  reason?: string
+  skip_reason?: string
   source?: string
   phase?: string
   compaction_id?: string
@@ -774,6 +784,7 @@ export interface RpcEventMap {
   'session.event.state_change': SessionEventPayload
   'session.event.run_heartbeat': SessionEventPayload
   'session.event.compaction': CompactionPayload
+  'session.event.goal': SessionEventPayload
   'session.event.warning': SessionEventPayload
   'session.event.input_disposition': InputDispositionPayload
   'session.epoch_changed': SessionEventPayload

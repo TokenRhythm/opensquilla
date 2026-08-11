@@ -89,8 +89,8 @@ def test_nano_usd_conversion_is_decimal_and_bounded() -> None:
         usd_to_nanos("10000000000")
 
 
-def test_session_schema_version_includes_plans_and_meta_launch_storage() -> None:
-    assert SCHEMA_VERSION == 18
+def test_session_schema_version_includes_plans_meta_launch_and_goals() -> None:
+    assert SCHEMA_VERSION == 20
 
 
 async def test_initialize_cutover_snapshots_legacy_totals_once(tmp_path: Path) -> None:

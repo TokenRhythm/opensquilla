@@ -172,12 +172,28 @@ describe('RunTrace activity presentation', () => {
     expect(mediaRule).not.toContain('translateX(-')
   })
 
-  it('keeps the running activity icon static so the header dot is the only loop', () => {
+  it('gives the running activity icon a local reduced-motion-safe heartbeat', () => {
     const runningIconRule = ruleBody('.tool-timeline--activity .tool-row__activity-icon--running')
     expect(runningIconRule).toContain('color: var(--accent);')
-    expect(runningIconRule).not.toContain('animation')
-    // No dangling keyframes or reduced-motion overrides for the removed pulse.
-    expect(runTraceSource).not.toContain('activity-tool-icon-pulse')
+    expect(runningIconRule).toContain(
+      'animation: activity-tool-breathe var(--dur-pulse) var(--ease-standard) infinite;',
+    )
+    expect(runTraceSource).toContain('@keyframes activity-tool-breathe')
+    const reducedMotionStart = runTraceSource.indexOf('@media (prefers-reduced-motion: reduce)')
+    expect(reducedMotionStart).toBeGreaterThanOrEqual(0)
+    expect(runTraceSource.slice(reducedMotionStart)).toContain(
+      '.tool-row__activity-icon--running',
+    )
+    expect(runTraceSource.slice(reducedMotionStart)).toContain('animation: none;')
+  })
+
+  it('animates calls appended inside an existing open tool group', () => {
+    expect(runTraceSource).toContain('name="tool-member"')
+    expect(runTraceSource).toContain('class="step-group-members"')
+    expect(ruleBody('.tool-member-enter-from')).toContain('opacity: 0;')
+    expect(ruleBody('.tool-member-enter-active,')).toContain(
+      'opacity var(--dur-base) var(--ease-out)',
+    )
   })
 
   const completedGroup = group('completed-group', [

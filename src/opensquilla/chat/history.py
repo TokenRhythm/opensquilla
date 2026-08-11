@@ -11,6 +11,7 @@ from opensquilla.meta_preflight_protocol import (
     display_text_from_preflight_confirmation,
     strip_preflight_confirmation_protocol_text,
 )
+from opensquilla.turn_outcome_projection import public_turn_context
 
 _LEGACY_PLAN_IMPLEMENTATION_PROMPT = re.compile(
     r'Implement the approved plan “.+”\. '
@@ -117,7 +118,8 @@ def transcript_entries_to_chat_messages(
             msg["reasoning_content"] = reasoning
         turn_context = getattr(entry, "turn_context", None)
         if isinstance(turn_context, dict):
-            msg["turn_context"] = dict(turn_context)
+            if public_context := public_turn_context(turn_context):
+                msg["turn_context"] = public_context
         if attachments:
             msg["attachments"] = attachments
         if artifacts:

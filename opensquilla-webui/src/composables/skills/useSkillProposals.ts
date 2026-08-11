@@ -3,6 +3,10 @@ import i18n from '@/i18n'
 import type { useRpcStore } from '@/stores/rpc'
 import { useConfirm } from '@/composables/useConfirm'
 import { useToasts } from '@/composables/useToasts'
+import {
+  createSkillMutationGate,
+  type SkillMutationGate,
+} from '@/composables/skills/useSkillMutationGate'
 import type { AutoEnabledSkill, Proposal, ProposalsSettings } from '@/types/skills'
 
 interface ProposalsListData {
@@ -57,6 +61,7 @@ const DEFAULT_PROPOSAL_SETTINGS: ProposalsSettings = {
 export function useSkillProposals(
   rpc: ReturnType<typeof useRpcStore>,
   loadData: () => Promise<void>,
+  mutationGate: SkillMutationGate = createSkillMutationGate(),
 ): SkillProposals {
   const { confirm } = useConfirm()
   const { pushToast } = useToasts()
@@ -92,6 +97,7 @@ export function useSkillProposals(
   }
 
   async function toggleAutoPropose(key: string, value: boolean) {
+    if (!mutationGate.acquire('proposal')) return
     try {
       const out = await rpc.call<ProposalSettingsData>('exec.proposals.settings.set', { [key]: value })
       if (out && out.status === 'error') {
@@ -102,10 +108,13 @@ export function useSkillProposals(
       await loadData()
     } catch (err) {
       pushToast(t('cronSkills.proposals.toastSettingsFailed', { reason: (err as Error).message }), { tone: 'danger' })
+    } finally {
+      mutationGate.release('proposal')
     }
   }
 
   async function setAutoEnableRisk(value: string) {
+    if (!mutationGate.acquire('proposal')) return
     try {
       const out = await rpc.call<ProposalSettingsData>('exec.proposals.settings.set', { auto_enable_max_risk: value })
       if (out && out.status === 'error') {
@@ -115,6 +124,8 @@ export function useSkillProposals(
       proposalsSettings.value = out.settings || proposalsSettings.value
     } catch (err) {
       pushToast(t('cronSkills.proposals.toastSettingsFailed', { reason: (err as Error).message }), { tone: 'danger' })
+    } finally {
+      mutationGate.release('proposal')
     }
   }
 
@@ -133,6 +144,7 @@ export function useSkillProposals(
   }
 
   async function acceptProposal(proposalId: string) {
+    if (!mutationGate.acquire('proposal')) return
     try {
       let data = await rpc.call<ProposalActionData>('exec.proposals.accept', { proposal_id: proposalId })
       if (data.status === 'refused' && data.reason && data.reason.indexOf('gates') !== -1) {
@@ -151,6 +163,8 @@ export function useSkillProposals(
       await loadData()
     } catch (err) {
       pushToast(t('cronSkills.proposals.toastAcceptFailed', { reason: (err as Error).message }), { tone: 'danger' })
+    } finally {
+      mutationGate.release('proposal')
     }
   }
 
@@ -161,6 +175,7 @@ export function useSkillProposals(
       primaryLabel: t('cronSkills.proposals.reject'),
     })
     if (!ok) return
+    if (!mutationGate.acquire('proposal')) return
     try {
       const data = await rpc.call<ProposalActionData>('exec.proposals.reject', { proposal_id: proposalId })
       if (data.status !== 'ok') {
@@ -170,6 +185,8 @@ export function useSkillProposals(
       await loadData()
     } catch (err) {
       pushToast(t('cronSkills.proposals.toastRejectFailed', { reason: (err as Error).message }), { tone: 'danger' })
+    } finally {
+      mutationGate.release('proposal')
     }
   }
 
@@ -180,6 +197,7 @@ export function useSkillProposals(
       primaryLabel: t('cronSkills.proposals.disable'),
     })
     if (!ok) return
+    if (!mutationGate.acquire('proposal')) return
     try {
       const data = await rpc.call<ProposalActionData>('exec.proposals.auto_enabled.disable', { name })
       if (data.status !== 'ok') {
@@ -189,6 +207,8 @@ export function useSkillProposals(
       await loadData()
     } catch (err) {
       pushToast(t('cronSkills.proposals.toastDisableFailed', { reason: (err as Error).message }), { tone: 'danger' })
+    } finally {
+      mutationGate.release('proposal')
     }
   }
 

@@ -25,12 +25,21 @@
     0 2px 0 color-mix(in srgb, var(--accent-secondary) 22%, transparent);
 }
 
-/* Neon rim on the primary action, the live connection pill, and new-chat.
-   This static rim is also the reduced-motion fallback for the breathing glow. */
+/* Neon rim on elevated accent surfaces. Sidebar navigation stays flat beside
+   the other destinations instead of reading as a floating primary control.
+   Semantic topbar states are excluded so stable status stays quiet. */
 [data-theme="synthwave"] .btn--primary,
-[data-theme="synthwave"] .conn-pill,
-[data-theme="synthwave"] .sidebar-new-session {
+[data-theme="synthwave"] .conn-pill:not(.topbar-state) {
   box-shadow: var(--elev-1), 0 0 16px color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+[data-theme="synthwave"] .topbar .topbar-state:is(
+  [data-state="info"],
+  [data-state="warning"],
+  [data-state="danger"]
+) {
+  box-shadow: var(--elev-1),
+              0 0 16px color-mix(in srgb, var(--topbar-state-channel) 34%, transparent);
 }
 
 /* Focus styling lives in tokens.css as --focus-ring/--focus-ring-inset overrides
@@ -39,12 +48,10 @@
 /* The breathing bloom is a dedicated overlay so we can animate OPACITY (GPU
    composited) instead of box-shadow (per-frame paint). Static and invisible by
    default; only the reduced-motion-gated animation fades it in and out. */
-[data-theme="synthwave"] .btn--primary,
-[data-theme="synthwave"] .sidebar-new-session {
+[data-theme="synthwave"] .btn--primary {
   position: relative;
 }
-[data-theme="synthwave"] .btn--primary::after,
-[data-theme="synthwave"] .sidebar-new-session::after {
+[data-theme="synthwave"] .btn--primary::after {
   content: "";
   position: absolute;
   inset: 0;
@@ -135,8 +142,7 @@
     animation: synthwave-grid 6s linear infinite; /* motion-allow */
   }
   /* A slow breathing neon bloom: OPACITY on the glow overlay only. */
-  [data-theme="synthwave"] .btn--primary::after,
-  [data-theme="synthwave"] .sidebar-new-session::after {
+  [data-theme="synthwave"] .btn--primary::after {
     animation: synthwave-breathe var(--dur-pulse) var(--ease-standard) infinite; /* motion-allow */
   }
 }

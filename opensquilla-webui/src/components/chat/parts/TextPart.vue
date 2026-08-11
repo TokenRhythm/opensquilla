@@ -206,26 +206,38 @@ watch(() => props.sources, decorate, { flush: 'post' })
   color: var(--text-muted);
 }
 .msg-ai-text :deep(pre) {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  background: var(--code-block-bg);
+  border: 1px solid var(--code-block-border);
   border-radius: var(--radius-md);
   padding: 0.625rem;
   overflow-x: auto;
   margin: 0.375rem 0;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
 }
 .msg-ai-text :deep(pre.code-block) {
   position: relative;
-  padding-top: 1.9rem;
+  padding-top: 2.375rem;
+  background: linear-gradient(
+    to bottom,
+    var(--code-block-header-bg) 0,
+    var(--code-block-header-bg) 1.75rem,
+    var(--code-block-bg) 1.75rem,
+    var(--code-block-bg) 100%
+  );
 }
 
 .msg-ai-text :deep(pre.code-block > .code-lang) {
-  right: 2.75rem;
+  top: 0.375rem;
+  right: 2.5rem;
+  line-height: 1rem;
+  background: transparent;
+  color: var(--text-dim);
 }
 
 .msg-ai-text :deep(.code-copy-btn) {
   position: absolute;
-  top: 0.375rem;
-  right: 0.375rem;
+  top: 0;
+  right: 0.25rem;
   display: inline-flex;
   align-items: center;
   justify-content: center;

@@ -630,141 +630,119 @@ def _nested_tool_result_segments(entry: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _tool_result_segment_needs_raw_preservation(
-    segment: dict[str, Any],
-) -> bool:
-    if bool(segment.get("is_error")):
-        return True
-    status, reason, preservation_class = _execution_status_parts(
-        segment.get("execution_status") or segment.get("status")
-    )
-    if status in {
-        "error",
-        "failed",
-        "failure",
-        "cancelled",
-        "timed_out",
-        "timeout",
-        "pending",
-        "running",
-        "in_progress",
-        "unresolved",
-        "waiting",
-        "queued",
-        "requires_action",
-        "awaiting_approval",
-        "unknown",
-    }:
-        return True
-    if reason in {
-        "background_running",
-        "pending",
-        "queued",
-        "running",
-        "requires_action",
-        "awaiting_approval",
-        "unresolved",
-    }:
-        return True
-    if preservation_class in {"ephemeral", "unresolved"}:
-        return True
-    content = str(
-        segment.get("result")
-        or segment.get("content")
-        or ""
-    ).casefold()
-    return any(
-        marker in content
-        for marker in (
-            "traceback",
-            "exception:",
-            "error:",
-            "failed:",
-            "timed out",
+def _execution_status_is_live(value: Any) -> bool:
+    status, reason, preservation_class = _execution_status_parts(value)
+    return bool(
+        status in {
+            "pending",
+            "running",
+            "in_progress",
             "unresolved",
-        )
-    )
-
-
-def _tool_result_needs_raw_preservation(entry: dict[str, Any]) -> bool:
-    nested = _nested_tool_result_segments(entry)
-    if nested:
-        return any(
-            _tool_result_segment_needs_raw_preservation(segment)
-            for segment in nested
-        )
-    if not _is_tool_result_entry(entry):
-        return False
-    return _tool_result_segment_needs_raw_preservation(entry)
-
-
-def _semantic_protected_tail_start(entries: list[dict[str, Any]]) -> int:
-    """Return the earliest raw entry protected by default safety rules."""
-
-    protected: set[int] = set()
-    latest_assistant = next(
-        (
-            index
-            for index in range(len(entries) - 1, -1, -1)
-            if entries[index].get("role") == "assistant"
-        ),
-        None,
-    )
-    if latest_assistant is not None:
-        protected.add(latest_assistant)
-
-    tool_result_indices: list[int] = []
-    for index, entry in enumerate(entries):
-        nested_count = len(_nested_tool_result_segments(entry))
-        if nested_count:
-            tool_result_indices.extend([index] * nested_count)
-        elif _is_tool_result_entry(entry):
-            tool_result_indices.append(index)
-    protected.update(tool_result_indices[-2:])
-    protected.update(
-        index
-        for index in tool_result_indices
-        if _tool_result_needs_raw_preservation(entries[index])
-    )
-
-    completed_call_ids: set[str] = set()
-    for entry in entries:
-        top_level_id = (
-            str(entry.get("tool_call_id") or "").strip()
-            if _is_tool_result_entry(entry)
-            else ""
-        )
-        if top_level_id:
-            completed_call_ids.add(top_level_id)
-        completed_call_ids.update(
-            str(
-                segment.get("tool_use_id")
-                or segment.get("id")
-                or ""
-            ).strip()
-            for segment in _nested_tool_result_segments(entry)
-            if str(
-                segment.get("tool_use_id")
-                or segment.get("id")
-                or ""
-            ).strip()
-        )
-    for index, entry in enumerate(entries):
-        tool_calls = entry.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        issued_ids = {
-            str(call.get("id") or call.get("tool_use_id") or "").strip()
-            for call in tool_calls
-            if isinstance(call, dict)
-            and str(call.get("type") or "").strip().lower()
-            in {"tool_use", "function"}
-            and str(call.get("id") or call.get("tool_use_id") or "").strip()
+            "waiting",
+            "queued",
+            "requires_action",
+            "awaiting_approval",
         }
-        if issued_ids - completed_call_ids:
-            protected.add(index)
+        or reason in {
+            "background_running",
+            "pending",
+            "queued",
+            "running",
+            "requires_action",
+            "awaiting_approval",
+            "unresolved",
+        }
+        or preservation_class in {"ephemeral", "unresolved"}
+    )
 
-    return min(protected) if protected else len(entries)
+
+def _api_round_requires_raw(entries: list[dict[str, Any]]) -> bool:
+    """Return whether the latest physical round still has live protocol state."""
+
+    pending_ids: set[str] = set()
+    unidentified_calls = 0
+    unstructured_call_open = False
+
+    for entry in entries:
+        nested_results = _nested_tool_result_segments(entry)
+        tool_calls = entry.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for segment in tool_calls:
+                if not isinstance(segment, dict):
+                    continue
+                segment_type = str(segment.get("type") or "").strip().lower()
+                segment_id = str(
+                    segment.get("tool_use_id") or segment.get("id") or ""
+                ).strip()
+                is_result = segment_type == "tool_result" or "result" in segment
+                is_call = bool(
+                    segment_type in {"tool_use", "function"}
+                    or isinstance(segment.get("function"), dict)
+                    or (
+                        not segment_type
+                        and not is_result
+                        and segment_id
+                        and any(key in segment for key in ("name", "arguments", "input"))
+                    )
+                )
+                if is_call:
+                    if segment_id:
+                        pending_ids.add(segment_id)
+                    else:
+                        unidentified_calls += 1
+                    continue
+                if is_result:
+                    if _execution_status_is_live(
+                        segment.get("execution_status") or segment.get("status")
+                    ):
+                        return True
+                    if segment_id:
+                        pending_ids.discard(segment_id)
+                    elif unidentified_calls > 0:
+                        unidentified_calls -= 1
+        elif _is_assistant_tool_call_entry(entry):
+            unstructured_call_open = True
+
+        if _is_tool_result_entry(entry) and not nested_results:
+            if _execution_status_is_live(
+                entry.get("execution_status") or entry.get("status")
+            ):
+                return True
+            result_id = str(entry.get("tool_call_id") or "").strip()
+            if result_id:
+                pending_ids.discard(result_id)
+            elif unidentified_calls > 0:
+                unidentified_calls -= 1
+            unstructured_call_open = False
+
+    last = entries[-1] if entries else None
+    unanswered_user = bool(
+        last is not None
+        and last.get("role") == "user"
+        and not _is_tool_result_entry(last)
+    )
+    return bool(
+        unanswered_user
+        or pending_ids
+        or unidentified_calls > 0
+        or unstructured_call_open
+    )
+
+
+def _semantic_protected_tail_start(
+    entries: list[dict[str, Any]],
+) -> int:
+    """Return the earliest entry required for live protocol state.
+
+    Terminal diagnostics and final answers are quality concerns. The natural
+    half-window tail and profile policy normally retain them, but only an
+    incomplete latest physical round participates in the mandatory cut.
+    """
+
+    rounds = _api_round_groups(entries)
+    if not rounds or not _api_round_requires_raw(rounds[-1]):
+        return len(entries)
+    return len(entries) - len(rounds[-1])
 
 
 def _retreat_to_turn_boundary(entries: list[dict[str, Any]], cut: int) -> int:
@@ -1243,10 +1221,18 @@ def _summarize_tool_calls_for_llm(tool_calls: Any) -> str:
             result = segment.get("result", "")
             rendered = result if isinstance(result, str) else _json_text(result)
             digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:16]
+            status, reason, _preservation_class = _execution_status_parts(
+                segment.get("execution_status") or segment.get("status")
+            )
+            status_fields = [
+                *([f"status={status}"] if status else []),
+                *([f"reason={reason}"] if reason else []),
+            ]
             lines.append(
                 "- tool_result "
                 f"{segment.get('tool_use_id') or 'unknown'}: "
                 f"is_error={bool(segment.get('is_error'))} "
+                f"{' '.join(status_fields)} "
                 f"chars={len(rendered)} sha256={digest} "
                 f"preview={_preview_text(rendered)!r}"
             )
@@ -1259,6 +1245,24 @@ def _summarize_tool_calls_for_llm(tool_calls: Any) -> str:
     return "\n".join(lines)
 
 
+def _top_level_tool_result_status(entry: dict[str, Any]) -> str:
+    if not _is_tool_result_entry(entry) or _nested_tool_result_segments(entry):
+        return ""
+    status, reason, _preservation_class = _execution_status_parts(
+        entry.get("execution_status") or entry.get("status")
+    )
+    tool_call_id = str(entry.get("tool_call_id") or "").strip()
+    if not tool_call_id and not status and not reason and not entry.get("is_error"):
+        return ""
+    fields = [
+        f"tool_call_id={tool_call_id or 'unknown'}",
+        f"is_error={bool(entry.get('is_error'))}",
+        *([f"status={status}"] if status else []),
+        *([f"reason={reason}"] if reason else []),
+    ]
+    return "[tool result status] " + " ".join(fields)
+
+
 def _format_chunk_for_llm(chunk: list[dict[str, Any]]) -> str:
     """Format conversation entries into readable text for the compaction LLM."""
     lines: list[str] = []
@@ -1269,6 +1273,9 @@ def _format_chunk_for_llm(chunk: list[dict[str, Any]]) -> str:
         tool_summary = _summarize_tool_calls_for_llm(entry.get("tool_calls"))
         if tool_summary:
             rendered_parts.append(tool_summary)
+        top_level_status = _top_level_tool_result_status(entry)
+        if top_level_status:
+            rendered_parts.append(top_level_status)
         reasoning_content = entry.get("reasoning_content")
         if isinstance(reasoning_content, str) and reasoning_content:
             rendered_parts.append(
@@ -1290,6 +1297,12 @@ def _summarize_chunk_fallback(chunk: list[dict[str, Any]], policy: str) -> str:
         content = _summarize_if_envelope(str(entry.get("content") or ""))
         preview = content[:200] + ("..." if len(content) > 200 else "")
         lines.append(f"  [{role}]: {preview}")
+        tool_summary = _summarize_tool_calls_for_llm(entry.get("tool_calls"))
+        if tool_summary:
+            lines.extend(f"    {line}" for line in tool_summary.splitlines())
+        top_level_status = _top_level_tool_result_status(entry)
+        if top_level_status:
+            lines.append(f"    {top_level_status}")
     return "\n".join(lines)
 
 

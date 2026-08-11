@@ -6,7 +6,7 @@
     data-testid="chat-header-actions"
   >
     <div class="chat-header__identity">
-      <h1 class="chat-header__title chat-label" :title="sessionKey">{{ title }}</h1>
+      <h1 class="chat-header__title chat-label" :title="title">{{ title }}</h1>
       <button
         v-if="layout === 'wide'"
         ref="wideCopyRef"
@@ -22,30 +22,34 @@
       <span class="chat-header__copy-live" aria-live="polite">{{ copyLiveText }}</span>
     </div>
 
+    <span class="chat-header__spacer" aria-hidden="true"></span>
+
     <div v-if="layout === 'wide'" class="chat-header__actions">
       <button
         v-if="deliverableCount > 0"
         ref="wideDeliverablesRef"
         type="button"
-        class="chat-header__action chat-header__action--deliverables chat-share-btn chat-deliverables-btn"
+        class="chat-header__action chat-header__action--deliverables chat-share-btn chat-deliverables-btn topbar-state topbar-state--deliverables"
+        data-state="normal"
         :title="deliverablesLabel"
         :aria-label="deliverablesLabel"
         data-testid="chat-session-action-deliverables"
         @click="emit('open-deliverables')"
       >
-        <Icon name="download" :size="14" />
-        <span class="chat-share-btn__label">{{ deliverablesLabel }}</span>
+        <Icon name="fileText" :size="14" />
+        <span class="chat-share-btn__label">{{ t('chat.deliverables') }}</span>
+        <span class="chat-header__count-badge" aria-hidden="true">{{ deliverableBadge }}</span>
       </button>
       <button
         v-if="!shareMode"
         ref="wideShareRef"
         type="button"
         class="chat-header__action chat-share-btn"
-        :disabled="shareableMessageCount === 0"
+        :aria-disabled="!canShare"
         :title="shareLabel"
         :aria-label="shareAriaLabel"
         data-testid="chat-session-action-share"
-        @click="emit('start-share')"
+        @click="invoke('share')"
       >
         <Icon name="share" :size="14" />
         <span class="chat-share-btn__label">{{ t('chat.share') }}</span>
@@ -59,15 +63,21 @@
         type="button"
         class="chat-header__action chat-header__action--icon"
         :class="{
-          'chat-header__action--deliverables chat-deliverables-btn': primaryAction === 'deliverables',
+          'chat-header__action--deliverables chat-deliverables-btn topbar-state topbar-state--deliverables': primaryAction === 'deliverables',
         }"
         :title="primaryActionLabel"
         :aria-label="primaryActionLabel"
         :data-action="primaryAction"
+        :data-state="primaryAction === 'deliverables' ? 'normal' : undefined"
         data-testid="chat-header-primary-action"
         @click="invoke(primaryAction)"
       >
-        <Icon :name="primaryAction === 'deliverables' ? 'download' : 'share'" :size="16" />
+        <Icon :name="primaryAction === 'deliverables' ? 'fileText' : 'share'" :size="16" />
+        <span
+          v-if="primaryAction === 'deliverables'"
+          class="chat-header__count-badge chat-header__count-badge--corner"
+          aria-hidden="true"
+        >{{ deliverableBadge }}</span>
       </button>
 
       <button
@@ -86,6 +96,12 @@
         @keydown.up.prevent="openMenu('last')"
       >
         <Icon name="moreHorizontal" :size="18" />
+        <span
+          v-if="layout === 'tight' && deliverableCount > 0"
+          class="chat-header__count-badge chat-header__count-badge--corner topbar-state topbar-state--deliverables"
+          data-state="normal"
+          aria-hidden="true"
+        >{{ deliverableBadge }}</span>
       </button>
 
       <div
@@ -96,34 +112,43 @@
         role="menu"
         :aria-label="t('chat.sessionActions')"
         data-testid="chat-session-actions-menu"
+        data-chat-topbar-popover="session-actions"
         @keydown="onMenuKeydown"
       >
         <button
           v-if="menuActions.includes('deliverables')"
           type="button"
-          class="chat-header__menu-item"
+          class="chat-header__menu-item topbar-state topbar-state--deliverables"
+          data-state="normal"
           role="menuitem"
+          :aria-label="deliverablesLabel"
           data-testid="chat-session-action-deliverables"
           @click="invoke('deliverables', true)"
         >
-          <Icon name="download" :size="16" />
-          <span>{{ deliverablesLabel }}</span>
+          <Icon name="fileText" :size="16" />
+          <span>{{ t('chat.deliverables') }}</span>
+          <span class="chat-header__count-badge" aria-hidden="true">{{ deliverableBadge }}</span>
         </button>
         <button
           v-if="menuActions.includes('share')"
           type="button"
           class="chat-header__menu-item"
           role="menuitem"
-          :aria-disabled="shareableMessageCount === 0"
+          :aria-disabled="!canShare"
           data-testid="chat-session-action-share"
           @click="invoke('share', true)"
         >
           <Icon name="share" :size="16" />
           <span class="chat-header__menu-copy">
             <span>{{ t('chat.share') }}</span>
-            <small v-if="shareableMessageCount === 0">{{ t('chat.shareSendFirst') }}</small>
+            <small v-if="!canShare">{{ t('chat.shareSendFirst') }}</small>
           </span>
         </button>
+        <div
+          v-if="menuActions.length > 1"
+          class="chat-header__menu-divider"
+          role="separator"
+        ></div>
         <button
           type="button"
           class="chat-header__menu-item"
@@ -144,15 +169,20 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import {
+  resolveSessionHeaderLayout,
+  type SessionHeaderLayout,
+} from '@/utils/headerLayout'
 import type { IconName } from '@/utils/icons'
 
-type Layout = 'wide' | 'compact' | 'tight'
 type Action = 'deliverables' | 'share' | 'copy-session-key'
+
+const COARSE_POINTER_QUERY = '(pointer: coarse)'
 
 const props = defineProps<{
   title: string
-  sessionKey: string
   copyState: string | null
   copyIcon: IconName
   copyLiveText: string
@@ -176,24 +206,32 @@ const primaryActionRef = ref<HTMLButtonElement | null>(null)
 const wideDeliverablesRef = ref<HTMLButtonElement | null>(null)
 const wideShareRef = ref<HTMLButtonElement | null>(null)
 const wideCopyRef = ref<HTMLButtonElement | null>(null)
-const layout = ref<Layout>('wide')
+const layout = ref<SessionHeaderLayout>('wide')
 const menuOpen = ref(false)
-useDialogLayer(computed(() => menuOpen.value))
+useChatTopbarPopoverCoordination('session-actions', menuOpen)
+const menuIsTopmost = useDialogLayer(computed(() => menuOpen.value))
 let resizeObserver: ResizeObserver | null = null
+let coarsePointerMedia: MediaQueryList | null = null
+let layoutFrame: number | null = null
+let hasMeasuredLayout = false
 
 const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey'))
 const deliverablesLabel = computed(() => t('chat.deliverablesCount', { count: props.deliverableCount }))
-const shareLabel = computed(() => props.shareableMessageCount === 0
+const deliverableBadge = computed(() => props.deliverableCount > 99
+  ? '99+'
+  : String(props.deliverableCount))
+const canShare = computed(() => props.shareableMessageCount > 0)
+const shareLabel = computed(() => !canShare.value
   ? t('chat.shareSendFirst')
   : t('chat.shareSelectHint'))
-const shareAriaLabel = computed(() => props.shareableMessageCount === 0
+const shareAriaLabel = computed(() => !canShare.value
   ? t('chat.shareSendFirst')
   : t('chat.share'))
 
 const primaryAction = computed<Action | null>(() => {
   if (layout.value === 'tight') return null
   if (props.deliverableCount > 0) return 'deliverables'
-  if (!props.shareMode && props.shareableMessageCount > 0) return 'share'
+  if (!props.shareMode && canShare.value) return 'share'
   return null
 })
 
@@ -213,28 +251,62 @@ function isVisible(element: HTMLElement | null): element is HTMLElement {
   return Boolean(element && element.getClientRects().length > 0)
 }
 
+function actionForElement(element: Element | null): Action | null {
+  if (element === wideDeliverablesRef.value) return 'deliverables'
+  if (element === wideShareRef.value) return 'share'
+  if (element === wideCopyRef.value) return 'copy-session-key'
+  if (element === primaryActionRef.value) return primaryAction.value
+  if (!(element instanceof HTMLElement)) return null
+  const testId = element.dataset.testid
+  if (testId === 'chat-session-action-deliverables') return 'deliverables'
+  if (testId === 'chat-session-action-share') return 'share'
+  if (testId === 'chat-session-action-copy') return 'copy-session-key'
+  return null
+}
+
+function focusWideFallback() {
+  const fallback = wideDeliverablesRef.value
+    || wideShareRef.value
+    || wideCopyRef.value
+  fallback?.focus()
+}
+
 function syncLayout() {
   const width = rootRef.value?.getBoundingClientRect().width ?? 0
-  const next: Layout = width < 144
-    ? 'tight'
-    : (window.innerWidth <= 768 || width < 560 ? 'compact' : 'wide')
+  const next = resolveSessionHeaderLayout({
+    availableWidth: width,
+    previousLayout: hasMeasuredLayout ? layout.value : null,
+    mobile: window.innerWidth <= 768,
+    coarseOnly: coarsePointerMedia?.matches ?? false,
+  })
+  hasMeasuredLayout = true
   if (next === layout.value) return
-  const restoreFocus = menuOpen.value
-    && menuRef.value?.contains(document.activeElement)
+
+  const activeElement = document.activeElement
+  const focusedAction = actionForElement(activeElement)
+  const restoreHeaderFocus = Boolean(
+    activeElement instanceof Node && rootRef.value?.contains(activeElement),
+  )
   layout.value = next
   menuOpen.value = false
-  if (restoreFocus) {
+  if (restoreHeaderFocus) {
     void nextTick(() => {
+      if (focusedAction && focusAction(focusedAction)) return
       if (next !== 'wide') {
         menuTriggerRef.value?.focus()
         return
       }
-      const fallback = wideDeliverablesRef.value
-        || wideShareRef.value
-        || wideCopyRef.value
-      fallback?.focus()
+      focusWideFallback()
     })
   }
+}
+
+function scheduleLayout() {
+  if (layoutFrame != null) return
+  layoutFrame = window.requestAnimationFrame(() => {
+    layoutFrame = null
+    syncLayout()
+  })
 }
 
 function menuItems(): HTMLButtonElement[] {
@@ -263,7 +335,7 @@ function toggleMenu() {
 }
 
 function invoke(action: Action, fromMenu = false) {
-  if (action === 'share' && props.shareableMessageCount === 0) return
+  if (action === 'share' && !canShare.value) return
   // Dialogs capture their invoker synchronously. Move focus to a stable node
   // before the menu item is unmounted so close-focus never falls back to body.
   if (fromMenu) closeMenu(true)
@@ -324,10 +396,10 @@ useDocumentEvent('click', (event) => {
 })
 
 useDocumentEvent('keydown', (event) => {
-  if (event.key === 'Escape' && menuOpen.value) {
-    event.preventDefault()
-    closeMenu(true)
-  }
+  if (event.defaultPrevented || event.key !== 'Escape') return
+  if (!menuOpen.value || !menuIsTopmost.value) return
+  event.preventDefault()
+  closeMenu(true)
 })
 
 watch(() => [
@@ -339,18 +411,28 @@ watch(() => [
 })
 
 onMounted(() => {
+  coarsePointerMedia = typeof window.matchMedia === 'function'
+    ? window.matchMedia(COARSE_POINTER_QUERY)
+    : null
+  coarsePointerMedia?.addEventListener('change', scheduleLayout)
   syncLayout()
   if (typeof ResizeObserver !== 'undefined' && rootRef.value) {
-    resizeObserver = new ResizeObserver(syncLayout)
+    resizeObserver = new ResizeObserver(scheduleLayout)
     resizeObserver.observe(rootRef.value)
   }
-  window.addEventListener('resize', syncLayout)
+  window.addEventListener('resize', scheduleLayout)
 })
 
 onUnmounted(() => {
   resizeObserver?.disconnect()
   resizeObserver = null
-  window.removeEventListener('resize', syncLayout)
+  coarsePointerMedia?.removeEventListener('change', scheduleLayout)
+  coarsePointerMedia = null
+  window.removeEventListener('resize', scheduleLayout)
+  if (layoutFrame != null) {
+    window.cancelAnimationFrame(layoutFrame)
+    layoutFrame = null
+  }
 })
 
 defineExpose({ focusAction, closeMenu })
@@ -369,14 +451,14 @@ defineExpose({ focusAction, closeMenu })
 .chat-header__identity {
   align-items: center;
   display: flex;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   gap: var(--sp-1);
   min-width: 0;
 }
 
 .chat-header__title {
   color: var(--text);
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   font-size: 0.9375rem;
   font-weight: 500;
   line-height: 1.3;
@@ -385,6 +467,11 @@ defineExpose({ focusAction, closeMenu })
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.chat-header__spacer {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .chat-header__copy {
@@ -452,7 +539,7 @@ defineExpose({ focusAction, closeMenu })
   white-space: nowrap;
 }
 
-.chat-header__action:hover:not(:disabled),
+.chat-header__action:hover:not(:disabled):not([aria-disabled='true']),
 .chat-header__action:focus-visible,
 .chat-header__action.is-open {
   background: var(--bg-hover);
@@ -460,13 +547,10 @@ defineExpose({ focusAction, closeMenu })
   color: var(--text);
 }
 
-.chat-header__action:disabled {
+.chat-header__action:disabled,
+.chat-header__action[aria-disabled='true'] {
   cursor: not-allowed;
   opacity: 0.6;
-}
-
-.chat-header__action--deliverables {
-  color: var(--accent);
 }
 
 .chat-header__action--icon {
@@ -476,12 +560,50 @@ defineExpose({ focusAction, closeMenu })
   min-height: 44px;
   min-width: 44px;
   padding: 0;
+  position: relative;
   width: 44px;
 }
 
 .chat-header__action--icon-small {
   min-width: 30px;
   padding: 0.25rem;
+}
+
+.chat-header__action--deliverables.topbar-state {
+  background: var(--topbar-state-fill);
+  border-color: var(--topbar-state-border);
+  color: var(--topbar-state-channel);
+}
+
+.chat-header__count-badge {
+  align-items: center;
+  background: var(--bg-hover);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-full);
+  box-sizing: border-box;
+  color: var(--text-muted);
+  display: inline-flex;
+  font-size: 0.625rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  height: 18px;
+  justify-content: center;
+  line-height: 16px;
+  min-width: 18px;
+  padding-inline: 4px;
+}
+
+.chat-header__count-badge--corner {
+  inset-block-start: 1px;
+  inset-inline-end: 1px;
+  position: absolute;
+}
+
+.topbar-state--deliverables .chat-header__count-badge,
+.chat-header__count-badge.topbar-state--deliverables {
+  background: var(--topbar-state-fill);
+  border-color: var(--topbar-state-border);
+  color: var(--topbar-state-channel);
 }
 
 .chat-header__menu {
@@ -515,7 +637,7 @@ defineExpose({ focusAction, closeMenu })
   width: 100%;
 }
 
-.chat-header__menu-item:hover,
+.chat-header__menu-item:hover:not([aria-disabled='true']),
 .chat-header__menu-item:focus-visible {
   background: var(--bg-hover);
   color: var(--text);
@@ -525,6 +647,15 @@ defineExpose({ focusAction, closeMenu })
 .chat-header__menu-item[aria-disabled='true'] {
   cursor: not-allowed;
   opacity: 0.62;
+}
+
+.chat-header__menu-item > .chat-header__count-badge {
+  margin-inline-start: auto;
+}
+
+.chat-header__menu-divider {
+  border-top: 1px solid var(--border);
+  margin: var(--sp-1) var(--sp-2);
 }
 
 .chat-header__menu-copy,
@@ -541,10 +672,6 @@ defineExpose({ focusAction, closeMenu })
   color: var(--text-muted);
   font-size: var(--fs-xs);
   margin-top: 2px;
-}
-
-.chat-header[data-layout='tight'] .chat-header__identity {
-  flex-basis: 0;
 }
 
 @media (max-width: 768px) {

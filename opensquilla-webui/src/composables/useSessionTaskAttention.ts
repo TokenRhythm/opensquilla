@@ -224,7 +224,7 @@ export function createSessionTaskAttentionStore(
       markRead(sessionKey)
       return
     }
-    if (reason !== 'task_terminal') return
+    if (reason !== 'task_terminal' && reason !== 'cron_static_message') return
 
     const task = taskFrom(payload)
     const taskId = taskIdFrom(payload, task)

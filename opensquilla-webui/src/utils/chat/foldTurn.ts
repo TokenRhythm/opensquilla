@@ -311,6 +311,7 @@ export function foldTurn(
           ...(frame.source ? { source: frame.source } : {}),
           ...(frame.durability ? { durability: frame.durability } : {}),
           ...(frame.detail ? { detail: frame.detail } : {}),
+          ...(frame.reason ? { reason: frame.reason } : {}),
         }
         // Context maintenance emits started/observed/completed lifecycle
         // frames. Keep its first chronological position and update that row in

@@ -57,6 +57,9 @@
           </button>
         </div>
         <footer class="cron-card__actions">
+          <button class="cron-iconbtn" :aria-label="t('cronSkills.list.showRunHistory')" :title="t('cronSkills.list.showRunHistory')" @click="emit('select', job.id)">
+            <Icon name="clock" :size="15" />
+          </button>
           <button class="cron-iconbtn cron-iconbtn--accent" :aria-label="runActionLabel(job)" :title="runActionLabel(job)" :disabled="runningJobIds.has(job.id) || workspaceUnavailable(job)" @click="emit('run', job.id)">
             <span v-if="runningJobIds.has(job.id)" class="cron-spinner" aria-hidden="true"></span>
             <Icon v-else :name="isJobFailed(job) ? 'refresh' : 'send'" :size="15" />
@@ -98,6 +101,7 @@
             </td>
             <td class="cron-table__time cron-table__next">{{ job.enabled ? nextRunText(job, now) : t('cronSkills.list.paused') }}</td>
             <td class="cron-table__actions"><div class="cron-table__actions-content">
+              <button class="cron-iconbtn cron-iconbtn--sm" :aria-label="t('cronSkills.list.showRunHistory')" :title="t('cronSkills.list.showRunHistory')" @click="emit('select', job.id)"><Icon name="clock" :size="14" /></button>
               <button class="cron-iconbtn cron-iconbtn--sm cron-iconbtn--accent" :aria-label="runActionLabel(job)" :title="runActionLabel(job)" :disabled="runningJobIds.has(job.id) || workspaceUnavailable(job)" @click="emit('run', job.id)"><span v-if="runningJobIds.has(job.id)" class="cron-spinner" aria-hidden="true"></span><Icon v-else :name="isJobFailed(job) ? 'refresh' : 'send'" :size="14" /></button>
               <button class="cron-iconbtn cron-iconbtn--sm" :aria-label="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" :title="job.enabled ? t('cronSkills.list.pause') : t('cronSkills.list.resume')" @click="emit('toggle', job)"><Icon :name="job.enabled ? 'pause' : 'play'" :size="14" /></button>
               <button class="cron-iconbtn cron-iconbtn--sm" :aria-label="t('cronSkills.list.edit')" :title="t('cronSkills.list.edit')" @click="emit('edit', job)"><Icon name="edit" :size="14" /></button>
