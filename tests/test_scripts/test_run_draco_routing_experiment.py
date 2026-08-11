@@ -11521,7 +11521,11 @@ def test_agent_done_envelope_does_not_create_request_after_explicit_zero(
 
 
 def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
-    from opensquilla.eval import draco_experiment_artifacts, draco_usage_evidence
+    from opensquilla.eval import (
+        draco_experiment_artifacts,
+        draco_runtime_contract,
+        draco_usage_evidence,
+    )
 
     resume_runner = _load_resume_runner()
     assert runner.gateway_replay_validation_contract is (
@@ -11536,6 +11540,15 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     assert resume_runner.publish_experiment_config_artifacts is (
         draco_experiment_artifacts.publish_experiment_config_artifacts
     )
+    for name in (
+        "_sanitize_fingerprint_config",
+        "_sanitize_url_for_fingerprint",
+        "canonical_json_sha256",
+        "gateway_execution_contract",
+    ):
+        shared = getattr(draco_runtime_contract, name)
+        assert getattr(runner, name) is shared
+        assert getattr(resume_runner, name) is shared
     shared_usage_functions = (
         "build_stable_receipt_evidence",
         "deduplicate_stable_usage_receipts",
@@ -11666,6 +11679,59 @@ def test_shared_gateway_replay_validation_contract_returns_fresh_payload() -> No
     first["contract_fields"].append("mutation-must-not-leak")
 
     assert draco_experiment_artifacts.gateway_replay_validation_contract() == expected
+
+
+def test_shared_gateway_execution_contract_redacts_without_mutating_source() -> None:
+    from opensquilla.eval import draco_runtime_contract
+
+    source = {
+        "llm": {
+            "api_key": "must-not-leak",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "base_url": (
+                "https://user:password@example.test:8443/v1?token=secret#fragment"
+            ),
+            "proxy": "http://user:password@proxy.test:8080/path?token=secret",
+        },
+        "llm_profiles": {"default": {"password": "must-not-leak"}},
+        "llm_ensemble": {"credential_env_pool": ("KEY_A", "KEY_B")},
+        "model_catalog": {},
+        "models": [],
+        "squilla_router": {},
+        "sandbox": {"secret": "must-not-leak"},
+        "unrelated": {"api_key": "not-part-of-contract"},
+    }
+    original = deepcopy(source)
+
+    class Config:
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return source
+
+    contract = draco_runtime_contract.gateway_execution_contract(Config())
+
+    assert source == original
+    assert set(contract) == {
+        "llm",
+        "llm_profiles",
+        "llm_ensemble",
+        "model_catalog",
+        "models",
+        "squilla_router",
+        "sandbox",
+    }
+    assert contract["llm"] == {
+        "api_key": "<redacted>",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "base_url": "https://example.test:8443/v1",
+        "proxy": "http://proxy.test:8080/path",
+    }
+    assert contract["llm_profiles"]["default"]["password"] == "<redacted>"
+    assert contract["llm_ensemble"]["credential_env_pool"] == (
+        "KEY_A",
+        "KEY_B",
+    )
+    assert contract["sandbox"]["secret"] == "<redacted>"
 
 
 def test_all_serialized_cost_accounting_assignments_strip_private_provenance() -> None:

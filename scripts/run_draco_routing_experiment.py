@@ -120,6 +120,12 @@ from opensquilla.eval.draco_result_summary import (
     result_failures_and_coverage,
     summarize_result_facts,
 )
+from opensquilla.eval.draco_runtime_contract import (
+    _sanitize_fingerprint_config,  # noqa: F401 - compatibility re-export
+    _sanitize_url_for_fingerprint,
+    canonical_json_sha256,
+    gateway_execution_contract,
+)
 from opensquilla.eval.draco_selection_plan_evidence import (
     SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
     SELECTION_PLAN_EVIDENCE_ROW_FIELD,
@@ -15115,74 +15121,6 @@ def command_payload(args: argparse.Namespace) -> dict[str, Any]:
         "parsed_args": manifest_args(args),
         "replay_validation": gateway_replay_validation_contract(),
     }
-
-
-def canonical_json_sha256(value: Any) -> str:
-    serialized = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return f"sha256:{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"
-
-
-def _sanitize_url_for_fingerprint(value: str) -> str:
-    try:
-        parsed = urlparse(value)
-    except ValueError:
-        return "<configured>" if value else ""
-    if not parsed.scheme or not parsed.hostname:
-        return value
-    host = parsed.hostname
-    if parsed.port is not None:
-        host = f"{host}:{parsed.port}"
-    return parsed._replace(netloc=host, query="", fragment="").geturl()
-
-
-def _sanitize_fingerprint_config(value: Any, *, key: str = "") -> Any:
-    normalized_key = key.casefold().replace("-", "_")
-    if normalized_key.endswith("_env") or normalized_key.endswith("_env_pool"):
-        return value
-    if normalized_key in {
-        "api_key",
-        "authorization",
-        "credential",
-        "credentials",
-        "password",
-        "secret",
-    } or normalized_key.endswith(("_api_key", "_password", "_secret")):
-        return "<redacted>" if value else ""
-    if isinstance(value, Mapping):
-        return {
-            str(item_key): _sanitize_fingerprint_config(item_value, key=str(item_key))
-            for item_key, item_value in value.items()
-        }
-    if isinstance(value, list):
-        return [_sanitize_fingerprint_config(item, key=key) for item in value]
-    if isinstance(value, tuple):
-        return [_sanitize_fingerprint_config(item, key=key) for item in value]
-    if normalized_key in {"base_url", "proxy"} and isinstance(value, str):
-        return _sanitize_url_for_fingerprint(value)
-    return value
-
-
-def gateway_execution_contract(config: GatewayConfig) -> dict[str, Any]:
-    dumped = config.model_dump(mode="json")
-    relevant = {
-        key: dumped.get(key)
-        for key in (
-            "llm",
-            "llm_profiles",
-            "llm_ensemble",
-            "model_catalog",
-            "models",
-            "squilla_router",
-            "sandbox",
-        )
-    }
-    return _sanitize_fingerprint_config(relevant)
 
 
 def validate_formal_openrouter_runtime_transport(
