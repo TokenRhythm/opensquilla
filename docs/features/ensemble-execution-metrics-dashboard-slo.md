@@ -201,6 +201,34 @@ Aggregator usage 只覆盖 `final_request`，不覆盖失败、continuation 或 
 
 主要解决：仅在 receipt coverage 完整时计算 role totals，并阻止未知 usage 被零 token/零成本占位符稀释。
 
+### 3.9 Canary rollout 与单次物理预算
+
+| 字段族 | 输出条件与精度 | 语义 |
+| --- | --- | --- |
+| `canary_rollout_observed` | `selection_plan.canary_rollout.schema` 精确等于 `opensquilla.ensemble-canary-rollout/v1` | rollout receipt gate；未知 schema 不投影。 |
+| `canary_rollout_projection_complete` | schema 已识别；enabled/config bool、input/admitted 闭合、完整 task gate、固定 risk、全部 12 个 reason counts 与 rollout conservation 均合法 | 可消费本 turn admission/reason counts 的总 gate。 |
+| `canary_rollout_{enabled,config_valid}_observed`、对应 value | source 为 bool | 本 turn rollout 开关与 runtime config 重校验结果。 |
+| `canary_rollout_input_canary_count_observed`、`canary_rollout_input_canary_count` | 严格非负整数 | 进入 rollout filter 的 canary 数。 |
+| `canary_rollout_admitted_counts_observed`、`canary_rollout_{proposer,aggregator}_admitted_count` | 两个 role count 都是严格非负整数，且 proposer ≤ 1、aggregator = 0、role sum ≤ input count | 本 turn 按 role 放行的 canary 数；矛盾 counts 不输出。 |
+| `canary_task_gate_observed` | task gate 为 dict | canary task gate receipt。 |
+| `canary_task_{analyzer_source_eligible,schema_valid,confidence_eligible,eligible}_observed`、对应 value | source 为 bool | Analyzer 来源、schema、confidence 与总 gate。 |
+| `canary_task_risk_observed`、`canary_task_risk` | 固定 `low`、`medium`、`high`、`unknown` | 固定风险枚举；其他 token 不输出。 |
+| `canary_rollout_reason_counts_observed`、`canary_rollout_reason_{policy_invalid,rollout_disabled,decision_id_missing,task_ineligible,global_cohort_excluded,role_disabled,role_cohort_excluded,health_unhealthy,role_unsupported,reliability_coverage_insufficient,reliability_threshold_exceeded,candidate_cap}_count` | 全部固定 reason family 都有严格非负整数 | 各 gate family 的 count；不输出原始 reason 文本。 |
+| `canary_rollout_conservation_observed`、`canary_rollout_conservation_valid` | enabled/config、完整 task gate、input/admitted 与全部 reason counts 足以做有界校验 | 要求 input ≥ 1、`sum(12 reason counts) == 2 × input_canary_count - proposer_admitted`、`role_disabled >= input`、enabled 蕴含 config_valid、task eligible 蕴含 source/schema/confidence 三项 eligible；且 proposer admitted > 0 时 enabled、config_valid、task eligible 必须全为 true。 |
+| `canary_physical_budget_observed` | top-level budget schema 精确等于 `opensquilla.ensemble-canary-physical-budget/v1` | 单个 root decision 的 budget receipt gate。 |
+| `canary_physical_budget_accounting_observed` | limit、committed、reserved、rejected、refunded 全为严格非负整数 | budget 字段类型完整。 |
+| `canary_physical_budget_conservation_observed`、`canary_physical_budget_conservation_valid` | accounting observed | v1 要求 `limit == 1`、`committed + reserved <= limit`，且 `rejected > 0` 时 committed/reserved/refunded 至少一项 > 0；refunded/rejected 是累计结算事件，不进入 active balance。 |
+| `canary_physical_budget_projection_complete`、`canary_physical_budget_{limit,committed,reserved,rejected,refunded}` | accounting 完整且 conservation valid | 可用于精确 per-turn budget 聚合。 |
+| `canary_physical_budget_exhausted_observed`、`canary_physical_budget_exhausted` | projection complete；`rejected > 0` | 本 turn 是否至少有一次 reservation 被物理上限阻止。 |
+
+投影明确丢弃 policy/root hash、policy version、bucket、model/provider/deployment identity 和任意 reason 文本。畸形或未知 schema 只留下 observed/complete gate，不把不可信 count 当作 0 或 exact value。
+
+`reason_counts` 统计的是 role-scoped exclusion occurrence，不是 unique canary。Producer 只有发现至少一个 canary 才写 rollout receipt；每个 input canary 固定产生一个 aggregator `role_disabled` occurrence，每个未 admitted proposer 再产生一个 proposer exclusion occurrence，所以总数必须满足上述守恒式，也可能大于 `input_canary_count`。因此禁止用 reason/input 计算 rejection rate；`role_disabled` 同时包含固定的 aggregator 禁用，不能直接解释为 proposer 配置故障。
+
+这些字段只证明单个 terminal trace 内的筛选与物理上限。跨 turn 持久 cohort、promotion、自动回滚 decision/reason/outcome、post-rollback health 与自动回滚延迟仍 unavailable。
+
+主要解决：让 canary 是否被 gate、为何被固定家族拦截，以及单次物理请求硬上限是否生效可审计，同时不把 per-turn receipt 冒充持续 rollout 控制面。
+
 ## 4. Vendor-neutral dashboard panels
 
 | Panel | 过滤与字段 | 展示 / 聚合 | Missing evidence 规则 | 主要解决 |
@@ -215,8 +243,9 @@ Aggregator usage 只覆盖 `final_request`，不覆盖失败、continuation 或 
 | Quorum / cleanup / recovery | quorum、cleanup、proposer recovery fields | quorum reach、time-to-quorum p50/p95/p99、lingering、unproven close、recovery calls | 对应 observed/value 缺失即 unavailable | 主要解决：发现 quorum 后仍残留 worker/stream 或额外 physical calls。 |
 | Aggregator | stage、attempt kinds/outcomes、selected kind、physical counts、recovery state | stage success/degraded/exhausted、outcome mix、selected-kind mix、physical requests | 空预初始化 recovery block 不进 stage denominator；capped attempts 不进总量 SLO | 主要解决：把 aggregator recovery 的质量损失和调用放大可视化。 |
 | Role usage / cost / cache | proposer projection complete；aggregator final usage complete；top-level unknown | tokens、unknown ratio、observed billed cost、cache-hit share、coverage | 不完整 role totals 不补零；aggregator final cost 明确不是全 aggregator cost | 主要解决：在费用与 cache 面板中保留 usage 证据完整性。 |
+| Canary rollout / physical budget | rollout/task/reason observed fields；rollout/budget conservation 与 complete；budget exhausted | input/admitted、task gate、固定 reason family、config invalid、budget rejection/refund 与两类 conservation | admission/reason sums 只消费 rollout complete；budget totals 只消费 budget complete；字段级 rate 使用各自 observed gate；不展示 hash、bucket 或 identity | 主要解决：发现 canary gate 漂移、配置失效和单次物理上限异常。 |
 | Data quality / privacy | 所有 observed、projection complete、scan capped、trace cap、unexpected keys | coverage rates、cap rates、字段类型错误计数（由 ingestion 层）、cardinality | denominator 只用对应 evidence gate；禁止采集原始 trace | 主要解决：让 SLO 数据质量本身可审计。 |
-| Canary rollback | 无 v1 producer 字段 | 显示 `unavailable`，列出缺少 cohort/attempt/rollback evidence | 禁止用 `fallback_used` 或 aggregator fallback 代替 canary rollback | 主要解决：防止用普通 fallback 假装 canary 自动回滚闭环。 |
+| Canary automatic rollback | 无跨 turn 持久状态、rollback decision/outcome/timestamp | 显示 `unavailable`，列出缺少的持久 control-plane evidence | 禁止用 rollout rejection、budget exhausted、`fallback_used` 或 aggregator fallback 代替自动回滚 | 主要解决：防止用单 turn 安全门禁假装自动回滚闭环。 |
 
 ## 5. SLI / SLO 公式
 
@@ -381,11 +410,45 @@ Tokens 和 observed billed cost 使用相同 complete gate做 sum/mean/p50/p95/p
 
 主要解决：让 token、cache 和 billed cost 的趋势可用，同时阻止不完整 receipts 形成虚假成本下降。
 
-### 5.10 Canary rollback
+### 5.10 Canary rollout 与物理预算
 
-v1 没有 canary cohort、canary attempt、rollback decision、rollback reason 或 post-rollback outcome 字段，`fallback_used`、`aggregator_selected_kind` 和 model fallback 都不能替代 canary rollback。故 canary rollback rate、rollback latency、false rollback rate 和 post-rollback success rate全部 unavailable；相关自动告警必须保持禁用，canary 自动放量不得仅依赖本 schema。
+```text
+canary_config_valid_rate =
+  count(canary_rollout_config_valid_observed == true and canary_rollout_config_valid == true)
+  / count(canary_rollout_config_valid_observed == true)
 
-主要解决：阻止普通 fallback 指标被误用为 canary 安全闭环。
+canary_task_eligible_rate =
+  count(canary_task_eligible_observed == true and canary_task_eligible == true)
+  / count(canary_task_eligible_observed == true)
+
+canary_proposer_admission_share =
+  sum(canary_rollout_proposer_admitted_count | canary_rollout_projection_complete)
+  / sum(canary_rollout_input_canary_count | canary_rollout_projection_complete)
+
+canary_budget_conservation_rate =
+  count(canary_physical_budget_conservation_valid == true)
+  / count(canary_physical_budget_conservation_observed == true)
+
+canary_rollout_conservation_rate =
+  count(canary_rollout_conservation_valid == true)
+  / count(canary_rollout_conservation_observed == true)
+
+canary_budget_exhaustion_rate =
+  count(canary_physical_budget_exhausted == true)
+  / count(canary_physical_budget_exhausted_observed == true)
+```
+
+`canary_proposer_admission_share` 只在 rollout projection complete 且 input sum > 0 时计算；它是筛选比例，不是请求成功率。固定 reason family counts 也只在 projection complete events 中按字段求和，并与 input/admitted 趋势并列展示，不能转回原始 reason label。
+
+建议：config valid、rollout conservation 与 budget conservation 必须为 100%；任一 conservation false 立即 critical，任一 config invalid 在 config-valid observed 时立即 warning、连续两个 5 分钟窗口 critical。Budget exhaustion 表示硬上限成功阻止额外 reservation，先采用七日同小时基线，只在突然升高时 warning，不把它本身定义为业务失败。task eligibility 与 admission share 先做趋势，不设 promotion SLO。
+
+主要解决：验证 rollout 输入、固定 gate 与一请求硬上限确实按 producer 合同运行。
+
+### 5.11 Canary automatic rollback（unavailable）
+
+v1 现在有单 turn rollout 与 physical-budget receipt，但没有跨 turn 持久 cohort 状态、canary attempt outcome 关联、promotion/rollback decision、rollback reason、decision timestamp 或 post-rollback outcome。`canary_physical_budget_exhausted`、固定 rejection reasons、`fallback_used`、`aggregator_selected_kind` 和 model fallback 都不能替代自动回滚。因此 automatic rollback rate、false rollback rate、post-rollback success rate，尤其自动回滚延迟，仍全部 unavailable；相关自动告警必须保持禁用，canary 自动放量不得仅依赖本 schema。
+
+主要解决：阻止单 turn gate 或普通 fallback 被误用为跨 turn canary 安全闭环。
 
 ## 6. 告警阈值建议
 
@@ -404,7 +467,11 @@ v1 没有 canary cohort、canary attempt、rollback decision、rollback reason �
 | Runtime health | state/defer/never-strand `>3×baseline` | never-strand `>10%` / 15m | 对应 observed ≥20 | 主要解决：发现 health filter 频繁兜底。 |
 | Aggregator recovery | success `<95%` 或 degraded `>5%` | success `<90%` 或 degraded `>10%` | stage + terminal bool observed，≥20 | 主要解决：发现 aggregator recovery 不稳定。 |
 | Usage projection | complete coverage `<99%` / 30m | `<95%` / 15m | role container observed ≥100 | 主要解决：发现 role cost/cache 面板失真风险。 |
-| Canary rollback | disabled / unavailable | disabled / unavailable | 缺 producer evidence | 主要解决：避免伪造 canary rollback 告警。 |
+| Canary config | 任一 config invalid | 连续两个 5m 窗口存在 invalid | rollout/config-valid observed | 主要解决：发现 runtime canary policy 重校验失败。 |
+| Canary rollout conservation | 任一 conservation false | 立即 critical | rollout conservation observed | 主要解决：发现 admission、固定 reason counts 或 gate 状态自相矛盾。 |
+| Canary budget conservation | 任一 conservation false | 立即 critical | budget accounting/conservation observed | 主要解决：发现一请求硬上限 receipt 自相矛盾。 |
+| Canary budget exhaustion | `>3×七日同小时基线` | 只人工升级，不自动 rollback | exhausted observed ≥20 | 主要解决：发现额外 canary reservation 突增，同时避免把安全拒绝当失败。 |
+| Canary automatic rollback | disabled / unavailable | disabled / unavailable | 缺跨 turn producer evidence | 主要解决：避免伪造自动回滚和回滚延迟告警。 |
 
 ## 7. Privacy、retention 与 cardinality gates
 
@@ -412,7 +479,7 @@ v1 没有 canary cohort、canary attempt、rollback decision、rollback reason �
 
 2. 禁止采集 model/provider/deployment identity、prompt、output、reasoning、error text、response id、tenant/session/task/user id；也禁止把完整 `selection_plan`、`candidates`、`final_request` 或 `aggregator_recovery` 当作日志属性。主要解决：防止敏感内容和高基数 identity 进入指标系统。
 
-3. 可作 label 的 producer 字段仅限 `schema`、`terminal_outcome`、`execution_status`、`selection_family`，以及各自专用 series 中最多一个固定 enum（`task_analyzer_source_family`、`aggregator_selected_kind` 或 `trace_compact_json_bytes_cap_reason`）；所有 bool、counts、indices、bytes、tokens、cost 和 latency 必须是 value。主要解决：固定时序数据库的 label cardinality 上界，避免多个低基数字段相乘后失控。
+3. 可作 label 的 producer 字段仅限 `schema`、`terminal_outcome`、`execution_status`、`selection_family`，以及各自专用 series 中最多一个固定 enum（`task_analyzer_source_family`、`aggregator_selected_kind`、`trace_compact_json_bytes_cap_reason` 或 `canary_task_risk`）；所有 bool、counts、indices、bytes、tokens、cost 和 latency 必须是 value。Canary policy/root hash、bucket、model/provider/deployment identity 和 reason 文本一律禁止采集。主要解决：固定时序数据库的 label cardinality 上界，避免多个低基数字段相乘后失控。
 
 4. 未知枚举统一落入 producer 的 `unknown` 或 unavailable；下游不得保留原始 token作为新枚举值。主要解决：避免供应商错误码或模型名形成无限 label domain。
 
@@ -438,4 +505,4 @@ v1 没有 canary cohort、canary attempt、rollback decision、rollback reason �
 
 6. 在 2–4 周基线期只启用 data-quality、cleanup 和极端 failure 告警，随后再校准第 6 节百分比阈值。主要解决：减少无基线情况下的告警噪音。
 
-7. Canary promotion/rollback 必须由独立、已审计 producer 提供 cohort 与 rollback evidence；在此之前保持相关 SLO 和自动告警禁用。主要解决：避免把 ensemble fallback 当成 canary safety signal。
+7. Canary promotion/rollback 必须由独立、已审计且跨 turn 持久的 producer 提供 cohort、decision、timestamp 与 outcome evidence；在此之前保持 automatic rollback rate/latency SLO 和自动告警禁用。主要解决：避免把 per-turn rollout/budget receipt 或 ensemble fallback 当成 canary safety signal。

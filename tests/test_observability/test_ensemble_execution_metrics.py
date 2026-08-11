@@ -7,6 +7,8 @@ from typing import Any
 import pytest
 import structlog.testing
 
+from opensquilla.engine.routing.health import ProviderHealthLedger
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.observability import ensemble_execution_metrics as metrics_module
 from opensquilla.observability.ensemble_execution_metrics import (
     TRACE_SIZE_CAP_BYTES,
@@ -15,6 +17,8 @@ from opensquilla.observability.ensemble_execution_metrics import (
     log_ensemble_execution_metrics,
     log_ensemble_execution_metrics_once,
 )
+from opensquilla.provider import ensemble as ensemble_provider
+from opensquilla.provider.ranking_router import TaskAnalysisResult
 
 
 def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
@@ -104,6 +108,14 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "aggregator_stage_observed": False,
         "aggregator_physical_request_count_observed": False,
         "runtime_health_filter_observed": False,
+        "canary_rollout_observed": False,
+        "canary_rollout_projection_complete": False,
+        "canary_rollout_conservation_observed": False,
+        "canary_physical_budget_observed": False,
+        "canary_physical_budget_projection_complete": False,
+        "canary_physical_budget_accounting_observed": False,
+        "canary_physical_budget_conservation_observed": False,
+        "canary_physical_budget_exhausted_observed": False,
         "aggregator_final_request_usage_container_observed": False,
         "aggregator_final_request_usage_projection_complete": False,
         "aggregator_final_request_usage_observed": False,
@@ -201,6 +213,642 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "unknown_usage_count": 1,
     }
     assert private_text not in json.dumps(metrics, sort_keys=True)
+
+
+def _canary_reason_counts(**overrides: int) -> dict[str, int]:
+    counts = {
+        "canary_policy_invalid": 0,
+        "canary_rollout_disabled": 0,
+        "canary_decision_id_missing": 0,
+        "canary_task_ineligible": 0,
+        "canary_global_cohort_excluded": 0,
+        "canary_role_disabled": 0,
+        "canary_role_cohort_excluded": 0,
+        "canary_health_unhealthy": 0,
+        "canary_role_unsupported": 0,
+        "canary_reliability_coverage_insufficient": 0,
+        "canary_reliability_threshold_exceeded": 0,
+        "canary_candidate_cap": 0,
+    }
+    counts.update(overrides)
+    return counts
+
+
+def test_canary_trace_projects_only_fixed_low_cardinality_evidence() -> None:
+    private_text = "private model identity, policy hash, bucket, and reason"
+    trace = {
+        "selection_plan": {
+            "canary_rollout": {
+                "schema": "opensquilla.ensemble-canary-rollout/v1",
+                "enabled": True,
+                "config_valid": True,
+                "policy_version": private_text,
+                "policy_sha256": private_text,
+                "root_subject_sha256": private_text,
+                "global_bucket": private_text,
+                "role_bucket": {"proposer": private_text},
+                "input_canary_count": 12,
+                "admitted_by_role": {"proposer": 1, "aggregator": 0},
+                "task_gate": {
+                    "analyzer_source_eligible": True,
+                    "schema_valid": True,
+                    "confidence_eligible": True,
+                    "risk": "low",
+                    "eligible": True,
+                    "model": private_text,
+                },
+                "reason_counts": {
+                    **_canary_reason_counts(
+                        canary_role_disabled=12,
+                        canary_candidate_cap=11,
+                    ),
+                    private_text: 999,
+                },
+            }
+        },
+        "canary_physical_budget": {
+            "schema": "opensquilla.ensemble-canary-physical-budget/v1",
+            "limit": 1,
+            "committed": 0,
+            "reserved": 0,
+            "rejected": 2,
+            "refunded": 3,
+            "identity": private_text,
+        },
+    }
+    before = deepcopy(trace)
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert trace == before
+    assert metrics["canary_rollout_observed"] is True
+    assert metrics["canary_rollout_projection_complete"] is True
+    assert metrics["canary_rollout_conservation_observed"] is True
+    assert metrics["canary_rollout_conservation_valid"] is True
+    assert metrics["canary_rollout_enabled"] is True
+    assert metrics["canary_rollout_config_valid"] is True
+    assert metrics["canary_rollout_input_canary_count"] == 12
+    assert metrics["canary_rollout_proposer_admitted_count"] == 1
+    assert metrics["canary_rollout_aggregator_admitted_count"] == 0
+    assert metrics["canary_task_analyzer_source_eligible"] is True
+    assert metrics["canary_task_schema_valid"] is True
+    assert metrics["canary_task_confidence_eligible"] is True
+    assert metrics["canary_task_risk"] == "low"
+    assert metrics["canary_task_eligible"] is True
+    assert metrics["canary_rollout_reason_counts_observed"] is True
+    assert metrics["canary_rollout_reason_policy_invalid_count"] == 0
+    assert metrics["canary_rollout_reason_candidate_cap_count"] == 11
+    assert metrics["canary_physical_budget_projection_complete"] is True
+    assert metrics["canary_physical_budget_conservation_valid"] is True
+    assert metrics["canary_physical_budget_limit"] == 1
+    assert metrics["canary_physical_budget_committed"] == 0
+    assert metrics["canary_physical_budget_reserved"] == 0
+    assert metrics["canary_physical_budget_rejected"] == 2
+    assert metrics["canary_physical_budget_refunded"] == 3
+    assert metrics["canary_physical_budget_exhausted"] is True
+    assert private_text not in json.dumps(metrics, sort_keys=True)
+    assert not any(
+        forbidden in key
+        for key in metrics
+        for forbidden in (
+            "bucket",
+            "identity",
+            "policy_version",
+            "root_subject",
+            "sha256",
+        )
+    )
+
+
+def test_real_canary_writer_trace_projects_without_private_trace_fields() -> None:
+    policy = GatewayConfig(
+        llm_ensemble={
+            "canary_rollout": {
+                "enabled": True,
+                "global_basis_points": 10_000,
+                "proposer": {
+                    "basis_points": 10_000,
+                    "max_candidates_per_decision": 1,
+                },
+            }
+        }
+    ).llm_ensemble.canary_rollout.model_dump(mode="json")
+    snapshot = {
+        "models": [
+            {
+                "registry_facts": {
+                    "provider": "fake",
+                    "model_id": "private-canary-model",
+                    "status": "canary",
+                    "roles": ["proposer", "aggregator"],
+                    "health": "healthy",
+                },
+                "online_profile": {
+                    "role_reliability": {
+                        "proposer": {"success": 20, "failure": 0},
+                    }
+                },
+            }
+        ]
+    }
+    ledger = ProviderHealthLedger()
+    ledger.record_success("fake", "private-canary-model")
+    rollout = ensemble_provider._apply_canary_candidate_filter(  # noqa: SLF001
+        snapshot,
+        rollout_config=policy,
+        task_analysis=TaskAnalysisResult(
+            profile={"constraints": {"risk": "low"}},
+            source="llm_provider",
+            schema_valid=True,
+            confidence=0.9,
+        ),
+        decision_id="private-root-decision",
+        health_ledger=ledger,
+    )
+    assert rollout is not None
+    budget = ensemble_provider._CanaryPhysicalRequestBudget()  # noqa: SLF001
+    reservation = budget.reserve()
+    assert reservation is not None
+    reservation.commit()
+    assert budget.reserve() is None
+    trace = {
+        "selection_plan": {"canary_rollout": rollout},
+        "canary_physical_budget": {
+            "schema": "opensquilla.ensemble-canary-physical-budget/v1",
+            **budget.snapshot(),
+        },
+    }
+    before = deepcopy(trace)
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert trace == before
+    assert metrics["canary_rollout_projection_complete"] is True
+    assert metrics["canary_rollout_conservation_valid"] is True
+    assert metrics["canary_rollout_input_canary_count"] == 1
+    assert metrics["canary_rollout_proposer_admitted_count"] == 1
+    assert metrics["canary_task_eligible"] is True
+    assert metrics["canary_rollout_reason_role_disabled_count"] == 1
+    assert metrics["canary_physical_budget_committed"] == 1
+    assert metrics["canary_physical_budget_rejected"] == 1
+    assert metrics["canary_physical_budget_exhausted"] is True
+    serialized = json.dumps(metrics, sort_keys=True)
+    for private_value in (
+        "private-canary-model",
+        "private-root-decision",
+        rollout["policy_sha256"],
+        rollout["root_subject_sha256"],
+    ):
+        assert private_value not in serialized
+
+
+def test_malformed_canary_metrics_fail_open_and_omit_untrusted_values() -> None:
+    private_text = "private future risk, reason, identity, and hash"
+    reason_counts = _canary_reason_counts()
+    reason_counts["canary_policy_invalid"] = True
+    trace = {
+        "selection_plan": {
+            "canary_rollout": {
+                "schema": "opensquilla.ensemble-canary-rollout/v1",
+                "enabled": 1,
+                "config_valid": "true",
+                "input_canary_count": True,
+                "admitted_by_role": {"proposer": -1, "aggregator": 0},
+                "task_gate": {
+                    "analyzer_source_eligible": 1,
+                    "schema_valid": True,
+                    "confidence_eligible": False,
+                    "risk": private_text,
+                    "eligible": "false",
+                },
+                "reason_counts": {**reason_counts, private_text: 1},
+                "policy_sha256": private_text,
+            }
+        },
+        "canary_physical_budget": {
+            "schema": "opensquilla.ensemble-canary-physical-budget/v1",
+            "limit": 1,
+            "committed": 1,
+            "reserved": 1,
+            "rejected": 0,
+            "refunded": 0,
+            "identity": private_text,
+        },
+    }
+    before = deepcopy(trace)
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="failed",
+    )
+
+    assert trace == before
+    assert metrics["canary_rollout_observed"] is True
+    assert metrics["canary_rollout_projection_complete"] is False
+    assert metrics["canary_rollout_conservation_observed"] is False
+    assert metrics["canary_rollout_enabled_observed"] is False
+    assert metrics["canary_rollout_config_valid_observed"] is False
+    assert metrics["canary_rollout_input_canary_count_observed"] is False
+    assert metrics["canary_rollout_admitted_counts_observed"] is False
+    assert metrics["canary_task_analyzer_source_eligible_observed"] is False
+    assert metrics["canary_task_schema_valid"] is True
+    assert metrics["canary_task_confidence_eligible"] is False
+    assert metrics["canary_task_eligible_observed"] is False
+    assert metrics["canary_task_risk_observed"] is False
+    assert "canary_task_risk" not in metrics
+    assert metrics["canary_rollout_reason_counts_observed"] is False
+    assert not any(
+        key.startswith("canary_rollout_reason_")
+        and key.endswith("_count")
+        for key in metrics
+    )
+    assert metrics["canary_physical_budget_observed"] is True
+    assert metrics["canary_physical_budget_accounting_observed"] is True
+    assert metrics["canary_physical_budget_conservation_observed"] is True
+    assert metrics["canary_physical_budget_conservation_valid"] is False
+    assert metrics["canary_physical_budget_projection_complete"] is False
+    assert metrics["canary_physical_budget_exhausted_observed"] is False
+    assert "canary_physical_budget_committed" not in metrics
+    assert private_text not in json.dumps(metrics, sort_keys=True)
+
+    unknown_schema = build_ensemble_execution_metrics(
+        {
+            "selection_plan": {
+                "canary_rollout": {
+                    "schema": "opensquilla.ensemble-canary-rollout/v2",
+                    "enabled": True,
+                    "identity": private_text,
+                }
+            },
+            "canary_physical_budget": {
+                "schema": "opensquilla.ensemble-canary-physical-budget/v2",
+                "limit": 1,
+                "committed": 0,
+                "reserved": 0,
+                "rejected": 0,
+                "refunded": 0,
+            },
+        },
+        terminal_outcome="completed",
+    )
+    assert unknown_schema["canary_rollout_observed"] is False
+    assert unknown_schema["canary_rollout_projection_complete"] is False
+    assert unknown_schema["canary_rollout_conservation_observed"] is False
+    assert unknown_schema["canary_physical_budget_observed"] is False
+    assert unknown_schema["canary_physical_budget_projection_complete"] is False
+    assert unknown_schema["canary_physical_budget_accounting_observed"] is False
+
+
+def test_canary_rollout_rejects_contradictory_admission_counts() -> None:
+    trace = {
+        "selection_plan": {
+            "canary_rollout": {
+                "schema": "opensquilla.ensemble-canary-rollout/v1",
+                "enabled": True,
+                "config_valid": True,
+                "input_canary_count": 0,
+                "admitted_by_role": {"proposer": 99, "aggregator": 7},
+                "task_gate": {
+                    "analyzer_source_eligible": True,
+                    "schema_valid": True,
+                    "confidence_eligible": True,
+                    "risk": "low",
+                    "eligible": True,
+                },
+                "reason_counts": _canary_reason_counts(),
+            }
+        }
+    }
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_rollout_observed"] is True
+    assert metrics["canary_rollout_input_canary_count_observed"] is True
+    assert metrics["canary_rollout_admitted_counts_observed"] is False
+    assert metrics["canary_rollout_projection_complete"] is False
+    assert metrics["canary_rollout_conservation_observed"] is True
+    assert metrics["canary_rollout_conservation_valid"] is False
+    assert "canary_rollout_proposer_admitted_count" not in metrics
+    assert "canary_rollout_aggregator_admitted_count" not in metrics
+
+
+@pytest.mark.parametrize(
+    ("proposer_admitted", "enabled", "reason_counts"),
+    [
+        (
+            0,
+            False,
+            _canary_reason_counts(
+                canary_role_disabled=1,
+                canary_rollout_disabled=1,
+            ),
+        ),
+        (1, True, _canary_reason_counts(canary_role_disabled=1)),
+    ],
+)
+def test_canary_rollout_conservation_accepts_valid_zero_or_one_admission(
+    proposer_admitted: int,
+    enabled: bool,
+    reason_counts: dict[str, int],
+) -> None:
+    trace = {
+        "selection_plan": {
+            "canary_rollout": {
+                "schema": "opensquilla.ensemble-canary-rollout/v1",
+                "enabled": enabled,
+                "config_valid": True,
+                "input_canary_count": 1,
+                "admitted_by_role": {
+                    "proposer": proposer_admitted,
+                    "aggregator": 0,
+                },
+                "task_gate": {
+                    "analyzer_source_eligible": True,
+                    "schema_valid": True,
+                    "confidence_eligible": True,
+                    "risk": "low",
+                    "eligible": True,
+                },
+                "reason_counts": reason_counts,
+            }
+        }
+    }
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_rollout_conservation_observed"] is True
+    assert metrics["canary_rollout_conservation_valid"] is True
+    assert metrics["canary_rollout_projection_complete"] is True
+    assert metrics["canary_rollout_proposer_admitted_count"] == (
+        proposer_admitted
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "config_valid", "task_eligible"),
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
+def test_canary_rollout_conservation_rejects_admission_when_gates_are_off(
+    enabled: bool,
+    config_valid: bool,
+    task_eligible: bool,
+) -> None:
+    trace = {
+        "selection_plan": {
+            "canary_rollout": {
+                "schema": "opensquilla.ensemble-canary-rollout/v1",
+                "enabled": enabled,
+                "config_valid": config_valid,
+                "input_canary_count": 1,
+                "admitted_by_role": {"proposer": 1, "aggregator": 0},
+                "task_gate": {
+                    "analyzer_source_eligible": True,
+                    "schema_valid": True,
+                    "confidence_eligible": True,
+                    "risk": "low",
+                    "eligible": task_eligible,
+                },
+                "reason_counts": _canary_reason_counts(
+                    canary_role_disabled=1
+                ),
+            }
+        }
+    }
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_rollout_admitted_counts_observed"] is True
+    assert metrics["canary_rollout_conservation_observed"] is True
+    assert metrics["canary_rollout_conservation_valid"] is False
+    assert metrics["canary_rollout_projection_complete"] is False
+
+
+@pytest.mark.parametrize(
+    "ineligible_task_field",
+    ["analyzer_source_eligible", "schema_valid", "confidence_eligible"],
+)
+def test_canary_rollout_conservation_rejects_incoherent_task_gate(
+    ineligible_task_field: str,
+) -> None:
+    task_gate = {
+        "analyzer_source_eligible": True,
+        "schema_valid": True,
+        "confidence_eligible": True,
+        "risk": "low",
+        "eligible": True,
+    }
+    task_gate[ineligible_task_field] = False
+    metrics = build_ensemble_execution_metrics(
+        {
+            "selection_plan": {
+                "canary_rollout": {
+                    "schema": "opensquilla.ensemble-canary-rollout/v1",
+                    "enabled": False,
+                    "config_valid": True,
+                    "input_canary_count": 1,
+                    "admitted_by_role": {
+                        "proposer": 0,
+                        "aggregator": 0,
+                    },
+                    "task_gate": task_gate,
+                    "reason_counts": _canary_reason_counts(
+                        canary_role_disabled=1,
+                        canary_rollout_disabled=1,
+                    ),
+                }
+            }
+        },
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_rollout_conservation_observed"] is True
+    assert metrics["canary_rollout_conservation_valid"] is False
+    assert metrics["canary_rollout_projection_complete"] is False
+
+
+def test_canary_rollout_conservation_requires_nonempty_input_receipt() -> None:
+    metrics = build_ensemble_execution_metrics(
+        {
+            "selection_plan": {
+                "canary_rollout": {
+                    "schema": "opensquilla.ensemble-canary-rollout/v1",
+                    "enabled": False,
+                    "config_valid": True,
+                    "input_canary_count": 0,
+                    "admitted_by_role": {
+                        "proposer": 0,
+                        "aggregator": 0,
+                    },
+                    "task_gate": {
+                        "analyzer_source_eligible": True,
+                        "schema_valid": True,
+                        "confidence_eligible": True,
+                        "risk": "low",
+                        "eligible": True,
+                    },
+                    "reason_counts": _canary_reason_counts(),
+                }
+            }
+        },
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_rollout_admitted_counts_observed"] is True
+    assert metrics["canary_rollout_conservation_observed"] is True
+    assert metrics["canary_rollout_conservation_valid"] is False
+    assert metrics["canary_rollout_projection_complete"] is False
+
+
+def test_canary_rollout_conservation_rejects_enabled_invalid_config() -> None:
+    metrics = build_ensemble_execution_metrics(
+        {
+            "selection_plan": {
+                "canary_rollout": {
+                    "schema": "opensquilla.ensemble-canary-rollout/v1",
+                    "enabled": True,
+                    "config_valid": False,
+                    "input_canary_count": 1,
+                    "admitted_by_role": {
+                        "proposer": 0,
+                        "aggregator": 0,
+                    },
+                    "task_gate": {
+                        "analyzer_source_eligible": True,
+                        "schema_valid": True,
+                        "confidence_eligible": True,
+                        "risk": "low",
+                        "eligible": True,
+                    },
+                    "reason_counts": _canary_reason_counts(
+                        canary_role_disabled=1,
+                        canary_policy_invalid=1,
+                    ),
+                }
+            }
+        },
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_rollout_conservation_observed"] is True
+    assert metrics["canary_rollout_conservation_valid"] is False
+    assert metrics["canary_rollout_projection_complete"] is False
+
+
+def test_canary_rollout_conservation_requires_aggregator_role_exclusion(
+) -> None:
+    metrics = build_ensemble_execution_metrics(
+        {
+            "selection_plan": {
+                "canary_rollout": {
+                    "schema": "opensquilla.ensemble-canary-rollout/v1",
+                    "enabled": False,
+                    "config_valid": True,
+                    "input_canary_count": 1,
+                    "admitted_by_role": {
+                        "proposer": 0,
+                        "aggregator": 0,
+                    },
+                    "task_gate": {
+                        "analyzer_source_eligible": True,
+                        "schema_valid": True,
+                        "confidence_eligible": True,
+                        "risk": "low",
+                        "eligible": True,
+                    },
+                    # Total still matches 2*input, but the mandatory one
+                    # aggregator role_disabled occurrence is absent.
+                    "reason_counts": _canary_reason_counts(
+                        canary_rollout_disabled=2
+                    ),
+                }
+            }
+        },
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_rollout_conservation_observed"] is True
+    assert metrics["canary_rollout_conservation_valid"] is False
+    assert metrics["canary_rollout_projection_complete"] is False
+
+
+@pytest.mark.parametrize("reason_total", [1, 3])
+def test_canary_rollout_conservation_rejects_reason_sum_drift(
+    reason_total: int,
+) -> None:
+    trace = {
+        "selection_plan": {
+            "canary_rollout": {
+                "schema": "opensquilla.ensemble-canary-rollout/v1",
+                "enabled": False,
+                "config_valid": True,
+                "input_canary_count": 1,
+                "admitted_by_role": {"proposer": 0, "aggregator": 0},
+                "task_gate": {
+                    "analyzer_source_eligible": True,
+                    "schema_valid": True,
+                    "confidence_eligible": True,
+                    "risk": "low",
+                    "eligible": True,
+                },
+                "reason_counts": _canary_reason_counts(
+                    canary_role_disabled=reason_total
+                ),
+            }
+        }
+    }
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_rollout_conservation_observed"] is True
+    assert metrics["canary_rollout_conservation_valid"] is False
+    assert metrics["canary_rollout_projection_complete"] is False
+
+
+def test_canary_budget_rejection_requires_prior_reservation_evidence() -> None:
+    metrics = build_ensemble_execution_metrics(
+        {
+            "canary_physical_budget": {
+                "schema": (
+                    "opensquilla.ensemble-canary-physical-budget/v1"
+                ),
+                "limit": 1,
+                "committed": 0,
+                "reserved": 0,
+                "rejected": 1,
+                "refunded": 0,
+            }
+        },
+        terminal_outcome="failed",
+    )
+
+    assert metrics["canary_physical_budget_accounting_observed"] is True
+    assert metrics["canary_physical_budget_conservation_observed"] is True
+    assert metrics["canary_physical_budget_conservation_valid"] is False
+    assert metrics["canary_physical_budget_projection_complete"] is False
+    assert metrics["canary_physical_budget_exhausted_observed"] is False
+    assert "canary_physical_budget_rejected" not in metrics
 
 
 def test_terminal_trace_projects_analyzer_and_aggregator_recovery() -> None:

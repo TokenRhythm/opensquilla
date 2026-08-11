@@ -33,6 +33,31 @@ _RUNTIME_HEALTH_BENCHED_REASON = "runtime_deployment_benched"
 _RUNTIME_HEALTH_HALF_OPEN_BUSY_REASON = (
     "runtime_deployment_half_open_busy"
 )
+_CANARY_ROLLOUT_SCHEMA = "opensquilla.ensemble-canary-rollout/v1"
+_CANARY_PHYSICAL_BUDGET_SCHEMA = (
+    "opensquilla.ensemble-canary-physical-budget/v1"
+)
+_CANARY_TASK_RISKS = frozenset({"low", "medium", "high", "unknown"})
+_CANARY_REASON_METRIC_SUFFIXES = (
+    ("canary_policy_invalid", "policy_invalid"),
+    ("canary_rollout_disabled", "rollout_disabled"),
+    ("canary_decision_id_missing", "decision_id_missing"),
+    ("canary_task_ineligible", "task_ineligible"),
+    ("canary_global_cohort_excluded", "global_cohort_excluded"),
+    ("canary_role_disabled", "role_disabled"),
+    ("canary_role_cohort_excluded", "role_cohort_excluded"),
+    ("canary_health_unhealthy", "health_unhealthy"),
+    ("canary_role_unsupported", "role_unsupported"),
+    (
+        "canary_reliability_coverage_insufficient",
+        "reliability_coverage_insufficient",
+    ),
+    (
+        "canary_reliability_threshold_exceeded",
+        "reliability_threshold_exceeded",
+    ),
+    ("canary_candidate_cap", "candidate_cap"),
+)
 _PROPOSER_ADMISSION_ERROR_CODES = frozenset(
     {
         "ensemble_provider_admission_error",
@@ -644,6 +669,274 @@ def _project_runtime_health_filter_metrics(
     )
     if type(raw_never_strand) is bool:
         metrics["runtime_health_never_strand"] = raw_never_strand
+
+
+def _project_canary_rollout_metrics(
+    trace: Mapping[str, Any],
+    metrics: dict[str, Any],
+) -> None:
+    selection_plan = _mapping(trace.get("selection_plan"))
+    raw_rollout = selection_plan.get("canary_rollout")
+    rollout_observed = bool(
+        type(raw_rollout) is dict
+        and raw_rollout.get("schema") == _CANARY_ROLLOUT_SCHEMA
+    )
+    metrics["canary_rollout_observed"] = rollout_observed
+    metrics["canary_rollout_projection_complete"] = False
+    metrics["canary_rollout_conservation_observed"] = False
+    if not rollout_observed:
+        return
+
+    rollout = raw_rollout
+    rollout_boolean_observations: list[bool] = []
+    for source_key, target_key in (
+        ("enabled", "canary_rollout_enabled"),
+        ("config_valid", "canary_rollout_config_valid"),
+    ):
+        raw_value = rollout.get(source_key)
+        observed_key = f"{target_key}_observed"
+        value_observed = type(raw_value) is bool
+        rollout_boolean_observations.append(value_observed)
+        metrics[observed_key] = value_observed
+        if value_observed:
+            metrics[target_key] = raw_value
+
+    input_count = _non_negative_int(rollout.get("input_canary_count"))
+    metrics["canary_rollout_input_canary_count_observed"] = (
+        input_count is not None
+    )
+    if input_count is not None:
+        metrics["canary_rollout_input_canary_count"] = input_count
+
+    admitted_by_role = rollout.get("admitted_by_role")
+    proposer_admitted = (
+        _non_negative_int(admitted_by_role.get("proposer"))
+        if type(admitted_by_role) is dict
+        else None
+    )
+    aggregator_admitted = (
+        _non_negative_int(admitted_by_role.get("aggregator"))
+        if type(admitted_by_role) is dict
+        else None
+    )
+    admitted_count_types_observed = bool(
+        proposer_admitted is not None
+        and aggregator_admitted is not None
+    )
+    admitted_counts_observed = bool(
+        admitted_count_types_observed
+        and input_count is not None
+        and proposer_admitted <= 1
+        and aggregator_admitted == 0
+        and proposer_admitted + aggregator_admitted <= input_count
+    )
+    metrics["canary_rollout_admitted_counts_observed"] = (
+        admitted_counts_observed
+    )
+    if admitted_counts_observed:
+        metrics["canary_rollout_proposer_admitted_count"] = (
+            proposer_admitted
+        )
+        metrics["canary_rollout_aggregator_admitted_count"] = (
+            aggregator_admitted
+        )
+
+    raw_task_gate = rollout.get("task_gate")
+    task_gate_observed = type(raw_task_gate) is dict
+    metrics["canary_task_gate_observed"] = task_gate_observed
+    task_boolean_observations: list[bool] = []
+    risk_observed = False
+    if task_gate_observed:
+        task_gate = raw_task_gate
+        for source_key, target_key in (
+            (
+                "analyzer_source_eligible",
+                "canary_task_analyzer_source_eligible",
+            ),
+            ("schema_valid", "canary_task_schema_valid"),
+            ("confidence_eligible", "canary_task_confidence_eligible"),
+            ("eligible", "canary_task_eligible"),
+        ):
+            raw_value = task_gate.get(source_key)
+            value_observed = type(raw_value) is bool
+            task_boolean_observations.append(value_observed)
+            metrics[f"{target_key}_observed"] = value_observed
+            if value_observed:
+                metrics[target_key] = raw_value
+        risk = _enum_token(task_gate.get("risk"))
+        risk_observed = risk in _CANARY_TASK_RISKS
+        metrics["canary_task_risk_observed"] = risk_observed
+        if risk_observed:
+            metrics["canary_task_risk"] = risk
+
+    raw_reason_counts = rollout.get("reason_counts")
+    reason_counts: list[tuple[str, int]] = []
+    if type(raw_reason_counts) is dict:
+        for source_key, suffix in _CANARY_REASON_METRIC_SUFFIXES:
+            count = _non_negative_int(raw_reason_counts.get(source_key))
+            if count is None:
+                reason_counts = []
+                break
+            reason_counts.append((suffix, count))
+    reason_counts_observed = (
+        len(reason_counts) == len(_CANARY_REASON_METRIC_SUFFIXES)
+    )
+    metrics["canary_rollout_reason_counts_observed"] = (
+        reason_counts_observed
+    )
+    if reason_counts_observed:
+        for suffix, count in reason_counts:
+            metrics[f"canary_rollout_reason_{suffix}_count"] = count
+    reason_count_total = _bounded_metric_sum(
+        [count for _, count in reason_counts]
+    )
+    doubled_input_count = (
+        _bounded_metric_sum([input_count, input_count])
+        if input_count is not None
+        else None
+    )
+    enabled = rollout.get("enabled")
+    config_valid = rollout.get("config_valid")
+    task_eligible = (
+        raw_task_gate.get("eligible")
+        if task_gate_observed
+        else None
+    )
+    conservation_observed = bool(
+        all(rollout_boolean_observations)
+        and input_count is not None
+        and admitted_count_types_observed
+        and len(task_boolean_observations) == 4
+        and all(task_boolean_observations)
+        and reason_counts_observed
+        and reason_count_total is not None
+        and doubled_input_count is not None
+    )
+    metrics["canary_rollout_conservation_observed"] = conservation_observed
+    conservation_valid = False
+    if conservation_observed:
+        assert input_count is not None
+        assert proposer_admitted is not None
+        assert doubled_input_count is not None
+        assert reason_count_total is not None
+        reason_count_by_suffix = dict(reason_counts)
+        analyzer_source_eligible = raw_task_gate.get(
+            "analyzer_source_eligible"
+        )
+        task_schema_valid = raw_task_gate.get("schema_valid")
+        confidence_eligible = raw_task_gate.get("confidence_eligible")
+        role_disabled_count = reason_count_by_suffix["role_disabled"]
+        conservation_valid = bool(
+            input_count >= 1
+            and admitted_counts_observed
+            and proposer_admitted <= doubled_input_count
+            and reason_count_total
+            == doubled_input_count - proposer_admitted
+            and role_disabled_count >= input_count
+            and (enabled is not True or config_valid is True)
+            and (
+                task_eligible is not True
+                or (
+                    analyzer_source_eligible is True
+                    and task_schema_valid is True
+                    and confidence_eligible is True
+                )
+            )
+            and (
+                proposer_admitted == 0
+                or (
+                    enabled is True
+                    and config_valid is True
+                    and task_eligible is True
+                )
+            )
+        )
+        metrics["canary_rollout_conservation_valid"] = conservation_valid
+    metrics["canary_rollout_projection_complete"] = bool(
+        all(rollout_boolean_observations)
+        and input_count is not None
+        and admitted_counts_observed
+        and task_gate_observed
+        and len(task_boolean_observations) == 4
+        and all(task_boolean_observations)
+        and risk_observed
+        and reason_counts_observed
+        and conservation_valid
+    )
+
+
+def _project_canary_physical_budget_metrics(
+    trace: Mapping[str, Any],
+    metrics: dict[str, Any],
+) -> None:
+    raw_budget = trace.get("canary_physical_budget")
+    budget_observed = bool(
+        type(raw_budget) is dict
+        and raw_budget.get("schema") == _CANARY_PHYSICAL_BUDGET_SCHEMA
+    )
+    metrics["canary_physical_budget_observed"] = budget_observed
+    metrics["canary_physical_budget_projection_complete"] = False
+    metrics["canary_physical_budget_accounting_observed"] = False
+    metrics["canary_physical_budget_conservation_observed"] = False
+    metrics["canary_physical_budget_exhausted_observed"] = False
+    if not budget_observed:
+        return
+
+    budget = raw_budget
+    values = {
+        key: _non_negative_int(budget.get(key))
+        for key in ("limit", "committed", "reserved", "rejected", "refunded")
+    }
+    accounting_observed = all(value is not None for value in values.values())
+    metrics["canary_physical_budget_accounting_observed"] = (
+        accounting_observed
+    )
+    if not accounting_observed:
+        return
+
+    limit = values["limit"]
+    committed = values["committed"]
+    reserved = values["reserved"]
+    rejected = values["rejected"]
+    refunded = values["refunded"]
+    assert limit is not None
+    assert committed is not None
+    assert reserved is not None
+    assert rejected is not None
+    assert refunded is not None
+    active_and_committed = _bounded_metric_sum([committed, reserved])
+    conservation_valid = bool(
+        limit == 1
+        and active_and_committed is not None
+        and active_and_committed <= limit
+        and (
+            rejected == 0
+            or committed > 0
+            or reserved > 0
+            or refunded > 0
+        )
+    )
+    metrics["canary_physical_budget_conservation_observed"] = True
+    metrics["canary_physical_budget_conservation_valid"] = (
+        conservation_valid
+    )
+    if not conservation_valid:
+        return
+
+    metrics.update(
+        {
+            "canary_physical_budget_projection_complete": True,
+            "canary_physical_budget_limit": limit,
+            "canary_physical_budget_committed": committed,
+            "canary_physical_budget_reserved": reserved,
+            "canary_physical_budget_rejected": rejected,
+            "canary_physical_budget_refunded": refunded,
+            "canary_physical_budget_exhausted_observed": True,
+            # A rejection is direct evidence that the physical ceiling
+            # prevented at least one attempted canary reservation.
+            "canary_physical_budget_exhausted": rejected > 0,
+        }
+    )
 
 
 def _project_proposer_runtime_health_and_failures(
@@ -1419,6 +1712,8 @@ def build_ensemble_execution_metrics(
     _project_task_analyzer_metrics(trace, metrics)
     _project_aggregator_recovery_metrics(trace, metrics)
     _project_runtime_health_filter_metrics(trace, metrics)
+    _project_canary_rollout_metrics(trace, metrics)
+    _project_canary_physical_budget_metrics(trace, metrics)
     _project_aggregator_final_request_usage(trace, metrics)
 
     trace_size, trace_size_capped, trace_size_cap_reason = (
