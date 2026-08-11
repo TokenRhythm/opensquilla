@@ -91,12 +91,17 @@ function historyContextText(value: unknown, key: string): string | undefined {
 function historyHasSteerEvidence(value: unknown): boolean {
   const disposition = historyContextText(value, 'disposition')
   const intent = historyContextText(value, 'intent')
-  return intent === 'steer'
-    || disposition === 'steering'
+  // Current gateways persist an intent for both primary sends and Steers.
+  // Treat that explicit value as authoritative: primary sends also carry a
+  // client_request_id, so transport identity alone cannot prove Steer UX.
+  if (intent) return intent === 'steer'
+  // Older gateways omitted intent. Preserve their Steer rows using fields
+  // that are specific to same-turn admission/application rather than IDs
+  // shared by every durable user input.
+  return disposition === 'steering'
     || disposition === 'promoted'
-    || disposition === 'cancelled'
-    || disposition === 'rejected'
-    || Boolean(historyContextText(value, 'client_request_id'))
+    || Boolean(historyContextText(value, 'promoted_turn_id'))
+    || Boolean(historyContextText(value, 'promoted_from_turn_id'))
     || Boolean(historyContextText(value, 'model_call_id'))
     || historyContextInteger(value, 'applied_iteration') !== undefined
 }
@@ -124,7 +129,10 @@ function historyDispositionRevision(value: unknown): number | undefined {
 
 function historyContextInteger(value: unknown, key: string): number | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-  const number = Number((value as Record<string, unknown>)[key])
+  const raw = (value as Record<string, unknown>)[key]
+  if (typeof raw !== 'number' && typeof raw !== 'string') return undefined
+  if (typeof raw === 'string' && !raw.trim()) return undefined
+  const number = Number(raw)
   return Number.isInteger(number) && number >= 0 ? number : undefined
 }
 
