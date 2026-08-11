@@ -7704,7 +7704,77 @@ def _write_compact_resume_bundle(
 
 
 @pytest.mark.asyncio
-async def test_selection_plan_evidence_default_stays_inline_until_resume_supports_refs(
+async def test_selection_plan_evidence_default_is_content_addressed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    fixed_stamp = "20260811-010203"
+    real_strftime = runner.time.strftime
+
+    def fixed_run_stamp(format_string: str, *call_args) -> str:
+        if format_string == "%Y%m%d-%H%M%S":
+            return fixed_stamp
+        return real_strftime(format_string, *call_args)
+
+    monkeypatch.setattr(runner.time, "strftime", fixed_run_stamp)
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+        ]
+    )
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    real_run_one = runner.run_one
+    plan = _content_addressed_writer_test_plan()
+
+    async def row_with_plan(*call_args, **call_kwargs):
+        row = await real_run_one(*call_args, **call_kwargs)
+        row["routing_trace"] = {"selection_plan": deepcopy(plan)}
+        return row
+
+    monkeypatch.setattr(runner, "run_one", row_with_plan)
+    assert args.selection_plan_evidence_mode == "content-addressed"
+    assert "selection_plan_evidence_mode" not in runner.manifest_args(args)
+    assert await runner.amain(args) == 0
+
+    row = json.loads(next(output_dir.glob("draco_ensemble_*.jsonl")).read_text())
+    manifest = json.loads(
+        next(output_dir.glob("draco_run_*.manifest.json")).read_text()
+    )
+    pack_path = next(output_dir.glob("draco_run_*.selection-plan.pack.jsonl"))
+    ref = row["routing_trace"]["selection_plan"]
+    assert selection_plan_reference_signal(row)
+    assert row[runner.SELECTION_PLAN_EVIDENCE_ROW_FIELD] == (
+        runner.selection_plan_evidence_capability_contract()
+    )
+    assert manifest[runner.SELECTION_PLAN_EVIDENCE_ROW_FIELD] == (
+        runner.selection_plan_evidence_capability_contract()
+    )
+    assert manifest["artifacts"][runner.SELECTION_PLAN_PACK_ARTIFACT_FIELD] == str(
+        pack_path
+    )
+    with runner.SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        assert reader.expand_selection_plan(ref) == plan
+        pack_object_count = reader.index.object_count
+    binding = manifest[runner.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD]
+    assert binding["pack_object_count"] == pack_object_count
+    assert binding["compact_row_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_selection_plan_evidence_explicit_inline_remains_compatible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7737,6 +7807,8 @@ async def test_selection_plan_evidence_default_stays_inline_until_resume_support
             "--groups",
             "B0",
             "--dry-run",
+            "--selection-plan-evidence-mode",
+            "inline",
         ]
     )
     monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
@@ -7750,7 +7822,7 @@ async def test_selection_plan_evidence_default_stays_inline_until_resume_support
 
     monkeypatch.setattr(runner, "run_one", row_with_plan)
     assert args.selection_plan_evidence_mode == "inline"
-    assert "selection_plan_evidence_mode" not in runner.manifest_args(args)
+    assert runner.manifest_args(args)["selection_plan_evidence_mode"] == "inline"
     assert await runner.amain(args) == 0
 
     row = json.loads(next(output_dir.glob("draco_ensemble_*.jsonl")).read_text())
@@ -17992,7 +18064,13 @@ def test_g1_dry_cli_main_exits_zero_with_frozen_registry_contract(
     assert len(result_paths) == 1
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
     row = json.loads(result_paths[0].read_text(encoding="utf-8").splitlines()[0])
-    plan = row["ensemble_trace"]["calls"][0]["selection_plan"]
+    plan_ref = row["ensemble_trace"]["calls"][0]["selection_plan"]
+    assert selection_plan_reference_signal(plan_ref)
+    pack_path = Path(
+        manifest["artifacts"][runner.SELECTION_PLAN_PACK_ARTIFACT_FIELD]
+    )
+    with runner.SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        plan = reader.expand_selection_plan(plan_ref)
     assert manifest["status"] == "complete"
     assert (
         manifest["run_compatibility"]["contracts"]["G1"]["cost_policy"][

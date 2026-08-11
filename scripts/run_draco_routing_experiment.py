@@ -243,7 +243,9 @@ SUPPORTED_SELECTION_PLAN_EVIDENCE_MODES = (
     SELECTION_PLAN_EVIDENCE_MODE_INLINE,
     SELECTION_PLAN_EVIDENCE_MODE_CONTENT_ADDRESSED,
 )
-DEFAULT_SELECTION_PLAN_EVIDENCE_MODE = SELECTION_PLAN_EVIDENCE_MODE_INLINE
+DEFAULT_SELECTION_PLAN_EVIDENCE_MODE = (
+    SELECTION_PLAN_EVIDENCE_MODE_CONTENT_ADDRESSED
+)
 DEFAULT_AGENT_MAX_ITERATIONS = 12
 DEFAULT_DEADLINE_WRAPUP_MARGIN_SECONDS = 0
 DEFAULT_DEADLINE_WRAPUP_DISABLE_TOOLS = False
@@ -16571,8 +16573,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SUPPORTED_SELECTION_PLAN_EVIDENCE_MODES,
         default=DEFAULT_SELECTION_PLAN_EVIDENCE_MODE,
         help=(
-            "Write legacy inline selection plans (default until resume supports compact "
-            "sources), or opt in to content-addressed pack evidence."
+            "Write content-addressed selection-plan pack evidence by default, or "
+            "explicitly request legacy inline selection plans for compatibility."
         ),
     )
     parser.add_argument(
