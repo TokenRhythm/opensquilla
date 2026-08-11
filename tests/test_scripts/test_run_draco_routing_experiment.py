@@ -11577,6 +11577,7 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         draco_experiment_artifacts,
         draco_generation_recovery,
         draco_judge_scoring,
+        draco_reporting,
         draco_run_result,
         draco_runtime_contract,
         draco_usage_evidence,
@@ -11607,6 +11608,10 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         )
         assert runner_module._shared_ignored_policy_evidence is (
             draco_agent_result.ignored_agent_done_summary_policy_evidence_core
+        )
+        assert runner_module._shared_summarize is draco_reporting.summarize_core
+        assert runner_module._shared_render_markdown is (
+            draco_reporting.render_markdown_core
         )
     for runner_module in (runner, resume_runner):
         assert runner_module._shared_g1_registry_contract_reasons is (
@@ -11949,6 +11954,73 @@ def test_agent_result_wrappers_bind_runner_callbacks_dynamically(
         is summary
     )
     assert observed["models_equivalent"] is module._formal_openrouter_models_equivalent
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_reporting_wrappers_bind_runner_callbacks_dynamically(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    def shared_summarize(rows: object, **kwargs: Any) -> object:
+        observed["rows"] = rows
+        observed.update(kwargs)
+        return rows
+
+    rows: list[dict[str, Any]] = []
+    monkeypatch.setattr(module, "_shared_summarize", shared_summarize)
+    assert module.summarize(rows) is rows
+    for callback_name, module_name in (
+        ("completed_quality_value_fn", "completed_quality_value"),
+        ("row_cost_accounting_fn", "row_cost_accounting"),
+        ("merge_cost_accounting_fn", "merge_cost_accounting"),
+        ("row_usage_number_fn", "row_usage_number"),
+        ("row_metric_int_fn", "row_metric_int"),
+        ("row_server_tool_call_count_fn", "row_server_tool_call_count"),
+        ("row_total_tool_call_count_fn", "row_total_tool_call_count"),
+        ("row_trajectory_steps_fn", "row_trajectory_steps"),
+        ("row_llm_request_count_fn", "row_llm_request_count"),
+        ("percentile_fn", "percentile"),
+        ("numeric_pct_delta_fn", "numeric_pct_delta"),
+    ):
+        assert observed[callback_name] is getattr(module, module_name)
+
+    def shared_render(*args: Any, **kwargs: Any) -> str:
+        observed["render_args"] = args
+        observed.update(kwargs)
+        return "sentinel"
+
+    monkeypatch.setattr(module, "_shared_render_markdown", shared_render)
+    summary: dict[str, Any] = {"groups": {}}
+    jsonl_path = Path("draco_ensemble_test.jsonl")
+    assert (
+        module.render_markdown(
+            summary,
+            jsonl_path,
+            tool_policy={},
+            generation_policy={},
+            runner_mode="agent_loop",
+            agent_max_iterations=7,
+            agent_finalization_policy={},
+        )
+        == "sentinel"
+    )
+    assert observed["render_args"] == (
+        summary,
+        jsonl_path,
+        {},
+        {},
+        "agent_loop",
+        7,
+        {},
+    )
+    assert observed["benchmark_tool_policy_fn"] is module.benchmark_tool_policy
+    assert observed["generation_thinking_policy_fn"] is module.generation_thinking_policy
+    assert observed["normalized_agent_finalization_policy_fn"] is (
+        module.normalized_agent_finalization_policy
+    )
+    assert observed["runner_mode_name"] == module.RUNNER_MODE
 
 
 def test_shared_criterion_scoring_preserves_partial_and_negative_semantics() -> None:
