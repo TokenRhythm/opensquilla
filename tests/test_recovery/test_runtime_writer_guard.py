@@ -205,7 +205,6 @@ def test_runtime_writer_lock_keeps_read_only_cli_available_and_rejects_agent(
     try:
         from opensquilla.cli import gateway_cmd, models_cmd
         from opensquilla.cli import main as cli_main
-        from opensquilla.recovery import ProfileLockBusyError
 
         status_calls: list[dict[str, object]] = []
 
@@ -259,7 +258,26 @@ def test_runtime_writer_lock_keeps_read_only_cli_available_and_rejects_agent(
             ["agent", "--message", "must not reach a provider", "--json"],
         )
         assert competing_agent.exit_code == 1
-        assert isinstance(competing_agent.exception, ProfileLockBusyError)
+        assert isinstance(competing_agent.exception, SystemExit)
+        assert competing_agent.stdout == ""
+        error = json.loads(competing_agent.stderr)
+        assert error["error"]["code"] == "profile_lock_busy"
+        assert "opensquilla chat" in error["error"]["message"]
+        assert "OPENSQUILLA_STATE_DIR" in error["error"]["message"]
+        assert str(home) not in competing_agent.stderr
+        assert "Traceback" not in competing_agent.stderr
+
+        competing_agent_human = runner.invoke(
+            cli_main.app,
+            ["agent", "--message", "must not reach a provider"],
+        )
+        assert competing_agent_human.exit_code == 1
+        assert isinstance(competing_agent_human.exception, SystemExit)
+        assert "Error:" in competing_agent_human.stderr
+        assert "opensquilla chat" in competing_agent_human.stderr
+        assert "OPENSQUILLA_GATEWAY_STATE_DIR" in competing_agent_human.stderr
+        assert str(home) not in competing_agent_human.stderr
+        assert "Traceback" not in competing_agent_human.stderr
         assert agent_calls == []
     finally:
         release.set()
