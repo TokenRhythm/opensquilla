@@ -11572,6 +11572,7 @@ def test_agent_done_envelope_does_not_create_request_after_explicit_zero(
 def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     from opensquilla.eval import (
         draco_experiment_artifacts,
+        draco_generation_recovery,
         draco_judge_scoring,
         draco_run_result,
         draco_runtime_contract,
@@ -11640,6 +11641,25 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         shared = getattr(draco_judge_scoring, name)
         assert getattr(runner, name) is shared
         assert getattr(resume_runner, name) is shared
+    for name in (
+        "generation_postprocessing_failure_reason",
+        "primitive_unknown_usage_payload",
+    ):
+        shared = getattr(draco_generation_recovery, name)
+        assert getattr(runner, name) is shared
+        assert getattr(resume_runner, name) is shared
+    assert runner._shared_emergency_generation_run_summary is (
+        draco_generation_recovery.emergency_generation_run_summary_core
+    )
+    assert resume_runner._shared_emergency_generation_run_summary is (
+        draco_generation_recovery.emergency_generation_run_summary_core
+    )
+    assert runner._shared_paid_generation_recovery is (
+        draco_generation_recovery.recover_paid_generation_postprocessing_failure_core
+    )
+    assert resume_runner._shared_paid_generation_recovery is (
+        draco_generation_recovery.recover_paid_generation_postprocessing_failure_core
+    )
     shared_run_result_names = (
         "_NO_PHYSICAL_REQUEST_GATE_CODES",
         "ProviderBuildError",
@@ -11665,6 +11685,9 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         assert getattr(runner, name) is shared
         assert getattr(resume_runner, name) is shared
     critical = (
+        "safe_provider_build_routing_trace",
+        "emergency_generation_run_summary",
+        "recover_paid_generation_postprocessing_failure",
         "validate_tool_mode_for_runner",
         "configure_benchmark_sandbox_runtime",
         "configure_local_web_fetch_runtime",
