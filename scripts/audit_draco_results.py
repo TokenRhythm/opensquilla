@@ -6,11 +6,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 from opensquilla.eval.draco_artifact_integrity import verify_result_row_evidence
+from opensquilla.eval.draco_resume_source_index import (
+    DracoResumeSourceError,
+    ResumeSourceIndex,
+    _read_json_object_snapshot,
+)
+from opensquilla.eval.draco_selection_plan_evidence import (
+    SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
+    SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+    SELECTION_PLAN_PACK_ARTIFACT_FIELD,
+    selection_plan_reference_signal,
+    selection_plan_row_capability_signal,
+)
 
 GROUPS = ("B0", "B1", "B2", "B3", "B4", "G1")
 FIXED_MODELS = {
@@ -88,7 +101,9 @@ def load_expected_fingerprints(
     return {group: str(fingerprints[group]) for group in groups}
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
+def _read_unbound_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Preserve the legacy parser and its public error semantics exactly."""
+
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as fh:
         for line_number, line in enumerate(fh, start=1):
@@ -104,6 +119,92 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             value["_audit_source_line"] = line_number
             rows.append(value)
     return rows
+
+
+def _read_bound_compact_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Authenticate, expand, and reseal one standard compact result bundle."""
+
+    materialized: list[dict[str, Any]] = []
+    with ResumeSourceIndex([path], force_spool=False) as source_index:
+        locators = []
+        with source_index.open_source(path, source_index=0) as indexed_rows:
+            for indexed in indexed_rows:
+                try:
+                    value = json.loads(indexed.payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"invalid JSONL at {path}:{indexed.locator.line_number}: {exc}"
+                    ) from exc
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        "JSONL row is not an object at "
+                        f"{path}:{indexed.locator.line_number}"
+                    )
+                locator = indexed.locator.bind(
+                    group=str(value.get("group") or ""),
+                    task_id=str(value.get("task_id") or ""),
+                )
+                _view, compact = source_index.classification_row(locator, value)
+                if not compact:
+                    raise ValueError(
+                        "compact audit source lacks its authenticated sibling binding"
+                    )
+                locators.append(locator)
+        source_index.seal()
+        for locator in locators:
+            value = source_index.consume_row(locator)
+            value["_audit_source"] = str(path)
+            value["_audit_source_line"] = locator.line_number
+            materialized.append(value)
+    return materialized
+
+
+def _standard_sibling_declares_compact_evidence(path: Path) -> bool:
+    standard = ResumeSourceIndex._standard_manifest_path(path)
+    if standard is None:
+        return False
+    stamp, manifest_path = standard
+    pack_path = manifest_path.parent / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    if os.path.lexists(pack_path):
+        return True
+    if not os.path.lexists(manifest_path):
+        return False
+    try:
+        manifest, _signature, _sha256 = _read_json_object_snapshot(
+            manifest_path,
+            label="audit sibling manifest",
+        )
+    except (DracoResumeSourceError, OSError):
+        # A pathname that exists but cannot be safely classified is evidence,
+        # not an excuse to downgrade to the legacy parser. The authenticated
+        # compact boundary below will surface the precise fail-closed error.
+        return True
+    artifacts = manifest.get("artifacts")
+    return bool(
+        SELECTION_PLAN_EVIDENCE_ROW_FIELD in manifest
+        or SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD in manifest
+        or (
+            isinstance(artifacts, dict)
+            and SELECTION_PLAN_PACK_ARTIFACT_FIELD in artifacts
+        )
+    )
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = _read_unbound_jsonl(path)
+    row_declares_compact_evidence = any(
+        selection_plan_row_capability_signal(row)
+        or selection_plan_reference_signal(row)
+        for row in rows
+    )
+    if not row_declares_compact_evidence and not (
+        _standard_sibling_declares_compact_evidence(path)
+    ):
+        return rows
+    # Compact rows are not data until their standard sibling terminal
+    # manifest, durable result/trace/checkpoint trio, and pack all bind.  The
+    # shared resume index owns that fail-closed protocol and its TOCTOU checks.
+    return _read_bound_compact_jsonl(path)
 
 
 def invalid_reasons(
