@@ -11573,6 +11573,7 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     from opensquilla.eval import (
         draco_experiment_artifacts,
         draco_judge_scoring,
+        draco_run_result,
         draco_runtime_contract,
         draco_usage_evidence,
     )
@@ -11637,6 +11638,30 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         assert getattr(resume_runner, name) is shared
     for name in ("clamp_percent", "coerce_weight", "score_criterion_judgments"):
         shared = getattr(draco_judge_scoring, name)
+        assert getattr(runner, name) is shared
+        assert getattr(resume_runner, name) is shared
+    shared_run_result_names = (
+        "_NO_PHYSICAL_REQUEST_GATE_CODES",
+        "ProviderBuildError",
+        "ProviderBuildResult",
+        "RunResult",
+        "add_metric_counts",
+        "candidate_texts",
+        "done_payload",
+        "judge_run_result_summary",
+        "json_safe",
+        "llm_request_count_for_run",
+        "run_result_error_physical_request_count",
+        "run_result_summary",
+        "run_result_usage_payload",
+        "run_result_was_blocked_before_request",
+        "server_tool_counts_from_provider_usage",
+        "server_tool_counts_from_usage_payload",
+        "text_sha256",
+        "usage_rows_request_count",
+    )
+    for name in shared_run_result_names:
+        shared = getattr(draco_run_result, name)
         assert getattr(runner, name) is shared
         assert getattr(resume_runner, name) is shared
     critical = (
