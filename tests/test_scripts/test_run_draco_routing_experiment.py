@@ -11601,18 +11601,29 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         assert getattr(runner, name) is shared
         assert getattr(resume_runner, name) is shared
     shared_usage_functions = (
+        "_billing_receipt_state",
+        "_coerce_provider_billing_receipt",
+        "_finite_nonnegative_number",
+        "_first_usage_cost",
+        "_mixed_usage_cost",
+        "_openrouter_provider_billed_cost_is_exact",
+        "_usage_token_count",
         "aggregate_agent_ensemble_trace",
         "aggregate_agent_model_usage",
         "build_stable_receipt_evidence",
         "coerce_metric_int",
         "deduplicate_stable_usage_receipts",
+        "ensemble_usage_unknown_count",
+        "exact_provider_usage_cost",
         "llm_response_records",
         "merge_usage_receipt_provenance",
         "payload_physical_request_count",
+        "trusted_provider_billed_cost",
         "usage_receipt_fingerprint",
         "usage_row_is_missing_placeholder",
         "usage_row_match_priority",
         "usage_row_response_ids",
+        "usage_unknown_count_from_usage_payload",
     )
     assert runner.STABLE_RECEIPT_EVIDENCE_KEY == (
         draco_usage_evidence.STABLE_RECEIPT_EVIDENCE_KEY

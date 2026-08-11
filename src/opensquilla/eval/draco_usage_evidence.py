@@ -11,6 +11,7 @@ import math
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from opensquilla.provider.types import ProviderBillingReceipt
 from opensquilla.usage_evidence import (
     MISSING_USAGE_PLACEHOLDER_ROLES,
     is_missing_usage_placeholder,
@@ -579,6 +580,257 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
             if key in terminal_trace:
                 payload[key] = terminal_trace[key]
     return payload
+
+
+def _usage_token_count(usage: dict[str, Any]) -> int:
+    # OpenRouter reports reasoning_tokens as a completion/output-token detail,
+    # not an additional billed token bucket.  Keep it separately observable
+    # without adding it to input + output a second time.
+    return sum(coerce_metric_int(usage.get(key)) for key in ("input_tokens", "output_tokens"))
+
+def _finite_nonnegative_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int | float)
+        and math.isfinite(float(value))
+        and float(value) >= 0.0
+    )
+
+def _openrouter_provider_billed_cost_is_exact(unit: Mapping[str, Any]) -> bool:
+    """Preserve the non-audit OpenRouter provider-billed cost contract."""
+
+    if str(unit.get("provider") or "").strip().casefold() != "openrouter":
+        return False
+    provider_usage = unit.get("provider_usage")
+    if not isinstance(provider_usage, Mapping):
+        return False
+    router_metadata = provider_usage.get("router_metadata")
+    response_ids = provider_usage.get("response_ids")
+    billed_cost = unit.get("billed_cost")
+    reported_cost = provider_usage.get("provider_reported_cost")
+    return (
+        provider_usage.get("is_byok") is False
+        and isinstance(router_metadata, Mapping)
+        and router_metadata.get("is_byok") is False
+        and _finite_nonnegative_number(billed_cost)
+        and _finite_nonnegative_number(reported_cost)
+        and round(float(billed_cost) * 1_000_000_000) == round(float(reported_cost) * 1_000_000_000)
+        and isinstance(response_ids, list)
+        and bool(response_ids)
+        and all(
+            isinstance(response_id, str) and bool(response_id.strip())
+            for response_id in response_ids
+        )
+    )
+
+def _first_usage_cost(unit: Mapping[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if key in unit and _finite_nonnegative_number(unit.get(key)):
+            return float(unit[key])
+    return None
+
+def _coerce_provider_billing_receipt(value: Any) -> ProviderBillingReceipt | None:
+    """Validate the complete provider-native billing receipt schema."""
+
+    if value is None:
+        return None
+
+    def receipt_int(raw: Any, *, nullable: bool = False) -> int | None:
+        if raw is None and nullable:
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0 or raw > (1 << 63) - 1:
+            raise ValueError("billing receipt nanos must be ledger-safe integers")
+        return int(raw)
+
+    if isinstance(value, ProviderBillingReceipt):
+        candidate = value
+    elif isinstance(value, Mapping):
+        try:
+            raw_fx = value.get("fx_native_per_usd_nanos")
+            raw_schema = value.get("schema_version", 1)
+            if (
+                isinstance(raw_fx, bool)
+                or not isinstance(raw_fx, int)
+                or isinstance(raw_schema, bool)
+                or not isinstance(raw_schema, int)
+            ):
+                return None
+            candidate = ProviderBillingReceipt(
+                currency=str(value.get("currency") or ""),
+                status=str(value.get("status") or ""),  # type: ignore[arg-type]
+                amount_nanos=receipt_int(value.get("amount_nanos"), nullable=True),
+                usd_equivalent_nanos=receipt_int(
+                    value.get("usd_equivalent_nanos"),
+                    nullable=True,
+                ),
+                fx_native_per_usd_nanos=raw_fx,
+                schema_version=raw_schema,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    try:
+        amount_nanos = receipt_int(candidate.amount_nanos, nullable=True)
+        usd_nanos = receipt_int(candidate.usd_equivalent_nanos, nullable=True)
+    except ValueError:
+        return None
+    if (
+        not isinstance(candidate.currency, str)
+        or len(candidate.currency) != 3
+        or any(character < "A" or character > "Z" for character in candidate.currency)
+        or candidate.status not in {"confirmed", "pending"}
+        or isinstance(candidate.fx_native_per_usd_nanos, bool)
+        or not isinstance(candidate.fx_native_per_usd_nanos, int)
+        or candidate.fx_native_per_usd_nanos <= 0
+        or candidate.fx_native_per_usd_nanos > (1 << 63) - 1
+        or isinstance(candidate.schema_version, bool)
+        or not isinstance(candidate.schema_version, int)
+        or candidate.schema_version != 1
+    ):
+        return None
+    if candidate.status == "confirmed" and (amount_nanos is None or usd_nanos is None):
+        return None
+    if candidate.status == "pending" and usd_nanos is not None:
+        return None
+    if candidate.status == "confirmed":
+        expected_usd_nanos = (
+            amount_nanos * 1_000_000_000 + candidate.fx_native_per_usd_nanos // 2
+        ) // candidate.fx_native_per_usd_nanos
+        if expected_usd_nanos != usd_nanos:
+            return None
+    return candidate
+
+def _billing_receipt_state(
+    unit: Mapping[str, Any],
+) -> tuple[bool, str, float | None]:
+    receipt = unit.get("billing_receipt", unit.get("billingReceipt"))
+    if receipt is None:
+        return False, "", None
+    normalized = _coerce_provider_billing_receipt(receipt)
+    if normalized is None:
+        return True, "invalid", None
+    if normalized.status == "confirmed":
+        return (
+            True,
+            normalized.status,
+            int(normalized.usd_equivalent_nanos or 0) / 1_000_000_000,
+        )
+    return True, normalized.status, None
+
+def exact_provider_usage_cost(unit: Mapping[str, Any]) -> float | None:
+    receipt_present, receipt_status, receipt_cost = _billing_receipt_state(unit)
+    if receipt_present:
+        return receipt_cost if receipt_status == "confirmed" else None
+    source = str(unit.get("cost_source") or "none").strip().casefold()
+    billed_cost = _first_usage_cost(unit, "billed_cost")
+    if source == "openrouter_usage":
+        return billed_cost
+    if source == "provider_billed" and _openrouter_provider_billed_cost_is_exact(unit):
+        return billed_cost
+    return None
+
+def trusted_provider_billed_cost(unit: Mapping[str, Any]) -> float:
+    exact_cost = exact_provider_usage_cost(unit)
+    if exact_cost is not None:
+        return exact_cost
+    receipt_present, _, _ = _billing_receipt_state(unit)
+    if receipt_present:
+        return 0.0
+    source = str(unit.get("cost_source") or "none").strip().casefold()
+    reported = _first_usage_cost(unit, "billed_cost")
+    if source in {"provider_billed", "openrouter_usage"}:
+        return float(reported or 0.0)
+    if source in {"", "none", "unavailable"} and reported and reported > 0.0:
+        return reported
+    return 0.0
+
+def _mixed_usage_cost(unit: Mapping[str, Any]) -> float | None:
+    total = _first_usage_cost(unit, "cost_usd", "costUsd")
+    if total is not None:
+        return total
+    billed = _first_usage_cost(
+        unit,
+        "billed_cost_usd",
+        "billedCostUsd",
+        "billed_cost",
+    )
+    estimated = _first_usage_cost(
+        unit,
+        "estimated_cost_usd",
+        "estimatedCostUsd",
+    )
+    if billed is None and estimated is None:
+        return None
+    return (billed or 0.0) + (estimated or 0.0)
+
+def ensemble_usage_unknown_count(trace: Any) -> int:
+    if not isinstance(trace, dict):
+        return 0
+    direct_missing = max(
+        0,
+        coerce_metric_int(trace.get("usage_missing_count")),
+    )
+    detected_missing = 0
+    calls = trace.get("calls")
+    if isinstance(calls, list):
+        detected_missing = sum(ensemble_usage_unknown_count(call) for call in calls)
+    early_stop = trace.get("proposer_early_stop")
+    if isinstance(early_stop, dict):
+        detected_missing = max(
+            detected_missing,
+            coerce_metric_int(early_stop.get("usage_unknown_count")),
+        )
+    candidates = trace.get("candidates")
+    if isinstance(candidates, list):
+        detected_missing = max(
+            detected_missing,
+            sum(
+                1
+                for candidate in candidates
+                if isinstance(candidate, dict) and candidate.get("error_code") == "early_stopped"
+            ),
+        )
+    return max(direct_missing, detected_missing)
+
+def usage_unknown_count_from_usage_payload(usage: Any) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    breakdown = usage.get("model_usage_breakdown")
+    units = (
+        [item for item in breakdown if isinstance(item, dict)]
+        if isinstance(breakdown, list) and breakdown
+        else [usage]
+    )
+    represented_missing = sum(
+        1
+        for item in units
+        if (
+            str(item.get("role") or "").strip().casefold() in MISSING_USAGE_PLACEHOLDER_ROLES
+            or item.get("error_code") == "early_stopped"
+            or str(item.get("cost_source") or "none") == "unknown_canceled"
+        )
+    )
+    unknown_receipt_cost = sum(
+        1
+        for item in units
+        if (
+            str(item.get("role") or "").strip().casefold() not in MISSING_USAGE_PLACEHOLDER_ROLES
+            and item.get("error_code") != "early_stopped"
+            and str(item.get("cost_source") or "none") != "unknown_canceled"
+            and (
+                _usage_token_count(item) > 0
+                and exact_provider_usage_cost(item) is None
+                and str(item.get("cost_source") or "none") != "mixed"
+                and not str(item.get("cost_source") or "none").startswith("opensquilla_")
+            )
+        )
+    )
+    explicit_missing = max(
+        0,
+        coerce_metric_int(usage.get("usage_missing_count")),
+    )
+    return unknown_receipt_cost + max(explicit_missing, represented_missing)
 
 
 def usage_row_is_missing_placeholder(row: Mapping[str, Any]) -> bool:
