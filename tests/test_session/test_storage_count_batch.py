@@ -1,7 +1,7 @@
-"""Tests for SessionStorage.count_transcript_entries_batch.
+"""Tests for SessionStorage count contracts.
 
-Pins the batch counting contract used by rpc_sessions.list to avoid the
-per-row N+1 against count_transcript_entries. Behaviour requirements:
+Pins the transcript batch contract used by rpc_sessions.list and the exact
+stored-session total used by the Overview KPI. Behaviour requirements:
 - Empty list returns {}.
 - Single id matches the legacy single-id path.
 - Many ids (>500) chunk correctly and still return one entry per id.
@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
+from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
 
 
@@ -97,3 +99,31 @@ async def test_batch_count_chunks_above_500(storage: SessionStorage) -> None:
     for sid in all_ids:
         if sid not in counts:
             assert result[sid] == 0
+
+
+async def test_session_count_can_scope_to_one_guest_owner(
+    storage: SessionStorage,
+) -> None:
+    owner_id = "a" * 64
+    other_owner_id = "b" * 64
+    sessions = (
+        (guest_owned_session_key(owner_id, "one"), "guest-one"),
+        (guest_owned_session_key(owner_id, "two"), "guest-two"),
+        (guest_owned_session_key(other_owner_id, "other"), "guest-other"),
+        ("agent:main:webchat:host", "host"),
+    )
+    for session_key, session_id in sessions:
+        await storage.upsert_session(
+            SessionNode(
+                session_key=session_key,
+                session_id=session_id,
+                agent_id="main",
+                status="idle",
+                created_at=1,
+                updated_at=1,
+            )
+        )
+
+    assert await storage.count_sessions() == 4
+    assert await storage.count_sessions(guest_owner_id=owner_id) == 2
+    assert await storage.count_sessions(guest_owner_id="invalid") == 0
