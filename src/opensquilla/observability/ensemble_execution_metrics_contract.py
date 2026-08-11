@@ -180,6 +180,16 @@ _FIXED_FIELDS = frozenset(
     quorum_observed
     quorum_reached
     quorum_reached_observed
+    ranking_hard_filter_ms
+    ranking_hard_filter_ms_observed
+    ranking_packaged_template_cache_hit
+    ranking_packaged_template_cache_hit_observed
+    ranking_score_ms
+    ranking_score_ms_observed
+    ranking_snapshot_build_ms
+    ranking_snapshot_build_ms_observed
+    ranking_stage_observed
+    ranking_stage_projection_complete
     runtime_health_filter_enabled
     runtime_health_filter_enabled_observed
     runtime_health_filter_observed
@@ -393,6 +403,7 @@ _BOOLEAN_FIELDS = frozenset(
         "canary_physical_budget_exhausted",
         "canary_persistent_rollout_enabled",
         "aggregator_final_request_cache_hit",
+        "ranking_packaged_template_cache_hit",
         "quorum_reached",
     }
 )

@@ -103,6 +103,12 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "selection_family": "router_dynamic",
         "fallback_used_observed": True,
         "fallback_used": False,
+        "ranking_stage_observed": False,
+        "ranking_snapshot_build_ms_observed": False,
+        "ranking_hard_filter_ms_observed": False,
+        "ranking_score_ms_observed": False,
+        "ranking_packaged_template_cache_hit_observed": False,
+        "ranking_stage_projection_complete": False,
         "task_analyzer_observed": False,
         "aggregator_recovery_observed": False,
         "aggregator_stage_observed": False,
@@ -217,6 +223,125 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "unknown_usage_count": 1,
     }
     assert private_text not in json.dumps(metrics, sort_keys=True)
+
+
+def test_ranking_stage_projection_is_exact_content_free_and_non_mutating() -> None:
+    private_text = "private-model-provider-hash-never-project"
+    trace = {
+        "ranking_stage_observability": {
+            "schema": (
+                "opensquilla.router-dynamic-ranking-stage-observability/v1"
+            ),
+            "snapshot_build_ms": 0,
+            "hard_filter_ms": 7,
+            "score_ms": 11,
+            "packaged_template_cache_hit": False,
+        },
+        "selection_plan": {"private": private_text},
+    }
+    before = deepcopy(trace)
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert trace == before
+    assert metrics["ranking_stage_observed"] is True
+    assert metrics["ranking_snapshot_build_ms_observed"] is True
+    assert metrics["ranking_snapshot_build_ms"] == 0
+    assert metrics["ranking_hard_filter_ms_observed"] is True
+    assert metrics["ranking_hard_filter_ms"] == 7
+    assert metrics["ranking_score_ms_observed"] is True
+    assert metrics["ranking_score_ms"] == 11
+    assert metrics["ranking_packaged_template_cache_hit_observed"] is True
+    assert metrics["ranking_packaged_template_cache_hit"] is False
+    assert metrics["ranking_stage_projection_complete"] is True
+    assert private_text not in json.dumps(metrics, sort_keys=True)
+
+    explicit_snapshot_metrics = build_ensemble_execution_metrics(
+        {
+            "ranking_stage_observability": {
+                "schema": (
+                    "opensquilla.router-dynamic-ranking-stage-observability/v1"
+                ),
+                "snapshot_build_ms": 1,
+                "hard_filter_ms": 2,
+                "score_ms": 3,
+            }
+        },
+        terminal_outcome="completed",
+    )
+    assert explicit_snapshot_metrics[
+        "ranking_stage_projection_complete"
+    ] is True
+    assert explicit_snapshot_metrics[
+        "ranking_packaged_template_cache_hit_observed"
+    ] is False
+    assert "ranking_packaged_template_cache_hit" not in (
+        explicit_snapshot_metrics
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_stage", "stage_observed", "build_observed"),
+    [
+        (None, False, False),
+        ({"schema": "unknown"}, False, False),
+        (
+            {
+                "schema": (
+                    "opensquilla.router-dynamic-ranking-stage-observability/v1"
+                ),
+                "snapshot_build_ms": 3,
+            },
+            True,
+            True,
+        ),
+        (
+            {
+                "schema": (
+                    "opensquilla.router-dynamic-ranking-stage-observability/v1"
+                ),
+                "snapshot_build_ms": True,
+                "hard_filter_ms": -1,
+                "score_ms": 1 << 63,
+                "packaged_template_cache_hit": 1,
+            },
+            True,
+            False,
+        ),
+        (
+            {
+                "schema": (
+                    "opensquilla.router-dynamic-ranking-stage-observability/v1"
+                ),
+                "snapshot_build_ms": 1,
+                "hard_filter_ms": 2,
+                "score_ms": 3,
+                "unknown_private_field": "secret",
+            },
+            True,
+            True,
+        ),
+    ],
+)
+def test_ranking_stage_projection_fails_closed_per_field(
+    raw_stage: Any,
+    stage_observed: bool,
+    build_observed: bool,
+) -> None:
+    trace = {"ranking_stage_observability": raw_stage}
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert metrics["ranking_stage_observed"] is stage_observed
+    assert metrics["ranking_snapshot_build_ms_observed"] is build_observed
+    assert metrics["ranking_stage_projection_complete"] is False
+    assert "unknown_private_field" not in metrics
 
 
 def _canary_reason_counts(**overrides: int) -> dict[str, int]:

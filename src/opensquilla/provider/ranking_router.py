@@ -14,7 +14,9 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
+import threading
 import time
 import weakref
 from collections import deque
@@ -6419,6 +6421,24 @@ class _PackagedRegistryTemplateIndex:
     unique_basenames: Mapping[str, Mapping[str, Any]]
 
 
+_PACKAGED_REGISTRY_TEMPLATE_INDEX_LOCK = threading.Lock()
+_PACKAGED_REGISTRY_TEMPLATE_INDEX: _PackagedRegistryTemplateIndex | None = None
+
+
+def _reset_packaged_registry_template_index_lock_after_fork() -> None:
+    """Drop a possibly inherited locked mutex without discarding the index."""
+
+    global _PACKAGED_REGISTRY_TEMPLATE_INDEX_LOCK
+
+    _PACKAGED_REGISTRY_TEMPLATE_INDEX_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        after_in_child=_reset_packaged_registry_template_index_lock_after_fork
+    )
+
+
 def _compile_packaged_registry_template_index(
     snapshot: Mapping[str, Any],
 ) -> _PackagedRegistryTemplateIndex:
@@ -6455,11 +6475,37 @@ def _compile_packaged_registry_template_index(
     )
 
 
-@cache
+def _packaged_registry_template_index_lookup(
+) -> tuple[_PackagedRegistryTemplateIndex, bool]:
+    """Atomically return the packaged index and this lookup's hit status."""
+
+    global _PACKAGED_REGISTRY_TEMPLATE_INDEX
+
+    cached = _PACKAGED_REGISTRY_TEMPLATE_INDEX
+    if cached is not None:
+        return cached, True
+    with _PACKAGED_REGISTRY_TEMPLATE_INDEX_LOCK:
+        cached = _PACKAGED_REGISTRY_TEMPLATE_INDEX
+        if cached is not None:
+            return cached, True
+        compiled = _compile_packaged_registry_template_index(
+            _packaged_registry_snapshot()
+        )
+        _PACKAGED_REGISTRY_TEMPLATE_INDEX = compiled
+        return compiled, False
+
+
 def _packaged_registry_template_index() -> _PackagedRegistryTemplateIndex:
     """Return indexes for the validated, process-local packaged registry only."""
 
-    return _compile_packaged_registry_template_index(_packaged_registry_snapshot())
+    return _packaged_registry_template_index_lookup()[0]
+
+
+def _ranking_stage_elapsed_ms(started_ns: int) -> int:
+    """Return a bounded monotonic duration without entering ranking state."""
+
+    elapsed_ns = max(0, time.monotonic_ns() - started_ns)
+    return min((1 << 63) - 1, elapsed_ns // 1_000_000)
 
 
 def _template_for_packaged_model(
@@ -6486,16 +6532,23 @@ def build_model_registry_snapshot(
     router_tiers: Mapping[str, Any] | None = None,
     packaged_snapshot: Mapping[str, Any] | None = None,
     ranking_config: Mapping[str, Any] | None = None,
+    _observability_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compose the mock snapshot with runtime and operator-defined deployments."""
 
+    if _observability_out is not None and type(_observability_out) is not dict:
+        raise TypeError("router_dynamic snapshot observability output must be a dict")
+    if _observability_out is not None:
+        _observability_out.pop("packaged_template_cache_hit", None)
     effective_config = _resolve_ranking_config(ranking_config)
     template_index: _PackagedRegistryTemplateIndex | None = None
     if packaged_snapshot is None:
         # The cached source has passed strict snapshot and provenance validation
         # in _packaged_registry_snapshot().  Arbitrary caller snapshots retain
         # the historical validate-and-linear-lookup path below.
-        template_index = _packaged_registry_template_index()
+        template_index, cache_hit = _packaged_registry_template_index_lookup()
+        if _observability_out is not None:
+            _observability_out["packaged_template_cache_hit"] = cache_hit
         templates = template_index.templates
         snapshot_version = template_index.snapshot_version
         schema_version = template_index.schema_version
@@ -8426,11 +8479,22 @@ def rank_models(
     proposer_visible_answer_reserve_tokens: int = 4_096,
     proposer_recovery_quorum: int | None = None,
     _emit_logs: bool = True,
+    _stage_observability_out: dict[str, Any] | None = None,
 ) -> RankingDecision:
     """Select ``(P, A)`` using the Step2 chapter-6 ranking pipeline."""
 
     if not isinstance(_emit_logs, bool):
         raise DynamicRankingError("router_dynamic _emit_logs must be a boolean")
+    if (
+        _stage_observability_out is not None
+        and type(_stage_observability_out) is not dict
+    ):
+        raise DynamicRankingError(
+            "router_dynamic stage observability output must be a dict"
+        )
+    if _stage_observability_out is not None:
+        _stage_observability_out.pop("hard_filter_ms", None)
+        _stage_observability_out.pop("score_ms", None)
 
     def emit_info(event: str, **fields: Any) -> None:
         if _emit_logs:
@@ -8570,6 +8634,11 @@ def rank_models(
         maximum = max(maximum, proposer_recovery_quorum)
         bound_reasons.append("proposer_recovery_quorum")
 
+    proposer_filter_started_ns = (
+        time.monotonic_ns()
+        if _stage_observability_out is not None
+        else None
+    )
     proposer_filters: list[dict[str, Any]] = []
     eligible: list[RankedModel] = []
     for model in models:
@@ -8595,6 +8664,11 @@ def rank_models(
         )
         if not reasons:
             eligible.append(model)
+    proposer_filter_ms = (
+        _ranking_stage_elapsed_ms(proposer_filter_started_ns)
+        if proposer_filter_started_ns is not None
+        else 0
+    )
     generation_policy_exclusions = [
         {
             "identity": row["identity"],
@@ -8655,6 +8729,11 @@ def rank_models(
             ),
         )
 
+    score_started_ns = (
+        time.monotonic_ns()
+        if _stage_observability_out is not None
+        else None
+    )
     score_rows = [
         _base_score_row(
             model,
@@ -8942,6 +9021,16 @@ def rank_models(
             f"a feasible aggregator (stop_reason={stop_reason})",
             reason="proposer_recovery_quorum_unreachable",
         )
+    score_ms = (
+        _ranking_stage_elapsed_ms(score_started_ns)
+        if score_started_ns is not None
+        else 0
+    )
+    aggregator_filter_started_ns = (
+        time.monotonic_ns()
+        if _stage_observability_out is not None
+        else None
+    )
     aggregator_rows, aggregator_filters = _aggregator_rows(
         models,
         proposers=selected,
@@ -8951,6 +9040,17 @@ def rank_models(
         ranking_config=effective_ranking_config,
         thinking_policy=thinking_policy,
     )
+    aggregator_filter_ms = (
+        _ranking_stage_elapsed_ms(aggregator_filter_started_ns)
+        if aggregator_filter_started_ns is not None
+        else 0
+    )
+    if _stage_observability_out is not None:
+        _stage_observability_out["hard_filter_ms"] = min(
+            (1 << 63) - 1,
+            proposer_filter_ms + aggregator_filter_ms,
+        )
+        _stage_observability_out["score_ms"] = score_ms
     if not aggregator_rows:
         thinking_unavailable = any(
             "thinking_level_unavailable" in row["reasons"] for row in aggregator_filters

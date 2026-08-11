@@ -54,10 +54,12 @@ alert ruler、通知目标或可加载 dashboard。因此不能把 JSONL 文件�
 并接入真实 backend 时，collector 只能消费通过 `transport_schema`、`event` 和
 `schema` 三重过滤且通过同一 allowlist 的 rows。
 
-snapshot build/filter/score latency、snapshot cache hit 与 metrics delivery
-coverage 仍保持 unavailable；本 transport 不增加这些 producer evidence，也不得
-为它们建立 query 或 alert。Same-host persistent canary rollback 已有独立 receipt
-projection，仍不代表 multi-host coordination、quality rollback 或 latency evidence。
+router-dynamic snapshot build、hard filter、score latency 与本次 packaged-template
+lookup 的 cache hit 已有独立 producer evidence 和固定 projector；metrics delivery
+coverage 仍保持 unavailable。本 transport 只承运已通过 contract 的投影行，不能
+反向证明投影行已被 collector 摄取。Same-host persistent canary rollback 已有独立
+receipt projection，仍不代表 multi-host coordination、quality rollback 或整体请求
+latency evidence。
 
 主要解决：为后续真实采集器提供可解析、低基数、空间有界的本地交接面，同时
 明确它没有越级完成 dashboard、告警或缺失 producer 的观测能力。
@@ -99,39 +101,34 @@ projection，仍不代表 multi-host coordination、quality rollback 或 latency
 | `trace_compact_json_bytes_cap`、`trace_compact_json_visit_cap` | 固定 262144、16384 | 测量工作上界。 |
 | `trace_compact_json_bytes_cap_reason` | `byte_limit`、`visit_limit`、`depth_limit` | capped 原因。 |
 
-当前没有 end-to-end ensemble latency、metrics delivery coverage、trace schema revision hash、snapshot version/hash、snapshot build/filter/score latency 或 snapshot cache hit producer 字段；这些全部 unavailable。
+router-dynamic 的 terminal trace 现在可带顶层
+`ranking_stage_observability`，schema 固定为
+`opensquilla.router-dynamic-ranking-stage-observability/v1`。它来自私有 sidecar，
+不进入 `selection_plan`、ranking decision、selection fingerprint 或 replay 输入；
+因此 nondeterministic 计时不会改变选择或历史重放字节。
 
-现有 `selection_plan` 中的 `candidate_pool`、`hard_filter` 和
-`model_scores` 只是确定性的阶段产物，不能证明阶段耗时；同样，进程内
-packaged-registry template index 使用缓存，并不等于 terminal trace 已记录
-“本次 lookup 命中”。禁止用这些产物是否存在推导 latency，禁止用进程级
-cache counter 的前后差值归因单次请求，也禁止把缺失字段补成 `0` 或
-`cache_hit=false`。
+| 字段 | 输出条件与精度 | 语义 |
+| --- | --- | --- |
+| `ranking_stage_observed` | 顶层 block 为 built-in dict 且 schema 精确匹配 | 识别到版本化阶段证据；不表示其中所有值都合法。 |
+| `ranking_snapshot_build_ms_observed`、`ranking_snapshot_build_ms` | schema 匹配，value 为非 bool、0..2^63-1 的整数毫秒 | 构造本 turn registry snapshot 的 monotonic elapsed time。0 是合法真实观测。 |
+| `ranking_hard_filter_ms_observed`、`ranking_hard_filter_ms` | 同上 | proposer 与 aggregator 两段 hard-filter monotonic elapsed time 之和。 |
+| `ranking_score_ms_observed`、`ranking_score_ms` | 同上 | proposer score/selection 阶段 monotonic elapsed time。 |
+| `ranking_stage_projection_complete` | 固定字段集合无未知键，三个计时都合法；可选 cache 字段若存在也必须为 strict bool | 三段 latency 可共同消费的总 gate；cache 字段不是 complete 的必需项。 |
+| `ranking_packaged_template_cache_hit_observed`、`ranking_packaged_template_cache_hit` | 默认 packaged registry lookup 原子返回 strict bool 时 | 本次 lookup 是否命中 process-local immutable template index。显式或历史 snapshot 不输出该字段。 |
 
-最小 producer instrumentation 必须先满足以下前置条件，之后才能扩展 v1
-projector：
+cache primitive 在同一次 lookup 内原子返回 index 与 hit/miss；projector 不读取
+`cache_info()`，也不以进程 counter delta 猜测请求归属。缺少 cache 字段不是
+`false`，必须从 cache-hit denominator 排除。三个计时均来自真实函数边界的
+monotonic clock，并被规范化为非负有界整数；未知 schema、坏类型、越界值或
+未知字段只会降低对应 observed/complete gate，不会阻断模型调用。
 
-1. 在 snapshot build、hard filter、score 的真实函数边界用 monotonic clock
-   记录有界整数毫秒；计时通过私有 sidecar 传递，不能写进确定性的 ranking
-   decision 或 replay 输入。主要解决：避免 nondeterministic latency 污染选择
-   结果与 replay。
-2. 缓存 primitive 必须在完成单次 lookup 时原子返回 hit/miss；不能从全局
-   `cache_info()` delta 猜测，因为并发 lookup 无法安全归因。主要解决：保证
-   cache-hit denominator 是请求级真实证据。
-3. producer 需要先定义版本化 terminal evidence block，并完成 trace schema、
-   artifact hash、历史 replay 与 compact-evidence 兼容性迁移；在确认 selection
-   fingerprint 和内容寻址语义不漂移前，不得把 sidecar 塞入现有
-   `selection_plan`。主要解决：保护现有 trace/hash 契约。
-4. projector 只接受固定 schema、非负有界整数和严格 bool；为每个阶段分别
-   输出 `*_observed`，只有三个计时都合法时才允许
-   `ranking_stage_projection_complete=true`。任何异常继续 fail-open，且不能把
-   snapshot version/hash、model/provider identity 或 cache key 投影为 label。
-   主要解决：固定 cardinality，并保持 telemetry 不影响模型调用。
+仍然 unavailable：end-to-end ensemble latency、metrics delivery coverage、trace
+schema revision hash、snapshot version/hash，以及显式/历史 snapshot 的 cache-hit
+语义。snapshot version/hash、model/provider identity、cache key 与 raw sidecar
+永远不能成为 metrics value 或 label。
 
-上述 producer 与迁移尚未实现，因此 dashboard 和 SLO 必须继续把这组字段显示
-为 unavailable；本节是实现门槛，不是已经生效的字段契约。
-
-主要解决：提供跨后端一致的结果与 trace 容量视图，同时明确 snapshot 和端到端延迟仍缺证据。
+主要解决：给三个真实排名阶段和默认 packaged-template cache 建立请求级证据，
+同时保持 deterministic ranking/replay 与低基数隐私边界。
 
 ### 3.2 Task Analyzer
 
@@ -320,9 +317,9 @@ false-rollback、post-rollback service health 与自动回滚延迟仍 unavailab
 | Panel | 过滤与字段 | 展示 / 聚合 | Missing evidence 规则 | 主要解决 |
 | --- | --- | --- | --- | --- |
 | Outcome overview | schema v1；`execution_status` | event count，success/degraded/failed rate，按 `selection_family` 分面 | 只统计已摄取 v1 events；同时显示“producer delivery coverage unavailable” | 主要解决：快速发现 terminal failure 与 degraded delivery 上升。 |
-| Latency percentiles | `task_analyzer_elapsed_ms`、`time_to_quorum_ms`、exact role `admission_wait_ms_max`、exact `trace_compact_json_bytes` | 每个 scalar 分别画 p50/p95/p99；`proposer_candidate_elapsed_ms_max` 仅作 diagnostic | 字段缺失不入样本；lower bound/capped 不混入 exact quantile | 主要解决：给现有可证明的阶段延迟建立尾延迟视图。 |
+| Latency percentiles | ranking 三阶段各自 observed value、`task_analyzer_elapsed_ms`、`time_to_quorum_ms`、exact role `admission_wait_ms_max`、exact `trace_compact_json_bytes` | 每个 scalar 分别画 p50/p95/p99；`proposer_candidate_elapsed_ms_max` 仅作 diagnostic | 字段缺失不入样本；ranking 联合视图还要求 projection complete；lower bound/capped 不混入 exact quantile | 主要解决：给现有可证明的阶段延迟建立尾延迟视图。 |
 | Analyzer | Analyzer observed/source/schema/chain/deadline fields | source family、schema-valid、exhausted、expired rate；attempt/physical counts | capped chain 从 exact SLO 排除，单列 cap rate | 主要解决：定位 Analyzer fallback、schema 和 deadline 故障。 |
-| Trace / snapshot | exact/lower-bound trace size、cap reason、selection family、runtime health filter | size p50/p95/p99、cap rate、family mix；snapshot 面板显示 unavailable 字段清单 | capped size只进入 lower-bound series；snapshot 无 producer 证据不显示 0 | 主要解决：控制 trace 膨胀并显式暴露 snapshot telemetry 缺口。 |
+| Trace / snapshot | exact/lower-bound trace size、cap reason、selection family、runtime health filter、ranking stage observed/complete、packaged cache hit observed/value | size p50/p95/p99、cap rate、family mix、三阶段 coverage 与 cache-hit share | capped size只进入 lower-bound series；cache 缺失不补 false；version/hash 与非 packaged cache 继续 unavailable | 主要解决：控制 trace 膨胀并量化 snapshot 阶段/cache 证据覆盖。 |
 | Admission | role observed/complete、exact/lower-bound counts/waits | proposer/aggregator 分开展示 exact failure rate、coverage、wait p50/p95/p99；lower bounds 单独堆叠 | projection incomplete 只进 coverage/lower-bound，不进 exact SLO | 主要解决：区分真实队列压力和无法 join 的不完整 admission 证据。 |
 | Runtime health | filter、role health states、deferred、half-open、never-strand | state/defer shares、probe activity、never-strand activation、filtered/minimum/exempt counts | 无 observed gate 不入 rate；不推断 probe success | 主要解决：发现 benched/half-open 堆积和 never-strand 频繁兜底。 |
 | Logical terminal HTTP | proposer/aggregator observed status counts | 429、5xx count 与 observed-status share，role 分开 | 没有 status 的 physical request 不入 denominator；注明不是真实 call error rate | 主要解决：发现 logical terminal 的 rate-limit 与 upstream burst，同时避免假分母。 |
@@ -358,9 +355,20 @@ quorum_latency_q    = quantile_q(time_to_quorum_ms | field exists)
 proposer_max_q      = quantile_q(proposer_candidate_elapsed_ms_max | field exists and candidate_scan_capped == false)
 role_admission_q    = quantile_q(role_admission_wait_ms_max | role_admission_projection_complete == true)
 trace_size_q        = quantile_q(trace_compact_json_bytes | trace_size_observed == true and capped == false)
+snapshot_build_q    = quantile_q(ranking_snapshot_build_ms | ranking_snapshot_build_ms_observed == true)
+hard_filter_q       = quantile_q(ranking_hard_filter_ms | ranking_hard_filter_ms_observed == true)
+ranking_score_q     = quantile_q(ranking_score_ms | ranking_score_ms_observed == true)
+
+ranking_stage_evidence_coverage =
+  count(ranking_stage_projection_complete == true)
+  / count(ranking_stage_observed == true)
+
+packaged_template_cache_hit_rate =
+  count(ranking_packaged_template_cache_hit == true)
+  / count(ranking_packaged_template_cache_hit_observed == true)
 ```
 
-建议由部署方配置固定预算 `T_analyzer`、`T_quorum`、`T_admission`：p95 不超过对应预算，p99 不超过 1.5 倍预算；没有预算时只做 7 天同小时基线告警（warning > 2× baseline，critical > 3× baseline，且至少 20 个样本）。`proposer_max_q` 是 per-call max 的分布，不是 candidate latency histogram。overall ensemble latency 与 aggregator attempt latency当前 unavailable。
+建议由部署方配置固定预算 `T_snapshot`、`T_filter`、`T_score`、`T_analyzer`、`T_quorum`、`T_admission`：p95 不超过对应预算，p99 不超过 1.5 倍预算；没有预算时只做 7 天同小时基线告警（warning > 2× baseline，critical > 3× baseline，且至少 20 个样本）。ranking stage evidence coverage warning `<99%`、critical `<95%`；cache-hit rate 只作容量/性能趋势，不设通用成功阈值。`proposer_max_q` 是 per-call max 的分布，不是 candidate latency histogram。overall ensemble latency 与 aggregator attempt latency 当前 unavailable。
 
 主要解决：提供不依赖具体监控厂商的尾延迟公式，并避免把 prefix/max 指标误称为逐请求延迟。
 

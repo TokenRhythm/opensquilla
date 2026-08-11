@@ -166,6 +166,14 @@ _RUNTIME_HEALTH_HALF_OPEN_BUSY_REASON = (
     "runtime_deployment_half_open_busy"
 )
 _CANARY_ROLLOUT_SCHEMA = "opensquilla.ensemble-canary-rollout/v1"
+_RANKING_STAGE_OBSERVABILITY_SCHEMA = (
+    "opensquilla.router-dynamic-ranking-stage-observability/v1"
+)
+_RANKING_STAGE_OBSERVABILITY_INT_FIELDS = (
+    "snapshot_build_ms",
+    "hard_filter_ms",
+    "score_ms",
+)
 _CANARY_ROLLOUT_REASONS = (
     "canary_policy_invalid",
     "canary_rollout_disabled",
@@ -183,6 +191,32 @@ _CANARY_ROLLOUT_REASONS = (
 _CANARY_PHYSICAL_BUDGET_EXHAUSTED_CODE = (
     "ensemble_canary_physical_budget_exhausted"
 )
+
+
+def _normalized_ranking_stage_observability(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Detach the private timing sidecar into a fixed terminal-trace block."""
+
+    if (
+        type(value) is not dict
+        or value.get("schema") != _RANKING_STAGE_OBSERVABILITY_SCHEMA
+    ):
+        return {}
+    normalized: dict[str, Any] = {
+        "schema": _RANKING_STAGE_OBSERVABILITY_SCHEMA,
+    }
+    for field_name in _RANKING_STAGE_OBSERVABILITY_INT_FIELDS:
+        raw_value = value.get(field_name)
+        if (
+            type(raw_value) is int
+            and 0 <= raw_value <= (1 << 63) - 1
+        ):
+            normalized[field_name] = raw_value
+    raw_cache_hit = value.get("packaged_template_cache_hit")
+    if type(raw_cache_hit) is bool:
+        normalized["packaged_template_cache_hit"] = raw_cache_hit
+    return normalized
 _CANARY_RUNTIME_HEALTH_UNAVAILABLE_CODE = (
     "ensemble_canary_runtime_health_unavailable"
 )
@@ -5181,6 +5215,7 @@ class EnsembleProvider:
         proposer_max_tokens_cap_explicit: bool = False,
         quorum_grace_seconds: float = 0.0,
         selection_plan: Mapping[str, Any] | None = None,
+        _ranking_stage_observability: Mapping[str, Any] | None = None,
         _router_dynamic_retry_context: _RouterDynamicRetryContext | None = None,
         _member_request_budget_bindings: Mapping[tuple[str, str, str], _MemberRequestBudgetBinding]
         | None = None,
@@ -5336,6 +5371,11 @@ class EnsembleProvider:
                 "match the executable prompt version"
             )
         self.selection_plan = normalized_selection_plan
+        self._ranking_stage_observability = (
+            _normalized_ranking_stage_observability(
+                _ranking_stage_observability
+            )
+        )
         self._analyzer_failure_fallback_declared_at_init = bool(
             self.selection_plan.get("analyzer_failure_fallback") is True
         )
@@ -14264,6 +14304,10 @@ class EnsembleProvider:
             trace["aggregator_prompt"] = _json_safe(
                 self.aggregator_prompt_evidence
             )
+        if self._ranking_stage_observability:
+            trace["ranking_stage_observability"] = dict(
+                self._ranking_stage_observability
+            )
         if self.selection_plan:
             trace["selection_plan"] = _json_safe(
                 self._selection_plan_execution_snapshot()
@@ -20752,6 +20796,7 @@ def _build_router_dynamic_members(
     retry_context_inputs_out: dict[str, Any] | None = None,
     provider_health_ledger: Any | None = None,
     live_canary_identities_out: set[str] | None = None,
+    ranking_stage_observability_out: dict[str, Any] | None = None,
 ) -> tuple[str, list[EnsembleMemberConfig], EnsembleMemberConfig, dict[str, Any]]:
     """Build members from the profile-driven Step2 ranking decision."""
 
@@ -20764,6 +20809,7 @@ def _build_router_dynamic_members(
         _is_validated_ranking_config,
         _legacy_registry_snapshot_projection,
         _prepare_effective_ranking_config,
+        _ranking_stage_elapsed_ms,
         _request_context_hash,
         build_model_registry_snapshot,
         build_request_context,
@@ -21551,6 +21597,16 @@ def _build_router_dynamic_members(
                 contract_source_snapshot = _legacy_registry_snapshot_projection(
                     contract_source_snapshot
                 )
+    if (
+        ranking_stage_observability_out is not None
+        and type(ranking_stage_observability_out) is not dict
+    ):
+        raise TypeError("router_dynamic ranking observability output must be a dict")
+    snapshot_started_ns = (
+        time.monotonic_ns()
+        if ranking_stage_observability_out is not None
+        else None
+    )
     snapshot = build_model_registry_snapshot(
         inherited_provider=inherited_provider_config.provider,
         inherited_model=inherited_provider_config.model,
@@ -21565,7 +21621,16 @@ def _build_router_dynamic_members(
             else None
         ),
         ranking_config=ranking_config,
+        _observability_out=ranking_stage_observability_out,
     )
+    if ranking_stage_observability_out is not None:
+        assert snapshot_started_ns is not None
+        ranking_stage_observability_out["schema"] = (
+            _RANKING_STAGE_OBSERVABILITY_SCHEMA
+        )
+        ranking_stage_observability_out["snapshot_build_ms"] = (
+            _ranking_stage_elapsed_ms(snapshot_started_ns)
+        )
     if not thinking_assignment_enabled:
         snapshot = _legacy_registry_snapshot_projection(snapshot)
 
@@ -21772,6 +21837,9 @@ def _build_router_dynamic_members(
                 configured_min_success if min_success_explicit else None
             ),
             _emit_logs=emit_logs,
+            _stage_observability_out=(
+                ranking_stage_observability_out if emit_logs else None
+            ),
         )
 
     runtime_health_filter_trace = None
@@ -22688,6 +22756,7 @@ def build_ensemble_provider_from_config(
     aggregator_fallbacks: list[EnsembleMemberConfig] = []
     proposer_backups: list[EnsembleMemberConfig] = []
     live_canary_identities: set[str] = set()
+    ranking_stage_observability: dict[str, Any] = {}
     materialized_retry_inputs: dict[str, Any] = {}
     static_profile = static_b5_profile(selection_mode)
     if static_profile is not None:
@@ -22726,6 +22795,9 @@ def build_ensemble_provider_from_config(
             retry_context_inputs_out=materialized_retry_inputs,
             provider_health_ledger=_provider_health_ledger,
             live_canary_identities_out=live_canary_identities,
+            ranking_stage_observability_out=(
+                ranking_stage_observability
+            ),
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
@@ -23140,6 +23212,7 @@ def build_ensemble_provider_from_config(
         ),
         quorum_grace_seconds=quorum_grace_seconds,
         selection_plan=selection_plan,
+        _ranking_stage_observability=ranking_stage_observability,
         _member_request_budget_bindings=request_budget_bindings,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
         _provider_health_ledger=live_provider_health_ledger,

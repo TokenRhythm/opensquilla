@@ -5057,6 +5057,51 @@ def _default_off_router_dynamic_provider(
     )
 
 
+def test_router_dynamic_ranking_stage_observability_is_terminal_only() -> None:
+    provider = _default_off_router_dynamic_provider(
+        decision_id="ranking-stage-observability",
+    )
+
+    sidecar = provider._ranking_stage_observability
+    assert sidecar["schema"] == (
+        "opensquilla.router-dynamic-ranking-stage-observability/v1"
+    )
+    for field_name in (
+        "snapshot_build_ms",
+        "hard_filter_ms",
+        "score_ms",
+    ):
+        assert type(sidecar[field_name]) is int
+        assert 0 <= sidecar[field_name] <= (1 << 63) - 1
+    assert type(sidecar["packaged_template_cache_hit"]) is bool
+    assert "ranking_stage_observability" not in provider.selection_plan
+    assert "ranking_stage_observability" not in (
+        provider.selection_plan_execution_snapshot()
+    )
+
+    trace = provider._trace_payload(
+        [],
+        successful_count=0,
+        fallback_used=False,
+        fallback_reason="",
+        final_request_role="aggregator",
+    )
+
+    assert trace["ranking_stage_observability"] == sidecar
+    assert "ranking_stage_observability" not in trace["selection_plan"]
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+    assert metrics["ranking_stage_projection_complete"] is True
+    assert metrics["ranking_snapshot_build_ms"] == sidecar["snapshot_build_ms"]
+    assert metrics["ranking_hard_filter_ms"] == sidecar["hard_filter_ms"]
+    assert metrics["ranking_score_ms"] == sidecar["score_ms"]
+    assert metrics["ranking_packaged_template_cache_hit"] is sidecar[
+        "packaged_template_cache_hit"
+    ]
+
+
 def _reasoning_only_quorum_error(
     provider: EnsembleProvider,
     *,

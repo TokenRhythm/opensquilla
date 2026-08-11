@@ -34,6 +34,15 @@ def test_projector_rows_satisfy_the_transport_contract() -> None:
             {
                 "fallback_used": True,
                 "selection_strategy": "router_dynamic",
+                "ranking_stage_observability": {
+                    "schema": (
+                        "opensquilla.router-dynamic-ranking-stage-observability/v1"
+                    ),
+                    "snapshot_build_ms": 1,
+                    "hard_filter_ms": 2,
+                    "score_ms": 3,
+                    "packaged_template_cache_hit": True,
+                },
                 "selection_plan": {
                     "task_analyzer": {
                         "source": "llm_provider",
@@ -225,6 +234,22 @@ def test_contract_requires_core_fields_and_consistent_terminal_status() -> None:
     inconsistent = _minimal_metrics() | {"execution_status": "failed"}
     with pytest.raises(EnsembleExecutionMetricsContractError, match="disagree"):
         validate_ensemble_execution_metrics(inconsistent)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"ranking_snapshot_build_ms": -1},
+        {"ranking_hard_filter_ms": True},
+        {"ranking_score_ms": 1 << 63},
+        {"ranking_packaged_template_cache_hit": 1},
+    ],
+)
+def test_ranking_stage_transport_contract_rejects_bad_scalar_values(
+    mutation: dict[str, Any],
+) -> None:
+    with pytest.raises(EnsembleExecutionMetricsContractError):
+        validate_ensemble_execution_metrics(_minimal_metrics() | mutation)
 
 
 def test_allowlist_excludes_raw_trace_identity_and_hash_keys() -> None:

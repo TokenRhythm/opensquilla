@@ -46,6 +46,18 @@ _CANARY_PHYSICAL_BUDGET_SCHEMA = (
 _CANARY_PERSISTENT_ROLLOUT_SCHEMA = (
     "opensquilla.ensemble-canary-persistent-rollout/v1"
 )
+_RANKING_STAGE_OBSERVABILITY_SCHEMA = (
+    "opensquilla.router-dynamic-ranking-stage-observability/v1"
+)
+_RANKING_STAGE_OBSERVABILITY_FIELDS = frozenset(
+    {
+        "schema",
+        "snapshot_build_ms",
+        "hard_filter_ms",
+        "score_ms",
+        "packaged_template_cache_hit",
+    }
+)
 _MAX_CANARY_PERSISTENT_RECEIPTS = 8
 _CANARY_PERSISTENT_RECEIPT_FIELDS = frozenset(
     {
@@ -328,6 +340,55 @@ def _selection_family(trace: Mapping[str, Any]) -> str:
     if strategy:
         return "fixed"
     return "unknown"
+
+
+def _project_ranking_stage_metrics(
+    trace: Mapping[str, Any],
+    metrics: dict[str, Any],
+) -> None:
+    raw_stage = trace.get("ranking_stage_observability")
+    stage_observed = bool(
+        type(raw_stage) is dict
+        and raw_stage.get("schema")
+        == _RANKING_STAGE_OBSERVABILITY_SCHEMA
+    )
+    metrics["ranking_stage_observed"] = stage_observed
+
+    stage = raw_stage if stage_observed else {}
+    all_timings_observed = True
+    for source_field, metric_field in (
+        ("snapshot_build_ms", "ranking_snapshot_build_ms"),
+        ("hard_filter_ms", "ranking_hard_filter_ms"),
+        ("score_ms", "ranking_score_ms"),
+    ):
+        value = _non_negative_int(stage.get(source_field))
+        observed = bool(stage_observed and value is not None)
+        metrics[f"{metric_field}_observed"] = observed
+        all_timings_observed = all_timings_observed and observed
+        if observed:
+            metrics[metric_field] = value
+
+    raw_cache_hit = stage.get("packaged_template_cache_hit")
+    cache_hit_observed = bool(
+        stage_observed and type(raw_cache_hit) is bool
+    )
+    metrics["ranking_packaged_template_cache_hit_observed"] = (
+        cache_hit_observed
+    )
+    if cache_hit_observed:
+        metrics["ranking_packaged_template_cache_hit"] = raw_cache_hit
+
+    shape_valid = bool(
+        stage_observed
+        and set(stage).issubset(_RANKING_STAGE_OBSERVABILITY_FIELDS)
+        and (
+            "packaged_template_cache_hit" not in stage
+            or cache_hit_observed
+        )
+    )
+    metrics["ranking_stage_projection_complete"] = bool(
+        shape_valid and all_timings_observed
+    )
 
 
 def _project_task_analyzer_metrics(
@@ -2004,6 +2065,7 @@ def build_ensemble_execution_metrics(
     if fallback_used_observed:
         metrics["fallback_used"] = fallback_used
 
+    _project_ranking_stage_metrics(trace, metrics)
     _project_task_analyzer_metrics(trace, metrics)
     _project_aggregator_recovery_metrics(trace, metrics)
     _project_runtime_health_filter_metrics(trace, metrics)

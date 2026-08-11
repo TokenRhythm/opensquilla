@@ -4,9 +4,11 @@ import asyncio
 import gc
 import hashlib
 import json
+import threading
 import time
 import weakref
 from collections.abc import AsyncIterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from copy import copy, deepcopy
 from typing import Any
 
@@ -259,6 +261,7 @@ def _decision(
     thinking_assignment_enabled: bool = False,
     proposer_recovery_quorum: int | None = None,
     user_profile_enabled: bool = True,
+    stage_observability_out: dict[str, Any] | None = None,
 ):
     return rank_models(
         task_analysis=analysis or _analysis(),
@@ -274,6 +277,7 @@ def _decision(
         ranking_config=ranking_config,
         ranking_thinking_assignment_enabled=thinking_assignment_enabled,
         proposer_recovery_quorum=proposer_recovery_quorum,
+        _stage_observability_out=stage_observability_out,
     )
 
 
@@ -2249,6 +2253,98 @@ def test_packaged_registry_template_index_preserves_exact_and_basename_semantics
     assert reread["static_profile"]["capability_dist_prior"]["reasoning"] == 0.91
 
 
+def test_packaged_registry_template_cache_reports_one_atomic_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ranking_router,
+        "_PACKAGED_REGISTRY_TEMPLATE_INDEX",
+        None,
+    )
+    original_compile = ranking_router._compile_packaged_registry_template_index
+    compile_count = 0
+    compile_count_lock = threading.Lock()
+
+    def counted_compile(snapshot: Any) -> Any:
+        nonlocal compile_count
+        with compile_count_lock:
+            compile_count += 1
+        return original_compile(snapshot)
+
+    monkeypatch.setattr(
+        ranking_router,
+        "_compile_packaged_registry_template_index",
+        counted_compile,
+    )
+    worker_count = 8
+    barrier = threading.Barrier(worker_count)
+
+    def lookup() -> tuple[Any, bool]:
+        barrier.wait(timeout=5)
+        return ranking_router._packaged_registry_template_index_lookup()
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        results = list(executor.map(lambda _: lookup(), range(worker_count)))
+
+    assert compile_count == 1
+    assert sum(cache_hit is False for _, cache_hit in results) == 1
+    assert sum(cache_hit is True for _, cache_hit in results) == worker_count - 1
+    assert len({id(index) for index, _ in results}) == 1
+
+    inherited_lock = ranking_router._PACKAGED_REGISTRY_TEMPLATE_INDEX_LOCK
+    inherited_lock.acquire()
+    try:
+        ranking_router._PACKAGED_REGISTRY_TEMPLATE_INDEX = None
+        ranking_router._reset_packaged_registry_template_index_lock_after_fork()
+        reset_index, reset_hit = (
+            ranking_router._packaged_registry_template_index_lookup()
+        )
+    finally:
+        inherited_lock.release()
+    assert reset_hit is False
+    assert reset_index is not results[0][0]
+    assert compile_count == 2
+
+
+def test_snapshot_build_reports_request_level_cache_evidence_without_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ranking_router,
+        "_PACKAGED_REGISTRY_TEMPLATE_INDEX",
+        None,
+    )
+    kwargs = {
+        "inherited_provider": "openrouter",
+        "inherited_model": "openai/gpt-5.6-sol",
+        "routed_tier": "c2",
+    }
+    first_observability: dict[str, Any] = {}
+    second_observability: dict[str, Any] = {}
+
+    first = build_model_registry_snapshot(
+        **kwargs,
+        _observability_out=first_observability,
+    )
+    second = build_model_registry_snapshot(
+        **kwargs,
+        _observability_out=second_observability,
+    )
+
+    assert canonical_json_sha256(first) == canonical_json_sha256(second)
+    assert first_observability == {"packaged_template_cache_hit": False}
+    assert second_observability == {"packaged_template_cache_hit": True}
+
+    explicit_observability = {"packaged_template_cache_hit": True}
+    explicit = build_model_registry_snapshot(
+        **kwargs,
+        packaged_snapshot=load_model_registry_snapshot(),
+        _observability_out=explicit_observability,
+    )
+    assert canonical_json_sha256(explicit) == canonical_json_sha256(first)
+    assert explicit_observability == {}
+
+
 def test_default_packaged_template_index_matches_linear_snapshot_build() -> None:
     kwargs = {
         "inherited_provider": "openrouter",
@@ -2293,7 +2389,7 @@ def test_explicit_legacy_registry_snapshot_skips_packaged_template_index(
     legacy = ranking_router._legacy_registry_snapshot_projection(historical)
     monkeypatch.setattr(
         ranking_router,
-        "_packaged_registry_template_index",
+        "_packaged_registry_template_index_lookup",
         lambda: (_ for _ in ()).throw(AssertionError("unexpected packaged fast path")),
     )
 
@@ -2324,6 +2420,55 @@ def test_explicit_legacy_registry_snapshot_skips_packaged_template_index(
     assert canonical_json_sha256(replay) == (
         "f7ec984706f8c6d7f5c691630d41c5735e7d5b0ebd8e79e7cf175b24fda6093a"
     )
+
+
+def test_ranker_records_monotonic_stage_timings_outside_decision_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models = (
+        _model("alpha", capability=0.95, aggregator_fit=0.82),
+        _model("beta", capability=0.90, aggregator_fit=0.97),
+        _model("gamma", capability=0.85, aggregator_fit=0.88),
+    )
+    expected = _decision(*models)
+    monotonic_values = iter(
+        [
+            0,
+            5_000_000,
+            10_000_000,
+            17_000_000,
+            20_000_000,
+            23_000_000,
+        ]
+    )
+    monkeypatch.setattr(
+        ranking_router.time,
+        "monotonic_ns",
+        lambda: next(monotonic_values),
+    )
+    stage_observability: dict[str, Any] = {}
+
+    actual = _decision(
+        *models,
+        stage_observability_out=stage_observability,
+    )
+
+    assert stage_observability == {
+        "hard_filter_ms": 8,
+        "score_ms": 7,
+    }
+    assert actual == expected
+    with pytest.raises(StopIteration):
+        next(monotonic_values)
+
+    monkeypatch.setattr(
+        ranking_router.time,
+        "monotonic_ns",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unrequested ranking timing")
+        ),
+    )
+    assert _decision(*models) == expected
 
 
 def test_operator_candidates_only_use_explicit_aggregator_role_for_aggregation() -> None:
