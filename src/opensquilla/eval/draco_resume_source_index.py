@@ -528,6 +528,63 @@ class ResumeSourceIndex:
             "compact_artifact_evidence": compact_evidence,
         }
 
+    def source_durable_artifact_verification(
+        self,
+        *,
+        source_index: int,
+    ) -> dict[str, Any] | None:
+        """Detach the durable verification already bound to one source.
+
+        Compact source authorization necessarily verifies the result/trace/
+        checkpoint trio before indexing starts.  A downstream consumer can
+        reuse that exact verification instead of reopening and rescanning the
+        same result artifact.  Legacy sources return ``None`` because they did
+        not pass through the compact durable-bundle boundary.
+
+        This accessor performs no I/O, hashing, expansion, or pack scan and
+        never exposes the mutable verification retained by the index.
+        """
+
+        self._require_open()
+        if (
+            isinstance(source_index, bool)
+            or not isinstance(source_index, int)
+            or source_index < 0
+        ):
+            raise DracoResumeSourceError("resume source index must be non-negative")
+        if self._active_source_id is not None:
+            raise DracoResumeSourceError(
+                "cannot inspect durable verification during a source scan"
+            )
+        if not self._sealed:
+            raise DracoResumeSourceError(
+                "resume source index must be sealed before reading durable verification"
+            )
+        matches = [
+            snapshot
+            for snapshot in self._sources.values()
+            if snapshot.source_index == source_index
+        ]
+        if not matches:
+            raise DracoResumeSourceError(
+                f"resume source index has no completed source {source_index}"
+            )
+        if len(matches) != 1:
+            raise DracoResumeSourceError(
+                f"resume source index is not unique for source {source_index}"
+            )
+        snapshot = matches[0]
+        if not snapshot.sha256:
+            raise DracoResumeSourceError(
+                f"resume source index has no completed digest for source {source_index}"
+            )
+        bundle = snapshot.compact_bundle
+        return (
+            None
+            if bundle is None
+            else copy.deepcopy(bundle.durable_verification)
+        )
+
     def _require_open(self) -> None:
         if self._closed:
             raise DracoResumeSourceError("resume source index is closed")

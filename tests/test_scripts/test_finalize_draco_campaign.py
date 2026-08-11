@@ -10198,26 +10198,365 @@ def test_finalizer_closes_bound_pack_reader_after_business_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args, _, lock_fd = _compact_source_fixture(module, tmp_path)
-    opened_views: list[object] = []
-    original_open = module.open_source_selection_plan_views
+    opened_archives: list[object] = []
+    original_archive = module.FinalizerSourceArchive
 
-    def tracked_open(*call_args: object, **call_kwargs: object):
-        views = original_open(*call_args, **call_kwargs)
-        opened_views.extend(views)
-        return views
+    class TrackedArchive(original_archive):
+        def __init__(self, *call_args: object, **call_kwargs: object) -> None:
+            super().__init__(*call_args, **call_kwargs)
+            opened_archives.append(self)
 
     def fail_after_open(_records: object) -> object:
         raise RuntimeError("business validation failed after pack open")
 
-    monkeypatch.setattr(module, "open_source_selection_plan_views", tracked_open)
+    monkeypatch.setattr(module, "FinalizerSourceArchive", TrackedArchive)
     monkeypatch.setattr(module, "validate_source_policy_history", fail_after_open)
     try:
         with pytest.raises(RuntimeError, match="business validation failed"):
             module.run_finalization(args)
-        assert opened_views
-        assert all(view.reader is None for view in opened_views)
+        assert opened_archives
+        assert all(archive.closed for archive in opened_archives)
     finally:
         os.close(lock_fd)
+
+
+def test_finalizer_streams_history_by_locator_without_legacy_full_row_views(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    archives: list[object] = []
+    original_archive = module.FinalizerSourceArchive
+
+    class TrackedArchive(original_archive):
+        def __init__(self, *call_args: object, **call_kwargs: object) -> None:
+            super().__init__(*call_args, **call_kwargs)
+            archives.append(self)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("legacy full-row finalizer path was called")
+
+    monkeypatch.setattr(module, "FinalizerSourceArchive", TrackedArchive)
+    monkeypatch.setattr(module, "read_source_shard_indexes", forbidden)
+    monkeypatch.setattr(module, "open_source_selection_plan_views", forbidden)
+    try:
+        manifest = module.run_finalization(args)
+        assert manifest["status"] == "complete"
+        assert len(archives) == 1
+        archive = archives[0]
+        assert archive.materialized_row_count == 10
+        assert archive.peeked_row_count == 5
+        assert archive.closed is True
+    finally:
+        os.close(lock_fd)
+
+
+def test_compact_finalizer_streaming_archive_supports_forced_spool(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _, lock_fd = _compact_source_fixture(module, tmp_path)
+    archives: list[object] = []
+    original_archive = module.FinalizerSourceArchive
+
+    class ForcedSpoolArchive(original_archive):
+        def __init__(self, paths: object) -> None:
+            super().__init__(paths, force_spool=True)
+            archives.append(self)
+
+    monkeypatch.setattr(module, "FinalizerSourceArchive", ForcedSpoolArchive)
+    try:
+        manifest = module.run_finalization(args)
+        assert manifest["status"] == "complete"
+        assert len(archives) == 1
+        archive = archives[0]
+        assert archive.backing == "spool"
+        assert archive.materialized_row_count == 5
+        assert archive.peeked_row_count == 5
+        assert archive.closed is True
+    finally:
+        os.close(lock_fd)
+
+
+def test_streaming_compact_manifest_reuses_bound_durable_verification(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.eval import draco_resume_source_index
+
+    args, _, lock_fd = _compact_source_fixture(module, tmp_path)
+    index_verification_calls = 0
+    original_index_verifier = (
+        draco_resume_source_index.verify_durable_draco_artifacts
+    )
+
+    def tracked_index_verifier(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal index_verification_calls
+        index_verification_calls += 1
+        return original_index_verifier(*args, **kwargs)
+
+    def duplicate_finalizer_verifier(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("finalizer rescanned a compact durable result bundle")
+
+    monkeypatch.setattr(
+        draco_resume_source_index,
+        "verify_durable_draco_artifacts",
+        tracked_index_verifier,
+    )
+    monkeypatch.setattr(
+        module,
+        "verify_durable_draco_artifacts",
+        duplicate_finalizer_verifier,
+    )
+    archive = module.FinalizerSourceArchive(args.result)
+    try:
+        indexes = archive.scan()
+        contracts = module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=module.GROUPS,
+            result_indexes=indexes,
+        )
+        assert index_verification_calls == 1
+        assert contracts[3][0]["durable_artifacts"] == (
+            indexes[0].durable_artifact_verification
+        )
+    finally:
+        archive.close(verify=False)
+        os.close(lock_fd)
+
+
+def test_streaming_pair_rejects_expansion_beyond_materialized_byte_cap(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _, lock_fd = _compact_source_fixture(module, tmp_path)
+    monkeypatch.setattr(module, "FINALIZER_MAX_PAIR_MATERIALIZED_BYTES", 1)
+    archive = module.FinalizerSourceArchive(args.result)
+    try:
+        archive.scan()
+        key = next(iter(sorted(archive.keys)))
+        with pytest.raises(
+            module.FinalizationError,
+            match="per-pair materialized byte cap",
+        ):
+            archive.materialize_pair(key)
+    finally:
+        archive.close(verify=False)
+        os.close(lock_fd)
+
+
+@pytest.mark.parametrize("artifact", ["result", "pack"])
+def test_streaming_finalizer_rechecks_same_bytes_inode_before_publication(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact: str,
+) -> None:
+    if artifact == "pack":
+        args, pack_path, lock_fd = _compact_source_fixture(module, tmp_path)
+        target = pack_path
+    else:
+        args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+        target = args.result[0]
+    original_publish = module.publish_atomically
+    replaced = False
+
+    def replace_at_final_gate(**kwargs: object) -> dict[str, object]:
+        original_verifier = kwargs.get("pre_publish_verifier")
+        assert callable(original_verifier)
+
+        def replace_then_verify() -> None:
+            nonlocal replaced
+            replacement = target.with_name(f".{target.name}.replacement")
+            replacement.write_bytes(target.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, target)
+            replaced = True
+            original_verifier()
+
+        kwargs["pre_publish_verifier"] = replace_then_verify
+        return original_publish(**kwargs)
+
+    monkeypatch.setattr(module, "publish_atomically", replace_at_final_gate)
+    try:
+        with pytest.raises(module.FinalizationError, match="changed during finalization"):
+            module.run_finalization(args)
+        assert replaced is True
+        assert not args.output_dir.exists()
+    finally:
+        os.close(lock_fd)
+
+
+def test_streaming_history_analysis_matches_legacy_in_memory_pipeline(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    groups = module.normalize_groups(args.groups)
+    tasks = module.read_tasks(args.input)
+    raw_indexes = module.read_source_shard_indexes(args.result)
+    legacy_contracts = module.load_manifest_contracts(
+        args.manifest,
+        result_paths=args.result,
+        groups=groups,
+        result_indexes=raw_indexes,
+    )
+    views = module.open_source_selection_plan_views(
+        raw_indexes,
+        legacy_contracts[3],
+    )
+    archive = module.FinalizerSourceArchive(args.result)
+    try:
+        records = [record for view in views for record in view.records]
+        fingerprints, contracts, _, manifest_sources = legacy_contracts
+        policy = module.validate_formal_campaign_contracts(contracts, groups=groups)
+        max_attempts = module.authenticated_generation_attempt_limit(
+            args.max_generation_attempts,
+            policy,
+        )
+        old_generation = module.validate_generation_attempt_evidence(
+            records,
+            max_attempts=max_attempts,
+        )
+        old_judge = module.validate_judge_attempt_evidence(
+            records,
+            judge_model=policy.judge_model,
+            judge_max_attempts=policy.judge_max_attempts,
+            judge_provider_pin=policy.judge_provider_pin,
+        )
+        old_selected, old_pair_audit = module.select_results(
+            records,
+            tasks=tasks,
+            groups=groups,
+            fingerprints=fingerprints,
+            contracts=contracts,
+            max_attempts=max_attempts,
+            experiment_policy=policy,
+            manifest_sources=manifest_sources,
+        )
+        old_bindings = module.bind_selected_generation_attempts(records, old_selected)
+        old_ledger, old_ledger_summary = module.build_actual_spend_ledger(
+            records,
+            selected=old_selected,
+            selected_attempt_bindings=old_bindings,
+            judge_model=policy.judge_model,
+        )
+        old_external = module.build_external_tool_cost_summary(
+            records,
+            manifest_sources=manifest_sources,
+        )
+
+        streaming_indexes = archive.scan()
+        streaming_contracts = module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=groups,
+            result_indexes=streaming_indexes,
+        )
+        assert streaming_contracts == legacy_contracts
+        streamed = module.analyze_streaming_source_history(
+            archive,
+            tasks=tasks,
+            groups=groups,
+            fingerprints=fingerprints,
+            contracts=contracts,
+            max_attempts=max_attempts,
+            experiment_policy=policy,
+            manifest_sources=manifest_sources,
+        )
+        assert streamed.generation_attempt_evidence == old_generation
+        assert streamed.judge_attempt_evidence == old_judge
+        assert streamed.pair_audit == old_pair_audit
+        assert streamed.selected_attempt_bindings == old_bindings
+        assert streamed.ledger_rows == old_ledger
+        assert streamed.ledger_summary == old_ledger_summary
+        assert streamed.external_tool_cost == old_external
+        assert archive.materialized_row_count == len(records)
+    finally:
+        archive.close(verify=False)
+        module.verify_and_close_source_selection_plan_views(views)
+        os.close(lock_fd)
+
+
+def test_run_finalization_cleanup_preserves_primary_and_closes_every_view(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[str] = []
+
+    class View:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            closed.append(self.name)
+            raise RuntimeError(f"close-{self.name}")
+
+    primary = module.FinalizationError("primary-finalization-error")
+
+    def fail_with_views(_args, holder):
+        holder.extend((View("first"), View("second")))
+        raise primary
+
+    monkeypatch.setattr(
+        module,
+        "_run_finalization_with_selection_plan_views",
+        fail_with_views,
+    )
+    with pytest.raises(module.FinalizationError, match="primary-finalization-error") as caught:
+        module.run_finalization(argparse.Namespace())
+
+    assert caught.value is primary
+    assert closed == ["second", "first"]
+    assert getattr(primary, "__notes__", []) == [
+        "finalizer cleanup also failed: builtins.RuntimeError",
+        "finalizer cleanup also failed: builtins.RuntimeError",
+    ]
+
+
+def test_run_finalization_cleanup_reports_first_close_error_after_success(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[str] = []
+
+    class View:
+        def __init__(self, name: str, error: BaseException | None) -> None:
+            self.name = name
+            self.error = error
+
+        def close(self) -> None:
+            closed.append(self.name)
+            if self.error is not None:
+                raise self.error
+
+    expected = ValueError("second-close-failed")
+
+    def succeed_with_views(_args, holder):
+        holder.extend(
+            (
+                View("first", RuntimeError("first-close-failed")),
+                View("second", expected),
+                View("third", None),
+            )
+        )
+        return {"status": "complete"}
+
+    monkeypatch.setattr(
+        module,
+        "_run_finalization_with_selection_plan_views",
+        succeed_with_views,
+    )
+    with pytest.raises(ValueError, match="second-close-failed") as caught:
+        module.run_finalization(argparse.Namespace())
+
+    assert caught.value is expected
+    assert closed == ["third", "second", "first"]
 
 
 def test_compact_finalizer_rejects_raw_ref_tamper_before_manifest_or_pack_use(

@@ -209,6 +209,8 @@ def test_sealed_source_artifact_evidence_is_bounded_detached_and_no_io(
     assert list(index.iter_source(result_path, source_index=0)) == []
     with pytest.raises(DracoResumeSourceError, match="must be sealed"):
         index.source_artifact_evidence(source_index=0)
+    with pytest.raises(DracoResumeSourceError, match="must be sealed"):
+        index.source_durable_artifact_verification(source_index=0)
     index.seal()
 
     with monkeypatch.context() as isolated:
@@ -223,6 +225,9 @@ def test_sealed_source_artifact_evidence_is_bounded_detached_and_no_io(
             lambda *_args, **_kwargs: pytest.fail("artifact evidence rescanned pack"),
         )
         evidence = index.source_artifact_evidence(source_index=0)
+        durable_verification = index.source_durable_artifact_verification(
+            source_index=0
+        )
 
     def signature(path: Path) -> tuple[int, ...]:
         info = path.stat()
@@ -263,19 +268,30 @@ def test_sealed_source_artifact_evidence_is_bounded_detached_and_no_io(
             },
         },
     }
+    assert durable_verification is not None
+    assert durable_verification["rows_written"] == 0
+    assert durable_verification["results_sha256"] == sha256(result_path)
+    assert durable_verification["trace_sha256"] == sha256(trace_path)
+    assert durable_verification["checkpoint_sha256"] == sha256(checkpoint_path)
     evidence["result_snapshot"]["sha256"] = "mutated"
     evidence["compact_artifact_evidence"]["durable_hashes"][
         "trace_sha256"
     ] = "mutated"
     fresh = index.source_artifact_evidence(source_index=0)
+    durable_verification["results_sha256"] = "mutated"
+    fresh_durable = index.source_durable_artifact_verification(source_index=0)
     assert fresh["result_snapshot"]["sha256"] == sha256(result_path)
     assert (
         fresh["compact_artifact_evidence"]["durable_hashes"]["trace_sha256"]
         == sha256(trace_path)
     )
+    assert fresh_durable is not None
+    assert fresh_durable["results_sha256"] == sha256(result_path)
     index.close()
     with pytest.raises(DracoResumeSourceError, match="closed"):
         index.source_artifact_evidence(source_index=0)
+    with pytest.raises(DracoResumeSourceError, match="closed"):
+        index.source_durable_artifact_verification(source_index=0)
 
 
 def test_legacy_source_artifact_evidence_and_invalid_lookup_gates(
@@ -288,6 +304,8 @@ def test_legacy_source_artifact_evidence_and_invalid_lookup_gates(
     next(active_rows)
     with pytest.raises(DracoResumeSourceError, match="during a source scan"):
         active_index.source_artifact_evidence(source_index=0)
+    with pytest.raises(DracoResumeSourceError, match="during a source scan"):
+        active_index.source_durable_artifact_verification(source_index=0)
     active_rows.close()
     active_index.close(verify=False)
 
@@ -304,6 +322,7 @@ def test_legacy_source_artifact_evidence_and_invalid_lookup_gates(
     assert evidence["compact_authenticated"] is False
     assert evidence["compact_artifact_evidence"] is None
     assert evidence["result_snapshot"]["sha256"] == resume_source_index._sha256(b"")
+    assert index.source_durable_artifact_verification(source_index=4) is None
     with pytest.raises(DracoResumeSourceError, match="non-negative"):
         index.source_artifact_evidence(source_index=True)
     with pytest.raises(DracoResumeSourceError, match="no completed source 0"):

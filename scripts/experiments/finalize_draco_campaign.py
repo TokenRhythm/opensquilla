@@ -25,8 +25,9 @@ import re
 import shutil
 import tempfile
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from functools import cache
@@ -39,6 +40,11 @@ from opensquilla.eval.draco_artifact_io import (
     DracoArtifactDurabilityError,
     durable_artifact_capability_contract,
     verify_durable_draco_artifacts,
+)
+from opensquilla.eval.draco_resume_source_index import (
+    DracoResumeSourceError,
+    ResumeRowLocator,
+    ResumeSourceIndex,
 )
 from opensquilla.eval.draco_selection_plan_evidence import (
     SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
@@ -105,6 +111,9 @@ JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
 FINALIZER_VERSION = 9
+FINALIZER_MAX_RESULT_LINE_BYTES = 16 * 1024 * 1024
+FINALIZER_MAX_PAIR_SOURCE_BYTES = 32 * 1024 * 1024
+FINALIZER_MAX_PAIR_MATERIALIZED_BYTES = 32 * 1024 * 1024
 RESUME_SCHEDULE_ACTIONS = frozenset(
     {
         "regenerate",
@@ -837,6 +846,515 @@ class SourceShardIndex:
     source_index: int
     sha256: str
     records: tuple[SourceRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRecordLocator:
+    """Bound source location retained instead of a decoded result row."""
+
+    path: Path
+    source_index: int
+    line: int
+    locator: ResumeRowLocator
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.locator.group, self.locator.task_id
+
+    @property
+    def reference(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "source_index": self.source_index,
+            "line": self.line,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingSourceShardIndex:
+    """Bound, locator-only facts collected during one source scan."""
+
+    path: Path
+    source_index: int
+    sha256: str
+    row_count: int
+    locators: tuple[SourceRecordLocator, ...]
+    result_pairs: frozenset[tuple[str, str]]
+    generation_attempt_ids: frozenset[str]
+    durable_marker_count: int
+    durable_markers_valid: bool
+    row_capability_present: bool
+    row_reference_present: bool
+    compact_row_count: int
+    exact_compact_capability: bool
+    skipped_preflight_rows_valid: bool
+    durable_artifact_verification: dict[str, Any] | None
+
+
+def _skipped_preflight_repair_row_valid(row: Mapping[str, Any]) -> bool:
+    execution = row.get("execution")
+    if not isinstance(execution, Mapping):
+        return False
+    action = str(execution.get("resume_action") or "")
+    if execution.get("generation_reused") is not True or action not in {
+        "regenerate",
+        "judge_only",
+        "metadata_only",
+        "audit_only",
+    }:
+        return False
+    if action == "regenerate" and (
+        execution.get("generation_auto_retry_blocked") is not True
+        or execution.get("generation_model_started") is not False
+        or not blocked_regenerate_terminal_evidence(execution)
+    ):
+        return False
+    if action == "metadata_only" and execution.get("judge_reran") is True:
+        return False
+    if action == "audit_only":
+        summary = execution.get("audit_only_summary")
+        if (
+            execution.get("judge_reran") is not False
+            or execution.get("audit_only_recorded") is not True
+            or not isinstance(summary, Mapping)
+            or summary.get("status") != "recorded"
+            or summary.get("generation_called") is not False
+            or summary.get("judge_called") is not False
+        ):
+            return False
+    return True
+
+
+class FinalizerSourceArchive:
+    """Own bound result/pack snapshots while retaining only row locators.
+
+    Every source line is decoded once during the initial authenticated scan.
+    Business rows are materialized later one pair at a time and discarded when
+    that pair's reducers finish.  The underlying :class:`ResumeSourceIndex`
+    keeps either bound descriptors or one private 0600 spool, so source count
+    cannot turn into an unbounded descriptor set.
+    """
+
+    def __init__(
+        self,
+        paths: Sequence[Path],
+        *,
+        force_spool: bool | None = None,
+    ) -> None:
+        if not paths:
+            raise FinalizationError("at least one --result source is required")
+        self._paths = tuple(Path(path) for path in paths)
+        self._index = ResumeSourceIndex(list(self._paths), force_spool=force_spool)
+        self._closed = False
+        self._shards: tuple[StreamingSourceShardIndex, ...] = ()
+        self._by_key: dict[tuple[str, str], tuple[SourceRecordLocator, ...]] = {}
+
+    @property
+    def shards(self) -> tuple[StreamingSourceShardIndex, ...]:
+        if not self._shards:
+            raise FinalizationError("streaming source archive has not been scanned")
+        return self._shards
+
+    @property
+    def keys(self) -> frozenset[tuple[str, str]]:
+        return frozenset(self._by_key)
+
+    @property
+    def materialized_row_count(self) -> int:
+        return self._index.materialized_row_count
+
+    @property
+    def peeked_row_count(self) -> int:
+        return self._index.peeked_row_count
+
+    @property
+    def closed(self) -> bool:
+        return self._closed and self._index.closed
+
+    @property
+    def backing(self) -> str:
+        return self._index.backing
+
+    def scan(self) -> tuple[StreamingSourceShardIndex, ...]:
+        if self._shards:
+            return self._shards
+        seen_paths: set[str] = set()
+        shards: list[StreamingSourceShardIndex] = []
+        by_key: dict[tuple[str, str], list[SourceRecordLocator]] = defaultdict(list)
+        try:
+            for source_index, raw_path in enumerate(self._paths):
+                path = require_regular_file(raw_path, owner_only=True)
+                path_key = str(path)
+                if path_key in seen_paths:
+                    raise FinalizationError(f"duplicate result source: {path}")
+                seen_paths.add(path_key)
+                locators: list[SourceRecordLocator] = []
+                result_pairs: set[tuple[str, str]] = set()
+                generation_attempt_ids: set[str] = set()
+                durable_marker_count = 0
+                durable_markers_valid = True
+                row_capability_present = False
+                row_reference_present = False
+                compact_row_count = 0
+                exact_compact_capability = True
+                skipped_preflight_rows_valid = True
+                with self._index.open_source(
+                    path,
+                    source_index=source_index,
+                ) as indexed_lines:
+                    for indexed in indexed_lines:
+                        if len(indexed.payload) > FINALIZER_MAX_RESULT_LINE_BYTES:
+                            raise FinalizationError(
+                                "result row exceeds the finalizer line byte cap: "
+                                f"{path}:{indexed.locator.line_number}"
+                            )
+                        try:
+                            text = indexed.payload.decode("utf-8")
+                        except UnicodeDecodeError as exc:
+                            raise FinalizationError(
+                                f"unable to read result JSONL {path}: {exc}"
+                            ) from exc
+                        if not text.strip():
+                            continue
+                        row = indexed.parsed_row
+                        if row is None:
+                            try:
+                                value = json.loads(text)
+                            except json.JSONDecodeError as exc:
+                                raise FinalizationError(
+                                    f"invalid result JSONL at {path}:"
+                                    f"{indexed.locator.line_number}"
+                                ) from exc
+                            if not isinstance(value, dict):
+                                raise FinalizationError(
+                                    f"result row is not an object at {path}:"
+                                    f"{indexed.locator.line_number}"
+                                )
+                            row = value
+                        if not verify_result_row_evidence(row):
+                            raise FinalizationError(
+                                "result row is not sealed or was mutated: "
+                                f"{path}:{indexed.locator.line_number}"
+                            )
+                        group = str(row.get("group") or "")
+                        task_id = str(row.get("task_id") or "")
+                        if not group or not task_id:
+                            raise FinalizationError(
+                                "result row lacks a group/task identity: "
+                                f"{path}:{indexed.locator.line_number}"
+                            )
+                        locator = indexed.locator.bind(group=group, task_id=task_id)
+                        # This verifies compact capability placement without
+                        # resolving any selection-plan object.
+                        self._index.classification_row(locator, row)
+                        record_locator = SourceRecordLocator(
+                            path=path,
+                            source_index=source_index,
+                            line=indexed.locator.line_number,
+                            locator=locator,
+                        )
+                        locators.append(record_locator)
+                        by_key[(group, task_id)].append(record_locator)
+                        result_pairs.add((group, task_id))
+                        execution = row.get("execution")
+                        attempts = (
+                            execution.get("generation_attempts")
+                            if isinstance(execution, Mapping)
+                            and isinstance(execution.get("generation_attempts"), list)
+                            else []
+                        )
+                        generation_attempt_ids.update(
+                            attempt_id
+                            for attempt in attempts
+                            if isinstance(attempt, Mapping)
+                            and HEX32.fullmatch(
+                                attempt_id := str(attempt.get("attempt_id") or "")
+                            )
+                        )
+                        if DRACO_DURABLE_RESULT_ROW_FIELD in row:
+                            durable_marker_count += 1
+                            durable_markers_valid = bool(
+                                durable_markers_valid
+                                and row.get(DRACO_DURABLE_RESULT_ROW_FIELD)
+                                == durable_artifact_capability_contract()
+                            )
+                        has_capability = selection_plan_row_capability_signal(row)
+                        has_reference = selection_plan_reference_signal(row)
+                        row_capability_present = row_capability_present or has_capability
+                        row_reference_present = row_reference_present or has_reference
+                        compact_row_count += int(has_reference)
+                        exact_compact_capability = bool(
+                            exact_compact_capability
+                            and _selection_plan_row_has_exact_root_capability(
+                                row,
+                                selection_plan_evidence_capability_contract(),
+                            )
+                        )
+                        skipped_preflight_rows_valid = bool(
+                            skipped_preflight_rows_valid
+                            and _skipped_preflight_repair_row_valid(row)
+                        )
+                        del row
+                # Artifact evidence is available only after the aggregate seal;
+                # the source digest is filled below from that immutable view.
+                shards.append(
+                    StreamingSourceShardIndex(
+                        path=path,
+                        source_index=source_index,
+                        sha256="",
+                        row_count=len(locators),
+                        locators=tuple(locators),
+                        result_pairs=frozenset(result_pairs),
+                        generation_attempt_ids=frozenset(generation_attempt_ids),
+                        durable_marker_count=durable_marker_count,
+                        durable_markers_valid=durable_markers_valid,
+                        row_capability_present=row_capability_present,
+                        row_reference_present=row_reference_present,
+                        compact_row_count=compact_row_count,
+                        exact_compact_capability=exact_compact_capability,
+                        skipped_preflight_rows_valid=skipped_preflight_rows_valid,
+                        durable_artifact_verification=None,
+                    )
+                )
+            if not any(shard.row_count for shard in shards):
+                raise FinalizationError("result sources contain no sealed rows")
+            self._index.seal()
+            sealed_shards: list[StreamingSourceShardIndex] = []
+            for shard in shards:
+                evidence = self._index.source_artifact_evidence(
+                    source_index=shard.source_index
+                )
+                durable_verification = (
+                    self._index.source_durable_artifact_verification(
+                        source_index=shard.source_index
+                    )
+                )
+                sealed_shards.append(
+                    dataclass_replace(
+                        shard,
+                        sha256=str(evidence["result_snapshot"]["sha256"]),
+                        durable_artifact_verification=durable_verification,
+                    )
+                )
+            self._shards = tuple(sealed_shards)
+            self._by_key = {
+                key: tuple(sorted(values, key=lambda value: (value.source_index, value.line)))
+                for key, values in by_key.items()
+            }
+            return self._shards
+        except DracoResumeSourceError as exc:
+            self.close(verify=False)
+            cause: BaseException | None = exc
+            while cause is not None:
+                if isinstance(cause, SelectionPlanEvidenceError) and (
+                    "nested capability marker" in str(cause)
+                ):
+                    raise FinalizationError(
+                        "selection-plan evidence row capability was stripped or downgraded"
+                    ) from exc
+                cause = cause.__cause__
+            raise FinalizationError(f"streaming result source binding failed: {exc}") from exc
+        except BaseException:
+            self.close(verify=False)
+            raise
+
+    def materialize_pair(self, key: tuple[str, str]) -> list[SourceRecord]:
+        if not self._shards:
+            raise FinalizationError("streaming source archive has not been scanned")
+        locations = self._by_key.get(key, ())
+        if sum(item.locator.length for item in locations) > FINALIZER_MAX_PAIR_SOURCE_BYTES:
+            raise FinalizationError(
+                f"streaming source history for {key} exceeds the per-pair byte cap"
+            )
+        records: list[SourceRecord] = []
+        materialized_bytes = 0
+        try:
+            for item in locations:
+                row = self._index.consume_row(item.locator)
+                materialized_bytes += len(canonical_json_bytes(row)) + 1
+                if materialized_bytes > FINALIZER_MAX_PAIR_MATERIALIZED_BYTES:
+                    raise FinalizationError(
+                        f"streaming source history for {key} exceeds the "
+                        "per-pair materialized byte cap"
+                    )
+                records.append(
+                    SourceRecord(
+                        path=item.path,
+                        source_index=item.source_index,
+                        line=item.line,
+                        row=row,
+                    )
+                )
+        except DracoResumeSourceError as exc:
+            if "changed after indexing" in str(exc):
+                raise FinalizationError(
+                    f"source shard changed during finalization: {exc}"
+                ) from exc
+            if "retained compact selection-plan evidence" in str(exc):
+                raise FinalizationError(
+                    "expanded selection-plan row retains a reserved capability marker"
+                ) from exc
+            raise FinalizationError(
+                f"streaming source row materialization failed for {key}: {exc}"
+            ) from exc
+        return records
+
+    def peek(self, item: SourceRecordLocator) -> SourceRecord:
+        try:
+            row = self._index.peek_row(item.locator)
+        except DracoResumeSourceError as exc:
+            raise FinalizationError(
+                f"selected source row materialization failed for {item.key}: {exc}"
+            ) from exc
+        return SourceRecord(
+            path=item.path,
+            source_index=item.source_index,
+            line=item.line,
+            row=row,
+        )
+
+    def locator_for_record(self, record: SourceRecord) -> SourceRecordLocator:
+        for item in self._by_key.get(record.key, ()):
+            if item.source_index == record.source_index and item.line == record.line:
+                return item
+        raise FinalizationError("selected source row has no bound locator")
+
+    def verify_snapshot(self) -> None:
+        try:
+            self._index.verify_snapshot()
+        except DracoResumeSourceError as exc:
+            raise FinalizationError(f"source shard changed during finalization: {exc}") from exc
+
+    def close(self, *, verify: bool = True) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._index.close(verify=verify)
+        except DracoResumeSourceError as exc:
+            raise FinalizationError(f"source shard changed during finalization: {exc}") from exc
+
+    def __enter__(self) -> FinalizerSourceArchive:
+        self.scan()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        self.close(verify=exc_type is None)
+
+
+class DiskBackedRowSequence(Sequence[dict[str, Any]]):
+    """Repeatable JSON-row sequence backed by one private unlinked file."""
+
+    def __init__(self) -> None:
+        self._handle = tempfile.TemporaryFile(mode="w+b")
+        os.fchmod(self._handle.fileno(), 0o600)
+        self._locators: list[tuple[int, int, str]] = []
+        self._offset = 0
+        self._closed = False
+        self._sealed = False
+        self._signature: tuple[int, int, int, int, int, int] | None = None
+        self._iteration_count = 0
+
+    @property
+    def iteration_count(self) -> int:
+        return self._iteration_count
+
+    def append(self, row: Mapping[str, Any]) -> None:
+        if self._closed or self._sealed:
+            raise FinalizationError("disk-backed row sequence is not appendable")
+        payload = canonical_json_bytes(dict(row)) + b"\n"
+        if len(payload) > FINALIZER_MAX_RESULT_LINE_BYTES:
+            raise FinalizationError("final row exceeds the finalizer line byte cap")
+        fd = self._handle.fileno()
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(fd, view[written:])
+            if count <= 0:
+                raise FinalizationError("disk-backed row write made no progress")
+            written += count
+        self._locators.append(
+            (self._offset, len(payload), hashlib.sha256(payload).hexdigest())
+        )
+        self._offset += len(payload)
+
+    def seal(self) -> None:
+        if self._closed:
+            raise FinalizationError("disk-backed row sequence is closed")
+        if self._sealed:
+            return
+        os.fsync(self._handle.fileno())
+        stat = os.fstat(self._handle.fileno())
+        if int(stat.st_size) != self._offset:
+            raise FinalizationError("disk-backed row sequence size changed before seal")
+        self._signature = (
+            int(stat.st_dev),
+            int(stat.st_ino),
+            int(stat.st_mode),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+        )
+        self._sealed = True
+
+    def _read(self, index: int) -> dict[str, Any]:
+        if self._closed or not self._sealed or self._signature is None:
+            raise FinalizationError("disk-backed row sequence is not sealed")
+        stat = os.fstat(self._handle.fileno())
+        signature = (
+            int(stat.st_dev),
+            int(stat.st_ino),
+            int(stat.st_mode),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+        )
+        if signature != self._signature:
+            raise FinalizationError("disk-backed row sequence changed after seal")
+        offset, length, expected_hash = self._locators[index]
+        payload = os.pread(self._handle.fileno(), length, offset)
+        if len(payload) != length or hashlib.sha256(payload).hexdigest() != expected_hash:
+            raise FinalizationError("disk-backed row changed after seal")
+        try:
+            value = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FinalizationError("disk-backed row is invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise FinalizationError("disk-backed row is not an object")
+        return value
+
+    def __len__(self) -> int:
+        return len(self._locators)
+
+    def __getitem__(self, index: int | slice) -> dict[str, Any] | list[dict[str, Any]]:
+        if isinstance(index, slice):
+            return [self._read(item) for item in range(*index.indices(len(self)))]
+        normalized = index if index >= 0 else len(self) + index
+        if not 0 <= normalized < len(self):
+            raise IndexError(index)
+        return self._read(normalized)
+
+    def __iter__(self) -> Iterable[dict[str, Any]]:
+        self._iteration_count += 1
+        for index in range(len(self)):
+            yield self._read(index)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._handle.close()
+
+    def __enter__(self) -> DiskBackedRowSequence:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 @dataclass
@@ -1932,6 +2450,7 @@ def _selection_plan_manifest_contract(
     payload: Mapping[str, Any],
     artifacts: Any,
     result_rows: Sequence[Any],
+    result_summary: StreamingSourceShardIndex | None = None,
     durable_v2: bool,
     artifact_verification: Mapping[str, Any] | None,
     manifest_path: Path,
@@ -1945,17 +2464,29 @@ def _selection_plan_manifest_contract(
         isinstance(artifacts, Mapping)
         and SELECTION_PLAN_PACK_ARTIFACT_FIELD in artifacts
     )
-    row_capability_present = any(
-        isinstance(row, Mapping) and selection_plan_row_capability_signal(row)
-        for row in result_rows
+    row_capability_present = (
+        result_summary.row_capability_present
+        if result_summary is not None
+        else any(
+            isinstance(row, Mapping) and selection_plan_row_capability_signal(row)
+            for row in result_rows
+        )
     )
-    row_ref_present = any(
-        isinstance(row, Mapping) and selection_plan_reference_signal(row)
-        for row in result_rows
+    row_ref_present = (
+        result_summary.row_reference_present
+        if result_summary is not None
+        else any(
+            isinstance(row, Mapping) and selection_plan_reference_signal(row)
+            for row in result_rows
+        )
     )
-    compact_row_count = sum(
-        isinstance(row, Mapping) and selection_plan_reference_signal(row)
-        for row in result_rows
+    compact_row_count = (
+        result_summary.compact_row_count
+        if result_summary is not None
+        else sum(
+            isinstance(row, Mapping) and selection_plan_reference_signal(row)
+            for row in result_rows
+        )
     )
     signaled = bool(
         manifest_capability_present
@@ -2005,14 +2536,19 @@ def _selection_plan_manifest_contract(
         raise FinalizationError(
             f"selection-plan evidence pack binding is malformed: {manifest_path}"
         )
-    if any(
-        not isinstance(row, Mapping)
-        or not _selection_plan_row_has_exact_root_capability(
-            row,
-            expected_capability,
+    exact_row_capability = (
+        result_summary.exact_compact_capability
+        if result_summary is not None
+        else not any(
+            not isinstance(row, Mapping)
+            or not _selection_plan_row_has_exact_root_capability(
+                row,
+                expected_capability,
+            )
+            for row in result_rows
         )
-        for row in result_rows
-    ):
+    )
+    if not exact_row_capability:
         raise FinalizationError(
             f"selection-plan evidence row capability was stripped or downgraded: {manifest_path}"
         )
@@ -2056,7 +2592,7 @@ def load_manifest_contracts(
     groups: Sequence[str],
     expected_task_concurrency: int = FORMAL_TASK_CONCURRENCY,
     expected_judge_concurrency: int = FORMAL_JUDGE_CONCURRENCY,
-    result_indexes: Sequence[SourceShardIndex] | None = None,
+    result_indexes: Sequence[SourceShardIndex | StreamingSourceShardIndex] | None = None,
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]], str, list[dict[str, Any]]]:
     if not paths:
         raise FinalizationError("at least one --manifest source is required")
@@ -2087,7 +2623,9 @@ def load_manifest_contracts(
     key_fingerprint = ""
     source_evidence: list[dict[str, Any]] = []
     prior_manifest_attempt_ids: set[str] = set()
-    aligned_result_indexes: Sequence[SourceShardIndex | None] = (
+    aligned_result_indexes: Sequence[
+        SourceShardIndex | StreamingSourceShardIndex | None
+    ] = (
         tuple(result_indexes)
         if result_indexes is not None
         else (None,) * len(result_paths)
@@ -2102,13 +2640,20 @@ def load_manifest_contracts(
     ):
         path = require_regular_file(raw_path, owner_only=True)
         result_path = require_regular_file(raw_result_path, owner_only=True)
+        result_index_locations = (
+            result_index.locators
+            if isinstance(result_index, StreamingSourceShardIndex)
+            else result_index.records
+            if isinstance(result_index, SourceShardIndex)
+            else ()
+        )
         if result_index is not None and (
             result_index.path != result_path
             or result_index.source_index != shard_index
             or any(
                 record.path != result_path
                 or record.source_index != result_index.source_index
-                for record in result_index.records
+                for record in result_index_locations
             )
         ):
             raise FinalizationError(
@@ -2250,16 +2795,24 @@ def load_manifest_contracts(
             checkpoint_path = require_regular_file(
                 Path(declared_checkpoint), owner_only=True
             )
-            try:
-                artifact_verification = verify_durable_draco_artifacts(
-                    results_path=result_path,
-                    trace_path=trace_path,
-                    checkpoint_path=checkpoint_path,
+            if (
+                isinstance(result_index, StreamingSourceShardIndex)
+                and result_index.durable_artifact_verification is not None
+            ):
+                artifact_verification = (
+                    result_index.durable_artifact_verification
                 )
-            except (OSError, UnicodeError, DracoArtifactDurabilityError) as exc:
-                raise FinalizationError(
-                    f"manifest durable artifact binding failed: {path}: {exc}"
-                ) from exc
+            else:
+                try:
+                    artifact_verification = verify_durable_draco_artifacts(
+                        results_path=result_path,
+                        trace_path=trace_path,
+                        checkpoint_path=checkpoint_path,
+                    )
+                except (OSError, UnicodeError, DracoArtifactDurabilityError) as exc:
+                    raise FinalizationError(
+                        f"manifest durable artifact binding failed: {path}: {exc}"
+                    ) from exc
         if (
             artifact_verification is not None
             and result_index is not None
@@ -2409,9 +2962,16 @@ def load_manifest_contracts(
                 seen_recovered_keys.add(key)
                 assert recovered_resume_scheduled_pairs is not None
                 recovered_resume_scheduled_pairs.append(normalized)
+        result_summary = (
+            result_index
+            if isinstance(result_index, StreamingSourceShardIndex)
+            else None
+        )
         result_rows = (
-            [record.row for record in result_index.records]
-            if result_index is not None
+            []
+            if result_summary is not None
+            else [record.row for record in result_index.records]
+            if isinstance(result_index, SourceShardIndex)
             else [
                 value
                 for _, value in load_jsonl_rows(
@@ -2421,20 +2981,36 @@ def load_manifest_contracts(
                 )
             ]
         )
-        durable_row_markers = [
-            row.get(DRACO_DURABLE_RESULT_ROW_FIELD)
-            for row in result_rows
-            if isinstance(row, Mapping)
-            and DRACO_DURABLE_RESULT_ROW_FIELD in row
-        ]
+        result_row_count = (
+            result_summary.row_count
+            if result_summary is not None
+            else len(result_rows)
+        )
+        durable_marker_count = (
+            result_summary.durable_marker_count
+            if result_summary is not None
+            else sum(
+                isinstance(row, Mapping)
+                and DRACO_DURABLE_RESULT_ROW_FIELD in row
+                for row in result_rows
+            )
+        )
+        durable_markers_valid = (
+            result_summary.durable_markers_valid
+            if result_summary is not None
+            else all(
+                row.get(DRACO_DURABLE_RESULT_ROW_FIELD) == expected_durability
+                for row in result_rows
+                if isinstance(row, Mapping)
+                and DRACO_DURABLE_RESULT_ROW_FIELD in row
+            )
+        )
         if durable_v2:
-            if len(durable_row_markers) != len(result_rows) or any(
-                marker != expected_durability for marker in durable_row_markers
-            ):
+            if durable_marker_count != result_row_count or not durable_markers_valid:
                 raise FinalizationError(
                     f"manifest durable row marker is missing or invalid: {path}"
                 )
-        elif durable_row_markers:
+        elif durable_marker_count:
             raise FinalizationError(
                 f"manifest durable capability was stripped from sealed rows: {path}"
             )
@@ -2442,6 +3018,7 @@ def load_manifest_contracts(
             payload=payload,
             artifacts=artifacts,
             result_rows=result_rows,
+            result_summary=result_summary,
             durable_v2=durable_v2,
             artifact_verification=artifact_verification,
             manifest_path=path,
@@ -2492,11 +3069,15 @@ def load_manifest_contracts(
                     for group in prior_groups
                     for task_id in prior_task_ids
                 }
-            durable_pairs = {
-                (str(row.get("group") or ""), str(row.get("task_id") or ""))
-                for row in result_rows
-                if isinstance(row, Mapping)
-            }
+            durable_pairs = (
+                set(result_summary.result_pairs)
+                if result_summary is not None
+                else {
+                    (str(row.get("group") or ""), str(row.get("task_id") or ""))
+                    for row in result_rows
+                    if isinstance(row, Mapping)
+                }
+            )
             expected_ambiguous = [
                 {"group": group, "task_id": task_id}
                 for group, task_id in sorted(expected_pairs - durable_pairs)
@@ -2513,18 +3094,22 @@ def load_manifest_contracts(
                 raise FinalizationError(
                     f"manifest recovery ambiguity ledger is not bound to its durable prefix: {path}"
                 )
-        shard_attempt_ids = {
-            str(attempt.get("attempt_id") or "")
-            for row in result_rows
-            if isinstance(row, Mapping)
-            for attempt in (
-                row.get("execution", {}).get("generation_attempts", [])
-                if isinstance(row.get("execution"), Mapping)
-                else []
-            )
-            if isinstance(attempt, Mapping)
-            and HEX32.fullmatch(str(attempt.get("attempt_id") or ""))
-        }
+        shard_attempt_ids = (
+            set(result_summary.generation_attempt_ids)
+            if result_summary is not None
+            else {
+                str(attempt.get("attempt_id") or "")
+                for row in result_rows
+                if isinstance(row, Mapping)
+                for attempt in (
+                    row.get("execution", {}).get("generation_attempts", [])
+                    if isinstance(row.get("execution"), Mapping)
+                    else []
+                )
+                if isinstance(attempt, Mapping)
+                and HEX32.fullmatch(str(attempt.get("attempt_id") or ""))
+            }
+        )
         new_attempt_ids = shard_attempt_ids - prior_manifest_attempt_ids
         if preflight_status == "skipped_not_required":
             resume_selection = payload.get("resume_selection")
@@ -2542,7 +3127,10 @@ def load_manifest_contracts(
                 or resume_selection.get("model_regenerate_pair_count") != 0
                 or bool(new_attempt_ids)
                 or not prior_manifest_attempt_ids
-                or any(
+                or (
+                    not result_summary.skipped_preflight_rows_valid
+                    if result_summary is not None
+                    else any(
                     not isinstance(row.get("execution"), Mapping)
                     or row["execution"].get("generation_reused") is not True
                     or str(row["execution"].get("resume_action") or "")
@@ -2577,17 +3165,18 @@ def load_manifest_contracts(
                     )
                     for row in result_rows
                     if isinstance(row, Mapping)
+                    )
                 )
             ):
                 raise FinalizationError(
                     f"skipped Web preflight is not bound to a no-generation repair shard: {path}"
                 )
         prior_manifest_attempt_ids.update(shard_attempt_ids)
-        if nonnegative_int(payload.get("rows_written")) != len(result_rows):
+        if nonnegative_int(payload.get("rows_written")) != result_row_count:
             raise FinalizationError(f"manifest rows_written differs from its result shard: {path}")
         if (
             artifact_verification is not None
-            and artifact_verification["rows_written"] != len(result_rows)
+            and artifact_verification["rows_written"] != result_row_count
         ):
             raise FinalizationError(
                 f"manifest checkpoint rows differ from its result shard: {path}"
@@ -2598,11 +3187,18 @@ def load_manifest_contracts(
             not isinstance(manifest_groups, list)
             or manifest_groups != list(groups)
             or not isinstance(manifest_task_ids, list)
-            or any(
-                str(row.get("group") or "") not in manifest_groups
-                or str(row.get("task_id") or "") not in manifest_task_ids
-                for row in result_rows
-                if isinstance(row, Mapping)
+            or (
+                any(
+                    group not in manifest_groups or task_id not in manifest_task_ids
+                    for group, task_id in result_summary.result_pairs
+                )
+                if result_summary is not None
+                else any(
+                    str(row.get("group") or "") not in manifest_groups
+                    or str(row.get("task_id") or "") not in manifest_task_ids
+                    for row in result_rows
+                    if isinstance(row, Mapping)
+                )
             )
         ):
             raise FinalizationError(
@@ -2648,11 +3244,15 @@ def load_manifest_contracts(
             )
         if resume_scheduled_pairs:
             assert isinstance(raw_resume_selection, Mapping)
-            result_pairs = {
-                (str(row.get("group") or ""), str(row.get("task_id") or ""))
-                for row in result_rows
-                if isinstance(row, Mapping)
-            }
+            result_pairs = (
+                set(result_summary.result_pairs)
+                if result_summary is not None
+                else {
+                    (str(row.get("group") or ""), str(row.get("task_id") or ""))
+                    for row in result_rows
+                    if isinstance(row, Mapping)
+                }
+            )
             scheduled_action_counts = Counter(
                 (
                     "regenerate"
@@ -2790,11 +3390,15 @@ def load_manifest_contracts(
                 )
             resume_schedule_contract_verified = True
         if recovered_resume_scheduled_pairs is not None:
-            result_pairs = {
-                (str(row.get("group") or ""), str(row.get("task_id") or ""))
-                for row in result_rows
-                if isinstance(row, Mapping)
-            }
+            result_pairs = (
+                set(result_summary.result_pairs)
+                if result_summary is not None
+                else {
+                    (str(row.get("group") or ""), str(row.get("task_id") or ""))
+                    for row in result_rows
+                    if isinstance(row, Mapping)
+                }
+            )
             recovered_pairs = {
                 (item["group"], item["task_id"])
                 for item in recovered_resume_scheduled_pairs
@@ -2862,7 +3466,7 @@ def load_manifest_contracts(
                 if result_index is not None
                 else file_sha256(result_path)
             ),
-            "rows_written": len(result_rows),
+            "rows_written": result_row_count,
             "execution_scheduling": execution_scheduling,
             "live_web_preflight": {
                 "status": preflight_status,
@@ -11717,6 +12321,95 @@ def build_actual_spend_ledger(
     return ledger_rows, summary
 
 
+def summarize_actual_spend_ledger_rows(
+    ledger_rows: Sequence[Mapping[str, Any]],
+    *,
+    source_row_count: int,
+    distinct_generation_attempt_count: int,
+    selected_generation_pair_count: int,
+    selected_generation_attempt_count: int,
+) -> dict[str, Any]:
+    """Rebuild the exact campaign summary from already-deduplicated rows."""
+
+    category_counts = Counter(str(row["non_byok_evidence"]) for row in ledger_rows)
+    scope_counts: Counter[str] = Counter()
+    scope_costs: dict[str, Decimal] = defaultdict(Decimal)
+    scope_exact_counts: Counter[str] = Counter()
+    scope_non_exact_counts: Counter[str] = Counter()
+    scope_unknown_counts: Counter[str] = Counter()
+    disposition_counts: Counter[str] = Counter()
+    disposition_costs: dict[str, Decimal] = defaultdict(Decimal)
+    recorded_cost = Decimal(0)
+    exact_cost = Decimal(0)
+    unknown_cost_count = 0
+    non_exact_cost_count = 0
+    for row in ledger_rows:
+        scopes = row.get("scopes")
+        if not isinstance(scopes, list):
+            raise FinalizationError("ledger row scopes are malformed")
+        for scope in scopes:
+            scope_counts[str(scope)] += 1
+        disposition = str(row.get("generation_disposition") or "")
+        if disposition:
+            disposition_counts[disposition] += 1
+        cost = row.get("recorded_cost_usd")
+        if cost is None:
+            unknown_cost_count += 1
+            for scope in scopes:
+                scope_unknown_counts[str(scope)] += 1
+        else:
+            parsed = required_decimal(cost, label="ledger cost")
+            recorded_cost += parsed
+            if row.get("cost_precision") == "exact":
+                exact_cost += parsed
+                for scope in scopes:
+                    scope_exact_counts[str(scope)] += 1
+            else:
+                non_exact_cost_count += 1
+                for scope in scopes:
+                    scope_non_exact_counts[str(scope)] += 1
+            for scope in scopes:
+                scope_costs[str(scope)] += parsed
+            if disposition:
+                disposition_costs[disposition] += parsed
+    return {
+        "schema": LEDGER_SCHEMA,
+        "physical_request_count": len(ledger_rows),
+        "scope_request_counts": dict(sorted(scope_counts.items())),
+        "scope_recorded_cost_usd": {
+            key: str(value) for key, value in sorted(scope_costs.items())
+        },
+        "scope_cost_precision_counts": {
+            scope: {
+                "exact": scope_exact_counts[scope],
+                "non_exact": scope_non_exact_counts[scope],
+                "unknown": scope_unknown_counts[scope],
+            }
+            for scope in sorted(scope_counts)
+        },
+        "generation_disposition_request_counts": dict(
+            sorted(disposition_counts.items())
+        ),
+        "generation_disposition_recorded_cost_usd": {
+            key: str(value) for key, value in sorted(disposition_costs.items())
+        },
+        "non_byok_evidence_counts": dict(sorted(category_counts.items())),
+        "recorded_cost_usd": str(recorded_cost),
+        "exact_cost_usd": str(exact_cost),
+        "unknown_cost_request_count": unknown_cost_count,
+        "non_exact_cost_request_count": non_exact_cost_count,
+        "source_row_count": source_row_count,
+        "distinct_generation_attempt_count": distinct_generation_attempt_count,
+        "selected_generation_pair_count": selected_generation_pair_count,
+        "selected_generation_attempt_count": selected_generation_attempt_count,
+        "note": (
+            "Built from all source-wave generation attempts and Judge attempts; "
+            "copied repairs are deduplicated by stable response id or retained "
+            "run-occurrence identity. Failed and replaced generation attempts remain."
+        ),
+    }
+
+
 def attach_retrospective_recovery_spend(
     pair_audit: Mapping[tuple[str, str] | str, Any],
     ledger_rows: Sequence[Mapping[str, Any]],
@@ -12069,6 +12762,120 @@ def build_external_tool_cost_summary(
             str(estimated_total) if estimated_total is not None and not exact else None
         ),
         "potentially_unpriced_tool_call_count_upper_bound": upper_bound,
+        "cost_complete": complete,
+        "cost_exact": exact,
+        "cost_status": status,
+        "cost_precision": status,
+        "recorded_cost_usd_is_lower_bound": not complete,
+        "separate_from_openrouter_account_delta": True,
+        "deduplication": (
+            "task calls: unique generation attempt_id across every source wave; "
+            "live preflight: once per supplied source manifest"
+        ),
+        "note": (
+            "Unknown Brave/Firecrawl calls are not reported as zero-dollar spend "
+            "and are never mixed into the OpenRouter LLM account delta."
+        ),
+    }
+
+
+def merge_external_tool_cost_summaries(
+    summaries: Sequence[Mapping[str, Any]],
+    *,
+    manifest_sources: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Merge pair-local tool summaries and add each manifest preflight once."""
+
+    providers = sorted(
+        {
+            str(provider)
+            for summary in summaries
+            for provider in summary.get("providers") or []
+        }
+    )
+    distinct_attempts = sum(
+        nonnegative_int(summary.get("distinct_generation_attempt_count"))
+        for summary in summaries
+    )
+    task_tool_calls = sum(
+        nonnegative_int(summary.get("task_generation_tool_call_count"))
+        for summary in summaries
+    )
+    task_upper_bound = sum(
+        nonnegative_int(
+            summary.get("potentially_unpriced_tool_call_count_upper_bound")
+        )
+        for summary in summaries
+    )
+    known_lower_bound = sum(
+        (
+            required_decimal(
+                summary.get("recorded_cost_usd_lower_bound"),
+                label="external tool recorded cost lower bound",
+            )
+            for summary in summaries
+        ),
+        Decimal(0),
+    )
+    preflight_by_tool: Counter[str] = Counter()
+    for source in manifest_sources:
+        preflight = source.get("live_web_preflight")
+        calls = preflight.get("preflight_calls") if isinstance(preflight, Mapping) else None
+        if not isinstance(calls, Mapping):
+            raise FinalizationError("manifest source lacks live Web preflight evidence")
+        for tool_name in ("web_search", "web_fetch"):
+            value = calls.get(tool_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise FinalizationError("manifest Web preflight call count is invalid")
+            preflight_by_tool[tool_name] += value
+    preflight_tool_calls = sum(preflight_by_tool.values())
+    exact = bool(summaries) and all(
+        summary.get("cost_exact") is True for summary in summaries
+    )
+    complete = bool(summaries) and all(
+        summary.get("cost_complete") is True for summary in summaries
+    )
+    if preflight_tool_calls:
+        exact = False
+        complete = False
+    estimated_total: Decimal | None = None
+    if not preflight_tool_calls and summaries and all(
+        str(summary.get("cost_status") or "") != "unknown"
+        for summary in summaries
+    ):
+        estimated_total = sum(
+            (
+                required_decimal(
+                    summary.get("recorded_cost_usd_lower_bound"),
+                    label="external tool pair cost",
+                )
+                if summary.get("cost_exact") is True
+                else required_decimal(
+                    summary.get("estimated_cost_usd"),
+                    label="external tool pair estimate",
+                )
+                for summary in summaries
+            ),
+            Decimal(0),
+        )
+    status = "exact" if exact else "estimated" if estimated_total is not None else "unknown"
+    return {
+        "scope": "campaign_actual_external_tools",
+        "providers": providers,
+        "distinct_generation_attempt_count": distinct_attempts,
+        "tool_call_count": task_tool_calls + preflight_tool_calls,
+        "task_generation_tool_call_count": task_tool_calls,
+        "live_preflight_tool_call_count": preflight_tool_calls,
+        "live_preflight_calls_by_tool": dict(sorted(preflight_by_tool.items())),
+        "live_preflight_manifest_count": len(manifest_sources),
+        "recorded_cost_usd": str(known_lower_bound) if complete else None,
+        "recorded_cost_usd_lower_bound": str(known_lower_bound),
+        "estimated_cost_usd": (
+            str(estimated_total) if estimated_total is not None and not exact else None
+        ),
+        "potentially_unpriced_tool_call_count_upper_bound": (
+            task_upper_bound + preflight_tool_calls
+        ),
         "cost_complete": complete,
         "cost_exact": exact,
         "cost_status": status,
@@ -12781,6 +13588,155 @@ def manifest_source_window_coverage(
     return min(starts), max(completions), coverage
 
 
+class StreamingSourceWindowFacts:
+    """Compact source/account-window facts accumulated as pairs are consumed."""
+
+    def __init__(self, manifest_sources: Sequence[Mapping[str, Any]]) -> None:
+        if not manifest_sources:
+            raise FinalizationError("campaign source/account windows are incomplete")
+        self._manifest_sources = tuple(manifest_sources)
+        self._windows: list[tuple[datetime, datetime]] = []
+        for manifest in self._manifest_sources:
+            raw_started = manifest.get("started_at")
+            raw_finished = manifest.get("finished_at")
+            started = (
+                datetime.fromtimestamp(float(raw_started), tz=UTC)
+                if finite_number(raw_started)
+                else parse_iso(raw_started, label="source manifest started_at")
+            )
+            finished = (
+                datetime.fromtimestamp(float(raw_finished), tz=UTC)
+                if finite_number(raw_finished)
+                else parse_iso(raw_finished, label="source manifest finished_at")
+            )
+            if started >= finished:
+                raise FinalizationError("source manifest has a non-positive execution window")
+            self._windows.append((started, finished))
+        self._row_count: Counter[int] = Counter()
+        self._row_completed_min: dict[int, datetime] = {}
+        self._row_completed_max: dict[int, datetime] = {}
+        self._seen_generation_attempt_ids: set[str] = set()
+        self._new_attempt_count: Counter[int] = Counter()
+
+    def observe(self, records: Sequence[SourceRecord]) -> None:
+        for record in sorted(records, key=lambda item: (item.source_index, item.line)):
+            if not 0 <= record.source_index < len(self._manifest_sources):
+                raise FinalizationError("source rows are not bound to every source manifest")
+            started, finished = self._windows[record.source_index]
+            raw_completed = record.row.get("completed_at")
+            if not finite_number(raw_completed):
+                raise FinalizationError("source result row lacks a numeric completion timestamp")
+            row_completed = datetime.fromtimestamp(float(raw_completed), tz=UTC)
+            if not started <= row_completed <= finished:
+                raise FinalizationError(
+                    "source result row completion is outside its manifest execution window"
+                )
+            self._row_count[record.source_index] += 1
+            prior_min = self._row_completed_min.get(record.source_index)
+            prior_max = self._row_completed_max.get(record.source_index)
+            self._row_completed_min[record.source_index] = (
+                row_completed if prior_min is None else min(prior_min, row_completed)
+            )
+            self._row_completed_max[record.source_index] = (
+                row_completed if prior_max is None else max(prior_max, row_completed)
+            )
+            execution = record.row.get("execution")
+            attempts = (
+                execution.get("generation_attempts")
+                if isinstance(execution, Mapping)
+                and isinstance(execution.get("generation_attempts"), list)
+                else []
+            )
+            for attempt in attempts:
+                if not isinstance(attempt, Mapping):
+                    continue
+                attempt_id = str(attempt.get("attempt_id") or "")
+                if attempt_id in self._seen_generation_attempt_ids:
+                    continue
+                raw_attempt_started = attempt.get("started_at")
+                raw_attempt_completed = attempt.get("completed_at")
+                if (
+                    HEX32.fullmatch(attempt_id) is None
+                    or not finite_number(raw_attempt_started)
+                    or not finite_number(raw_attempt_completed)
+                ):
+                    raise FinalizationError(
+                        "physical-first generation attempt lacks immutable timing evidence"
+                    )
+                attempt_started = datetime.fromtimestamp(
+                    float(raw_attempt_started), tz=UTC
+                )
+                attempt_completed = datetime.fromtimestamp(
+                    float(raw_attempt_completed), tz=UTC
+                )
+                if (
+                    attempt_started > attempt_completed
+                    or attempt_started < started
+                    or attempt_completed > finished
+                ):
+                    raise FinalizationError(
+                        "physical-first generation attempt is outside its source manifest"
+                    )
+                self._seen_generation_attempt_ids.add(attempt_id)
+                self._new_attempt_count[record.source_index] += 1
+
+    def coverage(
+        self,
+        campaign_windows: Sequence[Mapping[str, Any]],
+    ) -> tuple[datetime, datetime, list[dict[str, Any]]]:
+        if not campaign_windows:
+            raise FinalizationError("campaign source/account windows are incomplete")
+        if set(self._row_count) != set(range(len(self._manifest_sources))):
+            raise FinalizationError("source rows are not bound to every source manifest")
+        coverage: list[dict[str, Any]] = []
+        starts: list[datetime] = []
+        completions: list[datetime] = []
+        for source_index, manifest in enumerate(self._manifest_sources):
+            started, finished = self._windows[source_index]
+            matches = [
+                window
+                for window in campaign_windows
+                if parse_iso(
+                    window.get("account_before_at"),
+                    label="campaign account before",
+                )
+                <= started
+                and parse_iso(
+                    window.get("account_after_at"),
+                    label="campaign account after",
+                )
+                >= finished
+            ]
+            if len(matches) != 1:
+                raise FinalizationError(
+                    "source manifest is not covered by exactly one campaign account window"
+                )
+            starts.append(started)
+            completions.append(finished)
+            coverage.append(
+                {
+                    "source_index": source_index,
+                    "manifest_path": manifest.get("path"),
+                    "result_path": manifest.get("result_path"),
+                    "started_at": started.isoformat(),
+                    "finished_at": finished.isoformat(),
+                    "source_row_count": self._row_count[source_index],
+                    "source_row_completed_at_min": self._row_completed_min[
+                        source_index
+                    ].isoformat(),
+                    "source_row_completed_at_max": self._row_completed_max[
+                        source_index
+                    ].isoformat(),
+                    "physical_first_generation_attempt_count": self._new_attempt_count[
+                        source_index
+                    ],
+                    "account_window_path": matches[0].get("path"),
+                    "account_window_kind": matches[0].get("kind"),
+                }
+            )
+        return min(starts), max(completions), coverage
+
+
 def reconcile_ledger_campaign_windows(
     ledger_rows: Sequence[Mapping[str, Any]],
     *,
@@ -13054,6 +14010,7 @@ def validate_account_proof(
     lock_fd: int,
     runtime_key_fingerprint: str,
     source_records: Sequence[SourceRecord],
+    source_window_facts: StreamingSourceWindowFacts | None = None,
     manifest_sources: Sequence[Mapping[str, Any]],
     ledger_rows: Sequence[Mapping[str, Any]],
     ledger_summary: Mapping[str, Any],
@@ -13344,11 +14301,18 @@ def validate_account_proof(
             label="later campaign account BYOK before",
         ):
             raise FinalizationError("campaign account counters are not continuous between windows")
-    earliest_start, latest_completion, source_window_coverage = manifest_source_window_coverage(
-        manifest_sources,
-        source_records=source_records,
-        campaign_windows=campaign_windows,
-    )
+    if source_window_facts is None:
+        earliest_start, latest_completion, source_window_coverage = (
+            manifest_source_window_coverage(
+                manifest_sources,
+                source_records=source_records,
+                campaign_windows=campaign_windows,
+            )
+        )
+    else:
+        earliest_start, latest_completion, source_window_coverage = (
+            source_window_facts.coverage(campaign_windows)
+        )
     ledger_window_reconciliation = reconcile_ledger_campaign_windows(
         ledger_rows,
         source_window_coverage=source_window_coverage,
@@ -14131,11 +15095,12 @@ def finalize_rows(
     proof: Mapping[str, Any],
     pair_audit: Mapping[str, Any],
     groups: Sequence[str] = GROUPS,
+    start_row_index: int = 0,
 ) -> list[dict[str, Any]]:
     selected_by_key = {record.key: record for record in selected}
     proof_sha = str(proof.get("proof_sha256") or "")
     final_rows: list[dict[str, Any]] = []
-    row_index = 0
+    row_index = start_row_index
     for task in tasks:
         task_id = str(task["id"])
         for group in groups:
@@ -15078,6 +16043,7 @@ def publish_atomically(
     audit: dict[str, Any],
     manifest_base: dict[str, Any],
     report_markdown: str,
+    pre_publish_verifier: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     output = output_dir.resolve(strict=False)
     if output.exists():
@@ -15133,6 +16099,8 @@ def publish_atomically(
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+        if pre_publish_verifier is not None:
+            pre_publish_verifier()
         os.replace(staging, output)
         parent_fd = os.open(parent, os.O_RDONLY)
         try:
@@ -15407,9 +16375,332 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@dataclass
+class StreamingHistoryAnalysis:
+    selected_locators: dict[tuple[str, str], SourceRecordLocator]
+    pair_audit: dict[str, Any]
+    generation_attempt_evidence: dict[str, Any]
+    judge_attempt_evidence: dict[str, Any]
+    selected_attempt_bindings: dict[str, str]
+    ledger_rows: list[dict[str, Any]]
+    ledger_summary: dict[str, Any]
+    external_tool_cost: dict[str, Any]
+    source_policy_findings: list[dict[str, Any]]
+    physical_generation_warnings: list[dict[str, Any]]
+    source_window_facts: StreamingSourceWindowFacts
+
+
+def _observe_global_attempt_identities(
+    records: Sequence[SourceRecord],
+    *,
+    generation_payloads: dict[str, str],
+    generation_owners: dict[str, tuple[str, str]],
+    judge_payloads: dict[str, str],
+    judge_owners: dict[str, tuple[str, str, str, str, int]],
+    judge_model: str,
+) -> None:
+    """Preserve cross-pair attempt uniqueness while pairs stream independently."""
+
+    for record in records:
+        execution = record.row.get("execution")
+        attempts = (
+            execution.get("generation_attempts")
+            if isinstance(execution, Mapping)
+            and isinstance(execution.get("generation_attempts"), list)
+            else []
+        )
+        for attempt in attempts:
+            if not isinstance(attempt, Mapping):
+                continue
+            attempt_id = str(attempt.get("attempt_id") or "")
+            payload_sha = canonical_sha256(immutable_attempt_payload(attempt))
+            prior_owner = generation_owners.get(attempt_id)
+            if prior_owner is not None and prior_owner != record.key:
+                raise FinalizationError(
+                    f"generation attempt id {attempt_id} is reused by another pair"
+                )
+            prior_payload = generation_payloads.get(attempt_id)
+            if prior_payload is not None and prior_payload != payload_sha:
+                raise FinalizationError(
+                    f"generation attempt id {attempt_id} has conflicting payloads"
+                )
+            generation_owners[attempt_id] = record.key
+            generation_payloads[attempt_id] = payload_sha
+
+        scopes: list[tuple[str, Any]] = [("judge", record.row.get("judge"))]
+        candidate_judges = record.row.get("candidate_judges")
+        if isinstance(candidate_judges, list):
+            scopes.extend(
+                (f"candidate_judge/{index}", judge)
+                for index, judge in enumerate(candidate_judges)
+            )
+        for scope_name, judge in scopes:
+            if not isinstance(judge, Mapping):
+                continue
+            judgments = judge.get("criterion_judgments")
+            if not isinstance(judgments, list):
+                continue
+            for judgment in judgments:
+                if not isinstance(judgment, Mapping):
+                    continue
+                criterion_id = str(judgment.get("id") or "")
+                repeat_index = judgment.get("repeat_index")
+                if isinstance(repeat_index, bool) or not isinstance(repeat_index, int):
+                    continue
+                owner = (
+                    record.key[0],
+                    record.key[1],
+                    scope_name,
+                    criterion_id,
+                    repeat_index,
+                )
+                judge_attempts = judgment.get("judge_attempts")
+                if not isinstance(judge_attempts, list):
+                    continue
+                for attempt in judge_attempts:
+                    if not isinstance(attempt, Mapping):
+                        continue
+                    attempt_id = str(attempt.get("attempt_id") or "")
+                    payload_sha = canonical_sha256(
+                        immutable_judge_attempt_payload(
+                            attempt,
+                            judge_model=judge_model,
+                        )
+                    )
+                    prior_owner = judge_owners.get(attempt_id)
+                    if prior_owner is not None and prior_owner != owner:
+                        raise FinalizationError(
+                            f"Judge attempt id {attempt_id} is reused by another unit"
+                        )
+                    prior_payload = judge_payloads.get(attempt_id)
+                    if prior_payload is not None and prior_payload != payload_sha:
+                        raise FinalizationError(
+                            f"Judge attempt id {attempt_id} has conflicting payloads"
+                        )
+                    judge_owners[attempt_id] = owner
+                    judge_payloads[attempt_id] = payload_sha
+
+
+def _merge_judge_attempt_audits(
+    audits: Sequence[Mapping[str, Any]],
+    *,
+    unique_attempt_count: int,
+) -> dict[str, Any]:
+    units: dict[str, Any] = {}
+    scope_count = 0
+    unit_count = 0
+    for audit in audits:
+        if (
+            audit.get("schema") != JUDGE_ATTEMPT_EVIDENCE_SCHEMA
+            or audit.get("budget_scope") != JUDGE_ATTEMPT_BUDGET_SCOPE
+        ):
+            raise FinalizationError("pair-local Judge audit uses an incompatible schema")
+        scope_count += nonnegative_int(audit.get("judge_scope_source_count"))
+        unit_count += nonnegative_int(audit.get("criterion_repeat_unit_count"))
+        raw_units = audit.get("units")
+        if not isinstance(raw_units, Mapping):
+            raise FinalizationError("pair-local Judge audit units are malformed")
+        overlap = set(units) & set(raw_units)
+        if overlap:
+            raise FinalizationError(
+                f"pair-local Judge audit units overlap: {sorted(overlap)[:3]}"
+            )
+        units.update(copy.deepcopy(dict(raw_units)))
+    return {
+        "schema": JUDGE_ATTEMPT_EVIDENCE_SCHEMA,
+        "budget_scope": JUDGE_ATTEMPT_BUDGET_SCOPE,
+        "budget_limit_per_unit": (
+            audits[0].get("budget_limit_per_unit")
+            if audits
+            else JUDGE_ATTEMPT_BUDGET_LIMIT
+        ),
+        "judge_scope_source_count": scope_count,
+        "criterion_repeat_unit_count": unit_count,
+        "unique_physical_judge_attempt_count": unique_attempt_count,
+        "units": dict(sorted(units.items())),
+    }
+
+
+def analyze_streaming_source_history(
+    archive: FinalizerSourceArchive,
+    *,
+    tasks: Sequence[dict[str, Any]],
+    groups: Sequence[str],
+    fingerprints: Mapping[str, str],
+    contracts: Mapping[str, Mapping[str, Any]],
+    max_attempts: int,
+    experiment_policy: FinalizerExperimentPolicy,
+    manifest_sources: Sequence[Mapping[str, Any]],
+) -> StreamingHistoryAnalysis:
+    """Consume every historical row once, one bounded pair at a time."""
+
+    expected_keys = {(group, str(task["id"])) for task in tasks for group in groups}
+    unexpected = sorted(archive.keys - expected_keys)
+    if unexpected:
+        raise FinalizationError(
+            f"result sources contain unexpected rows: {unexpected[:5]}"
+        )
+    missing = sorted(expected_keys - archive.keys)
+    if missing:
+        raise FinalizationError(f"result sources miss expected pairs: {missing[:5]}")
+
+    selected_locators: dict[tuple[str, str], SourceRecordLocator] = {}
+    pair_audit: dict[str, Any] = {}
+    generation_attempt_evidence: dict[str, Any] = {}
+    selected_attempt_bindings: dict[str, str] = {}
+    source_policy_findings: list[dict[str, Any]] = []
+    physical_generation_warnings: list[dict[str, Any]] = []
+    pair_judge_audits: list[dict[str, Any]] = []
+    judge_audit_conflict: FinalizationError | None = None
+    pair_ledger_rows: list[dict[str, Any]] = []
+    pair_external_summaries: list[dict[str, Any]] = []
+    generation_payloads: dict[str, str] = {}
+    generation_owners: dict[str, tuple[str, str]] = {}
+    judge_payloads: dict[str, str] = {}
+    judge_owners: dict[str, tuple[str, str, str, str, int]] = {}
+    source_window_facts = StreamingSourceWindowFacts(manifest_sources)
+
+    tasks_by_id = {str(task["id"]): task for task in tasks}
+    for task in tasks:
+        task_id = str(task["id"])
+        for group in groups:
+            key = (group, task_id)
+            records = archive.materialize_pair(key)
+            source_window_facts.observe(records)
+            source_policy_findings.extend(validate_source_policy_history(records))
+            pair_generation_audit = validate_generation_attempt_evidence(
+                records,
+                max_attempts=max_attempts,
+            )
+            overlap = set(generation_attempt_evidence) & set(pair_generation_audit)
+            if overlap:
+                raise FinalizationError(
+                    f"streaming generation audit pair overlap: {sorted(overlap)}"
+                )
+            generation_attempt_evidence.update(pair_generation_audit)
+            _observe_global_attempt_identities(
+                records,
+                generation_payloads=generation_payloads,
+                generation_owners=generation_owners,
+                judge_payloads=judge_payloads,
+                judge_owners=judge_owners,
+                judge_model=experiment_policy.judge_model,
+            )
+            if group == "G1":
+                validate_g1_paid_attempt_plan_history(
+                    records,
+                    contracts=contracts,
+                )
+            physical_generation_warnings.extend(
+                validate_physical_generation_routes(
+                    records,
+                    contracts=contracts,
+                )
+            )
+            try:
+                pair_judge_audits.append(
+                    validate_judge_attempt_evidence(
+                        records,
+                        judge_model=experiment_policy.judge_model,
+                        judge_max_attempts=experiment_policy.judge_max_attempts,
+                        judge_provider_pin=experiment_policy.judge_provider_pin,
+                    )
+                )
+            except FinalizationError as exc:
+                if not judge_evidence_error_is_audit_only(exc):
+                    raise
+                if judge_audit_conflict is None:
+                    judge_audit_conflict = exc
+
+            pair_selected, current_pair_audit = select_results(
+                records,
+                tasks=[tasks_by_id[task_id]],
+                groups=[group],
+                fingerprints=fingerprints,
+                contracts=contracts,
+                max_attempts=max_attempts,
+                experiment_policy=experiment_policy,
+                manifest_sources=manifest_sources,
+            )
+            if len(pair_selected) != 1:
+                raise FinalizationError(f"streaming selection for {key} is not unique")
+            selected_record = pair_selected[0]
+            selected_locators[key] = archive.locator_for_record(selected_record)
+            pair_audit.update(current_pair_audit)
+            pair_binding = bind_selected_generation_attempts(records, pair_selected)
+            selected_attempt_bindings.update(pair_binding)
+            current_ledger_rows, _ = build_actual_spend_ledger(
+                records,
+                selected=pair_selected,
+                selected_attempt_bindings=pair_binding,
+                judge_model=experiment_policy.judge_model,
+            )
+            pair_ledger_rows.extend(current_ledger_rows)
+            pair_external_summaries.append(
+                build_external_tool_cost_summary(records, manifest_sources=())
+            )
+            del pair_selected
+            del records
+
+    ledger_rows = sorted(pair_ledger_rows, key=lambda row: str(row.get("ledger_id") or ""))
+    ledger_ids: set[str] = set()
+    response_ids: set[str] = set()
+    for row in ledger_rows:
+        ledger_id = str(row.get("ledger_id") or "")
+        raw_response_ids = row.get("response_id_sha256")
+        current_response_ids = (
+            {str(value) for value in raw_response_ids}
+            if isinstance(raw_response_ids, list)
+            else set()
+        )
+        if ledger_id in ledger_ids or response_ids & current_response_ids:
+            raise FinalizationError(
+                "provider response_id is reused across logical physical requests"
+            )
+        ledger_ids.add(ledger_id)
+        response_ids.update(current_response_ids)
+
+    if judge_audit_conflict is None:
+        judge_attempt_evidence = _merge_judge_attempt_audits(
+            pair_judge_audits,
+            unique_attempt_count=len(judge_payloads),
+        )
+    else:
+        judge_attempt_evidence = {
+            "status": "audit_conflict",
+            "pass": False,
+            "warning": str(judge_audit_conflict),
+        }
+    source_row_count = sum(shard.row_count for shard in archive.shards)
+    ledger_summary = summarize_actual_spend_ledger_rows(
+        ledger_rows,
+        source_row_count=source_row_count,
+        distinct_generation_attempt_count=len(generation_payloads),
+        selected_generation_pair_count=len(selected_attempt_bindings),
+        selected_generation_attempt_count=len(set(selected_attempt_bindings.values())),
+    )
+    external_tool_cost = merge_external_tool_cost_summaries(
+        pair_external_summaries,
+        manifest_sources=manifest_sources,
+    )
+    return StreamingHistoryAnalysis(
+        selected_locators=selected_locators,
+        pair_audit=pair_audit,
+        generation_attempt_evidence=dict(sorted(generation_attempt_evidence.items())),
+        judge_attempt_evidence=judge_attempt_evidence,
+        selected_attempt_bindings=selected_attempt_bindings,
+        ledger_rows=ledger_rows,
+        ledger_summary=ledger_summary,
+        external_tool_cost=external_tool_cost,
+        source_policy_findings=source_policy_findings,
+        physical_generation_warnings=physical_generation_warnings,
+        source_window_facts=source_window_facts,
+    )
+
+
 def _run_finalization_with_selection_plan_views(
     args: argparse.Namespace,
-    selection_plan_view_holder: list[SourceShardSelectionPlanView],
+    selection_plan_view_holder: list[Any],
 ) -> dict[str, Any]:
     groups = normalize_groups(args.groups)
     expected_task_concurrency = getattr(
@@ -15437,12 +16728,14 @@ def _run_finalization_with_selection_plan_views(
     input_path = require_regular_file(args.input, owner_only=False)
     tasks = read_tasks(input_path)
     frozen_input_sha256 = validate_frozen_draco_input(input_path, tasks)
-    raw_source_indexes = read_source_shard_indexes(args.result)
+    source_archive = FinalizerSourceArchive(args.result)
+    raw_source_indexes = source_archive.scan()
+    selection_plan_view_holder.append(source_archive)
     source_snapshots = {
         str(source_index.path): source_index.sha256
         for source_index in raw_source_indexes
     }
-    critical_source_snapshots = dict(source_snapshots)
+    critical_source_snapshots: dict[str, str] = {}
     for raw_path in (
         input_path,
         *args.manifest,
@@ -15474,28 +16767,25 @@ def _run_finalization_with_selection_plan_views(
         expected_judge_concurrency=expected_judge_concurrency,
         result_indexes=raw_source_indexes,
     )
-    source_views = open_source_selection_plan_views(
-        raw_source_indexes,
-        manifest_sources,
+    experiment_policy = validate_formal_campaign_contracts(
+        contracts,
+        groups=groups,
     )
-    selection_plan_view_holder.extend(source_views)
-    source_records = [
-        record for view in source_views for record in view.records
-    ]
-    for view in source_views:
-        pack_snapshot = view.pack_snapshot
-        if pack_snapshot is not None:
-            pack_path, pack_sha256 = pack_snapshot
-            critical_source_snapshots[str(pack_path)] = pack_sha256
-    unexpected_source_groups = sorted(
-        {record.key[0] for record in source_records if record.key[0] not in set(groups)}
+    max_generation_attempts = authenticated_generation_attempt_limit(
+        getattr(args, "max_generation_attempts", None),
+        experiment_policy,
     )
-    if unexpected_source_groups:
-        raise FinalizationError(
-            "result sources contain groups outside the active finalization scope: "
-            f"{unexpected_source_groups}"
-        )
-    source_policy_findings = validate_source_policy_history(source_records)
+    history = analyze_streaming_source_history(
+        source_archive,
+        tasks=tasks,
+        groups=groups,
+        fingerprints=fingerprints,
+        contracts=contracts,
+        max_attempts=max_generation_attempts,
+        experiment_policy=experiment_policy,
+        manifest_sources=manifest_sources,
+    )
+    source_policy_findings = history.source_policy_findings
     finalization_warnings: list[Any] = [
         {"kind": "source_policy_finding", **finding}
         for finding in source_policy_findings
@@ -15509,77 +16799,31 @@ def _run_finalization_with_selection_plan_views(
         for source in manifest_sources
         for warning in source.get("audit_warnings") or []
     )
-    experiment_policy = validate_formal_campaign_contracts(
-        contracts,
-        groups=groups,
-    )
-    max_generation_attempts = authenticated_generation_attempt_limit(
-        getattr(args, "max_generation_attempts", None),
-        experiment_policy,
-    )
-    attempt_evidence_audit = validate_generation_attempt_evidence(
-        source_records,
-        max_attempts=max_generation_attempts,
-    )
-    if "G1" in groups:
-        validate_g1_paid_attempt_plan_history(
-            source_records,
-            contracts=contracts,
-        )
     finalization_warnings.extend(
         {
             "kind": "physical_generation_audit_warning",
             **warning,
         }
-        for warning in validate_physical_generation_routes(
-            source_records,
-            contracts=contracts,
+        for warning in history.physical_generation_warnings
+    )
+    judge_attempt_evidence_audit = history.judge_attempt_evidence
+    if judge_attempt_evidence_audit.get("status") == "audit_conflict":
+        finalization_warnings.append(
+            {
+                "kind": "judge_attempt_audit_conflict",
+                "warning": str(judge_attempt_evidence_audit.get("warning") or ""),
+            }
         )
-    )
-    try:
-        judge_attempt_evidence_audit = validate_judge_attempt_evidence(
-            source_records,
-            judge_model=experiment_policy.judge_model,
-            judge_max_attempts=experiment_policy.judge_max_attempts,
-            judge_provider_pin=experiment_policy.judge_provider_pin,
-        )
-    except FinalizationError as exc:
-        if not judge_evidence_error_is_audit_only(exc):
-            raise
-        judge_attempt_evidence_audit = {
-            "status": "audit_conflict",
-            "pass": False,
-            "warning": str(exc),
-        }
-        finalization_warnings.append({"kind": "judge_attempt_audit_conflict", "warning": str(exc)})
-    selected, pair_audit = select_results(
-        source_records,
-        tasks=tasks,
-        groups=groups,
-        fingerprints=fingerprints,
-        contracts=contracts,
-        max_attempts=max_generation_attempts,
-        experiment_policy=experiment_policy,
-        manifest_sources=manifest_sources,
-    )
-    selected_attempt_bindings = bind_selected_generation_attempts(
-        source_records,
-        selected,
-    )
+    attempt_evidence_audit = history.generation_attempt_evidence
+    pair_audit = history.pair_audit
+    selected_attempt_bindings = history.selected_attempt_bindings
     for pair, attempt_id in selected_attempt_bindings.items():
         pair_audit[pair]["selected_generation_attempt_id"] = attempt_id
-    ledger_rows, ledger_summary = build_actual_spend_ledger(
-        source_records,
-        selected=selected,
-        selected_attempt_bindings=selected_attempt_bindings,
-        judge_model=experiment_policy.judge_model,
-    )
+    ledger_rows = history.ledger_rows
+    ledger_summary = history.ledger_summary
     attach_retrospective_recovery_spend(pair_audit, ledger_rows)
     model_metrics = ledger_model_metrics(ledger_rows)
-    external_tool_cost = build_external_tool_cost_summary(
-        source_records,
-        manifest_sources=manifest_sources,
-    )
+    external_tool_cost = history.external_tool_cost
     try:
         proof = validate_account_proof(
             before_path=args.account_before,
@@ -15589,7 +16833,8 @@ def _run_finalization_with_selection_plan_views(
             lock_file=args.lock_file,
             lock_fd=args.lock_fd,
             runtime_key_fingerprint=runtime_key,
-            source_records=source_records,
+            source_records=(),
+            source_window_facts=history.source_window_facts,
             manifest_sources=manifest_sources,
             ledger_rows=ledger_rows,
             ledger_summary=ledger_summary,
@@ -15660,14 +16905,35 @@ def _run_finalization_with_selection_plan_views(
             )
         )
         proof["proof_sha256"] = canonical_sha256(proof, prefix=True)
-    final_rows = finalize_rows(
-        selected,
-        tasks=tasks,
-        proof=proof,
-        pair_audit=pair_audit,
-        groups=groups,
-    )
-    traces = [trace_row_from_result(row) for row in final_rows]
+    final_rows = DiskBackedRowSequence()
+    traces = DiskBackedRowSequence()
+    selection_plan_view_holder.extend((final_rows, traces))
+    final_row_index = 0
+    tasks_by_id = {str(task["id"]): task for task in tasks}
+    for task in tasks:
+        task_id = str(task["id"])
+        for group in groups:
+            selected_locator = history.selected_locators[(group, task_id)]
+            selected_record = source_archive.peek(selected_locator)
+            finalized = finalize_rows(
+                [selected_record],
+                tasks=[tasks_by_id[task_id]],
+                proof=proof,
+                pair_audit=pair_audit,
+                groups=[group],
+                start_row_index=final_row_index,
+            )
+            if len(finalized) != 1:
+                raise FinalizationError("streaming final row construction is not unique")
+            final_row = finalized[0]
+            final_rows.append(final_row)
+            traces.append(trace_row_from_result(final_row))
+            final_row_index += 1
+            del final_row
+            del finalized
+            del selected_record
+    final_rows.seal()
+    traces.seal()
     selected_costs, selected_cost_reconciliation = selected_generation_costs_from_ledger(
         final_rows, ledger_rows
     )
@@ -15708,8 +16974,6 @@ def _run_finalization_with_selection_plan_views(
         "task_count": len(tasks),
         "task_ids": [str(task["id"]) for task in tasks],
     }
-    verify_and_close_source_selection_plan_views(source_views)
-    verify_source_snapshots(critical_source_snapshots)
     report = experiment_results_markdown(
         task_count=len(tasks),
         groups=groups,
@@ -15800,6 +17064,11 @@ def _run_finalization_with_selection_plan_views(
             "account_delta_allocated_to_tasks": False,
         },
     }
+
+    def verify_pre_publish_sources() -> None:
+        source_archive.verify_snapshot()
+        verify_source_snapshots(critical_source_snapshots)
+
     return publish_atomically(
         output_dir=args.output_dir,
         final_rows=final_rows,
@@ -15810,19 +17079,39 @@ def _run_finalization_with_selection_plan_views(
         audit=audit,
         manifest_base=manifest_base,
         report_markdown=report,
+        pre_publish_verifier=verify_pre_publish_sources,
     )
 
 
 def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
-    selection_plan_views: list[SourceShardSelectionPlanView] = []
+    selection_plan_views: list[Any] = []
+    primary_error: BaseException | None = None
     try:
         return _run_finalization_with_selection_plan_views(
             args,
             selection_plan_views,
         )
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        for view in selection_plan_views:
-            view.close()
+        close_error: BaseException | None = None
+        for view in reversed(selection_plan_views):
+            try:
+                if isinstance(view, FinalizerSourceArchive):
+                    view.close(verify=False)
+                else:
+                    view.close()
+            except BaseException as exc:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        "finalizer cleanup also failed: "
+                        f"{type(exc).__module__}.{type(exc).__qualname__}"
+                    )
+                elif close_error is None:
+                    close_error = exc
+        if primary_error is None and close_error is not None:
+            raise close_error
 
 
 def main(argv: Sequence[str] | None = None) -> int:
