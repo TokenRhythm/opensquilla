@@ -121,6 +121,7 @@ class SchedulerEngine:
         schedule_kind: ScheduleKind | str,
         schedule_value: str,
         schedule_tz: str = "",
+        enabled: bool = True,
         handler_key: str = "agent_run",
         payload: dict | None = None,
         session_target: SessionTarget = SessionTarget.ISOLATED,
@@ -148,6 +149,7 @@ class SchedulerEngine:
         """
         job = await self._ops.add(
             name=name,
+            enabled=enabled,
             handler_key=handler_key,
             payload=payload,
             session_target=session_target,
