@@ -81,7 +81,7 @@ from opensquilla.engine.types import (
 from opensquilla.eval.draco_artifact_index import (
     load_tasks,
     parse_maybe_json,
-    result_key_coverage,
+    result_key_coverage,  # noqa: F401 - compatibility re-export
 )
 from opensquilla.eval.draco_artifact_integrity import (
     compact_tool_result_diagnostic,
@@ -98,6 +98,7 @@ from opensquilla.eval.draco_artifact_io import (
     atomic_write_text,
     durable_artifact_capability_contract,
     fsync_directory,
+    iter_verified_result_rows,
 )
 from opensquilla.eval.draco_experiment_config import (
     DracoEnsembleMemberConfig,
@@ -109,7 +110,13 @@ from opensquilla.eval.draco_experiment_config import (
     validate_formal_draco_gateway_credential_binding,
     validate_reference_input,
 )
-from opensquilla.eval.draco_task_supervisor import DracoTaskSupervisor
+from opensquilla.eval.draco_result_summary import (
+    DracoResultSummaryFact,
+    build_result_summary_fact,
+    result_failures_and_coverage,
+    summarize_result_facts,
+)
+from opensquilla.eval.draco_task_supervisor import DracoRollingTaskWindow
 from opensquilla.eval.draco_usage_evidence import (
     STABLE_RECEIPT_EVIDENCE_KEY,
     build_stable_receipt_evidence,
@@ -15136,6 +15143,26 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def result_summary_fact(row: dict[str, Any]) -> DracoResultSummaryFact:
+    return build_result_summary_fact(
+        row,
+        row_cost_accounting=row_cost_accounting,
+        row_usage_number=row_usage_number,
+        row_metric_int=row_metric_int,
+        row_server_tool_call_count=row_server_tool_call_count,
+        row_total_tool_call_count=row_total_tool_call_count,
+        row_trajectory_steps=row_trajectory_steps,
+        row_llm_request_count=row_llm_request_count,
+    )
+
+
+def summarize_facts(facts: list[DracoResultSummaryFact]) -> dict[str, Any]:
+    return summarize_result_facts(
+        facts,
+        merge_cost_accounting=merge_cost_accounting,
+    )
+
+
 def render_markdown(
     summary: dict[str, Any],
     jsonl_path: Path,
@@ -21359,7 +21386,7 @@ async def _amain_with_run_lock(
         raise FileExistsError("DRACO artifact stamp already exists")
     semaphore = asyncio.Semaphore(max(1, args.concurrency))
     judge_semaphore = asyncio.Semaphore(max(1, int(getattr(args, "judge_concurrency", 1) or 1)))
-    rows: list[dict[str, Any]] = []
+    summary_facts: list[DracoResultSummaryFact] = []
     artifacts = {
         "results_jsonl": str(jsonl_path),
         "trace_jsonl": str(trace_path),
@@ -22094,27 +22121,31 @@ async def _amain_with_run_lock(
             return row
 
     expected_result_keys = set(scheduled_keys)
-    pending = [
-        asyncio.create_task(
-            _guarded(task, group)
+    task_window = DracoRollingTaskWindow(
+        [
+            (lambda task=task, group=group: _guarded(task, group))
             if (group, str(task["id"])) in regenerate_keys
-            else _repair_prior_row(
-                task,
-                group,
-                resume_states[(group, str(task["id"]))],
+            else (
+                lambda task=task, group=group: _repair_prior_row(
+                    task,
+                    group,
+                    resume_states[(group, str(task["id"]))],
+                )
             )
-        )
-        for task in tasks
-        for group in groups
-        if (group, str(task["id"])) in scheduled_keys
-    ]
-    supervisor = DracoTaskSupervisor(pending)
+            for task in tasks
+            for group in groups
+            if (group, str(task["id"])) in scheduled_keys
+        ],
+        max_live_tasks=max(1, args.concurrency),
+    )
     rows_persisted = 0
     repair_failures: list[dict[str, Any]] = []
     try:
         async with artifact_writer:
-            for row_index, coro in enumerate(asyncio.as_completed(pending), start=1):
-                row = await coro
+            row_index = 0
+            while (completed_task := await task_window.next_completed_task()) is not None:
+                row = completed_task.result()
+                row_index += 1
                 row["row_index"] = row_index
                 resume_completion = row.get("resume_completion")
                 if (
@@ -22127,12 +22158,8 @@ async def _amain_with_run_lock(
                             "group": row.get("group"),
                             "task_id": row.get("task_id"),
                             "action": resume_completion.get("action"),
-                            "reasons": list(
-                                resume_completion.get("incomplete_reasons") or []
-                            ),
-                            "model_or_judge_started": bool(
-                                resume_completion.get("judge_reran")
-                            ),
+                            "reasons": list(resume_completion.get("incomplete_reasons") or []),
+                            "model_or_judge_started": bool(resume_completion.get("judge_reran")),
                         }
                     )
                 if getattr(
@@ -22156,24 +22183,34 @@ async def _amain_with_run_lock(
                         row,
                         non_byok_audit=audit,
                     )
-                row[DRACO_DURABLE_RESULT_ROW_FIELD] = (
-                    durable_artifact_capability_contract()
-                )
+                row[DRACO_DURABLE_RESULT_ROW_FIELD] = durable_artifact_capability_contract()
                 row = seal_result_row(row)
                 trace_value = trace_row(row)
                 append_outcome = await artifact_writer.append(row, trace_value)
                 rows_persisted = append_outcome.paired_row_count
                 if not append_outcome.committed:
                     raise RuntimeError("new DRACO resume run produced duplicate sealed evidence")
-                rows.append(row)
+                summary_facts.append(result_summary_fact(row))
+                resume_states.pop(
+                    (
+                        str(row.get("group") or ""),
+                        str(row.get("task_id") or ""),
+                    ),
+                    None,
+                )
+                task_window.release_completed(completed_task)
                 print(
                     f"{row['group']} {row['task_id']} error={bool(row['error'])}",
                     flush=True,
                 )
+                del append_outcome, completed_task, row, trace_value
     except BaseException as exc:
-        await supervisor.cancel_and_wait()
+        await task_window.cancel_and_wait()
         rows_persisted = artifact_writer.paired_row_count
-        failure = supervisor.failure_payload(exc, rows_written=rows_persisted)
+        failure = task_window.failure_payload(
+            exc,
+            rows_written=rows_persisted,
+        )
         try:
             write_manifest(
                 manifest_path,
@@ -22192,54 +22229,25 @@ async def _amain_with_run_lock(
             )
         except Exception as manifest_exc:
             print(
-                "Failed to publish aborted manifest: "
-                f"{type(manifest_exc).__name__}",
+                f"Failed to publish aborted manifest: {type(manifest_exc).__name__}",
                 file=sys.stderr,
                 flush=True,
             )
         run_lock.close()
         raise
-    result_failures: list[dict[str, Any]] = []
-    for row in rows:
-        completion = row.get("completion_status")
-        completion_complete = bool(
-            isinstance(completion, Mapping) and completion.get("status") == "complete"
+    try:
+        result_failures, _ = result_failures_and_coverage(
+            summary_facts,
+            expected_keys=expected_result_keys,
+            completion_rows=(
+                iter_verified_result_rows(jsonl_path)
+                if any(fact.completion_failed for fact in summary_facts)
+                else None
+            ),
         )
-        if not row.get("error") and completion_complete:
-            continue
-        reasons = (
-            list(completion.get("incomplete_reasons") or [])
-            if isinstance(completion, Mapping)
-            else ["missing_completion_status"]
-        )
-        if row.get("error"):
-            reasons.append(str(row["error"]))
-        result_failures.append(
-            {
-                "stage": "result_completion",
-                "group": row.get("group"),
-                "task_id": row.get("task_id"),
-                "reasons": list(dict.fromkeys(reason for reason in reasons if reason)),
-                "model_or_judge_started": True,
-            }
-        )
-    coverage = result_key_coverage(rows, expected_keys=expected_result_keys)
-    if not coverage["pass"]:
-        coverage_reasons: list[str] = []
-        if coverage["missing_keys"]:
-            coverage_reasons.append("missing_result_rows")
-        if coverage["unexpected_keys"]:
-            coverage_reasons.append("unexpected_result_rows")
-        if coverage["duplicate_keys"]:
-            coverage_reasons.append("duplicate_result_rows")
-        result_failures.append(
-            {
-                "stage": "result_coverage",
-                **coverage,
-                "reasons": coverage_reasons,
-                "model_or_judge_started": bool(rows),
-            }
-        )
+    except BaseException:
+        run_lock.close()
+        raise
     manifest_failure: dict[str, Any] | None = None
     if repair_failures:
         repair_failure: dict[str, Any] = {
@@ -22296,7 +22304,7 @@ async def _amain_with_run_lock(
             else "resume_repair_incomplete"
         )
     try:
-        summary = summarize(rows)
+        summary = summarize_facts(summary_facts)
         summary_path = jsonl_path.with_suffix(".md")
         atomic_write_text(
             summary_path,
@@ -22323,7 +22331,7 @@ async def _amain_with_run_lock(
             finished_at=time.time(),
             tasks=tasks,
             groups=groups,
-            rows_written=len(rows),
+            rows_written=len(summary_facts),
             artifacts=artifacts,
             summary=summary,
             tool_policy=manifest_tool_policy,

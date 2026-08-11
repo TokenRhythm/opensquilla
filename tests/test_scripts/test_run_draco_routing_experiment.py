@@ -18,6 +18,12 @@ import pytest
 from opensquilla.engine.types import DoneEvent as AgentDoneEvent
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.eval import draco_artifact_index
+from opensquilla.eval.draco_result_summary import (
+    MAX_STABLE_RESPONSE_ID_BYTES,
+    MAX_SUMMARY_TEXT_BYTES,
+    DracoResultSummaryProjectionError,
+    compact_cost_merge_account,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import ensemble as ensemble_provider
 from opensquilla.provider.ensemble import (
@@ -7669,6 +7675,74 @@ async def test_worker_failure_cancels_siblings_and_publishes_aborted_manifest(
 
 
 @pytest.mark.asyncio
+async def test_same_tick_first_failure_precedes_successful_row_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        "\n".join(
+            json.dumps({"id": task_id, "prompt": task_id})
+            for task_id in ("task-a", "task-b")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+            "--concurrency",
+            "2",
+        ]
+    )
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    real_run_one = runner.run_one
+    gate = asyncio.Event()
+    both_ready = asyncio.Event()
+    ready_count = 0
+
+    async def fail_first_after_shared_gate(*args, **kwargs):
+        nonlocal ready_count
+        task_id = kwargs["task"]["id"]
+        row = await real_run_one(*args, **kwargs) if task_id == "task-b" else None
+        ready_count += 1
+        if ready_count == 2:
+            both_ready.set()
+        await gate.wait()
+        if task_id == "task-a":
+            raise RuntimeError("first completed worker failed")
+        assert row is not None
+        return row
+
+    monkeypatch.setattr(runner, "run_one", fail_first_after_shared_gate)
+    run_task = asyncio.create_task(runner.amain(args))
+    await asyncio.wait_for(both_ready.wait(), timeout=10)
+    gate.set()
+
+    with pytest.raises(RuntimeError, match="first completed worker failed"):
+        await run_task
+
+    manifest = json.loads(
+        next(output_dir.glob("draco_run_*.manifest.json")).read_text(encoding="utf-8")
+    )
+    result_path = next(output_dir.glob("draco_ensemble_*.jsonl"))
+    trace_path = next(output_dir.glob("draco_run_*.trace.jsonl"))
+    checkpoint_path = next(output_dir.glob("draco_run_*.checkpoint.json"))
+    assert manifest["status"] == "aborted"
+    assert manifest["rows_written"] == 0
+    assert result_path.read_text(encoding="utf-8") == ""
+    assert trace_path.read_text(encoding="utf-8") == ""
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["rows_written"] == 0
+
+
+@pytest.mark.asyncio
 async def test_aborted_manifest_uses_authoritative_count_after_commit_boundary_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7724,6 +7798,164 @@ async def test_aborted_manifest_uses_authoritative_count_after_commit_boundary_f
 
 
 @pytest.mark.asyncio
+async def test_projection_failure_after_commit_keeps_durable_evidence_and_aborts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+        ]
+    )
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+
+    def fail_projection(_row: dict[str, object]):
+        raise DracoResultSummaryProjectionError("synthetic projection failure")
+
+    monkeypatch.setattr(runner, "result_summary_fact", fail_projection)
+
+    with pytest.raises(DracoResultSummaryProjectionError, match="projection failure"):
+        await runner.amain(args)
+
+    manifest_path = next(output_dir.glob("draco_run_*.manifest.json"))
+    checkpoint_path = next(output_dir.glob("draco_run_*.checkpoint.json"))
+    result_path = next(output_dir.glob("draco_ensemble_*.jsonl"))
+    trace_path = next(output_dir.glob("draco_run_*.trace.jsonl"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "aborted"
+    assert manifest["rows_written"] == 1
+    assert manifest["failure"]["exception_type"] == ("DracoResultSummaryProjectionError")
+    assert manifest["failure"]["cleanup"]["complete"] is True
+    assert manifest["failure"]["cleanup"]["remaining_task_count"] == 0
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["rows_written"] == 1
+    assert len(result_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(trace_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert not result_path.with_suffix(".summary.json").exists()
+    assert not result_path.with_suffix(".md").exists()
+    lock_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".lock")
+    with runner.DracoArtifactRunLock(lock_path):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_large_failure_text_is_streamed_back_into_manifest_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+        ]
+    )
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    error = "provider-error-" + "e" * 1_000_000
+    reason = "incomplete-reason-" + "r" * 1_000_000
+    real_run_one = runner.run_one
+
+    async def run_one_with_large_failure(*args, **kwargs):
+        row = await real_run_one(*args, **kwargs)
+        row["error"] = error
+        row["completion_status"] = {
+            "status": "incomplete",
+            "incomplete_reasons": [reason],
+        }
+        return row
+
+    monkeypatch.setattr(runner, "run_one", run_one_with_large_failure)
+
+    assert await runner.amain(args) == 2
+
+    manifest = json.loads(
+        next(output_dir.glob("draco_run_*.manifest.json")).read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "result_incomplete"
+    assert manifest["rows_written"] == 1
+    assert manifest["failure"]["failures"] == [
+        {
+            "stage": "result_completion",
+            "group": "B0",
+            "task_id": "task-a",
+            "reasons": [reason, error],
+            "model_or_judge_started": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failure_row_reread_error_releases_durable_run_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+        ]
+    )
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    real_run_one = runner.run_one
+
+    async def incomplete_run_one(*args, **kwargs):
+        row = await real_run_one(*args, **kwargs)
+        row["error"] = "provider_error"
+        row["completion_status"] = {
+            "status": "incomplete",
+            "incomplete_reasons": ["generation_incomplete"],
+        }
+        return row
+
+    def fail_reread(_path: Path):
+        raise RuntimeError("synthetic verified reread failure")
+        yield
+
+    monkeypatch.setattr(runner, "run_one", incomplete_run_one)
+    monkeypatch.setattr(runner, "iter_verified_result_rows", fail_reread)
+
+    with pytest.raises(RuntimeError, match="verified reread failure"):
+        await runner.amain(args)
+
+    checkpoint_path = next(output_dir.glob("draco_run_*.checkpoint.json"))
+    lock_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".lock")
+    with runner.DracoArtifactRunLock(lock_path):
+        pass
+
+
+@pytest.mark.asyncio
 async def test_summary_failure_explicitly_releases_durable_run_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7748,8 +7980,8 @@ async def test_summary_failure_explicitly_releases_durable_run_lock(
     monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
     monkeypatch.setattr(
         runner,
-        "summarize",
-        lambda _rows: (_ for _ in ()).throw(RuntimeError("synthetic summary failure")),
+        "summarize_facts",
+        lambda _facts: (_ for _ in ()).throw(RuntimeError("synthetic summary failure")),
     )
 
     with pytest.raises(RuntimeError, match="summary failure"):
@@ -8219,6 +8451,558 @@ def test_run_result_summary_honors_explicit_physical_request_count(
 
     assert summary["llm_request_count"] == physical_request_count
     assert summary["usage_unknown_count"] == expected_unknown
+
+
+def _projected_summary_row(
+    *,
+    group: str,
+    task_id: str,
+    response_id: str,
+    cost_source: str = "openrouter_usage",
+    error: str | None = None,
+    huge_payload: str = "",
+) -> dict[str, object]:
+    usage_unit: dict[str, object] = {
+        "provider": "openrouter",
+        "model": "model-that-must-not-be-retained",
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "reasoning_tokens": 2,
+        "billed_cost": 0.01,
+        "cost_source": cost_source,
+        "response_id": response_id,
+        "provider_usage": {
+            "response_ids": [response_id],
+            "irrelevant_large_metadata": huge_payload,
+        },
+    }
+    if cost_source.startswith("opensquilla_"):
+        usage_unit["estimated_cost_usd"] = 0.01
+    elif cost_source == "mixed":
+        usage_unit["cost_usd"] = 0.01
+    return {
+        "group": group,
+        "task_id": task_id,
+        "error": error,
+        "completion_status": {
+            "status": "complete" if error is None else "incomplete",
+            "incomplete_reasons": [] if error is None else ["generation_incomplete"],
+        },
+        "latency_ms": 10 + len(task_id),
+        "quality_total": 0.8 if error is None else None,
+        "judge": {
+            "pass_rate": 1.0,
+            "judge_error_count": 0,
+            "judge_cost_exempt": True,
+        },
+        "candidate_judges": [],
+        "selected_generation_succeeded": error is None,
+        "usage": {
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "reasoning_tokens": 2,
+            "model_usage_breakdown": [usage_unit],
+        },
+        "llm_request_count": 1 if error is None else 0,
+        "stream_tool_call_count": 1,
+        "server_tool_call_count": 2,
+        "total_tool_call_count": 3,
+        "trajectory_steps": 4,
+        "provider_spec": {"kind": "single"},
+        "execution": {"generation_attempts": []},
+        "tool_policy": {},
+        "actual_spend_metrics": {},
+        "final_text": huge_payload,
+        "ensemble_trace": {"irrelevant_large_trace": huge_payload},
+    }
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_compact_summary_facts_preserve_legacy_summary_bytes(module) -> None:
+    rows = [
+        _projected_summary_row(
+            group="B0",
+            task_id="t1",
+            response_id="shared-response",
+        ),
+        _projected_summary_row(
+            group="B0",
+            task_id="t2",
+            response_id="shared-response",
+        ),
+        _projected_summary_row(
+            group="B1",
+            task_id="t1",
+            response_id="estimated-response",
+            cost_source="opensquilla_registry_estimate",
+        ),
+        _projected_summary_row(
+            group="G1",
+            task_id="t1",
+            response_id="failed-response",
+            error="provider_error",
+        ),
+    ]
+
+    legacy = module.summarize(deepcopy(rows))
+    projected = module.summarize_facts(
+        [module.result_summary_fact(deepcopy(row)) for row in rows]
+    )
+
+    assert json.dumps(projected, ensure_ascii=False, indent=2) == json.dumps(
+        legacy,
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_compact_receipts_preserve_cross_row_cost_coverage(module) -> None:
+    units = [
+        {
+            "provider": "openrouter",
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "billed_cost": 0.01,
+            "cost_source": "openrouter_usage",
+            "response_id": "bridge-a",
+        },
+        {
+            "provider": "openrouter",
+            "input_tokens": 5,
+            "output_tokens": 2,
+            "billed_cost": 0.02,
+            "cost_source": "opensquilla_registry_estimate",
+            "estimated_cost_usd": 0.02,
+            "provider_usage": {"response_ids": ["bridge-a", "bridge-b"]},
+        },
+        {
+            "provider": "openrouter",
+            "input_tokens": 7,
+            "output_tokens": 4,
+            "billed_cost": 0.03,
+            "cost_source": "mixed",
+            "cost_usd": 0.03,
+            "provider_usage": {"response_ids": ["bridge-b"]},
+        },
+        {
+            "provider": "openrouter",
+            "input_tokens": 11,
+            "output_tokens": 6,
+            "billed_cost": 0.04,
+            "cost_source": "provider_billed",
+            "provider_usage": {
+                "is_byok": False,
+                "provider_reported_cost": 0.04,
+                "router_metadata": {"is_byok": False},
+                "response_ids": ["provider-receipt"],
+                "large_unrelated_payload": "x" * 1_000_000,
+            },
+        },
+        {
+            "provider": "anthropic",
+            "input_tokens": 13,
+            "output_tokens": 7,
+            "billed_cost": 0.05,
+            "cost_source": "openrouter_usage",
+            "response_id": "cross-provider-response",
+        },
+        {
+            "provider": "google",
+            "input_tokens": 17,
+            "output_tokens": 8,
+            "billed_cost": 0.06,
+            "cost_source": "provider_billed",
+            "response_id": "cross-provider-response",
+            "provider_usage": {
+                "is_byok": False,
+                "provider_reported_cost": 0.06,
+                "router_metadata": {"is_byok": False},
+                "response_ids": ["cross-provider-response"],
+            },
+        },
+    ]
+    accounts = [
+        module.usage_cost_accounting(
+            {"model_usage_breakdown": [unit]},
+            expected_requests=1,
+            scope="row",
+        )
+        for unit in units
+    ]
+    original = module.merge_cost_accounting("group", accounts)
+    compact = module.merge_cost_accounting(
+        "group",
+        [compact_cost_merge_account(account) for account in accounts],
+    )
+
+    for key in (
+        "request_count",
+        "usage_observed_request_count",
+        "exact_request_count",
+        "estimated_request_count",
+        "mixed_request_count",
+        "unknown_request_count",
+        "total_tokens",
+        "exact_tokens",
+        "estimated_tokens",
+        "mixed_tokens",
+        "unknown_tokens",
+        "known_request_coverage_pct",
+        "exact_request_coverage_pct",
+        "known_token_coverage_pct",
+        "cost_complete",
+        "cost_exact",
+    ):
+        assert compact[key] == original[key]
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    "identity_evidence",
+    [
+        {"response_id": None},
+        {"response_id": "   "},
+        {"provider_usage": {"response_ids": None}},
+        {"provider_usage": {"response_id": None}},
+    ],
+    ids=["direct-null", "direct-blank", "provider-list-null", "provider-null"],
+)
+def test_compact_receipts_do_not_invent_stable_identity_for_empty_ids(
+    module,
+    identity_evidence: dict[str, object],
+) -> None:
+    accounts = []
+    for billed_cost in (0.01, 0.02):
+        unit = {
+            "provider": "openrouter",
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "billed_cost": billed_cost,
+            "cost_source": "openrouter_usage",
+            **deepcopy(identity_evidence),
+        }
+        accounts.append(
+            module.usage_cost_accounting(
+                {"model_usage_breakdown": [unit]},
+                expected_requests=1,
+                scope="row",
+            )
+        )
+
+    original = module.merge_cost_accounting("group", accounts)
+    compact = module.merge_cost_accounting(
+        "group",
+        [compact_cost_merge_account(account) for account in accounts],
+    )
+
+    for key, value in original.items():
+        if key == "scope" or key.startswith("_"):
+            continue
+        assert compact[key] == value
+
+
+def test_compact_receipts_are_payload_bounded_without_rejecting_257_requests() -> None:
+    receipt_count = 257
+    bounded_custom_source = "opensquilla_" + "x" * 3_000
+    receipts = [
+        {
+            "provider": "openrouter",
+            "model": "model-that-must-be-hashed",
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "response_id": f"direct-{index}",
+            "cost_source": bounded_custom_source,
+            "estimated_cost_usd": 0.01,
+            "provider_usage": {"response_ids": [f"provider-{index}"]},
+        }
+        for index in range(receipt_count)
+    ]
+    account = runner.usage_cost_accounting(
+        {"model_usage_breakdown": receipts},
+        expected_requests=receipt_count,
+        scope="row",
+    )
+    compact = compact_cost_merge_account(account)
+
+    def deep_size(value: object, seen: set[int]) -> int:
+        object_id = id(value)
+        if object_id in seen:
+            return 0
+        seen.add(object_id)
+        size = sys.getsizeof(value)
+        if isinstance(value, Mapping):
+            return size + sum(
+                deep_size(key, seen) + deep_size(item, seen) for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return size + sum(deep_size(item, seen) for item in value)
+        return size
+
+    compact_receipts = compact["_stable_usage_receipts"]
+    assert len(compact_receipts) == receipt_count
+    assert {receipt["cost_source"] for receipt in compact_receipts} == {"opensquilla_estimate"}
+    assert all(str(receipt["model"]).startswith("sha256:") for receipt in compact_receipts)
+    assert all(
+        str(receipt["response_id"]).startswith("sha256:")
+        and str(receipt["provider_usage"]["response_ids"][0]).startswith("sha256:")
+        for receipt in compact_receipts
+    )
+    assert deep_size(compact, set()) < receipt_count * 4_000
+
+    original_group = runner.merge_cost_accounting("group", [account])
+    compact_group = runner.merge_cost_accounting("group", [compact])
+    assert {
+        key: value
+        for key, value in compact_group.items()
+        if key != "scope" and not key.startswith("_")
+    } == {
+        key: value
+        for key, value in original_group.items()
+        if key != "scope" and not key.startswith("_")
+    }
+
+
+def test_compact_receipt_fingerprint_does_not_collapse_distinct_evidence() -> None:
+    units = [
+        {
+            "provider": "anthropic",
+            "model": "model-a",
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "reasoning_tokens": 1,
+            "cost_source": "opensquilla_registry_estimate",
+            "estimated_cost_usd": 0.01,
+        },
+        {
+            "provider": "google",
+            "model": "model-a",
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "reasoning_tokens": 1,
+            "cost_source": "opensquilla_registry_estimate",
+            "estimated_cost_usd": 0.01,
+        },
+        {
+            "provider": "anthropic",
+            "model": "model-b",
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "reasoning_tokens": 1,
+            "cost_source": "opensquilla_registry_estimate",
+            "estimated_cost_usd": 0.01,
+        },
+        {
+            "provider": "anthropic",
+            "model": "model-a",
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "reasoning_tokens": 2,
+            "cost_source": "opensquilla_static_estimate",
+            "estimated_cost_usd": 0.01,
+        },
+    ]
+    account = runner.usage_cost_accounting(
+        {"model_usage_breakdown": units},
+        expected_requests=len(units),
+        scope="row",
+    )
+    compact = compact_cost_merge_account(account)
+
+    assert runner.merge_cost_accounting("group", [compact])["request_count"] == 4
+    assert runner.merge_cost_accounting("group", [compact])["estimated_request_count"] == 4
+
+
+@pytest.mark.parametrize(
+    "value",
+    [10**10_000, float("nan"), float("inf"), -float("inf")],
+    ids=["huge-int", "nan", "positive-inf", "negative-inf"],
+)
+def test_compact_receipt_rejects_unbounded_nonfinite_costs(value: int | float) -> None:
+    with pytest.raises(DracoResultSummaryProjectionError):
+        compact_cost_merge_account(
+            {
+                "request_count": 1,
+                "duplicate_stable_receipt_count": 0,
+                "_stable_usage_receipts": [{"provider_usage": {"provider_reported_cost": value}}],
+                "_receipt_provenance_complete": True,
+            }
+        )
+
+
+@pytest.mark.parametrize("value", [1, "x" * (MAX_STABLE_RESPONSE_ID_BYTES + 1)])
+def test_compact_receipt_rejects_unbounded_or_untyped_response_id(
+    value: object,
+) -> None:
+    with pytest.raises(DracoResultSummaryProjectionError):
+        compact_cost_merge_account(
+            {
+                "request_count": 1,
+                "duplicate_stable_receipt_count": 0,
+                "_stable_usage_receipts": [{"response_id": value}],
+                "_receipt_provenance_complete": True,
+            }
+        )
+
+
+def test_compact_receipt_rejects_unbounded_cost_source() -> None:
+    with pytest.raises(DracoResultSummaryProjectionError, match="cost_source"):
+        compact_cost_merge_account(
+            {
+                "request_count": 1,
+                "duplicate_stable_receipt_count": 0,
+                "_stable_usage_receipts": [
+                    {"cost_source": "opensquilla_" + "x" * (MAX_SUMMARY_TEXT_BYTES + 1)}
+                ],
+                "_receipt_provenance_complete": True,
+            }
+        )
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_summary_fact_does_not_retain_large_or_sensitive_row_payload(module) -> None:
+    marker = "secret-payload-marker-" + "x" * 1_000_000
+    response_id = "sensitive-response-identifier"
+    row = _projected_summary_row(
+        group="B0",
+        task_id="t1",
+        response_id=response_id,
+        huge_payload=marker,
+    )
+
+    fact = module.result_summary_fact(row)
+    retained = repr(fact)
+
+    assert "secret-payload-marker" not in retained
+    assert "model-that-must-not-be-retained" not in retained
+    assert response_id not in retained
+    assert len(retained) < 20_000
+
+
+def test_compact_cost_account_rejects_receipts_exceeding_physical_count() -> None:
+    with pytest.raises(DracoResultSummaryProjectionError, match="physical request count"):
+        compact_cost_merge_account(
+            {
+                "request_count": 1,
+                "duplicate_stable_receipt_count": 0,
+                "_stable_usage_receipts": [{}, {}],
+                "_receipt_provenance_complete": True,
+            }
+        )
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_summary_fact_rejects_unbounded_task_identity(module) -> None:
+    row = _projected_summary_row(
+        group="B0",
+        task_id="t1",
+        response_id="bounded-response",
+    )
+    row["task_id"] = "x" * (MAX_SUMMARY_TEXT_BYTES + 1)
+
+    with pytest.raises(DracoResultSummaryProjectionError):
+        module.result_summary_fact(row)
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_summary_fact_defers_large_failure_text_to_streaming_rows(module) -> None:
+    error = "provider-error-" + "e" * 1_000_000
+    reason = "incomplete-reason-" + "r" * 1_000_000
+    row = _projected_summary_row(
+        group="B0",
+        task_id="t1",
+        response_id="bounded-response",
+        error=error,
+    )
+    row["completion_status"] = {
+        "status": "incomplete",
+        "incomplete_reasons": [reason],
+    }
+
+    fact = module.result_summary_fact(row)
+    assert fact.completion_failed is True
+    assert "provider-error-" not in repr(fact)
+    assert "incomplete-reason-" not in repr(fact)
+
+    failures, coverage = module.result_failures_and_coverage(
+        [fact],
+        expected_keys={("B0", "t1")},
+        completion_rows=iter([row]),
+    )
+    assert coverage["pass"] is True
+    assert failures == [
+        {
+            "stage": "result_completion",
+            "group": "B0",
+            "task_id": "t1",
+            "reasons": [reason, error],
+            "model_or_judge_started": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_successful_summary_facts_do_not_consume_completion_rows(module) -> None:
+    row = _projected_summary_row(
+        group="B0",
+        task_id="t1",
+        response_id="bounded-response",
+    )
+    fact = module.result_summary_fact(row)
+
+    def forbidden_rows():
+        raise AssertionError("successful summaries must not reread result artifacts")
+        yield
+
+    failures, coverage = module.result_failures_and_coverage(
+        [fact],
+        expected_keys={("B0", "t1")},
+        completion_rows=forbidden_rows(),
+    )
+    assert failures == []
+    assert coverage["pass"] is True
+
+
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_compact_result_failure_and_coverage_match_legacy_contract(module) -> None:
+    rows = [
+        _projected_summary_row(
+            group="B0",
+            task_id="t1",
+            response_id="r1",
+            error="provider_error",
+        ),
+        _projected_summary_row(
+            group="B0",
+            task_id="t1",
+            response_id="r2",
+        ),
+    ]
+    facts = [module.result_summary_fact(deepcopy(row)) for row in rows]
+    expected_keys = {("B0", "t1"), ("B0", "t2")}
+    failures, coverage = module.result_failures_and_coverage(
+        facts,
+        expected_keys=expected_keys,
+        completion_rows=iter(rows),
+    )
+    legacy_coverage = module.result_key_coverage(rows, expected_keys=expected_keys)
+
+    assert coverage == legacy_coverage
+    assert failures == [
+        {
+            "stage": "result_completion",
+            "group": "B0",
+            "task_id": "t1",
+            "reasons": ["generation_incomplete", "provider_error"],
+            "model_or_judge_started": True,
+        },
+        {
+            "stage": "result_coverage",
+            **legacy_coverage,
+            "reasons": ["missing_result_rows", "duplicate_result_rows"],
+            "model_or_judge_started": True,
+        },
+    ]
 
 
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
