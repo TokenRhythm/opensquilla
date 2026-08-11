@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -13,6 +14,19 @@ class PendingInputApplication:
     texts: tuple[str, ...]
     iteration: int
     model_call_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class PendingInputClaim:
+    """One safe-boundary claim prepared for the next provider request.
+
+    ``goal_context`` is an internal authority rebind. Ordinary user steering
+    leaves it unset; Goal objective edits use it only after TaskRuntime has
+    validated the exact owning task and objective revision.
+    """
+
+    texts: tuple[str, ...]
+    goal_context: Mapping[str, Any] | None = None
 
 
 @runtime_checkable
@@ -32,6 +46,9 @@ class PendingInputProvider(Protocol):
 
     def peek_pending(self) -> list[str]:
         """Return the next FIFO batch without claiming or mutating it."""
+
+    def claim_pending(self) -> Any:
+        """Claim a batch and optionally return an awaitable prepared claim."""
 
     def mark_applied(self, *, iteration: int, model_call_id: str) -> Any:
         """Mark the claimed batch as included; implementations may persist async."""
@@ -88,6 +105,11 @@ class ListPendingInputProvider:
         self._pending = []
         self._claimed = pending
         return pending
+
+    def claim_pending(self) -> PendingInputClaim:
+        """Claim ordinary text without changing Goal authority."""
+
+        return PendingInputClaim(texts=tuple(self.drain_pending()))
 
     def peek_pending(self) -> list[str]:
         """Return the next unclaimed FIFO batch without changing ownership."""

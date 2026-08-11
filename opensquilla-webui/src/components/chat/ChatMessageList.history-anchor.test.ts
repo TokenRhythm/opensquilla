@@ -107,4 +107,55 @@ describe('ChatMessageList history anchors', () => {
     expect(host.querySelector('.msg-system')).toBeNull()
     expect(host.querySelector('.msg-ai')).toBeNull()
   })
+
+  it('renders skipped compaction reasons truthfully in the transcript', () => {
+    const makeMessage = (id: string, reason: string): ChatRenderedMessage => ({
+      id,
+      messageId: `maintenance:context-compaction:${id}`,
+      role: 'maintenance',
+      displayRole: 'maintenance',
+      roleLabel: 'Maintenance',
+      text: '',
+      timeStr: '',
+      showHeader: false,
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: id,
+        source: 'manual',
+        state: 'skipped',
+        durability: 'none',
+        reason,
+      },
+    })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(ChatMessageList, {
+      messages: [
+        makeMessage('cmp-within', 'within_compaction_budget'),
+        makeMessage('cmp-vetoed', 'no_safe_turn_boundary'),
+      ],
+      shareMode: false,
+      selectedMessageIds: new Set<string>(),
+      stripTimePrefix: (value: string) => value,
+      renderMarkdown: (value: string) => value,
+      fmtTok: (value: number) => String(value),
+      subagentSummary: (value: string) => value,
+      subagentBody: (value: string) => value,
+      toolCallGroups: () => [],
+      isToolGroupOpen: () => false,
+      isToolItemOpen: () => false,
+      toolGroupStatusText: () => '',
+      toolStatusText: () => '',
+      toolSecondaryText: () => '',
+      copyMessage: async () => true,
+      downloadAttachment: async () => true,
+    })
+    app.use(i18n)
+    app.mount(host)
+    apps.push(app)
+
+    const events = host.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
+    expect(events[0]?.textContent).toContain('No organization needed; context has enough space')
+    expect(events[1]?.textContent).toContain('Context organization was not applied')
+  })
 })

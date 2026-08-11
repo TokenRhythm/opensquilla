@@ -774,7 +774,7 @@ async def test_quality_report_marks_compaction_that_still_exceeds_window():
 
 
 @pytest.mark.asyncio
-async def test_latest_assistant_is_never_removed_when_it_alone_exceeds_window():
+async def test_latest_completed_assistant_can_compact_when_it_exceeds_window():
     entries = [
         {"role": "user", "content": "old question", "token_count": 400},
         {"role": "assistant", "content": "old answer", "token_count": 400},
@@ -794,9 +794,9 @@ async def test_latest_assistant_is_never_removed_when_it_alone_exceeds_window():
         )
     )
 
-    assert result.removed_count == 0
-    assert result.kept_entries == entries
-    assert result.skip_reason == "quality_gate_failed"
+    assert result.removed_count == len(entries)
+    assert result.kept_entries == []
+    assert "LATEST_ASSISTANT_RAW" in result.summary
 
 
 @pytest.mark.asyncio
@@ -884,6 +884,258 @@ async def test_canonical_nested_error_tool_result_remains_raw() -> None:
 
     assert canonical_tool_round in result.kept_entries
     assert result.kept_entries.index(canonical_tool_round) >= 1
+
+
+@pytest.mark.asyncio
+async def test_old_completed_error_does_not_permanently_anchor_semantic_tail() -> None:
+    old_error_round = {
+        "role": "assistant",
+        "content": "old checker call",
+        "tool_calls": [
+            {"type": "tool_use", "tool_use_id": "old-error", "name": "exec"},
+            {
+                "type": "tool_result",
+                "tool_use_id": "old-error",
+                "result": "Error: old exact diagnostic",
+                "is_error": True,
+                "execution_status": {
+                    "status": "error",
+                    "reason": "nonzero_exit",
+                    "preservation_class": "diagnostic",
+                },
+            },
+        ],
+        "token_count": 400,
+    }
+    entries = [
+        {"role": "user", "content": "old request", "token_count": 400},
+        old_error_round,
+        *_make_entries(18, tokens_each=300),
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="old-terminal-error",
+            entries=entries,
+            context_window_tokens=1_500,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert result.removed_count > 0
+    assert old_error_round not in result.kept_entries
+    assert "status=error reason=nonzero_exit" in result.summary
+    assert result.kept_start_index in {
+        sum(len(group) for group in _api_round_groups(entries)[:index])
+        for index in range(1, len(_api_round_groups(entries)) + 1)
+    }
+
+
+@pytest.mark.asyncio
+async def test_historical_unmatched_call_does_not_anchor_later_user_rounds() -> None:
+    old_unmatched_call = {
+        "role": "assistant",
+        "content": "old interrupted call",
+        "tool_calls": [
+            {"type": "tool_use", "tool_use_id": "stale-unmatched", "name": "exec"},
+        ],
+        "token_count": 400,
+    }
+    entries = [
+        {"role": "user", "content": "old request", "token_count": 400},
+        old_unmatched_call,
+        *_make_entries(18, tokens_each=300),
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="old-unmatched-call",
+            entries=entries,
+            context_window_tokens=1_500,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert result.removed_count > 0
+    assert old_unmatched_call not in result.kept_entries
+
+
+@pytest.mark.asyncio
+async def test_latest_completed_large_error_round_can_be_compacted() -> None:
+    completed_error_round = {
+        "role": "assistant",
+        "content": "completed large terminal tool round",
+        "tool_calls": [
+            {"type": "tool_use", "tool_use_id": "latest-error", "name": "exec"},
+            {
+                "type": "tool_result",
+                "tool_use_id": "latest-error",
+                "result": "Error: " + ("large diagnostic " * 200),
+                "is_error": True,
+                "execution_status": {
+                    "status": "error",
+                    "reason": "nonzero_exit",
+                },
+            },
+        ],
+        "token_count": 4_000,
+    }
+    entries = [
+        *_make_entries(18, tokens_each=100),
+        {"role": "user", "content": "run the latest command", "token_count": 20},
+        completed_error_round,
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="latest-completed-error",
+            entries=entries,
+            context_window_tokens=1_500,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert result.removed_count == len(entries)
+    assert result.kept_entries == []
+    assert "latest-error" in result.summary
+    assert "status=error reason=nonzero_exit" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_top_level_terminal_result_status_is_preserved_in_summary() -> None:
+    top_level_error = {
+        "role": "tool",
+        "content": "command stopped",
+        "tool_call_id": "top-level-timeout",
+        "is_error": True,
+        "execution_status": {
+            "status": "timed_out",
+            "reason": "deadline_exceeded",
+        },
+        "token_count": 300,
+    }
+    entries = [
+        {"role": "user", "content": "old command", "token_count": 300},
+        {
+            "role": "assistant",
+            "content": "calling command",
+            "tool_calls": [{"id": "top-level-timeout", "type": "function"}],
+            "token_count": 300,
+        },
+        top_level_error,
+        *_make_entries(18, tokens_each=300),
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="top-level-terminal-status",
+            entries=entries,
+            context_window_tokens=1_500,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert result.removed_count > 0
+    assert top_level_error not in result.kept_entries
+    assert "tool_call_id=top-level-timeout" in result.summary
+    assert "status=timed_out reason=deadline_exceeded" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_current_live_tool_state_remains_raw() -> None:
+    active_round = {
+        "role": "assistant",
+        "content": "long-running command",
+        "tool_calls": [
+            {"type": "tool_use", "tool_use_id": "active-call", "name": "exec"},
+            {
+                "type": "tool_result",
+                "tool_use_id": "active-call",
+                "result": "still running",
+                "execution_status": {"status": "running"},
+            },
+        ],
+        "token_count": 20,
+    }
+    entries = [
+        *_make_entries(18, tokens_each=300),
+        {"role": "user", "content": "run the current command", "token_count": 20},
+        active_round,
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="current-live-state",
+            entries=entries,
+            context_window_tokens=1_500,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert result.removed_count > 0
+    assert result.kept_entries[-2:] == entries[-2:]
+
+
+@pytest.mark.asyncio
+async def test_latest_unmatched_tool_call_remains_raw() -> None:
+    unmatched_call = {
+        "role": "assistant",
+        "content": "starting current command",
+        "tool_calls": [
+            {"type": "tool_use", "tool_use_id": "current-unmatched", "name": "exec"},
+        ],
+        "token_count": 20,
+    }
+    entries = [
+        *_make_entries(18, tokens_each=300),
+        {"role": "user", "content": "run current command", "token_count": 20},
+        unmatched_call,
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="latest-unmatched-call",
+            entries=entries,
+            context_window_tokens=1_500,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert result.removed_count > 0
+    assert result.kept_entries[-2:] == entries[-2:]
+
+
+@pytest.mark.asyncio
+async def test_latest_legacy_untyped_tool_call_remains_raw() -> None:
+    legacy_unmatched_call = {
+        "role": "assistant",
+        "content": "starting legacy current command",
+        "tool_calls": [
+            {
+                "id": "legacy-current-unmatched",
+                "name": "exec_command",
+                "arguments": {"command": "pytest -q"},
+            },
+        ],
+        "token_count": 20,
+    }
+    entries = [
+        *_make_entries(18, tokens_each=300),
+        {"role": "user", "content": "run legacy current command", "token_count": 20},
+        legacy_unmatched_call,
+    ]
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="latest-legacy-untyped-call",
+            entries=entries,
+            context_window_tokens=1_500,
+            config=CompactionConfig(safety_margin=1.0),
+        )
+    )
+
+    assert result.removed_count > 0
+    assert result.kept_entries[-2:] == entries[-2:]
 
 
 @pytest.mark.asyncio

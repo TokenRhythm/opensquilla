@@ -22,6 +22,74 @@ from typing import cast
 from .types import AgentEvent, RunHeartbeatEvent, ToolUseStartEvent
 
 _STREAM_DONE = object()
+_PULL_NEXT = object()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _StreamFailure:
+    error: BaseException
+
+
+# How long a wrapper waits for a cancelled upstream task to actually finish
+# before giving up on it. An upstream whose cleanup blocks — a ``finally`` that
+# awaits a dead socket, a retry loop that swallows ``CancelledError`` — would
+# otherwise hold the timeout open forever, which is the exact stall the timeout
+# exists to end.
+_CANCEL_GRACE_SECONDS = 5.0
+
+# Abandoned tasks are parked here so the event loop keeps a strong reference and
+# cannot destroy them while they are still pending.
+_ORPHANED_TASKS: set[asyncio.Task[object]] = set()
+
+
+def _forget_orphan(task: asyncio.Task[object]) -> None:
+    _ORPHANED_TASKS.discard(task)
+    # Retrieve whatever it ended with so asyncio does not log it as never retrieved.
+    with contextlib.suppress(BaseException):
+        task.exception()
+
+
+def _park_orphan(task: asyncio.Task[object]) -> None:
+    if task in _ORPHANED_TASKS:
+        return
+    _ORPHANED_TASKS.add(task)
+    task.add_done_callback(_forget_orphan)
+
+
+async def _settle_or_abandon(
+    task: asyncio.Task[object],
+    stop_requested: asyncio.Event,
+) -> None:
+    """Cancel *task* and wait a bounded time for it to finish; else detach it.
+
+    ``asyncio.wait_for`` awaits the cancellation it requests, so an upstream
+    that never finishes cancelling makes the timeout itself unbounded. Waiting
+    only ``_CANCEL_GRACE_SECONDS`` and then walking away keeps the caller's
+    deadline real. The task is left running rather than awaited: it is already
+    unresponsive, and the turn it belonged to is failing regardless.
+    """
+    # If the upstream ignores cancellation and later yields, its driver must
+    # exit instead of parking forever for another pull from a consumer that has
+    # already left.
+    stop_requested.set()
+    task.cancel()
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
+    except asyncio.CancelledError:
+        # A second caller cancellation must still propagate, but it must not
+        # drop the only strong reference to an upstream that remains pending.
+        if task.done():
+            with contextlib.suppress(BaseException):
+                task.exception()
+        else:
+            _park_orphan(task)
+        raise
+    if done:
+        with contextlib.suppress(BaseException):
+            task.exception()
+        return
+    _park_orphan(task)
+
 
 # ---------------------------------------------------------------------------
 # JSON repair helpers
@@ -100,17 +168,84 @@ async def idle_timeout_stream(
     stream: AsyncIterator[AgentEvent],
     timeout: float = 30.0,
 ) -> AsyncIterator[AgentEvent]:
-    """Raise ``TimeoutError`` if no event arrives within *timeout* seconds."""
-    # Obtain the underlying __anext__ coroutine so we can wrap it with asyncio.wait_for
-    aiter = stream.__aiter__()
-    while True:
-        try:
-            event = await asyncio.wait_for(aiter.__anext__(), timeout=timeout)
-        except StopAsyncIteration:
-            return
-        except TimeoutError as exc:
-            raise TimeoutError(f"Stream idle for more than {timeout}s") from exc
-        yield event
+    """Raise ``TimeoutError`` if no event arrives within *timeout* seconds.
+
+    The upstream is advanced by a driver task and the deadline is applied to a
+    queue read, which is always safe to cancel. Awaiting ``__anext__`` directly
+    under ``asyncio.wait_for`` was not: on timeout it cancelled the upstream and
+    then *awaited that cancellation*, so an upstream whose cleanup blocked kept
+    the timeout pending forever and the turn hung with no event, no error and no
+    log line.
+
+    One driver for the whole stream — the shape ``heartbeat_stream`` already
+    uses — rather than a task per event. A task per event would hand the
+    upstream a fresh context copy and a fresh task identity every time, and the
+    turn depends on both being stable: ``TurnRunner.run`` sets the session-lock
+    owner before its first event and resets that token in a ``finally``, and
+    ``notify_compaction`` registers ``asyncio.current_task()`` as the owner
+    whose exit finalizes an in-flight compaction. The driver still waits to be
+    asked, so the upstream advances one event per consumed event exactly as it
+    did when this wrapper awaited ``__anext__`` inline.
+    """
+    requests: asyncio.Queue[object] = asyncio.Queue()
+    results: asyncio.Queue[AgentEvent | _StreamFailure | object] = asyncio.Queue()
+    stop_requested = asyncio.Event()
+    driver = asyncio.create_task(
+        _pull_on_demand(stream.__aiter__(), requests, results, stop_requested)
+    )
+    try:
+        while True:
+            requests.put_nowait(_PULL_NEXT)
+            try:
+                item = await asyncio.wait_for(results.get(), timeout=timeout)
+            except TimeoutError as exc:
+                raise TimeoutError(f"Stream idle for more than {timeout}s") from exc
+            if item is _STREAM_DONE:
+                return
+            if isinstance(item, _StreamFailure):
+                raise item.error
+            yield cast(AgentEvent, item)
+    finally:
+        # Bounded: a wedged upstream must not hold the deadline it just missed.
+        await _settle_or_abandon(cast("asyncio.Task[object]", driver), stop_requested)
+
+
+async def _pull_on_demand(
+    aiter: AsyncIterator[AgentEvent],
+    requests: asyncio.Queue[object],
+    results: asyncio.Queue[AgentEvent | _StreamFailure | object],
+    stop_requested: asyncio.Event,
+) -> None:
+    """Advance *aiter* once per request so the wrapper keeps pull semantics."""
+    try:
+        while not stop_requested.is_set():
+            await requests.get()
+            if stop_requested.is_set():
+                return
+            try:
+                event = await aiter.__anext__()
+            except StopAsyncIteration:
+                results.put_nowait(_STREAM_DONE)
+                return
+            except asyncio.CancelledError as exc:
+                if not stop_requested.is_set():
+                    results.put_nowait(_StreamFailure(exc))
+                raise
+            except Exception as exc:
+                if not stop_requested.is_set():
+                    results.put_nowait(_StreamFailure(exc))
+                return
+            if stop_requested.is_set():
+                return
+            results.put_nowait(event)
+    finally:
+        # The consumer cannot close an iterator it never touches, and cancelling
+        # this task while it waits to be asked would otherwise leave the
+        # upstream's ``finally`` blocks to garbage collection.
+        close = getattr(aiter, "aclose", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                await close()
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +271,11 @@ async def heartbeat_stream(
             yield event
         return
 
-    queue: asyncio.Queue[AgentEvent | Exception | object] = asyncio.Queue()
+    queue: asyncio.Queue[AgentEvent | _StreamFailure | object] = asyncio.Queue()
     started = time.monotonic()
     last_event_at = started
-    driver = asyncio.create_task(_drain_stream(stream.__aiter__(), queue))
+    stop_requested = asyncio.Event()
+    driver = asyncio.create_task(_drain_stream(stream.__aiter__(), queue, stop_requested))
 
     try:
         while True:
@@ -157,30 +293,48 @@ async def heartbeat_stream(
 
             if item is _STREAM_DONE:
                 return
-            if isinstance(item, Exception):
-                raise item
+            if isinstance(item, _StreamFailure):
+                raise item.error
 
             event = cast(AgentEvent, item)
             last_event_at = time.monotonic()
             yield event
     finally:
-        if not driver.done():
-            driver.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await driver
+        # Bounded for the same reason as the idle timeout: awaiting the driver's
+        # cancellation outright let a wedged upstream hang this wrapper's
+        # cleanup, and so the caller closing the stream after a failure.
+        await _settle_or_abandon(cast("asyncio.Task[object]", driver), stop_requested)
 
 
 async def _drain_stream(
     aiter: AsyncIterator[AgentEvent],
-    queue: asyncio.Queue[AgentEvent | Exception | object],
+    queue: asyncio.Queue[AgentEvent | _StreamFailure | object],
+    stop_requested: asyncio.Event,
 ) -> None:
     try:
         async for event in aiter:
-            await queue.put(event)
+            if stop_requested.is_set():
+                return
+            queue.put_nowait(event)
+    except asyncio.CancelledError as exc:
+        if not stop_requested.is_set():
+            queue.put_nowait(_StreamFailure(exc))
+        raise
     except Exception as exc:
-        await queue.put(exc)
+        if not stop_requested.is_set():
+            queue.put_nowait(_StreamFailure(exc))
     finally:
-        await queue.put(_STREAM_DONE)
+        try:
+            # Natural exhaustion and ordinary failures retain their previous
+            # iterator lifecycle. Only our early stop needs an explicit close.
+            if stop_requested.is_set():
+                close = getattr(aiter, "aclose", None)
+                if close is not None:
+                    with contextlib.suppress(Exception):
+                        await close()
+        finally:
+            queue.put_nowait(_STREAM_DONE)
+
 
 # ---------------------------------------------------------------------------
 # Wrapper 4: Tool-name trim

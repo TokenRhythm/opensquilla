@@ -731,10 +731,18 @@ async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
         "key": session_key,
         "source": raw_params.get("source") or "webui_abort",
     }
+    task_id_present = "taskId" in raw_params or "task_id" in raw_params
     task_id = raw_params.get("taskId") or raw_params.get("task_id")
-    source = str(abort_params["source"])
-    if source != "webui_stop" and isinstance(task_id, str) and task_id.strip():
+    if isinstance(task_id, str) and task_id.strip():
         abort_params["task_id"] = task_id.strip()
+        # chat.abort task ids are always session-bound, even for clients that
+        # predate the explicit scope marker.
+        abort_params["scope"] = "task"
+    elif (
+        task_id_present
+        or str(raw_params.get("scope") or "").strip().lower() == "task"
+    ):
+        abort_params["scope"] = "task"
     result = await _handle_sessions_abort(
         abort_params,
         ctx,

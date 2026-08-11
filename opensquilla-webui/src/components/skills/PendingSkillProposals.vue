@@ -23,8 +23,8 @@
         </div>
         <div class="sk-proposal-row__actions">
           <button class="btn btn--ghost btn--sm" type="button" @click="emit('show', p.proposal_id)">{{ t('cronSkills.proposals.show') }}</button>
-          <button class="btn btn--primary btn--sm" type="button" @click="emit('accept', p.proposal_id)">{{ t('cronSkills.proposals.accept') }}</button>
-          <button class="btn btn--ghost btn--sm" type="button" @click="emit('reject', p.proposal_id)">{{ t('cronSkills.proposals.reject') }}</button>
+          <button class="btn btn--primary btn--sm" type="button" :disabled="mutationDisabled" @click="emit('accept', p.proposal_id)">{{ t('cronSkills.proposals.accept') }}</button>
+          <button class="btn btn--ghost btn--sm" type="button" :disabled="mutationDisabled" @click="emit('reject', p.proposal_id)">{{ t('cronSkills.proposals.reject') }}</button>
         </div>
       </div>
     </div>
@@ -40,6 +40,7 @@ const { t } = useI18n()
 
 defineProps<{
   proposals: Proposal[]
+  mutationDisabled?: boolean
 }>()
 
 const emit = defineEmits<{

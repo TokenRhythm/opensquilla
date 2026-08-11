@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 
 from opensquilla.cli.chat.session_state import ChatSessionState
 from opensquilla.cli.chat.turn import TurnResult
+from opensquilla.cli.gateway_client import GatewayRPCError
 from opensquilla.cli.tui.adapters import slash_bridge as _slash_bridge
 from opensquilla.cli.tui.adapters import slash_gateway as _slash_gateway
 from opensquilla.cli.tui.adapters import slash_standalone as _slash_standalone
@@ -1341,6 +1343,664 @@ async def test_gateway_model_strategy_missing_control_rpc_is_explicit_read_only(
     assert handled is True
     assert "read-only" in recorder.text()
     assert ("set_model_routing", "router") not in client.calls
+
+
+# --------------------------------------------------------------------------- #
+# /goal: thin goals.* RPC controls                                          #
+# --------------------------------------------------------------------------- #
+
+_GOAL_KEY = "agent:main:test:0"
+
+
+def _goal_snapshot(
+    *,
+    status: str = "active",
+    revision: int = 3,
+    objective: str = "ship it",
+    deferred_reason: str | None = None,
+    execution_state: str = "idle",
+    active_task_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "goalId": "goal-1",
+        "sessionKey": _GOAL_KEY,
+        "sessionId": "session-1",
+        "epoch": 2,
+        "objective": objective,
+        "status": status,
+        "stateRevision": revision,
+        "objectiveRevision": 1,
+        "executionState": execution_state,
+        "activeTaskId": active_task_id,
+        "continuationDeferredReason": deferred_reason,
+        "turnsStarted": 3,
+        "turnsSettled": 1,
+    }
+
+
+class _GoalFakeClient:
+    """Minimal gateway double for the thin goals.* RPC controls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.responses: dict[str, list[Any]] = {}
+        self.errors: dict[str, Exception] = {}
+
+    async def call(self, method: str, params: dict | None = None) -> Any:
+        self.calls.append((method, params))
+        if method in self.errors:
+            raise self.errors[method]
+        responses = self.responses.get(method)
+        if responses:
+            return responses.pop(0)
+        if method == "goals.status":
+            return {"goal": None}
+        return {"accepted": True}
+
+    def goal_calls(self) -> list[tuple[str, dict[str, Any] | None]]:
+        return [call for call in self.calls if call[0].startswith("goals.")]
+
+
+def _assert_uuid4(value: object) -> None:
+    assert isinstance(value, str)
+    parsed = uuid.UUID(value)
+    assert parsed.version == 4
+    assert str(parsed) == value
+
+
+async def test_goal_bare_without_active_goal_renders_help(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+
+    handled = await handle_gateway_slash_command("/goal", _gateway_context(client))
+
+    assert handled is True
+    assert client.calls == [("goals.status", {"sessionKey": _GOAL_KEY})]
+    assert "No active goal" in recorder.text()
+    assert "Usage: /goal" in recorder.text()
+
+
+async def test_goal_explicit_status_without_active_goal_does_not_render_help(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+
+    handled = await handle_gateway_slash_command(
+        "/goal status",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert "No active goal" in recorder.text()
+    assert "Usage: /goal" not in recorder.text()
+
+
+async def test_goal_status_renders_canonical_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [{"goal": _goal_snapshot()}]
+
+    handled = await handle_gateway_slash_command("/goal", _gateway_context(client))
+
+    assert handled is True
+    text = recorder.text()
+    assert "ship it" in text
+    assert "active" in text
+    assert "idle" in text
+    assert "1/3 settled" in text
+    assert "Usage: /goal" not in text
+
+
+async def test_goal_status_renders_continuation_defer_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [
+        {"goal": _goal_snapshot(deferred_reason="plan_mode")}
+    ]
+
+    handled = await handle_gateway_slash_command("/goal", _gateway_context(client))
+
+    assert handled is True
+    assert "waiting" in recorder.text()
+    assert "plan_mode" in recorder.text()
+
+
+async def test_goal_capabilities_is_a_thin_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.responses["goals.capabilities"] = [
+        {
+            "capabilities": {
+                "executionEnabled": True,
+                "maxObjectiveChars": 4000,
+            }
+        }
+    ]
+
+    handled = await handle_gateway_slash_command(
+        "/goal capabilities",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert client.calls == [("goals.capabilities", {"sessionKey": _GOAL_KEY})]
+    assert "enabled" in recorder.text()
+    assert "4000" in recorder.text()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/goal ship it",
+        "/goal set ship it",
+    ],
+)
+async def test_goal_set_uses_uuid4_identities_and_never_starts_a_watch(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.responses["goals.set"] = [{"goal": _goal_snapshot()}]
+
+    handled = await handle_gateway_slash_command(command, _gateway_context(client))
+
+    assert handled is True
+    assert len(client.calls) == 1
+    method, params = client.calls[0]
+    assert method == "goals.set"
+    assert params is not None
+    assert params["sessionKey"] == _GOAL_KEY
+    assert params["objective"] == "ship it"
+    assert params["sourceKind"] == "cli"
+    _assert_uuid4(params["clientRequestId"])
+    _assert_uuid4(params["clientMessageId"])
+    assert not any(method in {"goals.observe", "goals.unobserve"} for method, _ in client.calls)
+    assert "goal[/] [green]set" in recorder.text()
+
+
+async def test_goal_edit_reads_fence_then_sends_cas_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    before = _goal_snapshot(revision=7)
+    after = _goal_snapshot(revision=8, objective="ship it safely")
+    client.responses["goals.status"] = [{"goal": before}]
+    client.responses["goals.edit"] = [{"goal": after}]
+
+    handled = await handle_gateway_slash_command(
+        "/goal edit ship it safely",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert [method for method, _ in client.calls] == ["goals.status", "goals.edit"]
+    params = client.calls[1][1]
+    assert params is not None
+    assert params["expectedGoalId"] == "goal-1"
+    assert params["expectedStateRevision"] == 7
+    assert params["objective"] == "ship it safely"
+    _assert_uuid4(params["clientRequestId"])
+    assert "edited" in recorder.text()
+    assert "ship it safely" in recorder.text()
+    assert "next safe model boundary" in recorder.text()
+
+
+async def test_goal_edit_completed_goal_reports_reactivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    before = _goal_snapshot(status="complete", revision=7)
+    after = _goal_snapshot(status="active", revision=8, objective="verify it again")
+    client.responses["goals.status"] = [{"goal": before}]
+    client.responses["goals.edit"] = [{"goal": after}]
+
+    handled = await handle_gateway_slash_command(
+        "/goal edit verify it again",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert "edited and reactivated" in recorder.text()
+    assert "verify it again" in recorder.text()
+
+
+@pytest.mark.parametrize(
+    ("command", "method", "status", "label"),
+    [
+        ("/goal pause", "goals.pause", "paused", "paused"),
+        ("/goal resume", "goals.resume", "active", "enabled"),
+    ],
+)
+async def test_goal_mutations_read_fence_and_use_uuid4_request(
+    command: str,
+    method: str,
+    status: str,
+    label: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    before = _goal_snapshot(
+        status="paused" if method == "goals.resume" else "active",
+        revision=11,
+    )
+    response_goal = None if method == "goals.clear" else _goal_snapshot(
+        status=status,
+        revision=12,
+    )
+    client.responses["goals.status"] = [{"goal": before}]
+    client.responses[method] = [{"goal": response_goal, "previousGoalId": "goal-1"}]
+
+    handled = await handle_gateway_slash_command(command, _gateway_context(client))
+
+    assert handled is True
+    assert [name for name, _ in client.calls] == ["goals.status", method]
+    params = client.calls[1][1]
+    assert params is not None
+    assert params["expectedGoalId"] == "goal-1"
+    assert params["expectedStateRevision"] == 11
+    _assert_uuid4(params["clientRequestId"])
+    if method == "goals.resume":
+        assert params["sourceKind"] == "cli"
+    else:
+        assert "sourceKind" not in params
+    assert label in recorder.text()
+    assert not any(name in {"goals.observe", "goals.unobserve"} for name, _ in client.calls)
+
+
+async def test_goal_pause_running_task_explains_execution_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    before = _goal_snapshot(
+        status="active",
+        revision=11,
+        execution_state="working",
+        active_task_id="task-1",
+    )
+    after = _goal_snapshot(
+        status="paused",
+        revision=12,
+        execution_state="working",
+        active_task_id="task-1",
+    )
+    client.responses["goals.status"] = [{"goal": before}]
+    client.responses["goals.pause"] = [{"goal": after}]
+
+    handled = await handle_gateway_slash_command("/goal pause", _gateway_context(client))
+
+    assert handled is True
+    text = recorder.text()
+    assert "automatic continuation paused" in text
+    assert "current task continues" in text
+
+
+async def test_goal_resume_with_owner_explains_no_duplicate_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    before = _goal_snapshot(
+        status="paused",
+        revision=11,
+        execution_state="working",
+        active_task_id="task-1",
+    )
+    after = _goal_snapshot(
+        status="active",
+        revision=12,
+        execution_state="working",
+        active_task_id="task-1",
+    )
+    client.responses["goals.status"] = [{"goal": before}]
+    client.responses["goals.resume"] = [{"goal": after}]
+
+    handled = await handle_gateway_slash_command("/goal resume", _gateway_context(client))
+
+    assert handled is True
+    text = recorder.text()
+    assert "automatic continuation enabled" in text
+    assert "current Goal task remains the owner" in text
+
+
+async def test_goal_clear_requires_explicit_confirmation_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [{"goal": _goal_snapshot()}]
+
+    handled = await handle_gateway_slash_command("/goal clear", _gateway_context(client))
+
+    assert handled is True
+    assert client.calls == [("goals.status", {"sessionKey": _GOAL_KEY})]
+    text = recorder.text()
+    assert "removal requires confirmation" in text
+    assert "stop tracking this Goal" in text
+    assert "current task, conversation, and artifacts will remain" in text
+    assert "/goal clear --confirm" in text
+    assert "tracking removed" not in text
+
+
+async def test_goal_clear_confirmed_uses_fence_and_explains_retained_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [{"goal": _goal_snapshot(revision=11)}]
+    client.responses["goals.clear"] = [{"goal": None, "previousGoalId": "goal-1"}]
+
+    handled = await handle_gateway_slash_command(
+        "/goal clear --confirm",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert [name for name, _ in client.calls] == ["goals.status", "goals.clear"]
+    params = client.calls[1][1]
+    assert params is not None
+    assert params["expectedGoalId"] == "goal-1"
+    assert params["expectedStateRevision"] == 11
+    _assert_uuid4(params["clientRequestId"])
+    text = recorder.text()
+    assert "tracking removed" in text
+    assert "Current tasks, transcript entries, and artifacts remain" in text
+
+
+async def test_goal_clear_confirmed_without_goal_stops_after_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+
+    handled = await handle_gateway_slash_command(
+        "/goal clear --confirm",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert client.calls == [("goals.status", {"sessionKey": _GOAL_KEY})]
+    assert "No active goal to clear" in recorder.text()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/goal clear yes",
+        "/goal clear --yes",
+        "/goal clear confirm",
+        "/goal clear --confirm extra",
+    ],
+)
+async def test_goal_clear_invalid_confirmation_arguments_fail_closed(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+
+    handled = await handle_gateway_slash_command(command, _gateway_context(client))
+
+    assert handled is True
+    assert client.calls == []
+    assert "Usage: /goal" in recorder.text()
+
+
+@pytest.mark.parametrize("command", ["/goal clear", "/goal clear --confirm"])
+def test_goal_clear_confirmation_forms_remain_immediate_controls(command: str) -> None:
+    assert classify(command) is SlashCategory.CONTROL
+
+
+async def test_goal_resume_explicitly_reattaches_detached_active_goal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    before = _goal_snapshot(
+        status="active",
+        revision=11,
+        deferred_reason="owner_disconnected",
+    )
+    client.responses["goals.status"] = [{"goal": before}]
+    client.responses["goals.reattach"] = [
+        {"accepted": True, "goal": _goal_snapshot(status="active", revision=11)}
+    ]
+
+    handled = await handle_gateway_slash_command(
+        "/goal resume",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert client.calls == [
+        ("goals.status", {"sessionKey": _GOAL_KEY}),
+        (
+            "goals.reattach",
+            {
+                "sessionKey": _GOAL_KEY,
+                "sessionId": "session-1",
+                "epoch": 2,
+                "expectedGoalId": "goal-1",
+                "takeover": True,
+                "sourceKind": "cli",
+            },
+        ),
+    ]
+    assert "automatic continuation enabled" in recorder.text()
+
+
+@pytest.mark.parametrize(
+    ("invalid_field", "invalid_value"),
+    [("sessionId", ""), ("epoch", True)],
+)
+async def test_goal_resume_detached_identity_fails_closed_before_reattach(
+    invalid_field: str,
+    invalid_value: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    before = _goal_snapshot(
+        status="active",
+        deferred_reason="owner_disconnected",
+    )
+    before[invalid_field] = invalid_value
+    client.responses["goals.status"] = [{"goal": before}]
+
+    handled = await handle_gateway_slash_command(
+        "/goal resume",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert client.calls == [("goals.status", {"sessionKey": _GOAL_KEY})]
+    assert "Goal resume failed" in recorder.text()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/goal edit new objective",
+        "/goal pause",
+        "/goal resume",
+        "/goal clear",
+        "/goal clear --confirm",
+    ],
+)
+async def test_goal_mutation_without_goal_stops_after_status(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+
+    handled = await handle_gateway_slash_command(command, _gateway_context(client))
+
+    assert handled is True
+    assert client.calls == [("goals.status", {"sessionKey": _GOAL_KEY})]
+    assert "No active goal" in recorder.text()
+
+
+@pytest.mark.parametrize("command", ["/goal help", "/goal edit", "/goal set"])
+async def test_goal_help_and_missing_objectives_are_local(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+
+    handled = await handle_gateway_slash_command(command, _gateway_context(client))
+
+    assert handled is True
+    assert client.calls == []
+    assert "Usage: /goal" in recorder.text()
+
+
+@pytest.mark.parametrize(
+    ("command", "method", "title"),
+    [
+        ("/goal status", "goals.status", "Goal status failed"),
+        ("/goal capabilities", "goals.capabilities", "Goal capabilities failed"),
+        ("/goal ship it", "goals.set", "Goal set failed"),
+    ],
+)
+async def test_goal_direct_rpc_errors_render_panel(
+    command: str,
+    method: str,
+    title: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.errors[method] = GatewayRPCError(method, message="boom")
+
+    handled = await handle_gateway_slash_command(command, _gateway_context(client))
+
+    assert handled is True
+    assert title in recorder.text()
+    assert "boom" in recorder.text()
+
+
+async def test_goal_busy_error_uses_stable_operator_wording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.responses["goals.status"] = [{"goal": _goal_snapshot(status="paused")}]
+    client.errors["goals.resume"] = GatewayRPCError(
+        "goals.resume",
+        code="GOAL_BUSY",
+        message="The Goal still owns an unsettled task",
+    )
+
+    handled = await handle_gateway_slash_command("/goal resume", _gateway_context(client))
+
+    assert handled is True
+    text = recorder.text()
+    assert "Goal resume failed" in text
+    assert "cannot apply that Goal action" in text
+    assert "still owns an unsettled task" not in text
+
+
+@pytest.mark.parametrize(
+    ("command", "method", "code", "expected", "hidden"),
+    [
+        (
+            "/goal ship it",
+            "goals.set",
+            "GOAL_ACTIVE",
+            "already has an unfinished Goal",
+            "raw active-goal backend prose",
+        ),
+        (
+            "/goal status",
+            "goals.status",
+            "SESSION_GENERATION_CHANGED",
+            "session generation changed",
+            "raw generation backend prose",
+        ),
+        (
+            "/goal set ship it",
+            "goals.set",
+            "INVALID_GOAL_OBJECTIVE",
+            "valid, non-empty Goal objective",
+            "raw invalid-objective backend prose",
+        ),
+    ],
+)
+async def test_goal_stable_rpc_codes_never_leak_backend_prose(
+    command: str,
+    method: str,
+    code: str,
+    expected: str,
+    hidden: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    client.errors[method] = GatewayRPCError(method, code=code, message=hidden)
+
+    handled = await handle_gateway_slash_command(command, _gateway_context(client))
+
+    assert handled is True
+    text = recorder.text()
+    assert expected in text
+    assert hidden not in text
+
+
+async def test_goal_malformed_fence_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _GoalFakeClient()
+    malformed = _goal_snapshot()
+    malformed["stateRevision"] = True
+    client.responses["goals.status"] = [{"goal": malformed}]
+
+    handled = await handle_gateway_slash_command(
+        "/goal pause",
+        _gateway_context(client),
+    )
+
+    assert handled is True
+    assert [method for method, _ in client.calls] == ["goals.status"]
+    assert "Goal pause failed" in recorder.text()
+    assert "valid mutation fence" in recorder.text()
+
+
+def test_goal_reason_text_filters_non_string_values() -> None:
+    text = _slash_gateway._goal_reason_text
+
+    assert text("all done") == "all done"
+    assert text("") is None
+    assert text(None) is None
+    assert text(0) is None
+    assert text(3.5) is None
+
+
+def test_goal_specific_turn_watch_helpers_are_removed() -> None:
+    for name in (
+        "_GoalTurnClient",
+        "_goal_plan_run",
+        "_goal_plan_run_terminal",
+        "_goal_status_after_turn",
+        "_goal_watch_cleanup",
+        "_run_goal_watch",
+    ):
+        assert not hasattr(_slash_gateway, name)
 
 
 async def test_gateway_model_strategy_failed_write_reprojects_canonical_state(

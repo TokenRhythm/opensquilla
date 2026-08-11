@@ -35,6 +35,10 @@ SESSION_KEY = "agent:main:webchat:abc123"
 CRON_SESSION_KEY = "cron:drink:run:def456"
 
 
+async def _record_async(target: list, value) -> None:
+    target.append(value)
+
+
 class _FakeScheduler:
     def __init__(self, job: CronJob | None = None) -> None:
         self.added = None
@@ -87,8 +91,10 @@ class _FakeSessionManager:
         self.created.append(kwargs)
         return kwargs
 
-    async def append_message(self, session_key, role, content):
+    async def append_message(self, session_key, role, content, provenance=None):
         row = {"role": role, "content": content}
+        if provenance is not None:
+            row["provenance"] = provenance
         self.rows.setdefault(session_key, []).append(row)
         return SimpleNamespace(role=role, content=content)
 
@@ -627,6 +633,7 @@ def test_delivery_sanitizes_reply_directives_across_cron_outputs() -> None:
     assert report.session_status == "skipped"
     assert cm.adapter.sent[0].content == "Here is the scheduled reply"
     assert ws_events[0][2]["summary"] == "Here is the scheduled reply"
+    assert ws_events[0][2]["payloadKind"] == AGENT_TURN_KIND
     assert ws_events[0][2]["runId"] == "run-1"
     assert forward_calls == []
 
@@ -819,6 +826,8 @@ async def test_current_webchat_agent_run_treats_same_session_transcript_as_deliv
 @pytest.mark.asyncio
 async def test_static_webchat_reminder_delivers_without_turn_runner() -> None:
     forward_calls = []
+    session_manager = _FakeSessionManager()
+    session_events = []
 
     async def forwarder(**kwargs) -> None:
         forward_calls.append(kwargs)
@@ -845,7 +854,9 @@ async def test_static_webchat_reminder_delivers_without_turn_runner() -> None:
         DeliveryChain(
             channel_manager_ref=lambda: _FakeChannelManager(),
             session_forwarder=forwarder,
-        )
+        ),
+        session_manager_ref=lambda: session_manager,
+        session_event_emitter=lambda *args: _record_async(session_events, args),
     )
 
     result = await handler(job)
@@ -853,6 +864,35 @@ async def test_static_webchat_reminder_delivers_without_turn_runner() -> None:
     assert result.summary == "drink water"
     assert result.delivery_status == "delivered|ws:skipped|fwd:skipped"
     assert result.session_key.startswith("cron:drink:run:")
+    assert session_manager.created == [
+        {
+            "session_key": result.session_key,
+            "agent_id": "main",
+            "display_name": "Cron: Drink",
+        }
+    ]
+    assert await session_manager.read_transcript(result.session_key) == [
+        {
+            "role": "assistant",
+            "content": "drink water",
+            "provenance": {
+                "kind": "cron",
+                "source_tool": "cron:drink",
+            },
+        }
+    ]
+    assert session_events == [
+        (
+            result.session_key,
+            "sessions.changed",
+            {
+                "key": result.session_key,
+                "reason": "cron_static_message",
+                "taskId": result.session_key,
+                "status": "succeeded",
+            },
+        )
+    ]
     assert forward_calls == [
         {
             "origin_session_key": SESSION_KEY,
@@ -868,6 +908,8 @@ async def test_static_webchat_reminder_delivers_without_turn_runner() -> None:
 
 @pytest.mark.asyncio
 async def test_static_reminder_delivery_failure_fails_job_by_default() -> None:
+    session_manager = _FakeSessionManager()
+    session_events = []
     job = CronJob(
         id="drink",
         name="Drink",
@@ -881,15 +923,43 @@ async def test_static_reminder_delivery_failure_fails_job_by_default() -> None:
         ),
     )
     handler = make_static_message_handler(
-        DeliveryChain(channel_manager_ref=lambda: _FakeChannelManager())
+        DeliveryChain(channel_manager_ref=_FakeChannelManager),
+        session_manager_ref=lambda: session_manager,
+        session_event_emitter=lambda *args: _record_async(session_events, args),
     )
 
     with pytest.raises(RuntimeError, match="delivery failed"):
         await handler(job)
 
+    session_key = session_manager.created[0]["session_key"]
+    assert await session_manager.read_transcript(session_key) == [
+        {
+            "role": "assistant",
+            "content": "drink water",
+            "provenance": {
+                "kind": "cron",
+                "source_tool": "cron:drink",
+            },
+        }
+    ]
+    assert session_events == [
+        (
+            session_key,
+            "sessions.changed",
+            {
+                "key": session_key,
+                "reason": "cron_static_message",
+                "taskId": session_key,
+                "status": "failed",
+            },
+        )
+    ]
+
 
 @pytest.mark.asyncio
 async def test_static_reminder_best_effort_delivery_failure_does_not_fail_job() -> None:
+    session_manager = _FakeSessionManager()
+    session_events = []
     job = CronJob(
         id="drink",
         name="Drink",
@@ -904,12 +974,97 @@ async def test_static_reminder_best_effort_delivery_failure_does_not_fail_job() 
         ),
     )
     handler = make_static_message_handler(
-        DeliveryChain(channel_manager_ref=lambda: _FakeChannelManager())
+        DeliveryChain(channel_manager_ref=_FakeChannelManager),
+        session_manager_ref=lambda: session_manager,
+        session_event_emitter=lambda *args: _record_async(session_events, args),
     )
 
     result = await handler(job)
 
     assert result.delivery_status == "delivery_failed|ws:skipped|fwd:skipped"
+    assert session_events == [
+        (
+            result.session_key,
+            "sessions.changed",
+            {
+                "key": result.session_key,
+                "reason": "cron_static_message",
+                "taskId": result.session_key,
+                "status": "succeeded",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_static_reminder_unexpected_delivery_error_marks_session_failed() -> None:
+    session_manager = _FakeSessionManager()
+    session_events = []
+
+    class _ExplodingDeliveryChain:
+        async def notify_start(self, _job, _text) -> None:
+            return None
+
+        async def deliver(self, *_args, **_kwargs):
+            raise RuntimeError("delivery exploded")
+
+    job = CronJob(
+        id="drink",
+        name="Drink",
+        handler_key="static_message",
+        payload={"kind": REMINDER_KIND, "text": "drink water", "agent_id": "main"},
+        session_target=SessionTarget.ISOLATED,
+    )
+    handler = make_static_message_handler(
+        _ExplodingDeliveryChain(),
+        session_manager_ref=lambda: session_manager,
+        session_event_emitter=lambda *args: _record_async(session_events, args),
+    )
+
+    with pytest.raises(RuntimeError, match="delivery exploded"):
+        await handler(job)
+
+    session_key = session_manager.created[0]["session_key"]
+    assert session_events == [
+        (
+            session_key,
+            "sessions.changed",
+            {
+                "key": session_key,
+                "reason": "cron_static_message",
+                "taskId": session_key,
+                "status": "failed",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_static_reminder_session_event_failure_does_not_fail_job() -> None:
+    session_manager = _FakeSessionManager()
+    emitted_statuses = []
+
+    async def failing_emitter(_session_key, _event_name, payload) -> None:
+        emitted_statuses.append(payload["status"])
+        raise RuntimeError("subscriber unavailable")
+
+    job = CronJob(
+        id="drink",
+        name="Drink",
+        handler_key="static_message",
+        payload={"kind": REMINDER_KIND, "text": "drink water", "agent_id": "main"},
+        session_target=SessionTarget.ISOLATED,
+    )
+    handler = make_static_message_handler(
+        DeliveryChain(),
+        session_manager_ref=lambda: session_manager,
+        session_event_emitter=failing_emitter,
+    )
+
+    result = await handler(job)
+
+    assert result.summary == "drink water"
+    assert emitted_statuses == ["succeeded"]
 
 
 @pytest.mark.asyncio

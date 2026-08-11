@@ -432,6 +432,42 @@ rules. Network access is public by default through the managed boundary, with
 SSRF and local metadata protections; operators can deny domains, allow
 exceptions, or block all network access.
 
+## Goal Mode (`[goal]`)
+
+Session-level `/goal` mode drives the agent toward a fixed goal turn after turn
+until it completes, blocks, pauses, reaches a provider usage limit, or hits a
+guardrail. Automatic turns use the same TaskRuntime, TurnRunner, sandbox,
+approval, provider, and usage-accounting path as ordinary turns. All fields
+below are optional; absent keys keep the defaults.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `execution_enabled` | `true` | Emergency kill switch. When false, no new Goal execution is accepted and unfinished active Goals pause. |
+| `max_turns` | `50` | Per-resume-window turn limit (`1`-`500`). The current turn finishes first; an otherwise active Goal then pauses with `turn_limit`. |
+| `runtime_budget_seconds` | `3600` | Per-resume-window active running-time limit (`60`-`86400` seconds). Queue time, pauses, and Gateway downtime do not count. An otherwise active Goal pauses with `runtime_limit`. |
+
+```toml
+[goal]
+execution_enabled = true
+max_turns = 50
+runtime_budget_seconds = 3600
+```
+
+`/goal resume` resets the current guardrail window while retaining lifetime
+turn, active-time, and token totals. Goal mode does not replay a failed or timed
+out whole turn: tools may already have produced side effects. Provider/core
+request retries remain governed by their existing policies.
+
+An execution lease belongs to the subscribed Web UI or CLI connection that
+started or resumed the Goal. Losing that client connection detaches the lease:
+the Goal stays active, its current accepted turn may finish, and no new
+automatic continuation starts until an authorized client reattaches. A Web UI
+refresh reattaches with a tab-local continuity token; an explicit takeover is
+available when that token was lost. Disabling execution or restarting the
+Gateway still pauses unattended work. Read the complete workflow, state model,
+Plan-mode interaction, upgrade notes, and recovery guidance in
+[`goal-mode.md`](goal-mode.md).
+
 ## Raw Config Editing
 
 For advanced settings, inspect `opensquilla.toml.example` and edit the active

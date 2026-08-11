@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
 _RESOURCE_DIRS = ("references", "scripts", "assets", "templates")
@@ -10,8 +11,18 @@ _RESOURCE_DIRS = ("references", "scripts", "assets", "templates")
 class SkillResources:
     """Access skill resource directories: scripts/, references/, assets/."""
 
-    def __init__(self, skill_dir: Path) -> None:
+    def __init__(
+        self,
+        skill_dir: Path,
+        *,
+        managed_manifest_files: Iterable[str] | None = None,
+    ) -> None:
         self._dir = skill_dir
+        self._managed_manifest_files = (
+            None
+            if managed_manifest_files is None
+            else frozenset(managed_manifest_files)
+        )
 
     @property
     def scripts_dir(self) -> Path:
@@ -70,6 +81,29 @@ class SkillResources:
         if parts == ("SKILL.md",):
             return self._read_text_under(self._dir, relative)
 
+        if self._managed_manifest_files is not None:
+            if any(part.startswith(".") for part in parts):
+                return None
+            if relative.as_posix() in self._managed_manifest_files:
+                return self._read_text_under(
+                    self._dir,
+                    relative,
+                    reject_symlinks=True,
+                    reject_nul=True,
+                )
+            if len(parts) == 1:
+                for root_name in _RESOURCE_DIRS:
+                    candidate = Path(root_name) / relative
+                    if candidate.as_posix() not in self._managed_manifest_files:
+                        continue
+                    return self._read_text_under(
+                        self._dir,
+                        candidate,
+                        reject_symlinks=True,
+                        reject_nul=True,
+                    )
+            return None
+
         if parts and parts[0] in _RESOURCE_DIRS:
             root = self._dir / parts[0]
             return self._read_text_under(root, Path(*parts[1:]))
@@ -99,10 +133,19 @@ class SkillResources:
             relative = Path(*relative.parts[1:])
         return self._read_text_under(self.scripts_dir, relative)
 
-    def _read_text_under(self, root: Path, relative: Path) -> str | None:
+    def _read_text_under(
+        self,
+        root: Path,
+        relative: Path,
+        *,
+        reject_symlinks: bool = False,
+        reject_nul: bool = False,
+    ) -> str | None:
         if not relative.parts:
             return None
         path = root / relative
+        if reject_symlinks and _contains_symlink(path, root):
+            return None
         try:
             resolved_root = root.resolve()
             resolved_path = path.resolve()
@@ -112,9 +155,26 @@ class SkillResources:
         if not resolved_path.is_file():
             return None
         try:
-            return resolved_path.read_text(encoding="utf-8")
+            content = resolved_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return None
+        if reject_nul and "\x00" in content:
+            return None
+        return content
+
+
+def _contains_symlink(path: Path, root: Path) -> bool:
+    current = path
+    while current != root:
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+        if current.parent == current:
+            return True
+        current = current.parent
+    return False
 
 
 def _normalise_resource_path(name: str) -> Path | None:

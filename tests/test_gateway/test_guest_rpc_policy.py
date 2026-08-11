@@ -194,17 +194,21 @@ def test_guest_policy_normalizes_verified_chat_key_alias_for_handler() -> None:
     assert normalized == {"sessionKey": owned}
 
 
-def test_guest_abort_discards_untrusted_task_id() -> None:
+def test_guest_abort_preserves_task_scope_after_session_ownership_check() -> None:
     ctx = _ctx()
     owned = guest_owned_session_key(ctx.principal.guest_owner_id, "mine")
 
     normalized = GuestRpcPolicy.authorize(
         "chat.abort",
-        {"sessionKey": owned, "taskId": "victim-task"},
+        {"sessionKey": owned, "taskId": "owned-task", "scope": "task"},
         ctx,
     )
 
-    assert normalized == {"sessionKey": owned}
+    assert normalized == {
+        "sessionKey": owned,
+        "taskId": "owned-task",
+        "scope": "task",
+    }
 
 
 def test_guest_can_submit_clarification_only_for_owned_session() -> None:

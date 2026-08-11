@@ -72,15 +72,31 @@ def test_api_url_absorbs_any_version_suffix() -> None:
         assert provider._api_url("/v1/chat/completions") == expected, base
 
 
-def test_tokenrhythm_never_toggles_thinking_but_replays_v4_reasoning() -> None:
-    """TokenRhythm rejects unknown request fields (a DeepSeek ``thinking``
-    toggle is an UNKNOWN_FIELD 400), so the policy must never declare toggle
-    ids or a default reasoning format; the V4 ids keep only the
-    reasoning_content replay requirement."""
+def test_tokenrhythm_v4_reasoning_is_exact_and_endpoint_scoped() -> None:
     policy = compat_policy_for_kind("tokenrhythm")
     assert policy.thinking_toggle_model_ids == frozenset()
     assert policy.default_reasoning_format == ""
     assert policy.replay_reasoning_format == ""
+    assert len(policy.reasoning_model_rules) == 2
+    official, custom = policy.reasoning_model_rules
+    assert official.matches(
+        "deepseek-v4-flash", "https://tokenrhythm.studio/v1"
+    )
+    assert not official.matches(
+        "tokenrhythm/deepseek-v4-flash-0731",
+        "https://api.tokenrhythm.studio/v1",
+    )
+    assert not official.matches(
+        "untrusted/deepseek-v4-flash", "https://tokenrhythm.studio/v1"
+    )
+    assert not official.matches(
+        "deepseek-v4-flash", "https://tokenrhythm.studio.evil.example/v1"
+    )
+    assert official.replay_scope == "tool_call_assistant"
+    assert official.max_reasoning_content_utf16_units == 50_000
+    assert official.reasoning_format == "deepseek"
+    assert custom.matches("deepseek-v4-flash", "https://custom.example/v1")
+    assert custom.reasoning_format == ""
     assert policy.supports_native_json_schema_output is False
     # cost_cny is CNY — booking it as USD would corrupt cost rollups.
     assert policy.trust_billed_cost is False
@@ -94,10 +110,16 @@ def test_tokenrhythm_never_toggles_thinking_but_replays_v4_reasoning() -> None:
         }
     )
     assert _should_replay_reasoning_content(
-        policy=policy, model="deepseek-v4-flash", caps=None
+        policy=policy,
+        model="deepseek-v4-flash",
+        caps=None,
+        reasoning_rule=official,
     )
     assert _should_replay_reasoning_content(
-        policy=policy, model="deepseek-v4-flash-0731", caps=None
+        policy=policy,
+        model="deepseek-v4-flash-0731",
+        caps=None,
+        reasoning_rule=official,
     )
     assert not _should_replay_reasoning_content(
         policy=policy, model="glm-5", caps=None

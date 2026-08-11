@@ -313,6 +313,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       source: String(payload.source || 'automatic'),
       durability: String(payload.durability || ''),
       detail: String(payload.detail || payload.phase || ''),
+      reason: String(payload.reason || payload.skip_reason || ''),
     })
     scheduleRender()
   }

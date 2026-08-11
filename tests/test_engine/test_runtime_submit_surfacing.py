@@ -148,3 +148,47 @@ def test_build_tools_plan_run_hides_submit_when_review_enabled(
     assert {"plan_run_checkpoint", "publish_artifact"} <= names
     assert "submit" not in names
     assert "submit" in ctx.denied_tools
+
+
+def test_build_tools_exposes_goal_controls_under_scaffold_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
+    runner = _runner_with_scaffold_profile()
+    ctx = ToolContext(
+        is_owner=True,
+        workspace_dir=str(tmp_path),
+        goal_context={"goalId": "goal-1"},
+        goal_service=object(),
+    )
+
+    tool_defs, _handler = runner._build_tools(ctx)
+    names = {getattr(definition, "name", "") for definition in tool_defs}
+
+    goal_tools = {"update_goal", "update_goal_progress"}
+    assert goal_tools <= names
+    assert _SCAFFOLD_TOOLS <= names
+    assert ctx.surfaced_tools is not None
+    assert goal_tools <= ctx.surfaced_tools
+
+
+def test_build_tools_goal_control_explicit_deny_remains_authoritative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
+    runner = _runner_with_scaffold_profile()
+    ctx = ToolContext(
+        is_owner=True,
+        workspace_dir=str(tmp_path),
+        goal_context={"goalId": "goal-1"},
+        goal_service=object(),
+        denied_tools={"update_goal"},
+    )
+
+    tool_defs, _handler = runner._build_tools(ctx)
+    names = {getattr(definition, "name", "") for definition in tool_defs}
+
+    assert "update_goal" not in names
+    assert "update_goal_progress" in names

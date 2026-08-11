@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from opensquilla.context_budget import ContextBudgetGovernor
+from opensquilla.engine import ToolResult
 from opensquilla.engine.agent import Agent
 from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.pipeline import TurnContext
@@ -33,7 +34,12 @@ from opensquilla.provider import (
     ModelCapabilities,
     ProviderRequestCorrelation,
     TextDeltaEvent,
+    ToolDefinition,
+    ToolInputSchema,
+    ToolUseEndEvent,
+    ToolUseStartEvent,
 )
+from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.tools.types import CallerKind, ToolContext
 
 
@@ -616,6 +622,116 @@ class _ChainProvider:
         return []
 
 
+class _ProjectingScriptProvider:
+    """Script one physical leg while using its real wire projection."""
+
+    def __init__(
+        self,
+        *,
+        provider_name: str,
+        wire_provider: OpenAIProvider,
+        streams: list[list[Any]],
+    ) -> None:
+        self.provider_name = provider_name
+        self._wire_provider = wire_provider
+        self._streams = streams
+        self.calls: list[dict[str, Any]] = []
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: Any = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> Any:
+        return self._wire_provider.project_final_request(
+            messages,
+            tools,
+            config,
+            message_limit=message_limit,
+        )
+
+    def project_message_count(
+        self,
+        messages: list[Message],
+        config: ChatConfig | None = None,
+        *,
+        additional_messages: int = 0,
+    ) -> Any:
+        return self._wire_provider.project_message_count(
+            messages,
+            config,
+            additional_messages=additional_messages,
+        )
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: Any = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        canonical_before = [message.model_dump(mode="json") for message in messages]
+        projection = self.project_final_request(messages, tools, config)
+        canonical_after = [message.model_dump(mode="json") for message in messages]
+        call_index = len(self.calls)
+        self.calls.append(
+            {
+                "messages": messages,
+                "canonical_before": canonical_before,
+                "canonical_after": canonical_after,
+                "payload": projection.payload,
+            }
+        )
+        events = self._streams[call_index]
+        return self._stream(events)
+
+    async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
+        for event in events:
+            yield event
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+class _ProjectingFallbackSelector:
+    def __init__(
+        self,
+        primary: _ProjectingScriptProvider,
+        fallback: _ProjectingScriptProvider,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.current_config = SimpleNamespace(
+            provider="tokenrhythm",
+            model="deepseek-v4-flash",
+            base_url="https://tokenrhythm.studio/v1",
+        )
+        self._remaining_chain = [
+            self.current_config,
+            SimpleNamespace(
+                provider="deepseek",
+                model="deepseek-v4-flash",
+                base_url="https://api.deepseek.com",
+            ),
+        ]
+
+    @property
+    def active_provider_id(self) -> str:
+        return str(self.current_config.provider)
+
+    def remaining_chain(self) -> list[SimpleNamespace]:
+        return list(self._remaining_chain)
+
+    def next_fallback_after_failure(
+        self,
+        _exc: Exception,
+    ) -> _ProjectingScriptProvider:
+        self.current_config = self._remaining_chain[1]
+        self._remaining_chain = self._remaining_chain[1:]
+        return self.fallback
+
+
 class _ChainSelector:
     """Two-link chain selector: primary fails, one fallback hop remains."""
 
@@ -672,6 +788,123 @@ async def test_physical_attempt_limit_prevents_selector_internal_fallback() -> N
     assert any(isinstance(event, ErrorEvent) for event in events)
     assert not any(isinstance(event, TextDeltaEvent) for event in events)
     assert selector.current_config.model == PRIMARY_MODEL
+
+
+async def test_tokenrhythm_tool_reasoning_fallback_rebuilds_from_canonical_history() -> None:
+    long_reasoning = "r" * 50_001
+    primary = _ProjectingScriptProvider(
+        provider_name="tokenrhythm",
+        wire_provider=OpenAIProvider(
+            api_key="synthetic-tokenrhythm-key",
+            model="deepseek-v4-flash",
+            base_url="https://tokenrhythm.studio/v1",
+            provider_kind="tokenrhythm",
+            provider_id="tokenrhythm",
+        ),
+        streams=[
+            [
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="echo"),
+                ToolUseEndEvent(
+                    tool_use_id="tool-1",
+                    tool_name="echo",
+                    arguments={"value": "once"},
+                ),
+                DoneEvent(
+                    stop_reason="tool_use",
+                    input_tokens=3,
+                    output_tokens=1,
+                    reasoning_tokens=1,
+                    reasoning_content=long_reasoning,
+                ),
+            ],
+            [ErrorEvent(message="upstream unavailable", code="503")],
+        ],
+    )
+    fallback = _ProjectingScriptProvider(
+        provider_name="deepseek",
+        wire_provider=OpenAIProvider(
+            api_key="synthetic-deepseek-key",
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            provider_kind="deepseek",
+            provider_id="deepseek",
+        ),
+        streams=[
+            [
+                TextDeltaEvent(text="done"),
+                DoneEvent(
+                    stop_reason="stop",
+                    model="deepseek-v4-flash",
+                    input_tokens=4,
+                    output_tokens=1,
+                ),
+            ]
+        ],
+    )
+    selector = _ProjectingFallbackSelector(primary, fallback)
+    provider = _SelectorFallbackProvider(primary, selector)
+    tool_handler_calls = 0
+
+    async def tool_handler(call: Any) -> ToolResult:
+        nonlocal tool_handler_calls
+        tool_handler_calls += 1
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="tool result",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=2,
+            max_provider_retries=0,
+            model_id="deepseek-v4-flash",
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo once.",
+                input_schema=ToolInputSchema(
+                    properties={"value": {"type": "string"}},
+                    required=["value"],
+                ),
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("run the tool once")]
+
+    assert tool_handler_calls == 1
+    assert len(primary.calls) == 2
+    assert len(fallback.calls) == 1
+    primary_post_tool = primary.calls[1]
+    fallback_post_tool = fallback.calls[0]
+    assert primary_post_tool["canonical_before"] == primary_post_tool["canonical_after"]
+    assert fallback_post_tool["canonical_before"] == fallback_post_tool["canonical_after"]
+    assert fallback_post_tool["canonical_before"] == primary_post_tool["canonical_before"]
+
+    canonical_tool_call = next(
+        message
+        for message in primary_post_tool["messages"]
+        if message.role == "assistant" and message.reasoning_content == long_reasoning
+    )
+    assert canonical_tool_call.reasoning_content == long_reasoning
+
+    primary_wire_tool_call = next(
+        message
+        for message in primary_post_tool["payload"]["messages"]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    fallback_wire_tool_call = next(
+        message
+        for message in fallback_post_tool["payload"]["messages"]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    assert primary_wire_tool_call["reasoning_content"] == ""
+    assert fallback_wire_tool_call["reasoning_content"] == long_reasoning
+    assert any(event.kind == "done" and event.text == "done" for event in events)
 
 
 async def test_local_admission_failure_escalates_to_larger_authorized_leg(

@@ -262,7 +262,10 @@ async def test_deadline_thinking_off_disables_thinking_when_margin_reached() -> 
     events = [event async for event in agent.run_turn("fix the bug")]
 
     assert any(event.kind == "done" for event in events)
-    assert provider.calls[0]["config"].thinking is False
+    disabled_config = provider.calls[0]["config"]
+    assert disabled_config.thinking is False
+    assert disabled_config.thinking_budget_tokens == 0
+    assert disabled_config.thinking_level is ThinkingLevel.OFF
 
 
 @pytest.mark.asyncio
@@ -285,8 +288,11 @@ async def test_deadline_thinking_off_stays_off_for_subsequent_calls() -> None:
     assert any(event.kind == "done" for event in events)
     assert len(provider.calls) == 2
     # Sticky: every call after arming runs with thinking off.
-    assert provider.calls[0]["config"].thinking is False
-    assert provider.calls[1]["config"].thinking is False
+    for call in provider.calls:
+        disabled_config = call["config"]
+        assert disabled_config.thinking is False
+        assert disabled_config.thinking_budget_tokens == 0
+        assert disabled_config.thinking_level is ThinkingLevel.OFF
 
 
 @pytest.mark.asyncio

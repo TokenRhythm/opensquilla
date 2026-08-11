@@ -8,6 +8,12 @@ on the recovery package directly.
 
 from __future__ import annotations
 
-from opensquilla.recovery.locking import ProfileOperationLock
+from opensquilla.recovery.locking import (
+    ProfileOperationLock,
+    profile_operation_lock_held_by_current_thread,
+)
 
-__all__ = ["ProfileOperationLock"]
+__all__ = [
+    "ProfileOperationLock",
+    "profile_operation_lock_held_by_current_thread",
+]

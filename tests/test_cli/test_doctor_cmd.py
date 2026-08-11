@@ -7,6 +7,7 @@ from typing import Any
 from typer.testing import CliRunner
 
 from opensquilla.cli import doctor_cmd as _doctor_cmd
+from opensquilla.cli import gateway_lifecycle
 from opensquilla.cli.main import app
 
 runner = CliRunner()
@@ -242,6 +243,99 @@ def test_doctor_targets_env_config_without_explicit_config(
         "opensquilla providers configure openrouter --api-key YOUR_API_KEY "
         f"--config {_config_arg(target)}"
     ]
+
+
+def test_doctor_prefers_active_profile_managed_gateway_runtime_port(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _FakeGatewayClient.calls = []
+    home = tmp_path / "profile"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_URL", raising=False)
+    config = home / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    lifecycle = home / "state" / "gateway" / "gateway.json"
+    lifecycle.parent.mkdir(parents=True)
+    lifecycle.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "host": "127.0.0.1",
+                "port": 18792,
+                "url": "http://127.0.0.1:18792",
+                "healthUrl": "http://127.0.0.1:18792/health",
+                "startedAt": "2026-08-10T00:00:00Z",
+                "argv": ["opensquilla", "gateway", "run", "--port", "18792"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_pid_running",
+        lambda self, pid: True,
+    )
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_probe_health",
+        lambda self: True,
+    )
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _FakeGatewayClient)
+
+    result = runner.invoke(app, ["doctor", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert ("connect", "ws://127.0.0.1:18792/ws") in _FakeGatewayClient.calls
+    assert payload["gatewayUrl"] == "ws://127.0.0.1:18792/ws"
+    assert payload["configPath"] == str(config)
+
+
+def test_doctor_reports_managed_gateway_recorded_config_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _FakeGatewayClient.calls = []
+    home = tmp_path / "profile"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_URL", raising=False)
+    custom_config = tmp_path / "custom.toml"
+    custom_config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    lifecycle = home / "state" / "gateway" / "gateway.json"
+    lifecycle.parent.mkdir(parents=True)
+    lifecycle.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "host": "127.0.0.1",
+                "port": 18792,
+                "configPath": str(custom_config),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_pid_running",
+        lambda self, pid: True,
+    )
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_probe_health",
+        lambda self: True,
+    )
+    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _FakeGatewayClient)
+
+    result = runner.invoke(app, ["doctor", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["gatewayUrl"] == "ws://127.0.0.1:18792/ws"
+    assert payload["configPath"] == str(custom_config)
 
 
 def test_doctor_config_scopes_gateway_recovery_commands(tmp_path, monkeypatch) -> None:
