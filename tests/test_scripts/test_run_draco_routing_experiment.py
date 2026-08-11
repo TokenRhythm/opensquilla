@@ -1437,6 +1437,55 @@ def test_task_analyzer_explicit_zero_request_emits_no_usage_rows(
     assert rows == []
 
 
+@pytest.mark.parametrize("loaded_runner", [runner, resume_runner], ids=["main", "resume"])
+def test_task_analyzer_usage_wrapper_preserves_runner_local_callbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    loaded_runner,
+) -> None:
+    generated_ids = iter(("a" * 32, "b" * 32, "c" * 32))
+    monkeypatch.setattr(
+        loaded_runner,
+        "uuid",
+        SimpleNamespace(uuid4=lambda: SimpleNamespace(hex=next(generated_ids))),
+    )
+    monkeypatch.setattr(
+        loaded_runner,
+        "coerce_metric_int",
+        lambda value: 7 if value is None else int(value),
+    )
+    monkeypatch.setattr(
+        loaded_runner,
+        "trusted_provider_billed_cost",
+        lambda _row: 1.25,
+    )
+    monkeypatch.setattr(
+        loaded_runner,
+        "exact_provider_usage_cost",
+        lambda _row: 1.25,
+    )
+
+    row = loaded_runner.task_analyzer_usage_row(
+        {},
+        provider_id="openrouter",
+        model_id="model-a",
+        source="fallback",
+        fallback_reason="missing",
+    )
+    rows = loaded_runner.task_analyzer_usage_rows(
+        {"attempt_count": 2},
+        provider_id="openrouter",
+        model_id="model-a",
+        source="fallback",
+        fallback_reason="missing",
+    )
+
+    assert row["physical_attempt_id"] == "a" * 32
+    assert row["attempt"] == 7
+    assert row["billed_cost"] == pytest.approx(1.25)
+    assert row["cost_source"] == "provider_billed"
+    assert [item["physical_attempt_id"] for item in rows] == ["b" * 32, "c" * 32]
+
+
 def _openrouter_config() -> tuple[GatewayConfig, ProviderConfig]:
     config = GatewayConfig(
         llm={
@@ -11578,6 +11627,9 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "build_benchmark_tool_context",
         "run_local_web_tools_preflight",
         "build_task_analyzer_provider",
+        "task_analyzer_usage_row",
+        "task_analyzer_usage_rows",
+        "conservative_task_analyzer_usage_rows",
         "result_key_coverage",
         "llm_request_count_for_run",
         "run_result_summary",
