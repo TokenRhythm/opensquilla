@@ -69,6 +69,7 @@ function i18n() {
           sidebar: {
             recentConversations: 'Recent tasks',
             recents: 'Recents',
+            pinned: 'Pinned',
             noConversations: 'No tasks yet.',
             refresh: 'Refresh',
             enterSelectionMode: 'Select tasks',
@@ -109,6 +110,7 @@ async function mountSidebar(
   rows: SidebarSectionRow[],
   canManageProjects = true,
   canCreateProjects = canManageProjects,
+  sessionOrder: string[] = [],
 ) {
   const sections: SidebarSection[] = [{ family: 'chats', label: 'Tasks', rows }]
   const events = {
@@ -126,6 +128,7 @@ async function mountSidebar(
   document.body.appendChild(host)
   const Root = defineComponent(() => () => h(SidebarConversations, {
     sections,
+    sessionOrder,
     error: false,
     loading: false,
     currentKey: '',
@@ -186,14 +189,111 @@ describe('SidebarConversations project workspaces', () => {
       }),
     ])
 
-    expect(host.querySelector('.sidebar-recents-eyebrow')?.textContent?.trim()).toBe('Projects')
+    const projectHeading = host.querySelector('[data-sidebar-zone-heading="projects"]')
+    expect(projectHeading?.querySelector('.sidebar-zone-heading__label')?.textContent).toBe('Projects')
+    expect(projectHeading?.querySelector('.sidebar-zone-heading__count')?.textContent).toBe('1')
     expect(
       host.querySelector('[data-session-key="agent:main:webchat:task-a"]')
         ?.getAttribute('data-sidebar-zone'),
     ).toBe('projects')
     const ordinary = host.querySelector('[data-session-key="agent:main:webchat:ordinary"]')
     expect(ordinary?.getAttribute('data-sidebar-zone')).toBe('recents')
-    expect(ordinary?.getAttribute('data-zone-label')).toBe('Recents')
+    expect(
+      host.querySelector('[data-sidebar-zone-heading="recents"] .sidebar-zone-heading__label')
+        ?.textContent,
+    ).toBe('Recents')
+  })
+
+  it('renders peer zone headings with independent counts and unique pinned rows', async () => {
+    const { host } = await mountSidebar([
+      projectRow(),
+      taskRow({ key: 'project-pin', pinned: true }),
+      taskRow({ key: 'project-live', pinned: false }),
+      taskRow({
+        key: 'recent-pin',
+        title: 'Pinned recent',
+        workspaceId: undefined,
+        depth: 0,
+        pinned: true,
+      }),
+      taskRow({
+        key: 'recent-live',
+        title: 'Recent task',
+        workspaceId: undefined,
+        depth: 0,
+        pinned: false,
+      }),
+    ], true, true, ['recent-pin', 'project-pin'])
+
+    expect(
+      Array.from(host.querySelectorAll<HTMLElement>('.sidebar-zone-heading'))
+        .map(node => ({
+          label: node.querySelector('.sidebar-zone-heading__label')?.textContent,
+          count: node.querySelector('.sidebar-zone-heading__count')?.textContent,
+        })),
+    ).toEqual([
+      { label: 'Pinned', count: '2' },
+      { label: 'Projects', count: '1' },
+      { label: 'Recents', count: '1' },
+    ])
+    expect(host.querySelectorAll('[data-session-key="project-pin"]')).toHaveLength(1)
+    expect(host.querySelectorAll('[data-session-key="recent-pin"]')).toHaveLength(1)
+    expect(
+      host.querySelector('[data-session-key="project-pin"]')?.getAttribute('data-sidebar-zone'),
+    ).toBe('pinned')
+    expect(
+      host.querySelector('[data-session-key="recent-pin"]')?.getAttribute('data-sidebar-zone'),
+    ).toBe('pinned')
+    expect(
+      host.querySelector('[data-session-key="project-live"]')?.getAttribute('data-sidebar-zone'),
+    ).toBe('projects')
+    expect(
+      host.querySelector('[data-session-key="recent-live"]')?.getAttribute('data-sidebar-zone'),
+    ).toBe('recents')
+  })
+
+  it('reorders pinned chats across their original project boundaries', async () => {
+    const { host, events } = await mountSidebar([
+      projectRow({
+        key: 'workspace:a',
+        title: 'A',
+        workspaceId: 'a',
+        workspace: '/a',
+      }),
+      taskRow({ key: 'a-pin', workspaceId: 'a', pinned: true }),
+      projectRow({
+        key: 'workspace:b',
+        title: 'B',
+        workspaceId: 'b',
+        workspace: '/b',
+      }),
+      taskRow({ key: 'b-pin', workspaceId: 'b', pinned: true }),
+    ], true, true, ['a-pin', 'b-pin'])
+    const source = host.querySelector<HTMLElement>('[data-session-key="a-pin"]')
+    const target = host.querySelector<HTMLElement>('[data-session-key="b-pin"]')
+
+    vi.spyOn(document, 'elementFromPoint').mockReturnValue(target || null)
+    source?.dispatchEvent(new MouseEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientX: 10,
+      clientY: 10,
+    }))
+    document.dispatchEvent(new MouseEvent('pointermove', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 20,
+      clientY: 20,
+    }))
+    document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }))
+    await nextTick()
+
+    expect(events.reorder).toHaveBeenCalledWith({
+      draggedKey: 'a-pin',
+      targetKey: 'b-pin',
+      position: 'after',
+    })
   })
 
   it('emits a reorder when one recent chat is dragged onto another', async () => {
@@ -297,7 +397,10 @@ describe('SidebarConversations project workspaces', () => {
     ])
 
     expect(host.querySelector('.sidebar-workspace-empty')).toBeNull()
-    expect(host.querySelector('.sidebar-zone-empty__label')?.textContent).toBe('Recents')
+    expect(
+      host.querySelector('[data-sidebar-zone-heading="recents"] .sidebar-zone-heading__label')
+        ?.textContent,
+    ).toBe('Recents')
     expect(host.querySelector('.sidebar-zone-empty__body')?.textContent).toBe('No tasks yet.')
   })
 

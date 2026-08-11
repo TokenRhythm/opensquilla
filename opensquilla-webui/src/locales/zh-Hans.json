@@ -4062,6 +4062,7 @@
     "sidebar": {
       "recentConversations": "最近任务",
       "recents": "最近",
+      "pinned": "置顶",
       "refresh": "重新加载任务",
       "clearAgentFilter": "清除智能体筛选：{name}",
       "loadError": "无法加载任务",

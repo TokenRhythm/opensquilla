@@ -80,6 +80,7 @@
     <!-- Recent conversations -->
     <SidebarConversations
       :sections="sidebarSections"
+      :session-order="sidebarSessionOrder"
       :error="sessionListError"
       :loading="isLoading"
       :current-key="sidebarCurrentKey"
@@ -1066,7 +1067,11 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
   if (!payload.pinned) return
   const currentOrder = sidebarSections.value
     .flatMap(section => section.rows)
-    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
+    .filter(row =>
+      row.rowKind === 'session'
+      && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
+      && !row.provisional,
+    )
     .map(row => row.key)
     .filter(key => key !== payload.key)
   currentOrder.unshift(payload.key)

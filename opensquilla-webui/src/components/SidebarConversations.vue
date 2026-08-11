@@ -46,6 +46,11 @@ import Icon from './Icon.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
+import {
+  buildSidebarDisplayProjection,
+  type SidebarDisplayRow,
+  type SidebarDisplayZone,
+} from '@/utils/sidebarDisplayProjection'
 
 const props = withDefaults(defineProps<{
   sections: SidebarSection[]
@@ -55,9 +60,11 @@ const props = withDefaults(defineProps<{
   contractDebugEnabled: boolean
   /** Command-palette chord, shown in the search button's tooltip. */
   searchHint: string
+  sessionOrder?: string[]
   canManageProjects?: boolean
   canCreateProjects?: boolean
 }>(), {
+  sessionOrder: () => [],
   canManageProjects: false,
   canCreateProjects: false,
 })
@@ -193,9 +200,9 @@ function startProjectTask(row: SidebarConversationItem) {
   emit('new-project-task', row.workspaceId)
 }
 
-function filterCollapsedProjectRows(rows: SidebarConversationItem[]): SidebarConversationItem[] {
+function filterCollapsedProjectRows<T extends SidebarConversationItem>(rows: T[]): T[] {
   const hiddenProjects = new Set<string>()
-  const result: SidebarConversationItem[] = []
+  const result: T[] = []
   for (const row of rows) {
     if (row.rowKind === 'workspace') {
       if (row.workspaceId && isProjectCollapsed(row)) hiddenProjects.add(row.workspaceId)
@@ -209,7 +216,7 @@ function filterCollapsedProjectRows(rows: SidebarConversationItem[]): SidebarCon
 }
 
 // Sections with at least one row, honoring the agent filter inside Chats.
-const visibleSections = computed(() => {
+const filteredSections = computed(() => {
   return props.sections
     .map(section => {
       const filteredRows = section.family === 'chats' && agentFilter.value
@@ -217,71 +224,82 @@ const visibleSections = computed(() => {
         : section.rows
       return {
         ...section,
-        rows: filterCollapsedProjectRows(filteredRows)
-          .filter(row => row.rowKind !== 'workspace-empty'),
+        rows: filteredRows.filter(row => row.rowKind !== 'workspace-empty'),
       }
     })
     .filter(section => section.rows.length > 0)
 })
 
-const visibleProjectCount = computed(() =>
-  visibleSections.value.reduce(
-    (sum, section) => sum + section.rows.filter(row => row.rowKind === 'workspace').length,
-    0,
-  ),
+const displayProjection = computed(() =>
+  buildSidebarDisplayProjection(filteredSections.value, props.sessionOrder),
 )
 
-/**
- * `arrangeSidebarSections` emits project rows as a small ordered ledger:
- * a workspace header followed by its task rows. Track those task keys without
- * treating every session cwd as a project — ordinary tasks can still carry a
- * workspace path even when they are not bound to a persisted project.
- */
-const projectRowKeys = computed(() => {
-  const keys = new Set<string>()
-  const chats = props.sections.find(section => section.family === 'chats')
-  let project: SidebarConversationItem | null = null
+interface SidebarDisplayBlock {
+  key: string
+  zone: SidebarDisplayZone
+  label: string
+  count: number
+  rows: SidebarDisplayRow[]
+  showHeading: boolean
+  family?: SidebarFamilyId
+  familyLabel?: string
+  showFamilyHeader?: boolean
+}
 
-  for (const row of chats?.rows || []) {
-    if (row.rowKind === 'workspace') {
-      project = row
-      keys.add(row.key)
-      continue
-    }
-    if (row.rowKind === 'workspace-empty') {
-      if (project) keys.add(row.key)
-      continue
-    }
-    const belongsToProject = Boolean(
-      project
-      && (
-        project.workspaceId
-          ? row.workspaceId === project.workspaceId
-          : Boolean(project.workspace && row.workspace === project.workspace)
-      ),
-    )
-    if (belongsToProject) keys.add(row.key)
-    else project = null
+const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
+  const projection = displayProjection.value
+  const blocks: SidebarDisplayBlock[] = []
+  if (projection.pinned.length > 0) {
+    blocks.push({
+      key: 'pinned',
+      zone: 'pinned',
+      label: t('shared.sidebar.pinned'),
+      count: projection.pinned.length,
+      rows: projection.pinned,
+      showHeading: true,
+    })
   }
-  return keys
+  if (props.canManageProjects || projection.projectCount > 0) {
+    blocks.push({
+      key: 'projects',
+      zone: 'projects',
+      label: t('workspaces.projects'),
+      count: projection.projectCount,
+      rows: filterCollapsedProjectRows(projection.projects),
+      showHeading: true,
+    })
+  }
+  if (projection.recents.length === 0) {
+    blocks.push({
+      key: 'recents',
+      zone: 'recents',
+      label: t('shared.sidebar.recents'),
+      count: 0,
+      rows: [],
+      showHeading: true,
+    })
+  } else {
+    projection.recents.forEach((section, index) => {
+      blocks.push({
+        key: `recents:${section.family}`,
+        zone: 'recents',
+        label: t('shared.sidebar.recents'),
+        count: projection.recentCount,
+        rows: section.rows,
+        showHeading: index === 0,
+        family: section.family,
+        familyLabel: section.label,
+        showFamilyHeader: projection.recents.length > 1,
+      })
+    })
+  }
+  return blocks
 })
 
-const firstRecentRowKey = computed(() => {
-  for (const section of visibleSections.value) {
-    const row = section.rows.find(item =>
-      item.rowKind === 'session' && !projectRowKeys.value.has(item.key),
-    )
-    if (row) return row.key
-  }
-  return ''
-})
-
-const hasVisibleRecentRows = computed(() =>
-  visibleSections.value.some(section =>
-    section.rows.some(row =>
-      row.rowKind === 'session' && !projectRowKeys.value.has(row.key),
-    ),
-  ),
+const controlsZone = computed<SidebarDisplayZone>(() =>
+  props.canManageProjects || displayProjection.value.projectCount > 0
+    ? 'projects'
+    : 'recents',
 )
 
 // Total rendered rows: drives the onboarding empty-state and the filter's
@@ -294,7 +312,7 @@ const totalRows = computed(() =>
 )
 
 const hasFilterMatches = computed(() =>
-  visibleSections.value.some(section => section.rows.some(row => !isWorkspaceRow(row))),
+  filteredSections.value.some(section => section.rows.some(row => !isWorkspaceRow(row))),
 )
 
 /* ── Session drag ordering ────────────────────────────────────────── */
@@ -312,13 +330,13 @@ const pointerDrag = ref<{
 } | null>(null)
 const suppressSelectKey = ref('')
 
-function reorderScope(row: SidebarConversationItem): string {
-  const pinGroup = row.pinned ? 'pinned' : 'regular'
-  if (!projectRowKeys.value.has(row.key)) return `recents:${pinGroup}`
-  return `project:${row.workspaceId || row.workspace || ''}:${pinGroup}`
+function reorderScope(row: SidebarDisplayRow): string {
+  if (row.pinned) return 'pinned'
+  if (row.displayZone === 'recents') return 'recents'
+  return `project:${row.workspaceId || row.workspace || ''}`
 }
 
-function canDragRow(row: SidebarConversationItem): boolean {
+function canDragRow(row: SidebarDisplayRow): boolean {
   return row.rowKind === 'session'
     && row.sessionKind === 'chat'
     && !row.provisional
@@ -334,15 +352,11 @@ function clearRowDrag() {
   pointerDrag.value = null
 }
 
-function findSessionRow(key: string): SidebarConversationItem | undefined {
-  for (const section of props.sections) {
-    const row = section.rows.find(candidate => candidate.key === key)
-    if (row) return row
-  }
-  return undefined
+function findSessionRow(key: string): SidebarDisplayRow | undefined {
+  return displayProjection.value.allRows.find(row => row.key === key)
 }
 
-function onRowPointerDown(row: SidebarConversationItem, event: PointerEvent) {
+function onRowPointerDown(row: SidebarDisplayRow, event: PointerEvent) {
   if (event.button !== 0 || !canDragRow(row)) return
   const target = event.target
   if (target instanceof Element && target.closest('.sidebar-row-menu-wrap, input, .sidebar-agent-badge')) return
@@ -402,10 +416,10 @@ const selectedKeys = ref<Set<string>>(new Set())
 const selectionMode = ref(false)
 
 const visibleSelectableRows = computed(() =>
-  visibleSections.value.flatMap(section =>
-    isCollapsed(section.family)
+  displayBlocks.value.flatMap(block =>
+    block.showFamilyHeader && block.family && isCollapsed(block.family)
       ? []
-      : section.rows.filter(row => row.rowKind === 'session' && !row.provisional),
+      : block.rows.filter(row => row.rowKind === 'session' && !row.provisional),
   ),
 )
 
@@ -687,15 +701,15 @@ function onSelectRow(row: SidebarConversationItem) {
 
 <template>
   <div
-    v-if="error || totalRows > 0 || visibleProjectCount > 0 || props.canManageProjects"
+    v-if="error || totalRows > 0 || displayProjection.projectCount > 0 || props.canManageProjects"
     class="sidebar-section sidebar-history"
     :class="{
       'is-selecting': selectionMode,
-      'has-projects': visibleProjectCount > 0,
+      'has-projects': displayProjection.projectCount > 0,
     }"
     :aria-label="t('shared.sidebar.recentConversations')"
   >
-    <div class="sidebar-recents-header">
+    <div v-if="selectionMode" class="sidebar-recents-header">
       <span class="sidebar-recents-eyebrow">
         {{
           selectionMode
@@ -708,7 +722,7 @@ function onSelectRow(row: SidebarConversationItem) {
         }}
       </span>
       <span
-        v-if="!selectionMode && visibleProjectCount === 0 && totalRows > 0"
+        v-if="!selectionMode && displayProjection.projectCount === 0 && totalRows > 0"
         class="sidebar-recents-count"
       >{{ totalRows }}</span>
       <button
@@ -812,53 +826,94 @@ function onSelectRow(row: SidebarConversationItem) {
 
     <div v-else class="sidebar-history-list">
       <div
-        v-for="section in visibleSections"
-        :key="section.family"
-        class="sidebar-group"
-        :data-family="section.family"
+        v-for="block in displayBlocks"
+        :key="block.key"
+        class="sidebar-group sidebar-zone"
+        :data-family="block.family || block.key"
+        :data-sidebar-zone-group="block.zone"
       >
-        <!-- One vocabulary, one header: with a single family the panel's own
-             "Chats" eyebrow already labels the list, so the per-family header
-             renders only when there are actually multiple families to tell
-             apart (chats vs cron vs channels). -->
+        <div
+          v-if="block.showHeading"
+          class="sidebar-zone-heading"
+          :data-sidebar-zone-heading="block.zone"
+        >
+          <span class="sidebar-zone-heading__label">{{ block.label }}</span>
+          <span class="sidebar-zone-heading__count">{{ block.count }}</span>
+          <button
+            v-if="
+              block.zone === 'projects'
+              && props.canManageProjects
+              && props.canCreateProjects
+              && !selectionMode
+            "
+            type="button"
+            class="sidebar-project-create-btn"
+            data-testid="sidebar-create-project"
+            :aria-label="t('workspaces.createProject')"
+            :title="t('workspaces.createProject')"
+            @click="emit('new-project')"
+          >
+            <Icon name="plus" :size="13" />
+          </button>
+          <button
+            v-if="block.zone === controlsZone && !selectionMode"
+            type="button"
+            class="sidebar-cmd-btn"
+            :aria-label="`${t('chrome.searchChats')} (${props.searchHint})`"
+            :title="`${t('chrome.searchChats')} (${props.searchHint})`"
+            aria-haspopup="dialog"
+            @click="emit('search')"
+          >
+            <Icon name="search" :size="13" />
+          </button>
+          <button
+            v-if="block.zone === controlsZone && totalRows > 0 && !selectionMode"
+            type="button"
+            class="sidebar-bulk-mode-btn"
+            :aria-label="t('shared.sidebar.enterSelectionMode')"
+            :title="t('shared.sidebar.enterSelectionMode')"
+            @click="toggleSelectionMode"
+          >
+            <Icon name="listChecks" :size="13" />
+          </button>
+        </div>
+
         <button
-          v-if="visibleSections.length > 1"
+          v-if="block.showFamilyHeader && block.family"
           type="button"
           class="sidebar-group__header"
-          :aria-expanded="!isCollapsed(section.family)"
-          :aria-controls="`sidebar-group-${section.family}`"
-          @click="toggleSection(section.family)"
+          :aria-expanded="!isCollapsed(block.family)"
+          :aria-controls="`sidebar-group-${block.key}`"
+          @click="toggleSection(block.family)"
         >
           <Icon class="sidebar-group__chevron" name="chevronRight" :size="12" />
-          <span class="sidebar-group__label">{{ section.label }}</span>
-          <span class="sidebar-group__count">{{ section.rows.length }}</span>
+          <span class="sidebar-group__label">{{ block.familyLabel }}</span>
+          <span class="sidebar-group__count">{{ block.rows.length }}</span>
         </button>
 
         <TransitionGroup
-          v-show="visibleSections.length === 1 || !isCollapsed(section.family)"
-          :id="`sidebar-group-${section.family}`"
+          v-show="!block.showFamilyHeader || !block.family || !isCollapsed(block.family)"
+          :id="`sidebar-group-${block.key}`"
           name="sidebar-row"
           tag="div"
           class="sidebar-group__body"
         >
           <div
-            v-for="row in section.rows"
+            v-for="row in block.rows"
             :key="row.key"
             class="sidebar-history-row"
             :class="{
               'is-selected': row.rowKind === 'session' && isRowSelected(row.key),
               'sidebar-history-row--workspace': row.rowKind === 'workspace',
               'sidebar-history-row--workspace-empty': row.rowKind === 'workspace-empty',
-              'sidebar-history-row--recent-start': row.key === firstRecentRowKey,
               'is-unavailable': row.rowKind === 'workspace' && row.workspaceAvailable === false,
               'is-reorderable': canDragRow(row),
               'is-dragging': draggedRowKey === row.key,
               'is-drop-before': dropTargetKey === row.key && dropPosition === 'before',
               'is-drop-after': dropTargetKey === row.key && dropPosition === 'after',
             }"
-            :data-family="section.family"
-            :data-sidebar-zone="projectRowKeys.has(row.key) ? 'projects' : 'recents'"
-            :data-zone-label="row.key === firstRecentRowKey ? t('shared.sidebar.recents') : undefined"
+            :data-family="row.displayFamily"
+            :data-sidebar-zone="row.displayZone"
             :data-depth="row.depth"
             :data-session-key="row.rowKind === 'session' ? row.key : undefined"
             :style="{ '--row-depth': row.depth }"
@@ -1132,7 +1187,7 @@ function onSelectRow(row: SidebarConversationItem) {
               v-else-if="
                 row.rowKind === 'session'
                 && !row.provisional
-                && shouldShowAgentFilterBadge(section.family, row)
+                && shouldShowAgentFilterBadge(row.displayFamily, row)
                 && renamingKey !== row.key
                 && !selectionMode
               "
@@ -1148,13 +1203,12 @@ function onSelectRow(row: SidebarConversationItem) {
             </button>
           </div>
         </TransitionGroup>
-      </div>
-      <div
-        v-if="visibleProjectCount > 0 && !hasVisibleRecentRows"
-        class="sidebar-zone-empty"
-      >
-        <div class="sidebar-zone-empty__label">{{ t('shared.sidebar.recents') }}</div>
-        <div class="sidebar-zone-empty__body">{{ t('shared.sidebar.noConversations') }}</div>
+        <div
+          v-if="block.zone === 'recents' && block.rows.length === 0"
+          class="sidebar-zone-empty"
+        >
+          <div class="sidebar-zone-empty__body">{{ t('shared.sidebar.noConversations') }}</div>
+        </div>
       </div>
     </div>
   </div>

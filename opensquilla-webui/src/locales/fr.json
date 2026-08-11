@@ -4009,6 +4009,7 @@
     "sidebar": {
       "recentConversations": "Tâches récentes",
       "recents": "Récentes",
+      "pinned": "Épinglées",
       "refresh": "Recharger les tâches",
       "clearAgentFilter": "Effacer le filtre d'agent : {name}",
       "loadError": "Impossible de charger les tâches",

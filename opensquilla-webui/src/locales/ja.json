@@ -4009,6 +4009,7 @@
     "sidebar": {
       "recentConversations": "最近のタスク",
       "recents": "最近",
+      "pinned": "ピン留め",
       "refresh": "タスクを再読み込み",
       "clearAgentFilter": "エージェントフィルターをクリア: {name}",
       "loadError": "タスクを読み込めません",

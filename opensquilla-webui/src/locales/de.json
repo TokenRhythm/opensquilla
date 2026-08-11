@@ -4009,6 +4009,7 @@
     "sidebar": {
       "recentConversations": "Letzte Aufgaben",
       "recents": "Zuletzt",
+      "pinned": "Angeheftet",
       "refresh": "Aufgaben neu laden",
       "clearAgentFilter": "Agentenfilter zurücksetzen: {name}",
       "loadError": "Aufgaben konnten nicht geladen werden",
