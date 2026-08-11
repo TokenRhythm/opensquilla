@@ -380,7 +380,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         showHeader: !sameGroup,
         messageId: msg.messageId,
         restoredFromHistory: msg.restoredFromHistory,
-        turnId: msg.turnId,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
         turnId: messageTurnId || undefined,
         turnInputMode: msg.turnInputMode,

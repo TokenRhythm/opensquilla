@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -9,6 +10,7 @@ from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway.config import GatewayConfig, SquillaRouterConfig
 from opensquilla.provider import ChatConfig, EnsembleProvider, Message
 from opensquilla.provider.selector import ProviderConfig
+from opensquilla.tools.types import ToolContext
 
 
 class _Provider:
@@ -87,6 +89,35 @@ async def test_static_b5_wrap_skipped_without_openrouter_credential(
     assert "ensemble_enabled" not in turn.metadata
 
 
+async def test_artifact_mutation_does_not_fall_back_when_ensemble_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    runner = TurnRunner(provider_selector=None, config=_static_b5_config())
+    selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
+    tool_context = ToolContext(
+        artifact_context=SimpleNamespace(
+            artifact_format="html",
+            operation_class="selection_edit",
+        )
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="artifact_ensemble_unavailable:static_openrouter_b5_no_credential",
+    ):
+        await runner._run_pipeline(
+            "apply the annotation",
+            "agent:main:test",
+            _Provider(),
+            selector,
+            [],
+            "system prompt",
+            [],
+            tool_context=tool_context,
+        )
+
+
 async def test_static_b5_wraps_when_openrouter_env_key_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -107,6 +138,48 @@ async def test_static_b5_wraps_when_openrouter_env_key_present(
     assert isinstance(provider, EnsembleProvider)
     assert turn.metadata["ensemble_enabled"] is True
     assert "ensemble_wrap_skipped_reason" not in turn.metadata
+
+
+async def test_restricted_artifact_ensemble_inherits_empty_skill_workspace_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-synthetic")
+    runner = TurnRunner(provider_selector=None, config=_static_b5_config())
+    selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
+    workspace = "/private/synthetic-prompt-annotation-workspace"
+    tool_context = ToolContext(
+        artifact_context=SimpleNamespace(
+            artifact_format="html",
+            operation_class="selection_edit",
+        ),
+        workspace_dir=workspace,
+        exclusive_tools={"document_inspect", "document_apply"},
+    )
+    skill_catalog = SimpleNamespace(
+        generation=99,
+        skills=(SimpleNamespace(name="must-not-reach-provider"),),
+    )
+
+    turn, provider = await runner._run_pipeline(
+        "apply the annotation",
+        "agent:main:webchat:prompt-annotation-ensemble",
+        _Provider(),
+        selector,
+        [],
+        "restricted system prompt",
+        [],
+        tool_context=tool_context,
+        skill_catalog=skill_catalog,
+    )
+
+    assert isinstance(provider, EnsembleProvider)
+    assert turn.metadata["ensemble_enabled"] is True
+    assert turn.metadata["skill_count"] == 0
+    assert turn.metadata["skills_prompt_chars"] == 0
+    assert turn.metadata["bootstrap_workspace_dir"] == ""
+    assert turn.skill_catalog is None
+    assert "must-not-reach-provider" not in str(turn.system_prompt)
+    assert workspace not in str(turn.system_prompt)
 
 
 async def test_static_b5_wraps_when_active_provider_is_keyed_openrouter(

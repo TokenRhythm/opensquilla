@@ -46,6 +46,10 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("run_kind", ("runKind", "run_kind")),
     ("workspace_id", ("workspaceId", "workspace_id")),
+    (
+        "prompt_annotation_ids",
+        ("promptAnnotationIds", "prompt_annotation_ids"),
+    ),
 )
 
 

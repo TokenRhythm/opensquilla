@@ -1453,8 +1453,10 @@ def build_session_material_cleanup(config: Any) -> Any:
     Removes all on-disk material stores for a deleted session: the canonical
     transcript-material store (``<media_root>/transcripts/<sid>/``) and the
     tool-visible workspace materialization
-    (``<workspace>/.opensquilla/attachments/<segment>/``), plus generated
-    Artifact files and bundle blobs below ``<media_root>/artifacts``. Lives in the gateway
+    (``<workspace>/.opensquilla/attachments/<segment>/``), plus every ArtifactStore
+    bucket owned by that session below ``<media_root>/artifacts``. Session deletion
+    is a privacy and disk-reclamation boundary, so both listed and internal
+    artifacts are removed. Lives in the gateway
     layer because it resolves the agent workspace via ``agents.scope``; the
     low-level ``session`` package only owns the hook registry + guarded remover.
     """
@@ -1482,9 +1484,24 @@ def build_session_material_cleanup(config: Any) -> Any:
         segment = _safe_path_segment(session_id, fallback="session")
         attachments_dir = workspace / ".opensquilla" / "attachments" / segment
         rmtree_scoped(attachments_dir, expected_name=segment)
-        # 3. Generated artifacts, including content-addressed bundle blobs and
-        #    legacy layouts. ArtifactStore owns the layout and deletion guards.
+        # 3. Every artifact owned by the deleted session, including listed
+        #    chat artifacts, internal revisions/candidates, bundle blobs, and
+        #    legacy layouts. ArtifactStore owns the scoped layout and link guards.
         ArtifactStore(media_root).delete_session_artifacts(session_id)
+
+    return _cleanup
+
+
+def build_session_artifact_cleanup(config: Any) -> Any:
+    """Build post-reset cleanup for internal ArtifactSession material only."""
+
+    from opensquilla.artifacts import ArtifactStore
+    from opensquilla.paths import media_root_from_config
+
+    async def _cleanup(session_id: str, _session_key: str) -> None:
+        ArtifactStore(media_root_from_config(config)).delete_session_internal_artifacts(
+            session_id
+        )
 
     return _cleanup
 
@@ -1547,6 +1564,13 @@ def build_task_runtime_run_kwargs(
         # Internal-only callback: the finalizer supplies the exact assistant
         # row/content to TaskRuntime for durable channel delivery.
         kwargs["assistant_message_sink"] = assistant_message_sink
+    document_mutation_outcome_sink = getattr(
+        run,
+        "document_mutation_outcome_sink",
+        None,
+    )
+    if document_mutation_outcome_sink is not None:
+        kwargs["document_mutation_outcome_sink"] = document_mutation_outcome_sink
     return kwargs
 
 
@@ -2558,6 +2582,19 @@ async def build_services(
     """
     services_started_at = time.monotonic()
 
+    # Electron gives its owned Gateway a one-process bridge credential. Consume
+    # and scrub it before loading .env or constructing services/tool
+    # subprocesses. This prevents a profile file from manufacturing bridge
+    # authority and leaves only the fixed-method runtime client in memory.
+    try:
+        from opensquilla.gateway.desktop_artifact_bridge import (
+            initialize_desktop_artifact_bridge_client,
+        )
+
+        initialize_desktop_artifact_bridge_client()
+    except ValueError:
+        log.warning("artifact.desktop_bridge_environment_rejected")
+
     # ── Load .env files (cwd/.env > ~/.opensquilla/.env, never override existing) ──
     from opensquilla.env import load_env
 
@@ -2568,6 +2605,7 @@ async def build_services(
         config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
         if config.config_path:
             log.info("build_services.config_loaded", path=config.config_path)
+
     _prewarm_tokenrhythm_install_id(config)
     deferred_warmups: list[Callable[[], Any]] = []
     sandbox_setup_task: asyncio.Task[Any] | None = None
@@ -2579,9 +2617,13 @@ async def build_services(
     # DB-only deletions otherwise and leak on disk). The concrete cleanup lives
     # here (gateway layer) because it resolves the agent workspace via
     # ``agents.scope`` — the low-level ``session`` package must not depend on it.
-    from opensquilla.session.material_cleanup import set_session_material_cleanup
+    from opensquilla.session.material_cleanup import (
+        set_session_artifact_cleanup,
+        set_session_material_cleanup,
+    )
 
     set_session_material_cleanup(build_session_material_cleanup(config))
+    set_session_artifact_cleanup(build_session_artifact_cleanup(config))
 
     validate_squilla_router_runtime(config)
     from opensquilla.memory.embedding_resolver import resolve_memory_embedding
@@ -2712,6 +2754,70 @@ async def build_services(
     set_session_manager(session_manager)
     _set_sessions_gateway_config(config)
     session_storage = get_session_storage(session_manager)
+    if session_storage is not None and callable(
+        getattr(session_storage, "_write_transaction", None)
+    ):
+        from opensquilla.artifact_session import ArtifactSessionService
+        from opensquilla.artifacts import ArtifactStore
+        from opensquilla.gateway.artifact_mutation_recovery import (
+            reconcile_pending_artifact_mutations,
+        )
+        from opensquilla.gateway.document_resource_recovery import (
+            reconcile_pending_document_resources,
+        )
+        from opensquilla.gateway.rpc import RpcContext
+        from opensquilla.gateway.rpc_workbench_resources import (
+            resolve_recovery_import_source,
+        )
+        from opensquilla.paths import media_root_from_config
+
+        artifact_recovery_service = await ArtifactSessionService.from_session_storage(
+            session_storage
+        )
+        resource_recovery_context = RpcContext(
+            conn_id="document-resource-recovery",
+            session_manager=session_manager,
+            config=config,
+        )
+
+        try:
+            recovery_summary = await reconcile_pending_artifact_mutations(
+                artifact_recovery_service,
+                ArtifactStore(media_root_from_config(config)),
+            )
+            resource_recovery_summary = await reconcile_pending_document_resources(
+                artifact_recovery_service,
+                ArtifactStore(media_root_from_config(config)),
+                import_source_resolver=lambda attempt: resolve_recovery_import_source(
+                    resource_recovery_context,
+                    attempt,
+                ),
+            )
+        finally:
+            await artifact_recovery_service.close()
+        if recovery_summary.examined:
+            log.info(
+                "build_services.artifact_mutations_reconciled",
+                examined=recovery_summary.examined,
+                applied=recovery_summary.applied,
+                failed=recovery_summary.failed,
+                ambiguous=recovery_summary.ambiguous,
+                deleted_candidates=recovery_summary.deleted_candidates,
+            )
+        if resource_recovery_summary.examined:
+            log.info(
+                "build_services.document_resources_reconciled",
+                imports_examined=resource_recovery_summary.imports_examined,
+                imports_applied=resource_recovery_summary.imports_applied,
+                imports_failed=resource_recovery_summary.imports_failed,
+                imports_ambiguous=resource_recovery_summary.imports_ambiguous,
+                publishes_examined=resource_recovery_summary.publishes_examined,
+                publishes_applied=resource_recovery_summary.publishes_applied,
+                publishes_failed=resource_recovery_summary.publishes_failed,
+                publishes_ambiguous=resource_recovery_summary.publishes_ambiguous,
+                deleted_candidates=resource_recovery_summary.deleted_candidates,
+                promoted_deliverables=resource_recovery_summary.promoted_deliverables,
+            )
     from opensquilla.application.approval_queue import get_approval_queue
 
     _expire_restart_orphaned_approvals(

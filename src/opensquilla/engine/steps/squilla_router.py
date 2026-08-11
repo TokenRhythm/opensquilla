@@ -19,6 +19,8 @@ import structlog
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import lookup_price
 from opensquilla.engine.routing import (
+    ArtifactRoutingFacts,
+    ArtifactRoutingUnavailableError,
     BudgetGateInput,
     CalibrationState,
     PolicyInputs,
@@ -26,6 +28,7 @@ from opensquilla.engine.routing import (
     RoutingPolicyEngine,
     TierCapability,
     calibration_path,
+    effective_artifact_floor,
     load_calibration,
     provider_mismatch,
     provider_mismatch_veto,
@@ -80,9 +83,28 @@ _router_runtime_warning_lock = threading.Lock()
 _router_runtime_warning_emitted = False
 _MAX_ROUTING_HISTORY = 5
 _ROUTING_HISTORY_WINDOW = 1800
+
+
+def _artifact_routing_facts_for_turn(ctx: TurnContext) -> ArtifactRoutingFacts | None:
+    """Parse only the bounded artifact enums seeded by the turn runner."""
+
+    artifact_format = ctx.metadata.get("artifact_format")
+    operation_class = ctx.metadata.get("artifact_operation_class")
+    if not isinstance(artifact_format, str) or not isinstance(operation_class, str):
+        return None
+    try:
+        return ArtifactRoutingFacts.from_values(artifact_format, operation_class)
+    except ValueError:
+        # Invalid runtime metadata must not smuggle arbitrary values into router
+        # telemetry or accidentally create a capability floor.
+        return None
+
+
 def _router_text_fallback_chain(
     selected_tier: object,
     tiers: dict,
+    *,
+    minimum_tier: object | None = None,
 ) -> list[dict[str, str]]:
     selected = normalize_text_tier(selected_tier)
     if selected is None:
@@ -92,8 +114,25 @@ def _router_text_fallback_chain(
     except ValueError:
         return []
 
+    minimum = normalize_text_tier(minimum_tier)
+    if minimum is None:
+        candidate_tiers = list(reversed(TEXT_TIERS[:selected_index]))
+    else:
+        try:
+            minimum_index = TEXT_TIERS.index(minimum)
+        except ValueError:
+            return []
+        # Artifact capability floors are hard execution constraints, including
+        # provider fallback. Prefer the nearest lower capable tier first, then
+        # progressively stronger tiers. This preserves normal router behavior
+        # while ensuring c2/c3 mutations can never fall through to c1/c0.
+        candidate_tiers = [
+            *reversed(TEXT_TIERS[minimum_index:selected_index]),
+            *TEXT_TIERS[selected_index + 1 :],
+        ]
+
     chain: list[dict[str, str]] = []
-    for tier_name in reversed(TEXT_TIERS[:selected_index]):
+    for tier_name in candidate_tiers:
         tier_cfg = tiers.get(tier_name)
         if not isinstance(tier_cfg, dict) or tier_cfg.get("image_only", False):
             continue
@@ -118,31 +157,109 @@ class RoutingHistoryStore:
 
     def __init__(self, max_entries: int = _MAX_ROUTING_HISTORY) -> None:
         self._entries: dict[str, list[dict]] = {}
+        self._next_turn_indexes: dict[str, int] = {}
         self._max_entries = max_entries
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _inferred_next_turn_index(entries: list[dict]) -> int:
+        indexes = [
+            value
+            for entry in entries
+            if isinstance(entry, dict)
+            and isinstance((value := entry.get("turn_index")), int)
+            and not isinstance(value, bool)
+            and value >= 0
+        ]
+        return max(indexes, default=-1) + 1
 
     def get(self, session_key: str) -> list[dict] | None:
-        return self._entries.get(session_key)
+        with self._lock:
+            return self._entries.get(session_key)
 
     def set(self, session_key: str, value: list[dict]) -> None:
-        self._entries[session_key] = value
+        with self._lock:
+            self._entries[session_key] = value
+            inferred = self._inferred_next_turn_index(value)
+            self._next_turn_indexes[session_key] = max(
+                self._next_turn_indexes.get(session_key, 0),
+                inferred,
+            )
 
     def setdefault(self, session_key: str, default: list[dict]) -> list[dict]:
-        return self._entries.setdefault(session_key, default)
+        with self._lock:
+            if session_key not in self._entries:
+                self._entries[session_key] = default
+                self._next_turn_indexes[session_key] = self._inferred_next_turn_index(default)
+            return self._entries[session_key]
 
     def length(self, session_key: str) -> int:
-        return len(self._entries.get(session_key, []))
+        with self._lock:
+            return len(self._entries.get(session_key, []))
+
+    def seed_next_turn_index(self, session_key: str, next_turn_index: int) -> None:
+        """Advance a session sequence from a persisted ``MAX + 1`` seed."""
+
+        if isinstance(next_turn_index, bool) or next_turn_index < 0:
+            return
+        with self._lock:
+            self._next_turn_indexes[session_key] = max(
+                self._next_turn_indexes.get(session_key, 0),
+                next_turn_index,
+            )
+
+    def reserve_turn_index(self, session_key: str) -> int:
+        """Atomically reserve the next process-local index for one session."""
+
+        with self._lock:
+            if session_key not in self._next_turn_indexes:
+                self._next_turn_indexes[session_key] = self._inferred_next_turn_index(
+                    self._entries.get(session_key, [])
+                )
+            turn_index = self._next_turn_indexes[session_key]
+            self._next_turn_indexes[session_key] = turn_index + 1
+            return turn_index
+
+    def append(
+        self,
+        session_key: str,
+        entry: dict,
+        *,
+        max_entries: int | None = None,
+    ) -> list[dict]:
+        """Append and bound one history entry under the store lock."""
+
+        bound = self._max_entries if max_entries is None else max(1, max_entries)
+        with self._lock:
+            history = [*self._entries.get(session_key, ()), entry]
+            if len(history) > bound:
+                history = history[-bound:]
+            self._entries[session_key] = history
+            inferred = self._inferred_next_turn_index(history)
+            self._next_turn_indexes[session_key] = max(
+                self._next_turn_indexes.get(session_key, 0),
+                inferred,
+            )
+            return list(history)
 
     def clear(self) -> None:
-        self._entries.clear()
+        with self._lock:
+            self._entries.clear()
+            self._next_turn_indexes.clear()
 
     def evict(self, session_key: str) -> bool:
-        return self._entries.pop(session_key, None) is not None
+        with self._lock:
+            return self._entries.pop(session_key, None) is not None
 
 
 _history_store = RoutingHistoryStore()
 
 
-def seed_routing_history(entries_by_session: dict[str, list[dict]]) -> int:
+def seed_routing_history(
+    entries_by_session: dict[str, list[dict]],
+    *,
+    next_turn_indexes: dict[str, int] | None = None,
+) -> int:
     """Seed the in-process history store from persisted decision records.
 
     Boot-time rehydration hook (see engine/steps/router_decision_record.py):
@@ -159,14 +276,32 @@ def seed_routing_history(entries_by_session: dict[str, list[dict]]) -> int:
             session_key,
             [dict(entry) for entry in entries][-_MAX_ROUTING_HISTORY:],
         )
+        if next_turn_indexes is not None:
+            persisted_next = next_turn_indexes.get(session_key)
+            if isinstance(persisted_next, int):
+                _history_store.seed_next_turn_index(session_key, persisted_next)
         seeded += 1
+    if next_turn_indexes is not None:
+        for session_key, persisted_next in next_turn_indexes.items():
+            if session_key and isinstance(persisted_next, int):
+                _history_store.seed_next_turn_index(session_key, persisted_next)
     return seeded
 
 
 _DEFER_ROUTING_HISTORY_KEY = "_defer_squilla_router_history"
 _PENDING_ROUTING_HISTORY_ENTRY_KEY = "_pending_squilla_router_history_entry"
 _PENDING_ROUTING_HISTORY_SESSION_KEY = "_pending_squilla_router_history_session"
+_ROUTING_TURN_INDEX_KEY = "routing_turn_index"
 _THINKING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "adaptive"}
+
+
+def _ensure_routing_turn_index(ctx: TurnContext) -> int:
+    existing = ctx.metadata.get(_ROUTING_TURN_INDEX_KEY)
+    if isinstance(existing, int) and not isinstance(existing, bool) and existing >= 0:
+        return existing
+    turn_index = _history_store.reserve_turn_index(ctx.session_key)
+    ctx.metadata[_ROUTING_TURN_INDEX_KEY] = turn_index
+    return turn_index
 
 
 def _routing_history_entry(
@@ -184,16 +319,24 @@ def _routing_history_entry(
     }
 
 
-def _append_routing_history(session_key: str, entry_payload: dict) -> list[dict]:
-    history = _history_store.setdefault(session_key, [])
+def _append_routing_history(
+    session_key: str,
+    entry_payload: dict,
+    *,
+    turn_index: int | None = None,
+) -> list[dict]:
+    if turn_index is None:
+        turn_index = _history_store.reserve_turn_index(session_key)
     entry = {
-        "turn_index": len(history),
+        "turn_index": turn_index,
         "_ts": time.monotonic(),
         **entry_payload,
     }
-    history.append(entry)
-    if len(history) > _MAX_ROUTING_HISTORY:
-        _history_store.set(session_key, history[-_MAX_ROUTING_HISTORY:])
+    history = _history_store.append(
+        session_key,
+        entry,
+        max_entries=_MAX_ROUTING_HISTORY,
+    )
     log.debug(
         "squilla_router.history_appended",
         session=session_key,
@@ -201,7 +344,7 @@ def _append_routing_history(session_key: str, entry_payload: dict) -> list[dict]
         route_class=entry.get("route_class"),
         total_history=_history_store.length(session_key),
     )
-    return _history_store.get(session_key) or []
+    return history
 
 
 def commit_deferred_router_history(ctx: TurnContext) -> TurnContext:
@@ -211,7 +354,12 @@ def commit_deferred_router_history(ctx: TurnContext) -> TurnContext:
     session_key = ctx.metadata.pop(_PENDING_ROUTING_HISTORY_SESSION_KEY, ctx.session_key)
     ctx.metadata.pop(_DEFER_ROUTING_HISTORY_KEY, None)
     if isinstance(entry_payload, dict):
-        ctx.metadata["routing_history"] = _append_routing_history(session_key, entry_payload)
+        turn_index = ctx.metadata.get("routing_turn_index")
+        ctx.metadata["routing_history"] = _append_routing_history(
+            session_key,
+            entry_payload,
+            turn_index=(turn_index if isinstance(turn_index, int) else None),
+        )
     return ctx
 
 
@@ -1071,9 +1219,6 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         return ctx
 
     tiers = getattr(router_cfg, "tiers", {})
-    if not tiers:
-        return ctx
-
     semantic_message = getattr(ctx, "semantic_message", None)
     if semantic_message is None:
         semantic_message = getattr(ctx, "raw_message", None)
@@ -1084,6 +1229,27 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         return ctx
 
     rollout_phase: str = getattr(router_cfg, "rollout_phase", "observe")
+    artifact_facts = _artifact_routing_facts_for_turn(ctx)
+    if not tiers:
+        if artifact_facts is not None:
+            raise ArtifactRoutingUnavailableError(artifact_facts, [])
+        return ctx
+
+    # Resolve the hard Artifact floor before every router shortcut. This keeps
+    # hold, classify, and empty-text turns on the same fail-closed contract.
+    valid_tiers = [name for name, tier in tiers.items() if not tier.get("image_only", False)]
+    valid_tiers = sorted(
+        valid_tiers,
+        key=lambda name: (0, tier_index(name)) if tier_index(name) >= 0 else (1, 0),
+    )
+    artifact_floor = effective_artifact_floor(artifact_facts, valid_tiers)
+    if artifact_facts is not None and artifact_floor is None:
+        raise ArtifactRoutingUnavailableError(artifact_facts, valid_tiers)
+
+    # This sequence is independent of the bounded sticky-routing history. It is
+    # reserved before any shortcut or classifier path so every persisted router
+    # decision in the session receives one monotonic identity.
+    routing_turn_index = _ensure_routing_turn_index(ctx)
 
     # Image-aware routing: skip ML and pick directly from supports_image tiers
     # for current uploads. Historical images require the upstream semantic
@@ -1155,21 +1321,48 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         log.debug("squilla_router.image_routed", tier=decision.tier, model=decision.model)
         return ctx
 
-    # Empty-text guard for the ML text classifier: only reached for non-image
-    # turns (the vision bypass above already handled empty-caption images).
+    # Empty routing text cannot be classified, but a validated Artifact mutation
+    # still has a deterministic capability floor and must route to it. This is
+    # only reached for non-image turns; the vision bypass handles empty captions.
     if not routing_message.strip():
+        if artifact_facts is None:
+            return ctx
+        assert artifact_floor is not None
+        tier_cfg = tiers[artifact_floor]
+        decision = RoutingDecision(
+            tier=artifact_floor,
+            model=tier_cfg.get("model", ctx.model),
+            confidence=1.0,
+            source="artifact_floor",
+        )
+        ctx.metadata.update(artifact_facts.to_telemetry())
+        ctx.metadata["artifact_floor_applied"] = True
+        ctx.metadata["baseline_model"] = ctx.model
+        ctx.model = decision.model
+        ctx.metadata["routed_tier"] = decision.tier
+        ctx.metadata["routed_model"] = decision.model
+        ctx.metadata["routing_applied"] = True
+        ctx.metadata["rollout_phase"] = rollout_phase
+        ctx.metadata["applied_model"] = ctx.model
+        ctx.metadata["routing_confidence"] = decision.confidence
+        ctx.metadata["routing_source"] = decision.source
+        ctx.metadata["router_fallback_chain"] = _router_text_fallback_chain(
+            decision.tier,
+            tiers,
+            minimum_tier=artifact_facts.minimum_tier,
+        )
+        ctx.metadata["router_fallback_strict"] = True
+        ctx.metadata.update(_compute_savings(decision.model, tiers))
+        _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=True)
+        _record_thinking_metadata(ctx, router_cfg, tier_cfg)
+        stage_router_decision(ctx, decision=decision)
+        log.debug(
+            "squilla_router.empty_artifact_routed",
+            tier=decision.tier,
+            model=decision.model,
+        )
         return ctx
 
-    # Order valid_tiers by the canonical c0<c1<c2<c3 ladder rather than TOML
-    # insertion order — downstream policy stages rank tiers by position in this
-    # list, so trusting declaration order inverted upgrades/holds for configs
-    # that list tiers out of order. Unknown/custom tier names (tier_index == -1)
-    # sort after the canonical ones, preserving their relative order (stable).
-    valid_tiers = [name for name, tier in tiers.items() if not tier.get("image_only", False)]
-    valid_tiers = sorted(
-        valid_tiers,
-        key=lambda name: (0, tier_index(name)) if tier_index(name) >= 0 else (1, 0),
-    )
     if not valid_tiers:
         return ctx
 
@@ -1183,6 +1376,23 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                 confidence=1.0,
                 source="router_control_hold",
             )
+            if (
+                artifact_facts is not None
+                and artifact_floor is not None
+                and tier_index(decision.tier) < tier_index(artifact_floor)
+            ):
+                decision = RoutingDecision(
+                    tier=artifact_floor,
+                    model=tiers[artifact_floor].get("model", decision.model),
+                    confidence=decision.confidence,
+                    source="artifact_floor",
+                )
+                ctx.metadata.update(artifact_facts.to_telemetry())
+                ctx.metadata["artifact_floor_applied"] = True
+                ctx.metadata["artifact_floor_from_tier"] = hold.tier
+            elif artifact_facts is not None:
+                ctx.metadata.update(artifact_facts.to_telemetry())
+                ctx.metadata["artifact_floor_applied"] = False
             ctx.metadata["baseline_model"] = ctx.model
             ctx.model = decision.model
             ctx.metadata["routed_tier"] = decision.tier
@@ -1194,7 +1404,12 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             ctx.metadata["router_fallback_chain"] = _router_text_fallback_chain(
                 decision.tier,
                 tiers,
+                minimum_tier=(
+                    artifact_facts.minimum_tier if artifact_facts is not None else None
+                ),
             )
+            if artifact_facts is not None:
+                ctx.metadata["router_fallback_strict"] = True
             ctx.metadata["router_control_hold_applied"] = True
             ctx.metadata["router_control_action"] = "set_hold"
             ctx.metadata["router_control_target_tier"] = hold.tier
@@ -1285,7 +1500,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         train_features = extra.pop("_train_features", None)
         if train_features is not None:
             ctx.metadata["routing_train_features"] = train_features
-            ctx.metadata["routing_train_turn_index"] = len(routing_history or [])
+            ctx.metadata["routing_train_turn_index"] = routing_turn_index
 
     if tier_name is None or tier_name not in tiers:
         default = normalize_text_tier(getattr(router_cfg, "default_tier", DEFAULT_TEXT_TIER))
@@ -1365,6 +1580,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             ),
             calibration=_calibration_for_turn(router_cfg),
             budget=budget_input,
+            artifact=artifact_facts,
         )
     )
     decision = policy_result.decision
@@ -1373,12 +1589,20 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     ctx.metadata.update(policy_result.metadata_updates)
     _log_budget_outcome(ctx)
 
-    routing_applied = rollout_phase != "observe"
+    # Artifact floors are execution constraints, not observe-only telemetry.
+    routing_applied = rollout_phase != "observe" or artifact_facts is not None
+    provider_valid_tiers = valid_tiers
+    if artifact_floor is not None:
+        provider_valid_tiers = [
+            tier
+            for tier in valid_tiers
+            if tier_index(tier) >= tier_index(artifact_floor)
+        ]
     decision, thinking_mode, prompt_policy = _apply_provider_mismatch_veto(
         ctx,
         router_cfg,
         tiers,
-        valid_tiers,
+        provider_valid_tiers,
         decision,
         thinking_mode,
         prompt_policy,
@@ -1396,7 +1620,10 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     ctx.metadata["router_fallback_chain"] = _router_text_fallback_chain(
         decision.tier,
         tiers,
+        minimum_tier=(artifact_facts.minimum_tier if artifact_facts is not None else None),
     )
+    if artifact_facts is not None:
+        ctx.metadata["router_fallback_strict"] = True
     ctx.metadata.update(_compute_savings(decision.model, tiers))
     _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=routing_applied)
 
@@ -1445,7 +1672,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                 ctx.metadata[_PENDING_ROUTING_HISTORY_SESSION_KEY] = ctx.session_key
                 local_history = list(routing_history or [])
                 local_entry = {
-                    "turn_index": len(local_history),
+                    "turn_index": routing_turn_index,
                     "_ts": time.monotonic(),
                     **entry_payload,
                 }
@@ -1456,6 +1683,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                 ctx.metadata["routing_history"] = _append_routing_history(
                     ctx.session_key,
                     entry_payload,
+                    turn_index=routing_turn_index,
                 )
 
     # Pull observability fields from routing_extra so operators can see

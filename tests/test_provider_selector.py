@@ -164,6 +164,67 @@ def test_override_model_with_router_fallback_chain_prefers_lower_tiers(monkeypat
     assert [cfg.model for cfg in built] == resolved_models
 
 
+def test_strict_router_fallback_chain_discards_configured_lower_tail(monkeypatch) -> None:
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", lambda cfg: cfg)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="openrouter",
+                model=BASELINE_MODEL,
+                api_key="sk-test",
+                base_url="https://openrouter.ai/api",
+            ),
+            fallbacks=[
+                ProviderConfig(
+                    provider="openrouter",
+                    model=LOW_TIER_MODEL,
+                    api_key="sk-test",
+                    base_url="https://openrouter.ai/api",
+                )
+            ],
+        )
+    )
+
+    selector.override_model_with_fallback_chain(
+        HIGH_TIER_MODEL,
+        [{"tier": "c2", "provider": "openrouter", "model": MID_TIER_MODEL}],
+        preserve_existing_tail=False,
+    )
+
+    assert [cfg.model for cfg in selector.remaining_chain()] == [
+        HIGH_TIER_MODEL,
+        MID_TIER_MODEL,
+    ]
+
+
+def test_strict_empty_router_fallback_chain_removes_every_lower_model(monkeypatch) -> None:
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", lambda cfg: cfg)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="openrouter",
+                model=BASELINE_MODEL,
+                api_key="sk-test",
+            ),
+            fallbacks=[
+                ProviderConfig(
+                    provider="openrouter",
+                    model=LOW_TIER_MODEL,
+                    api_key="sk-test",
+                )
+            ],
+        )
+    )
+
+    selector.override_model_with_fallback_chain(
+        HIGH_TIER_MODEL,
+        [],
+        preserve_existing_tail=False,
+    )
+
+    assert [cfg.model for cfg in selector.remaining_chain()] == [HIGH_TIER_MODEL]
+
+
 # A synthetic, public-dummy credential: it only exists to prove redaction.
 FAKE_LEAKED_KEY = "sk-test-000fakefakefakefake"
 

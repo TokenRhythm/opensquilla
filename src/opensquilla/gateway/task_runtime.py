@@ -310,6 +310,8 @@ class TaskRun:
     persist_input: bool = False
     history_has_persisted_user: bool = True
     goal_context: Mapping[str, Any] | None = field(default=None, repr=False)
+    # Internal-only sink for the runtime-owned document mutation receipt.
+    document_mutation_outcome_sink: Callable[[dict[str, Any]], None] | None = None
 
     @property
     def session_key(self) -> str:
@@ -400,6 +402,7 @@ class _RuntimeTask:
     fresh_user_session: bool = False
     terminal_assistant_message_id: str | None = None
     terminal_assistant_message_content: str | None = None
+    document_mutation_outcome: dict[str, Any] | None = None
     stream_event_sink: TaskStreamEventSink | None = None
     accepted_config: Any | None = None
     provider_request_correlation: ProviderRequestCorrelation | None = field(
@@ -455,6 +458,9 @@ class _RuntimeTask:
     ) -> None:
         self.terminal_assistant_message_id = message_id
         self.terminal_assistant_message_content = content
+
+    def capture_document_mutation_outcome(self, outcome: dict[str, Any]) -> None:
+        self.document_mutation_outcome = dict(outcome)
 
 
 @dataclass
@@ -3470,6 +3476,9 @@ class TaskRuntime:
                             if task.run_kind == "channel_turn"
                             else None
                         ),
+                        document_mutation_outcome_sink=(
+                            task.capture_document_mutation_outcome
+                        ),
                     )
                     from opensquilla.session.turn_context import turn_context_scope
 
@@ -5659,7 +5668,12 @@ class TaskRuntime:
             details["cancellation"] = cancellation
         details.pop("cancellation_requested", None)
         if status == AgentTaskStatus.SUCCEEDED:
-            details["turn_outcome"] = completed_outcome().to_dict()
+            turn_outcome = completed_outcome().to_dict()
+            if task.document_mutation_outcome is not None:
+                turn_outcome["documentMutationOutcome"] = dict(
+                    task.document_mutation_outcome
+                )
+            details["turn_outcome"] = turn_outcome
             if task.terminal_assistant_message_content is not None:
                 # This is a compact durable channel outbox payload. It keeps
                 # delivery exact after compaction/reset and avoids inferring
@@ -5680,6 +5694,10 @@ class TaskRuntime:
             ).to_dict()
             if cancellation is not None:
                 turn_outcome["cancellation_source"] = cancellation["source"]
+            if task.document_mutation_outcome is not None:
+                turn_outcome["documentMutationOutcome"] = dict(
+                    task.document_mutation_outcome
+                )
             details["turn_outcome"] = turn_outcome
         if outcome is not None:
             details["subagent_group_outcome"] = outcome

@@ -692,6 +692,28 @@ def test_build_task_runtime_run_kwargs_forwards_exact_assistant_sink() -> None:
     assert kwargs["assistant_message_sink"] is sink
 
 
+def test_build_task_runtime_run_kwargs_forwards_document_mutation_outcome_sink() -> None:
+    def sink(_outcome: dict[str, Any]) -> None:
+        return None
+
+    run = SimpleNamespace(
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        persisted_user_message_id="msg-123",
+        document_mutation_outcome_sink=sink,
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["document_mutation_outcome_sink"] is sink
+
+
 def test_gateway_stream_timeout_config_defaults_remain_serializable() -> None:
     config = GatewayConfig()
 

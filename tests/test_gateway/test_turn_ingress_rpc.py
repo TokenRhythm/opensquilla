@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,6 +14,15 @@ from typing import Any
 
 import pytest
 
+from opensquilla.artifact_session import (
+    Actor,
+    ActorKind,
+    AnchorKind,
+    ArtifactBlobRef,
+    ArtifactKind,
+    ArtifactSessionService,
+    PromptAnnotationStatus,
+)
 from opensquilla.engine.steps.meta_command import (
     format_meta_replay_sentinel,
     meta_command_launch,
@@ -22,15 +32,24 @@ from opensquilla.engine.steps.meta_command import (
     pending_meta_launch_state,
 )
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
+from opensquilla.gateway.artifact_contexts import (
+    PROMPT_ANNOTATION_TOOL_NAMES,
+)
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.session.goals import GoalCommandRequest, StartGoalMutation, new_goal
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, TranscriptEntry
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
+    TranscriptEntry,
+    TurnIngressReceipt,
+)
+from opensquilla.session.storage import SessionStorage, TurnAcceptanceResult
 from opensquilla.session.turn_context import current_turn_context, turn_context_scope
 
 SESSION_KEY = "agent:main:webchat:atomic-ingress"
@@ -210,6 +229,177 @@ async def _seed_idle_active_goal(stack: _RealIngressStack) -> Any:
     return settled
 
 
+async def _create_html_prompt_annotation(
+    stack: _RealIngressStack,
+    *,
+    annotation_id: str,
+) -> tuple[ArtifactSessionService, Any]:
+    service = await ArtifactSessionService.from_session_storage(stack.storage)
+    created = await service.create_document(
+        session_key=SESSION_KEY,
+        session_id=stack.session_id,
+        name="page.html",
+        kind=ArtifactKind.HTML,
+        initial_artifact=ArtifactBlobRef(
+            artifact_id=f"artifact-{annotation_id}",
+            sha256="b" * 64,
+            filename="page.html",
+            media_type="text/html",
+            byte_size=22,
+        ),
+        actor=Actor(ActorKind.USER, "user-1"),
+    )
+    anchor = await service.create_anchor(
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        kind=AnchorKind.DOM_SOURCE,
+        locator={
+            "start_offset": 6,
+            "start_tag_end_offset": 10,
+            "tag_name": "h1",
+            "source_sha256": "b" * 64,
+            "offset_encoding": "unicode_code_points",
+        },
+        quote="<h1>",
+        actor=Actor(ActorKind.USER, "user-1"),
+    )
+    draft = await service.create_prompt_annotation(
+        annotation_id=annotation_id,
+        session_key=SESSION_KEY,
+        session_id=stack.session_id,
+        session_epoch=0,
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        anchor_id=anchor.anchor_id,
+        body="Change this heading to Accepted.",
+    )
+    return service, draft
+
+
+@pytest.mark.asyncio
+async def test_chat_send_atomically_consumes_prompt_annotations_into_runtime_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        stack.context.config.naming.enabled = True
+        await stack.manager.update(SESSION_KEY, display_name="WebChat")
+        scheduled_titles: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def _record_auto_title(*args: Any, **kwargs: Any) -> None:
+            scheduled_titles.append((args, kwargs))
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.rpc_sessions._schedule_auto_title",
+            _record_auto_title,
+        )
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-ingress-1",
+        )
+
+        response = await get_dispatcher().dispatch(
+            "rpc-prompt-annotation-ingress",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "",
+                "clientRequestId": "prompt-annotation-ingress-1",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+
+        assert response.payload["acceptedPromptAnnotationIds"] == [draft.annotation_id]
+        sent = await service.get_prompt_annotation(draft.annotation_id)
+        assert sent.status is PromptAnnotationStatus.SENT
+        assert sent.sent_message_id == response.payload["user_message_id"]
+        assert sent.sent_turn_id == response.payload["task_id"]
+        entries = await stack.storage.get_transcript(stack.session_id)
+        envelope = json.loads(entries[-1].content)
+        assert envelope["prompt_annotations"][0]["annotationId"] == draft.annotation_id
+        assert envelope["prompt_annotations"][0]["body"] == draft.body
+
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        bound = runtime_task.envelope.runtime_services["artifact_context"]
+        assert bound.operation_class == "selection_edit"
+        assert bound.annotation_ids == (draft.annotation_id,)
+        assert bound.tool_names == PROMPT_ANNOTATION_TOOL_NAMES
+        assert "document_apply" in bound.request_context_prompt
+        assert "html_edit_source" not in bound.request_context_prompt
+        assert "version=" not in bound.request_context_prompt
+        assert scheduled_titles == []
+
+        replay = await get_dispatcher().dispatch(
+            "rpc-prompt-annotation-ingress-replay",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "",
+                "clientRequestId": "prompt-annotation-ingress-1",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+        assert replay.error is None, replay.error
+        assert replay.payload["replayed"] is True
+        assert replay.payload["acceptedPromptAnnotationIds"] == [draft.annotation_id]
+        assert scheduled_titles == []
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+@pytest.mark.asyncio
+async def test_chat_send_first_ordinary_turn_schedules_auto_title_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        stack.context.config.naming.enabled = True
+        await stack.manager.update(SESSION_KEY, display_name="WebChat")
+        scheduled_titles: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def _record_auto_title(*args: Any, **kwargs: Any) -> None:
+            scheduled_titles.append((args, kwargs))
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.rpc_sessions._schedule_auto_title",
+            _record_auto_title,
+        )
+        params = {
+            "sessionKey": SESSION_KEY,
+            "message": "Name this ordinary first turn.",
+            "clientRequestId": "ordinary-first-turn-naming",
+        }
+
+        response = await get_dispatcher().dispatch(
+            "rpc-ordinary-first-turn-naming",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+        assert len(scheduled_titles) == 1
+        assert scheduled_titles[0][0][2] == "Name this ordinary first turn."
+        assert scheduled_titles[0][1]["enabled"] is True
+
+        replay = await get_dispatcher().dispatch(
+            "rpc-ordinary-first-turn-naming-replay",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert replay.error is None, replay.error
+        assert replay.payload["replayed"] is True
+        assert len(scheduled_titles) == 1
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("control_kind", "message", "request_id", "correlation_id", "stage_options"),
@@ -368,6 +558,143 @@ async def test_default_turn_claims_goal_inside_atomic_acceptance_without_pre_rea
         # the acceptance transaction.
         current_goal = await original_get_goal(SESSION_KEY)
         assert current_goal is not None and current_goal.goal_id == seeded_goal.goal_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {"type": "image/png", "name": "synthetic.png", "data": "aW1hZ2U="},
+        {"type": "text/plain", "name": "synthetic.txt", "data": "dGV4dA=="},
+    ],
+    ids=["image", "file"],
+)
+async def test_prompt_annotations_reject_attachments_before_runtime_acceptance(
+    tmp_path: Path,
+    attachment: dict[str, str],
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-with-attachment",
+        )
+
+        response = await get_dispatcher().dispatch(
+            "rpc-prompt-annotation-attachment-rejected",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Apply this annotation and inspect the image.",
+                "clientRequestId": "prompt-annotation-attachment-rejected",
+                "promptAnnotationIds": [draft.annotation_id],
+                "attachments": [attachment],
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "PROMPT_ANNOTATION_ATTACHMENTS_UNSUPPORTED"
+        assert response.error.accepted is False
+        assert (await service.get_prompt_annotation(draft.annotation_id)).status is (
+            PromptAnnotationStatus.DRAFT
+        )
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+        assert stack.handler_started.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_annotations_reject_plan_mode_before_runtime_acceptance(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-in-plan-mode",
+        )
+        await stack.storage.set_collaboration_mode(
+            SESSION_KEY,
+            "plan",
+            expected_revision=0,
+        )
+
+        response = await get_dispatcher().dispatch(
+            "rpc-prompt-annotation-plan-rejected",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Apply this annotation while planning.",
+                "clientRequestId": "prompt-annotation-plan-rejected",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "ARTIFACT_PROMPT_ANNOTATIONS_PLAN_UNSUPPORTED"
+        assert response.error.accepted is False
+        assert (await service.get_prompt_annotation(draft.annotation_id)).status is (
+            PromptAnnotationStatus.DRAFT
+        )
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+        assert stack.handler_started.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_annotation_attachment_rule_runs_after_receipt_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        params = {
+            "sessionKey": SESSION_KEY,
+            "message": "Legacy accepted annotation with an image.",
+            "clientRequestId": "legacy-annotation-attachment",
+            "promptAnnotationIds": ["legacy-annotation"],
+            "attachments": [{"type": "image/png", "name": "legacy.png"}],
+        }
+        receipt = TurnIngressReceipt(
+            source_scope="web:web:operator",
+            request_session_key=SESSION_KEY,
+            client_request_id="legacy-annotation-attachment",
+            request_fingerprint=request_fingerprint(params),
+            accepted_session_key=SESSION_KEY,
+            session_id=stack.session_id,
+            message_id="legacy-message",
+            task_id=None,
+            accepted_at=1,
+        )
+
+        async def _replay(**_kwargs: object) -> TurnAcceptanceResult:
+            return TurnAcceptanceResult(
+                receipt=receipt,
+                replayed=True,
+                fresh_user_session=False,
+            )
+
+        monkeypatch.setattr(stack.storage, "replay_turn_ingress_receipt", _replay)
+
+        response = await get_dispatcher().dispatch(
+            "rpc-legacy-prompt-annotation-attachment-replay",
+            "chat.send",
+            params,
+            stack.context,
+        )
+
+        assert response.error is None, response.error
+        assert response.payload["replayed"] is True
+        assert response.payload["acceptedPromptAnnotationIds"] == ["legacy-annotation"]
+        _assert_no_runtime_acceptance_state(stack.runtime)
+        assert stack.handler_started.is_set() is False
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,12 @@ from uuid import uuid4
 
 import structlog
 
+from opensquilla.artifact_session import (
+    ArtifactSessionService,
+    MutationAttempt,
+    MutationAttemptStatus,
+    document_mutation_outcome_from_attempt,
+)
 from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.chat.source import chat_source_metadata
@@ -189,49 +195,108 @@ async def _chat_history_turn_outcomes(
         return outcomes
 
     missing_turn_ids = turn_ids - outcomes_by_turn.keys()
-    if not missing_turn_ids:
-        return _sorted_outcomes()
-
     storage = get_session_storage(getattr(ctx, "session_manager", None))
     exact_tasks = getattr(storage, "get_agent_tasks_by_ids", None)
     get_task = getattr(storage, "get_agent_task", None)
     list_tasks = getattr(storage, "list_agent_tasks", None)
-    try:
-        if callable(exact_tasks):
-            rows = await exact_tasks(sorted(missing_turn_ids))
-        elif callable(get_task):
-            rows = [
-                row
-                for turn_id in sorted(missing_turn_ids)
-                if (row := await get_task(turn_id)) is not None
-            ]
-        elif callable(list_tasks):
-            rows = await list_tasks(session_key=session_key)
-        else:
-            return _sorted_outcomes()
-    except Exception:  # noqa: BLE001 - history remains readable without outcomes.
-        log.warning(
-            "chat.history.turn_outcomes_failed",
-            session_key=session_key,
-            exc_info=True,
+    rows: list[Any] = []
+    if missing_turn_ids:
+        try:
+            if callable(exact_tasks):
+                rows = await exact_tasks(sorted(missing_turn_ids))
+            elif callable(get_task):
+                rows = [
+                    row
+                    for turn_id in sorted(missing_turn_ids)
+                    if (row := await get_task(turn_id)) is not None
+                ]
+            elif callable(list_tasks):
+                rows = await list_tasks(session_key=session_key)
+        except Exception:  # noqa: BLE001 - history remains readable without outcomes.
+            log.warning(
+                "chat.history.turn_outcomes_failed",
+                session_key=session_key,
+                exc_info=True,
+            )
+
+    attempts: tuple[MutationAttempt, ...] = ()
+    if storage is not None and callable(getattr(storage, "_write_transaction", None)):
+        artifact_service: ArtifactSessionService | None = None
+        try:
+            artifact_service = await ArtifactSessionService.from_session_storage(storage)
+            attempts = await artifact_service.list_mutation_attempts_by_turn_ids(
+                session_key=session_key,
+                turn_ids=sorted(turn_ids),
+            )
+        except Exception:  # noqa: BLE001 - transcript and task history remain readable.
+            log.warning(
+                "chat.history.document_mutation_outcomes_failed",
+                session_key=session_key,
+                exc_info=True,
+            )
+        finally:
+            if artifact_service is not None:
+                await artifact_service.close()
+
+    attempts_by_turn_id = {attempt.turn_id: attempt for attempt in attempts}
+
+    def with_ledger_facts(
+        attempt: MutationAttempt,
+        task_outcome: dict[str, Any],
+    ) -> dict[str, Any]:
+        canonical = document_mutation_outcome_from_attempt(attempt)
+        mutation_keys = (
+            "documentMutationOutcome",
+            "document_mutation_outcome",
+            "documentMutation",
+            "document_mutation",
         )
-        return _sorted_outcomes()
+        prior = next(
+            (
+                task_outcome[key]
+                for key in mutation_keys
+                if isinstance(task_outcome.get(key), dict)
+            ),
+            None,
+        )
+        if isinstance(prior, dict):
+            corrected = prior.get("corrected")
+            if isinstance(corrected, bool):
+                canonical["corrected"] = corrected
+            proposal_attempts = prior.get("proposalAttempts")
+            if (
+                isinstance(proposal_attempts, int)
+                and not isinstance(proposal_attempts, bool)
+                and proposal_attempts >= 0
+            ):
+                canonical["proposalAttempts"] = proposal_attempts
+        projected = {key: value for key, value in task_outcome.items() if key not in mutation_keys}
+        projected["documentMutationOutcome"] = canonical
+        return projected
 
     for row in rows:
+        row_session_key = getattr(row, "session_key", None)
+        if isinstance(row_session_key, str) and row_session_key != session_key:
+            continue
         task_id = getattr(row, "task_id", None)
         details = getattr(row, "details", None)
         details = details if isinstance(details, dict) else {}
         turn_id = details.get("turn_id") or task_id
+        if not isinstance(turn_id, str) or turn_id not in missing_turn_ids:
+            continue
+        attempt = attempts_by_turn_id.pop(turn_id, None)
         status = getattr(row, "status", None)
         status = str(getattr(status, "value", status) or "")
         outcome = terminal_turn_outcome(status, details.get("turn_outcome"))
         if outcome is None:
-            continue
-        if (
-            not isinstance(turn_id, str)
-            or turn_id not in missing_turn_ids
-        ):
-            continue
+            if attempt is None:
+                continue
+            outcome = {
+                "kind": "unknown",
+                "reason": "mutation_ledger_with_nonterminal_task",
+            }
+        if attempt is not None:
+            outcome = with_ledger_facts(attempt, outcome)
         outcomes_by_turn[turn_id] = {
             "turn_id": turn_id,
             "task_id": task_id,
@@ -239,6 +304,32 @@ async def _chat_history_turn_outcomes(
             "started_at": getattr(row, "started_at", None),
             "finished_at": getattr(row, "finished_at", None),
             "outcome": outcome,
+        }
+    for turn_id, attempt in attempts_by_turn_id.items():
+        existing = outcomes_by_turn.get(turn_id)
+        if existing is not None:
+            existing_outcome = existing.get("outcome")
+            existing["outcome"] = with_ledger_facts(
+                attempt,
+                existing_outcome if isinstance(existing_outcome, dict) else {},
+            )
+            continue
+        # The durable side-effect fact remains useful after a crash even when
+        # no task row survived.  Keep the generic turn state explicitly
+        # unknown instead of manufacturing a successful completion.
+        outcomes_by_turn[turn_id] = {
+            "turn_id": turn_id,
+            "task_id": None,
+            "status": "unknown",
+            "started_at": attempt.created_at,
+            "finished_at": (
+                None if attempt.status is MutationAttemptStatus.RESERVED else attempt.updated_at
+            ),
+            "outcome": {
+                "kind": "unknown",
+                "reason": "mutation_ledger_without_task",
+                "documentMutationOutcome": document_mutation_outcome_from_attempt(attempt),
+            },
         }
     return _sorted_outcomes()
 
@@ -534,6 +625,8 @@ async def _enforce_context_overflow(
     ctx: RpcContext,
     session_key: str,
     message: str,
+    *,
+    restricted_turn: bool = False,
 ) -> dict | None:
     """Apply the configured context-overflow policy before a turn runs.
 
@@ -599,15 +692,14 @@ async def _enforce_context_overflow(
             transcript=transcript,
             session_key=session_key,
             session_manager=ctx.session_manager,
-            compaction_config=await _build_context_overflow_compaction_config(
-                ctx, session_key
-            ),
+            compaction_config=await _build_context_overflow_compaction_config(ctx, session_key),
             flush_service=getattr(ctx, "flush_service", None),
             compaction_marker=getattr(ctx, "turn_runner", None),
             policy_override=policy_override,
             budget_override=budget_override,
             provider_request_correlation=provider_request_correlation,
             root_operation_id=root_operation_id,
+            restricted_turn=restricted_turn,
         )
 
     if outcome.refusal is not None:
@@ -637,16 +729,26 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
     agent_id = parse_agent_id(session_key)
     initial_collaboration_mode = _requested_initial_collaboration_mode(params)
+    prompt_annotation_ids = params.get(
+        "promptAnnotationIds",
+        params.get("prompt_annotation_ids"),
+    )
+    if prompt_annotation_ids is not None:
+        if not isinstance(prompt_annotation_ids, list):
+            raise ValueError("params.promptAnnotationIds must be an array")
+        if any(not isinstance(item, str) or not item.strip() for item in prompt_annotation_ids):
+            raise ValueError("params.promptAnnotationIds must contain non-empty strings")
+        prompt_annotation_ids = [item.strip() for item in prompt_annotation_ids]
 
     # Fresh-WebUI / smoke path: when no session manager is wired (webui
     # simulator, dispatcher-only boot), instant-accept without kicking off a
     # turn. This matches the roundtrip the WebUI observes on first paint
     # before the sessions engine is attached.
     if ctx.session_manager is None:
+        if prompt_annotation_ids:
+            raise RpcUnavailableError("Artifact context requires durable session storage")
         if initial_collaboration_mode is not None:
-            raise RpcUnavailableError(
-                "Initial collaboration mode requires atomic turn acceptance"
-            )
+            raise RpcUnavailableError("Initial collaboration mode requires atomic turn acceptance")
         return {"ok": True, "sessionKey": session_key, "instant_accept": True}
 
     mgr = _require_chat_session_manager(ctx)
@@ -654,8 +756,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     intent_was_provided = intent is not None
     requested_intent = intent
     if intent is None and (
-        isinstance(params.get("workspaceId"), str)
-        or isinstance(params.get("workspace_id"), str)
+        isinstance(params.get("workspaceId"), str) or isinstance(params.get("workspace_id"), str)
     ):
         # A project draft is always a first-turn request. Keeping this intent
         # stable on retries lets sessions.send consult the durable ingress
@@ -678,9 +779,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
                     if await get_session(session_key) is None:
                         intent = "new_chat"
                 except Exception as exc:
-                    raise RpcUnavailableError(
-                        f"Failed to inspect chat session: {exc}"
-                    ) from exc
+                    raise RpcUnavailableError(f"Failed to inspect chat session: {exc}") from exc
             else:
                 # Compatibility for minimal test/simulator managers that do
                 # not expose storage: retain the historical initializer.
@@ -691,9 +790,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
                         display_name="WebChat",
                     )
                 except Exception as exc:
-                    raise RpcUnavailableError(
-                        f"Failed to initialize chat session: {exc}"
-                    ) from exc
+                    raise RpcUnavailableError(f"Failed to initialize chat session: {exc}") from exc
 
         from opensquilla.gateway.rpc_sessions import _handle_sessions_send
 
@@ -727,6 +824,8 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ("surface_id", "surface_id"),
             ("workspaceId", "workspaceId"),
             ("workspace_id", "workspace_id"),
+            ("promptAnnotationIds", "promptAnnotationIds"),
+            ("prompt_annotation_ids", "promptAnnotationIds"),
         ):
             if source_key in params:
                 extra[target_key] = params[source_key]
@@ -762,9 +861,10 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
         if initial_collaboration_mode is not None:
             # Both public spellings represent the same logical request. Keep
             # one canonical field in the durable idempotency fingerprint.
-            fingerprint_params["initialCollaborationMode"] = (
-                initial_collaboration_mode
-            )
+            fingerprint_params["initialCollaborationMode"] = initial_collaboration_mode
+        if prompt_annotation_ids is not None:
+            send_params["promptAnnotationIds"] = prompt_annotation_ids
+            fingerprint_params["promptAnnotationIds"] = prompt_annotation_ids
         result = await _handle_sessions_send(
             send_params,
             ctx,
@@ -851,9 +951,7 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         with bounded_interactive_storage_reads():
             history_lock = get_session_lock(ctx.turn_runner, session_key)
             if history_lock is None:
-                page_entries, has_more, canonical_available, canonical_complete = (
-                    await _load_page()
-                )
+                page_entries, has_more, canonical_available, canonical_complete = await _load_page()
             else:
                 # Canonical reads and compaction rewrites share one aiosqlite
                 # connection.  SQLite statements are snapshots, but a statement on
@@ -876,9 +974,12 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
                             resource="session_mutation_lock",
                         ) from exc
                     acquired = True
-                    page_entries, has_more, canonical_available, canonical_complete = (
-                        await _load_page()
-                    )
+                    (
+                        page_entries,
+                        has_more,
+                        canonical_available,
+                        canonical_complete,
+                    ) = await _load_page()
                 finally:
                     if acquired:
                         history_lock.release()
@@ -976,9 +1077,7 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
         task_runtime = getattr(ctx, "task_runtime", None)
         resolve_user_input = getattr(task_runtime, "resolve_user_input", None)
         if not callable(resolve_user_input):
-            raise RpcUnavailableError(
-                "Deferred user-input resolution is not available"
-            )
+            raise RpcUnavailableError("Deferred user-input resolution is not available")
         result = await resolve_user_input(
             session_key=session_key,
             request_id=request_id,

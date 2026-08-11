@@ -1,10 +1,18 @@
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 
 import pytest
 
 import opensquilla.gateway.rpc_chat as rpc_chat_module
+from opensquilla.artifact_session import (
+    Actor,
+    ActorKind,
+    ArtifactBlobRef,
+    ArtifactKind,
+    ArtifactSessionService,
+)
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_chat import _handle_chat_history
 from opensquilla.session.manager import SessionManager
@@ -272,6 +280,213 @@ async def test_chat_history_returns_typed_outcomes_for_explicit_page_turns(
 
 
 @pytest.mark.asyncio
+async def test_chat_history_mutation_ledger_overrides_task_facts_and_is_scoped(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-mutation-ledger.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:mutation-ledger"
+    foreign_session_key = "agent:main:webchat:mutation-ledger-foreign"
+    await manager.create(session_key)
+    await manager.create(foreign_session_key)
+    service = await ArtifactSessionService.from_session_storage(storage)
+    actor = Actor(ActorKind.AGENT, "agent-1")
+
+    def blob(label: str) -> ArtifactBlobRef:
+        payload = label.encode()
+        return ArtifactBlobRef(
+            artifact_id=f"artifact-{label}",
+            sha256=hashlib.sha256(payload).hexdigest(),
+            filename=f"{label}.html",
+            media_type="text/html",
+            byte_size=len(payload),
+        )
+
+    async def reserve(
+        turn_id: str,
+        *,
+        owner_session_key: str = session_key,
+    ):
+        created = await service.create_document(
+            session_key=owner_session_key,
+            session_id=f"session-{turn_id}",
+            name=turn_id,
+            kind=ArtifactKind.HTML,
+            initial_artifact=blob(f"base-{turn_id}"),
+            actor=actor,
+        )
+        attempt = await service.reserve_mutation_attempt(
+            document_id=created.document.document_id,
+            turn_id=turn_id,
+            tool_use_id=f"tool-{turn_id}",
+            base_revision_id=created.revision.revision_id,
+            proposal_sha256=hashlib.sha256(turn_id.encode()).hexdigest(),
+        )
+        return created, attempt
+
+    try:
+        applied_document, _ = await reserve("turn-ledger-applied")
+        applied_change = await service.create_change_set(
+            document_id=applied_document.document.document_id,
+            base_revision_id=applied_document.revision.revision_id,
+            operations=({"op": "replace_text"},),
+            actor=actor,
+            turn_id="turn-ledger-applied",
+        )
+        ready_change = await service.ready_change_set(
+            change_set_id=applied_change.change_set_id,
+            expected_state_revision=applied_change.state_revision,
+            candidate_artifact=blob("result-turn-ledger-applied"),
+            actor=actor,
+        )
+        applied_result = await service.apply_change_set(
+            change_set_id=ready_change.change_set_id,
+            expected_change_set_state_revision=ready_change.state_revision,
+            expected_head_revision_id=applied_document.revision.revision_id,
+            expected_document_state_revision=applied_document.document.state_revision,
+            actor=actor,
+        )
+        applied_attempt = await service.mark_mutation_attempt_applied(
+            document_id=applied_document.document.document_id,
+            turn_id="turn-ledger-applied",
+            tool_use_id="tool-turn-ledger-applied",
+            change_set_id=applied_change.change_set_id,
+            revision_id=applied_result.revision.revision_id,
+        )
+
+        failed_document, _ = await reserve("turn-ledger-failed")
+        failed_attempt = await service.mark_mutation_attempt_failed(
+            document_id=failed_document.document.document_id,
+            turn_id="turn-ledger-failed",
+            tool_use_id="tool-turn-ledger-failed",
+            failure_code="restart_commit_not_applied",
+        )
+        ambiguous_document, _ = await reserve("turn-ledger-ambiguous")
+        ambiguous_attempt = await service.mark_mutation_attempt_ambiguous(
+            document_id=ambiguous_document.document.document_id,
+            turn_id="turn-ledger-ambiguous",
+            tool_use_id="tool-turn-ledger-ambiguous",
+            failure_code="restart_commit_outcome_unknown",
+        )
+        _reserved_document, reserved_attempt = await reserve("turn-ledger-reserved")
+        await reserve("turn-ledger-foreign", owner_session_key=foreign_session_key)
+
+        local_turns = (
+            "turn-ledger-applied",
+            "turn-ledger-failed",
+            "turn-ledger-ambiguous",
+            "turn-ledger-reserved",
+            "turn-ledger-foreign",
+        )
+        for index, turn_id in enumerate(local_turns, start=1):
+            with turn_context_scope({"turn_id": turn_id}):
+                await manager.append_message(session_key, "user", f"prompt {index}")
+
+        task_claims = {
+            "turn-ledger-applied": "not_applied",
+            "turn-ledger-failed": "applied",
+            "turn-ledger-ambiguous": "not_applied",
+        }
+        for index, (turn_id, claimed_status) in enumerate(task_claims.items(), start=1):
+            task_turn_outcome = {
+                "kind": "completed",
+                "reason": "completed",
+                "documentMutationOutcome": {
+                    "version": 1,
+                    "status": claimed_status,
+                    "phase": "proposal",
+                    "retryPolicy": "never",
+                    "code": "stale_task_claim",
+                    "corrected": True,
+                    "proposalAttempts": 2,
+                },
+            }
+            if turn_id == "turn-ledger-failed":
+                task_turn_outcome["document_mutation_outcome"] = {
+                    "version": 1,
+                    "status": "applied",
+                    "code": "stale_snake_case_claim",
+                }
+            await storage.create_agent_task(
+                AgentTaskRecord(
+                    task_id=turn_id,
+                    session_key=session_key,
+                    agent_id="main",
+                    source_kind="webui",
+                    queue_mode="followup",
+                    run_kind="session_turn",
+                    status=AgentTaskStatus.SUCCEEDED,
+                    started_at=index * 10,
+                    finished_at=index * 10 + 5,
+                    details={
+                        "turn_id": turn_id,
+                        "turn_outcome": task_turn_outcome,
+                    },
+                )
+            )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        by_turn = {item["turn_id"]: item for item in result["turn_outcomes"]}
+
+        assert set(by_turn) == {
+            "turn-ledger-applied",
+            "turn-ledger-failed",
+            "turn-ledger-ambiguous",
+            "turn-ledger-reserved",
+        }
+        applied = by_turn["turn-ledger-applied"]["outcome"]["documentMutationOutcome"]
+        assert applied == {
+            "version": 1,
+            "status": "applied",
+            "phase": "commit",
+            "retryPolicy": "never",
+            "code": "document_mutation_applied",
+            "attemptId": applied_attempt.mutation_attempt_id,
+            "documentId": applied_attempt.document_id,
+            "baseRevisionId": applied_attempt.base_revision_id,
+            "stateRevision": applied_attempt.state_revision,
+            "changeSetId": applied_attempt.change_set_id,
+            "resultRevisionId": applied_attempt.revision_id,
+            "corrected": True,
+            "proposalAttempts": 2,
+        }
+        failed = by_turn["turn-ledger-failed"]["outcome"]["documentMutationOutcome"]
+        assert failed["status"] == "not_applied"
+        assert failed["retryPolicy"] == "new_turn"
+        assert failed["code"] == failed_attempt.failure_code
+        assert failed["attemptId"] == failed_attempt.mutation_attempt_id
+        assert failed["corrected"] is True
+        assert failed["proposalAttempts"] == 2
+        assert "document_mutation_outcome" not in by_turn["turn-ledger-failed"]["outcome"]
+
+        ambiguous = by_turn["turn-ledger-ambiguous"]["outcome"]["documentMutationOutcome"]
+        assert ambiguous["status"] == "ambiguous"
+        assert ambiguous["retryPolicy"] == "reconcile"
+        assert ambiguous["code"] == ambiguous_attempt.failure_code
+
+        reserved_row = by_turn["turn-ledger-reserved"]
+        assert reserved_row["task_id"] is None
+        assert reserved_row["status"] == "unknown"
+        assert reserved_row["outcome"]["kind"] == "unknown"
+        reserved = reserved_row["outcome"]["documentMutationOutcome"]
+        assert reserved["status"] == "ambiguous"
+        assert reserved["retryPolicy"] == "reconcile"
+        assert reserved["code"] == "document_mutation_reconciliation_pending"
+        assert reserved["attemptId"] == reserved_attempt.mutation_attempt_id
+    finally:
+        await service.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_history_derives_legacy_outcomes_only_from_explicit_task_status(
     tmp_path,
 ) -> None:
@@ -429,8 +644,7 @@ async def test_chat_history_waits_for_same_connection_compaction_rewrite(
     session_key = "agent:main:webchat:compaction-race"
     await manager.create(session_key)
     persisted = [
-        await manager.append_message(session_key, "user", f"message {index}")
-        for index in range(4)
+        await manager.append_message(session_key, "user", f"message {index}") for index in range(4)
     ]
 
     mutation_lock = asyncio.Lock()
@@ -489,9 +703,7 @@ async def test_chat_history_waits_for_same_connection_compaction_rewrite(
     finally:
         allow_rewrite.set()
         pending = [
-            task
-            for task in (compaction_task, history_task)
-            if task is not None and not task.done()
+            task for task in (compaction_task, history_task) if task is not None and not task.done()
         ]
         for task in pending:
             task.cancel()
@@ -786,11 +998,11 @@ async def test_chat_history_returns_empty_for_missing_webchat_session(
         "history_scope": "complete",
         "loaded_count": 0,
         "page_size": 2,
-            "canonical_available": False,
-            "canonical_complete": True,
-            "compaction_summaries": [],
-            "turn_outcomes": [],
-        }
+        "canonical_available": False,
+        "canonical_complete": True,
+        "compaction_summaries": [],
+        "turn_outcomes": [],
+    }
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ import random
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import structlog
 
@@ -515,7 +515,11 @@ def _openrouter_static_capabilities(model: str) -> ModelCapabilities | None:
     return None
 
 
-def _member_model_capabilities(member: EnsembleMemberConfig) -> ModelCapabilities:
+def _member_model_capabilities(
+    member: EnsembleMemberConfig,
+    *,
+    model_catalog: Any | None = None,
+) -> ModelCapabilities:
     cfg = member.provider_config
     provider = cfg.provider.strip().lower()
     if provider == "openrouter":
@@ -523,13 +527,64 @@ def _member_model_capabilities(member: EnsembleMemberConfig) -> ModelCapabilitie
         if static_caps is not None:
             return static_caps
     try:
-        return shared_catalog().get_capabilities(
-            cfg.model,
-            provider_name=provider,
-            base_url=cfg.base_url,
+        catalog = model_catalog or shared_catalog()
+        deployment_capabilities = getattr(
+            catalog,
+            "resolve_deployment_capabilities",
+            None,
+        )
+        if callable(deployment_capabilities):
+            return cast(
+                ModelCapabilities,
+                deployment_capabilities(
+                    cfg.model,
+                    provider=provider,
+                    api_key=cfg.api_key,
+                    base_url=cfg.base_url,
+                ),
+            )
+        return catalog.get_capabilities(
+            cfg.model, provider_name=provider, base_url=cfg.base_url
         )
     except Exception:
         return ModelCapabilities()
+
+
+def _member_tools_capability_is_verified(
+    member: EnsembleMemberConfig,
+    *,
+    model_catalog: Any | None = None,
+) -> bool:
+    """Return true only for an authoritative, tool-capable member model."""
+
+    cfg = member.provider_config
+    provider = cfg.provider.strip().lower()
+    if provider == "openrouter":
+        static_caps = _openrouter_static_capabilities(cfg.model)
+        if static_caps is not None:
+            return bool(static_caps.supports_tools)
+    try:
+        catalog = model_catalog or shared_catalog()
+        verifier = getattr(
+            catalog,
+            "deployment_tool_capability_is_verified",
+            None,
+        )
+        if not callable(verifier) or not verifier(
+            cfg.model,
+            provider=provider,
+            api_key=cfg.api_key,
+            base_url=cfg.base_url,
+        ):
+            return False
+        return bool(
+            _member_model_capabilities(
+                member,
+                model_catalog=catalog,
+            ).supports_tools
+        )
+    except Exception:
+        return False
 
 
 def _member_max_tokens(member: EnsembleMemberConfig) -> int:
@@ -975,6 +1030,7 @@ class EnsembleProvider:
         | None = None,
         _fallback_request_budget_member: EnsembleMemberConfig | None = None,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
+        _artifact_tool_executor_capabilities: ModelCapabilities | None = None,
     ) -> None:
         self.profile_name = profile_name
         self.proposers = list(proposers)
@@ -1009,6 +1065,13 @@ class EnsembleProvider:
         )
         self._fallback_request_budget_member = _fallback_request_budget_member
         self._credential_pool_failure_reporter = _credential_pool_failure_reporter
+        self.artifact_tool_executor_capabilities = (
+            _artifact_tool_executor_capabilities
+        )
+        self.artifact_tools_capability_verified = bool(
+            _artifact_tool_executor_capabilities is not None
+            and _artifact_tool_executor_capabilities.supports_tools
+        )
 
     def _report_member_credential_failure(
         self,
@@ -4646,6 +4709,7 @@ def build_ensemble_provider_from_config(
     _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
     _session_key: str = "",
     _fallback_selector: Any | None = None,
+    _artifact_mutation: bool = False,
 ) -> EnsembleProvider:
     ensemble_cfg = getattr(config, "llm_ensemble", None)
     if ensemble_cfg is None:
@@ -4677,6 +4741,23 @@ def build_ensemble_provider_from_config(
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
+    artifact_tool_executor_capabilities: ModelCapabilities | None = None
+    if _artifact_mutation:
+        if not aggregator.ready:
+            raise ValueError(
+                "artifact_ensemble_unavailable:aggregator_not_ready"
+            )
+        if not _member_tools_capability_is_verified(
+            aggregator,
+            model_catalog=_model_catalog,
+        ):
+            raise ValueError(
+                "artifact_ensemble_unavailable:aggregator_tools_unverified"
+            )
+        artifact_tool_executor_capabilities = _member_model_capabilities(
+            aggregator,
+            model_catalog=_model_catalog,
+        )
     is_custom_b5 = selection_mode == CUSTOM_B5_SELECTION_MODE
     # Static and custom lineups share the fixed-lineup defaults family
     # (quorum replacement, 300/480s timeouts, no shuffle, quorum grace);
@@ -4819,27 +4900,43 @@ def build_ensemble_provider_from_config(
         if _enable_member_request_budget_rebinding
         else {}
     )
+    effective_all_failed_policy = cast(
+        Literal["fallback_single", "error"],
+        (
+            "error"
+            if _artifact_mutation
+            else getattr(ensemble_cfg, "all_failed_policy", "fallback_single")
+        ),
+    )
+    effective_proposer_tools = (
+        False
+        if _artifact_mutation
+        else bool(getattr(ensemble_cfg, "proposer_tools", False))
+    )
+    if _artifact_mutation:
+        selection_plan["artifact_execution_policy"] = "aggregator_only"
     return EnsembleProvider(
         profile_name=profile_name,
         proposers=proposers,
         aggregator=aggregator,
-        fallback_provider=fallback_provider,
+        fallback_provider=None if _artifact_mutation else fallback_provider,
         fallback_provider_name=inherited_provider_config.provider,
         fallback_model=inherited_provider_config.model,
         fallback_api_key=inherited_provider_config.api_key,
         min_successful_proposers=min_successful_proposers,
         target_successful_proposers=target_successful_proposers,
         proposer_max_retries=proposer_max_retries,
-        all_failed_policy=getattr(ensemble_cfg, "all_failed_policy", "fallback_single"),
+        all_failed_policy=effective_all_failed_policy,
         proposer_timeout_seconds=proposer_timeout_seconds,
         aggregator_timeout_seconds=aggregator_timeout_seconds,
         candidate_max_chars=int(getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0),
         shuffle_candidates=shuffle_candidates,
         record_candidates=bool(getattr(ensemble_cfg, "record_candidates", False)),
-        proposer_tools=bool(getattr(ensemble_cfg, "proposer_tools", False)),
+        proposer_tools=effective_proposer_tools,
         quorum_grace_seconds=quorum_grace_seconds,
         selection_plan=selection_plan,
         _member_request_budget_bindings=request_budget_bindings,
         _fallback_request_budget_member=fallback_request_budget_member,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
+        _artifact_tool_executor_capabilities=artifact_tool_executor_capabilities,
     )

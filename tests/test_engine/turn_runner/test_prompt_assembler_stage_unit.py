@@ -357,6 +357,67 @@ async def test_prompt_assembler_uses_effective_tool_workspace() -> None:
     assert prompt_assembler.last_kwargs["workspace_dir"] == "D:\\lrk\\opensquilla"
 
 
+@pytest.mark.asyncio
+async def test_restricted_tool_boundary_suppresses_workspace_prompt_inputs() -> None:
+    prompt_assembler = _RecordingPromptAssembler(
+        metadata_to_emit={"injected_workspace_files_count": 0}
+    )
+    executor = _RecordingPipelineExecutor(
+        turn=_make_turn(
+            metadata={
+                "skill_count": 0,
+                "skills_rendered_count": 0,
+                "skills_prompt_chars": 0,
+            }
+        ),
+        provider=_StubProvider(),
+    )
+    builder = _RecordingPromptReportBuilder()
+    stage = _make_stage(
+        assembler=prompt_assembler,
+        executor=executor,
+        builder=builder,
+    )
+    skill_catalog = object()
+
+    await stage.run(
+        _make_input(
+            extra_prompt_context={"project": "/secret/workspace"},
+            bootstrap_context_mode="full",
+            effective_tool_context=ToolContext(
+                workspace_dir="/secret/workspace",
+                exclusive_tools={"artifact_reader"},
+            ),
+            skill_catalog=skill_catalog,
+        )
+    )
+
+    assert prompt_assembler.last_kwargs["workspace_dir"] is None
+    assert prompt_assembler.last_kwargs["extra_context"] is None
+    assert (
+        prompt_assembler.last_kwargs["bootstrap_context_mode"]
+        == "restricted_tool_boundary"
+    )
+    assert executor.requests[0].skill_catalog is None
+    assert builder.last_kwargs["metadata"]["injected_workspace_files_count"] == 0
+    assert builder.last_kwargs["metadata"]["skill_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ordinary_turn_preserves_skill_catalog_projection() -> None:
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+    skill_catalog = object()
+
+    await _make_stage(executor=executor).run(
+        _make_input(
+            effective_tool_context=ToolContext(workspace_dir="/project"),
+            skill_catalog=skill_catalog,
+        )
+    )
+
+    assert executor.requests[0].skill_catalog is skill_catalog
+
+
 async def test_prompt_assembler_forwards_bound_user_message_id_to_router_context():
     router_context = _RecordingRouterContext()
     stage = _make_stage(router=router_context)

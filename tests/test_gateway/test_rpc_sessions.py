@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -3814,6 +3815,8 @@ class TestSessionsSend:
         assert store.evicted == ["u-pdf"]
         persisted = json.loads(manager.created_messages[0][2])
         persisted_att = persisted["attachments"][0]
+        attachment_id = persisted_att.pop("attachment_id")
+        assert re.fullmatch(r"att_[A-Za-z0-9_-]{24}", attachment_id)
         assert persisted_att == {
             "sha256_ref": sha,
             "name": "r.pdf",

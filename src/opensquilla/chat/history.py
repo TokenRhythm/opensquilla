@@ -74,6 +74,7 @@ def transcript_entries_to_chat_messages(
         content = silent_reply.content or ""
         attachments = None
         artifacts = None
+        prompt_annotations = None
         if content and content.startswith("{"):
             try:
                 parsed = json.loads(content)
@@ -81,6 +82,19 @@ def transcript_entries_to_chat_messages(
                     display_text = parsed.get("display_text")
                     content = display_text if isinstance(display_text, str) else parsed["text"]
                     attachments = parsed.get("attachments")
+                    from opensquilla.prompt_annotations import (
+                        PromptAnnotationSnapshotError,
+                        normalize_prompt_annotation_snapshots,
+                    )
+
+                    try:
+                        normalized_annotations = normalize_prompt_annotation_snapshots(
+                            parsed.get("prompt_annotations")
+                        )
+                    except PromptAnnotationSnapshotError:
+                        normalized_annotations = ()
+                    if normalized_annotations:
+                        prompt_annotations = list(normalized_annotations)
                     parsed_artifacts = parsed.get("artifacts")
                     if isinstance(parsed_artifacts, list):
                         artifacts = [
@@ -132,6 +146,8 @@ def transcript_entries_to_chat_messages(
             msg["attachments"] = attachments
         if artifacts:
             msg["artifacts"] = artifacts
+        if prompt_annotations:
+            msg["promptAnnotations"] = prompt_annotations
         usage = getattr(entry, "turn_usage", None)
         if isinstance(usage, dict):
             msg["usage"] = usage

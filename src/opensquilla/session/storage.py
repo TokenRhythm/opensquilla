@@ -116,6 +116,7 @@ from opensquilla.turn_outcome_projection import (
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
+    from opensquilla.artifact_session import PromptAnnotation
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
     from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
@@ -453,8 +454,12 @@ def _serialized_read[**P, R](
 # MetaSkill control intents. Version 18 added the bounded MetaSkill launch outbox
 # and discard tombstones. Version 19 added the generation-fenced current Goal
 # and Goal command idempotency ledger. Version 20 added the durable Goal origin
-# message anchor used by reconnect-safe transcript presentation.
-SCHEMA_VERSION = 20
+# message anchor used by reconnect-safe transcript presentation. Version 21
+# added durable ArtifactSession documents, immutable revisions, change sets,
+# editor sessions, writer leases, anchors, and audit events. Version 22 added
+# prompt-annotation drafts atomically consumed by chat turns. Version 23 added
+# durable idempotency receipts for artifact mutation attempts.
+SCHEMA_VERSION = 23
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -4813,6 +4818,16 @@ class SessionStorage:
         conn: aiosqlite.Connection,
         session: SessionNode,
     ) -> None:
+        from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+        # ArtifactSession state is fenced and removed inside the same durable
+        # boundary as the owning session.  A failure aborts the whole delete;
+        # post-commit filesystem cleanup is intentionally handled separately.
+        await purge_session_on_connection(
+            conn,
+            session_id=session.session_id,
+            boundary="session_delete",
+        )
         for table in (
             "transcript_entries",
             "compacted_transcript_entries",
@@ -10451,6 +10466,14 @@ class SessionStorage:
             )
             await archive_writer(snapshot)
 
+            from opensquilla.artifact_session.lifecycle import purge_session_on_connection
+
+            await purge_session_on_connection(
+                conn,
+                session_id=expected_session_id,
+                boundary="session_reset",
+            )
+
             assignments = [f"{column} = ?" for column in session_data if column != "session_key"]
             values = [
                 _serialize(value)
@@ -10533,6 +10556,9 @@ class SessionStorage:
             )
 
         _clear_pending_meta_launch_boundary(node.session_key)
+        from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+        await run_session_artifact_cleanup(expected_session_id, node.session_key)
 
     async def accept_turn(
         self,
@@ -10562,6 +10588,8 @@ class SessionStorage:
         goal_mutation: (
             StartGoalMutation | ClaimGoalMutation | ClaimCurrentGoalMutation | None
         ) = None,
+        expected_prompt_annotations: Sequence[PromptAnnotation] = (),
+        prompt_annotation_turn_id: str | None = None,
     ) -> TurnAcceptanceResult:
         """Commit one user message, optional task, and request receipt atomically.
 
@@ -10602,6 +10630,16 @@ class SessionStorage:
             raise ValueError("Goal turns cannot start or claim a Plan run")
         if goal_mutation is not None and meta_control_intent_id is not None:
             raise ValueError("Goal turns cannot consume a MetaSkill control intent")
+        expected_prompt_annotations = tuple(expected_prompt_annotations)
+        if expected_prompt_annotations:
+            if session_node is not None or merge_into_task:
+                raise ValueError(
+                    "prompt annotations require an existing session and a distinct turn"
+                )
+            if not isinstance(prompt_annotation_turn_id, str) or not (
+                prompt_annotation_turn_id := prompt_annotation_turn_id.strip()
+            ):
+                raise ValueError("prompt_annotation_turn_id is required")
 
         request_session_key = canonicalize_session_key(request_session_key)
         entry.session_key = canonicalize_session_key(entry.session_key)
@@ -10808,6 +10846,21 @@ class SessionStorage:
                     ),
                 )
 
+            if expected_prompt_annotations:
+                from opensquilla.artifact_session import consume_prompt_annotations_on_conn
+
+                assert prompt_annotation_turn_id is not None
+                await consume_prompt_annotations_on_conn(
+                    conn,
+                    expected_annotations=expected_prompt_annotations,
+                    session_key=entry.session_key,
+                    session_id=entry.session_id,
+                    session_epoch=expected_epoch,
+                    message_id=entry.message_id,
+                    turn_id=prompt_annotation_turn_id,
+                    updated_at=updated_at,
+                )
+
             if meta_control_intent_id is not None:
                 if task_record is None:
                     raise ValueError(
@@ -11011,6 +11064,15 @@ class SessionStorage:
                     if reset_archive_writer is not None:
                         await reset_archive_writer(reset_archive_snapshot)
                         reset_archive_snapshot = None
+                    from opensquilla.artifact_session.lifecycle import (
+                        purge_session_on_connection,
+                    )
+
+                    await purge_session_on_connection(
+                        conn,
+                        session_id=reset_from_session_id,
+                        boundary="session_reset",
+                    )
                     assignments = [
                         f"{column} = ?"
                         for column in session_data
@@ -11693,6 +11755,9 @@ class SessionStorage:
                 preserve_client_request_id=client_request_id,
                 preserve_message=entry.content,
             )
+            from opensquilla.session.material_cleanup import run_session_artifact_cleanup
+
+            await run_session_artifact_cleanup(reset_from_session_id, entry.session_key)
         return acceptance_result
 
     @_serialized_read

@@ -93,4 +93,11 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "goal_run",
         "goal_context",
         "goal_service",
+        "artifact_context",
+        "artifact_session",
+        "desktop_artifact_bridge",
+        "artifact_event_emitter",
+        "exclusive_tools",
+        "artifact_mutation_attempt_controller",
+        "turn_cleanup_callbacks",
     ]

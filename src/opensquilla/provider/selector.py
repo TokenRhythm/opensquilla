@@ -453,7 +453,12 @@ class ModelSelector:
         self._index = 1
         return _build_provider(self._chain[self._index])
 
-    def override_provider_config(self, cfg: ProviderConfig) -> None:
+    def override_provider_config(
+        self,
+        cfg: ProviderConfig,
+        *,
+        preserve_existing_tail: bool = True,
+    ) -> None:
         """Replace the active chain head with a full per-turn provider config.
 
         Cross-provider tier execution: unlike ``override_model`` (which keeps
@@ -467,7 +472,10 @@ class ModelSelector:
         original_primary = self._chain[0]
         deduped_fallbacks: list[ProviderConfig] = []
         seen: set[_ProviderConfigIdentity] = {_provider_config_identity(cfg)}
-        for candidate in [original_primary, *self._chain[1:]]:
+        candidates = (
+            [original_primary, *self._chain[1:]] if preserve_existing_tail else []
+        )
+        for candidate in candidates:
             identity = _provider_config_identity(candidate)
             if identity in seen:
                 continue
@@ -547,6 +555,8 @@ class ModelSelector:
         self,
         model: str,
         fallback_chain: list[object],
+        *,
+        preserve_existing_tail: bool = True,
     ) -> None:
         """Override primary model and prefer router-provided fallback models.
 
@@ -557,7 +567,7 @@ class ModelSelector:
         skipped instead of guessing secrets.
         """
         self.override_model(model)
-        if not fallback_chain:
+        if not fallback_chain and preserve_existing_tail:
             return
 
         current = self._chain[0]
@@ -599,7 +609,12 @@ class ModelSelector:
         seen: set[_ProviderConfigIdentity] = {
             _provider_config_identity(current)
         }
-        for cfg in [*router_fallbacks, *existing_tail]:
+        candidates = (
+            [*router_fallbacks, *existing_tail]
+            if preserve_existing_tail
+            else router_fallbacks
+        )
+        for cfg in candidates:
             identity = _provider_config_identity(cfg)
             if identity in seen:
                 continue

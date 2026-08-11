@@ -270,6 +270,31 @@ async def test_successful_parent_task_persists_subagent_group_outcome_details() 
     assert record.details["turn_outcome"]["kind"] == "completed"
 
 
+@pytest.mark.asyncio
+async def test_successful_task_persists_authoritative_document_mutation_outcome() -> None:
+    outcome = {
+        "status": "applied",
+        "phase": "commit",
+        "retryPolicy": "never",
+        "code": "document_mutation_applied",
+        "corrected": True,
+        "proposalAttempts": 2,
+    }
+
+    async def _success_handler(run: Any) -> None:
+        assert run.document_mutation_outcome_sink is not None
+        run.document_mutation_outcome_sink(outcome)
+
+    runtime = _make_runtime(_success_handler)
+    handle = await runtime.enqueue(_make_envelope(), "apply the annotations")
+
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.status == AgentTaskStatus.SUCCEEDED
+    assert record.details is not None
+    assert record.details["turn_outcome"]["documentMutationOutcome"] == outcome
+
+
 def test_subagent_completion_payload_adds_terminal_message_for_non_success() -> None:
     event = SubagentCompletionEvent(
         parent_session_key="agent:main:parent",

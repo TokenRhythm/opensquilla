@@ -372,18 +372,32 @@ class PromptAssemblerStage:
         # Local imports keep the module import-cycle-free.
         from opensquilla.engine.turn_runner.outcome import StageOutcome
 
-        # 1. Assemble identity prompt
+        # 1. Assemble identity prompt. A PromptAnnotation turn carries an
+        # explicit tool ceiling and must not inherit workspace bootstrap text
+        # or its absolute path into any provider strategy.
         prompt_metadata: dict[str, Any] = {}
+        restricted_tool_boundary = bool(
+            inp.effective_tool_context is not None
+            and getattr(inp.effective_tool_context, "exclusive_tools", None) is not None
+        )
         base_prompt = self._prompt_assembler.assemble_prompt(
             inp.agent_id,
             inp.tool_defs,
             session_key=inp.session_key,
             semantic_message=inp.semantic_input,
-            extra_context=inp.extra_prompt_context,
+            extra_context=(None if restricted_tool_boundary else inp.extra_prompt_context),
             prompt_metadata=prompt_metadata,
-            bootstrap_context_mode=inp.bootstrap_context_mode,
+            bootstrap_context_mode=(
+                "restricted_tool_boundary"
+                if restricted_tool_boundary
+                else inp.bootstrap_context_mode
+            ),
             fresh_user_session=inp.fresh_user_session,
-            workspace_dir=getattr(inp.effective_tool_context, "workspace_dir", None),
+            workspace_dir=(
+                None
+                if restricted_tool_boundary
+                else getattr(inp.effective_tool_context, "workspace_dir", None)
+            ),
         )
 
         # 2. Fetch router context (transcript-driven)
@@ -466,7 +480,12 @@ class PromptAssemblerStage:
             tool_context=inp.effective_tool_context,
             normalization_metadata=inp.normalization_metadata,
             input_provenance=inp.input_provenance,
-            skill_catalog=inp.skill_catalog,
+            # PromptAnnotation turns are projected independently from the
+            # ordinary workspace/skill environment.  Passing ``None`` here
+            # is only half of that boundary; ``TurnRunner._run_pipeline``
+            # also suppresses its legacy global-loader fallback whenever the
+            # same exclusive ToolContext is present.
+            skill_catalog=(None if restricted_tool_boundary else inp.skill_catalog),
             usage_execution_context=inp.usage_execution_context,
             provider_request_correlation=inp.provider_request_correlation,
         )

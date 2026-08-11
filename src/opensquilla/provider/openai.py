@@ -1953,6 +1953,20 @@ def _segment_text_tool_events(
                 events.append(TextDeltaEvent(text=segment.text))
             continue
         if isinstance(segment, RejectedTextToolSegment):
+            id_prefix = {
+                TEXT_TOOL_DIALECT_QWEN_TAG: "qwen_text_rejected",
+                TEXT_TOOL_DIALECT_MINIMAX_XML: "minimax_compat_rejected",
+                TEXT_TOOL_DIALECT_PLAIN_JSON: "text_compat_rejected",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: "deepseek_dsml_rejected",
+            }[segment.dialect]
+            for tool_name in segment.recognized_tool_names:
+                events.append(
+                    ToolUseStartEvent(
+                        tool_use_id=f"{id_prefix}_{uuid4().hex[:12]}",
+                        tool_name=tool_name,
+                        synthetic_from_text=True,
+                    )
+                )
             continue
         if isinstance(segment, InertDsmlSegment):
             raise AssertionError("inert DSML reached executable event conversion")
@@ -2024,14 +2038,14 @@ def _text_tool_rejection_error(
     cache_shape: Mapping[str, Any],
     trace: LLMTraceRecorder,
 ) -> ErrorEvent | None:
-    """Convert one rejected DSML response into a payload-free terminal error."""
+    """Convert rejected text-tool output into a payload-free terminal error."""
 
     details = _text_tool_rejection_details(segments)
     if details is None:
         return None
     reasons, call_count = details
     log.warning(
-        "provider.deepseek_dsml_tool_call_rejected",
+        "provider.text_tool_call_rejected",
         provider=provider_kind,
         model=model,
         reasons=reasons,
@@ -2039,7 +2053,7 @@ def _text_tool_rejection_error(
     )
     trace.record_error(
         code="incomplete_tool_call",
-        message="Provider returned rejected DeepSeek DSML tool-call text",
+        message="Provider returned rejected text-encoded tool-call output",
         metadata={
             "phase": phase,
             "cache_shape": cache_shape,
@@ -2049,7 +2063,7 @@ def _text_tool_rejection_error(
     )
     return ErrorEvent(
         message=(
-            f"{display_name} returned an invalid DeepSeek DSML tool call; "
+            f"{display_name} returned an invalid text-encoded tool call; "
             "no text-encoded tools were executed"
         ),
         code="incomplete_tool_call",
@@ -5047,6 +5061,19 @@ class OpenAIProvider:
                         trace=trace,
                     )
                     if rejection_error is not None:
+                        for event in _segment_text_tool_events(
+                            normalized_segments,
+                            provider_kind=self._provider_kind,
+                            model=self._model,
+                        ):
+                            if isinstance(event, ToolUseEndEvent):
+                                raise AssertionError(
+                                    "rejected text tool output produced a completed call"
+                                )
+                            emitted_stream_event = True
+                            if isinstance(event, TextDeltaEvent):
+                                visible_assistant_text_parts.append(event.text)
+                            yield event
                         yield rejection_error
                         return
                     for event in _segment_text_tool_events(
@@ -5983,6 +6010,9 @@ class OpenAIProvider:
                 if isinstance(event, TextDeltaEvent):
                     visible_assistant_text_parts.append(event.text)
                 yield event
+            for deferred_event in deferred_native_events:
+                if isinstance(deferred_event, ToolUseStartEvent):
+                    yield deferred_event
             trace.record_error(
                 code="incomplete_tool_call",
                 message=(
@@ -6012,6 +6042,9 @@ class OpenAIProvider:
                 if isinstance(event, TextDeltaEvent):
                     visible_assistant_text_parts.append(event.text)
                 yield event
+            for deferred_event in deferred_native_events:
+                if isinstance(deferred_event, ToolUseStartEvent):
+                    yield deferred_event
             trace.record_error(
                 code="incomplete_tool_call",
                 message="Provider returned invalid native tool arguments",
@@ -6047,6 +6080,18 @@ class OpenAIProvider:
             trace=trace,
         )
         if rejection_error is not None:
+            for event in _segment_text_tool_events(
+                normalized_segments,
+                provider_kind=self._provider_kind,
+                model=self._model,
+            ):
+                if isinstance(event, ToolUseEndEvent):
+                    raise AssertionError(
+                        "rejected text tool output produced a completed call"
+                    )
+                if isinstance(event, TextDeltaEvent):
+                    visible_assistant_text_parts.append(event.text)
+                yield event
             yield rejection_error
             return
         for event in _segment_text_tool_events(

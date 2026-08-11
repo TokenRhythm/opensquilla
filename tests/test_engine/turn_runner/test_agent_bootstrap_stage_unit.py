@@ -29,6 +29,7 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
 )
 from opensquilla.engine.turn_runner.outcome import StageOutcome
 from opensquilla.engine.types import ThinkingLevel
+from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
 # Recording fakes (one per port)
@@ -346,6 +347,23 @@ async def test_case01_success_all_defaults() -> None:
     assert o.agent_config.length_capped_continuations == 3
     assert o.agent_config.metadata["agent_max_iterations"] == 10
     assert o.agent_config.metadata["agent_max_iterations_source"] == "test budget"
+
+
+@pytest.mark.asyncio
+async def test_exclusive_tool_context_marks_agent_as_restricted_turn() -> None:
+    stage = _make_stage()
+
+    restricted = await stage.run(
+        _make_input(
+            tool_context=ToolContext(
+                exclusive_tools={"document_inspect"}
+            )
+        )
+    )
+    ordinary = await stage.run(_make_input(tool_context=ToolContext()))
+
+    assert restricted.output.agent_config.restricted_turn is True
+    assert ordinary.output.agent_config.restricted_turn is False
 
 
 @pytest.mark.asyncio

@@ -342,7 +342,18 @@ def apply_model_override(
     (its entries are same-provider models of the provider being left).
     """
     if tier_provider_config is not None and hasattr(selector, "override_provider_config"):
-        selector.override_provider_config(tier_provider_config)
+        if turn_metadata.get("router_fallback_strict") is True:
+            try:
+                selector.override_provider_config(
+                    tier_provider_config,
+                    preserve_existing_tail=False,
+                )
+            except TypeError as exc:
+                raise RuntimeError(
+                    "selector does not support strict artifact fallback isolation"
+                ) from exc
+        else:
+            selector.override_provider_config(tier_provider_config)
         turn_metadata["routed_provider_applied"] = tier_provider_config.provider
         turn_metadata["provider_state_replay_disabled"] = "cross_provider_route"
         _disable_selector_provider_state_replay(selector, turn_metadata)
@@ -405,7 +416,20 @@ def apply_model_override(
         None,
     )
     if callable(override_with_fallback_chain) and isinstance(router_fallback_chain, list):
-        override_with_fallback_chain(model, router_fallback_chain)
+        if turn_metadata.get("router_fallback_strict") is True:
+            try:
+                override_with_fallback_chain(
+                    model,
+                    router_fallback_chain,
+                    preserve_existing_tail=False,
+                )
+            except TypeError:
+                # Compatibility for third-party selector shims that implement
+                # the older two-argument hook. A strict Artifact turn must not
+                # silently retain their unknown fallback tail.
+                selector.override_model(model)
+        else:
+            override_with_fallback_chain(model, router_fallback_chain)
     else:
         selector.override_model(model)
     provider = _resolve_and_record_execution(selector, turn_metadata)

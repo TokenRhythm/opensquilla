@@ -13,6 +13,7 @@ from opensquilla.session.compaction_lifecycle import (
     normalize_flush_triggers_strict,
 )
 from opensquilla.tool_boundary import ToolCall as ToolCall
+from opensquilla.tool_boundary import ToolEffectOutcome as ToolEffectOutcome
 from opensquilla.tool_boundary import ToolResult as ToolResult
 
 if TYPE_CHECKING:
@@ -111,6 +112,7 @@ class ToolResultEvent:
     is_error: bool = False
     arguments: dict[str, Any] | None = None
     execution_status: ExecutionStatus | None = None
+    effect_outcome: ToolEffectOutcome | None = None
 
 
 @dataclass
@@ -240,6 +242,9 @@ class DoneEvent:
     # positional DoneEvent construction keeps its historical field order.
     delivery: Literal["visible", "suppressed"] = "visible"
     suppression_reason: Literal["no_reply", "heartbeat_ack"] | None = None
+    # Authoritative document side-effect fact for restricted annotation turns.
+    # Presentation text may be model-generated; this receipt is runtime-owned.
+    document_mutation_outcome: dict[str, Any] | None = None
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -585,6 +590,12 @@ class AgentConfig:
     compaction_protected_recent_messages: int = 0
     compaction_total_timeout_seconds: float = 120.0
     compaction_heartbeat_interval_seconds: float = 15.0
+    # Explicit per-turn authority boundary. Restricted turns (currently
+    # PromptAnnotation edits) must never send persisted history to an
+    # auxiliary compaction/flush model before or during the primary request.
+    # The runtime derives this from ToolContext.exclusive_tools; it is not a
+    # user-configurable inference from individual tool names.
+    restricted_turn: bool = False
     # Frozen runtime-only single-deployment chain for auxiliary compaction.
     # Kept opaque here to avoid coupling engine types to session internals.
     compaction_execution_plan: Any | None = field(
@@ -604,6 +615,11 @@ class AgentConfig:
     repair_max_items_per_tick: int = 5
     flush_workspace_dir: str | None = None
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
+    # Provenance gate for persistent Artifact writer tools. General chat keeps
+    # the historical optimistic capability fallback for unknown model ids,
+    # while Artifact mutations require an authoritative tools declaration for
+    # every physical selector leg.
+    model_tools_capability_verified: bool = False
     # Tokenjuice projection: project eligible fresh tool results before the
     # next LLM turn. This is not user-selectable behavior.
     # Legacy compression knobs remain as compatibility shims for meta_invoke
