@@ -2592,6 +2592,7 @@
       "toastNameRequired": "Le nom est requis",
       "toastWorkspaceRequired": "Choisissez un espace de travail de projet pour cette tâche",
       "toastIntervalInvalid": "L'intervalle doit être un nombre entier de secondes",
+      "toastCronRequired": "L'expression cron est requise",
       "toastIsoTimeRequired": "L'heure ISO est requise",
       "toastCurrentSessionRequired": "L’ID de session actuel est requis",
       "toastNamedSessionRequired": "L’ID de session spécifique est requis",

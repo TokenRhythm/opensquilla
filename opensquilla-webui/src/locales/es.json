@@ -2592,6 +2592,7 @@
       "toastNameRequired": "El nombre es obligatorio",
       "toastWorkspaceRequired": "Elige un espacio de trabajo de proyecto para esta tarea",
       "toastIntervalInvalid": "El intervalo debe ser un número entero de segundos",
+      "toastCronRequired": "La expresión cron es obligatoria",
       "toastIsoTimeRequired": "La hora ISO es obligatoria",
       "toastCurrentSessionRequired": "El ID de sesión actual es obligatorio",
       "toastNamedSessionRequired": "El ID de sesión específico es obligatorio",
