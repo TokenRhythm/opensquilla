@@ -11545,6 +11545,7 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "_sanitize_url_for_fingerprint",
         "canonical_json_sha256",
         "gateway_execution_contract",
+        "validate_formal_web_search_transport",
     ):
         shared = getattr(draco_runtime_contract, name)
         assert getattr(runner, name) is shared
@@ -11639,6 +11640,8 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "canonical_json_sha256",
         "g1_immutable_selection_plan_payload",
         "gateway_execution_contract",
+        "validate_formal_openrouter_runtime_transport",
+        "validate_formal_web_search_transport",
         "validate_strict_openrouter_non_byok_environment",
         "resolved_llm_runtime_contract",
         "build_run_compatibility",
