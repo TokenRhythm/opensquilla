@@ -16,6 +16,7 @@ from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -11571,6 +11572,7 @@ def test_agent_done_envelope_does_not_create_request_after_explicit_zero(
 
 def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     from opensquilla.eval import (
+        draco_ensemble_call_validation,
         draco_experiment_artifacts,
         draco_generation_recovery,
         draco_judge_scoring,
@@ -11592,6 +11594,16 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     assert resume_runner.publish_experiment_config_artifacts is (
         draco_experiment_artifacts.publish_experiment_config_artifacts
     )
+    for runner_module in (runner, resume_runner):
+        assert runner_module._shared_g1_registry_contract_reasons is (
+            draco_ensemble_call_validation.g1_registry_contract_reasons_core
+        )
+        assert runner_module._shared_authorized_dynamic_aggregator_fallback is (
+            draco_ensemble_call_validation.authorized_dynamic_aggregator_fallback_core
+        )
+        assert runner_module._shared_ensemble_call_core_reasons is (
+            draco_ensemble_call_validation.ensemble_call_core_reasons_core
+        )
     for name in (
         "_sanitize_fingerprint_config",
         "_sanitize_url_for_fingerprint",
@@ -11753,8 +11765,11 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "normalized_agent_finalization_policy",
         "legal_proposer_quorum",
         "expanded_proposer_slot_identities",
+        "_ensemble_call_validation_dependencies",
         "validate_g1_registry_contract",
         "g1_registry_contract_reasons",
+        "authorized_dynamic_aggregator_fallback",
+        "ensemble_call_core_reasons",
         "apply_b2_g12_argument_alignment",
         "enforce_draco_legal_proposer_quorum",
         "enforce_formal_draco_runtime_config",
@@ -11781,6 +11796,36 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     assert (
         runner._ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
         == resume_runner._ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
+    )
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_ensemble_call_validation_wrappers_bind_runner_dependencies_dynamically(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def models_equivalent(_left: Any, _right: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(module, "_formal_openrouter_models_equivalent", models_equivalent)
+    observed: dict[str, Any] = {}
+
+    def shared_g1(*args: Any, **kwargs: Any) -> list[str]:
+        observed["args"] = args
+        observed["dependencies"] = kwargs["dependencies"]
+        return ["sentinel"]
+
+    monkeypatch.setattr(module, "_shared_g1_registry_contract_reasons", shared_g1)
+    assert module.g1_registry_contract_reasons({}, None) == ["sentinel"]
+    assert observed["args"] == ({}, None, None)
+    dependencies = observed["dependencies"]
+    assert dependencies.models_equivalent is models_equivalent
+    assert dependencies.expanded_proposer_slot_identities is (
+        module.expanded_proposer_slot_identities
+    )
+    assert dependencies.frozen_proposer_quorum is module.frozen_proposer_quorum
+    assert dependencies.ensemble_metadata_field_resolved is (
+        module.ensemble_metadata_field_resolved
     )
 
 
