@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import json
 import time
-from collections.abc import AsyncIterator
-from copy import deepcopy
+import weakref
+from collections.abc import AsyncIterator, Sequence
+from copy import copy, deepcopy
 from typing import Any
 
 import pytest
@@ -593,6 +595,299 @@ def test_packaged_ranking_config_is_versioned_validated_and_isolated() -> None:
     assert first["aggregator"]["candidate_count"] == 3
     first["rerank"]["similarity_penalty_weight"] = 99.0
     assert second["rerank"]["similarity_penalty_weight"] == pytest.approx(0.25)
+
+
+def test_prepared_ranking_config_is_recursive_immutable_json_and_identity_copy() -> None:
+    source = load_ranking_config()
+    prepared = ranking_router._prepare_ranking_config(source)
+
+    assert ranking_router._is_validated_ranking_config(prepared) is True
+    assert prepared == source
+    assert prepared["task_analyzer"] == source["task_analyzer"]
+    assert prepared["task_analyzer"]["fallback_chain"] == (
+        source["task_analyzer"]["fallback_chain"]
+    )
+    assert copy(prepared) is prepared
+    assert deepcopy(prepared) is prepared
+    assert deepcopy(prepared["task_analyzer"]) is prepared["task_analyzer"]
+    assert deepcopy(prepared["task_analyzer"]["fallback_chain"]) is (
+        prepared["task_analyzer"]["fallback_chain"]
+    )
+    assert json.loads(ranking_router.canonical_json_bytes(prepared)) == source
+    assert canonical_json_sha256(prepared) == canonical_json_sha256(source)
+
+    rejected_mutations = (
+        lambda: prepared.__setattr__("forged", True),
+        lambda: prepared.__delattr__("forged"),
+        lambda: prepared.__setitem__("config_version", "forged"),
+        lambda: prepared.__delitem__("trace"),
+        lambda: prepared.__ior__({"forged": True}),
+        lambda: prepared.update({"config_version": "forged"}),
+        lambda: prepared.pop("config_version"),
+        lambda: prepared.popitem(),
+        lambda: prepared.clear(),
+        lambda: prepared["task_analyzer"].__setitem__("max_retries", 99),
+        lambda: prepared["task_analyzer"].setdefault("forged", True),
+        lambda: prepared["task_analyzer"]["fallback_chain"].__setitem__(0, {}),
+        lambda: prepared["task_analyzer"]["fallback_chain"].__delitem__(0),
+        lambda: prepared["task_analyzer"]["fallback_chain"].__iadd__([{}]),
+        lambda: prepared["task_analyzer"]["fallback_chain"].__imul__(2),
+        lambda: prepared["task_analyzer"]["fallback_chain"].append({}),
+        lambda: prepared["task_analyzer"]["fallback_chain"].clear(),
+        lambda: prepared["task_analyzer"]["fallback_chain"].extend([{}]),
+        lambda: prepared["task_analyzer"]["fallback_chain"].insert(0, {}),
+        lambda: prepared["task_analyzer"]["fallback_chain"].pop(),
+        lambda: prepared["task_analyzer"]["fallback_chain"].remove(
+            prepared["task_analyzer"]["fallback_chain"][0]
+        ),
+        lambda: prepared["task_analyzer"]["fallback_chain"].reverse(),
+        lambda: prepared["task_analyzer"]["fallback_chain"].sort(),
+    )
+    for mutate in rejected_mutations:
+        with pytest.raises(TypeError, match="immutable"):
+            mutate()
+    with pytest.raises(TypeError):
+        dict.__setitem__(prepared, "config_version", "base-class-bypass")
+    with pytest.raises(TypeError):
+        list.__setitem__(
+            prepared["task_analyzer"]["fallback_chain"],
+            0,
+            {},
+        )
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(prepared, "_values", {})
+
+
+def test_canonical_json_only_thaws_registered_immutable_containers() -> None:
+    class CustomSequence(Sequence[int]):
+        def __getitem__(self, index: int) -> int:
+            return (1, 2, 3)[index]
+
+        def __len__(self) -> int:
+            return 3
+
+    source = load_ranking_config()
+    prepared = ranking_router._prepare_ranking_config(source)
+    ordinary = {"tuple": (1, 2), "list": [3, 4]}
+
+    assert json.loads(ranking_router.canonical_json_bytes(prepared)) == source
+    assert ranking_router.canonical_json_bytes(ordinary) == (
+        b'{"list":[3,4],"tuple":[1,2]}'
+    )
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        ranking_router.canonical_json_bytes(range(3))
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        ranking_router.canonical_json_bytes(CustomSequence())
+
+    cyclic: dict[str, Any] = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError, match="Circular reference"):
+        ranking_router.canonical_json_bytes(cyclic)
+
+
+def test_external_ranking_config_does_not_coerce_tuple_for_json_array_field() -> None:
+    external = load_ranking_config()
+    external["task_analyzer"]["fallback_chain"] = tuple(
+        external["task_analyzer"]["fallback_chain"]
+    )
+
+    with pytest.raises(DynamicRankingError):
+        ranking_router._prepare_ranking_config(external)
+
+
+def test_prepared_ranking_config_marker_cannot_be_forged() -> None:
+    source = load_ranking_config()
+    marker_type = ranking_router._ValidatedRankingConfig
+
+    with pytest.raises(TypeError, match="factory-created"):
+        marker_type(source, _factory_token=object())
+    with pytest.raises(TypeError):
+        dict.__new__(marker_type)
+    unregistered = object.__new__(marker_type)
+    assert ranking_router._is_validated_ranking_config(unregistered) is False
+    with pytest.raises(TypeError, match="unregistered"):
+        ranking_router._prepare_ranking_config(unregistered)
+
+    class ForgedMarker(dict[str, Any]):
+        pass
+
+    forged = ForgedMarker(source)
+    prepared = ranking_router._prepare_ranking_config(forged)
+    assert prepared == source
+    assert prepared is not forged
+    assert ranking_router._is_validated_ranking_config(prepared) is True
+    assert not hasattr(prepared, "_factory_token")
+    assert not hasattr(ranking_router, "_freeze_validated_ranking_config")
+
+
+def test_prepared_ranking_config_registry_releases_roots_and_children() -> None:
+    source = load_ranking_config()
+    gc.collect()
+    baseline_size = ranking_router._ranking_config_registry_size()
+    prepared = ranking_router._prepare_ranking_config(source)
+    root_reference = weakref.ref(prepared)
+    child_reference = weakref.ref(prepared["task_analyzer"])
+    released_id = id(prepared)
+
+    assert ranking_router._ranking_config_registry_size() > baseline_size
+    del prepared
+    gc.collect()
+    assert root_reference() is None
+    assert child_reference() is None
+    assert ranking_router._ranking_config_registry_size() == baseline_size
+
+    # A same-layout, unregistered allocation must never inherit authenticity
+    # even if CPython reuses the released address.
+    unregistered = object.__new__(ranking_router._ValidatedRankingConfig)
+    reused_address = id(unregistered) == released_id
+    assert ranking_router._is_validated_ranking_config(unregistered) is False
+    if reused_address:
+        assert ranking_router._ranking_config_registry_size() == baseline_size
+
+
+def test_public_ranking_config_snapshots_are_detached_plain_json() -> None:
+    prepared = ranking_router._prepare_ranking_config(load_ranking_config())
+    snapshot = ranking_router._detached_ranking_config(prepared)
+    public_snapshot = ranking_config_snapshot(thinking_assignment_enabled=True)
+
+    assert type(snapshot) is dict
+    assert type(snapshot["task_analyzer"]) is dict
+    assert type(snapshot["task_analyzer"]["fallback_chain"]) is list
+    assert type(public_snapshot) is dict
+    assert type(public_snapshot["task_analyzer"]) is dict
+    snapshot["task_analyzer"]["max_retries"] = 99
+    assert prepared["task_analyzer"]["max_retries"] != 99
+
+
+def test_prepared_ranking_config_skips_revalidation_across_hot_path_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = ranking_config_snapshot(thinking_assignment_enabled=True)
+    original_validate = ranking_router._validate_ranking_config
+    original_detach = ranking_router._detached_ranking_config
+    validation_count = 0
+    detach_count = 0
+
+    def counted_validate(*args: Any, **kwargs: Any) -> Any:
+        nonlocal validation_count
+        validation_count += 1
+        return original_validate(*args, **kwargs)
+
+    def counted_detach(*args: Any, **kwargs: Any) -> Any:
+        nonlocal detach_count
+        detach_count += 1
+        return original_detach(*args, **kwargs)
+
+    monkeypatch.setattr(ranking_router, "_validate_ranking_config", counted_validate)
+    monkeypatch.setattr(ranking_router, "_detached_ranking_config", counted_detach)
+    prepared = ranking_router._prepare_effective_ranking_config(
+        source,
+        thinking_assignment_enabled=True,
+    )
+    for _ in range(100):
+        assert ranking_router._prepare_effective_ranking_config(
+            prepared,
+            thinking_assignment_enabled=True,
+        ) is prepared
+        task_analyzer_policy(prepared)
+        task_analyzer_chain_policy(prepared)
+        dynamic_output_token_budgets(
+            configured_output_tokens=8_192,
+            candidate_max_chars=24_000,
+            ranking_config=prepared,
+        )
+        fallback_task_profile(
+            routed_tier="c2",
+            request_context=_context(),
+            ranking_config=prepared,
+        )
+
+    assert validation_count == 1
+    assert detach_count == 1
+
+
+def test_analyzer_candidate_fast_freeze_requires_prevalidated_contracts() -> None:
+    candidate = ranking_router.TaskAnalyzerCandidate(
+        provider=None,
+        provider_id="openrouter",
+        model_id="openai/gpt-5.6-sol",
+        upstream_provider="azure",
+    )
+    external = load_ranking_config()
+    with pytest.raises(DynamicRankingError, match="requires a prepared base"):
+        ranking_router._task_analyzer_candidate_ranking_config(
+            external,
+            candidate,
+            schema_repair_max_retries=0,
+        )
+
+    prepared = ranking_router._prepare_ranking_config(external)
+    for invalid_repair_count in (-1, True, 2):
+        with pytest.raises(ValueError, match="must be 0 or 1"):
+            ranking_router._task_analyzer_candidate_ranking_config(
+                prepared,
+                candidate,
+                schema_repair_max_retries=invalid_repair_count,
+            )
+
+    rejected_provider = ranking_router.TaskAnalyzerCandidate(
+        provider=None,
+        provider_id="not-openrouter",
+        model_id="vendor/model",
+        upstream_provider="auto",
+    )
+    with pytest.raises(DynamicRankingError, match="must be openrouter"):
+        ranking_router._task_analyzer_candidate_ranking_config(
+            prepared,
+            rejected_provider,
+            schema_repair_max_retries=0,
+        )
+
+    for model_id, upstream_provider in (
+        ("Vendor/Model", "auto"),
+        ("vendor/model", "Invalid Provider"),
+    ):
+        malformed = object.__new__(ranking_router.TaskAnalyzerCandidate)
+        object.__setattr__(malformed, "provider", None)
+        object.__setattr__(malformed, "provider_id", "openrouter")
+        object.__setattr__(malformed, "model_id", model_id)
+        object.__setattr__(malformed, "upstream_provider", upstream_provider)
+        with pytest.raises(ValueError):
+            ranking_router._task_analyzer_candidate_ranking_config(
+                prepared,
+                malformed,
+                schema_repair_max_retries=0,
+            )
+
+    for model_id, upstream_provider, repair_count in (
+        ("openai/gpt-5.6-sol", "azure", 0),
+        ("google/gemini-3.1-pro-preview", "auto", 1),
+    ):
+        accepted_candidate = ranking_router.TaskAnalyzerCandidate(
+            provider=None,
+            provider_id="openrouter",
+            model_id=model_id,
+            upstream_provider=upstream_provider,
+        )
+        derived = ranking_router._task_analyzer_candidate_ranking_config(
+            prepared,
+            accepted_candidate,
+            schema_repair_max_retries=repair_count,
+        )
+        detached = ranking_router._detached_ranking_config(derived)
+        fully_validated = ranking_router._validate_ranking_config(detached)
+        assert ranking_router._is_validated_ranking_config(derived) is True
+        assert derived == fully_validated
+        assert detached["task_analyzer"]["fallback_chain"] == []
+        assert detached["task_analyzer"]["max_retries"] == repair_count
+
+    forged = object.__new__(ranking_router.TaskAnalyzerCandidate)
+    object.__setattr__(forged, "provider", None)
+    object.__setattr__(forged, "provider_id", "OpenRouter")
+    object.__setattr__(forged, "model_id", "openai/gpt-5.6-sol")
+    object.__setattr__(forged, "upstream_provider", "azure")
+    with pytest.raises(ValueError, match="lowercase"):
+        ranking_router._normalize_task_analyzer_chain_candidates([forged])
 
 
 def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(

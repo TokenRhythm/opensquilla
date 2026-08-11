@@ -20220,8 +20220,9 @@ def _build_router_dynamic_members(
         DynamicRankingError,
         TaskAnalysisResult,
         _canonical_hash,
-        _legacy_ranking_config_projection,
+        _detached_ranking_config,
         _legacy_registry_snapshot_projection,
+        _prepare_effective_ranking_config,
         _request_context_hash,
         build_model_registry_snapshot,
         build_request_context,
@@ -20289,7 +20290,7 @@ def _build_router_dynamic_members(
             else None
         )
         if isinstance(frozen_effective, Mapping):
-            ranking_config = deepcopy(dict(frozen_effective))
+            ranking_config = frozen_effective
         else:
             override_snapshot = getattr(
                 ensemble_cfg,
@@ -20305,8 +20306,10 @@ def _build_router_dynamic_members(
                 thinking_assignment_enabled=thinking_assignment_enabled,
                 override=frozen_override or None,
             )
-    if not thinking_assignment_enabled:
-        ranking_config = _legacy_ranking_config_projection(ranking_config)
+    ranking_config = _prepare_effective_ranking_config(
+        ranking_config,
+        thinking_assignment_enabled=thinking_assignment_enabled,
+    )
     aggregator_policy = ranking_config.get("aggregator")
     ranked_aggregator_count = (
         aggregator_policy.get("candidate_count")
@@ -20445,7 +20448,7 @@ def _build_router_dynamic_members(
         if analyzer_execution_contract is None:
             analyzer_execution_contract = (
                 task_analyzer_execution_contract_from_ranking_config(
-                    ranking_config
+                    _detached_ranking_config(ranking_config)
                 )
             )
         analyzer_execution_validation, execution_reasons = (
@@ -20723,7 +20726,7 @@ def _build_router_dynamic_members(
             retry_context_inputs_out.update(
                 {
                     "request_context": deepcopy(trace_request_context),
-                    "ranking_config": deepcopy(dict(ranking_config)),
+                    "ranking_config": _detached_ranking_config(ranking_config),
                 }
             )
             if task_analysis_supplied:
@@ -20877,7 +20880,7 @@ def _build_router_dynamic_members(
                 ranking_config.get("config_version") or ""
             ),
             "ranking_config_hash": _canonical_hash(ranking_config),
-            "ranking_parameters": deepcopy(dict(ranking_config)),
+            "ranking_parameters": _detached_ranking_config(ranking_config),
             "task_analyzer": task_analyzer_trace,
             "task_analyzer_execution_contract": deepcopy(
                 analyzer_execution_contract
@@ -21469,7 +21472,7 @@ def _build_router_dynamic_members(
         retry_context_inputs_out.update(
             {
                 "request_context": deepcopy(dict(request_context)),
-                "ranking_config": deepcopy(dict(ranking_config)),
+                "ranking_config": _detached_ranking_config(ranking_config),
             }
         )
         if task_analysis_supplied:

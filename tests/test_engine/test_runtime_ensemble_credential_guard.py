@@ -580,6 +580,54 @@ async def test_router_dynamic_wrap_is_not_credential_gated(
     }.intersection(turn.metadata["router_dynamic_decision"])
 
 
+async def test_router_dynamic_full_turn_prepares_ranking_config_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider import ranking_router
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config = _static_b5_config(selection_mode="router_dynamic")
+    runner = TurnRunner(provider_selector=None, config=config)
+    selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
+    original_validate = ranking_router._validate_ranking_config
+    original_prepare = ranking_router._prepare_effective_ranking_config
+    validation_count = 0
+    prepared_ids: list[int] = []
+
+    def counted_validate(*args: Any, **kwargs: Any) -> Any:
+        nonlocal validation_count
+        validation_count += 1
+        return original_validate(*args, **kwargs)
+
+    def capture_prepare(*args: Any, **kwargs: Any) -> Any:
+        prepared = original_prepare(*args, **kwargs)
+        prepared_ids.append(id(prepared))
+        return prepared
+
+    monkeypatch.setattr(ranking_router, "_validate_ranking_config", counted_validate)
+    monkeypatch.setattr(
+        ranking_router,
+        "_prepare_effective_ranking_config",
+        capture_prepare,
+    )
+
+    turn, provider = await runner._run_pipeline(
+        "exercise the complete dynamic production path",
+        "agent:main:ranking-config-prepare-once",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+    )
+
+    assert isinstance(provider, EnsembleProvider)
+    assert turn.metadata["ensemble_enabled"] is True
+    assert validation_count == 1
+    assert len(prepared_ids) >= 3
+    assert len(set(prepared_ids)) == 1
+
+
 async def test_router_dynamic_wraps_with_pinned_skill_loader_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,

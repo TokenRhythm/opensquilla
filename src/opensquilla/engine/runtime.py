@@ -6860,6 +6860,7 @@ class TurnRunner:
                         from opensquilla.provider.ranking_router import (
                             DynamicRankingError,
                             TaskAnalyzerCandidate,
+                            _prepare_effective_ranking_config,
                             analyze_task_with_fallback_chain,
                             analyze_task_with_provider,
                             build_request_context,
@@ -6910,6 +6911,12 @@ class TurnRunner:
                                     or None
                                 ),
                             )
+                        ranking_config = _prepare_effective_ranking_config(
+                            ranking_config,
+                            thinking_assignment_enabled=(
+                                thinking_assignment_enabled
+                            ),
+                        )
                         analyzer_policy = task_analyzer_policy(ranking_config)
                         analyzer_chain = task_analyzer_chain_policy(ranking_config)
                         analyzer_provider_id = str(analyzer_policy["provider"])

@@ -16,10 +16,11 @@ import json
 import math
 import re
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from functools import cache
+from functools import cache, wraps
 from importlib import resources
 from types import MappingProxyType
 from typing import Any
@@ -267,8 +268,311 @@ class TaskAnalyzerDeadlineError(TimeoutError):
     """The shared Analyzer-chain deadline elapsed before another request."""
 
 
-class _ValidatedRankingConfig(dict[str, Any]):
-    """Internal marker for a detached config that already passed full validation."""
+def _immutable_ranking_config_types() -> tuple[Any, ...]:
+    """Build the private immutable ranking-config representation.
+
+    The construction token deliberately lives only in this closure. Ordinary
+    container mutation, subclassing, or marker-like attributes therefore cannot
+    make an external mapping trusted. This is an integrity boundary against
+    accidental reuse, not a security boundary against hostile module introspection.
+    """
+
+    factory_token = object()
+    immutable_values: dict[int, tuple[Any, Any]] = {}
+    authentic_roots: set[int] = set()
+
+    def reject_mutation(*_args: Any, **_kwargs: Any) -> Any:
+        raise TypeError("prepared router_dynamic ranking config is immutable")
+
+    def register(instance: Any, values: Any) -> None:
+        object_id = id(instance)
+
+        def release(reference: Any, *, registered_id: int = object_id) -> None:
+            current = immutable_values.get(registered_id)
+            if current is not None and current[0] is reference:
+                immutable_values.pop(registered_id, None)
+                authentic_roots.discard(registered_id)
+
+        immutable_values[object_id] = (weakref.ref(instance, release), values)
+
+    def registered_values(instance: Any) -> Any:
+        current = immutable_values.get(id(instance))
+        if current is None or current[0]() is not instance:
+            raise TypeError("unregistered prepared ranking config container")
+        return current[1]
+
+    class ImmutableRankingDict(Mapping[str, Any]):
+        __slots__ = ("__weakref__",)
+
+        def __init__(
+            self,
+            values: Mapping[str, Any],
+            *,
+            _factory_token: object,
+        ) -> None:
+            if _factory_token is not factory_token:
+                raise TypeError("prepared ranking configs are factory-created")
+            register(self, MappingProxyType(dict(values)))
+
+        def __getitem__(self, key: str) -> Any:
+            return registered_values(self)[key]
+
+        def __iter__(self) -> Any:
+            return iter(registered_values(self))
+
+        def __len__(self) -> int:
+            return len(registered_values(self))
+
+        def __repr__(self) -> str:
+            return repr(dict(self))
+
+        def __copy__(self) -> ImmutableRankingDict:
+            return self
+
+        def __deepcopy__(self, memo: dict[int, Any]) -> ImmutableRankingDict:
+            memo[id(self)] = self
+            return self
+
+        __setattr__ = reject_mutation
+        __delattr__ = reject_mutation
+        __setitem__ = reject_mutation
+        __delitem__ = reject_mutation
+        __ior__ = reject_mutation
+        clear = reject_mutation
+        pop = reject_mutation
+        popitem = reject_mutation
+        setdefault = reject_mutation
+        update = reject_mutation
+
+    class ImmutableRankingList(Sequence[Any]):
+        __slots__ = ("__weakref__",)
+
+        def __init__(self, values: list[Any], *, _factory_token: object) -> None:
+            if _factory_token is not factory_token:
+                raise TypeError("prepared ranking configs are factory-created")
+            register(self, tuple(values))
+
+        def __getitem__(self, index: Any) -> Any:
+            return registered_values(self)[index]
+
+        def __len__(self) -> int:
+            return len(registered_values(self))
+
+        def __iter__(self) -> Any:
+            return iter(registered_values(self))
+
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, Sequence) and not isinstance(
+                other, (str, bytes, bytearray)
+            ) and list(self) == list(other)
+
+        def __repr__(self) -> str:
+            return repr(list(self))
+
+        def __copy__(self) -> ImmutableRankingList:
+            return self
+
+        def __deepcopy__(self, memo: dict[int, Any]) -> ImmutableRankingList:
+            memo[id(self)] = self
+            return self
+
+        __setattr__ = reject_mutation
+        __delattr__ = reject_mutation
+        __setitem__ = reject_mutation
+        __delitem__ = reject_mutation
+        __iadd__ = reject_mutation
+        __imul__ = reject_mutation
+        append = reject_mutation
+        clear = reject_mutation
+        extend = reject_mutation
+        insert = reject_mutation
+        pop = reject_mutation
+        remove = reject_mutation
+        reverse = reject_mutation
+        sort = reject_mutation
+
+    class ValidatedRankingConfig(ImmutableRankingDict):
+        """Factory-authenticated, recursively immutable validated config."""
+
+        __slots__ = ()
+
+    def freeze_value(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return ImmutableRankingDict(
+                {key: freeze_value(child) for key, child in value.items()},
+                _factory_token=factory_token,
+            )
+        if isinstance(value, list):
+            return ImmutableRankingList(
+                [freeze_value(child) for child in value],
+                _factory_token=factory_token,
+            )
+        return value
+
+    def freeze_config(value: Mapping[str, Any]) -> Mapping[str, Any]:
+        frozen = ValidatedRankingConfig(
+            {key: freeze_value(child) for key, child in value.items()},
+            _factory_token=factory_token,
+        )
+        authentic_roots.add(id(frozen))
+        return frozen
+
+    def registered_plain_value(value: Any) -> tuple[bool, Any]:
+        """Detach only containers created by this factory."""
+
+        if type(value) in {ImmutableRankingDict, ValidatedRankingConfig}:
+            values = registered_values(value)
+            return True, {
+                copy.deepcopy(key): registered_plain_value(child)[1]
+                for key, child in values.items()
+            }
+        if type(value) is ImmutableRankingList:
+            values = registered_values(value)
+            return True, [registered_plain_value(child)[1] for child in values]
+        return False, value
+
+    def registered_json_default(value: Any) -> Any:
+        """Teach json.dumps about only our private immutable containers."""
+
+        registered, plain = registered_plain_value(value)
+        if registered:
+            return plain
+        raise TypeError(
+            f"Object of type {type(value).__name__} is not JSON serializable"
+        )
+
+    def wrap_validated_builder(builder: Callable[..., Mapping[str, Any]]) -> Any:
+        """Authenticate only the checked plain mapping returned by ``builder``."""
+
+        @wraps(builder)
+        def checked_and_frozen(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
+            return freeze_config(builder(*args, **kwargs))
+
+        return checked_and_frozen
+
+    def derive_analyzer_candidate(
+        base: Mapping[str, Any],
+        *,
+        provider_id: str,
+        model_id: str,
+        upstream_provider: str,
+        schema_repair_max_retries: int,
+    ) -> Mapping[str, Any]:
+        """Freeze the one bounded mutation allowed for an Analyzer chain hop."""
+
+        if not is_authentic(base):
+            raise DynamicRankingError(
+                "router_dynamic analyzer candidate config requires a prepared base"
+            )
+        if provider_id != TASK_ANALYZER_PROVIDER_ID:
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.provider currently must be openrouter"
+            )
+        if (
+            not model_id
+            or model_id != model_id.strip().casefold()
+            or any(character.isspace() for character in model_id)
+            or "/" not in model_id
+            or any(not segment for segment in model_id.split("/"))
+        ):
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.model must be lowercase, trimmed, "
+                "contain '/', and contain no whitespace"
+            )
+        if (
+            not upstream_provider
+            or upstream_provider != upstream_provider.strip().casefold()
+            or _TASK_ANALYZER_UPSTREAM_PROVIDER_RE.fullmatch(upstream_provider)
+            is None
+        ):
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer.upstream_provider must be a lowercase "
+                "provider slug or auto"
+            )
+        if (
+            isinstance(schema_repair_max_retries, bool)
+            or not isinstance(schema_repair_max_retries, int)
+            or not 0 <= schema_repair_max_retries <= 1
+        ):
+            raise ValueError("task analyzer schema repair retries must be 0 or 1")
+        registered, temporary = registered_plain_value(base)
+        if not registered or not isinstance(temporary, dict):
+            raise DynamicRankingError(
+                "router_dynamic analyzer candidate config requires a prepared base"
+            )
+        analyzer = temporary.get("task_analyzer")
+        if not isinstance(analyzer, dict):
+            raise DynamicRankingError(
+                "router_dynamic task_analyzer must be a JSON object"
+            )
+        if not {
+            "provider",
+            "model",
+            "upstream_provider",
+            "stream_close_timeout_seconds",
+        }.issubset(analyzer):
+            raise DynamicRankingError(
+                "router_dynamic analyzer candidate requires the validated identity policy"
+            )
+        analyzer.update(
+            {
+                "provider": provider_id,
+                "model": model_id,
+                "upstream_provider": upstream_provider,
+                "max_retries": schema_repair_max_retries,
+            }
+        )
+        if "fallback_chain" in analyzer:
+            analyzer["fallback_chain"] = []
+        return freeze_config(temporary)
+
+    def is_authentic(value: Any) -> bool:
+        current = immutable_values.get(id(value))
+        return type(value) is ValidatedRankingConfig and (
+            id(value) in authentic_roots
+            and current is not None
+            and current[0]() is value
+        )
+
+    def registry_size() -> int:
+        return len(immutable_values)
+
+    return (
+        ValidatedRankingConfig,
+        wrap_validated_builder,
+        derive_analyzer_candidate,
+        is_authentic,
+        registry_size,
+        registered_plain_value,
+        registered_json_default,
+    )
+
+
+(
+    _ValidatedRankingConfig,
+    _wrap_validated_ranking_config_builder,
+    _derive_validated_analyzer_candidate,
+    _is_validated_ranking_config,
+    _ranking_config_registry_size,
+    _registered_ranking_config_plain_value,
+    _registered_ranking_config_json_default,
+) = _immutable_ranking_config_types()
+
+
+def _detached_ranking_config_value(value: Any) -> Any:
+    """Return mutable plain JSON containers without sharing prepared children."""
+
+    registered, plain = _registered_ranking_config_plain_value(value)
+    return plain if registered else copy.deepcopy(value)
+
+
+def _detached_ranking_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    registered, plain = _registered_ranking_config_plain_value(config)
+    if registered:
+        if not isinstance(plain, dict):
+            raise TypeError("prepared ranking config root must be an object")
+        return plain
+    return copy.deepcopy(dict(config))
 
 
 @dataclass(frozen=True)
@@ -514,6 +818,7 @@ def canonical_json_bytes(value: Any) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
+        default=_registered_ranking_config_json_default,
     ).encode("utf-8")
 
 
@@ -532,7 +837,7 @@ _canonical_hash = canonical_json_sha256
 def _legacy_ranking_config_projection(config: Mapping[str, Any]) -> dict[str, Any]:
     """Project the additive v4 policy config onto the exact pre-feature shape."""
 
-    projected = copy.deepcopy(dict(config))
+    projected = _detached_ranking_config(config)
     if projected.get("schema_version") != RANKING_CONFIG_SCHEMA_VERSION:
         return projected
     projected["schema_version"] = LEGACY_RANKING_CONFIG_SCHEMA_VERSION
@@ -1071,6 +1376,7 @@ def _thinking_assignment_policy(
     }
 
 
+@_wrap_validated_ranking_config_builder
 def _validate_ranking_config(
     raw: Any,
     *,
@@ -1078,7 +1384,7 @@ def _validate_ranking_config(
 ) -> _ValidatedRankingConfig:
     if not isinstance(raw, Mapping):
         raise DynamicRankingError("router_dynamic ranking config must be an object")
-    config = copy.deepcopy(dict(raw))
+    config = _detached_ranking_config(raw)
     schema_version = _ranking_string(config, "schema_version")
     if schema_version not in {
         RANKING_CONFIG_SCHEMA_VERSION,
@@ -2096,7 +2402,13 @@ def _validate_ranking_config(
     error_dimensions = _ranking_string_list(config, "rerank", "error_dimensions")
     if not error_dimensions:
         raise DynamicRankingError("router_dynamic rerank.error_dimensions cannot be empty")
-    return _ValidatedRankingConfig(config)
+    return config
+
+
+# The generic authenticator is intentionally unavailable after the strict
+# validator is constructed. Candidate derivation uses the separately bounded
+# capability created by the same private factory.
+del _wrap_validated_ranking_config_builder
 
 
 @cache
@@ -2180,7 +2492,7 @@ def _deep_merge_ranking_config_override(
     base: Mapping[str, Any],
     override: Mapping[str, Any],
 ) -> dict[str, Any]:
-    merged = copy.deepcopy(dict(base))
+    merged = _detached_ranking_config(base)
     for key, value in override.items():
         current = merged.get(key)
         if isinstance(current, Mapping) and isinstance(value, Mapping):
@@ -2210,7 +2522,7 @@ def _ranking_config_for_base_version(
         raise DynamicRankingError(
             f"router_dynamic ranking config base_version {requested!r} is not available"
         )
-    historical = copy.deepcopy(dict(packaged))
+    historical = _detached_ranking_config(packaged)
     historical["config_version"] = requested
     analyzer = historical.get("task_analyzer")
     if isinstance(analyzer, dict):
@@ -2239,7 +2551,7 @@ def _ranking_config_for_base_version(
 def load_ranking_config(*, base_version: str | None = None) -> dict[str, Any]:
     """Return an isolated copy of the selected Step2 ranking parameters."""
 
-    return copy.deepcopy(dict(_ranking_config_for_base_version(base_version)))
+    return _detached_ranking_config(_ranking_config_for_base_version(base_version))
 
 
 @cache
@@ -2251,7 +2563,7 @@ def _packaged_legacy_ranking_config() -> _ValidatedRankingConfig:
 def _packaged_enabled_ranking_config() -> _ValidatedRankingConfig:
     """Return the packaged v4 policy with its compatibility switch enabled."""
 
-    enabled = copy.deepcopy(dict(_packaged_ranking_config()))
+    enabled = _detached_ranking_config(_packaged_ranking_config())
     enabled["thinking_assignment"]["enabled"] = True
     return _validate_ranking_config(enabled)
 
@@ -2288,14 +2600,14 @@ def ranking_config_resolution(
         if thinking_assignment_enabled is not None
         else packaged_default_enabled
     )
-    full_base = copy.deepcopy(dict(packaged_base))
+    full_base = _detached_ranking_config(packaged_base)
     full_base["thinking_assignment"]["enabled"] = compatibility_enabled
     base = _validate_ranking_config(
         full_base
         if compatibility_enabled
         else _legacy_ranking_config_projection(full_base)
     )
-    base_config = copy.deepcopy(dict(base))
+    base_config = _detached_ranking_config(base)
     base_sha256 = _canonical_hash(base_config)
     if override is None:
         return {
@@ -2404,7 +2716,7 @@ def ranking_config_resolution(
         else _legacy_ranking_config_projection(validated_full)
     )
     validated_effective = _validate_ranking_config(effective)
-    effective_config = copy.deepcopy(dict(validated_effective))
+    effective_config = _detached_ranking_config(validated_effective)
     return {
         "base_config": copy.deepcopy(base_config),
         "override": copy.deepcopy(normalized_override),
@@ -2435,19 +2747,84 @@ def ranking_config_snapshot(
         override=override,
         base_version=base_version,
     )
-    return _ValidatedRankingConfig(resolution["effective_config"])
+    return _detached_ranking_config(resolution["effective_config"])
 
 
-def _resolve_ranking_config(
+def _prepare_ranking_config(
     ranking_config: Mapping[str, Any] | None,
 ) -> Mapping[str, Any]:
-    if isinstance(ranking_config, _ValidatedRankingConfig):
+    """Validate and recursively freeze one external config exactly once."""
+
+    if _is_validated_ranking_config(ranking_config):
         return ranking_config
     return (
         _validate_ranking_config(ranking_config)
         if ranking_config is not None
         else _packaged_ranking_config()
     )
+
+
+def _prepare_effective_ranking_config(
+    ranking_config: Mapping[str, Any] | None,
+    *,
+    thinking_assignment_enabled: bool,
+) -> Mapping[str, Any]:
+    """Prepare the exact thinking/legacy policy consumed by one turn."""
+
+    if not isinstance(thinking_assignment_enabled, bool):
+        raise DynamicRankingError(
+            "router_dynamic ranking_thinking_assignment_enabled must be a boolean"
+        )
+    if _is_validated_ranking_config(ranking_config):
+        schema_version = ranking_config.get("schema_version")
+        matches_mode = (
+            schema_version == RANKING_CONFIG_SCHEMA_VERSION
+            and _ranking_bool(ranking_config, "thinking_assignment", "enabled")
+            if thinking_assignment_enabled
+            else schema_version == LEGACY_RANKING_CONFIG_SCHEMA_VERSION
+        )
+        if matches_mode:
+            return ranking_config
+    if thinking_assignment_enabled:
+        if ranking_config is None:
+            return _packaged_enabled_ranking_config()
+        source_thinking = ranking_config.get("thinking_assignment")
+        if (
+            ranking_config.get("schema_version") == RANKING_CONFIG_SCHEMA_VERSION
+            and isinstance(source_thinking, Mapping)
+            and source_thinking.get("enabled") is True
+        ):
+            return _validate_ranking_config(ranking_config)
+        source_config = _detached_ranking_config(ranking_config)
+        thinking_section = source_config.get("thinking_assignment")
+        if (
+            isinstance(thinking_section, dict)
+            and thinking_section.get("enabled") is False
+        ):
+            # Compatibility adapter for callers that still pass the old
+            # out-of-band switch together with the packaged v4 template.
+            thinking_section["enabled"] = True
+        return _validate_ranking_config(
+            source_config,
+            allow_legacy_external_thinking_switch=True,
+        )
+    source_config = (
+        ranking_config if ranking_config is not None else _packaged_ranking_config()
+    )
+    if (
+        source_config.get("schema_version")
+        == LEGACY_RANKING_CONFIG_SCHEMA_VERSION
+    ):
+        return _validate_ranking_config(source_config)
+    return _validate_ranking_config(
+        _legacy_ranking_config_projection(source_config)
+    )
+
+
+def _resolve_ranking_config(
+    ranking_config: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    return _prepare_ranking_config(ranking_config)
 
 
 def task_analyzer_policy(
@@ -2535,7 +2912,13 @@ def task_analyzer_chain_policy(
         )
     )
     fallback_routes = analyzer.get("fallback_chain") if configured else []
-    assert isinstance(fallback_routes, list)
+    if not isinstance(fallback_routes, Sequence) or isinstance(
+        fallback_routes, (str, bytes, bytearray)
+    ):
+        raise DynamicRankingError(
+            "router_dynamic task_analyzer.fallback_chain must be a JSON array"
+        )
+    detached_fallback_routes = _detached_ranking_config_value(fallback_routes)
     return {
         "configured": configured,
         "routes": [
@@ -2544,7 +2927,7 @@ def task_analyzer_chain_policy(
                 "model": str(primary["model"]),
                 "upstream_provider": str(primary["upstream_provider"]),
             },
-            *copy.deepcopy(fallback_routes),
+            *detached_fallback_routes,
         ],
         "total_timeout_seconds": (
             _ranking_number(effective, "task_analyzer", "total_timeout_seconds")
@@ -3264,7 +3647,9 @@ def mock_user_profile(
     """Return the replaceable Step2 chapter-4 global default profile."""
 
     effective_config = _resolve_ranking_config(ranking_config)
-    return copy.deepcopy(dict(_ranking_mapping(effective_config, "mock_user_profile")))
+    return _detached_ranking_config(
+        _ranking_mapping(effective_config, "mock_user_profile")
+    )
 
 
 def validate_user_profile(
@@ -3847,7 +4232,9 @@ def _frozen_task_analyzer_routes(
     ]
     if "fallback_chain" in source_config:
         fallback_chain = source_config.get("fallback_chain")
-        if not isinstance(fallback_chain, list):
+        if not isinstance(fallback_chain, Sequence) or isinstance(
+            fallback_chain, (str, bytes, bytearray)
+        ):
             return None
         raw_routes.extend(fallback_chain)
     routes: list[dict[str, str]] = []
@@ -5332,7 +5719,12 @@ def _normalize_task_analyzer_chain_candidates(
     }
     for index, raw_candidate in enumerate(candidates):
         if isinstance(raw_candidate, TaskAnalyzerCandidate):
-            candidate = raw_candidate
+            candidate = TaskAnalyzerCandidate(
+                provider=raw_candidate.provider,
+                provider_id=raw_candidate.provider_id,
+                model_id=raw_candidate.model_id,
+                upstream_provider=raw_candidate.upstream_provider,
+            )
         elif isinstance(raw_candidate, Mapping):
             if set(raw_candidate) != expected_mapping_keys:
                 raise ValueError(
@@ -5368,21 +5760,31 @@ def _task_analyzer_candidate_ranking_config(
     *,
     schema_repair_max_retries: int,
 ) -> _ValidatedRankingConfig:
-    temporary = copy.deepcopy(dict(ranking_config))
-    analyzer = temporary.get("task_analyzer")
-    if not isinstance(analyzer, dict):
-        raise DynamicRankingError("router_dynamic task_analyzer must be a JSON object")
-    analyzer.update(
-        {
-            "provider": candidate.provider_id,
-            "model": candidate.model_id,
-            "upstream_provider": candidate.upstream_provider,
-            "max_retries": schema_repair_max_retries,
-        }
+    if not _is_validated_ranking_config(ranking_config):
+        raise DynamicRankingError(
+            "router_dynamic analyzer candidate config requires a prepared base"
+        )
+    if not isinstance(candidate, TaskAnalyzerCandidate):
+        raise ValueError("task analyzer candidate must be normalized")
+    if (
+        isinstance(schema_repair_max_retries, bool)
+        or not isinstance(schema_repair_max_retries, int)
+        or not 0 <= schema_repair_max_retries <= 1
+    ):
+        raise ValueError("task analyzer schema repair retries must be 0 or 1")
+    candidate = TaskAnalyzerCandidate(
+        provider=candidate.provider,
+        provider_id=candidate.provider_id,
+        model_id=candidate.model_id,
+        upstream_provider=candidate.upstream_provider,
     )
-    if "fallback_chain" in analyzer:
-        analyzer["fallback_chain"] = []
-    return _validate_ranking_config(temporary)
+    return _derive_validated_analyzer_candidate(
+        ranking_config,
+        provider_id=candidate.provider_id,
+        model_id=candidate.model_id,
+        upstream_provider=candidate.upstream_provider,
+        schema_repair_max_retries=schema_repair_max_retries,
+    )
 
 
 def _public_task_analyzer_chain_failure_reason(value: Any) -> str:
@@ -8062,28 +8464,11 @@ def rank_models(
         raise DynamicRankingError(
             "router_dynamic proposer recovery quorum must be a positive integer"
         )
-    if ranking_thinking_assignment_enabled:
-        if ranking_config is None:
-            effective_ranking_config = _packaged_enabled_ranking_config()
-        else:
-            source_config = copy.deepcopy(dict(ranking_config))
-            thinking_section = source_config.get("thinking_assignment")
-            if (
-                isinstance(thinking_section, dict)
-                and thinking_section.get("enabled") is False
-            ):
-                # Compatibility adapter for callers that still pass the old
-                # out-of-band switch together with the packaged v4 template.
-                thinking_section["enabled"] = True
-            effective_ranking_config = _validate_ranking_config(
-                source_config,
-                allow_legacy_external_thinking_switch=True,
-            )
-    else:
-        source_config = ranking_config if ranking_config is not None else _packaged_ranking_config()
-        effective_ranking_config = _validate_ranking_config(
-            _legacy_ranking_config_projection(source_config)
-        )
+    effective_ranking_config = _prepare_effective_ranking_config(
+        ranking_config,
+        thinking_assignment_enabled=ranking_thinking_assignment_enabled,
+    )
+    if not ranking_thinking_assignment_enabled:
         registry_snapshot = _legacy_registry_snapshot_projection(registry_snapshot)
     if (
         ranking_thinking_assignment_enabled
@@ -8748,7 +9133,7 @@ def rank_models(
         "ranking_config_schema_version": str(effective_ranking_config["schema_version"]),
         "ranking_config_version": str(effective_ranking_config["config_version"]),
         "ranking_config_hash": ranking_config_hash,
-        "ranking_parameters": copy.deepcopy(dict(effective_ranking_config)),
+        "ranking_parameters": _detached_ranking_config(effective_ranking_config),
         "task_profile_schema_version": TASK_PROFILE_SCHEMA_VERSION,
         "registry_snapshot_version": str(registry_snapshot.get("snapshot_version") or ""),
         "registry_snapshot_hash": registry_snapshot_hash,
