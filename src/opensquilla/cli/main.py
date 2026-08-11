@@ -153,7 +153,6 @@ from opensquilla.cli.sandbox_cmd import sandbox_app  # noqa: E402
 from opensquilla.cli.search_cmd import search_app  # noqa: E402
 from opensquilla.cli.sessions_cmd import app as sessions_app  # noqa: E402
 from opensquilla.cli.skills_cmd import skills_app  # noqa: E402
-from opensquilla.cli.swebench_cmd import swebench_app  # noqa: E402
 from opensquilla.cli.uninstall_cmd import uninstall_command  # noqa: E402
 from opensquilla.observability.cli_logging import configure_cli_structlog  # noqa: E402
 
@@ -203,7 +202,6 @@ app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(search_app, name="search")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(skills_app, name="skills")
-app.add_typer(swebench_app, name="swebench")
 app.add_typer(codetask_app, name="code-task")
 
 app.command("init")(init_command)

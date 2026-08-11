@@ -373,6 +373,34 @@ async def test_task_runtime_stream_error_terminal_message_carries_error_ref() ->
 
 
 @pytest.mark.asyncio
+async def test_task_runtime_stream_error_keeps_failure_kind_internal() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield ErrorEvent(
+            message="Provider quota exhausted",
+            code="usage_limit_reached",
+            failure_kind="insufficient_credits",
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    with pytest.raises(TaskRuntimeStreamError) as exc_info:
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            "agent:main:test",
+            _emitter,
+            stream_event_sink=None,
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+
+    assert exc_info.value.failure_kind == "insufficient_credits"
+    assert "failure_kind" not in emitted[-1][2]
+
+
+@pytest.mark.asyncio
 async def test_task_runtime_stream_output_truncation_is_terminal_state() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
 

@@ -35,7 +35,7 @@ from opensquilla.gateway.routing import tool_context_from_envelope
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
-from opensquilla.gateway.session_streams import get_session_streams
+from opensquilla.gateway.session_streams import SessionStreamRegistry, get_session_streams
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
@@ -49,7 +49,19 @@ from opensquilla.sandbox.guest_profile import (
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session import storage as session_storage
 from opensquilla.session.compaction import CompactionConfig
-from opensquilla.session.models import TranscriptEntry
+from opensquilla.session.goals import (
+    GoalCommandRequest,
+    StartGoalMutation,
+    goal_snapshot,
+    new_goal,
+)
+from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
+    SessionNode,
+    TranscriptEntry,
+)
+from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.visibility import guest_safe_tool_allowlist
 
 _DEFAULT_PRINCIPAL = Principal(
@@ -372,6 +384,8 @@ class FakeSessionManager:
         model_override: str | None = None,
         auth_profile_override: str | None = None,
         auth_profile_override_source: str | None = None,
+        workspace_id: str | None = None,
+        origin: dict[str, Any] | None = None,
     ):
         session = FakeSession(
             session_key=session_key,
@@ -384,6 +398,8 @@ class FakeSessionManager:
             model_override=model_override,
             auth_profile_override=auth_profile_override,
             auth_profile_override_source=auth_profile_override_source,
+            workspace_id=workspace_id,
+            origin=origin,
         )
         self._storage._sessions[session_key] = session
         return session
@@ -604,6 +620,103 @@ class _ReplayConn:
         self.events.append((event, payload or {}, meta))
 
 
+@asynccontextmanager
+async def _open_goal_hydration_context(
+    db_path: Path,
+    *,
+    session_key: str,
+    conn_id: str,
+) -> AsyncIterator[SimpleNamespace]:
+    """Create one real durable Goal plus an isolated subscribed connection."""
+
+    storage = SessionStorage(str(db_path))
+    await storage.connect()
+    session_id = f"session-{hashlib.sha256(session_key.encode()).hexdigest()[:12]}"
+    await storage.upsert_session(
+        SessionNode(
+            session_key=session_key,
+            session_id=session_id,
+            agent_id="main",
+            status="idle",
+            epoch=0,
+            created_at=100,
+            updated_at=100,
+        )
+    )
+    task_id = f"task-{hashlib.sha256(session_key.encode()).hexdigest()[:12]}"
+    objective = "Hydrate the authoritative Goal snapshot."
+    command = GoalCommandRequest(
+        source_scope="gateway:goal-hydration-test",
+        request_session_key=session_key,
+        client_request_id="00000000-0000-4000-8000-000000000901",
+        action="set",
+        request_fingerprint=hashlib.sha256(
+            f"set:{session_key}".encode()
+        ).hexdigest(),
+    )
+    await storage.accept_turn(
+        TranscriptEntry(
+            session_id=session_id,
+            session_key=session_key,
+            message_id=f"message-{hashlib.sha256(session_key.encode()).hexdigest()[:12]}",
+            role="user",
+            content=objective,
+            created_at=200,
+        ),
+        expected_epoch=0,
+        updated_at=200,
+        task_record=AgentTaskRecord(
+            task_id=task_id,
+            session_key=session_key,
+            agent_id="main",
+            source_kind="webui",
+            queue_mode="followup",
+            run_kind="goal",
+            status=AgentTaskStatus.QUEUED,
+            created_at=200,
+            updated_at=200,
+        ),
+        source_scope=command.source_scope,
+        request_session_key=session_key,
+        client_request_id=command.client_request_id,
+        request_fingerprint=command.request_fingerprint,
+        goal_mutation=StartGoalMutation(
+            goal=new_goal(
+                goal_id=f"goal-{hashlib.sha256(session_key.encode()).hexdigest()[:12]}",
+                session_key=session_key,
+                session_id=session_id,
+                session_epoch=0,
+                objective=objective,
+                task_id=task_id,
+                created_at_ms=200,
+            ),
+            command=command,
+        ),
+    )
+    subscriptions = SubscriptionManager()
+    manager = SimpleNamespace(_storage=storage, _epoch_cache={})
+    context = make_ctx(
+        session_manager=manager,
+        conn_id=conn_id,
+        subscription_manager=subscriptions,
+    )
+    conn = _ReplayConn(conn_id)
+    registry = get_registry()
+    registry.register(conn)
+    try:
+        yield SimpleNamespace(
+            storage=storage,
+            context=context,
+            subscriptions=subscriptions,
+            connection=conn,
+            objective=objective,
+        )
+    finally:
+        subscriptions.unsubscribe_messages(conn_id, session_key)
+        registry.unregister(conn_id)
+        await storage.close()
+
+
 class _RecordingTurnRunner:
     def __init__(self) -> None:
         self.run_calls: list[dict[str, Any]] = []
@@ -694,6 +807,66 @@ class TestSessionsCreate:
         )
         assert res.ok is True
         assert res.payload["key"].startswith("agent:myagent:webchat:")
+
+    @pytest.mark.asyncio
+    async def test_create_project_task_persists_workspace_and_run_context(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        session_manager = FakeSessionManager()
+        project = SimpleNamespace(
+            workspace_id="project-a",
+            path="/synthetic/project-a",
+        )
+
+        async def resolve_workspace(storage: Any, workspace_id: str) -> Any:
+            assert storage is session_manager._storage
+            assert workspace_id == "project-a"
+            return SimpleNamespace(workspace=project)
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "resolve_validated_project_workspace",
+            resolve_workspace,
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {
+                "agentId": "main",
+                "kind": "webchat",
+                "workspaceId": "project-a",
+            },
+            make_ctx(session_manager=session_manager),
+        )
+
+        assert res.ok is True
+        session = session_manager._storage._sessions[res.payload["key"]]
+        assert session.workspace_id == "project-a"
+        assert session.origin is not None
+        run_context = session.origin[RUN_CONTEXT_ORIGIN_KEY]
+        assert run_context["workspace"] == "/synthetic/project-a"
+        assert run_context["run_mode"] == "full"
+
+    @pytest.mark.asyncio
+    async def test_create_project_task_requires_local_owner(self, dispatcher):
+        session_manager = FakeSessionManager()
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {"agentId": "main", "workspaceId": "project-a"},
+            make_ctx(
+                session_manager=session_manager,
+                role="guest",
+                scopes=["operator.write"],
+            ),
+        )
+
+        assert res.ok is False
+        assert res.error.code == "OWNER_REQUIRED"
+        assert session_manager._storage._sessions == {}
 
     @pytest.mark.asyncio
     async def test_create_with_message_requires_manager(self, dispatcher, ctx_no_manager):
@@ -2103,7 +2276,6 @@ class TestSessionsSend:
     async def test_send_collect_keeps_preallocated_turn_identity(self, dispatcher, session):
         from opensquilla.gateway.routing import RouteEnvelope, SourceKind
         from opensquilla.gateway.task_runtime import TaskRuntime
-        from opensquilla.session.models import AgentTaskRecord
 
         class RuntimeStorage:
             def __init__(self) -> None:
@@ -3987,7 +4159,7 @@ class TestSessionsAbort:
         assert runtime.cancel_calls == [
             {
                 "task_id": "task-old",
-                "session_key": None,
+                "session_key": session.session_key,
                 "source": "webui_stop",
                 "reason": "user_abort",
             }
@@ -3995,7 +4167,7 @@ class TestSessionsAbort:
         assert runtime.wait_calls == ["task-old"]
 
     @pytest.mark.asyncio
-    async def test_guest_chat_abort_never_cancels_unbound_task_id(self, dispatcher):
+    async def test_guest_chat_abort_binds_task_id_to_owned_session(self, dispatcher):
         owner_id = "a" * 64
         session = FakeSession(session_key=guest_owned_session_key(owner_id, "mine"))
 
@@ -4005,11 +4177,17 @@ class TestSessionsAbort:
 
             async def list(self, session_key: str | None = None):
                 assert session_key == session.session_key
-                return []
+                return [SimpleNamespace(task_id="owned-task", status="running")]
 
             async def cancel(self, **kwargs) -> int:
                 self.cancel_calls.append(kwargs)
-                return 1 if len(self.cancel_calls) == 1 else 0
+                return int(
+                    kwargs.get("task_id") == "owned-task"
+                    and kwargs.get("session_key") == session.session_key
+                )
+
+            async def wait(self, task_id: str):
+                return SimpleNamespace(task_id=task_id, status="cancelled")
 
         runtime = Runtime()
         guest = Principal(
@@ -4030,18 +4208,28 @@ class TestSessionsAbort:
         response = await dispatcher.dispatch(
             "guest-abort",
             "chat.abort",
-            {"sessionKey": session.session_key, "taskId": "victim-task"},
+            {
+                "sessionKey": session.session_key,
+                "taskId": "owned-task",
+                "scope": "task",
+            },
             ctx,
         )
 
         assert response.ok is True
-        assert runtime.cancel_calls
-        assert all(call.get("task_id") is None for call in runtime.cancel_calls)
-        assert all(call.get("session_key") == session.session_key for call in runtime.cancel_calls)
+        assert response.payload["aborted"] is True
+        assert runtime.cancel_calls == [
+            {
+                "task_id": "owned-task",
+                "session_key": session.session_key,
+                "source": "webui_abort",
+                "reason": "user_abort",
+            }
+        ]
 
     @pytest.mark.asyncio
-    async def test_chat_user_stop_cancels_the_whole_session_even_with_a_stale_task_id(
-        self, dispatcher, session
+    async def test_chat_user_stop_with_stale_task_id_is_a_side_effect_free_mismatch(
+        self, dispatcher, session, monkeypatch
     ):
         class Runtime:
             def __init__(self) -> None:
@@ -4073,6 +4261,26 @@ class TestSessionsAbort:
 
         runtime = Runtime()
         ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=runtime)
+        background_cancel_calls: list[str] = []
+        approval_cancel_calls: list[str] = []
+
+        async def cancel_background(session_key: str) -> int:
+            background_cancel_calls.append(session_key)
+            return 1
+
+        class ApprovalQueue:
+            def resolve_pending_for_session(self, session_key: str, *, approved: bool) -> int:
+                approval_cancel_calls.append(session_key)
+                return 1
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
+            cancel_background,
+        )
+        monkeypatch.setattr(
+            "opensquilla.gateway.approval_queue.get_approval_queue",
+            lambda: ApprovalQueue(),
+        )
 
         res = await dispatcher.dispatch(
             "r1",
@@ -4081,19 +4289,126 @@ class TestSessionsAbort:
                 "sessionKey": session.session_key,
                 "taskId": "task-old",
                 "source": "webui_stop",
+                "scope": "task",
             },
             ctx,
         )
 
         assert res.ok is True
+        assert res.payload["aborted"] is False
+        assert res.payload["reason"] == "task_mismatch"
+        assert runtime.cancel_calls == []
+        assert background_cancel_calls == []
+        assert approval_cancel_calls == []
+
+    @pytest.mark.asyncio
+    async def test_chat_user_stop_cancels_only_the_bound_runtime_task(
+        self, dispatcher, session
+    ):
+        class Runtime:
+            def __init__(self) -> None:
+                self.cancel_calls: list[dict[str, Any]] = []
+                self.wait_calls: list[str] = []
+
+            async def list(self, session_key: str | None = None):
+                assert session_key == session.session_key
+                return [
+                    SimpleNamespace(task_id="task-current", status="running"),
+                    SimpleNamespace(task_id="task-followup", status="queued"),
+                ]
+
+            async def cancel(self, **kwargs) -> int:
+                self.cancel_calls.append(kwargs)
+                return int(
+                    kwargs.get("task_id") == "task-current"
+                    and kwargs.get("session_key") == session.session_key
+                )
+
+            async def wait(self, task_id: str):
+                self.wait_calls.append(task_id)
+                return SimpleNamespace(task_id=task_id, status="cancelled")
+
+        class Manager(FakeSessionManager):
+            async def list_sessions(self, **_kwargs):
+                raise AssertionError("task-scoped Stop must not traverse the session tree")
+
+        runtime = Runtime()
+        ctx = make_ctx(session_manager=Manager([session]), task_runtime=runtime)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "chat.abort",
+            {
+                "sessionKey": session.session_key,
+                "taskId": "task-current",
+                "source": "webui_stop",
+                "scope": "task",
+            },
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["aborted"] is True
+        assert "cancelled_sessions" not in res.payload
         assert runtime.cancel_calls == [
             {
-                "task_id": None,
+                "task_id": "task-current",
                 "session_key": session.session_key,
                 "source": "webui_stop",
                 "reason": "user_abort",
             }
         ]
+        assert runtime.wait_calls == ["task-current"]
+
+    @pytest.mark.asyncio
+    async def test_chat_task_scoped_stop_without_valid_task_id_never_widens_to_session_abort(
+        self, dispatcher, session
+    ):
+        class Runtime:
+            def __init__(self) -> None:
+                self.list_calls = 0
+                self.cancel_calls: list[dict[str, Any]] = []
+
+            async def list(self, session_key: str | None = None):
+                self.list_calls += 1
+                return [SimpleNamespace(task_id="task-live", status="running")]
+
+            async def cancel(self, **kwargs) -> int:
+                self.cancel_calls.append(kwargs)
+                return 1
+
+        runtime = Runtime()
+        ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=runtime)
+
+        payloads = (
+            {
+                "sessionKey": session.session_key,
+                "source": "webui_stop",
+                "scope": "task",
+            },
+            {
+                "sessionKey": session.session_key,
+                "source": "webui_stop",
+                "taskId": 17,
+            },
+            {
+                "sessionKey": session.session_key,
+                "source": "webui_stop",
+                "taskId": " ",
+            },
+        )
+        for index, payload in enumerate(payloads):
+            res = await dispatcher.dispatch(
+                f"r{index}",
+                "chat.abort",
+                payload,
+                ctx,
+            )
+            assert res.ok is True
+            assert res.payload["aborted"] is False
+            assert res.payload["reason"] == "task_id_required"
+        assert runtime.list_calls == 0
+        assert runtime.cancel_calls == []
 
     @pytest.mark.asyncio
     async def test_chat_user_stop_cancels_all_descendant_subagent_sessions(
@@ -7199,6 +7514,223 @@ class TestSessionsMessagesSubscribe:
         assert response.payload["hydration_complete"] is False
         assert snapshot.ok is True
         assert metadata_called is False
+
+    @pytest.mark.asyncio
+    async def test_messages_fast_subscribe_defers_both_goal_snapshot_fields(
+        self,
+        dispatcher,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        key = "agent:main:webchat:goal-fast-ack"
+        streams = SessionStreamRegistry()
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+
+        async with _open_goal_hydration_context(
+            tmp_path / "goal-fast-ack.sqlite",
+            session_key=key,
+            conn_id="goal-fast-ack-conn",
+        ) as stack:
+            goal_reads = 0
+            original_get_goal = stack.storage.get_goal
+
+            async def observed_get_goal(session_key: str) -> Any:
+                nonlocal goal_reads
+                goal_reads += 1
+                return await original_get_goal(session_key)
+
+            monkeypatch.setattr(stack.storage, "get_goal", observed_get_goal)
+            response = await dispatcher.dispatch(
+                "goal-fast-ack",
+                "sessions.messages.subscribe",
+                {"key": key, "fast_ack": True},
+                stack.context,
+            )
+
+            assert response.ok is True
+            assert response.payload["goal"] is None
+            assert response.payload["goalSnapshotStreamSeq"] is None
+            assert {"goal", "goalSnapshotStreamSeq"}.issubset(
+                response.payload["deferred_fields"]
+            )
+            assert response.payload["hydration_complete"] is False
+            assert goal_reads == 0
+            assert stack.subscriptions.get_message_subscribers(key) == {
+                stack.context.conn_id
+            }
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_registers_before_legacy_goal_read(
+        self,
+        dispatcher,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        key = "agent:main:webchat:goal-register-before-read"
+        streams = SessionStreamRegistry()
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+
+        async with _open_goal_hydration_context(
+            tmp_path / "goal-register-before-read.sqlite",
+            session_key=key,
+            conn_id="goal-register-before-read-conn",
+        ) as stack:
+            original_get_goal = stack.storage.get_goal
+            observed_registration = False
+
+            async def observed_get_goal(session_key: str) -> Any:
+                nonlocal observed_registration
+                observed_registration = stack.context.conn_id in (
+                    stack.subscriptions.get_message_subscribers(session_key)
+                )
+                return await original_get_goal(session_key)
+
+            monkeypatch.setattr(stack.storage, "get_goal", observed_get_goal)
+            response = await dispatcher.dispatch(
+                "goal-register-before-read",
+                "sessions.messages.subscribe",
+                {"key": key},
+                stack.context,
+            )
+
+            assert response.ok is True
+            assert observed_registration is True
+            assert response.payload["goal"]["objective"] == stack.objective
+
+    @pytest.mark.asyncio
+    async def test_messages_hydrate_goal_snapshot_uses_pre_read_stream_watermark(
+        self,
+        dispatcher,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        key = "agent:main:webchat:goal-hydrate-watermark"
+        streams = SessionStreamRegistry()
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+
+        async with _open_goal_hydration_context(
+            tmp_path / "goal-hydrate-watermark.sqlite",
+            session_key=key,
+            conn_id="goal-hydrate-watermark-conn",
+        ) as stack:
+            initial = streams.record(
+                key,
+                "session.event.thinking",
+                {"task_id": "goal-hydrate-watermark-task", "text": "before"},
+            )
+            subscribed = await dispatcher.dispatch(
+                "goal-watermark-subscribe",
+                "sessions.messages.subscribe",
+                {"key": key, "fast_ack": True},
+                stack.context,
+            )
+            assert subscribed.ok is True
+
+            durable_goal = await stack.storage.get_goal(key)
+            assert durable_goal is not None
+            original_get_goal = stack.storage.get_goal
+            goal_read_started = asyncio.Event()
+            release_goal_read = asyncio.Event()
+
+            async def blocked_get_goal(session_key: str) -> Any:
+                assert stack.context.conn_id in (
+                    stack.subscriptions.get_message_subscribers(session_key)
+                )
+                goal_read_started.set()
+                await release_goal_read.wait()
+                return await original_get_goal(session_key)
+
+            monkeypatch.setattr(stack.storage, "get_goal", blocked_get_goal)
+            hydration_task = asyncio.create_task(
+                dispatcher.dispatch(
+                    "goal-watermark-hydrate",
+                    "sessions.messages.hydrate",
+                    {"key": key},
+                    stack.context,
+                )
+            )
+            await asyncio.wait_for(goal_read_started.wait(), timeout=2.0)
+            try:
+                await rpc_sessions._emit_to_subscribers(
+                    stack.context,
+                    key,
+                    "session.event.goal",
+                    {
+                        "session_key": key,
+                        "session_id": durable_goal.session_id,
+                        "epoch": durable_goal.session_epoch,
+                        "event_type": "updated",
+                        "state_revision": durable_goal.state_revision,
+                        "progress_revision": durable_goal.progress_revision,
+                        "previous_goal_id": None,
+                        "goal": goal_snapshot(durable_goal),
+                    },
+                )
+            finally:
+                release_goal_read.set()
+            hydrated = await asyncio.wait_for(hydration_task, timeout=2.0)
+
+            assert hydrated.ok is True
+            assert hydrated.payload["goal"]["goalId"] == durable_goal.goal_id
+            assert hydrated.payload["goal"]["objective"] == stack.objective
+            assert hydrated.payload["goalSnapshotStreamSeq"] == initial["stream_seq"]
+            assert len(stack.connection.events) == 1
+            event_name, event_payload, event_meta = stack.connection.events[0]
+            assert event_name == "session.event.goal"
+            assert event_meta is None
+            assert event_payload["stream_seq"] > hydrated.payload[
+                "goalSnapshotStreamSeq"
+            ]
+
+    @pytest.mark.asyncio
+    async def test_messages_hydrate_recovers_goal_snapshot_after_replay_gap(
+        self,
+        dispatcher,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        key = "agent:main:webchat:goal-replay-gap"
+        streams = SessionStreamRegistry(max_events_per_session=1)
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+
+        async with _open_goal_hydration_context(
+            tmp_path / "goal-replay-gap.sqlite",
+            session_key=key,
+            conn_id="goal-replay-gap-conn",
+        ) as stack:
+            streams.record(
+                key,
+                "session.event.goal",
+                {"event_type": "created", "goal": {"goalId": "older"}},
+            )
+            latest = streams.record(
+                key,
+                "session.event.goal",
+                {"event_type": "updated", "goal": {"goalId": "buffered"}},
+            )
+            subscribed = await dispatcher.dispatch(
+                "goal-replay-gap-subscribe",
+                "sessions.messages.subscribe",
+                {"key": key, "since_stream_seq": 0, "fast_ack": True},
+                stack.context,
+            )
+
+            assert subscribed.ok is True
+            assert subscribed.payload["replay_complete"] is False
+            assert subscribed.payload["replay_gap_reason"] == "buffer_window_missed"
+            assert subscribed.payload["goal"] is None
+            hydrated = await dispatcher.dispatch(
+                "goal-replay-gap-hydrate",
+                "sessions.messages.hydrate",
+                {"key": key},
+                stack.context,
+            )
+
+            assert hydrated.ok is True
+            assert hydrated.payload["goal"]["objective"] == stack.objective
+            assert hydrated.payload["goalSnapshotStreamSeq"] == latest["stream_seq"]
+            assert "goal" not in hydrated.payload["deferred_fields"]
+            assert "goalSnapshotStreamSeq" not in hydrated.payload["deferred_fields"]
 
     @pytest.mark.asyncio
     async def test_messages_hydrate_returns_authoritative_enrichment_without_subscribing(

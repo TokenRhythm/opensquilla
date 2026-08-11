@@ -2818,7 +2818,7 @@ async def test_archive_only_memory_flush_compaction_status_does_not_enter_repair
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_reports_obligations_and_keeps_protected_tool_tail(manager):
+async def test_compact_with_result_summarizes_completed_tool_round(manager):
     await manager.create("agent:main:main")
     await manager.append_message(
         "agent:main:main",
@@ -2883,10 +2883,22 @@ async def test_compact_with_result_reports_obligations_and_keeps_protected_tool_
     assert summary.coverage_status == "pass"
     assert summary.missing_obligations == []
     assert summary.critical_carry_forward == []
-    assert "src/opensquilla/session/models.py" in str(summary.summary_payload)
-    transcript = await manager.get_transcript("agent:main:main")
-    assert any(entry.tool_call_id == "call_exec_1" for entry in transcript)
+    payload = summary.summary_payload
+    assert payload is not None
+    assert "src/opensquilla/session/models.py" in str(payload)
+    assert {"id": "call_exec_1"} in payload["tool_results_to_remember"]
     assert any(
+        "missing summary_payload column" in failure.get("detail", "")
+        for failure in payload["known_failures"]
+    )
+    assert any(
+        "pytest tests/test_session/test_manager.py" in command
+        for command in payload["executed_commands_and_tests"]
+    )
+    assert "call_exec_1" not in payload["pending_tool_and_approval_ids"]
+    transcript = await manager.get_transcript("agent:main:main")
+    assert not any(entry.tool_call_id == "call_exec_1" for entry in transcript)
+    assert not any(
         entry.tool_calls and entry.tool_calls[0]["id"] == "call_exec_1"
         for entry in transcript
     )

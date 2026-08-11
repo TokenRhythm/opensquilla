@@ -27,8 +27,9 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.session.goals import GoalCommandRequest, StartGoalMutation, new_goal
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
+from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
 from opensquilla.session.turn_context import current_turn_context, turn_context_scope
 
@@ -137,6 +138,236 @@ def _assert_no_runtime_acceptance_state(runtime: TaskRuntime) -> None:
     assert runtime._tasks == {}
     assert runtime._pending_by_session == {}
     assert runtime._running_by_session == {}
+
+
+async def _seed_idle_active_goal(stack: _RealIngressStack) -> Any:
+    """Create a settled active Goal without installing an execution lease."""
+
+    session = await stack.storage.get_session(SESSION_KEY)
+    assert session is not None
+    task_id = "meta-control-goal-bootstrap-task"
+    objective = "Keep the Goal active while a control turn runs."
+    command = GoalCommandRequest(
+        source_scope="web:test-owner",
+        request_session_key=SESSION_KEY,
+        client_request_id="00000000-0000-4000-8000-000000000001",
+        action="set",
+        request_fingerprint="a" * 64,
+    )
+    goal = new_goal(
+        goal_id="meta-control-active-goal",
+        session_key=SESSION_KEY,
+        session_id=session.session_id,
+        session_epoch=session.epoch,
+        objective=objective,
+        task_id=task_id,
+        created_at_ms=100,
+    )
+    accepted = await stack.storage.accept_turn(
+        TranscriptEntry(
+            session_id=session.session_id,
+            session_key=SESSION_KEY,
+            message_id="meta-control-goal-bootstrap-message",
+            role="user",
+            content=objective,
+            created_at=100,
+        ),
+        expected_epoch=session.epoch,
+        updated_at=100,
+        task_record=AgentTaskRecord(
+            task_id=task_id,
+            session_key=SESSION_KEY,
+            agent_id="main",
+            source_kind="webui",
+            queue_mode="followup",
+            run_kind="goal",
+            status=AgentTaskStatus.QUEUED,
+            created_at=100,
+            updated_at=100,
+        ),
+        source_scope=command.source_scope,
+        request_session_key=SESSION_KEY,
+        client_request_id=command.client_request_id,
+        request_fingerprint=command.request_fingerprint,
+        goal_mutation=StartGoalMutation(goal=goal, command=command),
+    )
+    assert accepted.goal_context is not None
+    await stack.storage.update_agent_task(
+        task_id,
+        status=AgentTaskStatus.SUCCEEDED,
+        started_at=110,
+        finished_at=120,
+        terminal_reason="completed",
+    )
+    settled = await stack.storage.settle_goal_task(
+        accepted.goal_context,
+        max_turns=50,
+        runtime_budget_seconds=3_600,
+    )
+    assert settled is not None
+    assert settled.status == "active"
+    assert settled.active_task_id is None
+    return settled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("control_kind", "message", "request_id", "correlation_id", "stage_options"),
+    [
+        (
+            "manual",
+            "/meta meta-tiny -- run outside the active goal",
+            "active-goal-manual-meta-control",
+            "request:active-goal-manual-meta-control",
+            {},
+        ),
+        (
+            "replay",
+            format_meta_replay_sentinel("0123456789abcdef0123456789abcdef"),
+            "active-goal-replay-meta-control",
+            "nonce:0123456789abcdef0123456789abcdef",
+            {"replay_run_id": "source-run-active-goal", "replay_mode": "failed-step"},
+        ),
+    ],
+    ids=["manual", "replay"],
+)
+async def test_durable_meta_control_does_not_claim_active_goal(
+    tmp_path: Path,
+    control_kind: str,
+    message: str,
+    request_id: str,
+    correlation_id: str,
+    stage_options: dict[str, str],
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        seeded_goal = await _seed_idle_active_goal(stack)
+        intent, disposition = await stack.storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind=control_kind,
+            correlation_id=correlation_id,
+            meta_skill_name="meta-tiny",
+            **stage_options,
+        )
+        assert disposition == "stamped"
+
+        response = await get_dispatcher().dispatch(
+            f"rpc-{control_kind}-meta-control-with-active-goal",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": message,
+                "clientRequestId": request_id,
+            },
+            stack.context,
+        )
+        await stack.wait_until_running()
+
+        assert response.ok is True
+        accepted_control = await stack.storage.get_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind=control_kind,
+            correlation_id=correlation_id,
+        )
+        assert accepted_control is not None
+        assert accepted_control.intent_id == intent.intent_id
+        assert accepted_control.status == "accepted"
+        assert accepted_control.accepted_task_id == response.payload["task_id"]
+        control_task = await stack.storage.get_agent_task(response.payload["task_id"])
+        assert control_task is not None
+        assert control_task.details is not None
+        assert control_task.details["goal_context"] is None
+        assert control_task.details["goal_candidate"] is None
+
+        current_goal = await stack.storage.get_goal(SESSION_KEY)
+        assert current_goal is not None
+        assert current_goal.goal_id == seeded_goal.goal_id
+        assert current_goal.status == "active"
+        assert current_goal.active_task_id is None
+        assert current_goal.state_revision == seeded_goal.state_revision
+
+
+@pytest.mark.asyncio
+async def test_legacy_meta_launch_does_not_claim_active_goal(tmp_path: Path) -> None:
+    request_id = "legacy-meta-launch-with-active-goal"
+    assert (
+        pending_meta_launch_put(
+            SESSION_KEY,
+            "meta-tiny",
+            client_request_id=request_id,
+        )
+        == "stamped"
+    )
+
+    try:
+        async with _open_real_stack(tmp_path / "legacy-meta-active-goal.db") as stack:
+            seeded_goal = await _seed_idle_active_goal(stack)
+            response = await get_dispatcher().dispatch(
+                "rpc-legacy-meta-launch-with-active-goal",
+                "chat.send",
+                {
+                    "sessionKey": SESSION_KEY,
+                    "message": "/meta meta-tiny",
+                    "clientRequestId": request_id,
+                },
+                stack.context,
+            )
+            await stack.wait_until_running()
+
+            assert response.ok is True
+            task = await stack.storage.get_agent_task(response.payload["task_id"])
+            assert task is not None and task.details is not None
+            assert task.details.get("goal_context") is None
+            assert task.details.get("goal_candidate") is None
+
+            current_goal = await stack.storage.get_goal(SESSION_KEY)
+            assert current_goal is not None
+            assert current_goal.goal_id == seeded_goal.goal_id
+            assert current_goal.status == "active"
+            assert current_goal.active_task_id is None
+            assert current_goal.state_revision == seeded_goal.state_revision
+    finally:
+        pending_meta_launch_pop(SESSION_KEY, client_request_id=request_id)
+
+
+@pytest.mark.asyncio
+async def test_default_turn_claims_goal_inside_atomic_acceptance_without_pre_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "atomic-current-goal-claim.db") as stack:
+        seeded_goal = await _seed_idle_active_goal(stack)
+        original_get_goal = stack.storage.get_goal
+
+        async def reject_pre_accept_read(_session_key: str) -> None:
+            pytest.fail("sessions.send must resolve the current Goal inside accept_turn")
+
+        monkeypatch.setattr(stack.storage, "get_goal", reject_pre_accept_read)
+        response = await get_dispatcher().dispatch(
+            "rpc-default-turn-current-goal-claim",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Continue the active Goal atomically.",
+                "clientRequestId": "atomic-current-goal-claim",
+            },
+            stack.context,
+        )
+
+        assert response.ok is True
+        accepted_task = await stack.storage.get_agent_task(response.payload["task_id"])
+        assert accepted_task is not None and accepted_task.details is not None
+        goal_context = accepted_task.details.get("goal_context")
+        assert isinstance(goal_context, dict)
+        assert goal_context["goalId"] == seeded_goal.goal_id
+        assert goal_context["taskId"] == response.payload["task_id"]
+        assert accepted_task.details.get("goal_candidate") is None
+
+        # The minimal ingress stack intentionally has no GoalService lifecycle
+        # listener.  Activation may therefore fail closed and settle the owner
+        # immediately, but the durable task must retain the context resolved in
+        # the acceptance transaction.
+        current_goal = await original_get_goal(SESSION_KEY)
+        assert current_goal is not None and current_goal.goal_id == seeded_goal.goal_id
 
 
 @pytest.mark.asyncio

@@ -22,7 +22,11 @@ async function mountQueue(
   }> = [
     { text: 'Follow the latest instruction' },
   ],
-  props: { imageBlockedMessage?: string; steerAvailable?: boolean } = {},
+  props: {
+    imageBlockedMessage?: string
+    steerAvailable?: boolean
+    steerUnavailableMessage?: string
+  } = {},
 ) {
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -41,13 +45,33 @@ async function mountQueue(
 
 describe('PendingQueue', () => {
   it('keeps the original steer affordance visible but disabled when capability is unavailable', async () => {
-    const { app, el } = await mountQueue({}, undefined, { steerAvailable: false })
+    const reason = 'Steer unavailable: the active task identity has not synchronized yet.'
+    const { app, el } = await mountQueue({}, undefined, {
+      steerAvailable: false,
+      steerUnavailableMessage: reason,
+    })
 
     const steer = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
     expect(steer?.textContent).toContain('Steer')
     expect(steer?.disabled).toBe(true)
-    expect(steer?.title).toContain('queues for after current response')
+    expect(steer?.title).toBe(reason)
+    expect(steer?.getAttribute('aria-describedby')).toBeNull()
+    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
     expect(el.querySelector('[aria-label="Remove pending message 1"]')).not.toBeNull()
+    app.unmount()
+  })
+
+  it('does not show an unavailable reason when same-turn steering is available', async () => {
+    const { app, el } = await mountQueue({}, undefined, {
+      steerAvailable: true,
+      steerUnavailableMessage: 'This stale reason must stay hidden.',
+    })
+
+    const steer = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+    expect(steer?.disabled).toBe(false)
+    expect(steer?.title).not.toContain('stale reason')
+    expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
+    expect(steer?.getAttribute('aria-describedby')).toBeNull()
     app.unmount()
   })
 
@@ -169,6 +193,32 @@ describe('PendingQueue', () => {
     )]
     expect(steerButtons).toHaveLength(2)
     expect(steerButtons.every(button => button.disabled)).toBe(true)
+    expect(steerButtons[0]?.title).toContain('already being applied')
+    expect(steerButtons[1]?.title).toContain('another queued message is being delivered')
+    app.unmount()
+  })
+
+  it('prioritizes the attachment blocker over a task capability reason', async () => {
+    const documentAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 9,
+      name: 'requirements.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'document-9',
+    }
+    const capabilityReason = 'Steer unavailable: the active task identity has not synchronized yet.'
+    const { app, el } = await mountQueue({}, [{
+      text: 'Review this document',
+      attachments: [documentAttachment],
+    }], {
+      steerAvailable: false,
+      steerUnavailableMessage: capabilityReason,
+    })
+
+    const steer = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+    expect(steer?.disabled).toBe(true)
+    expect(steer?.title).toContain('messages with attachments')
+    expect(steer?.title).not.toBe(capabilityReason)
     app.unmount()
   })
 

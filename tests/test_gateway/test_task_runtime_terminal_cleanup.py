@@ -37,9 +37,15 @@ from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_sessions import _handle_plans_cancel_run
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.sandbox.guest_profile import GuestProfileFactory
+from opensquilla.session.goals import (
+    GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
+    GoalObjectiveUpdate,
+    GoalTurnContext,
+)
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     AgentTaskRecord,
+    AgentTaskStatus,
     PlanRevisionRecord,
     PlanRunRecord,
     SessionNode,
@@ -142,6 +148,43 @@ async def test_terminal_clears_all_dicts() -> None:
     # _session_locks is intentionally retained: never pop while _execute may
     # still hold the lock; prevents split-brain on rapid re-enqueue.
     assert sk not in rt._last_envelope_by_session
+
+
+@pytest.mark.asyncio
+async def test_terminal_lifecycle_settles_before_session_lane_cleanup() -> None:
+    """The current task remains admission-visible until lifecycle settlement ends."""
+
+    terminal_entered = asyncio.Event()
+    release_terminal = asyncio.Event()
+
+    async def lifecycle(event: Any) -> None:
+        if event.phase != "terminal":
+            return
+        terminal_entered.set()
+        await release_terminal.wait()
+
+    rt = _make_runtime()
+    rt.set_lifecycle_listener(lifecycle)
+    env = _make_envelope("agent-1::sess-terminal-settlement")
+    handle = await rt.enqueue(env, "hello")
+
+    await asyncio.wait_for(terminal_entered.wait(), timeout=2.0)
+    persisted = await rt.status(handle.task_id)
+    assert persisted.status is AgentTaskStatus.SUCCEEDED
+    assert await rt.has_session_work(env.session_key) is True
+    assert rt._running_by_session[env.session_key].task_id == handle.task_id
+    assert handle.task_id in rt._tasks
+
+    waiter = asyncio.create_task(rt.wait(handle.task_id, timeout=2.0))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release_terminal.set()
+    settled = await waiter
+    assert settled.status is AgentTaskStatus.SUCCEEDED
+    assert await rt.has_session_work(env.session_key) is False
+    assert env.session_key not in rt._running_by_session
+    assert handle.task_id not in rt._tasks
 
 
 @pytest.mark.asyncio
@@ -1548,6 +1591,249 @@ async def test_ensemble_active_turn_exposes_queue_only_steer_capability() -> Non
     assert admission.failure_code == "ACTIVE_TURN_NOT_STEERABLE"
     assert admission.capability == capability
     assert persist_calls == 0
+    await rt.cancel(task_id=handle.task_id)
+    await rt.wait(handle.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_goal_edit_admission_queues_internal_update_on_running_task() -> None:
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+    persisted_task_ids: list[str | None] = []
+
+    async def _handler(_run: Any) -> None:
+        started.set()
+        await blocker.wait()
+
+    storage = _make_storage()
+    rt = TaskRuntime(storage=storage, turn_handler=_handler)
+    env = _make_envelope("agent-1::goal-edit-same-turn")
+    handle = await rt.enqueue(env, "first")
+    await started.wait()
+
+    async def _persist(task_id: str | None) -> dict[str, Any]:
+        persisted_task_ids.append(task_id)
+        assert task_id == handle.task_id
+        record = await storage.get_agent_task(task_id)
+        assert record is not None
+        details = dict(record.details or {})
+        update = GoalObjectiveUpdate(
+            context=GoalTurnContext(
+                session_id=env.session_key,
+                epoch=1,
+                goal_id="goal-edit-same-turn",
+                objective_revision=2,
+                objective_snapshot="Use the revised objective.",
+                task_id=task_id,
+            ),
+            state_revision=2,
+            accepted_at_ms=123,
+        )
+        details[GOAL_OBJECTIVE_UPDATE_DETAIL_KEY] = update.as_task_detail()
+        await storage.update_agent_task(task_id, details=details)
+        return {"status": "active", "revision": 2}
+
+    response = await rt.apply_goal_objective_edit(
+        env.session_key,
+        persist=_persist,
+    )
+
+    assert response == {"status": "active", "revision": 2}
+    assert persisted_task_ids == [handle.task_id]
+    assert await rt.active_task_id(env.session_key) == handle.task_id
+    assert [record.task_id for record in await storage.list_agent_tasks()] == [
+        handle.task_id
+    ]
+    runtime_task = rt._running_by_session[env.session_key]
+    provider = runtime_task.pending_input_provider
+    assert provider._pending == []
+    assert provider._goal_pending is not None
+    assert provider._goal_pending.context.task_id == handle.task_id
+    assert provider._goal_pending.context.objective_revision == 2
+    assert storage.turn_context_updates == []
+
+    # Durable Clear happens before this in-memory projection is revoked. An
+    # edit that has not crossed the Agent safe boundary must not be claimed or
+    # injected afterward, and revocation must not stop the owning task.
+    await rt.revoke_goal_objective_updates(env.session_key)
+    assert (await provider.claim_pending()).texts == ()
+    assert await rt.active_task_id(env.session_key) == handle.task_id
+
+    await rt.cancel(task_id=handle.task_id)
+    await rt.wait(handle.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_goal_clear_after_claim_keeps_assembled_input_but_blocks_late_apply() -> None:
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+    applied_updates: list[GoalObjectiveUpdate] = []
+
+    async def _handler(_run: Any) -> None:
+        started.set()
+        await blocker.wait()
+
+    storage = _make_storage()
+
+    async def _claim(update: GoalObjectiveUpdate) -> GoalObjectiveUpdate:
+        return replace(update, status="claimed")
+
+    async def _apply(
+        update: GoalObjectiveUpdate,
+        *,
+        iteration: int,
+        model_call_id: str,
+    ) -> GoalObjectiveUpdate:
+        del iteration, model_call_id
+        applied_updates.append(update)
+        return replace(update, status="applied")
+
+    storage.claim_goal_objective_update = _claim
+    storage.apply_goal_objective_update = _apply
+    rt = TaskRuntime(storage=storage, turn_handler=_handler)
+    env = _make_envelope("agent-1::goal-edit-claimed-clear")
+    handle = await rt.enqueue(env, "first")
+    await started.wait()
+    queued_updates: list[GoalObjectiveUpdate] = []
+
+    async def _persist(task_id: str | None) -> dict[str, Any]:
+        assert task_id == handle.task_id
+        record = await storage.get_agent_task(task_id)
+        assert record is not None
+        details = dict(record.details or {})
+        update = GoalObjectiveUpdate(
+            context=GoalTurnContext(
+                session_id=env.session_key,
+                epoch=1,
+                goal_id="goal-edit-claimed-clear",
+                objective_revision=2,
+                objective_snapshot="Use the claimed objective update.",
+                task_id=task_id,
+            ),
+            state_revision=2,
+            accepted_at_ms=123,
+        )
+        queued_updates.append(update)
+        details[GOAL_OBJECTIVE_UPDATE_DETAIL_KEY] = update.as_task_detail()
+        await storage.update_agent_task(task_id, details=details)
+        return {"status": "active", "revision": 2}
+
+    await rt.apply_goal_objective_edit(env.session_key, persist=_persist)
+    runtime_task = rt._running_by_session[env.session_key]
+    provider = runtime_task.pending_input_provider
+    claim = await provider.claim_pending()
+    assert queued_updates
+    assert claim.goal_context == queued_updates[0].context.as_task_detail()
+    assert len(claim.texts) == 1
+    assert "Use the claimed objective update." in claim.texts[0]
+
+    # The returned claim models prompt context already assembled by Agent.
+    # Clear cannot recall that value, but it removes the provider's authority
+    # acknowledgement so a later provider start cannot apply the Goal edit.
+    await rt.revoke_goal_objective_updates(env.session_key)
+    assert claim.texts[0]
+    assert provider._goal_claimed is None
+    assert provider.mark_applied(iteration=2, model_call_id="after-clear") is None
+    assert provider.take_applied_goal_context() is None
+    assert applied_updates == []
+    assert runtime_task.goal_context is None
+    assert await rt.active_task_id(env.session_key) == handle.task_id
+
+    await rt.cancel(task_id=handle.task_id)
+    await rt.wait(handle.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_goal_edit_post_commit_projection_failure_still_returns_acceptance() -> None:
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+    persisted_task_ids: list[str | None] = []
+
+    async def _handler(_run: Any) -> None:
+        started.set()
+        await blocker.wait()
+
+    storage = _make_storage()
+    rt = TaskRuntime(storage=storage, turn_handler=_handler)
+    env = _make_envelope("agent-1::goal-edit-projection-failure")
+    handle = await rt.enqueue(env, "first")
+    await started.wait()
+
+    async def _persist(task_id: str | None) -> dict[str, Any]:
+        persisted_task_ids.append(task_id)
+        return {"accepted": True, "status": "active", "revision": 2}
+
+    async def _failed_read(_task_id: str) -> AgentTaskRecord | None:
+        raise OSError("synthetic post-commit read failure")
+
+    original_get_agent_task = storage.get_agent_task
+    storage.get_agent_task = _failed_read
+    response = await rt.apply_goal_objective_edit(
+        env.session_key,
+        persist=_persist,
+    )
+
+    assert response == {"accepted": True, "status": "active", "revision": 2}
+    assert persisted_task_ids == [handle.task_id]
+    runtime_task = rt._running_by_session[env.session_key]
+    assert runtime_task.pending_input_provider._goal_pending is None
+    assert runtime_task.pending_input_provider._pending == []
+    assert storage.turn_context_updates == []
+
+    storage.get_agent_task = original_get_agent_task
+    await rt.cancel(task_id=handle.task_id)
+    await rt.wait(handle.task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_goal_edit_admission_defers_ensemble_to_next_goal_turn() -> None:
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+    persisted_task_ids: list[str | None] = []
+    accepted_config = SimpleNamespace(
+        squilla_router=SimpleNamespace(enabled=True, rollout_phase="enforce"),
+        llm_ensemble=SimpleNamespace(
+            enabled=True,
+            selection_mode="",
+            candidates=[],
+        ),
+    )
+
+    async def _handler(_run: Any) -> None:
+        started.set()
+        await blocker.wait()
+
+    async def _persist(task_id: str | None) -> dict[str, Any]:
+        persisted_task_ids.append(task_id)
+        return {"status": "active", "revision": 2}
+
+    storage = _make_storage()
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=_handler,
+        accepted_config_provider=lambda: accepted_config,
+    )
+    env = _make_envelope("agent-1::goal-edit-ensemble")
+    handle = await rt.enqueue(env, "first")
+    await started.wait()
+    runtime_task = rt._running_by_session[env.session_key]
+
+    response = await rt.apply_goal_objective_edit(
+        env.session_key,
+        persist=_persist,
+    )
+
+    assert response == {"status": "active", "revision": 2}
+    assert persisted_task_ids == [None]
+    assert await rt.active_task_id(env.session_key) == handle.task_id
+    assert rt._running_by_session[env.session_key] is runtime_task
+    assert [record.task_id for record in await storage.list_agent_tasks()] == [
+        handle.task_id
+    ]
+    assert runtime_task.pending_input_provider._pending == []
+    assert runtime_task.pending_input_provider._goal_pending is None
+    assert storage.turn_context_updates == []
+
     await rt.cancel(task_id=handle.task_id)
     await rt.wait(handle.task_id, timeout=2.0)
 

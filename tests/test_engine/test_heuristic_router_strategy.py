@@ -327,6 +327,27 @@ async def test_heuristic_metadata_flows_through_policy_engine(
 
 
 @pytest.mark.asyncio
+async def test_goal_routing_hint_drives_router_without_persisting_objective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.squilla_router.v4_phase3 as v4_phase3
+
+    monkeypatch.setattr(v4_phase3, "V4Phase3Strategy", ExplodingV4Strategy)
+    generic_event = "Continue working on the active Goal."
+    objective = "Repair the migration and implement the typed API. " + "x" * 3000
+    ctx = make_context(generic_event, session_key="agent:heuristic:goal-routing")
+    ctx.routing_hint = objective
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routing_extra"]["heuristic_features"]["char_len"] == len(
+        objective
+    )
+    assert routed.metadata["routing_history"][-1]["text"] == generic_event
+    assert objective not in repr(routed.metadata)
+
+
+@pytest.mark.asyncio
 async def test_borderline_band_defers_to_configured_default_tier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

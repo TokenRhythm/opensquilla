@@ -157,6 +157,9 @@ class ErrorEvent:
     # Appended last with a default: positional construction elsewhere must not
     # shift (same hazard the DoneEvent comment in this file documents).
     error_id: str = ""
+    # Stable provider taxonomy for terminal consumers.  The provider's raw
+    # ``code`` remains available for diagnostics and wire compatibility.
+    failure_kind: str = ""
 
 
 @dataclass

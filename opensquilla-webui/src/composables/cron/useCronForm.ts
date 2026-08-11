@@ -35,7 +35,7 @@ export function useCronForm(options: UseCronFormOptions) {
     every: '',
     at: '',
     tz: '',
-    payloadKind: 'reminder',
+    payloadKind: 'agent_turn',
     agentId: 'main',
     workspaceId: '',
     workspaceRequired: false,
@@ -90,7 +90,9 @@ export function useCronForm(options: UseCronFormOptions) {
     panelOpen.value = true
     const tpl = template || {}
     form.templateId = job ? (job.templateId || '') : (tpl.id || '')
-    const payloadKind = job ? (job.payloadKind || 'agent_turn') : (tpl.payloadKind || 'reminder')
+    // A newly-authored scheduled task should execute its instruction. Static
+    // delivery remains available as an explicit no-model reminder mode.
+    const payloadKind = job ? (job.payloadKind || 'agent_turn') : (tpl.payloadKind || 'agent_turn')
     const sessionTarget = job
       ? (job.sessionTarget || job.session_target || 'isolated')
       : (tpl.sessionTarget || (payloadKind === 'system_event' ? 'main' : 'isolated'))
@@ -98,10 +100,11 @@ export function useCronForm(options: UseCronFormOptions) {
     form.name = job ? (job.name || '') : (tpl.name || '')
     form.message = job ? (job.message || job.prompt || '') : (tpl.message || '')
     form.type = job ? (job.scheduleKind || job.schedule_kind || 'cron') : (tpl.scheduleKind || tpl.schedule_kind || 'cron')
-    // The friendly picker derives "Daily / 09:00" from this expression and falls
-    // back to that reading when it is empty. Leaving it empty for a new job puts
-    // a schedule on screen that the model does not hold, so saving without first
-    // touching the frequency select posts an empty expr for the Gateway to reject.
+    // Keep the friendly default and the submitted schedule in sync. Previously
+    // the panel rendered 09:00 from a display-only fallback while sending an
+    // empty expression on the first save. The default comes from the same
+    // constant the panel falls back to, so the two cannot drift apart, and only
+    // a cron job is seeded — an `every` or `at` job has no expression to hold.
     form.cron = job
       ? (job.expression || '')
       : (tpl.expression || (form.type === 'cron' ? DEFAULT_CRON_EXPRESSION : ''))

@@ -167,8 +167,8 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
 
 
 @pytest.mark.asyncio
-async def test_new_skips_when_only_cut_would_orphan_tool_result(monkeypatch):
-    """If no clean boundary exists, compaction must not split tool state.
+async def test_new_can_cut_after_completed_tool_round(monkeypatch):
+    """A paired tool call/result is a safe boundary, not live protocol state.
 
     The branch under test sits in a two-token-wide window band: one token
     higher and the transcript is within budget, one lower and a cut is found
@@ -205,9 +205,10 @@ async def test_new_skips_when_only_cut_would_orphan_tool_result(monkeypatch):
     result = await compact_context_new(request)
 
     assert result.removed_count == 0
-    assert result.summary_source == "skipped"
+    assert result.summary_source == "fallback"
     assert result.kept_entries == entries
-    assert result.skip_reason == "no_safe_turn_boundary"
+    assert result.skip_reason == "quality_gate_failed"
+    assert result.quality_report["fits_context_window"] is False
 
 
 @pytest.mark.asyncio

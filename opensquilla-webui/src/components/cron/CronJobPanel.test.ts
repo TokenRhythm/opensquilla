@@ -102,12 +102,14 @@ describe('CronJobPanel friendly schedule contracts', () => {
     const { form, open } = mountPanel()
     await nextTick()
 
-    const initial = document.querySelector<HTMLSelectElement>('#cp-repeat-kind')!
-    expect(initial.value).toBe('daily')
-    initial.value = 'custom'
-    initial.dispatchEvent(new Event('change', { bubbles: true }))
+    const initial = document.querySelector<HTMLButtonElement>('#cp-repeat-kind')!
+    expect(initial.textContent).toContain('cronSkills.panel.daily')
+    initial.click()
     await nextTick()
-    expect(initial.value).toBe('custom')
+    const options = document.querySelectorAll<HTMLButtonElement>('[role="option"]')
+    options[options.length - 1].click()
+    await nextTick()
+    expect(initial.textContent).toContain('cronSkills.panel.customAdvancedTime')
 
     open.value = false
     await nextTick()
@@ -116,7 +118,64 @@ describe('CronJobPanel friendly schedule contracts', () => {
     await nextTick()
 
     expect(
-      document.querySelector<HTMLSelectElement>('#cp-repeat-kind')!.value,
-    ).toBe('daily')
+      document.querySelector<HTMLButtonElement>('#cp-repeat-kind')!.textContent,
+    ).toContain('cronSkills.panel.daily')
+  })
+
+  it('uses themed selectors instead of the native time popup', async () => {
+    const { form } = mountPanel()
+    await nextTick()
+
+    expect(document.querySelector('select')).toBeNull()
+    expect(document.querySelector('input[type="time"]')).toBeNull()
+    document.querySelector<HTMLButtonElement>('#cp-friendly-hour')!.click()
+    await nextTick()
+    const hourOptions = document.querySelectorAll<HTMLButtonElement>('[role="option"]')
+    hourOptions[14].click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#cp-friendly-minute')!.click()
+    await nextTick()
+    const minuteOptions = Array.from(document.querySelectorAll<HTMLButtonElement>('[role="option"]'))
+    minuteOptions.find(option => option.textContent?.trim() === '30')!.click()
+    await nextTick()
+
+    expect(form.cron).toBe('30 14 * * *')
+  })
+
+  it('supports keyboard focus navigation and Escape in themed selectors', async () => {
+    mountPanel()
+    await nextTick()
+
+    const trigger = document.querySelector<HTMLButtonElement>('#cp-repeat-kind')!
+    trigger.focus()
+    trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+    await nextTick()
+    expect(document.activeElement?.textContent).toContain('cronSkills.panel.daily')
+
+    document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+    expect(document.activeElement?.textContent).toContain('cronSkills.panel.weekdays')
+    document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    await nextTick()
+
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(trigger)
+  })
+
+  it('closes a themed selector when Tab moves focus to the next field', async () => {
+    mountPanel()
+    await nextTick()
+
+    const trigger = document.querySelector<HTMLButtonElement>('#cp-repeat-kind')!
+    const nextField = document.querySelector<HTMLButtonElement>('#cp-payload-kind-simple')!
+    trigger.focus()
+    trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+    await nextTick()
+    expect(trigger.getAttribute('aria-expanded')).toBe('true')
+
+    nextField.focus()
+    await nextTick()
+
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(nextField)
   })
 })

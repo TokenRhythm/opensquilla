@@ -244,6 +244,16 @@ export function skillDependencyCounts(skill: Skill): SkillDependencyCounts {
 }
 
 export function installActionsForCurrentDependencies(skill: Skill): SkillInstall[] {
+  // Lifecycle-v2 can expose same-name managed candidates that are shadowed,
+  // disabled, hidden, or otherwise not the live winner. The dependency RPC is
+  // intentionally still name-based, so offering an action for one of those
+  // candidates could execute the current winner's different install spec.
+  if (skill.active === false) return []
+  if (skill.lifecycle && (
+    skill.lifecycle.selection_state !== 'active'
+    || !['loaded', 'serving_previous'].includes(skill.lifecycle.load_state)
+  )) return []
+
   const summary = skillDependencySummary(skill)
   const missingBins = new Set([
     ...summary.missing.binaries.all,
@@ -301,6 +311,14 @@ export function skillProviderCheckAtLaunch(skill: Skill): boolean {
   )
 }
 
+export function skillCatalogKey(skill: Skill): string {
+  const instanceId = (skill.instance_id || '').trim()
+  if (instanceId) return `instance:${instanceId}`
+  const installId = (skill.install_id || '').trim()
+  if (installId) return `install:${installId}`
+  return `legacy:${skill.layer || 'unknown'}:${skill.name}`
+}
+
 export function skillStatusDotClass(skill: Skill): string {
   const status = skill.status || (skill.eligible ? 'ready' : 'needs_setup')
   if (skillProviderCheckAtLaunch(skill)) return 'is-provider-check'
@@ -332,6 +350,98 @@ export function skillStatusChipText(skill: Skill): string {
   if (status === 'ready') return i18n.global.t('cronSkills.skills.statusReady')
   if (status === 'not_declared') return i18n.global.t('cronSkills.skills.statusNoDeps')
   return i18n.global.t('cronSkills.skills.statusNeedsDeps')
+}
+
+export type SkillLifecycleSurface = 'installed' | 'registry'
+export type SkillLifecycleTone = 'success' | 'info' | 'warning' | 'danger' | 'neutral'
+
+export interface SkillLifecyclePresentation {
+  label: string
+  tone: SkillLifecycleTone
+}
+
+export function skillLifecyclePresentation(
+  skill: Skill,
+  surface: SkillLifecycleSurface,
+): SkillLifecyclePresentation | null {
+  const lifecycle = skill.lifecycle
+  if (!lifecycle) return null
+  if (lifecycle.install_state === 'missing') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateMissing'),
+      tone: 'danger',
+    }
+  }
+  if (
+    lifecycle.load_state === 'rejected'
+    || lifecycle.compatibility_state === 'unsupported'
+  ) {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateRejected'),
+      tone: 'danger',
+    }
+  }
+  if (lifecycle.load_state === 'serving_previous') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateRestored'),
+      tone: 'warning',
+    }
+  }
+  if (lifecycle.install_state === 'drifted') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateDrifted'),
+      tone: 'warning',
+    }
+  }
+  if (lifecycle.load_state === 'validated_offline') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateNextStart'),
+      tone: 'info',
+    }
+  }
+  if (lifecycle.load_state === 'not_discovered') return null
+  if (lifecycle.selection_state === 'shadowed') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateShadowed'),
+      tone: 'neutral',
+    }
+  }
+  if (lifecycle.selection_state === 'disabled') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateDisabled'),
+      tone: 'neutral',
+    }
+  }
+  if (lifecycle.selection_state === 'hidden') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateHidden'),
+      tone: 'neutral',
+    }
+  }
+  if (lifecycle.readiness_state === 'needs_setup') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateNeedsSetup'),
+      tone: 'warning',
+    }
+  }
+  if (lifecycle.compatibility_state === 'degraded') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateDegraded'),
+      tone: 'warning',
+    }
+  }
+  if (
+    lifecycle.install_state === 'tracked'
+    && lifecycle.load_state === 'loaded'
+    && lifecycle.selection_state === 'active'
+  ) {
+    if (surface === 'installed') return null
+    return {
+      label: i18n.global.t('cronSkills.registry.stateActive'),
+      tone: 'success',
+    }
+  }
+  return null
 }
 
 export function skillLayerLabel(layer: string | undefined): string {
@@ -433,7 +543,7 @@ export function useSkillsCatalog(
       return false
     }
     try {
-      const data = await rpc.call<SkillsListData>('skills.list')
+      const data = await rpc.call<SkillsListData>('skills.list', { includeLifecycle: true })
       allSkills.value = (data.skills || []).map(normalizeSkill)
       await options.loadProposals()
       return true

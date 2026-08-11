@@ -17,6 +17,7 @@ from opensquilla.sandbox.run_context import (
     RunContext,
     effective_project_run_mode,
     get_run_context,
+    run_context_from_origin_payload,
 )
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
@@ -47,6 +48,39 @@ def apply_accepted_run_mode_override(
         run_mode_source=override.run_mode_source,
         source=override.source,
     )
+
+
+def apply_run_context_route_metadata(
+    route_envelope: Any,
+    run_context: RunContext,
+    *,
+    principal_is_owner: bool,
+) -> None:
+    """Attach one freshly validated run context to an execution envelope.
+
+    This is shared by ordinary session ingress, Goal ingress, and the final
+    TaskRuntime dispatch boundary.  Keeping the projection here prevents a
+    new automatic producer from accidentally omitting sandbox mounts or the
+    execution-only freshness marker.
+    """
+
+    run_context_payload = run_context.to_origin_payload()
+    filtered_run_context = run_context_from_origin_payload(
+        run_context_payload,
+        source="route_metadata",
+        preserve_materialized_user_grants=True,
+    )
+    route_envelope.metadata["run_mode"] = run_context.run_mode.value
+    route_envelope.metadata["run_mode_explicit"] = run_context.source != "default"
+    route_envelope.metadata["sandbox_mounts"] = (
+        filtered_run_context.to_origin_payload()["mounts"]
+        if filtered_run_context is not None
+        else []
+    )
+    route_envelope.metadata["sandbox_run_context"] = run_context_payload
+    object.__setattr__(route_envelope, "sandbox_run_context_fresh", True)
+    if run_context.run_mode.value == "full" and principal_is_owner:
+        route_envelope.metadata["elevated"] = "full"
 
 
 async def resolve_session_project_workspace(
@@ -201,6 +235,7 @@ def map_project_workspace_error(
 __all__ = [
     "AcceptedRunModeOverride",
     "apply_accepted_run_mode_override",
+    "apply_run_context_route_metadata",
     "authoritative_project_run_context",
     "map_project_workspace_error",
     "persisted_project_workspace_snapshot",

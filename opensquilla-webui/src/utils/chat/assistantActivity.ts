@@ -4,6 +4,7 @@ import type {
   ChatToolCallRenderItem,
 } from '@/types/chat'
 import type { ChatPart, StatusPart } from '@/types/parts'
+import { compactionSkippedLabelCode } from '@/utils/chat/compactionStatus'
 
 type TextPart = Extract<ChatPart, { type: 'text' }>
 
@@ -111,6 +112,7 @@ export type AssistantActivityStatusCode =
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
   | 'chat.compact.withinBudget'
+  | 'chat.compact.skipped'
   | 'chat.compact.cancelled'
   | 'chat.compact.failed'
 
@@ -125,6 +127,7 @@ export interface AssistantActivityStatusStep {
   source?: string
   durability?: string
   detail?: string
+  reason?: string
 }
 
 export interface AssistantActivityTimelineProjection {
@@ -807,7 +810,7 @@ function statusLabelFor(
 ): AssistantActivityCodeDescriptor<AssistantActivityStatusCode> | null {
   if (entry.category === 'maintenance') {
     if (entry.state === 'failed') return codeDescriptor('chat.compact.failed')
-    if (entry.state === 'skipped') return codeDescriptor('chat.compact.withinBudget')
+    if (entry.state === 'skipped') return codeDescriptor(compactionSkippedLabelCode(entry.reason))
     if (entry.state === 'stale' || entry.state === 'cancelled') {
       return codeDescriptor('chat.compact.cancelled')
     }
@@ -910,6 +913,7 @@ function projectStatusSteps(
         source: entry.source,
         durability: entry.durability,
         detail: entry.detail,
+        reason: entry.reason,
       }
       if (entry.id && maintenanceById.has(entry.id)) {
         steps[maintenanceById.get(entry.id)!] = step

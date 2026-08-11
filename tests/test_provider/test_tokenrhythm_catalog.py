@@ -623,6 +623,21 @@ def test_merge_uses_auth_as_entitlement_and_filters_known_non_chat_or_offline() 
     assert merged["auth-only"].metadata.published is None
 
 
+def test_v4_flash_0731_public_metadata_does_not_grant_entitlement() -> None:
+    model_id = "deepseek-v4-flash-0731"
+    published = parse_tokenrhythm_published(
+        {"data": [_published_row(id=model_id, name="DeepSeek V4 Flash 0731")]}
+    )
+
+    assert merge_tokenrhythm_catalog(published, {}) == {}
+
+    declared = parse_tokenrhythm_declared({"data": [{"id": model_id}]})
+    merged = merge_tokenrhythm_catalog(published, declared)
+    assert set(merged) == {model_id}
+    assert merged[model_id].metadata.published is published[model_id]
+    assert merged[model_id].metadata.declared is declared[model_id]
+
+
 def test_testing_model_projects_raw_catalog_value_but_runtime_policy_is_scoped() -> None:
     published = parse_tokenrhythm_published(
         {

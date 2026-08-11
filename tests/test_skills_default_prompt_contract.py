@@ -59,7 +59,6 @@ DEFAULTS = {
     "skill-creator",
     "sub-agent",
     "subtitle-burner",
-    "swe-bench",
     "summarize",
     "text-file-read",
     "title-card-image",
@@ -315,6 +314,47 @@ async def test_pinned_catalog_avoids_reloading_during_skill_injection() -> None:
     out = await filter_skills(ctx)
 
     assert "<name>catalog-pinned</name>" in out.system_prompt[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("injection_mode", ["system", "user_context", "user_message"])
+async def test_production_skill_prompts_do_not_expose_host_locations(
+    injection_mode: str,
+) -> None:
+    spec = SkillSpec(
+        name="portable-community-skill",
+        description="Portable community skill",
+        layer=SkillLayer.MANAGED,
+        always=True,
+        triggers=[],
+        content="Use this skill.",
+        path=Path("/synthetic/host/skills/portable-community-skill/SKILL.md"),
+        file_path="/synthetic/host/skills/portable-community-skill/SKILL.md",
+    )
+
+    class _FailingLoader:
+        def load_all(self):
+            raise AssertionError("loader must not be read after the turn snapshot is pinned")
+
+    ctx = _ctx(
+        _FailingLoader(),  # type: ignore[arg-type]
+        skills_config=SimpleNamespace(
+            filter_enabled=False,
+            max_skills_prompt_chars=100_000,
+            injection_mode=injection_mode,
+        ),
+    )
+    ctx.skill_catalog = SimpleNamespace(skills=(spec,), generation=8)
+
+    out = await filter_skills(ctx)
+    if injection_mode == "user_context":
+        prompt = out.metadata["skills_context_prompt"]
+    else:
+        prompt = out.system_prompt[1]
+
+    assert "<name>portable-community-skill</name>" in prompt
+    assert "<location>" not in prompt
+    assert "/synthetic/host/skills" not in prompt
 
 
 @pytest.mark.asyncio
