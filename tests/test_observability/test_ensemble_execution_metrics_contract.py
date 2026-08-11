@@ -93,6 +93,23 @@ def test_projector_rows_satisfy_the_transport_contract() -> None:
                             "outcome": "succeeded",
                             "request_started": True,
                             "physical_request_count": 1,
+                            "usage": {
+                                "schema": (
+                                    "opensquilla.ensemble-aggregator-"
+                                    "attempt-usage/v1"
+                                ),
+                                "physical_request_count": 1,
+                                "usage_row_count": 1,
+                                "usage_missing_count": 0,
+                                "input_tokens": 3,
+                                "output_tokens": 2,
+                                "reasoning_tokens": 1,
+                                "cached_tokens": 0,
+                                "cache_write_tokens": 0,
+                                "cache_hit_request_count": 0,
+                                "billed_cost_usd": 0.1,
+                                "cost_source_kind": "provider_billed",
+                            },
                         }
                     ],
                     "selected_kind": "primary",
@@ -246,6 +263,24 @@ def test_contract_requires_core_fields_and_consistent_terminal_status() -> None:
     ],
 )
 def test_ranking_stage_transport_contract_rejects_bad_scalar_values(
+    mutation: dict[str, Any],
+) -> None:
+    with pytest.raises(EnsembleExecutionMetricsContractError):
+        validate_ensemble_execution_metrics(_minimal_metrics() | mutation)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"aggregator_usage_physical_request_count": -1},
+        {"aggregator_usage_missing_count": True},
+        {"aggregator_input_tokens": 1 << 63},
+        {"aggregator_billed_cost_usd": math.nan},
+        {"aggregator_billed_cost_usd": math.inf},
+        {"aggregator_cost_source_kind": "private-provider"},
+    ],
+)
+def test_aggregator_usage_transport_contract_rejects_bad_scalar_values(
     mutation: dict[str, Any],
 ) -> None:
     with pytest.raises(EnsembleExecutionMetricsContractError):

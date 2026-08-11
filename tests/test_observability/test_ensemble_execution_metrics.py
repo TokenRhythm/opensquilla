@@ -113,6 +113,12 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "aggregator_recovery_observed": False,
         "aggregator_stage_observed": False,
         "aggregator_physical_request_count_observed": False,
+        "aggregator_usage_observed": False,
+        "aggregator_usage_accounting_observed": False,
+        "aggregator_usage_projection_complete": False,
+        "aggregator_cost_source_observed": False,
+        "aggregator_cost_projection_complete": False,
+        "aggregator_billed_cost_usd_observed": False,
         "runtime_health_filter_observed": False,
         "canary_rollout_observed": False,
         "canary_rollout_projection_complete": False,
@@ -1360,6 +1366,22 @@ def test_terminal_trace_projects_role_health_admission_usage_and_failures() -> N
                     "physical_request_count": 1,
                     "outcome": "failed",
                     "code": "503",
+                    "usage": {
+                        "schema": (
+                            "opensquilla.ensemble-aggregator-attempt-usage/v1"
+                        ),
+                        "physical_request_count": 1,
+                        "usage_row_count": 1,
+                        "usage_missing_count": 0,
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "reasoning_tokens": 1,
+                        "cached_tokens": 4,
+                        "cache_write_tokens": 0,
+                        "cache_hit_request_count": 1,
+                        "billed_cost_usd": 0.12,
+                        "cost_source_kind": "provider_billed",
+                    },
                 },
                 {
                     "kind": "model_fallback",
@@ -1374,6 +1396,22 @@ def test_terminal_trace_projects_role_health_admission_usage_and_failures() -> N
                     "physical_request_count": 1,
                     "outcome": "succeeded",
                     "code": private_text,
+                    "usage": {
+                        "schema": (
+                            "opensquilla.ensemble-aggregator-attempt-usage/v1"
+                        ),
+                        "physical_request_count": 1,
+                        "usage_row_count": 1,
+                        "usage_missing_count": 0,
+                        "input_tokens": 30,
+                        "output_tokens": 6,
+                        "reasoning_tokens": 3,
+                        "cached_tokens": 5,
+                        "cache_write_tokens": 1,
+                        "cache_hit_request_count": 1,
+                        "billed_cost_usd": 0.56,
+                        "cost_source_kind": "provider_billed",
+                    },
                 },
             ],
             "success": True,
@@ -1453,6 +1491,23 @@ def test_terminal_trace_projects_role_health_admission_usage_and_failures() -> N
     assert "proposer_billed_cost_usd" not in metrics
     assert metrics["aggregator_physical_request_count"] == 2
     assert metrics["aggregator_physical_request_count_observed"] is True
+    assert metrics["aggregator_usage_observed"] is True
+    assert metrics["aggregator_usage_accounting_observed"] is True
+    assert metrics["aggregator_usage_projection_complete"] is True
+    assert metrics["aggregator_usage_physical_request_count"] == 2
+    assert metrics["aggregator_usage_row_count"] == 2
+    assert metrics["aggregator_usage_missing_count"] == 0
+    assert metrics["aggregator_input_tokens"] == 40
+    assert metrics["aggregator_output_tokens"] == 8
+    assert metrics["aggregator_reasoning_tokens"] == 4
+    assert metrics["aggregator_cache_read_tokens"] == 9
+    assert metrics["aggregator_cache_write_tokens"] == 1
+    assert metrics["aggregator_cache_hit_request_count"] == 2
+    assert metrics["aggregator_cost_source_observed"] is True
+    assert metrics["aggregator_cost_source_kind"] == "provider_billed"
+    assert metrics["aggregator_cost_projection_complete"] is True
+    assert metrics["aggregator_billed_cost_usd_observed"] is True
+    assert metrics["aggregator_billed_cost_usd"] == pytest.approx(0.68)
     assert metrics["aggregator_final_request_usage_projection_complete"] is True
     assert metrics["aggregator_final_request_usage_observed"] is True
     assert metrics["aggregator_final_request_input_tokens"] == 30
@@ -1462,6 +1517,112 @@ def test_terminal_trace_projects_role_health_admission_usage_and_failures() -> N
         "aggregator_final_request_billed_cost_usd"
     ] == pytest.approx(0.56)
     assert private_text not in json.dumps(metrics, sort_keys=True)
+
+
+def test_aggregator_attempt_usage_requires_exact_accounting_and_cost_source() -> None:
+    usage = {
+        "schema": "opensquilla.ensemble-aggregator-attempt-usage/v1",
+        "physical_request_count": 1,
+        "usage_row_count": 1,
+        "usage_missing_count": 0,
+        "input_tokens": 7,
+        "output_tokens": 2,
+        "reasoning_tokens": 1,
+        "cached_tokens": 3,
+        "cache_write_tokens": 0,
+        "cache_hit_request_count": 1,
+        "billed_cost_usd": 0.4,
+        "cost_source_kind": "provider_billed",
+    }
+    trace = {
+        "aggregator_recovery": {
+            "attempts": [
+                {
+                    "kind": "primary",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "outcome": "failed",
+                    "usage": deepcopy(usage),
+                },
+                {
+                    "kind": "continuation",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "outcome": "succeeded",
+                    "usage": deepcopy(usage),
+                },
+            ],
+            "success": True,
+            "selected_kind": "continuation",
+        }
+    }
+
+    exact = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+    assert exact["aggregator_usage_accounting_observed"] is True
+    assert exact["aggregator_usage_projection_complete"] is True
+    assert exact["aggregator_cost_source_kind"] == "provider_billed"
+    assert exact["aggregator_cost_projection_complete"] is True
+    assert exact["aggregator_billed_cost_usd"] == pytest.approx(0.8)
+
+    missing_block = deepcopy(trace)
+    del missing_block["aggregator_recovery"]["attempts"][1]["usage"]
+    missing_metrics = build_ensemble_execution_metrics(
+        missing_block,
+        terminal_outcome="completed",
+    )
+    assert missing_metrics["aggregator_usage_observed"] is True
+    assert missing_metrics["aggregator_usage_accounting_observed"] is False
+    assert missing_metrics["aggregator_usage_projection_complete"] is False
+    assert "aggregator_usage_physical_request_count" not in missing_metrics
+    assert "aggregator_input_tokens" not in missing_metrics
+
+    contradictory = deepcopy(trace)
+    contradictory_usage = contradictory["aggregator_recovery"]["attempts"][0][
+        "usage"
+    ]
+    contradictory_usage["usage_missing_count"] = 1
+    contradictory_usage["private_identity"] = "must not be projected"
+    contradictory_metrics = build_ensemble_execution_metrics(
+        contradictory,
+        terminal_outcome="completed",
+    )
+    assert contradictory_metrics["aggregator_usage_accounting_observed"] is False
+    assert contradictory_metrics["aggregator_usage_projection_complete"] is False
+    assert "aggregator_billed_cost_usd" not in contradictory_metrics
+
+    missing_usage = deepcopy(trace)
+    missing_attempt = missing_usage["aggregator_recovery"]["attempts"][0]
+    missing_attempt["physical_request_count"] = 2
+    missing_attempt["usage"]["physical_request_count"] = 2
+    missing_attempt["usage"]["usage_missing_count"] = 1
+    missing_metrics = build_ensemble_execution_metrics(
+        missing_usage,
+        terminal_outcome="completed",
+    )
+    assert missing_metrics["aggregator_usage_accounting_observed"] is True
+    assert missing_metrics["aggregator_usage_physical_request_count"] == 3
+    assert missing_metrics["aggregator_usage_row_count"] == 2
+    assert missing_metrics["aggregator_usage_missing_count"] == 1
+    assert missing_metrics["aggregator_usage_projection_complete"] is False
+    assert missing_metrics["aggregator_cost_projection_complete"] is False
+
+    unverified_cost = deepcopy(trace)
+    unverified_cost["aggregator_recovery"]["attempts"][1]["usage"][
+        "cost_source_kind"
+    ] = "unverified"
+    unverified_metrics = build_ensemble_execution_metrics(
+        unverified_cost,
+        terminal_outcome="completed",
+    )
+    assert unverified_metrics["aggregator_usage_projection_complete"] is True
+    assert unverified_metrics["aggregator_cost_source_observed"] is True
+    assert unverified_metrics["aggregator_cost_source_kind"] == "mixed"
+    assert unverified_metrics["aggregator_cost_projection_complete"] is False
+    assert unverified_metrics["aggregator_billed_cost_usd_observed"] is False
+    assert "aggregator_billed_cost_usd" not in unverified_metrics
 
 
 def test_proposer_admission_exactness_requires_one_to_one_attempt_evidence() -> None:
@@ -2067,6 +2228,12 @@ def test_stage_projection_is_bounded_and_malformed_values_are_omitted() -> None:
     assert metrics["aggregator_request_started_count"] == 0
     assert metrics["aggregator_physical_request_count_observed"] is False
     assert "aggregator_physical_request_count" not in metrics
+    assert metrics["aggregator_usage_observed"] is False
+    assert metrics["aggregator_usage_accounting_observed"] is False
+    assert metrics["aggregator_usage_projection_complete"] is False
+    assert "aggregator_usage_started_attempt_count" not in metrics
+    assert metrics["aggregator_cost_source_observed"] is False
+    assert metrics["aggregator_cost_projection_complete"] is False
     assert metrics["aggregator_selected_kind"] == "unknown"
     assert metrics["aggregator_fallback_index_observed"] is False
     assert "aggregator_fallback_index" not in metrics

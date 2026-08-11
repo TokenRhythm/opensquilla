@@ -33,8 +33,14 @@ _FIXED_FIELDS = frozenset(
     admission_wait_observation_count
     aggregator_abandoned_attempt_count
     aggregator_admission_projection_complete
+    aggregator_billed_cost_usd
+    aggregator_billed_cost_usd_observed
+    aggregator_cache_hit_request_count
     aggregator_continuation_attempt_count
     aggregator_continuation_fallback_attempt_count
+    aggregator_cost_projection_complete
+    aggregator_cost_source_kind
+    aggregator_cost_source_observed
     aggregator_failed_attempt_count
     aggregator_fallback_index
     aggregator_fallback_index_observed
@@ -75,6 +81,14 @@ _FIXED_FIELDS = frozenset(
     aggregator_unknown_kind_attempt_count
     aggregator_unknown_outcome_attempt_count
     aggregator_unsuccessful_attempt_count
+    aggregator_usage_accounting_observed
+    aggregator_usage_attempt_observation_count
+    aggregator_usage_missing_count
+    aggregator_usage_observed
+    aggregator_usage_physical_request_count
+    aggregator_usage_projection_complete
+    aggregator_usage_row_count
+    aggregator_usage_started_attempt_count
     canary_physical_budget_accounting_observed
     canary_physical_budget_committed
     canary_physical_budget_conservation_observed
@@ -310,6 +324,7 @@ for _name in (
             f"proposer_{_name}_tokens",
             f"aggregator_final_request_{_name}_tokens_observed",
             f"aggregator_final_request_{_name}_tokens",
+            f"aggregator_{_name}_tokens",
         }
     )
 
@@ -370,6 +385,9 @@ _STRING_DOMAINS: dict[str, frozenset[str]] = {
             "unknown",
         }
     ),
+    "aggregator_cost_source_kind": frozenset(
+        {"provider_billed", "mixed", "unverified", "none"}
+    ),
     "trace_compact_json_bytes_cap_reason": frozenset({"byte_limit", "visit_limit", "depth_limit"}),
     "canary_task_risk": frozenset({"low", "medium", "high", "unknown"}),
 }
@@ -411,6 +429,7 @@ _BOOLEAN_FIELDS = frozenset(
 _FLOAT_FIELDS = frozenset(
     {
         "proposer_billed_cost_usd",
+        "aggregator_billed_cost_usd",
         "aggregator_final_request_billed_cost_usd",
     }
 )

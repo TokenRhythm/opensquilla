@@ -174,6 +174,17 @@ _RANKING_STAGE_OBSERVABILITY_INT_FIELDS = (
     "hard_filter_ms",
     "score_ms",
 )
+_AGGREGATOR_ATTEMPT_USAGE_SCHEMA = (
+    "opensquilla.ensemble-aggregator-attempt-usage/v1"
+)
+_AGGREGATOR_ATTEMPT_USAGE_INT_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+)
+_MAX_TRACE_NUMERIC_VALUE = (1 << 63) - 1
 _CANARY_ROLLOUT_REASONS = (
     "canary_policy_invalid",
     "canary_rollout_disabled",
@@ -4281,6 +4292,93 @@ def _rollup_cost_source(rows: Sequence[dict[str, Any]]) -> str:
     if meaningful:
         return "mixed"
     return "none"
+
+
+def _aggregator_attempt_cost_source_kind(
+    rows: Sequence[dict[str, Any]],
+) -> str:
+    """Collapse provider-specific cost provenance to a fixed trace enum."""
+
+    if not rows:
+        return "none"
+    sources = [_canonical_usage_cost_source(row) for row in rows]
+    exact_count = sum(source == "provider_billed" for source in sources)
+    if exact_count == len(sources):
+        return "provider_billed"
+    if exact_count or "mixed" in sources:
+        return "mixed"
+    if any(source not in {"none", "unavailable", ""} for source in sources):
+        return "unverified"
+    return "none"
+
+
+def _aggregator_attempt_usage_evidence(
+    rows: Sequence[dict[str, Any]],
+    *,
+    physical_request_count: int,
+    usage_missing_count: int,
+) -> dict[str, Any]:
+    """Build a bounded identity-free receipt for one aggregator attempt."""
+
+    evidence: dict[str, Any] = {
+        "schema": _AGGREGATOR_ATTEMPT_USAGE_SCHEMA,
+    }
+    if (
+        type(physical_request_count) is int
+        and 0 <= physical_request_count <= _MAX_TRACE_NUMERIC_VALUE
+    ):
+        evidence["physical_request_count"] = physical_request_count
+    if len(rows) <= _MAX_TRACE_NUMERIC_VALUE:
+        evidence["usage_row_count"] = len(rows)
+    if (
+        type(usage_missing_count) is int
+        and 0 <= usage_missing_count <= _MAX_TRACE_NUMERIC_VALUE
+    ):
+        evidence["usage_missing_count"] = usage_missing_count
+
+    cached_values: list[int] = []
+    for field_name in _AGGREGATOR_ATTEMPT_USAGE_INT_FIELDS:
+        values: list[int] = []
+        for row in rows:
+            raw_value = row.get(field_name)
+            if (
+                type(raw_value) is not int
+                or not 0 <= raw_value <= _MAX_TRACE_NUMERIC_VALUE
+            ):
+                values = []
+                break
+            values.append(raw_value)
+        total = sum(values)
+        if len(values) == len(rows) and total <= _MAX_TRACE_NUMERIC_VALUE:
+            evidence[field_name] = total
+            if field_name == "cached_tokens":
+                cached_values = values
+    if len(cached_values) == len(rows):
+        evidence["cache_hit_request_count"] = sum(
+            value > 0 for value in cached_values
+        )
+
+    billed_costs: list[float] = []
+    for row in rows:
+        billed_cost = float(_canonical_usage_billed_cost(row)[0])
+        if (
+            not math.isfinite(billed_cost)
+            or not 0.0 <= billed_cost <= _MAX_TRACE_NUMERIC_VALUE
+        ):
+            billed_costs = []
+            break
+        billed_costs.append(billed_cost)
+    if len(billed_costs) == len(rows):
+        billed_total = math.fsum(billed_costs)
+        if (
+            math.isfinite(billed_total)
+            and 0.0 <= billed_total <= _MAX_TRACE_NUMERIC_VALUE
+        ):
+            evidence["billed_cost_usd"] = billed_total
+    evidence["cost_source_kind"] = _aggregator_attempt_cost_source_kind(
+        rows
+    )
+    return evidence
 
 
 def _summed_int(rows: Sequence[dict[str, Any]], key: str) -> int:
@@ -15249,12 +15347,15 @@ class EnsembleProvider:
                 trace["usage_missing_count"] = usage_missing_count
             selected_attempt = selected_attempt_override
             if record_success_attempt:
+                success_physical_request_count = (
+                    _done_event_physical_request_count(event)
+                )
                 success_attempt = {
                     "kind": selected_kind,
                     "fallback_index": active_fallback_index,
                     "trigger": attempt_trigger,
                     "request_started": True,
-                    "physical_request_count": _done_event_physical_request_count(event),
+                    "physical_request_count": success_physical_request_count,
                     "visible_output_emitted": bool((assembled_contribution_text or "").strip()),
                     "stream_closed": True,
                     "outcome": "succeeded",
@@ -15272,6 +15373,13 @@ class EnsembleProvider:
                     "thinking_budget_tokens": max(
                         0,
                         int(active_config.thinking_budget_tokens or 0),
+                    ),
+                    "usage": _aggregator_attempt_usage_evidence(
+                        aggregator_rows,
+                        physical_request_count=(
+                            success_physical_request_count
+                        ),
+                        usage_missing_count=event_missing_count,
                     ),
                 }
                 if requires_physical_attempt_evidence(active_member):
@@ -15517,6 +15625,12 @@ class EnsembleProvider:
                     "requested_provider": active_member.provider_config.provider,
                     "requested_model": active_member.provider_config.model,
                 }
+                if physical_request_count > 0:
+                    failed_attempt["usage"] = _aggregator_attempt_usage_evidence(
+                        combined_event_rows,
+                        physical_request_count=physical_request_count,
+                        usage_missing_count=event_missing_count,
+                    )
                 if requires_physical_attempt_evidence(active_member):
                     if physical_request_count > 0:
                         failed_attempt["physical_attempt_id"] = (
@@ -15679,6 +15793,12 @@ class EnsembleProvider:
                     int(config_for_attempt.thinking_budget_tokens or 0),
                 ),
             }
+            if physical_request_count > 0:
+                abandoned_attempt["usage"] = _aggregator_attempt_usage_evidence(
+                    combined_event_rows,
+                    physical_request_count=physical_request_count,
+                    usage_missing_count=recorded_missing_count,
+                )
             if requires_physical_attempt_evidence(member):
                 if physical_request_count > 0:
                     abandoned_attempt["physical_attempt_id"] = (

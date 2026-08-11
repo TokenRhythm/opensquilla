@@ -245,7 +245,7 @@ HTTP 成功状态、无 error-code physical requests、provider/model/deployment
 | `aggregator_recovery_{success,exhausted,degraded}_observed`、对应 value | stage observed 且 bool 存在 | recovery terminal state。 |
 | `aggregator_{continuation,same_model_recovery}_count_observed`、对应 value | stage observed 且 count 合法 | recovery 次数。 |
 
-当前没有 aggregator attempt elapsed、TTFT、所有 aggregator attempts 的 usage/cost/cache，或全请求 HTTP status denominator；这些全部 unavailable。
+当前没有 aggregator attempt elapsed、TTFT 或全请求 HTTP status denominator；这些全部 unavailable。所有已启动 aggregator attempts 的 usage/cost/cache 证据见 3.8。
 
 主要解决：把 aggregator failure、abandon、pre-dispatch unavailable 和 unknown outcome 分开，防止失败被 recovery 容器掩盖。
 
@@ -263,6 +263,11 @@ HTTP 成功状态、无 error-code physical requests、provider/model/deployment
 | `proposer_{input,output,reasoning,cache_read,cache_write}_tokens` | projection complete 且每个 known row 有该字段 | exact role totals。 |
 | `proposer_cache_hit_request_count` | projection complete 且所有 cached token fields 完整 | cached_tokens >0 的 exact request count。 |
 | `proposer_billed_cost_usd_observation_count`、`proposer_billed_cost_usd` | projection complete 且每个 known row 有合法 billed_cost | observed billed total；未验证 cost source/exactness。 |
+| `aggregator_usage_observed`、`aggregator_usage_attempt_observation_count`、`aggregator_usage_started_attempt_count` | attempt usage v1 block 可见；started count 还要求 request_started 完整且未 capped | 所有 aggregator attempts 的 receipt coverage；不是完整性 gate。 |
+| `aggregator_usage_accounting_observed`、`aggregator_usage_{physical_request,row,missing}_count` | stage observed、未 capped、每个 started attempt 有严格 v1 block，且逐 attempt 满足 `rows + missing = physical` | 全 attempt 物理调用与 usage 行守恒；允许 missing >0，但只输出精确 accounting totals。 |
+| `aggregator_usage_projection_complete`、`aggregator_{input,output,reasoning,cache_read,cache_write}_tokens`、`aggregator_cache_hit_request_count` | accounting exact、missing=0、每个 started attempt 的五个 token fields 与 cache-hit count 完整且总和有界 | 所有失败、continuation、fallback 与最终成功 attempt 的 exact role totals。 |
+| `aggregator_cost_source_observed`、`aggregator_cost_source_kind` | usage projection complete 且每个 started attempt 有固定 provenance enum | 固定 `provider_billed`、`mixed`、`unverified`、`none`；不保留 provider 自定义 token。 |
+| `aggregator_cost_projection_complete`、`aggregator_billed_cost_usd_observed`、`aggregator_billed_cost_usd` | cost source 全部为 `provider_billed` 且有界求和成功 | 所有 aggregator attempts 的 exact provider-billed USD total。mixed/unverified/none 不输出成本值。 |
 | `aggregator_final_request_usage_container_observed` | final request role 为 aggregator 且 usage 为 dict | 最后一次 aggregator request 的 usage gate。 |
 | `aggregator_final_request_usage_projection_complete`、`aggregator_final_request_usage_observed` | 五个 token fields 与 billed cost 全部合法、至少一项非零、无 missing marker | final-request exact projection gate。 |
 | `aggregator_final_request_{input,output,reasoning,cache_read,cache_write}_tokens_observed`、对应 value | projection complete | 最后一次 aggregator request totals。 |
@@ -271,7 +276,7 @@ HTTP 成功状态、无 error-code physical requests、provider/model/deployment
 | `physical_request_count_observed`、`physical_request_count` | top-level scalar 合法 | 全 ensemble physical request total。 |
 | `unknown_usage_count_observed`、`unknown_usage_count` | top-level usage missing scalar 合法 | 全 ensemble unknown usage total。 |
 
-Aggregator usage 只覆盖 `final_request`，不覆盖失败、continuation 或 fallback attempts；v1 也没有 cost source、exact/estimated/mixed、currency、cache savings 或 logical request count。上述能力全部 unavailable，不能把 `aggregator_final_request_billed_cost_usd` 当作 aggregator 全成本。
+`aggregator_final_request_*` 保留为向后兼容和最终请求诊断；role totals 与成本 SLO 必须优先使用 `aggregator_usage_projection_complete` / `aggregator_cost_projection_complete`。v1 尚无 cache savings、非 USD currency 换算或 logical request count；这些仍 unavailable。`mixed`、`unverified`、`none` 只描述证据状态，绝不能把对应 `billed_cost_usd` 零值当作真实成本。
 
 主要解决：仅在 receipt coverage 完整时计算 role totals，并阻止未知 usage 被零 token/零成本占位符稀释。
 
@@ -325,7 +330,7 @@ false-rollback、post-rollback service health 与自动回滚延迟仍 unavailab
 | Logical terminal HTTP | proposer/aggregator observed status counts | 429、5xx count 与 observed-status share，role 分开 | 没有 status 的 physical request 不入 denominator；注明不是真实 call error rate | 主要解决：发现 logical terminal 的 rate-limit 与 upstream burst，同时避免假分母。 |
 | Quorum / cleanup / recovery | quorum、cleanup、proposer recovery fields | quorum reach、time-to-quorum p50/p95/p99、lingering、unproven close、recovery calls | 对应 observed/value 缺失即 unavailable | 主要解决：发现 quorum 后仍残留 worker/stream 或额外 physical calls。 |
 | Aggregator | stage、attempt kinds/outcomes、selected kind、physical counts、recovery state | stage success/degraded/exhausted、outcome mix、selected-kind mix、physical requests | 空预初始化 recovery block 不进 stage denominator；capped attempts 不进总量 SLO | 主要解决：把 aggregator recovery 的质量损失和调用放大可视化。 |
-| Role usage / cost / cache | proposer projection complete；aggregator final usage complete；top-level unknown | tokens、unknown ratio、observed billed cost、cache-hit share、coverage | 不完整 role totals 不补零；aggregator final cost 明确不是全 aggregator cost | 主要解决：在费用与 cache 面板中保留 usage 证据完整性。 |
+| Role usage / cost / cache | proposer projection complete；aggregator all-attempt accounting/usage/cost complete；final-request 仅诊断；top-level unknown | tokens、unknown ratio、exact provider-billed cost、cache-hit share、coverage 与 cost-source mix | 不完整 role totals 不补零；aggregator mixed/unverified/none 不进 exact cost；final-request 不代替全 attempt totals | 主要解决：在费用与 cache 面板中保留 usage 与 cost-source 证据完整性。 |
 | Canary rollout / physical budget | rollout/task/reason observed fields；rollout/budget conservation 与 complete；budget exhausted | input/admitted、task gate、固定 reason family、config invalid、budget rejection/refund 与两类 conservation | admission/reason sums 只消费 rollout complete；budget totals 只消费 budget complete；字段级 rate 使用各自 observed gate；不展示 hash、bucket 或 identity | 主要解决：发现 canary gate 漂移、配置失效和单次物理上限异常。 |
 | Canary persistent rollback | persistent observed/complete；admission、settlement、provider/usage outcome、rollback/recovery transition counts | projection coverage、ledger unavailable、usage missing、rollback/recovery transition 与固定 provider outcome trends | aggregate 只消费 persistent complete；denominator 为 0 时 unavailable；严禁把 policy/deployment hash、provider/model 或 token 变成 label | 主要解决：观测同机持久 safety latch 是否真实阻断、落闩与恢复，而不泄露 identity。 |
 | Data quality / privacy | 所有 observed、projection complete、scan capped、trace cap、unexpected keys | coverage rates、cap rates、字段类型错误计数（由 ingestion 层）、cardinality | denominator 只用对应 evidence gate；禁止采集原始 trace | 主要解决：让 SLO 数据质量本身可审计。 |
@@ -496,12 +501,20 @@ proposer_billed_cost_per_eligible_event =
   sum(proposer_billed_cost_usd | proposer_usage_projection_complete)
   / count(proposer_usage_projection_complete == true)
 
-aggregator_final_cache_hit_rate =
-  count(aggregator_final_request_cache_hit == true)
-  / count(aggregator_final_request_cache_hit_observed == true)
+aggregator_cache_hit_request_rate =
+  sum(aggregator_cache_hit_request_count | aggregator_usage_projection_complete)
+  / sum(aggregator_usage_row_count | aggregator_usage_projection_complete)
+
+aggregator_billed_cost_per_eligible_event =
+  sum(aggregator_billed_cost_usd | aggregator_cost_projection_complete)
+  / count(aggregator_cost_projection_complete == true)
+
+aggregator_unknown_usage_rate =
+  sum(aggregator_usage_missing_count | aggregator_usage_accounting_observed)
+  / sum(aggregator_usage_physical_request_count | aggregator_usage_accounting_observed)
 ```
 
-Tokens 和 observed billed cost 使用相同 complete gate做 sum/mean/p50/p95/p99。建议 usage projection coverage `<99%` warning、`<95%` critical；费用和 cache 先采用七日基线告警。因为 v1 不含 cost source/exactness 和 aggregator 全 attempts cost，当前不能定义精确成本预算 SLO。
+Tokens 使用对应 usage complete gate；aggregator billed cost 只使用更严格的 cost complete gate做 sum/mean/p50/p95/p99。建议 usage/accounting projection coverage `<99%` warning、`<95%` critical；费用和 cache 先采用七日基线告警。只有 `provider_billed` aggregator events 可进入 exact 成本预算；mixed/unverified/none 单列 coverage，不补零。
 
 主要解决：让 token、cache 和 billed cost 的趋势可用，同时阻止不完整 receipts 形成虚假成本下降。
 
@@ -590,7 +603,7 @@ multi-host、quality 与 latency 证据缺口。
 | Evidence cap | 任一 scan/trace cap rate `>0.1%` / 30m | `>1%` / 15m | 对应 observed ≥100 | 主要解决：发现 trace 或 attempt 数超出可审计范围。 |
 | Admission failure | exact rate `>1%` / 15m | `>2%` / 10m | projection complete 且 exact denominator ≥20 | 主要解决：发现 queue timeout/rejection。 |
 | Admission evidence | coverage `<99%` / 30m | `<95%` / 15m | role observed ≥100 | 主要解决：发现 attempt join 丢失。 |
-| Unknown usage | `>0.1%` / 15m | `>1%` / 10m | physical + unknown counts observed | 主要解决：发现 token/cost 盲区。 |
+| Unknown usage | `>0.1%` / 15m | `>1%` / 10m | top-level physical+unknown observed，或 aggregator usage accounting observed | 主要解决：发现 token/cost 盲区。 |
 | Logical HTTP burst | count `>max(5,3×baseline)` / 5m | count `>max(20,5×baseline)` / 5m | observed status count；share 需 ≥20 | 主要解决：发现 429/5xx 突发而不制造全调用 error rate。 |
 | Quorum reach | `<99%` / 15m | `<95%` / 10m | quorum reached observed ≥20 | 主要解决：发现 proposer quorum 退化。 |
 | Cleanup | 任一 lingering/unproven >0 两个窗口 | 任一 >0 持续 10m | cleanup/value observed | 主要解决：发现 worker 或 stream 未收尾。 |
@@ -609,7 +622,7 @@ multi-host、quality 与 latency 证据缺口。
 
 2. 禁止采集 model/provider/deployment identity、prompt、output、reasoning、error text、response id、tenant/session/task/user id；也禁止把完整 `selection_plan`、`candidates`、`final_request` 或 `aggregator_recovery` 当作日志属性。主要解决：防止敏感内容和高基数 identity 进入指标系统。
 
-3. 可作 label 的 producer 字段仅限 `schema`、`terminal_outcome`、`execution_status`、`selection_family`，以及各自专用 series 中最多一个固定 enum（`task_analyzer_source_family`、`aggregator_selected_kind`、`trace_compact_json_bytes_cap_reason` 或 `canary_task_risk`）；所有 bool、counts、indices、bytes、tokens、cost 和 latency 必须是 value。Canary policy/root hash、bucket、model/provider/deployment identity 和 reason 文本一律禁止采集。主要解决：固定时序数据库的 label cardinality 上界，避免多个低基数字段相乘后失控。
+3. 可作 label 的 producer 字段仅限 `schema`、`terminal_outcome`、`execution_status`、`selection_family`，以及各自专用 series 中最多一个固定 enum（`task_analyzer_source_family`、`aggregator_selected_kind`、`aggregator_cost_source_kind`、`trace_compact_json_bytes_cap_reason` 或 `canary_task_risk`）；所有 bool、counts、indices、bytes、tokens、cost 和 latency 必须是 value。Canary policy/root hash、bucket、model/provider/deployment identity 和 reason 文本一律禁止采集。主要解决：固定时序数据库的 label cardinality 上界，避免多个低基数字段相乘后失控。
 
 4. 未知枚举统一落入 producer 的 `unknown` 或 unavailable；下游不得保留原始 token作为新枚举值。主要解决：避免供应商错误码或模型名形成无限 label domain。
 

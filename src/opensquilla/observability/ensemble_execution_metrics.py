@@ -207,6 +207,35 @@ _AGGREGATOR_KNOWN_OUTCOMES = frozenset(
         *_AGGREGATOR_UNAVAILABLE_OUTCOMES,
     }
 )
+_AGGREGATOR_ATTEMPT_USAGE_SCHEMA = (
+    "opensquilla.ensemble-aggregator-attempt-usage/v1"
+)
+_AGGREGATOR_ATTEMPT_USAGE_FIELDS = frozenset(
+    {
+        "schema",
+        "physical_request_count",
+        "usage_row_count",
+        "usage_missing_count",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+        "cache_hit_request_count",
+        "billed_cost_usd",
+        "cost_source_kind",
+    }
+)
+_AGGREGATOR_ATTEMPT_USAGE_INT_FIELDS = (
+    ("input_tokens", "aggregator_input_tokens"),
+    ("output_tokens", "aggregator_output_tokens"),
+    ("reasoning_tokens", "aggregator_reasoning_tokens"),
+    ("cached_tokens", "aggregator_cache_read_tokens"),
+    ("cache_write_tokens", "aggregator_cache_write_tokens"),
+)
+_AGGREGATOR_COST_SOURCE_KINDS = frozenset(
+    {"provider_billed", "mixed", "unverified", "none"}
+)
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -506,6 +535,254 @@ def _project_task_analyzer_metrics(
         metrics["task_analyzer_deadline_expired"] = raw_expired
 
 
+def _aggregate_aggregator_cost_source_kind(kinds: list[str]) -> str:
+    if kinds and all(kind == "provider_billed" for kind in kinds):
+        return "provider_billed"
+    if "mixed" in kinds or (
+        "provider_billed" in kinds
+        and any(kind != "provider_billed" for kind in kinds)
+    ):
+        return "mixed"
+    if "unverified" in kinds:
+        return "unverified"
+    return "none"
+
+
+def _project_aggregator_attempt_usage_metrics(
+    raw_attempts: list[Any] | None,
+    *,
+    stage_observed: bool,
+    metrics: dict[str, Any],
+) -> None:
+    metrics.update(
+        {
+            "aggregator_usage_observed": False,
+            "aggregator_usage_accounting_observed": False,
+            "aggregator_usage_projection_complete": False,
+            "aggregator_cost_source_observed": False,
+            "aggregator_cost_projection_complete": False,
+            "aggregator_billed_cost_usd_observed": False,
+        }
+    )
+    if raw_attempts is None:
+        return
+
+    scanned_attempts = raw_attempts[:_MAX_AGGREGATOR_RECOVERY_ATTEMPT_ROWS]
+    capped = len(raw_attempts) > _MAX_AGGREGATOR_RECOVERY_ATTEMPT_ROWS
+    request_flags_complete = True
+    started_attempt_count = 0
+    usage_block_observation_count = 0
+    accounting_valid = True
+    usage_values_valid = True
+    cost_values_valid = True
+    physical_counts: list[int] = []
+    row_counts: list[int] = []
+    missing_counts: list[int] = []
+    cache_hit_counts: list[int] = []
+    billed_costs: list[float] = []
+    cost_source_kinds: list[str] = []
+    token_values: dict[str, list[int]] = {
+        source_field: []
+        for source_field, _ in _AGGREGATOR_ATTEMPT_USAGE_INT_FIELDS
+    }
+
+    for raw_attempt in scanned_attempts:
+        attempt = _mapping(raw_attempt)
+        raw_started = attempt.get("request_started")
+        raw_usage = attempt.get("usage")
+        usage_observed = bool(
+            type(raw_usage) is dict
+            and raw_usage.get("schema")
+            == _AGGREGATOR_ATTEMPT_USAGE_SCHEMA
+        )
+        usage_block_observation_count += int(usage_observed)
+        if type(raw_started) is not bool:
+            request_flags_complete = False
+            if raw_usage is not None:
+                accounting_valid = False
+            continue
+        if raw_started is False:
+            if raw_usage is not None:
+                accounting_valid = False
+            continue
+
+        started_attempt_count += 1
+        attempt_physical_count = _non_negative_int(
+            attempt.get("physical_request_count")
+        )
+        if not usage_observed:
+            accounting_valid = False
+            usage_values_valid = False
+            cost_values_valid = False
+            continue
+        usage = raw_usage
+        if not set(usage).issubset(_AGGREGATOR_ATTEMPT_USAGE_FIELDS):
+            accounting_valid = False
+            usage_values_valid = False
+            cost_values_valid = False
+
+        block_physical_count = _non_negative_int(
+            usage.get("physical_request_count")
+        )
+        row_count = _non_negative_int(usage.get("usage_row_count"))
+        missing_count = _non_negative_int(
+            usage.get("usage_missing_count")
+        )
+        if (
+            attempt_physical_count is None
+            or attempt_physical_count <= 0
+            or block_physical_count != attempt_physical_count
+            or row_count is None
+            or missing_count is None
+            or row_count + missing_count != block_physical_count
+        ):
+            accounting_valid = False
+        else:
+            physical_counts.append(block_physical_count)
+            row_counts.append(row_count)
+            missing_counts.append(missing_count)
+
+        block_int_values: dict[str, int] = {}
+        for source_field, _ in _AGGREGATOR_ATTEMPT_USAGE_INT_FIELDS:
+            value = _non_negative_int(usage.get(source_field))
+            if value is None:
+                usage_values_valid = False
+            else:
+                block_int_values[source_field] = value
+        cache_hit_count = _non_negative_int(
+            usage.get("cache_hit_request_count")
+        )
+        if (
+            cache_hit_count is None
+            or row_count is None
+            or cache_hit_count > row_count
+        ):
+            usage_values_valid = False
+        if len(block_int_values) == len(
+            _AGGREGATOR_ATTEMPT_USAGE_INT_FIELDS
+        ):
+            for source_field, value in block_int_values.items():
+                token_values[source_field].append(value)
+        if cache_hit_count is not None:
+            cache_hit_counts.append(cache_hit_count)
+
+        billed_cost = _non_negative_float(usage.get("billed_cost_usd"))
+        cost_source_kind = _enum_token(usage.get("cost_source_kind"))
+        if (
+            billed_cost is None
+            or cost_source_kind not in _AGGREGATOR_COST_SOURCE_KINDS
+        ):
+            cost_values_valid = False
+        else:
+            billed_costs.append(billed_cost)
+            cost_source_kinds.append(cost_source_kind)
+
+    metrics["aggregator_usage_observed"] = bool(
+        usage_block_observation_count
+    )
+    metrics["aggregator_usage_attempt_observation_count"] = (
+        usage_block_observation_count
+    )
+    if request_flags_complete and not capped:
+        metrics["aggregator_usage_started_attempt_count"] = (
+            started_attempt_count
+        )
+
+    accounting_observed = bool(
+        stage_observed
+        and not capped
+        and request_flags_complete
+        and started_attempt_count > 0
+        and usage_block_observation_count == started_attempt_count
+        and accounting_valid
+        and len(physical_counts) == started_attempt_count
+    )
+    physical_total = _bounded_metric_sum(physical_counts)
+    row_total = _bounded_metric_sum(row_counts)
+    missing_total = _bounded_metric_sum(missing_counts)
+    if (
+        physical_total is None
+        or row_total is None
+        or missing_total is None
+    ):
+        accounting_observed = False
+    metrics["aggregator_usage_accounting_observed"] = accounting_observed
+    if accounting_observed:
+        assert physical_total is not None
+        assert row_total is not None
+        assert missing_total is not None
+        metrics.update(
+            {
+                "aggregator_usage_physical_request_count": physical_total,
+                "aggregator_usage_row_count": row_total,
+                "aggregator_usage_missing_count": missing_total,
+            }
+        )
+
+    usage_projection_complete = bool(
+        accounting_observed
+        and missing_total == 0
+        and row_total == physical_total
+        and usage_values_valid
+        and all(
+            len(values) == started_attempt_count
+            for values in token_values.values()
+        )
+        and len(cache_hit_counts) == started_attempt_count
+    )
+    projected_token_totals: dict[str, int] = {}
+    if usage_projection_complete:
+        for source_field, target_field in (
+            _AGGREGATOR_ATTEMPT_USAGE_INT_FIELDS
+        ):
+            total = _bounded_metric_sum(token_values[source_field])
+            if total is None:
+                usage_projection_complete = False
+                break
+            projected_token_totals[target_field] = total
+        cache_hit_total = _bounded_metric_sum(cache_hit_counts)
+        if cache_hit_total is None:
+            usage_projection_complete = False
+    else:
+        cache_hit_total = None
+    metrics["aggregator_usage_projection_complete"] = (
+        usage_projection_complete
+    )
+    if usage_projection_complete:
+        metrics.update(projected_token_totals)
+        assert cache_hit_total is not None
+        metrics["aggregator_cache_hit_request_count"] = cache_hit_total
+
+    cost_source_observed = bool(
+        usage_projection_complete
+        and cost_values_valid
+        and len(billed_costs) == started_attempt_count
+        and len(cost_source_kinds) == started_attempt_count
+    )
+    metrics["aggregator_cost_source_observed"] = cost_source_observed
+    aggregate_cost_source = ""
+    if cost_source_observed:
+        aggregate_cost_source = _aggregate_aggregator_cost_source_kind(
+            cost_source_kinds
+        )
+        metrics["aggregator_cost_source_kind"] = aggregate_cost_source
+    billed_total = _bounded_metric_float_sum(billed_costs)
+    cost_projection_complete = bool(
+        cost_source_observed
+        and aggregate_cost_source == "provider_billed"
+        and billed_total is not None
+    )
+    metrics["aggregator_cost_projection_complete"] = (
+        cost_projection_complete
+    )
+    metrics["aggregator_billed_cost_usd_observed"] = (
+        cost_projection_complete
+    )
+    if cost_projection_complete:
+        assert billed_total is not None
+        metrics["aggregator_billed_cost_usd"] = billed_total
+
+
 def _project_aggregator_recovery_metrics(
     trace: Mapping[str, Any],
     metrics: dict[str, Any],
@@ -518,12 +795,19 @@ def _project_aggregator_recovery_metrics(
     )
     metrics["aggregator_stage_observed"] = stage_observed
     metrics["aggregator_physical_request_count_observed"] = False
+    raw_attempts = (
+        raw_recovery.get("attempts") if recovery_observed else None
+    )
+    attempts_observed = type(raw_attempts) is list
+    _project_aggregator_attempt_usage_metrics(
+        raw_attempts if attempts_observed else None,
+        stage_observed=stage_observed,
+        metrics=metrics,
+    )
     if not recovery_observed:
         return
 
     recovery = raw_recovery
-    raw_attempts = recovery.get("attempts")
-    attempts_observed = type(raw_attempts) is list
     metrics["aggregator_recovery_attempts_observed"] = attempts_observed
     if attempts_observed:
         scanned_attempts = raw_attempts[

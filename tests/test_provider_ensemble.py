@@ -9623,6 +9623,35 @@ async def test_aggregator_retry_preserves_nested_partial_usage(
     assert done.ensemble_trace["physical_request_count"] == 5
     assert done.ensemble_trace["usage_missing_count"] == 2
     assert done.ensemble_trace["final_request"]["abandoned_attempts"][0]["usage_missing_count"] == 2
+    started_attempts = [
+        attempt
+        for attempt in done.ensemble_trace["aggregator_recovery"]["attempts"]
+        if attempt["request_started"] is True
+    ]
+    assert [attempt["usage"]["physical_request_count"] for attempt in started_attempts] == [
+        3,
+        1,
+    ]
+    assert [attempt["usage"]["usage_row_count"] for attempt in started_attempts] == [
+        1,
+        1,
+    ]
+    assert [attempt["usage"]["usage_missing_count"] for attempt in started_attempts] == [
+        2,
+        0,
+    ]
+    metrics = build_ensemble_execution_metrics(
+        done.ensemble_trace,
+        terminal_outcome="completed",
+    )
+    assert metrics["aggregator_usage_accounting_observed"] is True
+    assert metrics["aggregator_usage_physical_request_count"] == 4
+    assert metrics["aggregator_usage_row_count"] == 2
+    assert metrics["aggregator_usage_missing_count"] == 2
+    assert metrics["aggregator_usage_projection_complete"] is False
+    assert metrics["aggregator_cost_projection_complete"] is False
+    assert "aggregator_input_tokens" not in metrics
+    assert "aggregator_billed_cost_usd" not in metrics
 
 
 @pytest.mark.asyncio
@@ -12458,6 +12487,62 @@ async def test_aggregator_retry_with_diagnostic_receipt_is_not_missing_usage(
         "aggregator_retry_1",
         "aggregator",
     ]
+    started_attempts = [
+        attempt
+        for attempt in done.ensemble_trace["aggregator_recovery"]["attempts"]
+        if attempt["request_started"] is True
+    ]
+    assert len(started_attempts) == 2
+    expected_usage_keys = {
+        "schema",
+        "physical_request_count",
+        "usage_row_count",
+        "usage_missing_count",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+        "cache_hit_request_count",
+        "billed_cost_usd",
+        "cost_source_kind",
+    }
+    for attempt in started_attempts:
+        usage = attempt["usage"]
+        assert set(usage) == expected_usage_keys
+        assert usage["schema"] == (
+            "opensquilla.ensemble-aggregator-attempt-usage/v1"
+        )
+        assert usage["physical_request_count"] == 1
+        assert usage["usage_row_count"] == 1
+        assert usage["usage_missing_count"] == 0
+        assert usage["cost_source_kind"] == "provider_billed"
+        assert {
+            "provider",
+            "model",
+            "requested_provider",
+            "requested_model",
+            "physical_attempt_id",
+            "response_id",
+        }.isdisjoint(usage)
+    metrics = build_ensemble_execution_metrics(
+        done.ensemble_trace,
+        terminal_outcome="completed",
+    )
+    assert metrics["aggregator_usage_accounting_observed"] is True
+    assert metrics["aggregator_usage_projection_complete"] is True
+    assert metrics["aggregator_usage_physical_request_count"] == 2
+    assert metrics["aggregator_usage_row_count"] == 2
+    assert metrics["aggregator_usage_missing_count"] == 0
+    assert metrics["aggregator_input_tokens"] == 9
+    assert metrics["aggregator_output_tokens"] == 4
+    assert metrics["aggregator_reasoning_tokens"] == 0
+    assert metrics["aggregator_cache_read_tokens"] == 0
+    assert metrics["aggregator_cache_write_tokens"] == 0
+    assert metrics["aggregator_cache_hit_request_count"] == 0
+    assert metrics["aggregator_cost_source_kind"] == "provider_billed"
+    assert metrics["aggregator_cost_projection_complete"] is True
+    assert metrics["aggregator_billed_cost_usd"] == pytest.approx(0.7)
 
 
 @dataclass
