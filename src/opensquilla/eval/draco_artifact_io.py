@@ -15,6 +15,7 @@ import json
 import os
 import stat
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -203,9 +204,8 @@ def _row_identity(row: dict[str, Any], *, artifact: str) -> tuple[str, str, str]
 @dataclass(frozen=True)
 class _ArtifactLine:
     identity: tuple[str, str, str]
-    row: dict[str, Any]
-    payload: bytes
     sha256: str
+    start_offset: int
     end_offset: int
 
 
@@ -213,19 +213,29 @@ def _serialized_line(row: dict[str, Any]) -> bytes:
     return (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
 
 
+def _update_checkpoint_prefix_digest(
+    digest: Any,
+    result: _ArtifactLine,
+    trace: _ArtifactLine,
+) -> None:
+    """Extend the v1 paired-row digest with one compact line pair."""
+
+    payload = json.dumps(
+        [*result.identity, result.sha256, trace.sha256],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    digest.update(len(payload).to_bytes(8, byteorder="big"))
+    digest.update(payload)
+
+
 def _checkpoint_prefix_digest(
     results: list[_ArtifactLine], traces: list[_ArtifactLine], count: int
 ) -> str:
     digest = hashlib.sha256()
     for result, trace in zip(results[:count], traces[:count], strict=True):
-        payload = json.dumps(
-            [*result.identity, result.sha256, trace.sha256],
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-        digest.update(len(payload).to_bytes(8, byteorder="big"))
-        digest.update(payload)
+        _update_checkpoint_prefix_digest(digest, result, trace)
     return f"sha256:{digest.hexdigest()}"
 
 
@@ -236,6 +246,7 @@ def _checkpoint_payload_for(
     results: list[_ArtifactLine],
     traces: list[_ArtifactLine],
     count: int,
+    paired_rows_sha256: str | None = None,
 ) -> dict[str, Any]:
     last_row: dict[str, Any] | None = None
     if count:
@@ -255,83 +266,81 @@ def _checkpoint_payload_for(
         "rows_written": count,
         "results_bytes": results[count - 1].end_offset if count else 0,
         "trace_bytes": traces[count - 1].end_offset if count else 0,
-        "paired_rows_sha256": _checkpoint_prefix_digest(results, traces, count),
+        "paired_rows_sha256": (
+            paired_rows_sha256
+            if paired_rows_sha256 is not None
+            else _checkpoint_prefix_digest(results, traces, count)
+        ),
         "last_row": last_row,
     }
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _open_readonly_artifact(path: Path, *, artifact: str) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise DracoArtifactDurabilityError(
+            f"{artifact} artifact is not a regular non-symlink file"
+        ) from exc
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except BaseException:
+        os.close(fd)
+        raise
+    if not regular:
+        os.close(fd)
+        raise DracoArtifactDurabilityError(
+            f"{artifact} artifact is not a regular non-symlink file"
+        )
+    return fd
 
 
-def _readonly_artifact_lines(
-    path: Path,
+def _parse_readonly_result_line(
+    line: bytes,
     *,
-    artifact: str,
-    results: list[_ArtifactLine] | None = None,
-) -> list[_ArtifactLine]:
-    """Read a finalized artifact without repairing or otherwise mutating it."""
+    line_number: int,
+) -> dict[str, Any]:
+    if not line.endswith(b"\n"):
+        raise DracoArtifactDurabilityError(
+            f"unterminated result row at line {line_number}"
+        )
+    if line == b"\n":
+        raise DracoArtifactDurabilityError(f"blank result row at line {line_number}")
+    try:
+        value = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DracoArtifactDurabilityError(
+            f"invalid result JSON at line {line_number}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise DracoArtifactDurabilityError(
+            f"result line {line_number} is not a JSON object"
+        )
+    if not verify_result_row_evidence(value):
+        raise DracoArtifactDurabilityError(
+            f"result evidence verification failed at line {line_number}"
+        )
+    return value
 
-    if path.is_symlink() or not path.is_file():
-        raise DracoArtifactDurabilityError(f"{artifact} artifact is not a regular non-symlink file")
-    lines: list[_ArtifactLine] = []
-    offset = 0
-    with path.open("rb") as handle:
+
+def iter_verified_result_rows(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield sealed result rows without retaining prior payloads in memory."""
+
+    path = Path(path)
+    fd = _open_readonly_artifact(path, artifact="result")
+    seen: set[tuple[str, str, str]] = set()
+    with os.fdopen(fd, "rb") as handle:
         for line_number, line in enumerate(handle, start=1):
-            offset += len(line)
-            if not line.endswith(b"\n"):
+            value = _parse_readonly_result_line(line, line_number=line_number)
+            identity = _row_identity(value, artifact="result")
+            if identity in seen:
                 raise DracoArtifactDurabilityError(
-                    f"unterminated {artifact} row at line {line_number}"
+                    f"duplicate sealed result row for {identity!r}"
                 )
-            if line == b"\n":
-                raise DracoArtifactDurabilityError(f"blank {artifact} row at line {line_number}")
-            try:
-                value = json.loads(line)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise DracoArtifactDurabilityError(
-                    f"invalid {artifact} JSON at line {line_number}: {exc}"
-                ) from exc
-            if not isinstance(value, dict):
-                raise DracoArtifactDurabilityError(
-                    f"{artifact} line {line_number} is not a JSON object"
-                )
-            if artifact == "result" and not verify_result_row_evidence(value):
-                raise DracoArtifactDurabilityError(
-                    f"result evidence verification failed at line {line_number}"
-                )
-            identity = _row_identity(value, artifact=artifact)
-            if artifact == "trace":
-                if results is None or len(lines) >= len(results):
-                    raise DracoArtifactDurabilityError(
-                        "trace artifact is ahead of results artifact"
-                    )
-                result = results[len(lines)]
-                expected = _serialized_line(trace_row_from_result(result.row))
-                if identity != result.identity or line != expected:
-                    raise DracoArtifactDurabilityError(
-                        f"trace projection mismatch at row {line_number}"
-                    )
-            lines.append(
-                _ArtifactLine(
-                    identity=identity,
-                    row=value,
-                    payload=line,
-                    sha256=_line_sha256(line),
-                    end_offset=offset,
-                )
-            )
-    indexed: set[tuple[str, str, str]] = set()
-    for line in lines:
-        if line.identity in indexed:
-            raise DracoArtifactDurabilityError(
-                f"duplicate sealed {artifact} row for {line.identity!r}"
-            )
-        indexed.add(line.identity)
-    return lines
+            seen.add(identity)
+            del line
+            yield value
 
 
 def verify_durable_draco_artifacts(
@@ -345,20 +354,110 @@ def verify_durable_draco_artifacts(
     results_path = Path(results_path)
     trace_path = Path(trace_path)
     checkpoint_path = Path(checkpoint_path)
-    results = _readonly_artifact_lines(results_path, artifact="result")
-    traces = _readonly_artifact_lines(
-        trace_path,
-        artifact="trace",
-        results=results,
-    )
-    if len(results) != len(traces):
-        raise DracoArtifactDurabilityError(
-            "finalized result and trace artifacts are not fully paired"
-        )
-    if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
-        raise DracoArtifactDurabilityError("artifact checkpoint is not a regular non-symlink file")
+    results_fd = _open_readonly_artifact(results_path, artifact="result")
     try:
-        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        trace_fd = _open_readonly_artifact(trace_path, artifact="trace")
+    except BaseException:
+        os.close(results_fd)
+        raise
+    try:
+        checkpoint_fd = _open_readonly_artifact(
+            checkpoint_path,
+            artifact="checkpoint",
+        )
+    except BaseException:
+        os.close(trace_fd)
+        os.close(results_fd)
+        raise
+    results: list[_ArtifactLine] = []
+    traces: list[_ArtifactLine] = []
+    result_identities: set[tuple[str, str, str]] = set()
+    trace_identities: set[tuple[str, str, str]] = set()
+    durable_result_keys: list[tuple[str, str]] = []
+    durable_capability = durable_artifact_capability_contract()
+    results_digest = hashlib.sha256()
+    trace_digest = hashlib.sha256()
+    paired_digest = hashlib.sha256()
+    results_offset = 0
+    trace_offset = 0
+    with os.fdopen(results_fd, "rb") as results_handle:
+        with os.fdopen(trace_fd, "rb") as trace_handle:
+            with os.fdopen(checkpoint_fd, "rb") as checkpoint_handle:
+                for line_number, result_line in enumerate(results_handle, start=1):
+                    result_start = results_offset
+                    results_offset += len(result_line)
+                    results_digest.update(result_line)
+                    result_row = _parse_readonly_result_line(
+                        result_line,
+                        line_number=line_number,
+                    )
+                    result_identity = _row_identity(result_row, artifact="result")
+                    if result_identity in result_identities:
+                        raise DracoArtifactDurabilityError(
+                            f"duplicate sealed result row for {result_identity!r}"
+                        )
+                    result_identities.add(result_identity)
+                    if result_row.get(DRACO_DURABLE_RESULT_ROW_FIELD) == durable_capability:
+                        durable_result_keys.append(
+                            (result_identity[0], result_identity[1])
+                        )
+                    result = _ArtifactLine(
+                        identity=result_identity,
+                        sha256=_line_sha256(result_line),
+                        start_offset=result_start,
+                        end_offset=results_offset,
+                    )
+                    results.append(result)
+                    del result_line
+
+                    trace_line = trace_handle.readline()
+                    if not trace_line:
+                        raise DracoArtifactDurabilityError(
+                            "finalized result and trace artifacts are not fully paired"
+                        )
+                    trace_start = trace_offset
+                    trace_offset += len(trace_line)
+                    trace_digest.update(trace_line)
+                    if not trace_line.endswith(b"\n"):
+                        raise DracoArtifactDurabilityError(
+                            f"unterminated trace row at line {line_number}"
+                        )
+                    if trace_line == b"\n":
+                        raise DracoArtifactDurabilityError(
+                            f"blank trace row at line {line_number}"
+                        )
+                    expected = _serialized_line(trace_row_from_result(result_row))
+                    del result_row
+                    if trace_line != expected:
+                        raise DracoArtifactDurabilityError(
+                            f"trace projection mismatch at row {line_number}"
+                        )
+                    trace_identity = result_identity
+                    if trace_identity in trace_identities:
+                        raise DracoArtifactDurabilityError(
+                            f"duplicate sealed trace row for {trace_identity!r}"
+                        )
+                    trace_identities.add(trace_identity)
+                    trace = _ArtifactLine(
+                        identity=trace_identity,
+                        sha256=_line_sha256(trace_line),
+                        start_offset=trace_start,
+                        end_offset=trace_offset,
+                    )
+                    traces.append(trace)
+                    _update_checkpoint_prefix_digest(
+                        paired_digest,
+                        result,
+                        trace,
+                    )
+                if trace_handle.read(1):
+                    raise DracoArtifactDurabilityError(
+                        "trace artifact is ahead of results artifact"
+                    )
+                checkpoint_payload = checkpoint_handle.read()
+                checkpoint_digest = hashlib.sha256(checkpoint_payload).hexdigest()
+    try:
+        checkpoint = json.loads(checkpoint_payload.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise DracoArtifactDurabilityError(f"invalid artifact checkpoint: {exc}") from exc
     expected = _checkpoint_payload_for(
@@ -367,6 +466,7 @@ def verify_durable_draco_artifacts(
         results=results,
         traces=traces,
         count=len(results),
+        paired_rows_sha256=f"sha256:{paired_digest.hexdigest()}",
     )
     if checkpoint != expected:
         raise DracoArtifactDurabilityError(
@@ -374,9 +474,10 @@ def verify_durable_draco_artifacts(
         )
     return {
         **expected,
-        "results_sha256": _file_sha256(results_path),
-        "trace_sha256": _file_sha256(trace_path),
-        "checkpoint_sha256": _file_sha256(checkpoint_path),
+        "results_sha256": results_digest.hexdigest(),
+        "trace_sha256": trace_digest.hexdigest(),
+        "checkpoint_sha256": checkpoint_digest,
+        "durable_result_keys": tuple(durable_result_keys),
     }
 
 
@@ -400,6 +501,8 @@ class DurableDracoArtifactWriter:
         self._traces: list[_ArtifactLine] = []
         self._result_by_identity: dict[tuple[str, str, str], _ArtifactLine] = {}
         self._trace_by_identity: dict[tuple[str, str, str], _ArtifactLine] = {}
+        self._paired_digest = hashlib.sha256()
+        self._paired_prefix_digests: list[str] = []
         self._broken = False
         self._closed = False
         try:
@@ -408,6 +511,7 @@ class DurableDracoArtifactWriter:
             else:
                 self._open_existing_files()
             self._validate_pair_order()
+            self._rebuild_paired_prefix_digests()
             checkpoint_count = self._load_checkpoint_count()
             if checkpoint_count != self.paired_row_count:
                 self._publish_checkpoint()
@@ -428,7 +532,19 @@ class DurableDracoArtifactWriter:
     def paired_result_rows(self) -> list[dict[str, Any]]:
         """Return detached result objects for every fully paired durable row."""
 
-        return [json.loads(line.payload) for line in self._results[: self.paired_row_count]]
+        return list(self.iter_paired_result_rows())
+
+    def iter_paired_result_rows(self) -> Iterator[dict[str, Any]]:
+        """Yield paired result objects while retaining only compact line metadata."""
+
+        if self._closed or self._results_fd is None:
+            raise DracoArtifactDurabilityError("artifact writer is closed")
+        for line in self._results[: self.paired_row_count]:
+            yield self._read_indexed_row(
+                self._results_fd,
+                line,
+                artifact="result",
+            )
 
     def __enter__(self) -> DurableDracoArtifactWriter:
         return self
@@ -560,7 +676,13 @@ class DurableDracoArtifactWriter:
                             "trace artifact is ahead of results artifact"
                         )
                     result = self._results[len(lines)]
-                    expected = _serialized_line(trace_row_from_result(result.row))
+                    assert self._results_fd is not None
+                    result_row = self._read_indexed_row(
+                        self._results_fd,
+                        result,
+                        artifact="result",
+                    )
+                    expected = _serialized_line(trace_row_from_result(result_row))
                     if identity != result.identity or candidate != expected:
                         if not terminated:
                             self._truncate_torn_tail(
@@ -584,14 +706,59 @@ class DurableDracoArtifactWriter:
                 lines.append(
                     _ArtifactLine(
                         identity=identity,
-                        row=value,
-                        payload=line,
                         sha256=_line_sha256(line),
+                        start_offset=start_offset,
                         end_offset=offset,
                     )
                 )
         os.lseek(fd, 0, os.SEEK_END)
         return lines
+
+    @staticmethod
+    def _read_indexed_payload(fd: int, line: _ArtifactLine) -> bytes:
+        remaining = line.end_offset - line.start_offset
+        offset = line.start_offset
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.pread(fd, remaining, offset)
+            if not chunk:
+                raise DracoArtifactDurabilityError(
+                    "artifact row changed after it was indexed"
+                )
+            chunks.append(chunk)
+            offset += len(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if _line_sha256(payload) != line.sha256:
+            raise DracoArtifactDurabilityError(
+                "artifact row changed after it was indexed"
+            )
+        return payload
+
+    @classmethod
+    def _read_indexed_row(
+        cls,
+        fd: int,
+        line: _ArtifactLine,
+        *,
+        artifact: str,
+    ) -> dict[str, Any]:
+        payload = cls._read_indexed_payload(fd, line)
+        try:
+            value = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DracoArtifactDurabilityError(
+                f"indexed {artifact} row is no longer valid JSON"
+            ) from exc
+        if not isinstance(value, dict) or _row_identity(value, artifact=artifact) != line.identity:
+            raise DracoArtifactDurabilityError(
+                f"indexed {artifact} row changed identity"
+            )
+        if artifact == "result" and not verify_result_row_evidence(value):
+            raise DracoArtifactDurabilityError(
+                "indexed result row failed evidence verification"
+            )
+        return value
 
     def _truncate_torn_tail(
         self,
@@ -624,9 +791,7 @@ class DurableDracoArtifactWriter:
             raise DracoArtifactDurabilityError("trace artifact is ahead of results artifact")
         for index, trace in enumerate(self._traces):
             result = self._results[index]
-            if trace.identity != result.identity or trace.payload != _serialized_line(
-                trace_row_from_result(result.row)
-            ):
+            if trace.identity != result.identity:
                 raise DracoArtifactDurabilityError(
                     f"result/trace projection mismatch at row {index + 1}"
                 )
@@ -634,6 +799,43 @@ class DurableDracoArtifactWriter:
             raise DracoArtifactDurabilityError(
                 "results artifact contains more than one unpaired row"
             )
+
+    def _rebuild_paired_prefix_digests(self) -> None:
+        digest = hashlib.sha256()
+        prefixes: list[str] = []
+        for result, trace in zip(
+            self._results[: self.paired_row_count],
+            self._traces,
+            strict=True,
+        ):
+            _update_checkpoint_prefix_digest(digest, result, trace)
+            prefixes.append(f"sha256:{digest.hexdigest()}")
+        self._paired_digest = digest
+        self._paired_prefix_digests = prefixes
+
+    def _record_paired_prefix_digest(
+        self,
+        result: _ArtifactLine,
+        trace: _ArtifactLine,
+    ) -> None:
+        if len(self._paired_prefix_digests) + 1 != self.paired_row_count:
+            raise DracoArtifactDurabilityError(
+                "paired digest state is not aligned with durable rows"
+            )
+        _update_checkpoint_prefix_digest(self._paired_digest, result, trace)
+        self._paired_prefix_digests.append(
+            f"sha256:{self._paired_digest.hexdigest()}"
+        )
+
+    def _paired_prefix_digest(self, count: int) -> str:
+        if count == 0:
+            return f"sha256:{hashlib.sha256().hexdigest()}"
+        try:
+            return self._paired_prefix_digests[count - 1]
+        except IndexError as exc:
+            raise DracoArtifactDurabilityError(
+                "paired digest prefix is outside durable rows"
+            ) from exc
 
     def _checkpoint_payload(self, count: int | None = None) -> dict[str, Any]:
         if count is None:
@@ -644,6 +846,7 @@ class DurableDracoArtifactWriter:
             results=self._results,
             traces=self._traces,
             count=count,
+            paired_rows_sha256=self._paired_prefix_digest(count),
         )
 
     def _load_checkpoint_count(self) -> int:
@@ -713,11 +916,19 @@ class DurableDracoArtifactWriter:
             )
         existing_result = self._result_by_identity.get(result_identity)
         existing_trace = self._trace_by_identity.get(result_identity)
-        if existing_result is not None and existing_result.payload != result_payload:
+        assert self._results_fd is not None
+        assert self._trace_fd is not None
+        if existing_result is not None and (
+            self._read_indexed_payload(self._results_fd, existing_result)
+            != result_payload
+        ):
             raise DracoArtifactDurabilityError(
                 "sealed result evidence conflicts with the existing result bytes"
             )
-        if existing_trace is not None and existing_trace.payload != trace_payload:
+        if existing_trace is not None and (
+            self._read_indexed_payload(self._trace_fd, existing_trace)
+            != trace_payload
+        ):
             raise DracoArtifactDurabilityError(
                 "sealed result evidence conflicts with the existing trace bytes"
             )
@@ -736,29 +947,27 @@ class DurableDracoArtifactWriter:
                 "an unpaired result must be repaired before appending another row"
             )
 
-        assert self._results_fd is not None
-        assert self._trace_fd is not None
         try:
+            result_line = existing_result
             if existing_result is None:
                 result_line = _ArtifactLine(
                     identity=result_identity,
-                    row=result,
-                    payload=result_payload,
                     sha256=_line_sha256(result_payload),
+                    start_offset=os.lseek(self._results_fd, 0, os.SEEK_END),
                     end_offset=self._append_line(self._results_fd, result_payload),
                 )
                 self._results.append(result_line)
                 self._result_by_identity[result_identity] = result_line
+            assert result_line is not None
             trace_line = _ArtifactLine(
                 identity=trace_identity,
-                row=trace,
-                payload=trace_payload,
                 sha256=_line_sha256(trace_payload),
+                start_offset=os.lseek(self._trace_fd, 0, os.SEEK_END),
                 end_offset=self._append_line(self._trace_fd, trace_payload),
             )
             self._traces.append(trace_line)
             self._trace_by_identity[trace_identity] = trace_line
-            self._validate_pair_order()
+            self._record_paired_prefix_digest(result_line, trace_line)
             self._publish_checkpoint()
         except BaseException:
             self._broken = True
@@ -770,7 +979,12 @@ class DurableDracoArtifactWriter:
 
         if len(self._results) == len(self._traces):
             return False
-        result = self._results[-1].row
+        assert self._results_fd is not None
+        result = self._read_indexed_row(
+            self._results_fd,
+            self._results[-1],
+            artifact="result",
+        )
         return self.append(result, trace_row_from_result(result))
 
 

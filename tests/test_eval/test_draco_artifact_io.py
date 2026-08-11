@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -33,6 +34,24 @@ def _pair(
             "row_index": 1,
             "final_text": final_text,
             "error": None,
+        }
+    )
+    return result, trace_row_from_result(result)
+
+
+def _durable_pair(
+    *, task_id: str, final_text: str
+) -> tuple[dict[str, object], dict[str, object]]:
+    result = seal_result_row(
+        {
+            "group": "B0",
+            "task_id": task_id,
+            "row_index": 1,
+            "final_text": final_text,
+            "error": None,
+            artifact_io.DRACO_DURABLE_RESULT_ROW_FIELD: (
+                artifact_io.durable_artifact_capability_contract()
+            ),
         }
     )
     return result, trace_row_from_result(result)
@@ -306,6 +325,124 @@ def test_readonly_verifier_binds_every_result_trace_and_checkpoint_byte(
     assert len(verification["checkpoint_sha256"]) == 64
 
 
+def test_streaming_verifier_preserves_golden_checkpoint_offsets_and_durable_keys(
+    tmp_path: Path,
+) -> None:
+    results_path, trace_path, checkpoint_path = _paths(tmp_path)
+    pairs = [
+        _durable_pair(task_id="task-short", final_text="one"),
+        _durable_pair(task_id="任务-long", final_text="界" * 137),
+    ]
+    with artifact_io.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        for result, trace in pairs:
+            assert writer.append(result, trace) is True
+
+    results_payload = results_path.read_bytes()
+    trace_payload = trace_path.read_bytes()
+    checkpoint_payload = checkpoint_path.read_bytes()
+    checkpoint = json.loads(checkpoint_payload)
+
+    verification = artifact_io.verify_durable_draco_artifacts(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert verification["results_bytes"] == len(results_payload)
+    assert verification["trace_bytes"] == len(trace_payload)
+    assert verification["results_sha256"] == hashlib.sha256(results_payload).hexdigest()
+    assert verification["trace_sha256"] == hashlib.sha256(trace_payload).hexdigest()
+    assert verification["checkpoint_sha256"] == hashlib.sha256(
+        checkpoint_payload
+    ).hexdigest()
+    assert verification["durable_result_keys"] == (
+        ("B0", "task-short"),
+        ("B0", "任务-long"),
+    )
+    assert verification["paired_rows_sha256"] == checkpoint["paired_rows_sha256"]
+    assert checkpoint["results_bytes"] == sum(
+        len(line) for line in results_payload.splitlines(keepends=True)
+    )
+    assert checkpoint["trace_bytes"] == sum(
+        len(line) for line in trace_payload.splitlines(keepends=True)
+    )
+    assert checkpoint_path.read_bytes() == checkpoint_payload
+    result_lengths = [
+        len(line) for line in results_payload.splitlines(keepends=True)
+    ]
+    trace_lengths = [
+        len(line) for line in trace_payload.splitlines(keepends=True)
+    ]
+    with artifact_io.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+        create=False,
+    ) as reopened:
+        assert [
+            (line.start_offset, line.end_offset) for line in reopened._results
+        ] == [
+            (0, result_lengths[0]),
+            (result_lengths[0], sum(result_lengths)),
+        ]
+        assert [
+            (line.start_offset, line.end_offset) for line in reopened._traces
+        ] == [
+            (0, trace_lengths[0]),
+            (trace_lengths[0], sum(trace_lengths)),
+        ]
+
+
+def test_verifier_hashes_the_checkpoint_bytes_it_parsed_when_path_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results_path, trace_path, checkpoint_path = _paths(tmp_path)
+    result, trace = _durable_pair(task_id="task-1", final_text="answer")
+    with artifact_io.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        writer.append(result, trace)
+
+    checkpoint_payload = checkpoint_path.read_bytes()
+    replacement_payload = checkpoint_payload + b" "
+    real_json_loads = artifact_io.json.loads
+    replaced = False
+
+    def replace_path_after_checkpoint_parse(payload: object, *args: object, **kwargs: object):
+        nonlocal replaced
+        value = real_json_loads(payload, *args, **kwargs)
+        if (
+            not replaced
+            and isinstance(value, dict)
+            and value.get("schema") == artifact_io.DRACO_ARTIFACT_CHECKPOINT_SCHEMA
+        ):
+            replacement_path = tmp_path / "replacement.checkpoint.json"
+            replacement_path.write_bytes(replacement_payload)
+            replacement_path.replace(checkpoint_path)
+            replaced = True
+        return value
+
+    monkeypatch.setattr(artifact_io.json, "loads", replace_path_after_checkpoint_parse)
+    verification = artifact_io.verify_durable_draco_artifacts(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert replaced is True
+    assert checkpoint_path.read_bytes() == replacement_payload
+    assert verification["checkpoint_sha256"] == hashlib.sha256(
+        checkpoint_payload
+    ).hexdigest()
+
+
 def test_exact_checkpoint_reopen_retries_parent_directory_barrier(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -560,3 +697,139 @@ def test_same_evidence_with_different_serialized_bytes_fails_closed(tmp_path: Pa
             writer.append(reordered, trace)
 
     assert len(results_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_append_uses_constant_time_rolling_checkpoint_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results_path, trace_path, checkpoint_path = _paths(tmp_path)
+    writer = artifact_io.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+
+    def reject_prefix_rescan(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("append rescanned an already committed checkpoint prefix")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            artifact_io,
+            "_checkpoint_prefix_digest",
+            reject_prefix_rescan,
+        )
+        with writer:
+            for index in range(8):
+                result, trace = _pair(task_id=f"task-{index}")
+                assert writer.append(result, trace) is True
+
+    verification = artifact_io.verify_durable_draco_artifacts(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+    assert verification["rows_written"] == 8
+
+
+def test_reopen_rebuilds_digest_once_then_appends_without_prefix_rescan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results_path, trace_path, checkpoint_path = _paths(tmp_path)
+    with artifact_io.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        for index in range(4):
+            result, trace = _pair(task_id=f"before-{index}")
+            writer.append(result, trace)
+
+    updates = 0
+    real_update = artifact_io._update_checkpoint_prefix_digest
+
+    def count_update(*args: object, **kwargs: object) -> None:
+        nonlocal updates
+        updates += 1
+        real_update(*args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(artifact_io, "_update_checkpoint_prefix_digest", count_update)
+        scoped.setattr(
+            artifact_io,
+            "_checkpoint_prefix_digest",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("writer used the offline prefix rescan")
+            ),
+        )
+        with artifact_io.DurableDracoArtifactWriter(
+            results_path=results_path,
+            trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
+            create=False,
+        ) as reopened:
+            assert updates == 4
+            result, trace = _pair(task_id="after")
+            assert reopened.append(result, trace) is True
+            assert updates == 5
+
+
+def test_writer_retains_only_compact_line_metadata_for_large_rows(tmp_path: Path) -> None:
+    results_path, trace_path, checkpoint_path = _paths(tmp_path)
+    result, trace = _pair(final_text="x" * (2 * 1024 * 1024))
+
+    with artifact_io.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        writer.append(result, trace)
+        result_line = writer._results[0]
+        trace_line = writer._traces[0]
+        assert not hasattr(result_line, "row")
+        assert not hasattr(result_line, "payload")
+        assert not hasattr(trace_line, "row")
+        assert not hasattr(trace_line, "payload")
+        assert next(writer.iter_paired_result_rows())["final_text"] == result["final_text"]
+
+
+def test_streaming_verifier_hashes_result_and_trace_during_pair_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results_path, trace_path, checkpoint_path = _paths(tmp_path)
+    with artifact_io.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        for index in range(3):
+            result, trace = _pair(task_id=f"task-{index}")
+            writer.append(result, trace)
+
+    open_calls: list[tuple[Path, str]] = []
+    real_open = artifact_io._open_readonly_artifact
+
+    def record_open(path: Path, *, artifact: str) -> int:
+        open_calls.append((Path(path), artifact))
+        return real_open(path, artifact=artifact)
+
+    monkeypatch.setattr(artifact_io, "_open_readonly_artifact", record_open)
+    verification = artifact_io.verify_durable_draco_artifacts(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert verification["rows_written"] == 3
+    assert open_calls == [
+        (results_path, "result"),
+        (trace_path, "trace"),
+        (checkpoint_path, "checkpoint"),
+    ]
+    assert [row["task_id"] for row in artifact_io.iter_verified_result_rows(results_path)] == [
+        "task-0",
+        "task-1",
+        "task-2",
+    ]

@@ -115,6 +115,77 @@ def test_recover_run_repairs_half_pair_and_publishes_terminal_manifest(
     assert module.recover_run(manifest_path) == recovery
 
 
+def test_recover_run_never_materializes_all_paired_result_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load()
+    manifest_path, _, _, _ = _running_half_pair(tmp_path)
+
+    def reject_full_materialization(_writer: object) -> list[dict[str, object]]:
+        raise AssertionError("recovery materialized the complete result shard")
+
+    monkeypatch.setattr(
+        artifact_io.DurableDracoArtifactWriter,
+        "paired_result_rows",
+        property(reject_full_materialization),
+    )
+
+    recovery = module.recover_run(manifest_path)
+    assert recovery["rows_written"] == 1
+    assert module.recover_run(manifest_path) == recovery
+
+
+def test_idempotent_recovery_uses_keys_from_the_verified_result_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load()
+    manifest_path, results_path, _, _ = _running_half_pair(tmp_path)
+    recovery = module.recover_run(manifest_path)
+    verified_results_payload = results_path.read_bytes()
+    replacement_result = seal_result_row(
+        {
+            "group": "B0",
+            "task_id": "task-2",
+            "row_index": 2,
+            "final_text": "different durable answer",
+            "error": None,
+            artifact_io.DRACO_DURABLE_RESULT_ROW_FIELD: (
+                artifact_io.durable_artifact_capability_contract()
+            ),
+        }
+    )
+    replacement_payload = (
+        json.dumps(replacement_result, ensure_ascii=False, allow_nan=False) + "\n"
+    ).encode()
+    real_verify = module.verify_durable_draco_artifacts
+    replaced = False
+
+    def verify_then_replace_result(**kwargs):
+        nonlocal replaced
+        verification = real_verify(**kwargs)
+        replacement_path = tmp_path / "replacement.results.jsonl"
+        replacement_path.write_bytes(replacement_payload)
+        replacement_path.replace(results_path)
+        replaced = True
+        return verification
+
+    monkeypatch.setattr(
+        module,
+        "verify_durable_draco_artifacts",
+        verify_then_replace_result,
+    )
+
+    assert module.recover_run(manifest_path) == recovery
+    assert replaced is True
+    assert results_path.read_bytes() == replacement_payload
+    assert recovery["results_sha256"] == module._sha256_bytes(
+        verified_results_payload
+    )
+    assert recovery["ambiguous_pairs"] == [{"group": "B0", "task_id": "task-2"}]
+
+
 def test_recover_run_refuses_an_active_runner_lock(tmp_path: Path) -> None:
     module = _load()
     manifest_path, _, _, checkpoint_path = _running_half_pair(tmp_path)

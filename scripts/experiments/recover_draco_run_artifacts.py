@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.eval.draco_artifact_io import (
-    DRACO_DURABLE_RESULT_ROW_FIELD,
     DRACO_RUN_MANIFEST_SCHEMA_V2,
     DracoArtifactDurabilityError,
     DracoArtifactRunLock,
@@ -132,15 +131,33 @@ def _expected_keys(manifest: Mapping[str, Any]) -> set[tuple[str, str]]:
     return {(str(group), str(task_id)) for group in groups for task_id in task_ids}
 
 
-def _durable_keys(rows: list[Mapping[str, Any]]) -> set[tuple[str, str]]:
+def _durable_keys_from_verification(
+    verification: Mapping[str, Any],
+) -> set[tuple[str, str]]:
+    rows_written = verification.get("rows_written")
+    raw_keys = verification.get("durable_result_keys")
+    if (
+        not isinstance(rows_written, int)
+        or isinstance(rows_written, bool)
+        or rows_written < 0
+        or not isinstance(raw_keys, tuple)
+        or len(raw_keys) != rows_written
+    ):
+        raise DracoArtifactDurabilityError(
+            "recovered shard lacks its sealed durable row marker"
+        )
     keys: set[tuple[str, str]] = set()
-    for row in rows:
-        if row.get(DRACO_DURABLE_RESULT_ROW_FIELD) != (durable_artifact_capability_contract()):
+    for raw_key in raw_keys:
+        if (
+            not isinstance(raw_key, tuple)
+            or len(raw_key) != 2
+            or not all(isinstance(value, str) and value for value in raw_key)
+        ):
             raise DracoArtifactDurabilityError(
-                "recovered shard lacks its sealed durable row marker"
+                "verified shard contains a malformed durable group/task key"
             )
-        key = (str(row.get("group") or ""), str(row.get("task_id") or ""))
-        if not all(key) or key in keys:
+        key = (raw_key[0], raw_key[1])
+        if key in keys:
             raise DracoArtifactDurabilityError(
                 f"recovered shard has a missing or duplicate group/task key: {key!r}"
             )
@@ -192,18 +209,6 @@ def _recovery_ledgers(
         item for item in normalized_schedule if (item["group"], item["task_id"]) in durable_keys
     ]
     return ambiguous, durable_schedule
-
-
-def _read_verified_result_rows(results_path: Path) -> list[Mapping[str, Any]]:
-    rows: list[Mapping[str, Any]] = []
-    for raw in results_path.read_bytes().split(b"\n"):
-        if not raw:
-            continue
-        value = json.loads(raw)
-        if not isinstance(value, Mapping):
-            raise DracoArtifactDurabilityError("verified result artifact contains a non-object row")
-        rows.append(value)
-    return rows
 
 
 def recover_run(manifest_path: Path) -> dict[str, Any]:
@@ -258,7 +263,7 @@ def recover_run(manifest_path: Path) -> dict[str, Any]:
             recomputed_ambiguous: list[dict[str, str]] | None = None
             recomputed_schedule: list[dict[str, str]] | None = None
             if isinstance(prior_manifest, Mapping):
-                durable_keys = _durable_keys(_read_verified_result_rows(results_path))
+                durable_keys = _durable_keys_from_verification(verification)
                 recomputed_ambiguous, recomputed_schedule = _recovery_ledgers(
                     prior_manifest,
                     durable_keys,
@@ -300,13 +305,12 @@ def recover_run(manifest_path: Path) -> dict[str, Any]:
             create=False,
         ) as writer:
             writer.repair_unpaired_result()
-            rows = writer.paired_result_rows
         verification = verify_durable_draco_artifacts(
             results_path=results_path,
             trace_path=trace_path,
             checkpoint_path=checkpoint_path,
         )
-        durable_keys = _durable_keys(rows)
+        durable_keys = _durable_keys_from_verification(verification)
         ambiguous, durable_scheduled_pairs = _recovery_ledgers(
             manifest,
             durable_keys,
@@ -359,7 +363,7 @@ def recover_run(manifest_path: Path) -> dict[str, Any]:
         if manifest.get("failure") is None:
             manifest["failure"] = {
                 "stage": "unclean_run_recovered",
-                "model_or_judge_started": bool(rows or ambiguous),
+                "model_or_judge_started": bool(durable_keys or ambiguous),
                 "ambiguous_pair_count": len(ambiguous),
             }
         atomic_write_text(
