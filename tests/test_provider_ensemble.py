@@ -48,9 +48,11 @@ from opensquilla.provider.admission import (
 from opensquilla.provider.ensemble import (
     EnsembleMemberConfig,
     EnsembleProvider,
+    _apply_canary_candidate_filter,
     _apply_runtime_health_candidate_filter,
     _attach_final_request_output,
     _bind_managed_usage_rows,
+    _canary_rollout_bucket,
     _CandidateResult,
     _canonicalize_usage_row,
     _close_async_iterator,
@@ -59,6 +61,7 @@ from opensquilla.provider.ensemble import (
     _error_event_physical_request_count,
     _is_thinking_parameter_rejection,
     _json_safe,
+    _materialize_canary_runtime_policy,
     _member_chat_config,
     _member_execution_trace,
     _member_from_ref,
@@ -4201,7 +4204,9 @@ def test_router_dynamic_selection_plan_is_materialized_without_rewriting_members
     )
 
 
-def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallback() -> None:
+def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = GatewayConfig(
         llm={
             "provider": "openrouter",
@@ -4393,6 +4398,61 @@ def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallba
             "analyzer_failure_fallback": fallback,
         },
     )
+
+    from opensquilla.provider import ranking_router
+
+    real_registry_loader = ranking_router.load_model_registry_snapshot
+
+    def registry_with_future_canary(*, base_version: str | None = None) -> dict[str, Any]:
+        snapshot = real_registry_loader(base_version=base_version)
+        for row in snapshot["models"]:
+            facts = row["registry_facts"]
+            if facts["model_id"] == "z-ai/glm-5.2":
+                facts["status"] = "canary"
+                break
+        else:
+            raise AssertionError("test registry lacks z-ai/glm-5.2")
+        return snapshot
+
+    frozen_fallback_inputs = deepcopy(
+        legacy_provider._router_dynamic_retry_context.frozen_ranking_inputs
+    )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            ranking_router,
+            "load_model_registry_snapshot",
+            registry_with_future_canary,
+        )
+        with pytest.raises(
+            DynamicRankingError,
+            match="live analyzer_failure_fallback.*canary",
+        ):
+            build_ensemble_provider_from_config(
+                config=config,
+                inherited_provider_config=ProviderConfig(
+                    provider="openrouter",
+                    model="deepseek/deepseek-v4-pro",
+                    api_key="fake",
+                ),
+                fallback_provider=None,
+                turn_metadata={"routed_tier": "c2"},
+                ranking_inputs=deepcopy(frozen_fallback_inputs),
+            )
+
+        experiment_config = config.model_copy(deep=True)
+        experiment_config.llm_ensemble.latency_class = "experiment"
+        experiment_provider = build_ensemble_provider_from_config(
+            config=experiment_config,
+            inherited_provider_config=ProviderConfig(
+                provider="openrouter",
+                model="deepseek/deepseek-v4-pro",
+                api_key="fake",
+            ),
+            fallback_provider=None,
+            turn_metadata={"routed_tier": "c2"},
+            ranking_inputs=deepcopy(frozen_fallback_inputs),
+        )
+    assert experiment_provider.selection_plan["analyzer_failure_fallback"] is True
 
     assert legacy_provider.selection_plan["analyzer_failure_fallback"] is True
     assert [
@@ -19745,6 +19805,792 @@ async def test_experiment_continues_after_provider_error_with_visible_text(
     assert done.usage_missing_count == 0
 
 
+def _canary_rollout_policy() -> dict[str, Any]:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "canary_rollout": {
+                "enabled": True,
+                "global_basis_points": 10_000,
+                "proposer": {
+                    "basis_points": 10_000,
+                    "max_candidates_per_decision": 1,
+                    "min_observations": 20,
+                    "max_failure_basis_points": 500,
+                },
+            }
+        }
+    )
+    return cfg.llm_ensemble.canary_rollout.model_dump(mode="json")
+
+
+def _canary_rollout_snapshot(
+    *models: str,
+    success: int = 20,
+    failure: int = 0,
+) -> dict[str, Any]:
+    return {
+        "models": [
+            {
+                "registry_facts": {
+                    "provider": "fake",
+                    "model_id": model,
+                    "status": "canary",
+                    "roles": ["proposer", "aggregator"],
+                    "health": "healthy",
+                },
+                "online_profile": {
+                    "role_reliability": {
+                        "proposer": {"success": success, "failure": failure},
+                        "aggregator": {"success": 50, "failure": 0},
+                    }
+                },
+            }
+            for model in (models or ("canary-a",))
+        ]
+    }
+
+
+def _fresh_canary_health_ledger(*models: str) -> ProviderHealthLedger:
+    ledger = ProviderHealthLedger()
+    for model in models or ("canary-a",):
+        ledger.record_success("fake", model)
+    return ledger
+
+
+def _canary_task_analysis(
+    *,
+    risk: str = "low",
+    schema_valid: bool = True,
+    confidence: float = 0.9,
+    source: str = "llm_provider",
+) -> TaskAnalysisResult:
+    return TaskAnalysisResult(
+        profile={"constraints": {"risk": risk}},
+        source=source,
+        schema_valid=schema_valid,
+        confidence=confidence,
+    )
+
+
+def test_live_canary_rollout_defaults_to_fail_closed() -> None:
+    snapshot = _canary_rollout_snapshot("canary-a")
+    policy = GatewayConfig().llm_ensemble.canary_rollout.model_dump(mode="json")
+
+    trace = _apply_canary_candidate_filter(
+        snapshot,
+        rollout_config=policy,
+        task_analysis=_canary_task_analysis(),
+        decision_id="decision-a",
+    )
+
+    assert trace is not None
+    assert trace["enabled"] is False
+    assert trace["admitted_by_role"] == {"proposer": 0, "aggregator": 0}
+    assert snapshot["models"][0]["registry_facts"][
+        "runtime_hard_filter_reasons_by_role"
+    ] == {
+        "proposer": ["canary_rollout_disabled"],
+        "aggregator": ["canary_role_disabled"],
+    }
+
+
+def test_live_canary_rollout_is_stable_across_retry_and_caps_candidates() -> None:
+    first = _canary_rollout_snapshot("canary-a", "canary-b")
+    retry = deepcopy(first)
+    policy = _canary_rollout_policy()
+
+    first_trace = _apply_canary_candidate_filter(
+        first,
+        rollout_config=policy,
+        task_analysis=_canary_task_analysis(),
+        decision_id="root-decision",
+        health_ledger=_fresh_canary_health_ledger(
+            "canary-a",
+            "canary-b",
+        ),
+    )
+    retry_trace = _apply_canary_candidate_filter(
+        retry,
+        rollout_config=policy,
+        task_analysis=_canary_task_analysis(),
+        decision_id="replacement-decision",
+        retry_parent_decision_id="root-decision",
+        health_ledger=_fresh_canary_health_ledger(
+            "canary-a",
+            "canary-b",
+        ),
+    )
+
+    assert first_trace == retry_trace
+    assert first == retry
+    assert first_trace is not None
+    assert first_trace["admitted_by_role"] == {"proposer": 1, "aggregator": 0}
+    assert first_trace["reason_counts"]["canary_candidate_cap"] == 1
+    assert _canary_rollout_bucket(
+        policy_version="router-canary-v1",
+        root_decision_id="root-decision",
+        scope="global",
+    ) == first_trace["global_bucket"]
+
+
+@pytest.mark.parametrize(
+    ("analysis", "success", "failure", "expected_reason"),
+    [
+        (_canary_task_analysis(risk="medium"), 20, 0, "canary_task_ineligible"),
+        (_canary_task_analysis(schema_valid=False), 20, 0, "canary_task_ineligible"),
+        (_canary_task_analysis(confidence=0.79), 20, 0, "canary_task_ineligible"),
+        (
+            _canary_task_analysis(source="router_fallback"),
+            20,
+            0,
+            "canary_task_ineligible",
+        ),
+        (
+            _canary_task_analysis(source="analyzer_failure_fallback"),
+            20,
+            0,
+            "canary_task_ineligible",
+        ),
+        (
+            _canary_task_analysis(),
+            19,
+            0,
+            "canary_reliability_coverage_insufficient",
+        ),
+        (
+            _canary_task_analysis(),
+            18,
+            2,
+            "canary_reliability_threshold_exceeded",
+        ),
+    ],
+)
+def test_live_canary_rollout_enforces_task_and_reliability_gates(
+    analysis: TaskAnalysisResult,
+    success: int,
+    failure: int,
+    expected_reason: str,
+) -> None:
+    snapshot = _canary_rollout_snapshot(
+        "canary-a",
+        success=success,
+        failure=failure,
+    )
+
+    trace = _apply_canary_candidate_filter(
+        snapshot,
+        rollout_config=_canary_rollout_policy(),
+        task_analysis=analysis,
+        decision_id="decision-a",
+        health_ledger=_fresh_canary_health_ledger("canary-a"),
+    )
+
+    assert trace is not None
+    reasons = snapshot["models"][0]["registry_facts"][
+        "runtime_hard_filter_reasons_by_role"
+    ]["proposer"]
+    assert reasons == [expected_reason]
+    assert trace["admitted_by_role"]["proposer"] == 0
+
+
+@pytest.mark.parametrize(
+    "health_mode",
+    [
+        "missing",
+        "exception",
+        "nonmapping",
+        "stale",
+        "benched",
+        "half_open",
+        "half_open_busy",
+    ],
+)
+def test_live_canary_rollout_requires_fresh_healthy_runtime_evidence(
+    health_mode: str,
+) -> None:
+    class _Ledger:
+        def runtime_facts(self, *_args: Any, **_kwargs: Any) -> Any:
+            if health_mode == "exception":
+                raise RuntimeError("ledger unavailable")
+            if health_mode == "nonmapping":
+                return []
+            if health_mode == "stale":
+                return {"fresh": False, "state": "healthy"}
+            if health_mode == "benched":
+                return {"fresh": True, "state": "benched"}
+            if health_mode == "half_open":
+                return {"fresh": True, "state": "half_open"}
+            if health_mode == "half_open_busy":
+                return {
+                    "fresh": True,
+                    "state": "healthy",
+                    "half_open_inflight": True,
+                }
+            raise AssertionError(health_mode)
+
+    snapshot = _canary_rollout_snapshot("canary-a")
+    trace = _apply_canary_candidate_filter(
+        snapshot,
+        rollout_config=_canary_rollout_policy(),
+        task_analysis=_canary_task_analysis(),
+        decision_id="decision-health",
+        health_ledger=None if health_mode == "missing" else _Ledger(),
+    )
+
+    assert trace is not None
+    assert trace["admitted_by_role"]["proposer"] == 0
+    assert snapshot["models"][0]["registry_facts"][
+        "runtime_hard_filter_reasons_by_role"
+    ]["proposer"] == ["canary_health_unhealthy"]
+
+
+def test_live_canary_filter_replaces_only_its_own_stale_reasons() -> None:
+    snapshot = _canary_rollout_snapshot("canary-a")
+    facts = snapshot["models"][0]["registry_facts"]
+    facts["runtime_hard_filter_reasons_by_role"] = {
+        "proposer": ["unrelated_filter_reason"],
+    }
+    disabled = GatewayConfig().llm_ensemble.canary_rollout.model_dump(
+        mode="json"
+    )
+    _apply_canary_candidate_filter(
+        snapshot,
+        rollout_config=disabled,
+        task_analysis=_canary_task_analysis(),
+        decision_id="decision-idempotent",
+    )
+    assert facts["runtime_hard_filter_reasons_by_role"]["proposer"] == [
+        "unrelated_filter_reason",
+        "canary_rollout_disabled",
+    ]
+
+    trace = _apply_canary_candidate_filter(
+        snapshot,
+        rollout_config=_canary_rollout_policy(),
+        task_analysis=_canary_task_analysis(),
+        decision_id="decision-idempotent",
+        health_ledger=_fresh_canary_health_ledger("canary-a"),
+    )
+
+    assert trace is not None
+    assert trace["admitted_by_role"]["proposer"] == 1
+    assert facts["runtime_hard_filter_reasons_by_role"]["proposer"] == [
+        "unrelated_filter_reason"
+    ]
+
+
+def test_live_canary_filter_rejects_huge_analyzer_confidence_without_overflow() -> None:
+    snapshot = _canary_rollout_snapshot("canary-a")
+    analysis = _canary_task_analysis(confidence=10**10_000)
+
+    trace = _apply_canary_candidate_filter(
+        snapshot,
+        rollout_config=_canary_rollout_policy(),
+        task_analysis=analysis,
+        decision_id="decision-huge-confidence",
+        health_ledger=_fresh_canary_health_ledger("canary-a"),
+    )
+
+    assert trace is not None
+    assert trace["admitted_by_role"]["proposer"] == 0
+    assert snapshot["models"][0]["registry_facts"][
+        "runtime_hard_filter_reasons_by_role"
+    ]["proposer"] == ["canary_task_ineligible"]
+
+
+@pytest.mark.parametrize(
+    "unsafe_update",
+    [
+        {"allowed_risks": ["high"]},
+        {"min_analyzer_confidence": 0.1},
+    ],
+)
+def test_live_canary_filter_revalidates_model_copy_updates(
+    unsafe_update: dict[str, Any],
+) -> None:
+    rollout = GatewayConfig(
+        llm_ensemble={
+            "canary_rollout": {
+                "enabled": True,
+                "global_basis_points": 10_000,
+                "proposer": {
+                    "basis_points": 10_000,
+                    "max_candidates_per_decision": 1,
+                },
+            }
+        }
+    ).llm_ensemble.canary_rollout.model_copy(update=unsafe_update)
+    snapshot = _canary_rollout_snapshot("canary-a")
+    policy, policy_valid = _materialize_canary_runtime_policy(rollout)
+
+    trace = _apply_canary_candidate_filter(
+        snapshot,
+        rollout_config=policy,
+        rollout_config_valid=policy_valid,
+        task_analysis=_canary_task_analysis(),
+        decision_id="decision-model-copy-guard",
+        health_ledger=_fresh_canary_health_ledger("canary-a"),
+    )
+
+    assert trace is not None
+    assert trace["config_valid"] is False
+    assert trace["admitted_by_role"]["proposer"] == 0
+    assert snapshot["models"][0]["registry_facts"][
+        "runtime_hard_filter_reasons_by_role"
+    ]["proposer"] == ["canary_policy_invalid"]
+
+
+@pytest.mark.parametrize("bypass", ["frozen", "experiment", "allowlist"])
+def test_live_canary_rollout_does_not_mutate_frozen_surfaces(bypass: str) -> None:
+    snapshot = _canary_rollout_snapshot("canary-a")
+    original = deepcopy(snapshot)
+    analysis = _canary_task_analysis(
+        source="frozen_replay" if bypass == "frozen" else "llm_provider"
+    )
+
+    trace = _apply_canary_candidate_filter(
+        snapshot,
+        rollout_config=_canary_rollout_policy(),
+        task_analysis=analysis,
+        decision_id="decision-a",
+        latency_class="experiment" if bypass == "experiment" else "normal",
+        registry_allowlist={} if bypass == "allowlist" else None,
+    )
+
+    assert trace is None
+    assert snapshot == original
+
+
+@pytest.mark.asyncio
+async def test_canary_physical_budget_allows_only_one_concurrent_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    registry = _FakeRegistry(
+        {
+            "canary": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="canary")],
+                gate=release,
+                started=started,
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="answer"), DoneEvent(model="agg")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    canary = replace(
+        _member("canary"),
+        k=2,
+        canary_runtime_managed=True,
+    )
+    ledger = _fresh_canary_health_ledger("canary")
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/canary-budget",
+        proposers=[canary],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        _provider_health_ledger=ledger,
+    )
+
+    collect_task = asyncio.create_task(_collect(provider))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+    assert [row["model"] for row in registry.calls] == ["canary"]
+    release.set()
+    events = await asyncio.wait_for(collect_task, timeout=1.0)
+
+    assert [row["model"] for row in registry.calls] == ["canary", "agg"]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace["canary_physical_budget"] == {
+        "schema": "opensquilla.ensemble-canary-physical-budget/v1",
+        "limit": 1,
+        "committed": 1,
+        "reserved": 0,
+        "rejected": 1,
+        "refunded": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_canary_dispatch_without_fresh_ledger_starts_zero_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "canary": _FakePlan([DoneEvent(model="canary")]),
+            "agg": _FakePlan([DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/canary-no-ledger",
+        proposers=[
+            replace(_member("canary"), canary_runtime_managed=True)
+        ],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        _provider_health_ledger=None,
+    )
+
+    events = await _collect(provider)
+
+    assert registry.calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.request_started is False
+    assert error.physical_request_count == 0
+    [candidate] = error.ensemble_trace["candidates"]
+    assert candidate["error_code"] == (
+        "ensemble_canary_runtime_health_unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_canary_thinking_fallback_cannot_start_a_second_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"canary": 0, "agg": 0}
+
+    class _Provider:
+        provider_name = "fake"
+
+        def __init__(self, cfg: ProviderConfig) -> None:
+            self._cfg = cfg
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+            calls[self._cfg.model] += 1
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                if self._cfg.model == "canary":
+                    yield ErrorEvent(
+                        message="unsupported reasoning_effort value",
+                        code="invalid_reasoning_effort",
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                    return
+                yield DoneEvent(model=self._cfg.model)
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        lambda cfg: _Provider(cfg),
+    )
+    proposer = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="canary"),
+        label="canary",
+        thinking="high",
+        requested_thinking_level="high",
+        effective_thinking_level="high",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+        thinking_fallbacks=(("medium", "medium"),),
+        canary_runtime_managed=True,
+    )
+    aggregator = EnsembleMemberConfig(
+        provider_config=ProviderConfig(provider="fake", model="agg"),
+        label="agg",
+        thinking="off",
+        requested_thinking_level="off",
+        effective_thinking_level="off",
+        thinking_policy_version="thinking-policy-v1",
+        thinking_policy_managed=True,
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/canary-thinking",
+        proposers=[proposer],
+        aggregator=aggregator,
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        selection_plan=_managed_selection_plan([proposer], aggregator),
+        _provider_health_ledger=_fresh_canary_health_ledger("canary"),
+    )
+
+    events = await _collect(provider)
+
+    assert calls == {"canary": 1, "agg": 0}
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    [candidate] = error.ensemble_trace["candidates"]
+    assert candidate["physical_request_count"] == 1
+    assert candidate["error_code"] == (
+        "ensemble_canary_physical_budget_exhausted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_canary_transient_and_backup_recovery_share_root_physical_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "canary-primary": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="upstream overloaded",
+                        code="503",
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                ]
+            ),
+            "enabled": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="enabled")]
+            ),
+            "canary-backup": _FakePlan(
+                [TextDeltaEvent(text="backup"), DoneEvent(model="canary-backup")]
+            ),
+            "agg": _FakePlan([DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._PROPOSER_TRANSIENT_RETRY_BACKOFF_SECONDS",
+        0.0,
+    )
+    primary = replace(
+        _member("canary-primary"),
+        canary_runtime_managed=True,
+    )
+    enabled = _member("enabled")
+    backup = replace(
+        _member("canary-backup"),
+        canary_runtime_managed=True,
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/canary-recovery",
+        proposers=[primary, enabled],
+        proposer_backups=[backup],
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        selection_plan=_slot_recovery_plan(
+            [primary, enabled],
+            [backup],
+        ),
+        _provider_health_ledger=_fresh_canary_health_ledger(
+            "canary-primary",
+            "canary-backup",
+        ),
+    )
+    scope_id = "canary-root-recovery-budget"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    assert [row["model"] for row in registry.calls].count(
+        "canary-primary"
+    ) == 1
+    assert [row["model"] for row in registry.calls].count(
+        "canary-backup"
+    ) == 0
+    assert "agg" not in [row["model"] for row in registry.calls]
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    budget = error.ensemble_trace["canary_physical_budget"]
+    assert budget["committed"] == 1
+    assert budget["rejected"] >= 1
+    recovery_kinds = [
+        row["kind"]
+        for row in error.ensemble_trace["proposer_recovery"]["attempts"]
+    ]
+    assert "transient_retry" in recovery_kinds
+    assert "backup_replacement" in recovery_kinds
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authoritative_recheck", [False, True])
+async def test_canary_fallback_single_bypass_starts_zero_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    authoritative_recheck: bool,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "failed": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="failed",
+                        code="503",
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                ]
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    if authoritative_recheck:
+        monkeypatch.setattr(
+            "opensquilla.provider.ranking_router.load_model_registry_snapshot",
+            lambda: {
+                "models": [
+                    {
+                        "registry_facts": {
+                            "provider": "fake",
+                            "model_id": "canary-fallback",
+                            "status": "canary",
+                        }
+                    }
+                ]
+            },
+        )
+
+    class _Fallback:
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+            self.calls += 1
+
+            async def _stream() -> AsyncIterator[StreamEvent]:
+                yield DoneEvent(model="canary-fallback")
+
+            return _stream()
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    fallback = _Fallback()
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/canary-fallback",
+        proposers=[_member("failed")],
+        aggregator=_member("agg"),
+        fallback_provider=fallback,
+        fallback_provider_name="fake",
+        fallback_model="canary-fallback",
+        min_successful_proposers=1,
+        all_failed_policy="fallback_single",
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        _fallback_single_canary_blocked=not authoritative_recheck,
+        _selector_canary_governance_active=authoritative_recheck,
+    )
+
+    events = await _collect(provider)
+
+    assert fallback.calls == 0
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_canary_fallback_blocked"
+    assert error.request_started is True
+    assert error.physical_request_count == 1
+
+
+@pytest.mark.asyncio
+async def test_canary_zero_request_terminal_refunds_root_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "canary": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="local request validation rejected",
+                        code="local_validation",
+                        request_started=False,
+                        physical_request_count=0,
+                    )
+                ]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="answer"), DoneEvent(model="agg")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/canary-refund",
+        proposers=[
+            replace(_member("canary"), canary_runtime_managed=True)
+        ],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        _provider_health_ledger=_fresh_canary_health_ledger("canary"),
+    )
+
+    first = await _collect(provider)
+    first_error = next(
+        event for event in first if isinstance(event, ErrorEvent)
+    )
+    assert first_error.ensemble_trace["canary_physical_budget"] == {
+        "schema": "opensquilla.ensemble-canary-physical-budget/v1",
+        "limit": 1,
+        "committed": 0,
+        "reserved": 0,
+        "rejected": 0,
+        "refunded": 1,
+    }
+
+    registry.plans["canary"].events = [
+        TextDeltaEvent(text="ok"),
+        DoneEvent(model="canary"),
+    ]
+    second = await _collect(provider)
+
+    assert [row["model"] for row in registry.calls] == [
+        "canary",
+        "canary",
+        "agg",
+    ]
+    done = next(event for event in second if isinstance(event, DoneEvent))
+    assert done.ensemble_trace["canary_physical_budget"] == {
+        "schema": "opensquilla.ensemble-canary-physical-budget/v1",
+        "limit": 1,
+        "committed": 1,
+        "reserved": 0,
+        "rejected": 0,
+        "refunded": 1,
+    }
+
+
 def _runtime_health_snapshot(
     *models: str,
 ) -> dict[str, Any]:
@@ -19765,6 +20611,45 @@ def _runtime_health_snapshot(
             }
             for model in model_ids
         ]
+    }
+
+
+def test_runtime_health_never_strand_does_not_exempt_canary() -> None:
+    ledger = ProviderHealthLedger(failure_threshold=1)
+    for model in ("canary", "enabled"):
+        ledger.record_failure(
+            "fake",
+            model,
+            ProviderFailureKind.PROVIDER_OVERLOADED,
+        )
+    snapshot = _runtime_health_snapshot("canary", "enabled")
+    snapshot["models"][0]["registry_facts"]["status"] = "canary"
+
+    trace = _apply_runtime_health_candidate_filter(
+        snapshot,
+        health_ledger=ledger,
+        inherited_provider_config=ProviderConfig("fake", "anchor"),
+        eligible_identities_by_role={
+            "proposer": ["fake:canary", "fake:enabled"],
+            "aggregator": ["fake:canary", "fake:enabled"],
+        },
+        preferred_identities_by_role={
+            "proposer": ["fake:canary", "fake:enabled"],
+            "aggregator": ["fake:canary", "fake:enabled"],
+        },
+        minimum_by_role={"proposer": 1, "aggregator": 1},
+    )
+
+    assert trace is not None
+    assert trace["canary_never_strand"] is False
+    assert trace["never_strand_exempt_identities_by_role"] == {
+        "proposer": ["fake:enabled"],
+        "aggregator": ["fake:enabled"],
+    }
+    canary_facts = snapshot["models"][0]["registry_facts"]
+    assert canary_facts["runtime_hard_filter_reasons_by_role"] == {
+        "proposer": ["runtime_deployment_benched"],
+        "aggregator": ["runtime_deployment_benched"],
     }
 
 

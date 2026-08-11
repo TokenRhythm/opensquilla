@@ -543,6 +543,109 @@ class LlmEnsembleAdmissionConfig(BaseModel):
         return normalized
 
 
+class LlmEnsembleCanaryRoleConfig(BaseModel):
+    """One role's bounded share of the live canary cohort."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    basis_points: int = Field(default=0, ge=0, le=10_000, strict=True)
+    max_candidates_per_decision: int = Field(default=0, ge=0, le=1, strict=True)
+    min_observations: int = Field(default=20, ge=20, le=10_000, strict=True)
+    max_failure_basis_points: int = Field(
+        default=500,
+        ge=0,
+        le=500,
+        strict=True,
+    )
+
+    @model_validator(mode="after")
+    def _validate_candidate_cap(self) -> LlmEnsembleCanaryRoleConfig:
+        if (self.basis_points == 0) != (self.max_candidates_per_decision == 0):
+            raise ValueError(
+                "canary role basis_points and max_candidates_per_decision "
+                "must both be zero or both be non-zero"
+            )
+        return self
+
+
+def _default_llm_ensemble_canary_aggregator() -> LlmEnsembleCanaryRoleConfig:
+    return LlmEnsembleCanaryRoleConfig(
+        min_observations=50,
+        max_failure_basis_points=200,
+    )
+
+
+class LlmEnsembleCanaryRolloutConfig(BaseModel):
+    """Fail-closed live rollout policy for registry rows marked ``canary``."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    policy_version: Literal["router-canary-v1"] = "router-canary-v1"
+    enabled: bool = False
+    global_basis_points: int = Field(default=0, ge=0, le=10_000, strict=True)
+    allowed_risks: list[Literal["low"]] = Field(default_factory=lambda: ["low"])
+    require_schema_valid_analysis: bool = True
+    min_analyzer_confidence: float = Field(default=0.8, ge=0.8, le=1.0)
+    proposer: LlmEnsembleCanaryRoleConfig = Field(
+        default_factory=LlmEnsembleCanaryRoleConfig
+    )
+    aggregator: LlmEnsembleCanaryRoleConfig = Field(
+        default_factory=_default_llm_ensemble_canary_aggregator
+    )
+
+    @field_validator("enabled", "require_schema_valid_analysis", mode="before")
+    @classmethod
+    def _reject_coerced_canary_booleans(cls, value: object) -> object:
+        if not isinstance(value, bool):
+            raise ValueError("canary rollout boolean fields must be booleans")
+        return value
+
+    @field_validator("min_analyzer_confidence", mode="before")
+    @classmethod
+    def _validate_canary_confidence(cls, value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("canary min_analyzer_confidence must be finite and numeric")
+        try:
+            normalized = float(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "canary min_analyzer_confidence must be finite and numeric"
+            ) from exc
+        if not math.isfinite(normalized):
+            raise ValueError("canary min_analyzer_confidence must be finite and numeric")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_v1_canary_policy(self) -> LlmEnsembleCanaryRolloutConfig:
+        if self.allowed_risks != ["low"]:
+            raise ValueError("router-canary-v1 only permits low-risk tasks")
+        if self.require_schema_valid_analysis is not True:
+            raise ValueError("router-canary-v1 requires schema-valid task analysis")
+        if (
+            self.aggregator.basis_points != 0
+            or self.aggregator.max_candidates_per_decision != 0
+        ):
+            raise ValueError("router-canary-v1 does not permit aggregator canaries")
+        if (
+            self.aggregator.min_observations < 50
+            or self.aggregator.max_failure_basis_points > 200
+        ):
+            raise ValueError(
+                "router-canary-v1 aggregator gates require at least 50 observations "
+                "and at most 200 failure basis points"
+            )
+        for role, policy in (("proposer", self.proposer), ("aggregator", self.aggregator)):
+            if policy.basis_points > self.global_basis_points:
+                raise ValueError(
+                    f"canary {role}.basis_points cannot exceed global_basis_points"
+                )
+        if self.enabled and self.proposer.basis_points == 0:
+            raise ValueError(
+                "enabled router-canary-v1 requires a non-zero proposer cohort"
+            )
+        return self
+
+
 class LlmEnsembleConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_LLM_ENSEMBLE_",
@@ -607,6 +710,12 @@ class LlmEnsembleConfig(BaseSettings):
     # scheduling remains byte-for-byte compatible.
     admission: LlmEnsembleAdmissionConfig = Field(
         default_factory=LlmEnsembleAdmissionConfig
+    )
+    # Live-only, fail-closed admission for registry rows marked ``canary``.
+    # Frozen replay, formal allowlists, and experiment scheduling bypass this
+    # mutable serving policy so their historical rosters remain reproducible.
+    canary_rollout: LlmEnsembleCanaryRolloutConfig = Field(
+        default_factory=LlmEnsembleCanaryRolloutConfig
     )
     # Serving stops after the first useful recovery action to protect
     # interactive latency. Experiment mode exhausts the frozen Top-3

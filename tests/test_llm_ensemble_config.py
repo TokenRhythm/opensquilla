@@ -4,6 +4,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -52,6 +53,16 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.admission.provider_default_max_in_flight == 8
     assert ensemble.admission.deployment_default_max_in_flight == 4
     assert ensemble.admission.queue_timeout_seconds == 5.0
+    assert ensemble.canary_rollout.enabled is False
+    assert ensemble.canary_rollout.policy_version == "router-canary-v1"
+    assert ensemble.canary_rollout.global_basis_points == 0
+    assert ensemble.canary_rollout.allowed_risks == ["low"]
+    assert ensemble.canary_rollout.require_schema_valid_analysis is True
+    assert ensemble.canary_rollout.min_analyzer_confidence == pytest.approx(0.8)
+    assert ensemble.canary_rollout.proposer.basis_points == 0
+    assert ensemble.canary_rollout.proposer.max_candidates_per_decision == 0
+    assert ensemble.canary_rollout.aggregator.basis_points == 0
+    assert ensemble.canary_rollout.aggregator.max_candidates_per_decision == 0
     assert ensemble.shuffle_candidates is True
     assert ensemble.candidate_order_seed is None
     assert ensemble.record_candidates is False
@@ -143,6 +154,86 @@ def test_llm_ensemble_rejects_coerced_or_nonfinite_admission_scalars(
 ) -> None:
     with pytest.raises(ValueError, match="admission|finite|integer"):
         GatewayConfig(llm_ensemble={"admission": {field: value}})
+
+
+def test_llm_ensemble_accepts_bounded_proposer_canary_rollout() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "canary_rollout": {
+                "enabled": True,
+                "global_basis_points": 500,
+                "proposer": {
+                    "basis_points": 250,
+                    "max_candidates_per_decision": 1,
+                },
+            }
+        }
+    )
+
+    rollout = cfg.llm_ensemble.canary_rollout
+    assert rollout.enabled is True
+    assert rollout.global_basis_points == 500
+    assert rollout.proposer.basis_points == 250
+    assert rollout.proposer.max_candidates_per_decision == 1
+    assert rollout.aggregator.basis_points == 0
+
+
+@pytest.mark.parametrize(
+    "rollout",
+    [
+        {"enabled": "true"},
+        {"global_basis_points": True},
+        {"min_analyzer_confidence": 0.79},
+        {"min_analyzer_confidence": 10**10_000},
+        {"allowed_risks": ["medium"]},
+        {"require_schema_valid_analysis": False},
+        {
+            "enabled": True,
+            "global_basis_points": 100,
+            "proposer": {"basis_points": 0, "max_candidates_per_decision": 0},
+        },
+        {
+            "global_basis_points": 100,
+            "proposer": {"basis_points": 101, "max_candidates_per_decision": 1},
+        },
+        {
+            "global_basis_points": 100,
+            "proposer": {"basis_points": 100, "max_candidates_per_decision": 0},
+        },
+        {
+            "global_basis_points": 100,
+            "aggregator": {"basis_points": 1, "max_candidates_per_decision": 1},
+        },
+        {"aggregator": {"min_observations": 49}},
+        {"aggregator": {"max_failure_basis_points": 201}},
+    ],
+)
+def test_llm_ensemble_rejects_unsafe_canary_rollout(rollout: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="canary|router-canary"):
+        GatewayConfig(llm_ensemble={"canary_rollout": rollout})
+
+
+@pytest.mark.parametrize(
+    "rollout",
+    [
+        {"unexpected_policy_field": True},
+        {"proposer": {"unexpected_role_field": 1}},
+    ],
+)
+def test_llm_ensemble_canary_rollout_rejects_unknown_fields(
+    rollout: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError, match="extra|unexpected"):
+        GatewayConfig(llm_ensemble={"canary_rollout": rollout})
+
+
+def test_llm_ensemble_canary_rollout_validates_assignment() -> None:
+    rollout = GatewayConfig().llm_ensemble.canary_rollout
+
+    with pytest.raises(ValueError, match="confidence|greater than or equal"):
+        rollout.min_analyzer_confidence = 0.1
+    with pytest.raises(ValueError, match="less than or equal"):
+        rollout.proposer.max_failure_basis_points = 501
 
 
 @pytest.mark.parametrize("seed", [0, (1 << 64) - 1])
@@ -1917,6 +2008,240 @@ async def test_selector_fallback_cannot_bypass_routed_thinking_policy() -> None:
     assert events[0].code == "429"
     assert wrapper.fallback_after_invalid_response("empty response") is False
     assert selector.fallback_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "expected_mutations"),
+    [("direct", 0), ("benched_skip", 1), ("plugin_replacement", 1)],
+)
+async def test_selector_fallback_cannot_bypass_live_canary_governance(
+    route: str,
+    expected_mutations: int,
+) -> None:
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+    from opensquilla.provider.types import ErrorEvent
+
+    calls: list[str] = []
+
+    class _Provider:
+        provider_name = "openrouter"
+
+        def __init__(self, model: str) -> None:
+            self.model = model
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            calls.append(self.model)
+            yield ErrorEvent(message="rate limited", code="429")
+
+    class _Primary(_Provider):
+        selector_fallback_governance_active = True
+        enforces_routed_thinking_policy = False
+
+        @staticmethod
+        def selector_fallback_allowed(
+            provider: object,
+            model: object,
+        ) -> bool:
+            return f"{provider}:{model}" != "openrouter:canary"
+
+    class _Ledger:
+        def record_failure(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def record_success(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        @staticmethod
+        def eligible(provider: str, model: str, candidates) -> bool:
+            del provider, candidates
+            return model != "enabled-benched"
+
+    class _Selector:
+        def __init__(self) -> None:
+            self._index = 0
+            self.mutations = 0
+            self._chain = [
+                ProviderConfig("openrouter", "primary"),
+                ProviderConfig(
+                    "openrouter",
+                    "canary" if route == "direct" else "enabled-benched",
+                ),
+            ]
+            if route == "benched_skip":
+                self._chain.append(ProviderConfig("openrouter", "canary"))
+
+        @property
+        def current_config(self) -> ProviderConfig:
+            return self._chain[self._index]
+
+        @property
+        def active_provider_id(self) -> str:
+            return self.current_config.provider
+
+        def remaining_chain(self) -> list[ProviderConfig]:
+            return self._chain[self._index :]
+
+        def has_fallback(self) -> bool:
+            return self._index < len(self._chain) - 1
+
+        def next_fallback_after_failure(self, error) -> _Provider:
+            del error
+            self.mutations += 1
+            if route == "plugin_replacement":
+                self._chain = [
+                    self.current_config,
+                    ProviderConfig("openrouter", "canary"),
+                ]
+            self._index = 1
+            return _Provider(self.current_config.model)
+
+        def next_fallback(self) -> _Provider:
+            self.mutations += 1
+            self._index += 1
+            return _Provider(self.current_config.model)
+
+    selector = _Selector()
+    wrapper = _SelectorFallbackProvider(
+        _Primary("primary"),
+        selector,
+        health_ledger=_Ledger(),
+    )
+
+    events = [
+        event
+        async for event in wrapper.chat(
+            [Message(role="user", content="synthetic")]
+        )
+    ]
+
+    assert calls == ["primary"]
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "429"
+    assert wrapper.fallback_after_invalid_response("empty response") is False
+    assert calls == ["primary"]
+    assert selector.mutations == expected_mutations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flip_phase", ["primary_close", "lazy_dispatch"])
+async def test_selector_fallback_rechecks_canary_status_at_physical_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    flip_phase: str,
+) -> None:
+    import opensquilla.engine.runtime as runtime
+    from opensquilla.provider.types import ErrorEvent
+
+    status = {"value": "enabled"}
+    calls: list[str] = []
+    metadata: dict[str, Any] = {}
+
+    class _Primary:
+        provider_name = "openrouter"
+        selector_fallback_governance_active = True
+        enforces_routed_thinking_policy = False
+
+        @staticmethod
+        def selector_fallback_allowed(provider: object, model: object) -> bool:
+            del provider, model
+            return status["value"] != "canary"
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            calls.append("primary")
+            try:
+                yield ErrorEvent(
+                    message="rate limited",
+                    code="429",
+                    request_started=True,
+                    physical_request_count=1,
+                )
+            finally:
+                if flip_phase == "primary_close":
+                    status["value"] = "canary"
+
+    class _Fallback:
+        provider_name = "openrouter"
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            calls.append("fallback")
+            yield ErrorEvent(message="must not run", code="unsafe")
+
+    class _Selector:
+        active_provider_id = "openrouter"
+
+        def __init__(self) -> None:
+            self._index = 0
+            self._chain = [
+                ProviderConfig("openrouter", "primary"),
+                ProviderConfig("openrouter", "fallback"),
+            ]
+
+        @property
+        def current_config(self) -> ProviderConfig:
+            return self._chain[self._index]
+
+        def remaining_chain(self) -> list[ProviderConfig]:
+            return self._chain[self._index :]
+
+        def has_fallback(self) -> bool:
+            return self._index < len(self._chain) - 1
+
+        def next_fallback_after_failure(self, error) -> _Fallback:
+            del error
+            self._index = 1
+            return _Fallback()
+
+    real_account_provider_stream = runtime.account_provider_stream
+    if flip_phase == "lazy_dispatch":
+        accounting_calls = 0
+
+        async def flip_before_lazy_factory(stream_factory, **kwargs):
+            nonlocal accounting_calls
+            accounting_calls += 1
+            if accounting_calls == 2:
+                status["value"] = "canary"
+            async for account_event in real_account_provider_stream(
+                stream_factory,
+                **kwargs,
+            ):
+                yield account_event
+
+        monkeypatch.setattr(
+            runtime,
+            "account_provider_stream",
+            flip_before_lazy_factory,
+        )
+
+    primary = _Primary()
+    wrapper = runtime._SelectorFallbackProvider(
+        primary,
+        _Selector(),
+        turn_metadata=metadata,
+    )
+
+    events = [
+        event
+        async for event in wrapper.chat(
+            [Message(role="user", content="synthetic")]
+        )
+    ]
+
+    assert calls == ["primary"]
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    if flip_phase == "primary_close":
+        assert events[0].code == "429"
+    else:
+        assert events[0].code == "ensemble_canary_fallback_blocked"
+        assert events[0].request_started is False
+        assert events[0].physical_request_count == 0
+    assert wrapper.primary is primary
+    assert "router_fallback_hops" not in metadata
+    assert "executed_model" not in metadata
 
 
 def test_custom_b5_uses_shared_session_pinned_profile_pool(

@@ -10,6 +10,7 @@ import math
 import os
 import random
 import re
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -146,6 +147,28 @@ _RUNTIME_HEALTH_BENCHED_REASON = "runtime_deployment_benched"
 _RUNTIME_HEALTH_HALF_OPEN_BUSY_REASON = (
     "runtime_deployment_half_open_busy"
 )
+_CANARY_ROLLOUT_SCHEMA = "opensquilla.ensemble-canary-rollout/v1"
+_CANARY_ROLLOUT_REASONS = (
+    "canary_policy_invalid",
+    "canary_rollout_disabled",
+    "canary_decision_id_missing",
+    "canary_task_ineligible",
+    "canary_global_cohort_excluded",
+    "canary_role_disabled",
+    "canary_role_cohort_excluded",
+    "canary_health_unhealthy",
+    "canary_role_unsupported",
+    "canary_reliability_coverage_insufficient",
+    "canary_reliability_threshold_exceeded",
+    "canary_candidate_cap",
+)
+_CANARY_PHYSICAL_BUDGET_EXHAUSTED_CODE = (
+    "ensemble_canary_physical_budget_exhausted"
+)
+_CANARY_RUNTIME_HEALTH_UNAVAILABLE_CODE = (
+    "ensemble_canary_runtime_health_unavailable"
+)
+_CANARY_FALLBACK_BLOCKED_CODE = "ensemble_canary_fallback_blocked"
 _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE = "ensemble_proposer_close_timeout"
 _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE = "proposer_recovery_budget_overrun"
 _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE = (
@@ -390,6 +413,161 @@ class _EnsembleStreamCloseError(RuntimeError):
 
 class _EnsemblePreDispatchDeadlineError(TimeoutError):
     """The absolute budget expired after admission but before provider chat."""
+
+
+@dataclass
+class _CanaryPhysicalRequestReservation:
+    """One private, single-use reservation at the provider chat boundary."""
+
+    _budget: _CanaryPhysicalRequestBudget
+    _token: int
+    _settled: bool = False
+
+    def commit(self) -> None:
+        if self._settled:
+            return
+        self._budget._settle(self._token, committed=True)
+        self._settled = True
+
+    def refund(self) -> None:
+        if self._settled:
+            return
+        self._budget._settle(self._token, committed=False)
+        self._settled = True
+
+
+@dataclass
+class _CanaryPhysicalRequestEvidenceGuard:
+    """Settle a reservation only after the stream proves its first outcome."""
+
+    reservation: _CanaryPhysicalRequestReservation | None
+    _event_count: int = 0
+    _zero_request_terminal: bool = False
+    _finished: bool = False
+
+    @staticmethod
+    def _proves_zero_request(event: StreamEvent) -> bool:
+        return bool(
+            isinstance(event, ErrorEvent)
+            and event.request_started is False
+            and event.physical_request_count == 0
+            and not event.model_usage_breakdown
+            and event.diagnostic_done is None
+            and int(event.usage_missing_count or 0) == 0
+        )
+
+    def observe(self, event: StreamEvent) -> None:
+        if self.reservation is None or self._finished:
+            return
+        self._event_count += 1
+        if self._event_count == 1 and self._proves_zero_request(event):
+            # Keep the reservation active until the terminal iterator is
+            # closed. A malformed provider that emits another event loses the
+            # refund and remains conservatively counted.
+            self._zero_request_terminal = True
+            return
+        self._zero_request_terminal = False
+        self.reservation.commit()
+
+    def finish(self) -> None:
+        if self.reservation is None or self._finished:
+            return
+        self._finished = True
+        if self._zero_request_terminal and self._event_count == 1:
+            self.reservation.refund()
+        else:
+            self.reservation.commit()
+
+
+class _CanaryPhysicalRequestStream:
+    """Iterator proxy that settles a canary reservation on close/exhaustion."""
+
+    def __init__(
+        self,
+        stream: AsyncIterator[StreamEvent],
+        reservation: _CanaryPhysicalRequestReservation,
+    ) -> None:
+        self._stream = stream
+        self._iterator = stream.__aiter__()
+        self._evidence = _CanaryPhysicalRequestEvidenceGuard(reservation)
+
+    def __aiter__(self) -> _CanaryPhysicalRequestStream:
+        return self
+
+    async def __anext__(self) -> StreamEvent:
+        try:
+            event = await self._iterator.__anext__()
+        except BaseException:
+            self._evidence.finish()
+            raise
+        self._evidence.observe(event)
+        return event
+
+    async def aclose(self) -> None:
+        try:
+            close = getattr(self._iterator, "aclose", None)
+            if not callable(close) and self._iterator is not self._stream:
+                close = getattr(self._stream, "aclose", None)
+            if callable(close):
+                await close()
+        finally:
+            self._evidence.finish()
+
+
+def _guard_canary_physical_request_stream(
+    stream: AsyncIterator[StreamEvent],
+    reservation: _CanaryPhysicalRequestReservation | None,
+) -> AsyncIterator[StreamEvent]:
+    if reservation is None:
+        return stream
+    return _CanaryPhysicalRequestStream(stream, reservation)
+
+
+class _CanaryPhysicalRequestBudget:
+    """Atomic one-request ceiling shared by one root routing decision."""
+
+    def __init__(self, *, limit: int = 1) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit != 1:
+            raise ValueError("router-canary-v1 physical request limit must be 1")
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._next_token = 0
+        self._active_tokens: set[int] = set()
+        self._committed = 0
+        self._rejected = 0
+        self._refunded = 0
+
+    def reserve(self) -> _CanaryPhysicalRequestReservation | None:
+        with self._lock:
+            if self._committed + len(self._active_tokens) >= self._limit:
+                self._rejected += 1
+                return None
+            self._next_token += 1
+            token = self._next_token
+            self._active_tokens.add(token)
+        return _CanaryPhysicalRequestReservation(self, token)
+
+    def _settle(self, token: int, *, committed: bool) -> None:
+        with self._lock:
+            if token not in self._active_tokens:
+                return
+            self._active_tokens.remove(token)
+            if committed:
+                self._committed += 1
+            else:
+                self._refunded += 1
+
+    def snapshot(self) -> dict[str, int]:
+        """Return identity-free, low-cardinality runtime evidence."""
+
+        with self._lock:
+            return {
+                "limit": self._limit,
+                "committed": self._committed,
+                "reserved": len(self._active_tokens),
+                "rejected": self._rejected,
+                "refunded": self._refunded,
+            }
 
 
 @dataclass
@@ -914,6 +1092,11 @@ async def _provider_events_with_error_boundary(
     admission_role: str = "proposer",
     on_admission: Callable[[ProviderAdmissionLease], None] | None = None,
     before_request_dispatch: Callable[[], ErrorEvent | None] | None = None,
+    canary_dispatch_guard: Callable[
+        [],
+        tuple[_CanaryPhysicalRequestReservation | None, ErrorEvent | None],
+    ]
+    | None = None,
     on_stream_close: Callable[[bool], None] | None = None,
     on_local_cancellation: Callable[[], None] | None = None,
     before_admission_release: Callable[[], None] | None = None,
@@ -921,6 +1104,7 @@ async def _provider_events_with_error_boundary(
     """Convert direct provider exceptions into normal terminal error evidence."""
 
     request_started = False
+    canary_reservation: _CanaryPhysicalRequestReservation | None = None
     admission_lease: ProviderAdmissionLease | None = None
     admission_guard: ProviderAdmissionLeaseGuard | None = None
     try:
@@ -990,7 +1174,21 @@ async def _provider_events_with_error_boundary(
                 physical_request_count=0,
             )
             return
-        raw_stream = provider.chat(messages, tools=tools, config=chat_config)
+        if canary_dispatch_guard is not None:
+            canary_reservation, canary_error = canary_dispatch_guard()
+            if canary_error is not None:
+                yield canary_error
+                return
+        try:
+            raw_stream = provider.chat(messages, tools=tools, config=chat_config)
+        except BaseException:
+            if canary_reservation is not None:
+                canary_reservation.refund()
+            raise
+        raw_stream = _guard_canary_physical_request_stream(
+            raw_stream,
+            canary_reservation,
+        )
         on_request_started()
         request_started = True
         async with _closing_async_iterator(
@@ -1068,6 +1266,10 @@ class EnsembleMemberConfig:
     # lineups retain the defaults and never consult the shared ledger.
     runtime_health_upstream: str = ""
     runtime_health_never_strand: bool = False
+    # Private live-serving marker. Frozen replay, formal allowlists, and
+    # experiment rosters never set it even if their historical status was
+    # ``canary``.
+    canary_runtime_managed: bool = False
 
 
 def _detached_ensemble_member(
@@ -1120,6 +1322,7 @@ def _ensemble_member_runtime_guard_row(
         member.unavailable_reason,
         member.runtime_health_upstream,
         member.runtime_health_never_strand,
+        member.canary_runtime_managed,
     )
 
 
@@ -1959,6 +2162,451 @@ def _normalized_runtime_health_upstream(
     )
 
 
+def _canary_runtime_health_is_fresh_and_healthy(
+    health_ledger: Any | None,
+    *,
+    provider: str,
+    model: str,
+    upstream: str,
+) -> bool:
+    """Fail closed unless the runtime ledger proves fresh healthy state."""
+
+    runtime_facts = getattr(health_ledger, "runtime_facts", None)
+    if not callable(runtime_facts):
+        return False
+    try:
+        row = runtime_facts(provider, model, upstream=upstream)
+    except Exception:  # noqa: BLE001 - canary admission is fail closed
+        log.debug(
+            "llm_ensemble.canary_runtime_health_snapshot_failed",
+            provider=provider,
+            model=model,
+            exc_info=True,
+        )
+        return False
+    return bool(
+        isinstance(row, Mapping)
+        and row.get("fresh") is True
+        and str(row.get("state") or "").strip().casefold() == "healthy"
+        and row.get("half_open_inflight") is not True
+    )
+
+
+def _canary_rollout_bucket(
+    *,
+    policy_version: str,
+    root_decision_id: str,
+    scope: str,
+) -> int:
+    """Return a process-stable basis-point bucket for one rollout scope."""
+
+    payload = json.dumps(
+        {
+            "policy_version": policy_version,
+            "root_decision_id": root_decision_id,
+            "scope": scope,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % 10_000
+
+
+def _materialize_canary_runtime_policy(
+    value: Any,
+) -> tuple[dict[str, Any], bool]:
+    """Dump and revalidate the concrete config model after unsafe copies."""
+
+    dump = getattr(value, "model_dump", None)
+    validate = getattr(type(value), "model_validate", None)
+    if not callable(dump) or not callable(validate):
+        return {}, False
+    raw: dict[str, Any] = {}
+    try:
+        dumped = dump(mode="json")
+        if not isinstance(dumped, Mapping):
+            return {}, False
+        raw = dict(dumped)
+        validated = validate(raw)
+        normalized = validated.model_dump(mode="json")
+        if not isinstance(normalized, Mapping):
+            return raw, False
+        return dict(normalized), True
+    except (TypeError, ValueError):
+        return raw, False
+
+
+def _apply_canary_candidate_filter(
+    snapshot: Mapping[str, Any],
+    *,
+    rollout_config: Mapping[str, Any] | None,
+    rollout_config_valid: bool = True,
+    task_analysis: Any,
+    decision_id: str,
+    retry_parent_decision_id: str = "",
+    latency_class: str = "normal",
+    registry_allowlist: Any = None,
+    health_ledger: Any | None = None,
+    inherited_provider_config: ProviderConfig | None = None,
+) -> dict[str, Any] | None:
+    """Fail closed for live canaries, while leaving frozen inputs untouched.
+
+    The policy mutates only role-scoped hard-filter reasons on canary rows. A
+    frozen replay or formal experiment allowlist already authenticates its
+    roster, so applying mutable serving state to either would break replay.
+    """
+
+    rows = snapshot.get("models")
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return None
+    source = str(getattr(task_analysis, "source", "") or "").strip().casefold()
+    if (
+        source == "frozen_replay"
+        or isinstance(registry_allowlist, Mapping)
+        or str(latency_class or "normal").strip().casefold() == "experiment"
+    ):
+        return None
+
+    # This filter owns only the reason vocabulary declared above. Reapplying
+    # it to a mutable snapshot must replace its own decision without retaining
+    # stale exclusions, while preserving every other filter's reasons.
+    all_facts: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
+    for row in rows:
+        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+        if not isinstance(facts, dict):
+            continue
+        all_facts.append((row, facts))
+        raw_by_role = facts.get(_RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD)
+        if not isinstance(raw_by_role, Mapping):
+            continue
+        cleaned_by_role: dict[str, list[str]] = {}
+        for raw_role, raw_reasons in raw_by_role.items():
+            if not isinstance(raw_reasons, Sequence) or isinstance(
+                raw_reasons,
+                (str, bytes),
+            ):
+                continue
+            reasons = [
+                str(reason)
+                for reason in raw_reasons
+                if str(reason) not in _CANARY_ROLLOUT_REASONS
+            ]
+            if reasons:
+                cleaned_by_role[str(raw_role)] = reasons
+        if cleaned_by_role:
+            facts[_RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD] = cleaned_by_role
+        else:
+            facts.pop(_RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD, None)
+
+    canaries: list[tuple[Mapping[str, Any], dict[str, Any], str]] = []
+    for row, facts in all_facts:
+        if str(facts.get("status") or "").strip().casefold() != "canary":
+            continue
+        identity = (
+            f"{str(facts.get('provider') or '').strip().casefold()}:"
+            f"{str(facts.get('model_id') or '').strip().casefold()}"
+        )
+        canaries.append((row, facts, identity))
+    if not canaries:
+        return None
+
+    policy = dict(rollout_config or {})
+    runtime_policy_valid = rollout_config_valid
+
+    def bounded_int(
+        values: Mapping[str, Any],
+        key: str,
+        default: int,
+        maximum: int,
+    ) -> int:
+        value = values.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return default
+        return max(0, min(maximum, value))
+
+    policy_version = str(policy.get("policy_version") or "router-canary-v1")
+    enabled = runtime_policy_valid and policy.get("enabled") is True
+    global_basis_points = bounded_int(
+        policy,
+        "global_basis_points",
+        0,
+        10_000,
+    )
+    proposer_policy_raw = policy.get("proposer")
+    proposer_policy = (
+        dict(proposer_policy_raw)
+        if isinstance(proposer_policy_raw, Mapping)
+        else {}
+    )
+    proposer_basis_points = bounded_int(
+        proposer_policy,
+        "basis_points",
+        0,
+        10_000,
+    )
+    max_candidates = bounded_int(
+        proposer_policy,
+        "max_candidates_per_decision",
+        0,
+        1,
+    )
+    min_observations = max(
+        20,
+        bounded_int(proposer_policy, "min_observations", 20, 10_000),
+    )
+    max_failure_basis_points = bounded_int(
+        proposer_policy,
+        "max_failure_basis_points",
+        500,
+        500,
+    )
+
+    root_decision_id = str(retry_parent_decision_id or decision_id or "").strip()
+    global_bucket = (
+        _canary_rollout_bucket(
+            policy_version=policy_version,
+            root_decision_id=root_decision_id,
+            scope="global",
+        )
+        if root_decision_id
+        else None
+    )
+    proposer_bucket = (
+        _canary_rollout_bucket(
+            policy_version=policy_version,
+            root_decision_id=root_decision_id,
+            scope="role:proposer",
+        )
+        if root_decision_id
+        else None
+    )
+    within_global_threshold = (
+        min(10_000, proposer_basis_points * 10_000 // global_basis_points)
+        if global_basis_points > 0
+        else 0
+    )
+
+    profile = getattr(task_analysis, "profile", {})
+    constraints = profile.get("constraints") if isinstance(profile, Mapping) else None
+    constraint_map = constraints if isinstance(constraints, Mapping) else {}
+    task_risk = str(constraint_map.get("risk") or "").strip().casefold()
+    if task_risk not in {"low", "medium", "high"}:
+        task_risk = "unknown"
+    allowed_risks_raw = policy.get("allowed_risks")
+    allowed_risks = (
+        {
+            str(value).strip().casefold()
+            for value in (
+                allowed_risks_raw
+                if isinstance(allowed_risks_raw, Sequence)
+                and not isinstance(allowed_risks_raw, (str, bytes))
+                else ()
+            )
+        }
+        if runtime_policy_valid
+        else set()
+    )
+    raw_confidence = getattr(task_analysis, "confidence", 0.0)
+    try:
+        confidence = (
+            0.0 if isinstance(raw_confidence, bool) else float(raw_confidence)
+        )
+    except (OverflowError, TypeError, ValueError):
+        confidence = 0.0
+    if not math.isfinite(confidence):
+        confidence = 0.0
+    raw_min_confidence = policy.get("min_analyzer_confidence")
+    try:
+        min_confidence = (
+            1.0
+            if isinstance(raw_min_confidence, bool)
+            else float(raw_min_confidence)
+        )
+    except (OverflowError, TypeError, ValueError):
+        min_confidence = 1.0
+    if not math.isfinite(min_confidence):
+        min_confidence = 1.0
+    task_eligible = bool(
+        source == "llm_provider"
+        and getattr(task_analysis, "schema_valid", False) is True
+        and policy.get("require_schema_valid_analysis") is True
+        and confidence >= min_confidence
+        and task_risk in allowed_risks
+    )
+
+    reason_counts = {reason: 0 for reason in _CANARY_ROLLOUT_REASONS}
+
+    def add_reason(facts: dict[str, Any], role: str, reason: str) -> None:
+        raw_by_role = facts.get(_RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD)
+        by_role = (
+            {
+                str(existing_role): [str(value) for value in values]
+                for existing_role, values in raw_by_role.items()
+                if isinstance(values, Sequence)
+                and not isinstance(values, (str, bytes))
+            }
+            if isinstance(raw_by_role, Mapping)
+            else {}
+        )
+        reasons = by_role.setdefault(role, [])
+        if reason not in reasons:
+            reasons.append(reason)
+            reason_counts[reason] += 1
+        facts[_RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD] = by_role
+
+    eligible_proposers: list[tuple[dict[str, Any], str]] = []
+    for row, facts, identity in canaries:
+        add_reason(facts, "aggregator", "canary_role_disabled")
+        reason = ""
+        if not runtime_policy_valid:
+            reason = "canary_policy_invalid"
+        elif not enabled:
+            reason = "canary_rollout_disabled"
+        elif not root_decision_id:
+            reason = "canary_decision_id_missing"
+        elif not task_eligible:
+            reason = "canary_task_ineligible"
+        elif global_bucket is None or global_bucket >= global_basis_points:
+            reason = "canary_global_cohort_excluded"
+        elif proposer_basis_points <= 0 or max_candidates <= 0:
+            reason = "canary_role_disabled"
+        elif proposer_bucket is None or proposer_bucket >= within_global_threshold:
+            reason = "canary_role_cohort_excluded"
+        elif str(facts.get("health") or "").strip().casefold() != "healthy":
+            reason = "canary_health_unhealthy"
+        elif not _canary_runtime_health_is_fresh_and_healthy(
+            health_ledger,
+            provider=str(facts.get("provider") or "").strip().casefold(),
+            model=str(facts.get("model_id") or "").strip(),
+            upstream=(
+                canonicalize_provider_routing_upstream(
+                    facts.get("endpoint_provider_pin") or ""
+                )
+                or _normalized_runtime_health_upstream(
+                    facts.get("provider"),
+                    facts.get("model_id"),
+                    (
+                        inherited_provider_config.provider_routing
+                        if inherited_provider_config is not None
+                        else {}
+                    ),
+                )
+            ),
+        ):
+            reason = "canary_health_unhealthy"
+        elif "proposer" not in {
+            str(role).strip().casefold() for role in (facts.get("roles") or [])
+        }:
+            reason = "canary_role_unsupported"
+        else:
+            online_profile = row.get("online_profile")
+            role_reliability = (
+                online_profile.get("role_reliability")
+                if isinstance(online_profile, Mapping)
+                else None
+            )
+            proposer_counts = (
+                role_reliability.get("proposer")
+                if isinstance(role_reliability, Mapping)
+                else None
+            )
+            success = (
+                proposer_counts.get("success", 0)
+                if isinstance(proposer_counts, Mapping)
+                else 0
+            )
+            failure = (
+                proposer_counts.get("failure", 0)
+                if isinstance(proposer_counts, Mapping)
+                else 0
+            )
+            if (
+                isinstance(success, bool)
+                or not isinstance(success, int)
+                or success < 0
+                or isinstance(failure, bool)
+                or not isinstance(failure, int)
+                or failure < 0
+            ):
+                success = 0
+                failure = 0
+            observed = success + failure
+            if observed < min_observations:
+                reason = "canary_reliability_coverage_insufficient"
+            elif failure * 10_000 > max_failure_basis_points * observed:
+                reason = "canary_reliability_threshold_exceeded"
+        if reason:
+            add_reason(facts, "proposer", reason)
+        else:
+            eligible_proposers.append((facts, identity))
+
+    eligible_proposers.sort(
+        key=lambda item: hashlib.sha256(
+            json.dumps(
+                {
+                    "policy_version": policy_version,
+                    "root_decision_id": root_decision_id,
+                    "role": "proposer",
+                    "identity": item[1],
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).digest()
+    )
+    admitted = eligible_proposers[:max_candidates]
+    for facts, _ in eligible_proposers[max_candidates:]:
+        add_reason(facts, "proposer", "canary_candidate_cap")
+
+    try:
+        policy_payload = json.dumps(
+            policy,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (OverflowError, TypeError, ValueError):
+        policy_payload = json.dumps(
+            {"config_valid": False, "policy_version": policy_version},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    policy_sha256 = hashlib.sha256(policy_payload.encode("utf-8")).hexdigest()
+    return {
+        "schema": _CANARY_ROLLOUT_SCHEMA,
+        "enabled": enabled,
+        "config_valid": runtime_policy_valid,
+        "policy_version": policy_version,
+        "policy_sha256": policy_sha256,
+        "root_subject_sha256": (
+            hashlib.sha256(root_decision_id.encode("utf-8")).hexdigest()
+            if root_decision_id
+            else ""
+        ),
+        "input_canary_count": len(canaries),
+        "admitted_by_role": {
+            "proposer": len(admitted),
+            "aggregator": 0,
+        },
+        "global_basis_points": global_basis_points,
+        "global_bucket": global_bucket,
+        "role_basis_points": {"proposer": proposer_basis_points, "aggregator": 0},
+        "role_bucket": {"proposer": proposer_bucket, "aggregator": None},
+        "task_gate": {
+            "analyzer_source_eligible": source == "llm_provider",
+            "schema_valid": getattr(task_analysis, "schema_valid", False) is True,
+            "confidence_eligible": confidence >= min_confidence,
+            "risk": task_risk,
+            "eligible": task_eligible,
+        },
+        "reason_counts": reason_counts,
+    }
+
+
 def _apply_runtime_health_candidate_filter(
     snapshot: Mapping[str, Any],
     *,
@@ -1991,6 +2639,7 @@ def _apply_runtime_health_candidate_filter(
     row_bindings: list[
         tuple[dict[str, Any], str, tuple[str, str, str]]
     ] = []
+    canary_bindings: set[tuple[str, str, str]] = set()
     bindings_by_identity: dict[str, tuple[str, str, str]] = {}
     provider_routing = dict(inherited_provider_config.provider_routing)
     for row in rows:
@@ -2014,6 +2663,8 @@ def _apply_runtime_health_candidate_filter(
         identity = f"{provider}:{model}".casefold()
         row_bindings.append((facts, identity, binding))
         bindings_by_identity[identity] = binding
+        if str(facts.get("status") or "").strip().casefold() == "canary":
+            canary_bindings.add(binding)
 
     candidates_by_role: dict[str, list[tuple[str, str, str]]] = {}
     for role in ("proposer", "aggregator"):
@@ -2086,7 +2737,9 @@ def _apply_runtime_health_candidate_filter(
         # benched deployment over a half-open-busy deployment because the
         # latter cannot legally accept another physical probe yet.
         unavailable_in_preference_order = [
-            binding for binding in candidates if binding in unavailable
+            binding
+            for binding in candidates
+            if binding in unavailable and binding not in canary_bindings
         ]
         unavailable_in_preference_order.sort(
             key=lambda binding: (
@@ -2195,6 +2848,7 @@ def _apply_runtime_health_candidate_filter(
             exempt_identities_by_role
         ),
         "never_strand": True,
+        "canary_never_strand": False,
     }
 
 
@@ -4125,6 +4779,10 @@ class EnsembleProvider:
         | None = None,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
         _provider_health_ledger: Any | None = None,
+        _canary_request_budget: _CanaryPhysicalRequestBudget | None = None,
+        _selector_blocked_canary_identities: Sequence[str] = (),
+        _selector_canary_governance_active: bool | None = None,
+        _fallback_single_canary_blocked: bool = False,
         _admission_controller: ProviderAdmissionController | None = None,
         _admission_settings: ProviderAdmissionSettings | None = None,
         _admission_before_release: Callable[[str], None] | None = None,
@@ -4362,6 +5020,35 @@ class EnsembleProvider:
         self._member_request_budget_bindings = dict(_member_request_budget_bindings or {})
         self._credential_pool_failure_reporter = _credential_pool_failure_reporter
         self._provider_health_ledger = _provider_health_ledger
+        managed_canary_member_present = any(
+            member.canary_runtime_managed
+            for member in [
+                *self.proposers,
+                *self.proposer_backups,
+                self.aggregator,
+                *self.aggregator_fallbacks,
+            ]
+        )
+        self._canary_request_budget = (
+            _canary_request_budget
+            if _canary_request_budget is not None
+            else _CanaryPhysicalRequestBudget()
+            if managed_canary_member_present
+            else None
+        )
+        self._selector_blocked_canary_identities = frozenset(
+            str(identity or "").strip().casefold()
+            for identity in _selector_blocked_canary_identities
+            if str(identity or "").strip()
+        )
+        self._selector_canary_governance_active = (
+            bool(self._selector_blocked_canary_identities)
+            if _selector_canary_governance_active is None
+            else bool(_selector_canary_governance_active)
+        )
+        self._fallback_single_canary_blocked = bool(
+            _fallback_single_canary_blocked
+        )
         self._active_chat = False
         self._proposer_retry_scope: _ProposerRecoveryScopeState | None = None
         self._current_proposer_recovery_trace: dict[str, Any] | None = None
@@ -4833,6 +5520,106 @@ class EnsembleProvider:
             or self._router_dynamic_proposer_recovery_enabled()
         )
 
+    def selector_fallback_allowed(self, provider: object, model: object) -> bool:
+        """Fail closed when an actual live fallback is currently a canary."""
+
+        provider_id = str(provider or "").strip().casefold()
+        model_id = str(model or "").strip().casefold()
+        identity = f"{provider_id}:{model_id}"
+        if not provider_id or not model_id:
+            return False
+        if identity in self._selector_blocked_canary_identities:
+            return False
+        if not self._selector_canary_governance_active:
+            return True
+
+        # Fallbacks are not part of the frozen selected lineup. Re-read the
+        # authoritative registry adjacent to every selector/fallback hop so a
+        # hot enabled->canary transition cannot escape the root snapshot.
+        try:
+            from .ranking_router import load_model_registry_snapshot
+
+            registry = load_model_registry_snapshot()
+            rows = registry.get("models")
+            if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+                return False
+            for row in rows:
+                facts = (
+                    row.get("registry_facts")
+                    if isinstance(row, Mapping)
+                    else None
+                )
+                if not isinstance(facts, Mapping):
+                    continue
+                if (
+                    str(facts.get("provider") or "").strip().casefold()
+                    == provider_id
+                    and str(facts.get("model_id") or "").strip().casefold()
+                    == model_id
+                    and str(facts.get("status") or "").strip().casefold()
+                    == "canary"
+                ):
+                    return False
+        except Exception:  # noqa: BLE001 - live canary fallback is fail closed
+            return False
+        return True
+
+    @property
+    def selector_fallback_governance_active(self) -> bool:
+        return self._selector_canary_governance_active
+
+    def _fallback_single_canary_is_blocked(self) -> bool:
+        if self._fallback_single_canary_blocked:
+            return True
+        if not self._selector_canary_governance_active:
+            return False
+        return not self.selector_fallback_allowed(
+            self.fallback_provider_name,
+            self.fallback_model,
+        )
+
+    def _reserve_canary_physical_request(
+        self,
+        member: EnsembleMemberConfig,
+        *,
+        role: str,
+    ) -> tuple[_CanaryPhysicalRequestReservation | None, ErrorEvent | None]:
+        """Recheck health and atomically reserve at the physical boundary."""
+
+        if not member.canary_runtime_managed:
+            return None, None
+        if not _canary_runtime_health_is_fresh_and_healthy(
+            self._provider_health_ledger,
+            provider=member.provider_config.provider,
+            model=member.provider_config.model,
+            upstream=member.runtime_health_upstream,
+        ):
+            return None, ErrorEvent(
+                message=(
+                    f"{role} canary deployment lacks fresh healthy runtime evidence"
+                ),
+                code=_CANARY_RUNTIME_HEALTH_UNAVAILABLE_CODE,
+                request_started=False,
+                physical_request_count=0,
+            )
+        budget = self._canary_request_budget
+        if budget is None:
+            return None, ErrorEvent(
+                message="canary physical request budget is unavailable",
+                code=_CANARY_PHYSICAL_BUDGET_EXHAUSTED_CODE,
+                request_started=False,
+                physical_request_count=0,
+            )
+        reservation = budget.reserve()
+        if reservation is None:
+            return None, ErrorEvent(
+                message="root decision canary physical request budget is exhausted",
+                code=_CANARY_PHYSICAL_BUDGET_EXHAUSTED_CODE,
+                request_started=False,
+                physical_request_count=0,
+            )
+        return reservation, None
+
     def _reset_usage_accounting_snapshot(
         self,
         state: _UsageAccountingSnapshotState | None = None,
@@ -5278,6 +6065,18 @@ class EnsembleProvider:
             or replacement._accounting_state.usage_rows
         ):
             return None
+        if self._canary_request_budget is not None:
+            replacement._canary_request_budget = self._canary_request_budget
+        replacement._selector_blocked_canary_identities = frozenset(
+            {
+                *self._selector_blocked_canary_identities,
+                *replacement._selector_blocked_canary_identities,
+            }
+        )
+        replacement._selector_canary_governance_active = bool(
+            self._selector_canary_governance_active
+            or replacement._selector_canary_governance_active
+        )
 
         target_plan = replacement.selection_plan_execution_snapshot()
         target_plan["retry_parent_decision_id"] = root_decision_id
@@ -12129,6 +12928,10 @@ class EnsembleProvider:
                 admission_role=admission_role,
                 on_admission=mark_admission,
                 before_request_dispatch=begin_runtime_health_after_admission,
+                canary_dispatch_guard=lambda: self._reserve_canary_physical_request(
+                    member,
+                    role=admission_role,
+                ),
                 on_stream_close=mark_stream_close_result,
                 on_local_cancellation=mark_local_cancellation,
                 before_admission_release=before_admission_release,
@@ -12144,7 +12947,28 @@ class EnsembleProvider:
             provider = _build_provider(_proposer_provider_config(member))
             if stop_before_dispatch_if_expired():
                 return result
-            raw_stream = provider.chat(messages, tools=tools, config=chat_cfg)
+            canary_reservation, canary_error = (
+                self._reserve_canary_physical_request(
+                    member,
+                    role="proposer",
+                )
+            )
+            if canary_error is not None:
+                result.error = canary_error.message
+                result.error_code = canary_error.code
+                result.request_started = False
+                result.physical_request_count = 0
+                return result
+            try:
+                raw_stream = provider.chat(messages, tools=tools, config=chat_cfg)
+            except BaseException:
+                if canary_reservation is not None:
+                    canary_reservation.refund()
+                raise
+            raw_stream = _guard_canary_physical_request_stream(
+                raw_stream,
+                canary_reservation,
+            )
             mark_request_started()
 
         async with _closing_async_iterator(
@@ -12925,6 +13749,11 @@ class EnsembleProvider:
             trace["thinking_execution_fallbacks"] = _json_safe(
                 self._thinking_execution_fallbacks
             )
+        if self._canary_request_budget is not None:
+            trace["canary_physical_budget"] = {
+                "schema": "opensquilla.ensemble-canary-physical-budget/v1",
+                **self._canary_request_budget.snapshot(),
+            }
         final_request: dict[str, Any] = {
             "role": final_request_role,
             "request_started": False,
@@ -14845,10 +15674,54 @@ class EnsembleProvider:
                             execution["effective_timeout"] = (
                                 attempt_timeout_seconds
                             )
-                stream = provider.chat(
-                    active_messages,
-                    tools=active_tools,
-                    config=active_config,
+                canary_reservation, canary_error = (
+                    self._reserve_canary_physical_request(
+                        active_member,
+                        role=admission_role,
+                    )
+                )
+                if canary_error is not None:
+                    current_attempt_recorded_sequence = append_recovery_attempt(
+                        {
+                            "kind": attempt_kind,
+                            "fallback_index": active_fallback_index,
+                            "trigger": attempt_trigger,
+                            "request_started": False,
+                            "outcome": "canary_dispatch_rejected",
+                            "code": canary_error.code,
+                            "requested_provider": (
+                                active_member.provider_config.provider
+                            ),
+                            "requested_model": (
+                                active_member.provider_config.model
+                            ),
+                        }
+                    )
+                    if activate_next_fallback(trigger=canary_error.code):
+                        attempt += 1
+                        trace.setdefault("final_request", {})[
+                            "retry_count"
+                        ] = attempt
+                        continue
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=canary_error.message,
+                    )
+                    yield partial_error(canary_error)
+                    return
+                try:
+                    stream = provider.chat(
+                        active_messages,
+                        tools=active_tools,
+                        config=active_config,
+                    )
+                except BaseException:
+                    if canary_reservation is not None:
+                        canary_reservation.refund()
+                    raise
+                stream = _guard_canary_physical_request_stream(
+                    stream,
+                    canary_reservation,
                 )
                 if attempt == 0:
                     _mark_final_request_started(trace)
@@ -16720,6 +17593,7 @@ class EnsembleProvider:
             and not self._thinking_policy_active()
             and self.all_failed_policy == "fallback_single"
             and self.fallback_provider is not None
+            and not self._fallback_single_canary_is_blocked()
         ):
             # Preserve normal fallback quality before the cutoff. Buffer its
             # user-visible output and enforce a separate absolute deadline
@@ -17009,6 +17883,25 @@ class EnsembleProvider:
                 ),
                 error_trace,
             )
+
+        if (
+            allow_single_fallback
+            and not self._thinking_policy_active()
+            and self.all_failed_policy == "fallback_single"
+            and self.fallback_provider is not None
+            and self._fallback_single_canary_is_blocked()
+        ):
+            yield proposer_error(
+                ErrorEvent(
+                    message=(
+                        "single-provider fallback was blocked by live canary governance"
+                    ),
+                    code=_CANARY_FALLBACK_BLOCKED_CODE,
+                    request_started=False,
+                    physical_request_count=0,
+                )
+            )
+            return
 
         if (
             not allow_single_fallback
@@ -17427,6 +18320,19 @@ class EnsembleProvider:
                             "the fallback request could start"
                         ),
                         code="ensemble_absolute_deadline",
+                        request_started=False,
+                        physical_request_count=0,
+                    )
+                )
+                return
+            if self._fallback_single_canary_is_blocked():
+                yield partial_error(
+                    ErrorEvent(
+                        message=(
+                            "single-provider fallback was blocked by live "
+                            "canary governance"
+                        ),
+                        code=_CANARY_FALLBACK_BLOCKED_CODE,
                         request_started=False,
                         physical_request_count=0,
                     )
@@ -18544,6 +19450,7 @@ class _EnsembleModelRef:
     k: int = 1
     runtime_health_upstream: str = ""
     runtime_health_never_strand: bool = False
+    canary_runtime_managed: bool = False
 
 
 @dataclass(frozen=True)
@@ -19305,6 +20212,7 @@ def _build_router_dynamic_members(
     proposer_backups_out: list[EnsembleMemberConfig] | None = None,
     retry_context_inputs_out: dict[str, Any] | None = None,
     provider_health_ledger: Any | None = None,
+    live_canary_identities_out: set[str] | None = None,
 ) -> tuple[str, list[EnsembleMemberConfig], EnsembleMemberConfig, dict[str, Any]]:
     """Build members from the profile-driven Step2 ranking decision."""
 
@@ -19732,6 +20640,43 @@ def _build_router_dynamic_members(
             raw_aggregator,
             role="aggregator",
         )
+        live_fallback_status_guard = bool(
+            task_analysis.source != "frozen_replay"
+            and not isinstance(registry_allowlist, Mapping)
+            and str(
+                getattr(ensemble_cfg, "latency_class", "normal") or "normal"
+            ).strip().casefold()
+            != "experiment"
+        )
+        if live_fallback_status_guard:
+            authoritative_registry = load_model_registry_snapshot()
+            canary_identities = {
+                (
+                    f"{str(facts.get('provider') or '').strip().casefold()}:"
+                    f"{str(facts.get('model_id') or '').strip().casefold()}"
+                )
+                for row in authoritative_registry.get("models", [])
+                if isinstance(row, Mapping)
+                and isinstance((facts := row.get("registry_facts")), Mapping)
+                and str(facts.get("status") or "").strip().casefold()
+                == "canary"
+            }
+            fallback_identities = {
+                f"{ref.provider}:{ref.model}".casefold()
+                for ref, _ in [
+                    *proposer_refs_and_pins,
+                    (aggregator_ref, aggregator_upstream_provider),
+                ]
+            }
+            blocked_canaries = sorted(
+                fallback_identities.intersection(canary_identities)
+            )
+            if blocked_canaries:
+                raise DynamicRankingError(
+                    "router_dynamic live analyzer_failure_fallback cannot use "
+                    "registry canary model(s): "
+                    + ", ".join(blocked_canaries)
+                )
         fallback_route_pins: dict[str, str] = {}
         for ref, upstream_provider in [
             *proposer_refs_and_pins,
@@ -20074,6 +21019,30 @@ def _build_router_dynamic_members(
             provider_routing=provider_routing,
         )
 
+    live_canary_surface = bool(
+        task_analysis.source != "frozen_replay"
+        and not isinstance(registry_allowlist, Mapping)
+        and str(
+            getattr(ensemble_cfg, "latency_class", "normal") or "normal"
+        ).strip().casefold()
+        != "experiment"
+    )
+    if live_canary_surface and live_canary_identities_out is not None:
+        for row in snapshot.get("models", []):
+            facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+            if (
+                not isinstance(facts, Mapping)
+                or str(facts.get("status") or "").strip().casefold()
+                != "canary"
+            ):
+                continue
+            identity = (
+                f"{str(facts.get('provider') or '').strip().casefold()}:"
+                f"{str(facts.get('model_id') or '').strip().casefold()}"
+            )
+            if identity != ":":
+                live_canary_identities_out.add(identity)
+
     raw_retry_exclusions = inputs.get("retry_excluded_proposer_identities")
     retry_exclusions: set[str] = set()
     if raw_retry_exclusions is not None:
@@ -20172,6 +21141,23 @@ def _build_router_dynamic_members(
         snapshot,
         generation_policy,
     )
+    canary_config, canary_config_valid = _materialize_canary_runtime_policy(
+        getattr(ensemble_cfg, "canary_rollout", None)
+    )
+    canary_filter_trace = _apply_canary_candidate_filter(
+        snapshot,
+        rollout_config=canary_config,
+        rollout_config_valid=canary_config_valid,
+        task_analysis=task_analysis,
+        decision_id=decision_id,
+        retry_parent_decision_id=retry_parent_decision_id,
+        latency_class=str(
+            getattr(ensemble_cfg, "latency_class", "normal") or "normal"
+        ),
+        registry_allowlist=registry_allowlist,
+        health_ledger=provider_health_ledger,
+        inherited_provider_config=inherited_provider_config,
+    )
     proposer_recovery_max_additional_calls = int(
         getattr(
             ensemble_cfg,
@@ -20264,6 +21250,8 @@ def _build_router_dynamic_members(
     decision = rank_snapshot(emit_logs=True)
     if generation_filter_trace is not None:
         decision.trace["generation_policy_filter"] = generation_filter_trace
+    if canary_filter_trace is not None:
+        decision.trace["canary_rollout"] = canary_filter_trace
     if runtime_health_filter_trace is not None:
         decision.trace["runtime_health_filter"] = runtime_health_filter_trace
     if allowlist_trace is not None:
@@ -20410,11 +21398,21 @@ def _build_router_dynamic_members(
             thinking_policy_version=policy_version,
             thinking_policy_managed=thinking_assignment_enabled,
             thinking_fallbacks=tuple(fallback_levels),
-            runtime_health_upstream=str(
-                runtime_health_map.get("upstream") or ""
+            runtime_health_upstream=canonicalize_provider_routing_upstream(
+                runtime_health_map.get("upstream")
+                or facts.get("endpoint_provider_pin")
+                or inherited_provider_config.provider_routing.get(
+                    model.model_id,
+                    "",
+                )
             ),
             runtime_health_never_strand=(
                 runtime_role_map.get("never_strand_exempt") is True
+            ),
+            canary_runtime_managed=bool(
+                canary_filter_trace is not None
+                and str(facts.get("status") or "").strip().casefold()
+                == "canary"
             ),
         )
 
@@ -20936,6 +21934,9 @@ def _member_from_ref(
         runtime_health_never_strand=bool(
             getattr(ref, "runtime_health_never_strand", False)
         ),
+        canary_runtime_managed=bool(
+            getattr(ref, "canary_runtime_managed", False)
+        ),
     )
 
 
@@ -21110,6 +22111,7 @@ def build_ensemble_provider_from_config(
     )
     aggregator_fallbacks: list[EnsembleMemberConfig] = []
     proposer_backups: list[EnsembleMemberConfig] = []
+    live_canary_identities: set[str] = set()
     materialized_retry_inputs: dict[str, Any] = {}
     static_profile = static_b5_profile(selection_mode)
     if static_profile is not None:
@@ -21147,6 +22149,7 @@ def build_ensemble_provider_from_config(
             proposer_backups_out=proposer_backups,
             retry_context_inputs_out=materialized_retry_inputs,
             provider_health_ledger=_provider_health_ledger,
+            live_canary_identities_out=live_canary_identities,
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
@@ -21173,6 +22176,22 @@ def build_ensemble_provider_from_config(
     is_analyzer_failure_fallback = bool(
         selection_mode == "router_dynamic"
         and selection_plan.get("analyzer_failure_fallback") is True
+    )
+    materialized_task_analysis = materialized_retry_inputs.get("task_analysis")
+    live_canary_governance_active = bool(
+        selection_mode == "router_dynamic"
+        and str(
+            getattr(materialized_task_analysis, "source", "") or ""
+        ).strip().casefold()
+        != "frozen_replay"
+        and not isinstance(
+            materialized_retry_inputs.get("registry_allowlist"),
+            Mapping,
+        )
+        and str(
+            getattr(ensemble_cfg, "latency_class", "normal") or "normal"
+        ).strip().casefold()
+        != "experiment"
     )
     # Static and custom lineups share the fixed-lineup defaults family
     # (quorum replacement, 300/480s timeouts, no shuffle, quorum grace).
@@ -21525,6 +22544,19 @@ def build_ensemble_provider_from_config(
         _member_request_budget_bindings=request_budget_bindings,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
         _provider_health_ledger=live_provider_health_ledger,
+        _selector_blocked_canary_identities=tuple(
+            sorted(live_canary_identities)
+        ),
+        _selector_canary_governance_active=(
+            live_canary_governance_active
+        ),
+        _fallback_single_canary_blocked=(
+            (
+                f"{str(inherited_provider_config.provider or '').strip().casefold()}:"
+                f"{str(inherited_provider_config.model or '').strip().casefold()}"
+            )
+            in live_canary_identities
+        ),
         _admission_settings=admission_settings,
         _absolute_deadline=_absolute_deadline,
     )

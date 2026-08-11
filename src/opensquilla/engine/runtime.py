@@ -1563,6 +1563,17 @@ class _SelectorFallbackProvider:
     ) -> None:
         self._provider = provider
         self._selector = selector
+        self._selector_fallback_admission = (
+            getattr(provider, "selector_fallback_allowed", None)
+            if getattr(
+                provider,
+                "selector_fallback_governance_active",
+                False,
+            )
+            is True
+            else None
+        )
+        self._selector_canary_route_blocked = False
         self._turn_metadata = turn_metadata
         # Opt-in provider health ledger (engine/routing/health.py). None —
         # the default everywhere today — makes every ledger hook below a
@@ -1953,39 +1964,53 @@ class _SelectorFallbackProvider:
             return
         ledger.record_success(provider_id, model)
 
-    def _skip_benched_fallbacks(self) -> None:
-        """Advance past benched fallback deployments (opt-in ledger only).
+    def _skip_benched_fallbacks(
+        self,
+        provider: Any,
+    ) -> tuple[Any, bool, int]:
+        """Resolve past benched fallbacks without bypassing canary admission.
 
         Uses :meth:`ProviderHealthLedger.eligible` with the remaining chain as
         the candidate set, so the ledger's never-strand exemption applies: when
         every remaining deployment is benched, the current one is reported
-        eligible and no hop is taken. No-op without a ledger.
+        eligible and no hop is taken. Returns the final local provider, whether
+        a canary hop was blocked, and the number of health-skip hops. The caller
+        remains the sole owner of the externally visible route commit.
         """
         ledger = self._health_ledger
         if ledger is None:
-            return
+            return provider, False, 0
         remaining_chain = getattr(self._selector, "remaining_chain", None)
         has_fallback = getattr(self._selector, "has_fallback", None)
         next_fallback = getattr(self._selector, "next_fallback", None)
         if remaining_chain is None or has_fallback is None or next_fallback is None:
-            return
+            return provider, False, 0
+        current_provider = provider
+        skipped_hops = 0
         while True:
             candidates = [
                 (str(getattr(cfg, "provider", "")), str(getattr(cfg, "model", "")))
                 for cfg in remaining_chain()
             ]
             if not candidates:
-                return
+                return current_provider, False, skipped_hops
             provider_id, model = candidates[0]
             if ledger.eligible(provider_id, model, candidates):
-                return
+                return current_provider, False, skipped_hops
             if not has_fallback():
-                return
+                return current_provider, False, skipped_hops
+            if self._live_canary_policy_blocks_next_fallback():
+                self._selector_canary_route_blocked = True
+                return current_provider, True, skipped_hops
             try:
-                self._provider = next_fallback()
+                next_provider = next_fallback()
             except Exception:  # noqa: BLE001 — a failed hop must not break the turn
-                return
-            self._note_fallback_hop()
+                return current_provider, False, skipped_hops
+            if self._live_canary_policy_blocks_active_fallback():
+                self._selector_canary_route_blocked = True
+                return current_provider, True, skipped_hops
+            current_provider = next_provider
+            skipped_hops += 1
 
     def _routed_thinking_policy_blocks_fallback(self) -> bool:
         return bool(
@@ -1996,15 +2021,79 @@ class _SelectorFallbackProvider:
             )
         )
 
+    def _live_canary_policy_blocks_next_fallback(self) -> bool:
+        """Fail closed before a selector advances onto a live canary route."""
+
+        if self._selector_canary_route_blocked:
+            return True
+        allows = self._selector_fallback_admission
+        if not callable(allows):
+            return False
+        remaining_chain = getattr(self._selector, "remaining_chain", None)
+        if not callable(remaining_chain):
+            return True
+        try:
+            candidates = list(remaining_chain())
+        except Exception:
+            return True
+        # ModelSelector exposes the active deployment followed by untried
+        # fallbacks. A governance-aware primary must not allow an unknown hop.
+        if len(candidates) < 2:
+            return True
+        next_config = candidates[1]
+        return (
+            allows(
+                getattr(next_config, "provider", ""),
+                getattr(next_config, "model", ""),
+            )
+            is not True
+        )
+
+    def _live_canary_policy_blocks_active_fallback(self) -> bool:
+        """Recheck the route produced by plugin/static selector mutation."""
+
+        if self._selector_canary_route_blocked:
+            return True
+        allows = self._selector_fallback_admission
+        if not callable(allows):
+            return False
+        current_config = getattr(self._selector, "current_config", None)
+        if current_config is None:
+            return True
+        return (
+            allows(
+                getattr(current_config, "provider", ""),
+                getattr(current_config, "model", ""),
+            )
+            is not True
+        )
+
+    def _managed_policy_blocks_fallback(self) -> bool:
+        return bool(
+            self._routed_thinking_policy_blocks_fallback()
+            or self._live_canary_policy_blocks_next_fallback()
+        )
+
     def fallback_after_invalid_response(self, reason: str) -> bool:
-        if self._routed_thinking_policy_blocks_fallback():
+        if self._managed_policy_blocks_fallback():
             return False
         try:
-            self._provider = self._selector.next_fallback_after_failure(RuntimeError(reason))
+            fallback_provider = self._selector.next_fallback_after_failure(
+                RuntimeError(reason)
+            )
         except Exception:
             return False
-        self._note_fallback_hop()
-        self._skip_benched_fallbacks()
+        if self._live_canary_policy_blocks_active_fallback():
+            self._selector_canary_route_blocked = True
+            return False
+        fallback_provider, blocked, skipped_hops = (
+            self._skip_benched_fallbacks(fallback_provider)
+        )
+        if blocked:
+            return False
+        self._provider = fallback_provider
+        for _ in range(1 + skipped_hops):
+            self._note_fallback_hop()
         self._realign_routed_model_after_fallback()
         return True
 
@@ -2080,7 +2169,7 @@ class _SelectorFallbackProvider:
                 if isinstance(event, ProviderErrorEvent) and _should_use_selector_fallback(
                     self.provider_name, event
                 ):
-                    if self._routed_thinking_policy_blocks_fallback():
+                    if self._managed_policy_blocks_fallback():
                         for buffered_event in drain_pre_text_buffer():
                             yield buffered_event
                         yield event
@@ -2095,9 +2184,29 @@ class _SelectorFallbackProvider:
                             yield buffered_event
                         yield event
                         return
+                    if self._live_canary_policy_blocks_active_fallback():
+                        self._selector_canary_route_blocked = True
+                        for buffered_event in drain_pre_text_buffer():
+                            yield buffered_event
+                        yield event
+                        return
+                    fallback_provider, blocked, skipped_hops = (
+                        self._skip_benched_fallbacks(fallback_provider)
+                    )
+                    if blocked:
+                        for buffered_event in drain_pre_text_buffer():
+                            yield buffered_event
+                        yield event
+                        return
                     # Prove the failed physical leg closed before reserving or
                     # dispatching another potentially billable request.
                     await primary_stream.aclose()
+                    if self._live_canary_policy_blocks_active_fallback():
+                        self._selector_canary_route_blocked = True
+                        for buffered_event in drain_pre_text_buffer():
+                            yield buffered_event
+                        yield event
+                        return
                     active_scope_ids = tuple(self._retry_scope_provider_bindings)
                     if len(active_scope_ids) > 1:
                         for buffered_event in drain_pre_text_buffer():
@@ -2115,14 +2224,11 @@ class _SelectorFallbackProvider:
                                 yield buffered_event
                             yield event
                             return
-                    # Reservation success is the commit point for this route.
-                    # Failed close/resolution/reservation leaves `_provider`
-                    # and externally visible route metadata on the source.
-                    self._provider = fallback_provider
-                    self._note_fallback_hop()
-                    self._skip_benched_fallbacks()
-                    self._realign_routed_model_after_fallback()
-                    fallback_provider = self._provider
+                    # The usage envelope is lazy and may await durable setup
+                    # before invoking its stream factory. Keep the final live
+                    # status check inside that factory, immediately beside
+                    # provider.chat, and commit externally visible route
+                    # metadata only after that check passes.
                     fallback_provider_id, fallback_model = self._active_deployment()
                     fallback_usage_snapshot = getattr(
                         fallback_provider,
@@ -2135,12 +2241,34 @@ class _SelectorFallbackProvider:
                         fallback_config = model_copy(
                             update={"allow_provider_stream_fallback": False}
                         )
-                    fallback_stream = account_provider_stream(
-                        lambda: fallback_provider.chat(
+
+                    async def canary_blocked_stream() -> AsyncIterator[Any]:
+                        yield ProviderErrorEvent(
+                            message=(
+                                "selector fallback was blocked by live canary "
+                                "governance"
+                            ),
+                            code="ensemble_canary_fallback_blocked",
+                            request_started=False,
+                            physical_request_count=0,
+                        )
+
+                    def dispatch_fallback_stream() -> AsyncIterator[Any]:
+                        if self._live_canary_policy_blocks_active_fallback():
+                            self._selector_canary_route_blocked = True
+                            return canary_blocked_stream()
+                        self._provider = fallback_provider
+                        for _ in range(1 + skipped_hops):
+                            self._note_fallback_hop()
+                        self._realign_routed_model_after_fallback()
+                        return fallback_provider.chat(
                             messages,
                             tools=tools,
                             config=fallback_config,
-                        ),
+                        )
+
+                    fallback_stream = account_provider_stream(
+                        dispatch_fallback_stream,
                         provider=fallback_provider_id,
                         model=fallback_model,
                         usage_snapshot=(
@@ -3261,6 +3389,7 @@ class TurnRunner:
         session_key: str,
         ranking_config: Mapping[str, Any],
         analyzer_route: Mapping[str, Any] | None = None,
+        allow_canary_route: bool = False,
     ) -> Any | None:
         """Build the frozen task analyzer without reusing another credential."""
 
@@ -3297,6 +3426,42 @@ class TurnRunner:
             analyzer_provider_id = validated_route.provider_id
             analyzer_model_id = validated_route.model_id
             analyzer_upstream_provider = validated_route.upstream_provider
+            if not allow_canary_route:
+                from opensquilla.provider.ranking_router import (
+                    load_model_registry_snapshot,
+                )
+
+                authoritative_registry = load_model_registry_snapshot()
+                registry_rows = authoritative_registry.get("models")
+                if not isinstance(registry_rows, Sequence) or isinstance(
+                    registry_rows,
+                    (str, bytes),
+                ):
+                    raise ValueError(
+                        "authoritative model registry has no model rows"
+                    )
+                for registry_row in registry_rows:
+                    facts = (
+                        registry_row.get("registry_facts")
+                        if isinstance(registry_row, Mapping)
+                        else None
+                    )
+                    if not isinstance(facts, Mapping):
+                        continue
+                    if (
+                        str(facts.get("provider") or "").strip().casefold()
+                        == analyzer_provider_id
+                        and str(facts.get("model_id") or "").strip().casefold()
+                        == analyzer_model_id
+                        and str(facts.get("status") or "").strip().casefold()
+                        == "canary"
+                    ):
+                        log.warning(
+                            "llm_ensemble.router_dynamic.task_analyzer_canary_blocked",
+                            provider=analyzer_provider_id,
+                            model=analyzer_model_id,
+                        )
+                        return None
             spec = get_provider_spec(analyzer_provider_id)
             turn_config = self._turn_config()
             inherited_provider = str(
@@ -6857,6 +7022,17 @@ class TurnRunner:
                                     analyzer_admission_deadline,
                                     turn_absolute_deadline,
                                 )
+                        allow_canary_analyzer_route = bool(
+                            str(
+                                getattr(
+                                    ensemble_cfg,
+                                    "latency_class",
+                                    "normal",
+                                )
+                                or "normal"
+                            ).strip().casefold()
+                            == "experiment"
+                        )
                         if analyzer_chain["configured"]:
                             analyzer_candidates = [
                                 TaskAnalyzerCandidate(
@@ -6865,6 +7041,9 @@ class TurnRunner:
                                         session_key=turn.session_key,
                                         ranking_config=ranking_config,
                                         analyzer_route=route,
+                                        allow_canary_route=(
+                                            allow_canary_analyzer_route
+                                        ),
                                     ),
                                     provider_id=str(route["provider"]),
                                     model_id=str(route["model"]),
@@ -6894,6 +7073,9 @@ class TurnRunner:
                                 current_provider_config,
                                 session_key=turn.session_key,
                                 ranking_config=ranking_config,
+                                allow_canary_route=(
+                                    allow_canary_analyzer_route
+                                ),
                             )
                             task_analysis = await analyze_task_with_provider(
                                 provider=analyzer_provider,

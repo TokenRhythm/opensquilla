@@ -1072,6 +1072,76 @@ def test_router_dynamic_task_analyzer_resolution_failure_uses_local_fallback(
     assert provider is None
 
 
+def test_live_router_dynamic_analyzer_canary_is_blocked_before_provider_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider import ranking_router
+
+    real_loader = ranking_router.load_model_registry_snapshot
+
+    def canary_registry(*, base_version: str | None = None) -> dict[str, Any]:
+        snapshot = real_loader(base_version=base_version)
+        for row in snapshot["models"]:
+            facts = row["registry_facts"]
+            if (
+                facts["provider"] == TASK_ANALYZER_PROVIDER_ID
+                and facts["model_id"] == TASK_ANALYZER_MODEL_ID
+            ):
+                facts["status"] = "canary"
+                break
+        else:
+            raise AssertionError("task analyzer route is absent from registry")
+        return snapshot
+
+    sentinel = object()
+    provider_builds: list[ProviderConfig] = []
+
+    def capture_resolution(selector: Any) -> object:
+        provider_builds.append(selector.current_config)
+        return sentinel
+
+    monkeypatch.setattr(
+        ranking_router,
+        "load_model_registry_snapshot",
+        canary_registry,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.selector.ModelSelector.resolve",
+        capture_resolution,
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "openrouter-key",
+        },
+        squilla_router=SquillaRouterConfig(enabled=False),
+        llm_ensemble={"enabled": True, "selection_mode": "router_dynamic"},
+    )
+    runner = TurnRunner(provider_selector=None, config=config)
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-pro",
+        api_key="openrouter-key",
+    )
+
+    live_provider = runner._router_dynamic_task_analyzer_provider(
+        inherited,
+        session_key="agent:main:live-canary-analyzer",
+        ranking_config=ranking_config_snapshot(),
+    )
+    experiment_provider = runner._router_dynamic_task_analyzer_provider(
+        inherited,
+        session_key="agent:main:experiment-canary-analyzer",
+        ranking_config=ranking_config_snapshot(),
+        allow_canary_route=True,
+    )
+
+    assert live_provider is None
+    assert experiment_provider is sentinel
+    assert len(provider_builds) == 1
+
+
 def test_router_dynamic_task_analyzer_rejects_misbound_resolver_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
