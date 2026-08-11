@@ -11604,6 +11604,37 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         assert runner_module._shared_ensemble_call_core_reasons is (
             draco_ensemble_call_validation.ensemble_call_core_reasons_core
         )
+        assert runner_module._shared_admissible_fallback_reasons is (
+            draco_ensemble_call_validation.admissible_empty_nonterminal_fallback_reasons_core
+        )
+        assert runner_module._shared_ensemble_generation_retry_reason is (
+            draco_ensemble_call_validation.ensemble_generation_retry_reason_core
+        )
+        assert runner_module._shared_generation_retry_reason is (
+            draco_ensemble_call_validation.generation_retry_reason_core
+        )
+        for name in (
+            "_ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS",
+            "_ENSEMBLE_EXECUTION_BLOCKING_REASONS",
+            "_PROVIDER_NATIVE_PROPOSER_RETRY_REASONS",
+            "GENERATION_EMPTY_OUTPUT_ERROR",
+            "GENERATION_MISSING_DONE_ERROR",
+            "_reasoning_only_length_failures_from_trace",
+            "agent_call_output_sequence_reasons",
+            "deterministic_reasoning_only_length_failures",
+            "ensemble_call_trace_sequence",
+            "ensemble_execution_blocking_reason",
+            "g1_retry_physical_usage_binding_reasons",
+            "generation_cleanup_failure_reason",
+            "is_agent_hard_timeout",
+            "provider_native_proposer_retry_reason",
+            "record_generation_audit_warnings",
+            "single_generation_identity_reason",
+        ):
+            assert getattr(runner_module, name) is getattr(
+                draco_ensemble_call_validation,
+                name,
+            )
     for name in (
         "_sanitize_fingerprint_config",
         "_sanitize_url_for_fingerprint",
@@ -11823,9 +11854,37 @@ def test_ensemble_call_validation_wrappers_bind_runner_dependencies_dynamically(
     assert dependencies.expanded_proposer_slot_identities is (
         module.expanded_proposer_slot_identities
     )
+    assert dependencies.legal_proposer_quorum is module.legal_proposer_quorum
     assert dependencies.frozen_proposer_quorum is module.frozen_proposer_quorum
     assert dependencies.ensemble_metadata_field_resolved is (
         module.ensemble_metadata_field_resolved
+    )
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_generation_retry_wrapper_binds_runner_callbacks_dynamically(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    def shared_retry(result: object, **kwargs: Any) -> str:
+        observed["result"] = result
+        observed.update(kwargs)
+        return "sentinel"
+
+    retry_result = object()
+    monkeypatch.setattr(module, "_shared_generation_retry_reason", shared_retry)
+    assert module.generation_retry_reason(retry_result) == "sentinel"
+    assert observed["result"] is retry_result
+    assert observed["record_generation_audit_warnings_fn"] is (
+        module.record_generation_audit_warnings
+    )
+    assert observed["ensemble_generation_retry_reason_fn"] is (
+        module.ensemble_generation_retry_reason
+    )
+    assert observed["single_generation_identity_reason_fn"] is (
+        module.single_generation_identity_reason
     )
 
 
