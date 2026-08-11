@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.eval import draco_resume_source_index as resume_source_index
 from opensquilla.eval.draco_artifact_integrity import (
     seal_result_row,
     trace_row_from_result,
@@ -69,7 +70,7 @@ def _valid_row(group: str, task_hash: str, fingerprint: str) -> dict[str, object
 
 def _write_compact_bundle(
     directory: Path,
-    row: dict[str, object],
+    row: dict[str, object] | None,
     *,
     fingerprint: str,
     stamp: str = "20260811-120000",
@@ -80,16 +81,19 @@ def _write_compact_bundle(
     manifest_path = directory / f"draco_run_{stamp}.manifest.json"
     pack_path = directory / f"draco_run_{stamp}.selection-plan.pack.jsonl"
     durable_capability = durable_artifact_capability_contract()
+    compact: dict[str, object] | None = None
     with SelectionPlanPackAppender(pack_path) as appender:
-        compact = compact_selection_plan_evidence_row(row, appender=appender)
-        compact[DRACO_DURABLE_RESULT_ROW_FIELD] = durable_capability
-        compact = seal_result_row(compact)
+        if row is not None:
+            compact = compact_selection_plan_evidence_row(row, appender=appender)
+            compact[DRACO_DURABLE_RESULT_ROW_FIELD] = durable_capability
+            compact = seal_result_row(compact)
     with DurableDracoArtifactWriter(
         results_path=results_path,
         trace_path=trace_path,
         checkpoint_path=checkpoint_path,
     ) as writer:
-        assert writer.append(compact, trace_row_from_result(compact))
+        if compact is not None:
+            assert writer.append(compact, trace_row_from_result(compact))
     verification = verify_durable_draco_artifacts(
         results_path=results_path,
         trace_path=trace_path,
@@ -99,9 +103,9 @@ def _write_compact_bundle(
         binding = selection_plan_evidence_manifest_binding(
             pack_index=reader.index,
             durable_artifact_verification=verification,
-            compact_row_count=1,
+            compact_row_count=int(compact is not None),
         )
-    group = str(row["group"])
+    group = str(row["group"]) if row is not None else "B2"
     artifacts = {
         "results_jsonl": str(results_path),
         "trace_jsonl": str(trace_path),
@@ -196,24 +200,21 @@ def test_expected_manifest_without_fingerprints_fails(tmp_path: Path) -> None:
         audit.load_expected_fingerprints(path)
 
 
-def test_legacy_read_keeps_line_metadata_and_does_not_open_compact_index(
+@pytest.mark.parametrize("manifest_present", [False, True])
+def test_standard_legacy_read_keeps_blank_lines_metadata_and_error_semantics(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    manifest_present: bool,
 ) -> None:
     path = tmp_path / "draco_ensemble_20260811-120001.jsonl"
-    (tmp_path / "draco_run_20260811-120001.manifest.json").write_text(
-        "{}\n",
-        encoding="utf-8",
-    )
+    if manifest_present:
+        (tmp_path / "draco_run_20260811-120001.manifest.json").write_text(
+            "{}\n",
+            encoding="utf-8",
+        )
     path.write_text(
-        "\n{\"group\":\"B2\",\"task_id\":\"task-1\"}\n",
+        "\u2003\n{\"group\":\"B2\",\"task_id\":\"task-1\"}\n",
         encoding="utf-8",
     )
-
-    def unexpected_index(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("legacy result unexpectedly opened the compact index")
-
-    monkeypatch.setattr(audit.ResumeSourceIndex, "__init__", unexpected_index)
     assert audit.read_jsonl(path) == [
         {
             "group": "B2",
@@ -228,6 +229,46 @@ def test_legacy_read_keeps_line_metadata_and_does_not_open_compact_index(
         audit.read_jsonl(path)
 
 
+def test_nonstandard_legacy_read_does_not_open_resume_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy-results.jsonl"
+    path.write_text('{"group":"B2","task_id":"task-1"}\n', encoding="utf-8")
+
+    def unexpected_index(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("nonstandard result unexpectedly opened the resume index")
+
+    monkeypatch.setattr(audit.ResumeSourceIndex, "__init__", unexpected_index)
+    assert audit.read_jsonl(path)[0]["_audit_source_line"] == 1
+
+
+def test_renamed_compact_result_is_not_accepted_as_nonstandard_legacy(
+    tmp_path: Path,
+) -> None:
+    fingerprint = "sha256:b2"
+    row = _valid_row("B2", "sha256:task", fingerprint)
+    row["routing_trace"] = {
+        "selection_plan": {
+            "strategy": "router_dynamic",
+            "selected_P": ["openrouter:model-a"],
+        }
+    }
+    result_path, _manifest_path, _pack_path = _write_compact_bundle(
+        tmp_path,
+        row,
+        fingerprint=fingerprint,
+    )
+    renamed_path = tmp_path / "renamed-compact.jsonl"
+    result_path.rename(renamed_path)
+
+    with pytest.raises(
+        ValueError,
+        match="requires a standard authenticated sibling binding",
+    ):
+        audit.read_jsonl(renamed_path)
+
+
 @pytest.mark.parametrize(
     "unsafe_sibling, expected_error",
     [
@@ -235,7 +276,6 @@ def test_legacy_read_keeps_line_metadata_and_does_not_open_compact_index(
         ("symlink_manifest", "cannot open resume sibling manifest"),
         ("oversize_manifest", "outside its byte bound"),
         ("malformed_manifest", "is not valid JSON"),
-        ("broken_pack_symlink", "lacks its authenticated sibling binding"),
     ],
 )
 def test_unsafe_standard_sibling_is_never_treated_as_legacy(
@@ -250,7 +290,6 @@ def test_unsafe_standard_sibling_is_never_treated_as_legacy(
         encoding="utf-8",
     )
     manifest_path = tmp_path / f"draco_run_{stamp}.manifest.json"
-    pack_path = tmp_path / f"draco_run_{stamp}.selection-plan.pack.jsonl"
     if unsafe_sibling == "fifo_manifest":
         os.mkfifo(manifest_path)
     elif unsafe_sibling == "symlink_manifest":
@@ -263,13 +302,157 @@ def test_unsafe_standard_sibling_is_never_treated_as_legacy(
             handle.write(b"\n")
     elif unsafe_sibling == "malformed_manifest":
         manifest_path.write_text("{invalid\n", encoding="utf-8")
-    elif unsafe_sibling == "broken_pack_symlink":
-        pack_path.symlink_to(tmp_path / "missing-pack.jsonl")
     else:  # pragma: no cover - parameter list is closed above.
         raise AssertionError(unsafe_sibling)
 
     with pytest.raises(ValueError, match=expected_error):
         audit.read_jsonl(result_path)
+
+
+def test_standard_read_rejects_parent_directory_swap_between_open_and_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stamp = "20260811-120003"
+    live_dir = tmp_path / "live"
+    forged_dir = tmp_path / "forged"
+    held_dir = tmp_path / "held-original"
+    displaced_dir = tmp_path / "displaced-forged"
+    live_dir.mkdir()
+    forged_dir.mkdir()
+    result_name = f"draco_ensemble_{stamp}.jsonl"
+    result_path = live_dir / result_name
+    result_path.write_text(
+        '{"group":"B2","task_id":"original"}\n',
+        encoding="utf-8",
+    )
+    (forged_dir / result_name).write_text(
+        '{"group":"B2","task_id":"forged"}\n',
+        encoding="utf-8",
+    )
+    real_open_regular = resume_source_index._open_regular
+    real_iter_lines = resume_source_index._iter_universal_binary_lines
+    swapped = False
+    restored = False
+
+    def swap_before_first_result_open(path: Path, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if Path(path) == result_path and not swapped:
+            live_dir.rename(held_dir)
+            forged_dir.rename(live_dir)
+            swapped = True
+        return real_open_regular(path, *args, **kwargs)
+
+    def restore_before_scan(handle: object):
+        nonlocal restored
+        if swapped and not restored:
+            live_dir.rename(displaced_dir)
+            held_dir.rename(live_dir)
+            restored = True
+        yield from real_iter_lines(handle)
+
+    monkeypatch.setattr(
+        resume_source_index,
+        "_open_regular",
+        swap_before_first_result_open,
+    )
+    monkeypatch.setattr(
+        resume_source_index,
+        "_iter_universal_binary_lines",
+        restore_before_scan,
+    )
+
+    with pytest.raises(ValueError, match="(?:path|directory).*changed"):
+        audit.read_jsonl(result_path)
+    assert swapped and restored
+
+
+@pytest.mark.parametrize("pack_state", ["regular", "broken_symlink"])
+def test_downgraded_standard_bundle_cannot_hide_its_reserved_pack(
+    tmp_path: Path,
+    pack_state: str,
+) -> None:
+    fingerprint = "sha256:b2"
+    plan = {
+        "strategy": "router_dynamic",
+        "selected_P": ["openrouter:model-a"],
+    }
+    row = _valid_row("B2", "sha256:task", fingerprint)
+    row["routing_trace"] = {"selection_plan": plan}
+    result_path, manifest_path, pack_path = _write_compact_bundle(
+        tmp_path,
+        row,
+        fingerprint=fingerprint,
+        stamp="20260811-120004",
+    )
+    downgraded_row = json.loads(result_path.read_text(encoding="utf-8"))
+    downgraded_row.pop(SELECTION_PLAN_EVIDENCE_ROW_FIELD)
+    downgraded_row["routing_trace"]["selection_plan"] = plan
+    result_path.write_text(
+        json.dumps(seal_result_row(downgraded_row)) + "\n",
+        encoding="utf-8",
+    )
+    downgraded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    downgraded_manifest.pop(SELECTION_PLAN_EVIDENCE_ROW_FIELD)
+    downgraded_manifest.pop(SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD)
+    downgraded_manifest["artifacts"].pop(SELECTION_PLAN_PACK_ARTIFACT_FIELD)
+    manifest_path.write_text(
+        json.dumps(downgraded_manifest) + "\n",
+        encoding="utf-8",
+    )
+    if pack_state == "broken_symlink":
+        pack_path.unlink()
+        pack_path.symlink_to(tmp_path / "missing-selection-plan.pack.jsonl")
+
+    with pytest.raises(
+        ValueError,
+        match="reserved selection-plan pack lacks its authenticated sibling binding",
+    ):
+        audit.read_jsonl(result_path)
+
+
+@pytest.mark.parametrize("attack_sample", [1, 3])
+def test_reserved_pack_presence_sample_then_verify_rejects_restore_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack_sample: int,
+) -> None:
+    stamp = "20260811-120005"
+    result_path = tmp_path / f"draco_ensemble_{stamp}.jsonl"
+    manifest_path = tmp_path / f"draco_run_{stamp}.manifest.json"
+    pack_path = tmp_path / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    hidden_path = tmp_path / "temporarily-hidden-pack.jsonl"
+    result_path.write_text(
+        '{"group":"B2","task_id":"task-1"}\n',
+        encoding="utf-8",
+    )
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    if attack_sample == 1:
+        pack_path.write_text("reserved\n", encoding="utf-8")
+    else:
+        hidden_path.write_text("reserved\n", encoding="utf-8")
+    real_presence_check = audit._bound_pathname_exists
+    presence_calls = 0
+
+    def hide_and_restore(directory_fd: int, name: str) -> bool:
+        nonlocal presence_calls
+        presence_calls += 1
+        if presence_calls == 1 and attack_sample == 1:
+            pack_path.rename(hidden_path)
+            present_while_hidden = real_presence_check(directory_fd, name)
+            hidden_path.rename(pack_path)
+            return present_while_hidden
+        if presence_calls == 3 and attack_sample == 3:
+            present_before_restore = real_presence_check(directory_fd, name)
+            hidden_path.rename(pack_path)
+            return present_before_restore
+        return real_presence_check(directory_fd, name)
+
+    monkeypatch.setattr(audit, "_bound_pathname_exists", hide_and_restore)
+    with pytest.raises(ValueError, match="audit source directory changed"):
+        audit.read_jsonl(result_path)
+    assert presence_calls == attack_sample
+    assert pack_path.is_file()
 
 
 def test_audit_supports_single_group_and_max_tasks(
@@ -385,6 +568,20 @@ def test_required_result_evidence_rejects_a_mutated_sealed_row(
     assert report["all_attempt_invalid_reason_counts"] == {
         "invalid_result_evidence": 1
     }
+
+
+def test_audit_accepts_authenticated_header_only_compact_bundle(
+    tmp_path: Path,
+) -> None:
+    result_path, _manifest_path, pack_path = _write_compact_bundle(
+        tmp_path,
+        None,
+        fingerprint="sha256:b2",
+        stamp="20260811-120006",
+    )
+
+    assert audit.read_jsonl(result_path) == []
+    assert pack_path.is_file()
 
 
 def test_audit_materializes_bound_compact_rows_and_writes_resealed_inline_output(

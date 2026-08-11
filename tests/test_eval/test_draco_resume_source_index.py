@@ -166,6 +166,33 @@ def _scan(
     return locators
 
 
+def test_completed_source_reports_authenticated_compact_state_without_io(
+    tmp_path: Path,
+) -> None:
+    compact_dir = tmp_path / "compact"
+    compact_dir.mkdir()
+    compact_path, _manifest_path, _rows = _write_compact_source_bundle(
+        compact_dir,
+        [],
+    )
+    with ResumeSourceIndex([compact_path], force_spool=False) as compact_index:
+        assert list(compact_index.iter_source(compact_path, source_index=0)) == []
+        assert compact_index.source_is_compact_authenticated(source_index=0) is True
+        with pytest.raises(
+            DracoResumeSourceError,
+            match="no completed source 1",
+        ):
+            compact_index.source_is_compact_authenticated(source_index=1)
+        compact_index.seal()
+
+    legacy_path = tmp_path / "empty-legacy.jsonl"
+    legacy_path.write_text("", encoding="utf-8")
+    with ResumeSourceIndex([legacy_path], force_spool=False) as legacy_index:
+        assert list(legacy_index.iter_source(legacy_path, source_index=0)) == []
+        assert legacy_index.source_is_compact_authenticated(source_index=0) is False
+        legacy_index.seal()
+
+
 def test_lazy_selection_plan_row_view_resolves_once_and_never_leaks_ref(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

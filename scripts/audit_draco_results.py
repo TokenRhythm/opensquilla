@@ -7,20 +7,17 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 from opensquilla.eval.draco_artifact_integrity import verify_result_row_evidence
 from opensquilla.eval.draco_resume_source_index import (
-    DracoResumeSourceError,
+    ResumeRowLocator,
     ResumeSourceIndex,
-    _read_json_object_snapshot,
 )
 from opensquilla.eval.draco_selection_plan_evidence import (
-    SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
-    SELECTION_PLAN_EVIDENCE_ROW_FIELD,
-    SELECTION_PLAN_PACK_ARTIFACT_FIELD,
     selection_plan_reference_signal,
     selection_plan_row_capability_signal,
 )
@@ -30,6 +27,90 @@ FIXED_MODELS = {
     "B0": "anthropic/claude-fable-5",
     "B4": "openai/gpt-5.6-sol",
 }
+_DIRECTORY_SIGNATURE_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+
+
+def _directory_signature(value: os.stat_result) -> tuple[int, ...]:
+    return tuple(
+        int(getattr(value, field)) for field in _DIRECTORY_SIGNATURE_FIELDS
+    )
+
+
+def _open_bound_source_directory(path: Path) -> tuple[int, tuple[int, ...]]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"cannot bind audit source directory: {path}") from exc
+    try:
+        directory_stat = os.fstat(fd)
+        signature = _directory_signature(directory_stat)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise ValueError(f"audit source parent is not a directory: {path}")
+        if _directory_signature(os.stat(path)) != signature:
+            raise ValueError(f"audit source directory changed while binding: {path}")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return fd, signature
+
+
+def _verify_bound_source_directory(
+    fd: int,
+    path: Path,
+    *,
+    signature: tuple[int, ...],
+) -> None:
+    try:
+        descriptor_signature = _directory_signature(os.fstat(fd))
+        pathname_signature = _directory_signature(os.stat(path))
+    except OSError as exc:
+        raise ValueError(f"audit source directory disappeared: {path}") from exc
+    if descriptor_signature != signature or pathname_signature != signature:
+        raise ValueError(f"audit source directory changed after binding: {path}")
+
+
+def _bound_pathname_exists(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValueError(f"cannot classify reserved audit artifact: {name}") from exc
+    return True
+
+
+def _bound_pathname_presence_snapshot(
+    directory_fd: int,
+    name: str,
+    *,
+    directory_path: Path,
+    directory_signature: tuple[int, ...],
+) -> bool:
+    present = _bound_pathname_exists(directory_fd, name)
+    # Presence is useful only when the directory snapshot is verified after
+    # the sample. A hide/restore inside the sample changes directory ctime.
+    _verify_bound_source_directory(
+        directory_fd,
+        directory_path,
+        signature=directory_signature,
+    )
+    return present
 
 
 def canonical_json_sha256(value: Any) -> str:
@@ -115,96 +196,126 @@ def _read_unbound_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"invalid JSONL at {path}:{line_number}: {exc}") from exc
             if not isinstance(value, dict):
                 raise ValueError(f"JSONL row is not an object at {path}:{line_number}")
+            if (
+                selection_plan_row_capability_signal(value)
+                or selection_plan_reference_signal(value)
+            ):
+                raise ValueError(
+                    "content-addressed selection-plan evidence requires a standard "
+                    f"authenticated sibling binding at {path}:{line_number}"
+                )
             value["_audit_source"] = str(path)
             value["_audit_source_line"] = line_number
             rows.append(value)
     return rows
 
 
-def _read_bound_compact_jsonl(path: Path) -> list[dict[str, Any]]:
-    """Authenticate, expand, and reseal one standard compact result bundle."""
+def _read_standard_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read one stamped source through a single identity-bound lifecycle."""
 
-    materialized: list[dict[str, Any]] = []
-    with ResumeSourceIndex([path], force_spool=False) as source_index:
-        locators = []
-        with source_index.open_source(path, source_index=0) as indexed_rows:
-            for indexed in indexed_rows:
-                try:
-                    value = json.loads(indexed.payload.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise ValueError(
-                        f"invalid JSONL at {path}:{indexed.locator.line_number}: {exc}"
-                    ) from exc
-                if not isinstance(value, dict):
-                    raise ValueError(
-                        "JSONL row is not an object at "
-                        f"{path}:{indexed.locator.line_number}"
-                    )
-                locator = indexed.locator.bind(
-                    group=str(value.get("group") or ""),
-                    task_id=str(value.get("task_id") or ""),
-                )
-                _view, compact = source_index.classification_row(locator, value)
-                if not compact:
-                    raise ValueError(
-                        "compact audit source lacks its authenticated sibling binding"
-                    )
-                locators.append(locator)
-        source_index.seal()
-        for locator in locators:
-            value = source_index.consume_row(locator)
-            value["_audit_source"] = str(path)
-            value["_audit_source_line"] = locator.line_number
-            materialized.append(value)
-    return materialized
-
-
-def _standard_sibling_declares_compact_evidence(path: Path) -> bool:
     standard = ResumeSourceIndex._standard_manifest_path(path)
-    if standard is None:
-        return False
+    if standard is None:  # pragma: no cover - caller guards this boundary.
+        raise ValueError("standard DRACO result path is malformed")
     stamp, manifest_path = standard
-    pack_path = manifest_path.parent / f"draco_run_{stamp}.selection-plan.pack.jsonl"
-    if os.path.lexists(pack_path):
-        return True
-    if not os.path.lexists(manifest_path):
-        return False
-    try:
-        manifest, _signature, _sha256 = _read_json_object_snapshot(
-            manifest_path,
-            label="audit sibling manifest",
-        )
-    except (DracoResumeSourceError, OSError):
-        # A pathname that exists but cannot be safely classified is evidence,
-        # not an excuse to downgrade to the legacy parser. The authenticated
-        # compact boundary below will surface the precise fail-closed error.
-        return True
-    artifacts = manifest.get("artifacts")
-    return bool(
-        SELECTION_PLAN_EVIDENCE_ROW_FIELD in manifest
-        or SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD in manifest
-        or (
-            isinstance(artifacts, dict)
-            and SELECTION_PLAN_PACK_ARTIFACT_FIELD in artifacts
-        )
+    reserved_pack_name = f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    pending: list[tuple[dict[str, Any] | None, ResumeRowLocator | None, int]] = []
+    directory_fd, directory_signature = _open_bound_source_directory(
+        manifest_path.parent
     )
+    try:
+        with ResumeSourceIndex([path], force_spool=False) as source_index:
+            with source_index.open_source(path, source_index=0) as indexed_rows:
+                for indexed in indexed_rows:
+                    if indexed.parsed_row is not None:
+                        pending.append(
+                            (indexed.parsed_row, None, indexed.locator.line_number)
+                        )
+                        continue
+                    text = indexed.payload.decode("utf-8")
+                    if not text.strip():
+                        continue
+                    try:
+                        value = json.loads(text)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"invalid JSONL at {path}:"
+                            f"{indexed.locator.line_number}: {exc}"
+                        ) from exc
+                    if not isinstance(value, dict):
+                        raise ValueError(
+                            "JSONL row is not an object at "
+                            f"{path}:{indexed.locator.line_number}"
+                        )
+                    locator = indexed.locator.bind(
+                        group=str(value.get("group") or ""),
+                        task_id=str(value.get("task_id") or ""),
+                    )
+                    _view, compact = source_index.classification_row(locator, value)
+                    if not compact:
+                        raise ValueError(
+                            "compact audit source lacks its authenticated sibling "
+                            "binding"
+                        )
+                    del _view
+                    pending.append((None, locator, locator.line_number))
+            authenticated_compact = source_index.source_is_compact_authenticated(
+                source_index=0
+            )
+            reserved_pack_present = _bound_pathname_presence_snapshot(
+                directory_fd,
+                reserved_pack_name,
+                directory_path=manifest_path.parent,
+                directory_signature=directory_signature,
+            )
+            if reserved_pack_present and not authenticated_compact:
+                raise ValueError(
+                    "reserved selection-plan pack lacks its authenticated sibling "
+                    "binding"
+                )
+            source_index.seal()
+            rows: list[dict[str, Any]] = []
+            for legacy_row, locator, line_number in pending:
+                if locator is None:
+                    assert legacy_row is not None
+                    value = legacy_row
+                else:
+                    value = source_index.consume_row(locator)
+                value["_audit_source"] = str(path)
+                value["_audit_source_line"] = line_number
+                rows.append(value)
+            current_pack_present = _bound_pathname_presence_snapshot(
+                directory_fd,
+                reserved_pack_name,
+                directory_path=manifest_path.parent,
+                directory_signature=directory_signature,
+            )
+            if current_pack_present != reserved_pack_present:
+                raise ValueError(
+                    "reserved selection-plan pack changed during audit binding"
+                )
+        current_pack_present = _bound_pathname_presence_snapshot(
+            directory_fd,
+            reserved_pack_name,
+            directory_path=manifest_path.parent,
+            directory_signature=directory_signature,
+        )
+        if current_pack_present != reserved_pack_present:
+            raise ValueError("reserved selection-plan pack changed during audit binding")
+        return rows
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows = _read_unbound_jsonl(path)
-    row_declares_compact_evidence = any(
-        selection_plan_row_capability_signal(row)
-        or selection_plan_reference_signal(row)
-        for row in rows
-    )
-    if not row_declares_compact_evidence and not (
-        _standard_sibling_declares_compact_evidence(path)
-    ):
-        return rows
-    # Compact rows are not data until their standard sibling terminal
-    # manifest, durable result/trace/checkpoint trio, and pack all bind.  The
-    # shared resume index owns that fail-closed protocol and its TOCTOU checks.
-    return _read_bound_compact_jsonl(path)
+    if ResumeSourceIndex._standard_manifest_path(path) is None:
+        return _read_unbound_jsonl(path)
+    # A stamped result must never mix rows from one pathname snapshot with a
+    # sibling-manifest decision from another. ResumeSourceIndex owns the first
+    # open, row parsing, optional compact binding, and final pathname check.
+    return _read_standard_jsonl(path)
 
 
 def invalid_reasons(

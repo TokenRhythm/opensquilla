@@ -406,6 +406,35 @@ class ResumeSourceIndex:
     def closed(self) -> bool:
         return self._closed
 
+    def source_is_compact_authenticated(self, *, source_index: int) -> bool:
+        """Report a completed source's bound compact state without doing I/O."""
+
+        self._require_open()
+        if (
+            isinstance(source_index, bool)
+            or not isinstance(source_index, int)
+            or source_index < 0
+        ):
+            raise DracoResumeSourceError("resume source index must be non-negative")
+        if self._active_source_id is not None:
+            raise DracoResumeSourceError(
+                "cannot inspect compact authentication during a source scan"
+            )
+        matches = [
+            snapshot
+            for snapshot in self._sources.values()
+            if snapshot.source_index == source_index
+        ]
+        if not matches:
+            raise DracoResumeSourceError(
+                f"resume source index has no completed source {source_index}"
+            )
+        if len(matches) != 1:
+            raise DracoResumeSourceError(
+                f"resume source index is not unique for source {source_index}"
+            )
+        return matches[0].compact_bundle is not None
+
     def _require_open(self) -> None:
         if self._closed:
             raise DracoResumeSourceError("resume source index is closed")
