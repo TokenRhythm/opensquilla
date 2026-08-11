@@ -54,6 +54,36 @@ Schema：`opensquilla.ensemble-execution-metrics/v1`。
 
 当前没有 end-to-end ensemble latency、metrics delivery coverage、trace schema revision hash、snapshot version/hash、snapshot build/filter/score latency 或 snapshot cache hit producer 字段；这些全部 unavailable。
 
+现有 `selection_plan` 中的 `candidate_pool`、`hard_filter` 和
+`model_scores` 只是确定性的阶段产物，不能证明阶段耗时；同样，进程内
+packaged-registry template index 使用缓存，并不等于 terminal trace 已记录
+“本次 lookup 命中”。禁止用这些产物是否存在推导 latency，禁止用进程级
+cache counter 的前后差值归因单次请求，也禁止把缺失字段补成 `0` 或
+`cache_hit=false`。
+
+最小 producer instrumentation 必须先满足以下前置条件，之后才能扩展 v1
+projector：
+
+1. 在 snapshot build、hard filter、score 的真实函数边界用 monotonic clock
+   记录有界整数毫秒；计时通过私有 sidecar 传递，不能写进确定性的 ranking
+   decision 或 replay 输入。主要解决：避免 nondeterministic latency 污染选择
+   结果与 replay。
+2. 缓存 primitive 必须在完成单次 lookup 时原子返回 hit/miss；不能从全局
+   `cache_info()` delta 猜测，因为并发 lookup 无法安全归因。主要解决：保证
+   cache-hit denominator 是请求级真实证据。
+3. producer 需要先定义版本化 terminal evidence block，并完成 trace schema、
+   artifact hash、历史 replay 与 compact-evidence 兼容性迁移；在确认 selection
+   fingerprint 和内容寻址语义不漂移前，不得把 sidecar 塞入现有
+   `selection_plan`。主要解决：保护现有 trace/hash 契约。
+4. projector 只接受固定 schema、非负有界整数和严格 bool；为每个阶段分别
+   输出 `*_observed`，只有三个计时都合法时才允许
+   `ranking_stage_projection_complete=true`。任何异常继续 fail-open，且不能把
+   snapshot version/hash、model/provider identity 或 cache key 投影为 label。
+   主要解决：固定 cardinality，并保持 telemetry 不影响模型调用。
+
+上述 producer 与迁移尚未实现，因此 dashboard 和 SLO 必须继续把这组字段显示
+为 unavailable；本节是实现门槛，不是已经生效的字段契约。
+
 主要解决：提供跨后端一致的结果与 trace 容量视图，同时明确 snapshot 和端到端延迟仍缺证据。
 
 ### 3.2 Task Analyzer
