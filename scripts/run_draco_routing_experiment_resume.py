@@ -100,6 +100,7 @@ from opensquilla.eval.draco_artifact_io import (
     iter_verified_result_rows,
 )
 from opensquilla.eval.draco_experiment_artifacts import (
+    gateway_replay_validation_contract,
     publish_experiment_config_artifacts,
 )
 from opensquilla.eval.draco_experiment_config import (
@@ -15424,15 +15425,6 @@ def command_argv(args: argparse.Namespace) -> list[str]:
         str(Path(__file__).resolve()),
         *reconstructed_cli_args(args),
     ]
-
-
-def gateway_replay_validation_contract() -> dict[str, Any]:
-    return {
-        "replay_scope": "experiment_config_and_cli_args",
-        "gateway_config_materialization": "external",
-        "required_post_run_validation": "compare_run_compatibility_fingerprint",
-        "contract_fields": ["gateway_execution", "resolved_llm_runtime"],
-    }
 
 
 def command_payload(args: argparse.Namespace) -> dict[str, Any]:

@@ -11524,6 +11524,12 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     from opensquilla.eval import draco_experiment_artifacts, draco_usage_evidence
 
     resume_runner = _load_resume_runner()
+    assert runner.gateway_replay_validation_contract is (
+        draco_experiment_artifacts.gateway_replay_validation_contract
+    )
+    assert resume_runner.gateway_replay_validation_contract is (
+        draco_experiment_artifacts.gateway_replay_validation_contract
+    )
     assert runner.publish_experiment_config_artifacts is (
         draco_experiment_artifacts.publish_experiment_config_artifacts
     )
@@ -11639,6 +11645,27 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         runner._ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
         == resume_runner._ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
     )
+
+
+def test_shared_gateway_replay_validation_contract_returns_fresh_payload() -> None:
+    from opensquilla.eval import draco_experiment_artifacts
+
+    expected = {
+        "replay_scope": "experiment_config_and_cli_args",
+        "gateway_config_materialization": "external",
+        "required_post_run_validation": "compare_run_compatibility_fingerprint",
+        "contract_fields": ["gateway_execution", "resolved_llm_runtime"],
+    }
+    first = draco_experiment_artifacts.gateway_replay_validation_contract()
+    second = draco_experiment_artifacts.gateway_replay_validation_contract()
+
+    assert first == second == expected
+    assert first is not second
+    assert first["contract_fields"] is not second["contract_fields"]
+
+    first["contract_fields"].append("mutation-must-not-leak")
+
+    assert draco_experiment_artifacts.gateway_replay_validation_contract() == expected
 
 
 def test_all_serialized_cost_accounting_assignments_strip_private_provenance() -> None:
