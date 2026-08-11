@@ -11601,9 +11601,14 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         assert getattr(runner, name) is shared
         assert getattr(resume_runner, name) is shared
     shared_usage_functions = (
+        "aggregate_agent_ensemble_trace",
+        "aggregate_agent_model_usage",
         "build_stable_receipt_evidence",
+        "coerce_metric_int",
         "deduplicate_stable_usage_receipts",
+        "llm_response_records",
         "merge_usage_receipt_provenance",
+        "payload_physical_request_count",
         "usage_receipt_fingerprint",
         "usage_row_is_missing_placeholder",
         "usage_row_match_priority",
