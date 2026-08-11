@@ -10,7 +10,10 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import { localizedSkillDescription } from '@/composables/skills/useSkillsCatalog'
+import {
+  localizedSkillDescription,
+  type SkillLifecycleTone,
+} from '@/composables/skills/useSkillsCatalog'
 import type { IconName } from '@/utils/icons'
 import { assignedFallbackIcon } from '@/utils/skillIcons'
 
@@ -25,6 +28,8 @@ const props = defineProps<{
   meta?: boolean
   source?: string
   trustLevel?: string
+  lifecycleLabel?: string
+  lifecycleTone?: SkillLifecycleTone
   statusDotClass?: string
   statusDotTitle?: string
 }>()
@@ -69,7 +74,7 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
       <span class="sk-tile__name" :title="name">{{ name }}</span>
       <span class="sk-tile__desc">{{ desc }}</span>
       <span
-        v-if="variant === 'registry' && (source || trustLevel)"
+        v-if="variant === 'registry' && (source || trustLevel || lifecycleLabel)"
         class="sk-tile__registry-meta"
       >
         <span v-if="source" class="sk-tile__source">{{ source }}</span>
@@ -78,7 +83,17 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
           class="sk-tile__trust"
           :class="{ 'is-trusted': trustLevel === 'trusted' || trustLevel === 'builtin' }"
         >{{ trustLevel }}</span>
+        <span
+          v-if="lifecycleLabel"
+          class="sk-tile__lifecycle"
+          :data-tone="lifecycleTone || 'neutral'"
+        >{{ lifecycleLabel }}</span>
       </span>
+      <span
+        v-if="variant === 'installed' && lifecycleLabel"
+        class="sk-tile__lifecycle sk-tile__lifecycle--installed"
+        :data-tone="lifecycleTone || 'neutral'"
+      >{{ lifecycleLabel }}</span>
     </span>
 
     <span class="sk-tile__action">
@@ -196,7 +211,8 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
   margin-top: 4px;
 }
 .sk-tile__source,
-.sk-tile__trust {
+.sk-tile__trust,
+.sk-tile__lifecycle {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text-dim);
@@ -205,6 +221,21 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
   line-height: 18px;
   padding: 0 6px;
 }
+.sk-tile__lifecycle--installed {
+  align-self: flex-start;
+  margin-top: 2px;
+  width: fit-content;
+}
+.sk-tile__lifecycle {
+  --sk-lifecycle-tone: var(--text-dim);
+  background: color-mix(in srgb, var(--sk-lifecycle-tone) 8%, transparent);
+  border-color: color-mix(in srgb, var(--sk-lifecycle-tone) 38%, var(--border));
+  color: var(--sk-lifecycle-tone);
+}
+.sk-tile__lifecycle[data-tone='success'] { --sk-lifecycle-tone: var(--ok); }
+.sk-tile__lifecycle[data-tone='info'] { --sk-lifecycle-tone: var(--info); }
+.sk-tile__lifecycle[data-tone='warning'] { --sk-lifecycle-tone: var(--warn); }
+.sk-tile__lifecycle[data-tone='danger'] { --sk-lifecycle-tone: var(--danger); }
 .sk-tile__trust {
   border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
   color: var(--warn);

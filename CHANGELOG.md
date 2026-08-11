@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Community Skills from ClawHub and GitHub now support immutable source
+  resolution and transactional management through one shared service. Gateway
+  RPC and CLI add read-only Doctor diagnostics, agent installs return lifecycle
+  diagnostics, and the Web UI displays lifecycle and selection state. The
+  compatibility claim is intentionally limited to single-root,
+  instruction-first Skills; unsupported execution dialects remain inert and
+  explicit. Source package, managed storage, and runtime names are tracked
+  separately, dangerous scanner confirmations are bound to the reviewed
+  artifact, and GitHub batches are serial, capped at 10 references, and pause
+  remaining work when the source reports a rate limit.
 - Official TokenRhythm HTTPS API requests can now include the optional
   `X-OpenSquilla-Install-Id` header by default. It carries the existing
   pseudonymous, cross-session installation identifier without exposing raw
@@ -43,8 +53,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   ignore them; external decoders using `additionalProperties: false` must allow
   the new additive fields before upgrading.
 
+### Removed
+
+- Removed the in-repository `opensquilla swebench` CLI, optional dependency,
+  Python namespace, and bundled skill. Benchmark recipes and evidence now live
+  in the external experiment ledger and handoff runner; `opensquilla agent` and
+  Coding Mode are unchanged. Existing local benchmark artifacts are left
+  untouched and are no longer managed by OpenSquilla.
+
 ### Security
 
+- Community Skill ingestion now fails closed on unsafe archive paths and links,
+  ambiguous package roots, source drift, malformed manifests, YAML alias/depth
+  expansion, bounded artifact limits, and interrupted publication recovery.
 - LAN WebSocket peers are limited to loopback, RFC 1918, or IPv6 ULA ranges
   and may be narrowed further with `auth.allowed_client_cidrs`; public peers
   are rejected before authentication.

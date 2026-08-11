@@ -57,6 +57,24 @@ def _update_config_in_place(old: Any, new: Any) -> None:
         old.reconcile_runtime_overrides(new)
 
 
+async def _notify_goal_config_changed(ctx: RpcContext, previous_config: Any) -> None:
+    """Apply the committed Goal kill-switch transition to the live service."""
+
+    task_runtime = getattr(ctx, "task_runtime", None)
+    goal_service = getattr(task_runtime, "goal_service", None)
+    hook = getattr(goal_service, "on_config_changed", None)
+    if not callable(hook):
+        return
+    previous_goal = getattr(previous_config, "goal", previous_config)
+    previous_enabled = bool(getattr(previous_goal, "execution_enabled", False))
+    try:
+        await hook(previous_execution_enabled=previous_enabled)
+    except Exception:
+        # The service reads the current root config dynamically, so a failed
+        # best-effort pause hook still blocks every new automatic admission.
+        log.warning("gateway.goal_config_reconcile_failed", exc_info=True)
+
+
 def _persist_config(config: Any) -> None:
     """Write config to TOML, defaulting to the user config path when unset.
 
@@ -829,6 +847,7 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     # instead of silently diverging until the next restart reverts memory.
     _persist_config(new_config)
     _update_config_in_place(ctx.config, new_config)
+    await _notify_goal_config_changed(ctx, previous_config)
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
@@ -980,6 +999,7 @@ async def _handle_config_patch(
     _persist_config(new_config)
     # Update in-memory config so subsequent requests see changes immediately
     _update_config_in_place(ctx.config, new_config)
+    await _notify_goal_config_changed(ctx, previous_config)
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
@@ -1100,6 +1120,7 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     _persist_config(new_config)
     if ctx.config is not None:
         _update_config_in_place(ctx.config, new_config)
+        await _notify_goal_config_changed(ctx, previous_config)
     _sync_resolved_provider_selector(ctx, provider_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
@@ -1238,6 +1259,7 @@ async def _handle_config_reload(params: dict | None, ctx: RpcContext) -> dict[st
 
     # Step 4: swap values + runtime-secret markers into the live config.
     _update_config_in_place(ctx.config, candidate)
+    await _notify_goal_config_changed(ctx, previous_config)
     _sync_image_generation(candidate)
     _sync_model_catalog_overrides(candidate)
     await _reconcile_tokenrhythm_profile_after_config_change(

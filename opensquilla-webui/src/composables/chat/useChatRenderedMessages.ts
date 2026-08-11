@@ -39,7 +39,7 @@ import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { InterruptViewState } from '@/types/parts'
 import { toParts, toolState, type ToPartsInterrupt } from '@/utils/chat/toParts'
 import { toSources } from '@/utils/chat/toSources'
-import { relativeTime } from '@/utils/messageTime'
+import { relativeTime, type TimeTranslator } from '@/utils/messageTime'
 
 export interface NormalizedRouterDecision extends Record<string, unknown> {
   tier: string
@@ -71,6 +71,7 @@ export interface UseChatRenderedMessagesOptions {
   stripGeneratedArtifactMarkers: (text: string) => string
   stripTimePrefix: (text: string) => string
   isSubagentCompletionMessage: (role: string, text: string, options?: ChatMessage) => boolean
+  timeTranslator?: TimeTranslator
 }
 
 type ChatRouterRequestKind = 'text' | 'image'
@@ -353,12 +354,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           : msg.role === 'assistant'
             ? options.stripGeneratedArtifactMarkers(msg.text)
             : msg.text,
-        timeStr: relativeTime(msg.ts),
+        timeStr: relativeTime(msg.ts, Date.now(), options.timeTranslator),
         ts: msg.ts ?? null,
         showHeader: !sameGroup,
         messageId: msg.messageId,
         restoredFromHistory: msg.restoredFromHistory,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
+        turnId: messageTurnId || undefined,
         inputDisposition: msg.inputDisposition,
         inputDispositionRevision: msg.inputDispositionRevision,
         maintenance: msg.maintenance,
@@ -442,7 +444,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       displayRole: 'router',
       roleLabel: 'Router',
       text: '',
-      timeStr: relativeTime(msg.ts),
+      timeStr: relativeTime(msg.ts, Date.now(), options.timeTranslator),
       ts: msg.ts ?? null,
       showHeader: false,
       sourceIndex: index,
@@ -477,7 +479,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       displayRole: 'router',
       roleLabel: 'Router',
       text: '',
-      timeStr: relativeTime(msg.ts),
+      timeStr: relativeTime(msg.ts, Date.now(), options.timeTranslator),
       ts: msg.ts ?? null,
       showHeader: false,
       sourceIndex: index,

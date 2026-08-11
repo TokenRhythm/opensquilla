@@ -9,8 +9,9 @@ import math
 import os
 import re
 import sys
+from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -37,6 +38,7 @@ from .compat_policy import (
     TEXT_TOOL_DIALECT_PLAIN_JSON,
     TEXT_TOOL_DIALECT_QWEN_TAG,
     OpenAICompatPolicy,
+    ReasoningModelRule,
     compat_policy_for_kind,
 )
 from .context_capabilities import supports_openrouter_explicit_prompt_cache
@@ -112,6 +114,7 @@ from .types import (
 
 _OPENAI_API_BASE = "https://api.openai.com"
 log = structlog.get_logger(__name__)
+_OPENROUTER_GENERATION_ID_RE = re.compile(r"\Agen-[A-Za-z0-9_-]{1,255}\Z")
 _DASHSCOPE_PARAMETER_RE = re.compile(
     r"<parameter(?:\s[^>]*)?>(?P<body>[\s\S]*?)</parameter>",
     re.IGNORECASE,
@@ -460,6 +463,48 @@ def _base_url_hostname(base_url: str) -> str:
         return ""
 
 
+def _openrouter_generation_id_from_headers(
+    headers: Mapping[str, Any] | None,
+) -> str | None:
+    """Return only a bounded, official-shaped OpenRouter generation ID."""
+
+    if headers is None:
+        return None
+    value = str(headers.get("x-generation-id") or "").strip()
+    if not _OPENROUTER_GENERATION_ID_RE.fullmatch(value):
+        return None
+    return value
+
+
+_OPENAI_REASONING_TEXT_FIELDS = ("reasoning_content", "reasoning")
+
+
+def _openai_reasoning_fragments(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Normalize OpenAI-compatible reasoning aliases into text fragments.
+
+    Gateways may expose the same semantic stream as ``reasoning_details``,
+    ``reasoning_content``, or ``reasoning`` depending on the selected upstream.
+    Keep that wire-format tolerance in one read-only boundary so streaming and
+    non-streaming responses feed the same canonical reasoning accumulator.
+    """
+
+    fragments: list[str] = []
+    reasoning_details = payload.get("reasoning_details")
+    if isinstance(reasoning_details, list):
+        for detail in reasoning_details:
+            if not isinstance(detail, Mapping):
+                continue
+            text = detail.get("text")
+            if isinstance(text, str) and text:
+                fragments.append(text)
+    for reasoning_field in _OPENAI_REASONING_TEXT_FIELDS:
+        text = payload.get(reasoning_field)
+        if isinstance(text, str) and text:
+            fragments.append(text)
+            break
+    return tuple(fragments)
+
+
 def _safe_validation_message(value: object) -> str:
     """Return a bounded, single-line, secret-redacted validation detail."""
     if not isinstance(value, str):
@@ -592,6 +637,50 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
+_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV = "OPENSQUILLA_DASHSCOPE_PARALLEL_TOOL_CALLS"
+_DASHSCOPE_NON_STREAM_FALLBACK_ENV = "OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK"
+
+
+def _dashscope_parallel_tool_calls_from_env() -> bool:
+    """Return the opt-in DashScope parallel tool-call request setting.
+
+    The default and explicit false forms preserve the historical payload by
+    omitting ``parallel_tool_calls``. Invalid values fail closed so benchmark
+    arms cannot silently become null treatments because of a typo.
+    """
+    raw = os.environ.get(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV)
+    if raw is None or not raw.strip():
+        return False
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV} must be one of "
+        "1/true/yes/on or 0/false/no/off"
+    )
+
+
+def _dashscope_non_stream_fallback_from_env() -> bool:
+    """Return whether DashScope may retry a stream as a non-stream request.
+
+    The historical default is enabled. Invalid values fail closed at request
+    construction so benchmark manifests cannot claim a strict streaming arm
+    while silently retaining the fallback.
+    """
+    raw = os.environ.get(_DASHSCOPE_NON_STREAM_FALLBACK_ENV)
+    if raw is None or not raw.strip():
+        return True
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{_DASHSCOPE_NON_STREAM_FALLBACK_ENV} must be one of "
+        "1/true/yes/on or 0/false/no/off"
+    )
 
 
 def _thinking_budget_tokens_from_env() -> int | None:
@@ -689,11 +778,38 @@ _DASHSCOPE_PRESERVE_THINKING_MODEL_IDS = frozenset(
         "qwen3.6-max-preview",
     }
 )
+_DASHSCOPE_PRESERVE_THINKING_EXPERIMENT_MODEL_IDS = frozenset(
+    {
+        "qwen3.6-flash",
+        "qwen3.6-flash-2026-04-16",
+        "qwen3.7-flash",
+        "qwen3.7-flash-2026-07-15",
+    }
+)
+_DASHSCOPE_PRESERVE_THINKING_ENV = "OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING"
 
 
 def _dashscope_supports_preserve_thinking(model: str) -> bool:
     model_name = model.rsplit("/", 1)[-1].strip().lower()
     return model_name in _DASHSCOPE_PRESERVE_THINKING_MODEL_IDS
+
+
+def _dashscope_preserve_thinking_override_from_env() -> bool | None:
+    """Return an explicit preserve-thinking treatment, or None for model auto-detection."""
+    raw = os.environ.get(_DASHSCOPE_PRESERVE_THINKING_ENV)
+    if raw is None or not raw.strip():
+        return None
+    normalized = raw.strip().lower()
+    if normalized == "auto":
+        return None
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{_DASHSCOPE_PRESERVE_THINKING_ENV} must be one of "
+        "auto, 1/true/yes/on, or 0/false/no/off"
+    )
 
 
 def _should_send_temperature(
@@ -727,6 +843,7 @@ def _apply_compat_request_constraints(
     payload: dict[str, Any],
     *,
     policy: OpenAICompatPolicy,
+    reasoning_rule: ReasoningModelRule | None,
     model: str,
     cfg: ChatConfig,
     has_tools: bool,
@@ -738,10 +855,32 @@ def _apply_compat_request_constraints(
     if force_thinking:
         payload["enable_thinking"] = True
 
+    thinking_object = payload.get("thinking")
+    thinking_enabled = payload.get("enable_thinking") is True or bool(
+        isinstance(thinking_object, Mapping)
+        and thinking_object.get("type") == "enabled"
+    )
+    thinking_unspecified = bool(
+        reasoning_rule
+        and reasoning_rule.reasoning_format
+        and "thinking" not in payload
+        and "enable_thinking" not in payload
+    )
+    tool_choice_auto_only = policy.thinking_tool_choice_auto_only or bool(
+        reasoning_rule and reasoning_rule.thinking_tool_choice_auto_only
+    )
+    prefer_pinned_over_thinking = (
+        policy.prefer_pinned_tool_choice_over_thinking
+        or bool(
+            reasoning_rule
+            and reasoning_rule.prefer_pinned_tool_choice_over_thinking
+        )
+    )
     if (
-        policy.thinking_tool_choice_auto_only
+        tool_choice_auto_only
         and (
-            payload.get("enable_thinking") is True
+            thinking_enabled
+            or thinking_unspecified
             or model_name in policy.implicit_thinking_tool_choice_model_ids
         )
         and "tool_choice" in payload
@@ -756,17 +895,25 @@ def _apply_compat_request_constraints(
         if tool_choice_type in {"auto", "none"}:
             payload["tool_choice"] = tool_choice_type
         elif (
-            policy.prefer_pinned_tool_choice_over_thinking
+            prefer_pinned_over_thinking
             and pinned_tool_choice
             and not force_thinking
         ):
-            payload["enable_thinking"] = False
+            if reasoning_rule and reasoning_rule.reasoning_format:
+                apply_reasoning_disable(
+                    payload,
+                    reasoning_rule.reasoning_format,
+                    ReasoningDisableArgs(model=model),
+                )
+            else:
+                payload["enable_thinking"] = False
             payload.pop("thinking_budget", None)
             payload.pop("reasoning_effort", None)
             payload.pop("preserve_thinking", None)
-            for message in payload.get("messages", ()):
-                if isinstance(message, dict):
-                    message.pop("reasoning_content", None)
+            if reasoning_rule is None:
+                for message in payload.get("messages", ()):
+                    if isinstance(message, dict):
+                        message.pop("reasoning_content", None)
         else:
             # The endpoint rejects required/pinned choices while thinking.
             # Preserve the requested reasoning mode and degrade the selector
@@ -2486,6 +2633,95 @@ def _attach_reasoning_content(
     return payload
 
 
+@dataclass(slots=True)
+class _ReasoningReplayStats:
+    limit_utf16_units: int | None = None
+    replay_candidates: list[tuple[str, int | None]] = field(
+        default_factory=list
+    )
+
+
+def _retained_reasoning_replay_units(
+    payload: Mapping[str, Any],
+    stats: _ReasoningReplayStats,
+) -> list[int]:
+    """Return only over-limit suppressions still present in the final payload."""
+
+    if not stats.replay_candidates:
+        return []
+    retained_signatures: Counter[str] = Counter()
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return []
+    for message in messages:
+        if (
+            not isinstance(message, Mapping)
+            or message.get("role") != "assistant"
+            or message.get("reasoning_content") != ""
+        ):
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        if any(
+            isinstance(tool_call, Mapping) and tool_call.get("id")
+            for tool_call in tool_calls
+        ):
+            retained_signatures[_reasoning_replay_signature(message)] += 1
+
+    # Count only suppressions that are provably retained. Identical naturally
+    # empty tool messages make provenance ambiguous after context shaping, so
+    # consume those first and conservatively under-count instead of emitting a
+    # false transport metric.
+    candidates_by_signature: dict[str, list[int | None]] = {}
+    for signature, units in stats.replay_candidates:
+        candidates_by_signature.setdefault(signature, []).append(units)
+    retained_units: list[int] = []
+    for signature, final_count in retained_signatures.items():
+        candidates = candidates_by_signature.get(signature, [])
+        natural_count = sum(units is None for units in candidates)
+        guaranteed_suppressed = max(0, final_count - natural_count)
+        if guaranteed_suppressed <= 0:
+            continue
+        suppressed_units = [units for units in candidates if units is not None]
+        if final_count >= len(candidates):
+            retained_units.extend(suppressed_units)
+        elif len(set(suppressed_units)) == 1:
+            retained_units.extend(suppressed_units[:guaranteed_suppressed])
+    return retained_units
+
+
+def _reasoning_replay_signature(message: Mapping[str, Any]) -> str:
+    """Return a full in-memory digest used only for conservative telemetry."""
+
+    raw = json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _reasoning_rule_for_request(
+    policy: OpenAICompatPolicy,
+    *,
+    model: str,
+    base_url: str,
+) -> ReasoningModelRule | None:
+    for rule in policy.reasoning_model_rules:
+        if rule.matches(model, base_url):
+            return rule
+    return None
+
+
+def _utf16_code_units(value: str) -> int:
+    """Count provider-side JavaScript string units without allocating a copy."""
+
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in value)
+
+
+def _message_contains_tool_use(message: Message) -> bool:
+    return not isinstance(message.content, str) and any(
+        block.type == "tool_use" for block in message.content
+    )
+
+
 _REASONING_ECHO_TURNS_ENV = "OPENSQUILLA_REASONING_ECHO_TURNS"
 
 
@@ -2533,7 +2769,10 @@ def _requires_assistant_reasoning_content(
     model: str,
     *,
     thinking: bool = False,
+    reasoning_rule: ReasoningModelRule | None = None,
 ) -> bool:
+    if reasoning_rule is not None:
+        return reasoning_rule.require_reasoning_content
     model_name = model_basename(model)
     return model_name in policy.require_reasoning_content_model_ids or (
         thinking
@@ -2570,7 +2809,10 @@ def _should_replay_reasoning_content(
     model: str,
     caps: ModelCapabilities | None,
     thinking: bool = False,
+    reasoning_rule: ReasoningModelRule | None = None,
 ) -> bool:
+    if reasoning_rule is not None:
+        return reasoning_rule.require_reasoning_content
     model_name = model_basename(model)
     effective_thinking = _effective_policy_thinking(
         policy, model, thinking=thinking
@@ -2585,12 +2827,28 @@ def _should_replay_reasoning_content(
         return True
     if not caps or not caps.supports_reasoning:
         return False
-    if effective_thinking and model_name in policy.preserve_thinking_model_ids:
-        return True
     if caps.reasoning_format == "dashscope":
         if not effective_thinking:
             return False
-        return _dashscope_supports_preserve_thinking(model)
+        supported_by_default = (
+            model_name in policy.preserve_thinking_model_ids
+            or _dashscope_supports_preserve_thinking(model)
+        )
+        override = _dashscope_preserve_thinking_override_from_env()
+        if override is None:
+            return supported_by_default
+        supported_by_override = (
+            supported_by_default
+            or model_name in _DASHSCOPE_PRESERVE_THINKING_EXPERIMENT_MODEL_IDS
+        )
+        if override and not supported_by_override:
+            raise ValueError(
+                f"{_DASHSCOPE_PRESERVE_THINKING_ENV}=on is not supported "
+                f"for DashScope model {model!r}"
+            )
+        return override
+    if effective_thinking and model_name in policy.preserve_thinking_model_ids:
+        return True
     return bool(policy.replay_reasoning_format) and (
         caps.reasoning_format == policy.replay_reasoning_format
     )
@@ -2726,6 +2984,8 @@ def _build_openai_wire_messages(
     replay_provider_state: bool,
     reasoning_echo_turns: int | None,
     logical_index_map: dict[int, int] | None = None,
+    reasoning_rule: ReasoningModelRule | None = None,
+    reasoning_replay_stats: _ReasoningReplayStats | None = None,
 ) -> list[dict[str, Any]]:
     """Build the exact OpenAI-compatible wire-message array, without I/O."""
     openai_messages: list[dict[str, Any]] = []
@@ -2736,6 +2996,7 @@ def _build_openai_wire_messages(
             model=model,
             caps=caps,
             thinking=cfg.thinking,
+            reasoning_rule=reasoning_rule,
         )
     )
     explicit_cache_supported = False
@@ -2768,27 +3029,69 @@ def _build_openai_wire_messages(
         effective_thinking = _effective_policy_thinking(
             policy, model, thinking=cfg.thinking
         )
-        openai_messages.extend(
-            _build_openai_messages(
-                message,
-                include_reasoning_content=(
-                    include_reasoning_content
-                    if reasoning_echo_allowed is None
-                    else message_index in reasoning_echo_allowed
-                ),
-                require_assistant_reasoning_content=(
-                    _requires_assistant_reasoning_content(
-                        policy, model, thinking=effective_thinking
-                    )
-                ),
-                require_tool_call_reasoning_content=(
-                    _requires_tool_call_reasoning_content(
-                        policy, model, thinking=effective_thinking
-                    )
-                ),
-                replay_provider_state=replay_provider_state,
-            )
+        message_replays_reasoning = (
+            include_reasoning_content
+            if reasoning_echo_allowed is None
+            else message_index in reasoning_echo_allowed
         )
+        if (
+            reasoning_rule is not None
+            and reasoning_rule.replay_scope == "tool_call_assistant"
+            and not _message_contains_tool_use(message)
+        ):
+            message_replays_reasoning = False
+        limit = (
+            reasoning_rule.max_reasoning_content_utf16_units
+            if reasoning_rule is not None
+            else None
+        )
+        suppressed_units: int | None = None
+        if (
+            message_replays_reasoning
+            and limit is not None
+            and message.role == "assistant"
+            and message.reasoning_content
+        ):
+            observed_units = _utf16_code_units(message.reasoning_content)
+            if observed_units > limit:
+                message_replays_reasoning = False
+                if reasoning_replay_stats is not None:
+                    reasoning_replay_stats.limit_utf16_units = limit
+                    suppressed_units = observed_units
+        built_messages = _build_openai_messages(
+            message,
+            include_reasoning_content=message_replays_reasoning,
+            require_assistant_reasoning_content=(
+                _requires_assistant_reasoning_content(
+                    policy,
+                    model,
+                    thinking=effective_thinking,
+                    reasoning_rule=reasoning_rule,
+                )
+            ),
+            require_tool_call_reasoning_content=(
+                _requires_tool_call_reasoning_content(
+                    policy, model, thinking=effective_thinking
+                )
+            ),
+            replay_provider_state=replay_provider_state,
+        )
+        if reasoning_replay_stats is not None and limit is not None:
+            for built_message in built_messages:
+                tool_calls = built_message.get("tool_calls")
+                if (
+                    built_message.get("role") == "assistant"
+                    and built_message.get("reasoning_content") == ""
+                    and isinstance(tool_calls, list)
+                    and any(
+                        isinstance(tool_call, Mapping) and tool_call.get("id")
+                        for tool_call in tool_calls
+                    )
+                ):
+                    reasoning_replay_stats.replay_candidates.append(
+                        (_reasoning_replay_signature(built_message), suppressed_units)
+                    )
+        openai_messages.extend(built_messages)
     if provider_kind == "dashscope" and cfg.cache_mode == "on":
         _attach_cache_control_to_latest_text_messages(
             openai_messages,
@@ -2955,6 +3258,11 @@ class OpenAIProvider:
             raise ValueError("additional_messages must be a non-negative integer")
         cfg = config or ChatConfig()
         wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
+        reasoning_rule = _reasoning_rule_for_request(
+            self._compat,
+            model=self._model,
+            base_url=self._base_url,
+        )
         wire_messages = _build_openai_wire_messages(
             messages,
             wire_cfg,
@@ -2963,6 +3271,7 @@ class OpenAIProvider:
             model=self._model,
             replay_provider_state=self._replay_provider_state,
             reasoning_echo_turns=self._reasoning_echo_turns,
+            reasoning_rule=reasoning_rule,
         )
         return ProviderMessageCountProjection(
             actual_wire_messages=len(wire_messages) + additional_messages,
@@ -2984,16 +3293,28 @@ class OpenAIProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
-    ) -> tuple[dict[str, Any], int | None, str | None]:
+    ) -> tuple[
+        dict[str, Any],
+        int | None,
+        str | None,
+        _ReasoningReplayStats,
+    ]:
         wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         caps = cfg.model_capabilities
+        reasoning_rule = _reasoning_rule_for_request(
+            self._compat,
+            model=self._model,
+            base_url=self._base_url,
+        )
         include_reasoning_content = _should_replay_reasoning_content(
             policy=self._compat,
             model=self._model,
             caps=caps,
             thinking=cfg.thinking,
+            reasoning_rule=reasoning_rule,
         )
         logical_index_map: dict[int, int] = {}
+        reasoning_replay_stats = _ReasoningReplayStats()
         openai_messages = _build_openai_wire_messages(
             messages,
             wire_cfg,
@@ -3003,6 +3324,8 @@ class OpenAIProvider:
             replay_provider_state=self._replay_provider_state,
             reasoning_echo_turns=self._reasoning_echo_turns,
             logical_index_map=logical_index_map,
+            reasoning_rule=reasoning_rule,
+            reasoning_replay_stats=reasoning_replay_stats,
         )
         wire_active_user_index = (
             logical_index_map.get(cfg.active_user_message_index)
@@ -3082,6 +3405,11 @@ class OpenAIProvider:
                 )
                 for tool in tools
             ]
+            if (
+                self._provider_kind == "dashscope"
+                and _dashscope_parallel_tool_calls_from_env()
+            ):
+                payload["parallel_tool_calls"] = True
             if _should_send_tool_choice(self._provider_kind, cfg, caps):
                 payload["tool_choice"] = cfg.tool_choice
         if self._compat.supports_provider_routing_pin:
@@ -3098,17 +3426,34 @@ class OpenAIProvider:
                         "allow_fallbacks": True,
                     }
 
-        thinking_toggle_model = (
-            self._model.strip().lower() in self._compat.thinking_toggle_model_ids
+        thinking_toggle_model = bool(
+            (reasoning_rule and reasoning_rule.reasoning_format)
+            or self._model.strip().lower()
+            in self._compat.thinking_toggle_model_ids
         )
         if (caps and caps.supports_reasoning and cfg.thinking) or (
             thinking_toggle_model and cfg.thinking
         ):
             reasoning_format = (
-                caps.reasoning_format
-                if caps is not None
-                else self._compat.default_reasoning_format
+                reasoning_rule.reasoning_format
+                if reasoning_rule and reasoning_rule.reasoning_format
+                else (
+                    caps.reasoning_format
+                    if caps is not None
+                    else self._compat.default_reasoning_format
+                )
             )
+            reasoning_effort_override: str | None = None
+            if reasoning_rule and reasoning_rule.reasoning_format:
+                level = getattr(cfg.thinking_level, "value", "")
+                if (
+                    self._model.strip().lower()
+                    in reasoning_rule.low_effort_model_ids
+                    and level in {"minimal", "low"}
+                ):
+                    reasoning_effort_override = "low"
+                else:
+                    reasoning_effort_override = "high"
             apply_reasoning_enable(
                 payload,
                 reasoning_format,
@@ -3119,6 +3464,7 @@ class OpenAIProvider:
                     thinking_budget_explicit=bool(
                         cfg.thinking_budget_explicit
                     ),
+                    reasoning_effort_override=reasoning_effort_override,
                 ),
             )
             if reasoning_format == "dashscope":
@@ -3138,7 +3484,23 @@ class OpenAIProvider:
         ):
             pass
         elif thinking_toggle_model:
-            payload["thinking"] = {"type": "disabled"}
+            if reasoning_rule and reasoning_rule.reasoning_format:
+                configured_level = getattr(
+                    cfg.thinking_level,
+                    "value",
+                    cfg.thinking_level,
+                )
+                if str(configured_level or "").strip().lower() in {
+                    "none",
+                    "off",
+                }:
+                    apply_reasoning_disable(
+                        payload,
+                        reasoning_rule.reasoning_format,
+                        ReasoningDisableArgs(model=self._model),
+                    )
+            else:
+                payload["thinking"] = {"type": "disabled"}
         elif caps and caps.supports_reasoning:
             apply_reasoning_disable(
                 payload,
@@ -3154,6 +3516,7 @@ class OpenAIProvider:
         _apply_compat_request_constraints(
             payload,
             policy=self._compat,
+            reasoning_rule=reasoning_rule,
             model=self._model,
             cfg=cfg,
             has_tools=bool(tools),
@@ -3163,7 +3526,12 @@ class OpenAIProvider:
             if any(message.get("role") == "tool" for message in openai_messages)
             else None
         )
-        return payload, wire_active_user_index, fallback_reason
+        return (
+            payload,
+            wire_active_user_index,
+            fallback_reason,
+            reasoning_replay_stats,
+        )
 
     def project_final_request(
         self,
@@ -3176,7 +3544,12 @@ class OpenAIProvider:
         """Project the exact Chat Completions payload without I/O or shaping."""
 
         cfg = config or ChatConfig()
-        payload, wire_active_user_index, fallback_reason = self._build_payload(
+        (
+            payload,
+            wire_active_user_index,
+            fallback_reason,
+            _reasoning_replay_stats,
+        ) = self._build_payload(
             messages,
             tools,
             cfg,
@@ -3231,7 +3604,26 @@ class OpenAIProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
-        payload, wire_active_user_index, fallback_reason = self._build_payload(
+        non_stream_fallback_allowed = (
+            self._provider_kind != "dashscope"
+            or _dashscope_non_stream_fallback_from_env()
+        )
+        stream_timeout_fallback = (
+            self._compat.stream_timeout_fallback
+            and cfg.physical_attempt_limit != 1
+            and non_stream_fallback_allowed
+        )
+        empty_stream_fallback = (
+            self._compat.empty_stream_fallback
+            and cfg.physical_attempt_limit != 1
+            and non_stream_fallback_allowed
+        )
+        (
+            payload,
+            wire_active_user_index,
+            fallback_reason,
+            reasoning_replay_stats,
+        ) = self._build_payload(
             messages,
             tools,
             cfg,
@@ -3320,6 +3712,20 @@ class OpenAIProvider:
                 code="provider_request_budget_exhausted",
             )
             return
+        retained_replay_units = _retained_reasoning_replay_units(
+            payload,
+            reasoning_replay_stats,
+        )
+        if retained_replay_units:
+            log.info(
+                "provider.reasoning_content_withheld",
+                provider=self._provider_kind,
+                model=self._model,
+                reason="reasoning_content_limit",
+                withheld_count=len(retained_replay_units),
+                max_observed_utf16_units=max(retained_replay_units),
+                limit_utf16_units=reasoning_replay_stats.limit_utf16_units,
+            )
 
         headers: dict[str, str] = {
             "Content-Type": "application/json",
@@ -3417,6 +3823,7 @@ class OpenAIProvider:
         terminal_native_finish_reason_present = False
         terminal_native_finish_reason: Any = None
         active_choice_seen = False
+        response_ids: set[str] = set()
 
         if os.environ.get("OPENSQUILLA_TRACE_ROUTING"):
             print(
@@ -3504,10 +3911,7 @@ class OpenAIProvider:
             async with httpx.AsyncClient(
                 timeout=(
                     _stream_timeout(cfg.timeout)
-                    if (
-                        self._compat.stream_timeout_fallback
-                        and cfg.physical_attempt_limit != 1
-                    )
+                    if stream_timeout_fallback
                     else cfg.timeout
                 ),
                 trust_env=_trust_env(),
@@ -3528,6 +3932,14 @@ class OpenAIProvider:
                     headers=headers,
                     json=payload,
                 ) as response:
+                    response_generation_id = _openrouter_generation_id_from_headers(
+                        response.headers
+                    )
+                    if response_generation_id:
+                        response_ids.add(response_generation_id)
+                        trace.record_response_headers(
+                            response_ids=[response_generation_id]
+                        )
                     if self._compat.attribution_response_headers:
                         attribution = {
                             name: response.headers[name]
@@ -3648,7 +4060,6 @@ class OpenAIProvider:
                         )
                         return
 
-                    response_ids: set[str] = set()
                     trace_tool_calls: list[dict[str, Any]] = []
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):
@@ -3965,34 +4376,10 @@ class OpenAIProvider:
                             # has received reasoning deltas, an empty-stream or
                             # timeout fallback retry would deliver (and bill)
                             # the turn twice.
-                            reasoning_details = delta.get("reasoning_details")
-                            if reasoning_details:
-                                for detail in reasoning_details:
-                                    if isinstance(detail, dict):
-                                        reasoning_event = reasoning.emit(detail.get("text", ""))
-                                        if reasoning_event is not None:
-                                            emitted_stream_event = True
-                                            if text_tool_normalizer.native_lifecycle_deferred:
-                                                _append_coalesced_stream_event(
-                                                    deferred_post_native_events,
-                                                    reasoning_event,
-                                                )
-                                                if deferred_queue_is_oversized():
-                                                    for (
-                                                        release_event
-                                                    ) in release_deferred_queue():
-                                                        if isinstance(
-                                                            release_event,
-                                                            TextDeltaEvent,
-                                                        ):
-                                                            visible_assistant_text_parts.append(
-                                                                release_event.text
-                                                            )
-                                                        yield release_event
-                                            else:
-                                                yield reasoning_event
-                            reasoning_event = reasoning.emit(delta.get("reasoning_content"))
-                            if reasoning_event is not None:
+                            for fragment in _openai_reasoning_fragments(delta):
+                                reasoning_event = reasoning.emit(fragment)
+                                if reasoning_event is None:
+                                    continue
                                 emitted_stream_event = True
                                 if text_tool_normalizer.native_lifecycle_deferred:
                                     _append_coalesced_stream_event(
@@ -4443,8 +4830,7 @@ class OpenAIProvider:
                     has_terminal_evidence = active_choice_seen and choice_terminal_seen
                     if not has_terminal_evidence:
                         if (
-                            self._compat.empty_stream_fallback
-                            and cfg.physical_attempt_limit != 1
+                            empty_stream_fallback
                             and not active_choice_seen
                             and not emitted_stream_event
                             and not assistant_text_parts
@@ -4735,8 +5121,7 @@ class OpenAIProvider:
                         gemini_thought_sig = streamed_thought_signature
 
                     if (
-                        self._compat.empty_stream_fallback
-                        and cfg.physical_attempt_limit != 1
+                        empty_stream_fallback
                         and not emitted_stream_event
                         and not assistant_text_parts
                         and not tools_acc.has_calls
@@ -4814,6 +5199,13 @@ class OpenAIProvider:
                         billing_receipt=billing_receipt,
                     )
 
+        except asyncio.CancelledError:
+            trace.record_error(
+                code="cancelled",
+                message="Provider request cancelled",
+                metadata={"phase": "stream", "cache_shape": cache_shape},
+            )
+            raise
         except httpx.TimeoutException as exc:
             safe_error = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
@@ -4825,11 +5217,7 @@ class OpenAIProvider:
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
-            if (
-                self._compat.stream_timeout_fallback
-                and cfg.physical_attempt_limit != 1
-                and not emitted_stream_event
-            ):
+            if stream_timeout_fallback and not emitted_stream_event:
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"
                     if self._provider_kind == "openrouter"
@@ -5148,6 +5536,14 @@ class OpenAIProvider:
             yield ErrorEvent(message=safe_error, code="request_error")
             return
 
+        response_ids: set[str] = set()
+        response_generation_id = _openrouter_generation_id_from_headers(
+            response.headers
+        )
+        if response_generation_id:
+            response_ids.add(response_generation_id)
+            trace.record_response_headers(response_ids=[response_generation_id])
+
         if response.status_code != 200:
             safe_response_body = redact_upstream_error_text(
                 response.text,
@@ -5355,19 +5751,10 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(visible_text)
                     yield TextDeltaEvent(text=visible_text)
 
-            reasoning_details = message.get("reasoning_details")
-            if reasoning_details:
-                for detail in reasoning_details:
-                    if isinstance(detail, dict):
-                        reasoning_event = reasoning.emit(detail.get("text", ""))
-                        if reasoning_event is not None:
-                            yield reasoning_event
-            for key in ("reasoning_content", "reasoning"):
-                reasoning_str = message.get(key)
-                if isinstance(reasoning_str, str):
-                    reasoning_event = reasoning.emit(reasoning_str)
-                    if reasoning_event is not None:
-                        yield reasoning_event
+            for fragment in _openai_reasoning_fragments(message):
+                reasoning_event = reasoning.emit(fragment)
+                if reasoning_event is not None:
+                    yield reasoning_event
 
             raw_tool_calls_value = message.get("tool_calls")
             if _has_native_tool_payload(raw_tool_calls_value):
@@ -5707,6 +6094,9 @@ class OpenAIProvider:
         ):
             reasoning_text = _extract_think_tags("".join(assistant_text_parts)) or None
 
+        response_id = data.get("id")
+        if isinstance(response_id, str) and response_id:
+            response_ids.add(response_id)
         trace.record_response(
             response=data,
             usage={
@@ -5723,7 +6113,7 @@ class OpenAIProvider:
             assistant_text="".join(visible_assistant_text_parts),
             reasoning_content=reasoning_text or None,
             tool_calls=trace_tool_calls,
-            response_ids=[str(data["id"])] if data.get("id") else [],
+            response_ids=sorted(response_ids),
             metadata={"cache_shape": cache_shape},
         )
         if candidate_artifact_text:

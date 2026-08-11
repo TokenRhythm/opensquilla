@@ -552,6 +552,14 @@ class LlmEnsembleConfig(BaseSettings):
     # boundary.
     proposer_tools: bool = False
     min_successful_proposers: int = Field(default=1, ge=1)
+    # Optional quality target above the minimum floor. When set, proposer
+    # collection keeps waiting for this many successful drafts; if the target
+    # becomes unreachable, the turn may still aggregate once the minimum
+    # floor is satisfied.
+    target_successful_proposers: int | None = Field(default=None, ge=1)
+    # Number of in-place retries after the initial proposer request. Zero
+    # preserves the historical single-attempt behavior.
+    proposer_max_retries: int = Field(default=0, ge=0, le=10)
     all_failed_policy: Literal["fallback_single", "error"] = "fallback_single"
     model_options: list[str] = Field(default_factory=_default_llm_ensemble_model_options)
     candidates: list[LlmEnsembleCandidateConfig] = Field(default_factory=list)
@@ -572,6 +580,28 @@ class LlmEnsembleConfig(BaseSettings):
             seen_options.add(normalized)
             model_options.append(normalized)
         self.model_options = model_options
+        return self
+
+    @model_validator(mode="after")
+    def _validate_success_targets(self) -> LlmEnsembleConfig:
+        if (
+            self.target_successful_proposers is not None
+            and self.target_successful_proposers < self.min_successful_proposers
+        ):
+            raise ValueError(
+                "llm_ensemble.target_successful_proposers cannot be lower than "
+                "llm_ensemble.min_successful_proposers"
+            )
+        if (
+            self.selection_mode
+            in {"static_openrouter_b5", "static_tokenrhythm_b5"}
+            and self.target_successful_proposers is not None
+            and self.target_successful_proposers > 4
+        ):
+            raise ValueError(
+                "llm_ensemble.target_successful_proposers cannot exceed the "
+                "static B5 proposer count (4)"
+            )
         return self
 
     @model_validator(mode="after")
@@ -622,6 +652,14 @@ class LlmEnsembleConfig(BaseSettings):
         if self.min_successful_proposers > len(proposers):
             raise ValueError(
                 "llm_ensemble.min_successful_proposers cannot exceed the "
+                f"custom_b5 proposer count ({len(proposers)})"
+            )
+        if (
+            self.target_successful_proposers is not None
+            and self.target_successful_proposers > len(proposers)
+        ):
+            raise ValueError(
+                "llm_ensemble.target_successful_proposers cannot exceed the "
                 f"custom_b5 proposer count ({len(proposers)})"
             )
         return self
@@ -2209,6 +2247,27 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
         return values
 
 
+class GoalConfig(BaseSettings):
+    """Guardrails for session-level Goal execution.
+
+    TOML section ``[goal]``; keys mirror the field names (snake_case).
+    Automatic execution is enabled by default, with a fail-closed operator
+    switch and bounded per-resume execution windows.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_GOAL_",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    execution_enabled: bool = True
+    max_turns: int = Field(default=50, ge=1, le=500)
+    # Accumulated running time only. Queued, paused, and process downtime are
+    # deliberately excluded from this limit.
+    runtime_budget_seconds: int = Field(default=3_600, ge=60, le=86_400)
+
+
 class GatewayConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_GATEWAY_",
@@ -2271,6 +2330,7 @@ class GatewayConfig(BaseSettings):
     naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    goal: GoalConfig = Field(default_factory=GoalConfig)
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)

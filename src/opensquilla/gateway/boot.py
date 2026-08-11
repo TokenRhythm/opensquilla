@@ -310,10 +310,12 @@ class TaskRuntimeStreamError(RuntimeError):
         *,
         code: str | None = None,
         terminal_reason: str | None = None,
+        failure_kind: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.terminal_reason = terminal_reason
+        self.failure_kind = failure_kind
 
 
 # fmt: off
@@ -648,6 +650,8 @@ class ServiceContainer:
     tool_registry: ToolRegistry | None = None
     session_manager: SessionManager | None = None
     skill_loader: SkillLoader | None = None
+    skill_management_service: Any = None
+    skill_management_state: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker | None = None
     usage_event_sink: Any = None
     usage_backfill_task: asyncio.Task[Any] | None = None
@@ -678,6 +682,7 @@ class ServiceContainer:
     router_calibration_service: Any = None
     provider_stats: Any = None  # ProviderStatsStore | None (rolling call latency samples)
     task_runtime: Any = None
+    goal_service: Any = None
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
     prompt_cache_keepalive_service: Any = None
@@ -835,6 +840,12 @@ class ServiceContainer:
                     await store.close()
                 except Exception:
                     pass
+        if self.goal_service is not None:
+            try:
+                await self.goal_service.close()
+            except Exception:
+                log.debug("gateway.goal_service_close_failed", exc_info=True)
+            self.goal_service = None
         if self.task_runtime is not None:
             try:
                 await self.task_runtime.shutdown()
@@ -1267,6 +1278,7 @@ async def dispatch_task_runtime_turn(
     """
     from opensquilla.gateway.project_workspace_runtime import (
         apply_accepted_run_mode_override,
+        apply_run_context_route_metadata,
         authoritative_project_run_context,
         map_project_workspace_error,
     )
@@ -1304,15 +1316,11 @@ async def dispatch_task_runtime_turn(
                 },
             )
             raise
-        from opensquilla.gateway.rpc_sessions import (
-            _apply_run_context_route_metadata,
-        )
-
         run_context = apply_accepted_run_mode_override(
             run_context,
             getattr(run, "accepted_run_mode_override", None),
         )
-        _apply_run_context_route_metadata(
+        apply_run_context_route_metadata(
             run.envelope,
             run_context,
             principal_is_owner=_task_runtime_envelope_owner(run.envelope),
@@ -1377,13 +1385,18 @@ async def dispatch_task_runtime_turn(
                 client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
                 user_message_id=getattr(run, "persisted_user_message_id", None),
                 surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
+                input_mode=getattr(run, "input_mode", "user"),
+                run_kind=getattr(run, "run_kind", None),
             )
     except TaskRuntimeStreamError as exc:
         if exc.code in {
             "provider_request_budget_exhausted",
             "provider_request_too_large",
             "current_turn_context_exhausted",
-        }:
+        } and (
+            str(getattr(run.envelope, "metadata", {}).get("turn_context_intent") or "")
+            != "goal_set"
+        ):
             rollback_reason = exc.code
             remove_message = getattr(session_manager, "remove_message", None)
             raw_message_ids = getattr(run, "persisted_user_message_ids", ())
@@ -1498,6 +1511,11 @@ def build_task_runtime_run_kwargs(
         "input_provenance": run.input_provenance,
         "run_kind": run.run_kind,
         "no_memory_capture": run.no_memory_capture,
+        "input_mode": getattr(run, "input_mode", "user"),
+        "persist_input": bool(getattr(run, "persist_input", False)),
+        "history_has_persisted_user": bool(
+            getattr(run, "history_has_persisted_user", True)
+        ),
         "fresh_user_session": bool(getattr(run, "fresh_user_session", False)),
         "ingress_pipeline_steps": ingress_steps,
         "pending_input_provider": getattr(run, "pending_input_provider", None),
@@ -1653,6 +1671,8 @@ async def _emit_task_runtime_stream_events(
     client_message_id: str | None = None,
     user_message_id: str | None = None,
     surface_id: str | None = None,
+    input_mode: str | None = None,
+    run_kind: str | None = None,
 ) -> None:
     """Emit turn events and fail the task if the stream reports an error.
 
@@ -1667,6 +1687,7 @@ async def _emit_task_runtime_stream_events(
 
     error_message: str | None = None
     error_code: str | None = None
+    failure_kind: str | None = None
     terminal_reason: str | None = None
     async for event in wrap_stream(
         raw_stream,
@@ -1704,6 +1725,12 @@ async def _emit_task_runtime_stream_events(
             )
             code = event_dict.get("code")
             error_code = str(code) if code else None
+            # Keep the normalized provider classification internal to the
+            # durable task outcome; it is not part of the public stream event.
+            raw_failure_kind = event_dict.pop("failure_kind", None)
+            failure_kind = (
+                str(raw_failure_kind) if isinstance(raw_failure_kind, str) else None
+            )
             code_text = str(code or "").lower()
             is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
             is_output_truncated = code_text == "provider_output_truncated"
@@ -1747,6 +1774,10 @@ async def _emit_task_runtime_stream_events(
             event_dict["user_message_id"] = user_message_id
         if surface_id:
             event_dict["surface_id"] = surface_id
+        if input_mode:
+            event_dict["input_mode"] = input_mode
+        if run_kind:
+            event_dict["run_kind"] = run_kind
         await event_emitter(
             session_key,
             f"session.event.{event_kind}",
@@ -1760,6 +1791,7 @@ async def _emit_task_runtime_stream_events(
             error_message,
             code=error_code,
             terminal_reason=terminal_reason,
+            failure_kind=failure_kind,
         )
 
 
@@ -1986,6 +2018,16 @@ class GatewayServer:
             # task_runtime.shutdown() waits for all running turns to complete before
             # returning; only then do we stop channel delivery.
             drain_budget = gateway_graceful_timeout()
+            goal_service = (
+                getattr(self._services, "goal_service", None)
+                if self._services is not None
+                else None
+            )
+            if goal_service is not None:
+                try:
+                    await goal_service.prepare_shutdown()
+                except Exception:
+                    log.debug("gateway.goal_service_shutdown_failed", exc_info=True)
             if self._services is not None and self._services.task_runtime is not None:
                 try:
                     await self._services.task_runtime.shutdown(
@@ -2488,6 +2530,11 @@ async def build_services(
     path need: session storage, provider selector, tool registry, memory,
     skills, scheduler, search, and MCP discovery.
 
+    Managed-Skill crash recovery runs only when the current thread already
+    owns :class:`ProfileOperationLock`. Callers without that capability still
+    receive the other services, but the managed Skill layer is quarantined and
+    its recovery state is left byte-for-byte untouched.
+
     Parameters that are *None* are auto-constructed from *config* defaults.
     Pass explicit instances to override (useful for tests and embedding).
 
@@ -2622,7 +2669,13 @@ async def build_services(
         if storage_db_path != ":memory:" and "://" not in storage_db_path:
             os.makedirs(os.path.dirname(storage_db_path) or os.curdir, mode=0o700, exist_ok=True)
         storage = SessionStorage(storage_db_path)
-        await storage.connect()
+        await storage.connect(
+            goal_pause_reason=(
+                "process_restart"
+                if config.goal.execution_enabled
+                else "feature_disabled"
+            )
+        )
         log.info(
             "build_services.session_storage_ready",
             duration_ms=_elapsed_monotonic_ms(session_storage_started_at),
@@ -2895,6 +2948,8 @@ async def build_services(
 
     # ── Skill loader (boot order 19) ────────────────────────────────
     skill_loader = None
+    skill_management_service = None
+    skill_management_state: dict[str, Any] = {}
     try:
         from opensquilla.skills.loader import SkillLoader
         from opensquilla.skills.paths import resolve_skill_layer_dirs
@@ -2911,14 +2966,96 @@ async def build_services(
             managed_override=config.skills.managed_dir,
             extra_dirs=[Path(d) for d in config.skills.extra_dirs],
         )
-        skill_loader = SkillLoader(
+        managed_skill_dir = layer_dirs.managed_dir
+        if managed_skill_dir is None:
+            raise RuntimeError("No managed Skill directory is configured")
+        # Recover any interrupted managed-Skill transaction before the
+        # production loader is allowed to scan that layer. Gateway and supported
+        # standalone CLI lifecycles already hold the profile lease on this
+        # thread. Public embedders that call build_services() without that
+        # capability must remain read-only: quarantine the managed layer instead
+        # of racing an active writer or sweeping its transaction reservation.
+        from opensquilla.paths import default_opensquilla_home
+        from opensquilla.profile_operation_lock import (
+            profile_operation_lock_held_by_current_thread,
+        )
+        from opensquilla.skills.hub.contracts import (
+            DiagnosticPhase,
+            DiagnosticSeverity,
+            SkillDiagnostic,
+        )
+        from opensquilla.skills.hub.transaction import (
+            journal_path_for_state,
+            recover_pending_skill_transaction,
+        )
+
+        configured_state = str(getattr(config, "state_dir", "") or "").strip()
+        skill_journal_path = journal_path_for_state(
+            managed_skill_dir,
+            Path(configured_state) if configured_state else None,
+        )
+        skill_management_state.update(
+            {
+                "managed_dir": managed_skill_dir,
+                "journal_path": skill_journal_path,
+            }
+        )
+        profile_home = default_opensquilla_home()
+        if profile_operation_lock_held_by_current_thread(profile_home):
+            recovery_diagnostics = recover_pending_skill_transaction(
+                managed_dir=managed_skill_dir,
+                lockfile_path=profile_home / "skills-lock.json",
+                journal_path=skill_journal_path,
+                sweep_orphan_staging=True,
+            )
+        else:
+            recovery_diagnostics = [
+                SkillDiagnostic(
+                    code="PROFILE_LEASE_REQUIRED",
+                    severity=DiagnosticSeverity.ERROR,
+                    phase=DiagnosticPhase.STORE,
+                    message=(
+                        "Managed Skill recovery was skipped because this service "
+                        "builder does not hold the profile writer lease"
+                    ),
+                    blocking=True,
+                    hint=(
+                        "Call build_services() only while ProfileOperationLock is held "
+                        "for the active OpenSquilla profile."
+                    ),
+                )
+            ]
+        skill_management_state["recovery_diagnostics"] = tuple(recovery_diagnostics)
+        for diagnostic in recovery_diagnostics:
+            log.warning(
+                "build_services.skill_transaction_recovery",
+                **diagnostic.to_dict(),
+            )
+        managed_recovery_required = any(
+            item.blocking for item in recovery_diagnostics
+        )
+        if managed_recovery_required:
+            log.warning(
+                "build_services.skill_managed_layer_quarantined",
+                managed_dir=str(managed_skill_dir),
+            )
+        candidate_skill_loader = SkillLoader(
             bundled_dir=layer_dirs.bundled_dir,
             workspace_dir=layer_dirs.workspace_dir,
-            managed_dir=layer_dirs.managed_dir,
+            managed_dir=managed_skill_dir,
             personal_agents_dir=layer_dirs.personal_agents_dir,
             project_agents_dir=layer_dirs.project_agents_dir,
             extra_dirs=layer_dirs.extra_dirs,
         )
+        if managed_recovery_required:
+            # Quarantine is a loader safety invariant, not a side effect of the
+            # optional management-service composition below.  Assign the loader
+            # only after the freeze succeeds so a construction failure cannot
+            # leave uncommitted managed bytes available to later boot consumers.
+            candidate_skill_loader.freeze_catalog_for_recovery(
+                reason="skill.management.startup-recovery-required"
+            )
+        skill_loader = candidate_skill_loader
         log.info(
             "build_services.skill_loader_initialized",
             bundled_dir=str(layer_dirs.bundled_dir),
@@ -2927,11 +3064,23 @@ async def build_services(
         # Register skill_list and skill_view tools. Pass a live getter for the
         # skills config so coding-mode / disabled gating is honored at call
         # time (config is updated in place by config.patch).
+        from opensquilla.skills.hub.defaults import (
+            build_default_skill_management_service,
+        )
         from opensquilla.tools.builtin.skill_tools import create_skill_tools
+
+        skill_management_service = build_default_skill_management_service(
+            managed_dir=managed_skill_dir,
+            loader=skill_loader,
+            journal_path=skill_journal_path,
+            offline=False,
+            startup_recovery_diagnostics=recovery_diagnostics,
+        )
 
         create_skill_tools(
             skill_loader,
             skills_cfg_getter=lambda: getattr(config, "skills", None),
+            management_service=skill_management_service,
         )
         log.info("build_services.skill_tools_registered")
     except Exception as e:
@@ -3268,6 +3417,8 @@ async def build_services(
         tool_registry=tool_registry,
         session_manager=session_manager,
         skill_loader=skill_loader,
+        skill_management_service=skill_management_service,
+        skill_management_state=skill_management_state,
         usage_tracker=usage_tracker,
         usage_event_sink=usage_event_sink,
         cron_scheduler=cron_scheduler,
@@ -3754,15 +3905,16 @@ async def start_gateway_server(
             event_emitter=runtime_event_bridge.emit,
         )
 
+    session_lifecycle_listener = _make_task_session_lifecycle_listener(
+        session_manager=svc.session_manager,
+        event_emitter=runtime_event_bridge.emit,
+    )
     task_runtime = TaskRuntime(
         storage=get_session_storage(svc.session_manager) or svc.session_manager,
         turn_handler=_task_runtime_turn_handler,
         event_emitter=runtime_event_bridge.emit,
         terminal_listener=_subagent_completion_listener,
-        lifecycle_listener=_make_task_session_lifecycle_listener(
-            session_manager=svc.session_manager,
-            event_emitter=runtime_event_bridge.emit,
-        ),
+        lifecycle_listener=session_lifecycle_listener,
         max_concurrency=_task_runtime_max_concurrency(config),
         max_pending_per_session=_task_runtime_max_pending_per_session(config),
         subagent_reserved_slots=int(
@@ -3773,6 +3925,48 @@ async def start_gateway_server(
         pending_overflow_policy=getattr(
             config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),
+    )
+    from opensquilla.gateway.goal_service import GoalService
+
+    goal_service = GoalService(
+        storage=get_session_storage(svc.session_manager) or svc.session_manager,
+        session_manager=svc.session_manager,
+        task_runtime=task_runtime,
+        event_emitter=runtime_event_bridge.emit,
+        subscription_manager=subscription_manager,
+        # Keep the live root object: config.set/reload replace ``config.goal``
+        # in place, and the Goal kill switch must observe that replacement.
+        config=config,
+    )
+
+    async def _ordered_task_lifecycle(event: TaskLifecycleEvent) -> None:
+        # Session projection remains first. Goal settlement is independently
+        # isolated so one observer cannot suppress the other.
+        try:
+            await session_lifecycle_listener(event)
+        except Exception:
+            log.warning(
+                "gateway.session_lifecycle_projection_failed",
+                session_key=event.session_key,
+                task_id=event.task_id,
+                exc_info=True,
+            )
+        try:
+            await goal_service.on_task_lifecycle(event)
+        except Exception:
+            log.warning(
+                "gateway.goal_lifecycle_settlement_failed",
+                session_key=event.session_key,
+                task_id=event.task_id,
+                exc_info=True,
+            )
+
+    task_runtime.set_lifecycle_listener(_ordered_task_lifecycle)
+    task_runtime.set_activation_listener(goal_service.on_task_activation)
+    task_runtime.set_idle_listener(goal_service.on_runtime_idle)
+    task_runtime.set_goal_service(goal_service)
+    subscription_manager.set_message_unsubscribe_listener(
+        goal_service.on_subscription_lost
     )
     # Wire task_runtime's short write-lock provider into turn_runner.
     turn_runner.set_session_lock_provider(task_runtime._get_session_lock_for_turn)
@@ -3797,6 +3991,7 @@ async def start_gateway_server(
     else:
         log.warning("gateway.prompt_cache_keepalive_recorder_unavailable")
     svc.prompt_cache_keepalive_service = prompt_cache_keepalive_service
+    svc.goal_service = goal_service
     # Wire the runtime into SessionManager so kill_session can cascade-cancel.
     attach_runtime = getattr(svc.session_manager, "attach_task_runtime", None)
     if callable(attach_runtime):
@@ -4256,7 +4451,11 @@ async def start_gateway_server(
             workspace_resolver=_cron_workspace_resolver,
             default_elevated=lambda: configured_default_elevated(config),
         )
-        static_handler = make_static_message_handler(delivery_chain=delivery_chain)
+        static_handler = make_static_message_handler(
+            delivery_chain=delivery_chain,
+            session_manager_ref=lambda: svc.session_manager,
+            session_event_emitter=_emit_session_event,
+        )
         auto_propose_handler = make_auto_propose_handler(
             build_orchestrator=lambda agent_id: _build_auto_propose_orchestrator(
                 agent_id,
@@ -4425,6 +4624,8 @@ async def start_gateway_server(
         usage_event_sink=usage_event_sink,
         meta_run_writer=getattr(svc, "meta_run_writer", None),
         skill_loader=svc.skill_loader,
+        skill_management_service=getattr(svc, "skill_management_service", None),
+        skill_management_state=getattr(svc, "skill_management_state", None) or {},
         cron_scheduler=svc.cron_scheduler,
         turn_runner=turn_runner,
         task_runtime=task_runtime,

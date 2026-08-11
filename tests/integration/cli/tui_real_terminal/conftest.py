@@ -20,7 +20,11 @@ from tui_real_terminal.driver import (  # noqa: E402
 )
 from tui_real_terminal.evidence import EvidenceBundle, ScenarioResult  # noqa: E402
 from tui_real_terminal.scenarios import TuiScenario, run_scenario  # noqa: E402
-from tui_real_terminal.targets import TargetContext, build_tui_target  # noqa: E402
+from tui_real_terminal.targets import (  # noqa: E402
+    TargetContext,
+    build_tui_target,
+    opentui_host_capability_gate,
+)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -129,12 +133,10 @@ def run_real_terminal_scenario(
                 f"scenario {scenario.scenario_id!r} requires "
                 f"--tui-backend={scenario.required_backend_id}"
             )
-        if target.backend_id in {"opentui", "live-opentui"}:
-            from opensquilla.cli.tui.opentui.bridge import check_opentui_host_available
-
-            availability = check_opentui_host_available()
-            if not availability.available:
-                pytest.skip(availability.reason or "OpenTUI host unavailable")
+        opentui_host_capability_gate(
+            target.env,
+            require_capabilities=require_capabilities,
+        )
         scenario_driver = tui_driver
         if scenario.requires_tmux:
             if not capabilities.tmux_available:

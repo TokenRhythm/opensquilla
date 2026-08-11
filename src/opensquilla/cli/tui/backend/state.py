@@ -5,6 +5,8 @@ from __future__ import annotations
 import collections
 from dataclasses import dataclass, field
 
+from opensquilla.engine.agent_injection import PendingInputClaim
+
 
 @dataclass
 class TuiRuntimeState:
@@ -68,6 +70,11 @@ class TuiRuntimeState:
         """Return queued inputs without changing their FIFO ownership."""
 
         return list(self._pending)
+
+    def claim_pending(self) -> PendingInputClaim:
+        """Claim ordinary TUI input without changing Goal authority."""
+
+        return PendingInputClaim(texts=tuple(self.drain_pending()))
 
     def mark_applied(self, *, iteration: int, model_call_id: str) -> None:
         """Satisfy the injection contract for this legacy in-memory queue.

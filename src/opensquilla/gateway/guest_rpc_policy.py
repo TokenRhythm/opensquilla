@@ -157,9 +157,10 @@ class GuestRpcPolicy:
         normalized[fields[0]] = key
         for alias in fields[1:]:
             normalized.pop(alias, None)
-        if method == "chat.abort":
-            normalized.pop("taskId", None)
-            normalized.pop("task_id", None)
+        # Keep a guest WebUI's task id only after proving ownership of the
+        # session key. chat.abort binds that id back to this same session in
+        # TaskRuntime; stripping it here would widen a precise Stop into the
+        # legacy whole-session cancellation path.
         return normalized
 
 

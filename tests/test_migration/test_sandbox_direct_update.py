@@ -85,6 +85,50 @@ def test_direct_update_is_idempotent_and_keeps_one_snapshot(tmp_path: Path) -> N
     assert len(list(tmp_path.glob(".sandbox-upgrade-snapshot*"))) == 1
 
 
+def test_prepared_agent_config_retries_to_committed_without_losing_the_agent(
+    tmp_path: Path,
+) -> None:
+    raw = b'''agents = [
+    { id = "qa-agent", name = "QA Agent", enabled = true },
+]
+'''
+    config = tmp_path / "config.toml"
+    config.write_bytes(raw)
+    snapshot = tmp_path / upgrade_migration.SNAPSHOT_NAME
+    snapshot.mkdir()
+    (snapshot / "config.toml").write_bytes(raw)
+    (snapshot / "manifest.json").write_text(
+        json.dumps({"stores": [{"path": "config.toml"}]}) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / upgrade_migration.JOURNAL_NAME).write_text(
+        json.dumps(
+            {
+                "migrationVersion": upgrade_migration.MIGRATION_VERSION,
+                "status": "prepared",
+                "stores": ["config.toml"],
+                "snapshot": str(snapshot),
+                "error": (
+                    "LosslessTomlPatchError: unsupported TOML key expression: { id"
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = SandboxUpgradeCoordinator(tmp_path).run()
+
+    assert report.ok is True
+    assert report.status == "committed"
+    assert (snapshot / "config.toml").read_bytes() == raw
+    patched = config.read_bytes()
+    assert b'{ id = "qa-agent", name = "QA Agent", enabled = true },' in patched
+    assert tomllib.loads(patched.decode("utf-8"))["sandbox"]["run_mode"] == "full"
+    journal = json.loads((tmp_path / upgrade_migration.JOURNAL_NAME).read_text())
+    assert journal["status"] == "committed"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
 def test_direct_update_snapshot_is_owner_only_on_posix(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"

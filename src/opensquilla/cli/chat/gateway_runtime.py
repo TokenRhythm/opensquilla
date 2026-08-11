@@ -132,7 +132,14 @@ class GatewayClientLike(Protocol):
 
     async def abort_session(self, key: str) -> dict[str, Any]: ...
 
-    async def steer_session(self, key: str, message: str) -> dict[str, Any]: ...
+    async def steer_session(
+        self,
+        key: str,
+        message: str,
+        *,
+        expected_turn_id: str | None = None,
+    ) -> dict[str, Any]:
+        pass
 
 
 class GatewayRunInputLoop(Protocol):
@@ -211,6 +218,23 @@ def _event_user_message_id(event: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _event_input_mode(event: dict[str, Any]) -> str:
+    value = event.get("input_mode") or event.get("inputMode")
+    if isinstance(value, str) and value:
+        return value
+    # Same-series Gateways did not stamp input_mode on streamed events. Goal
+    # continuations were still distinguishable from the user-authored first
+    # turn: they had a goal surface and no durable user-message identity.
+    surface_id = event.get("surface_id") or event.get("surfaceId")
+    if (
+        isinstance(surface_id, str)
+        and surface_id.startswith("goal:")
+        and _event_user_message_id(event) is None
+    ):
+        return "system_event"
+    return "user"
+
+
 def _event_stream_seq(frame: dict[str, Any]) -> int | None:
     payload = frame.get("payload")
     if not isinstance(payload, dict):
@@ -246,8 +270,82 @@ class _ExternalTurn:
     client_message_id: str | None
     user_message_id: str | None
     surface_id: str | None
+    input_mode: str
     first_frame: dict[str, Any]
     subscription: Any
+
+
+@dataclass(frozen=True)
+class _ExternalTurnIdentity:
+    session_key: str
+    turn_id: str
+
+
+class _ExternalTurnFence:
+    """Fence local sends from discovered external turns awaiting projection.
+
+    Discovery and rendering are intentionally separate coroutines.  The fence
+    records identity before discovery performs an await, so input arriving
+    while a turn subscription is being created (or while a prior local turn is
+    finishing) can still steer the authoritative external turn.
+    """
+
+    def __init__(
+        self,
+        idle: asyncio.Event,
+        state: dict[str, str | None] | None = None,
+    ) -> None:
+        self._idle = idle
+        self._state: dict[str, str | None] = (
+            state if state is not None else {"turn_id": None, "session_key": None}
+        )
+        self._pending: deque[_ExternalTurnIdentity] = deque()
+        self._turn_ids: set[str] = set()
+        self._sync_projection()
+
+    def discover(self, *, session_key: str, turn_id: str) -> None:
+        if turn_id in self._turn_ids:
+            return
+        self._turn_ids.add(turn_id)
+        self._pending.append(
+            _ExternalTurnIdentity(session_key=session_key, turn_id=turn_id)
+        )
+        self._sync_projection()
+
+    def settle(self, turn_id: str) -> None:
+        if turn_id not in self._turn_ids:
+            return
+        self._turn_ids.discard(turn_id)
+        self._pending = deque(item for item in self._pending if item.turn_id != turn_id)
+        self._sync_projection()
+
+    def current(self, session_key: str) -> _ExternalTurnIdentity | None:
+        if not self._pending:
+            return None
+        current = self._pending[0]
+        return current if current.session_key == session_key else None
+
+    def is_idle(self) -> bool:
+        return self._idle.is_set()
+
+    async def wait_idle(self) -> None:
+        await self._idle.wait()
+
+    def reset(self) -> None:
+        self._pending.clear()
+        self._turn_ids.clear()
+        self._sync_projection()
+
+    def _sync_projection(self) -> None:
+        if self._pending:
+            current = self._pending[0]
+            self._state["turn_id"] = current.turn_id
+            self._state["session_key"] = current.session_key
+            self._idle.clear()
+            return
+        self._state["turn_id"] = None
+        self._state["session_key"] = None
+        self._idle.set()
 
 
 _EXTERNAL_TURN_DISCOVERY_CLOSED = object()
@@ -336,7 +434,11 @@ async def _external_prompt(
     session_key: str,
     user_message_id: str | None,
     surface_id: str | None,
-) -> str:
+    *,
+    input_mode: str,
+) -> str | None:
+    if input_mode == "system_event":
+        return None
     if user_message_id:
         with suppress(Exception):
             snapshot = await client.bootstrap_session(session_key, limit=200)
@@ -446,7 +548,15 @@ async def _mirror_external_turns(
     elevated_state: dict[str, str | None],
     local_turn_idle: asyncio.Event,
     external_turn_idle: asyncio.Event,
+    external_turn_state: dict[str, str | None] | None = None,
+    external_turn_fence: _ExternalTurnFence | None = None,
 ) -> None:
+    if external_turn_state is None:
+        external_turn_state = {"turn_id": None, "session_key": None}
+    fence = external_turn_fence or _ExternalTurnFence(
+        external_turn_idle,
+        external_turn_state,
+    )
     discovered = _BoundedTurnIds()
     completed = _BoundedTurnIds()
     turn_queue: asyncio.Queue[_ExternalTurn | BaseException | object] = asyncio.Queue(maxsize=64)
@@ -461,6 +571,7 @@ async def _mirror_external_turns(
                     continue
                 turn_id, client_message_id, surface_id = _event_identity(event)
                 user_message_id = _event_user_message_id(event)
+                input_mode = _event_input_mode(event)
                 if (
                     turn_id is None
                     or surface_id in {None, client.surface_id}
@@ -469,33 +580,54 @@ async def _mirror_external_turns(
                 ):
                     continue
                 discovered.add(turn_id)
-                turn_subscription = await client.subscribe_session_events(
-                    session_key,
-                    since_stream_seq=_event_stream_seq(frame),
-                )
-                bind_turn = getattr(turn_subscription, "bind_turn", None)
-                if callable(bind_turn):
-                    bind_turn(
-                        turn_id=turn_id,
-                        client_message_id=client_message_id,
+                # Publish the exact identity before subscription creation or
+                # queue admission can yield.  Dispatch may run during either
+                # await and must steer this turn instead of starting a local
+                # one in parallel.
+                fence.discover(session_key=session_key, turn_id=turn_id)
+                try:
+                    turn_subscription = await client.subscribe_session_events(
+                        session_key,
+                        since_stream_seq=_event_stream_seq(frame),
                     )
-                open_turn_subscriptions[turn_id] = turn_subscription
-                await turn_queue.put(
-                    _ExternalTurn(
-                        turn_id=turn_id,
-                        client_message_id=client_message_id,
-                        user_message_id=user_message_id,
-                        surface_id=surface_id,
-                        first_frame=frame,
-                        subscription=turn_subscription,
+                    open_turn_subscriptions[turn_id] = turn_subscription
+                    bind_turn = getattr(turn_subscription, "bind_turn", None)
+                    if callable(bind_turn):
+                        bind_turn(
+                            turn_id=turn_id,
+                            client_message_id=client_message_id,
+                        )
+                    await turn_queue.put(
+                        _ExternalTurn(
+                            turn_id=turn_id,
+                            client_message_id=client_message_id,
+                            user_message_id=user_message_id,
+                            surface_id=surface_id,
+                            input_mode=input_mode,
+                            first_frame=frame,
+                            subscription=turn_subscription,
+                        )
                     )
-                )
+                except asyncio.CancelledError:
+                    fence.settle(turn_id)
+                    raise
+                except Exception:
+                    fence.settle(turn_id)
+                    raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await turn_queue.put(exc)
         finally:
-            await turn_queue.put(_EXTERNAL_TURN_DISCOVERY_CLOSED)
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                # The consumer is also tearing down and may no longer drain a
+                # full queue.  Cleanup must not deadlock trying to add a
+                # sentinel that no coroutine needs after cancellation.
+                with suppress(asyncio.QueueFull):
+                    turn_queue.put_nowait(_EXTERNAL_TURN_DISCOVERY_CLOSED)
+            else:
+                await turn_queue.put(_EXTERNAL_TURN_DISCOVERY_CLOSED)
 
     discovery_task = asyncio.create_task(_discover())
     try:
@@ -507,7 +639,6 @@ async def _mirror_external_turns(
                 raise item
             assert isinstance(item, _ExternalTurn)
             await local_turn_idle.wait()
-            external_turn_idle.clear()
             try:
                 output = await _wait_for_output(deps, session_context.scope)
                 prompt = await _external_prompt(
@@ -515,9 +646,10 @@ async def _mirror_external_turns(
                     session_key,
                     item.user_message_id or item.client_message_id,
                     item.surface_id,
+                    input_mode=item.input_mode,
                 )
                 send = getattr(output, "send_message", None)
-                if callable(send):
+                if prompt is not None and callable(send):
                     await send(
                         "prompt.echo",
                         {
@@ -540,13 +672,14 @@ async def _mirror_external_turns(
                     result = await deps.stream_response(
                         cast(GatewayClientLike, external_client),
                         session_key,
-                        prompt,
+                        prompt or "",
                         elevated_state,
                         tui_output=output,
                     )
                 if session_context.session_key == session_key:
                     session_context.state.model = result.model_after or session_context.model
-                    session_context.state.transcript.add("user", prompt)
+                    if prompt is not None:
+                        session_context.state.transcript.add("user", prompt)
                     session_context.state.transcript.add("assistant", result.text)
                     session_context.state.usage.apply(result.usage)
                     session_context.sync_from_state()
@@ -558,7 +691,7 @@ async def _mirror_external_turns(
                 if callable(close):
                     with suppress(Exception):
                         await close()
-                external_turn_idle.set()
+                fence.settle(item.turn_id)
     finally:
         discovery_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
@@ -568,7 +701,7 @@ async def _mirror_external_turns(
             if callable(close):
                 with suppress(Exception):
                     await close()
-        external_turn_idle.set()
+        fence.reset()
 
 
 async def run_gateway_chat(
@@ -657,6 +790,14 @@ async def run_gateway_chat(
         if isinstance(workspace, str) and workspace:
             session_context.scope["workspace_label"] = workspace
         active_turn_session_key: str | None = None
+        external_turn_state: dict[str, str | None] = {
+            "turn_id": None,
+            "session_key": None,
+        }
+        external_turn_fence = _ExternalTurnFence(
+            external_turn_idle,
+            external_turn_state,
+        )
 
         async def _stop_session_observer() -> None:
             nonlocal session_subscription, session_observer_task
@@ -733,6 +874,8 @@ async def run_gateway_chat(
                     elevated_state=elevated_state,
                     local_turn_idle=local_turn_idle,
                     external_turn_idle=external_turn_idle,
+                    external_turn_state=external_turn_state,
+                    external_turn_fence=external_turn_fence,
                 )
             )
 
@@ -836,14 +979,39 @@ async def run_gateway_chat(
                 return True
 
             turn_session_key = session_context.session_key
-            active_turn_session_key = turn_session_key
-            if not external_turn_idle.is_set():
-                # A mirrored turn from another surface (e.g. the Web UI) is
-                # still streaming into this session. The submitted prompt was
-                # already echoed, so without feedback the parked send is
-                # indistinguishable from a hang.
+            external_identity = external_turn_fence.current(turn_session_key)
+            if not external_turn_fence.is_idle():
+                steer_external = getattr(client, "steer_session", None)
+                if (
+                    external_identity is not None
+                    and callable(steer_external)
+                ):
+                    try:
+                        steered = await steer_external(
+                            turn_session_key,
+                            user_input,
+                            expected_turn_id=external_identity.turn_id,
+                        )
+                    except GatewayRPCError as exc:
+                        deps.notify(GatewayRuntimeNotice(kind="error", message=str(exc)))
+                        return True
+                    if bool(steered.get("accepted")):
+                        return True
+                    if steered.get("fallback_safe") is not True:
+                        deps.notify(
+                            GatewayRuntimeNotice(
+                                kind="error",
+                                message="The active turn could not accept steering.",
+                            )
+                        )
+                        return True
+                # A terminal race or a non-steerable external turn falls back
+                # to an ordinary durable send after that turn becomes idle.
                 deps.notify(GatewayRuntimeNotice(kind="queued_behind_external"))
-            await external_turn_idle.wait()
+            await external_turn_fence.wait_idle()
+            # This field represents only a locally started stream.  Failed or
+            # unsafe external steering must not leave a phantom abort target.
+            active_turn_session_key = turn_session_key
             local_turn_idle.clear()
             try:
                 result = await deps.stream_response(
@@ -884,6 +1052,25 @@ async def run_gateway_chat(
             return _abort_captured_turn()
 
         async def _steer_active_turn(text: str) -> bool:
+            external_identity = external_turn_fence.current(session_context.session_key)
+            if external_identity is not None:
+                result = await client.steer_session(
+                    external_identity.session_key,
+                    text,
+                    expected_turn_id=external_identity.turn_id,
+                )
+                if (
+                    not bool(result.get("accepted"))
+                    and result.get("fallback_safe") is not True
+                ):
+                    raise GatewayRPCError(
+                        "sessions.steer.v2",
+                        code=str(result.get("failure_code") or "STEER_REJECTED"),
+                        message="The active external turn could not accept steering.",
+                        data={"fallback_safe": False},
+                        accepted=False,
+                    )
+                return bool(result.get("accepted"))
             turn_session_key = active_turn_session_key
             if turn_session_key is None:
                 return False

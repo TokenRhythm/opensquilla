@@ -3,6 +3,9 @@ import { test, expect, type Page } from '@playwright/test'
 const CONTROL_URL = '/control/'
 const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
 const SESSION_KEY = 'agent:main:webchat:e2efork'
+const THROUGH_TURN_CHILD_KEY = 'agent:main:webchat:e2efork-through-child'
+const SESSION_TITLE = 'Release planning notes'
+const THROUGH_TURN_CHILD_TITLE = `${SESSION_TITLE} (2)`
 const EDIT_PARENT_KEY = 'agent:main:webchat:e2e-edit-parent'
 const EDIT_CHILD_KEY = 'agent:main:webchat:e2e-edit-child'
 const FORK_BUTTON = '[data-testid="fork-conversation"]'
@@ -14,6 +17,11 @@ type CapturedEditSend = {
   [key: string]: unknown
 }
 
+type CapturedForkRequest = {
+  method: string
+  params: Record<string, unknown>
+}
+
 function sessionFromUrl(url: string): string {
   try {
     return new URL(url).searchParams.get('session') || ''
@@ -22,65 +30,206 @@ function sessionFromUrl(url: string): string {
   }
 }
 
-// Seed a settled two-turn thread through the real WS pipeline: chat.history
-// responses are rewritten in flight so two assistant messages render without
-// a live agent run.
-async function seedHistoryWithTwoTurns(page: Page) {
+// Seed a settled two-turn thread through the same deterministic WS mock used by
+// the edit coverage below. The historical-fork contract must not require a live
+// gateway merely to prove its method name and inclusive turn boundary.
+async function seedHistoryWithTwoTurns(
+  page: Page,
+  capturedForks: CapturedForkRequest[] = [],
+) {
+  let forkCreated = false
+  const parentHistory = {
+    messages: [
+      {
+        role: 'user',
+        text: 'First question.',
+        id: 'msg-e2e-fork-user-1',
+        timestamp: Math.floor(Date.now() / 1000) - 120,
+        turn_context: { turn_id: 'turn-e2e-fork-1' },
+      },
+      {
+        role: 'assistant',
+        text: 'First answer.',
+        id: 'msg-e2e-fork-ai-1',
+        timestamp: Math.floor(Date.now() / 1000) - 110,
+        turn_context: { turn_id: 'turn-e2e-fork-1' },
+        usage: { model: 'openai/gpt-test', input_tokens: 20, output_tokens: 8, cost_usd: 0.0002 },
+      },
+      {
+        role: 'user',
+        text: 'Second question.',
+        id: 'msg-e2e-fork-user-2',
+        timestamp: Math.floor(Date.now() / 1000) - 60,
+        turn_context: { turn_id: 'turn-e2e-fork-2' },
+      },
+      {
+        role: 'assistant',
+        text: 'Second answer.',
+        id: 'msg-e2e-fork-ai-2',
+        timestamp: Math.floor(Date.now() / 1000) - 50,
+        turn_context: { turn_id: 'turn-e2e-fork-2' },
+        usage: { model: 'openai/gpt-test', input_tokens: 30, output_tokens: 10, cost_usd: 0.0003 },
+      },
+    ],
+    turn_outcomes: [
+      {
+        turn_id: 'turn-e2e-fork-1',
+        task_id: 'turn-e2e-fork-1',
+        status: 'succeeded',
+        outcome: { kind: 'completed' },
+      },
+      {
+        turn_id: 'turn-e2e-fork-2',
+        task_id: 'turn-e2e-fork-2',
+        status: 'succeeded',
+        outcome: { kind: 'completed' },
+      },
+    ],
+    has_more: false,
+  }
+  const childHistory = {
+    messages: parentHistory.messages.slice(0, 2).map((message, index) => ({
+      ...message,
+      id: index === 0 ? 'child-msg-e2e-fork-user-1' : 'child-msg-e2e-fork-ai-1',
+    })),
+    turn_outcomes: parentHistory.turn_outcomes.slice(0, 1),
+    has_more: false,
+  }
+
+  await page.route('**/api/approvals', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ pending: [] }),
+  }))
+
   await page.routeWebSocket(/\/ws$/, ws => {
-    const server = ws.connectToServer()
-    const historyIds = new Set<string>()
+    ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
     ws.onMessage(message => {
       try {
         const frame = JSON.parse(String(message))
-        if (frame?.type === 'req' && frame.method === 'chat.history') {
-          historyIds.add(String(frame.id))
-        }
-      } catch {}
-      server.send(message)
-    })
-    server.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'res' && frame.id !== undefined && historyIds.has(String(frame.id))) {
-          historyIds.delete(String(frame.id))
-          frame.ok = true
-          delete frame.error
-          frame.payload = {
-            messages: [
-              {
-                role: 'user',
-                text: 'First question.',
-                id: 'msg-e2e-fork-user-1',
-                timestamp: Math.floor(Date.now() / 1000) - 120,
-              },
-              {
-                role: 'assistant',
-                text: 'First answer.',
-                id: 'msg-e2e-fork-ai-1',
-                timestamp: Math.floor(Date.now() / 1000) - 110,
-                usage: { model: 'openai/gpt-test', input_tokens: 20, output_tokens: 8, cost_usd: 0.0002 },
-              },
-              {
-                role: 'user',
-                text: 'Second question.',
-                id: 'msg-e2e-fork-user-2',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-              },
-              {
-                role: 'assistant',
-                text: 'Second answer.',
-                id: 'msg-e2e-fork-ai-2',
-                timestamp: Math.floor(Date.now() / 1000) - 50,
-                usage: { model: 'openai/gpt-test', input_tokens: 30, output_tokens: 10, cost_usd: 0.0003 },
-              },
-            ],
-            has_more: false,
-          }
-          ws.send(JSON.stringify(frame))
+        if (frame?.type !== 'req') return
+        const method = String(frame.method || '')
+        if (method === 'connect') {
+          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
           return
         }
-      } catch {}
-      ws.send(message)
+        if (method === 'sessions.forkThroughTurn') {
+          forkCreated = true
+          capturedForks.push({
+            method,
+            params: { ...(frame.params || {}) },
+          })
+          ws.send(JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: true,
+            payload: {
+              key: THROUGH_TURN_CHILD_KEY,
+              forkMode: 'through_turn',
+              throughTurnId: frame.params?.throughTurnId,
+            },
+          }))
+          ws.send(JSON.stringify({
+            type: 'event',
+            event: 'sessions.changed',
+            payload: { key: THROUGH_TURN_CHILD_KEY },
+          }))
+          return
+        }
+        if (method === 'chat.history') {
+          const payload = frame.params?.sessionKey === THROUGH_TURN_CHILD_KEY
+            ? childHistory
+            : parentHistory
+          ws.send(JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: true,
+            payload,
+          }))
+          return
+        }
+        if (method === 'sessions.messages.subscribe') {
+          ws.send(JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: true,
+            payload: {
+              subscribed: true,
+              replay_complete: true,
+              current_stream_seq: 0,
+              hydration_complete: true,
+              run_status: 'idle',
+            },
+          }))
+          return
+        }
+        if (method === 'sessions.messages.snapshot') {
+          ws.send(JSON.stringify({
+            type: 'res',
+            id: frame.id,
+            ok: true,
+            payload: {
+              key: THROUGH_TURN_CHILD_KEY,
+              events: [],
+              current_stream_seq: 0,
+            },
+          }))
+          return
+        }
+        const sessionRow = (
+          key: string,
+          title: string,
+          updatedAt: number,
+          extra: Record<string, unknown> = {},
+        ) => ({
+          key,
+          title,
+          sessionKind: 'chat',
+          surface: 'webchat',
+          conversationKind: 'direct',
+          effectiveAgentId: 'main',
+          updatedAt,
+          messageCount: 2,
+          status: 'ok',
+          runStatus: 'idle',
+          ...extra,
+        })
+        const payloads: Record<string, unknown> = {
+          'agents.list': { agents: [] },
+          'commands.list_for_surface': { commands: [] },
+          'config.get': {
+            squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
+            permissions: {},
+            skills: {},
+          },
+          'sessions.list': {
+            sessions: forkCreated
+              ? [
+                  sessionRow(
+                    THROUGH_TURN_CHILD_KEY,
+                    THROUGH_TURN_CHILD_TITLE,
+                    200,
+                    {
+                      forked_from_parent: true,
+                      parent: { key: SESSION_KEY, title: SESSION_TITLE },
+                    },
+                  ),
+                  sessionRow(SESSION_KEY, SESSION_TITLE, 100),
+                ]
+              : [sessionRow(SESSION_KEY, SESSION_TITLE, 100)],
+            has_more: false,
+          },
+          'usage.status': { sessions: [] },
+        }
+        ws.send(JSON.stringify({
+          type: 'res',
+          id: frame.id,
+          ok: true,
+          payload: payloads[method] ?? {},
+        }))
+      } catch (err) {
+        if (!(err instanceof SyntaxError)) throw err
+      }
     })
   })
 }
@@ -219,19 +368,54 @@ test.describe('Conversation fork', () => {
     await expect(page.locator(FORK_BUTTON)).toHaveCount(0)
   })
 
-  test('fork renders only on the last assistant message of the thread', async ({ page }) => {
+  test('fork renders on every completed assistant turn', async ({ page }) => {
     await seedHistoryWithTwoTurns(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
 
     await expect(page.locator('.msg-ai')).toHaveCount(2, { timeout: 10000 })
-    // Whole-conversation fork: one button on the tip, none on earlier turns.
-    await expect(page.locator(FORK_BUTTON)).toHaveCount(1)
+    await expect(page.locator(FORK_BUTTON)).toHaveCount(2)
     await expect(page.locator('.msg-ai').last().locator(FORK_BUTTON)).toHaveCount(1)
-    await expect(page.locator('.msg-ai').first().locator(FORK_BUTTON)).toHaveCount(0)
-    await expect(page.locator(FORK_BUTTON)).toHaveAttribute('aria-label', 'Fork conversation')
+    await expect(page.locator('.msg-ai').first().locator(FORK_BUTTON)).toHaveCount(1)
+    await expect(page.locator(FORK_BUTTON).first()).toHaveAttribute('aria-label', 'Fork from here')
     // The retired follow-up row stays gone.
     await expect(page.locator('.done-card')).toHaveCount(0)
+  })
+
+  test('historical fork uses the dedicated through-turn RPC and exact boundary', async ({ page }) => {
+    const capturedForks: CapturedForkRequest[] = []
+    await seedHistoryWithTwoTurns(page, capturedForks)
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await expect(page.locator('.msg-ai')).toHaveCount(2, { timeout: 10000 })
+
+    const firstAnswer = page.locator('.msg-ai').first()
+    await firstAnswer.hover()
+    await firstAnswer.locator(FORK_BUTTON).click()
+
+    await expect.poll(() => capturedForks).toEqual([{
+      method: 'sessions.forkThroughTurn',
+      params: {
+        key: SESSION_KEY,
+        throughTurnId: 'turn-e2e-fork-1',
+      },
+    }])
+    await expect.poll(() => sessionFromUrl(page.url())).toBe(THROUGH_TURN_CHILD_KEY)
+    await expect(page.locator('.chat-thread')).toContainText('First answer.')
+    await expect(page.locator('.chat-thread')).not.toContainText('Second question.')
+
+    const parentRow = page.locator(
+      `.sidebar-history-row[data-session-key="${SESSION_KEY}"]`,
+    )
+    const childRow = page.locator(
+      `.sidebar-history-row[data-session-key="${THROUGH_TURN_CHILD_KEY}"]`,
+    )
+    await expect(parentRow.locator('.sidebar-history-title')).toHaveText(SESSION_TITLE)
+    await expect(childRow.locator('.sidebar-history-title')).toHaveText(THROUGH_TURN_CHILD_TITLE)
+    await expect(parentRow).toHaveAttribute('data-depth', '0')
+    await expect(childRow).toHaveAttribute('data-depth', '0')
+    await expect(parentRow.locator('.sidebar-history-rail')).toHaveCount(0)
+    await expect(childRow.locator('.sidebar-history-rail')).toHaveCount(0)
   })
 
   test('editing a middle message forks before it without leaking later history', async ({ page }) => {

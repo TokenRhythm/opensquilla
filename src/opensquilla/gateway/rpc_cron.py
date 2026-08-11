@@ -727,6 +727,10 @@ async def _finalize_cron_add(
         jitter_seconds = 0.0
     job = await scheduler.add_job(
         name=params.get("name") or text,
+        # Only an explicit JSON false changes the legacy create default.  This
+        # keeps missing or malformed values backward-compatible while making
+        # the Control UI's Enabled switch effective on the initial write.
+        enabled=params.get("enabled") is not False,
         handler_key=_handler_key_for_payload_kind(payload_kind_name),
         payload=payload,
         session_target=session_target,

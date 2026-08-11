@@ -163,6 +163,7 @@ export interface StatusPart {
   source?: string
   durability?: string
   detail?: string
+  reason?: string
 }
 
 export interface TurnMessageParts {

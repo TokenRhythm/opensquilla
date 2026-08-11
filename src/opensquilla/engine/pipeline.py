@@ -34,6 +34,10 @@ class TurnContext:
     attachments: list[dict] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
     raw_message: str | None = None
+    # Runtime-only semantic input for model routing and skill retrieval. It is
+    # intentionally excluded from metadata and repr so it cannot leak through
+    # decision snapshots or routine context logging.
+    routing_hint: str | None = field(default=None, repr=False)
     # Immutable catalog pinned at the provider/tools boundary. Selection
     # steps use this instead of probing the loader again mid-turn.
     skill_catalog: Any | None = None

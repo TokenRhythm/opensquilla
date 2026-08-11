@@ -137,3 +137,14 @@ class SkillSpec:
     #   timeout: float         — seconds before the subprocess is killed
     #   cwd: str               — working directory (defaults to base_dir)
     entrypoint: dict[str, Any] | None = None
+    # Stable identity of this physical skill instance. Kept last so adding the
+    # field does not shift any historical positional ``SkillSpec`` arguments.
+    # Multiple layers may contribute the same logical ``name``; ``instance_id``
+    # distinguishes the winning instance from shadowed candidates without
+    # exposing host paths.
+    instance_id: str = ""
+    # Full content/type digest of the physical Skill tree at catalog compile
+    # time. Supporting-resource reads compare this value with the live tree so
+    # a turn pinned to an older catalog cannot combine old instructions with
+    # files published by a newer install or reload.
+    tree_digest: str = ""

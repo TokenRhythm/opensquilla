@@ -316,7 +316,7 @@ def _add_desktop_logs(
     desktop_dir = _desktop_log_dir(home_dir)
     if desktop_dir is None:
         return
-    for name in ("desktop.log", "gateway.log"):
+    for name in ("desktop.log", "desktop.log.1", "desktop.log.2", "gateway.log"):
         path = desktop_dir / name
         if path.is_file():
             attempt(

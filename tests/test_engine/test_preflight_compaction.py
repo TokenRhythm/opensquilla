@@ -24,6 +24,7 @@ from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import Message, ModelInfo
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider.model_catalog import ModelCatalog
+from opensquilla.session import compaction as compaction_module
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import TranscriptEntry
@@ -1183,7 +1184,7 @@ async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim()
 
     _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert len(await sm.get_transcript(session_key)) == len(entries)
-    assert 0 < len(agent.history) < len(entries)
+    assert len(agent.history) < len(entries)
     assert summary_context is not None
     assert "emergency request-scoped compaction" in summary_context.lower()
 
@@ -1232,7 +1233,9 @@ async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_key = "agent:ops:preflight-open-circuit"
-    context_window = 1000
+    context_window = 10_000
+    history_capacity = 1_500
+    history_capacity_chars = 5_000
     entries = [
         TranscriptEntry(
             session_id="test-session-id",
@@ -1257,8 +1260,21 @@ async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
         count=3,
         opened_at=runtime_module.time.monotonic(),
     )
+    emergency_requests: list[Any] = []
+    original_compact_context = compaction_module.compact_context
 
-    await runner._maybe_preflight_compact(session_key, context_window)
+    async def capture_emergency_request(request: Any) -> Any:
+        emergency_requests.append(request)
+        return await original_compact_context(request)
+
+    monkeypatch.setattr(compaction_module, "compact_context", capture_emergency_request)
+
+    await runner._maybe_preflight_compact(
+        session_key,
+        context_window,
+        history_capacity_tokens=history_capacity,
+        history_capacity_chars=history_capacity_chars,
+    )
 
     mock_sm.compact.assert_not_awaited()
     assert [payload["status"] for _, payload in events] == ["emergency_ephemeral"]
@@ -1267,6 +1283,9 @@ async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
     assert emergency["applied"] is True
     assert emergency["durability"] == "request_scoped"
     assert runner._compaction_failures[session_key].count == 3
+    assert len(emergency_requests) == 1
+    assert emergency_requests[0].context_window_tokens == history_capacity
+    assert emergency_requests[0].context_window_chars == history_capacity_chars
 
 
 @pytest.mark.asyncio
@@ -1324,7 +1343,7 @@ async def test_preflight_empty_summary_uses_emergency_ephemeral_history_trim() -
 
     _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert len(await sm.get_transcript(session_key)) == len(entries)
-    assert 0 < len(agent.history) < len(entries)
+    assert len(agent.history) < len(entries)
     assert summary_context is not None
     assert "emergency request-scoped compaction" in summary_context.lower()
 

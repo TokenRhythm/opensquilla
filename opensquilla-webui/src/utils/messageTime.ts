@@ -22,27 +22,46 @@ export function messageDate(ts: string | number | null | undefined): Date | null
   return Number.isNaN(date.getTime()) ? null : date
 }
 
+// Minimal translator shape shared by chat bubbles: resolves a named i18n key
+// (e.g. "chat.time.minutesAgo") into a display string. vue-i18n's `t` satisfies
+// it, and keeping this narrow structural type lets messageTime stay decoupled
+// from the i18n runtime.
+export type TimeTranslator = (key: string, named?: Record<string, string | number>) => string
+
+// Compact English forms preserve existing non-UI callers and tests that don't
+// carry a translator. Chat UI projections and bubbles inject vue-i18n's t, so
+// their labels follow the active locale instead of being hardcoded.
+const DEFAULT_TRANSLATOR: TimeTranslator = (key, named = {}) => {
+  if (key === 'chat.time.justNow') return 'just now'
+  if (key === 'chat.time.minutesAgo') return `${named.n}m ago`
+  if (key === 'chat.time.hoursAgo') return `${named.n}h ago`
+  return key
+}
+
 // Coarse relative label for messages less than one day old. Older messages keep
 // their absolute timestamp without a redundant age suffix.
 // Pass a ticking `now` (epoch ms) to keep the label live without per-component
 // timers; it defaults to the current time for one-shot callers (e.g. export).
+// An optional translator resolves the bucket labels through the active locale.
 export function relativeTime(
   ts: string | number | null | undefined,
   now: number = Date.now(),
+  t: TimeTranslator = DEFAULT_TRANSLATOR,
 ): string {
   const date = messageDate(ts)
   if (!date) return ''
   // Clamp future timestamps (client/server clock skew) to "just now" rather than
   // letting a negative diff fall through the buckets incidentally.
   const diff = Math.max(0, (now - date.getTime()) / 1000)
-  if (diff < 60) return 'just now'
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
+  if (diff < 60) return t('chat.time.justNow')
+  if (diff < 3600) return t('chat.time.minutesAgo', { n: Math.floor(diff / 60) })
+  if (diff < 86400) return t('chat.time.hoursAgo', { n: Math.floor(diff / 3600) })
   return ''
 }
 
 // Locale-aware coarse relative label for status readouts ("5 minutes ago",
-// "5 分钟前"). Chat rendering keeps the compact English `relativeTime` above.
+// "5 分钟前"). Chat bubbles use the i18n-key `relativeTime` above; this Intl
+// formatter is for readouts that pass a raw locale string.
 export function localizedRelativeTime(
   ts: string | number | null | undefined,
   locale: string,

@@ -648,7 +648,32 @@ async def run_channel_dispatch(
             ) -> None:
                 await _dispatch_combined_message_after_debounce(channel, combined, turn_runner, session_manager, key, session_prefix, task_runtime, config, event_bridge, _ifl, channel_rpc_context_factory=channel_rpc_context_factory, admission_decision=_admission, busy_input_mode=busy_input_mode)  # noqa: E501
 
-            await debounce_coordinator.schedule(session_key, msg, window_s=debounce_window_s, on_fire=_on_debounce_fire)  # noqa: E501
+            acquire_intent = getattr(
+                task_runtime,
+                "acquire_explicit_ingress_intent",
+                None,
+            )
+            intent_lease = (
+                await acquire_intent(session_key) if callable(acquire_intent) else None
+            )
+
+            async def _release_debounce_intent(
+                _lease: Any = intent_lease,
+            ) -> None:
+                if _lease is not None:
+                    await _lease.release()
+
+            try:
+                await debounce_coordinator.schedule(
+                    session_key,
+                    msg,
+                    window_s=debounce_window_s,
+                    on_fire=_on_debounce_fire,
+                    on_settled=_release_debounce_intent,
+                )
+            except BaseException:
+                await _release_debounce_intent()
+                raise
             continue
         # fmt: on
 
@@ -681,17 +706,19 @@ async def run_channel_dispatch(
                     route_envelope=route_envelope,
                 )
 
-        await _apply_saved_channel_run_context(
-            route_envelope,
-            session_manager=session_manager,
-            config=config,
-            workspace_dir=None,
-            principal_is_owner=principal_is_owner,
-        )
+        ingested: AttachmentIngestResult | None = None
+        if not atomic_channel_acceptance:
+            await _apply_saved_channel_run_context(
+                route_envelope,
+                session_manager=session_manager,
+                config=config,
+                workspace_dir=None,
+                principal_is_owner=principal_is_owner,
+            )
 
-        ingested = await _ingest_channel_message_attachments(
-            channel=channel, msg=msg, config=config
-        )
+            ingested = await _ingest_channel_message_attachments(
+                channel=channel, msg=msg, config=config
+            )
 
         if not atomic_channel_acceptance:
             async with _maybe_lock(session_lock):
@@ -770,9 +797,11 @@ async def run_channel_dispatch(
                             ingested=ingested,
                             raw_content=raw_content,
                             config=config,
+                            principal_is_owner=principal_is_owner,
                             busy_input_mode=busy_input_mode,
                         )
                     else:
+                        assert ingested is not None
                         stream_relay = _RuntimeChannelStreamRelay.maybe_start(
                             channel,
                             msg,
@@ -978,6 +1007,7 @@ async def run_channel_dispatch(
         typing_task = _start_typing_keepalive(channel, msg)
         try:
             # Gap 4: Run agent turn with streaming (or batch fallback)
+            assert ingested is not None
             await _run_turn_with_streaming(
                 channel,
                 turn_runner,
@@ -1532,15 +1562,21 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         if not atomic_channel_acceptance:
             await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
 
-    await _apply_saved_channel_run_context(
-        route_envelope,
-        session_manager=session_manager,
-        config=config,
-        workspace_dir=None,
-        principal_is_owner=principal_is_owner,
-    )
+    ingested: AttachmentIngestResult | None = None
+    if not atomic_channel_acceptance:
+        await _apply_saved_channel_run_context(
+            route_envelope,
+            session_manager=session_manager,
+            config=config,
+            workspace_dir=None,
+            principal_is_owner=principal_is_owner,
+        )
 
-    ingested = await _ingest_channel_message_attachments(channel=channel, msg=msg, config=config)
+        ingested = await _ingest_channel_message_attachments(
+            channel=channel,
+            msg=msg,
+            config=config,
+        )
 
     if not atomic_channel_acceptance:
         async with _maybe_lock(session_lock):
@@ -1598,9 +1634,11 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
                     ingested=ingested,
                     raw_content=raw_content,
                     config=config,
+                    principal_is_owner=principal_is_owner,
                     busy_input_mode=busy_input_mode,
                 )
             else:
+                assert ingested is not None
                 stream_relay = _RuntimeChannelStreamRelay.maybe_start(channel, msg, task_runtime, config)  # noqa: E501
                 channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
                 if channel_overflow_policy is not None:
@@ -3030,7 +3068,7 @@ async def _record_main_delivery_context_after_acceptance(
         )
 
 
-async def _accept_channel_runtime_turn(
+async def _accept_channel_runtime_turn_impl(
     *,
     channel: Any,
     msg: IncomingMessage,
@@ -3106,6 +3144,16 @@ async def _accept_channel_runtime_turn(
         agent_id=route_envelope.agent_id,
         **delivery_fields,
     )
+    from opensquilla.session.goals import ClaimGoalMutation, GoalClaimCandidate
+
+    goal_claim_candidate: GoalClaimCandidate | None = None
+    current_goal = await storage.get_goal(session_key)
+    if current_goal is not None and current_goal.status == "active":
+        goal_claim_candidate = GoalClaimCandidate(
+            session_id=current_goal.session_id,
+            epoch=current_goal.session_epoch,
+            goal_id=current_goal.goal_id,
+        )
     workspace_guard = None
     bound_workspace_id = getattr(intent_plan.node, "workspace_id", None)
     if isinstance(bound_workspace_id, str) and bound_workspace_id:
@@ -3153,6 +3201,11 @@ async def _accept_channel_runtime_turn(
                 stream_relay.emit if stream_relay is not None else None
             ),
             overflow_policy=overflow_policy,
+            goal_candidate=(
+                goal_claim_candidate.as_task_detail()
+                if goal_claim_candidate is not None
+                else None
+            ),
         )
         try:
             acceptance = await storage.accept_turn(
@@ -3167,6 +3220,11 @@ async def _accept_channel_runtime_turn(
                 session_node=intent_plan.node if intent_plan.action == "create" else None,
                 session_updates=delivery_fields,
                 workspace_guard=workspace_guard,
+                goal_mutation=(
+                    ClaimGoalMutation(candidate=goal_claim_candidate)
+                    if goal_claim_candidate is not None
+                    else None
+                ),
             )
         except BaseException:
             await task_runtime.abort_reservation(reservation)
@@ -3200,7 +3258,14 @@ async def _accept_channel_runtime_turn(
                 task_id=acceptance.receipt.task_id,
                 exc_info=True,
             )
-            if not reservation.activated:
+            if reservation.activated:
+                log.warning(
+                    "channel.turn_activation_error_after_start",
+                    session_key=session_key,
+                    task_id=acceptance.receipt.task_id,
+                )
+                handle = await task_runtime.activate(reservation)
+            else:
                 try:
                     await task_runtime.abort_reservation(reservation)
                 except Exception:  # noqa: BLE001 - preserve accepted channel handling.
@@ -3210,27 +3275,46 @@ async def _accept_channel_runtime_turn(
                         task_id=acceptance.receipt.task_id,
                         exc_info=True,
                     )
-            try:
-                await storage.update_agent_task(
-                    acceptance.receipt.task_id,
-                    status="failed",
-                    finished_at=int(time.time() * 1000),
-                    terminal_reason="activation_failed",
-                    error_class=type(exc).__name__,
-                    error_message=str(exc),
+                goal_compensated = False
+                goal_service = getattr(task_runtime, "goal_service", None)
+                compensate_goal = getattr(
+                    goal_service,
+                    "compensate_activation_failure",
+                    None,
                 )
-            except Exception:  # noqa: BLE001 - preserve accepted channel handling.
-                log.warning(
-                    "channel.turn_activation_failure_record_failed",
-                    session_key=session_key,
+                if acceptance.goal_context is not None and callable(compensate_goal):
+                    try:
+                        await compensate_goal(acceptance.goal_context.as_task_detail())
+                        goal_compensated = True
+                    except Exception:  # noqa: BLE001 - preserve accepted handling.
+                        log.warning(
+                            "channel.goal_activation_compensation_failed",
+                            session_key=session_key,
+                            task_id=acceptance.receipt.task_id,
+                            exc_info=True,
+                        )
+                if not goal_compensated:
+                    try:
+                        await storage.update_agent_task(
+                            acceptance.receipt.task_id,
+                            status="failed",
+                            finished_at=int(time.time() * 1000),
+                            terminal_reason="activation_failed",
+                            error_class=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                    except Exception:  # noqa: BLE001 - preserve accepted handling.
+                        log.warning(
+                            "channel.turn_activation_failure_record_failed",
+                            session_key=session_key,
+                            task_id=acceptance.receipt.task_id,
+                            exc_info=True,
+                        )
+                handle = TaskHandle(
                     task_id=acceptance.receipt.task_id,
-                    exc_info=True,
+                    session_key=acceptance.receipt.accepted_session_key,
+                    status=AgentTaskStatus.FAILED,
                 )
-            handle = TaskHandle(
-                task_id=acceptance.receipt.task_id,
-                session_key=acceptance.receipt.accepted_session_key,
-                status=AgentTaskStatus.FAILED,
-            )
 
         try:
             session_manager.notify_message_appended(entry)
@@ -3258,6 +3342,51 @@ async def _accept_channel_runtime_turn(
             return await _commit_and_activate()
 
     return await complete_durable_ingress(_commit_with_session_admission())
+
+
+async def _accept_channel_runtime_turn(
+    *,
+    channel: Any,
+    msg: IncomingMessage,
+    session_manager: Any,
+    session_key: str,
+    route_envelope: Any,
+    task_runtime: Any,
+    ingested: AttachmentIngestResult | None,
+    raw_content: str,
+    config: Any,
+    principal_is_owner: bool | None = None,
+    busy_input_mode: str = "followup",
+) -> tuple[Any | None, str, _RuntimeChannelStreamRelay | None, bool]:
+    """Fence user intent before channel session/workspace preparation."""
+
+    async with task_runtime.explicit_ingress_intent(route_envelope.session_key):
+        if ingested is None:
+            assert principal_is_owner is not None
+            await _apply_saved_channel_run_context(
+                route_envelope,
+                session_manager=session_manager,
+                config=config,
+                workspace_dir=None,
+                principal_is_owner=principal_is_owner,
+            )
+            ingested = await _ingest_channel_message_attachments(
+                channel=channel,
+                msg=msg,
+                config=config,
+            )
+        return await _accept_channel_runtime_turn_impl(
+            channel=channel,
+            msg=msg,
+            session_manager=session_manager,
+            session_key=session_key,
+            route_envelope=route_envelope,
+            task_runtime=task_runtime,
+            ingested=ingested,
+            raw_content=raw_content,
+            config=config,
+            busy_input_mode=busy_input_mode,
+        )
 
 
 async def _append_channel_user_message(

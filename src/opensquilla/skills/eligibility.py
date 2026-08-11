@@ -300,6 +300,21 @@ def effective_disabled(disabled: set[str] | list[str] | None, coding_mode: bool)
     return result
 
 
+def eligibility_context_for_skills_config(config: object | None) -> EligibilityContext:
+    """Build an eligibility context from one ``SkillsConfig``-shaped object.
+
+    Keeping this conversion beside :func:`effective_disabled` prevents read-only
+    lifecycle and Doctor surfaces from silently dropping the operator gate while
+    the invocation path still enforces it.
+    """
+
+    disabled = getattr(config, "disabled", None) if config is not None else None
+    coding_mode = bool(getattr(config, "coding_mode", False)) if config is not None else False
+    return EligibilityContext.auto(
+        disabled_set=effective_disabled(disabled, coding_mode),
+    )
+
+
 def is_skill_available(
     name: str, *, disabled: set[str] | list[str] | None, coding_mode: bool
 ) -> bool:
@@ -341,3 +356,19 @@ def is_skill_available_live(name: str) -> bool:
     disabled = getattr(cfg, "disabled", None) or []
     coding_mode = bool(getattr(cfg, "coding_mode", False))
     return is_skill_available(name, disabled=disabled, coding_mode=coding_mode)
+
+
+def live_eligibility_context(
+    fallback_config: object | None = None,
+) -> EligibilityContext:
+    """Build an eligibility context from the current live operator config.
+
+    ``fallback_config`` is used by unit-test and offline-style composition roots
+    that have not registered the Gateway getter. With neither source present,
+    the normal default (coding mode off) still fails closed for ``code-task``.
+    """
+
+    config = fallback_config
+    if _live_skills_cfg_getter is not None:
+        config = _live_skills_cfg_getter()  # type: ignore[operator]
+    return eligibility_context_for_skills_config(config)

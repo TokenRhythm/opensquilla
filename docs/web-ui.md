@@ -99,6 +99,8 @@ The chat UI supports:
 - a deliverables drawer for generated outputs;
 - share and export actions for handoff;
 - a conversation sidebar for switching sessions;
+- durable `/goal` objectives with structured progress, usage, pause/resume,
+  edit, clear, guardrail, and Plan-mode waiting states;
 - `/meta` listing and run launch on gateway-backed chat sessions;
 - pending message queue behavior while compaction or runtime work is in flight;
 - manual `/compact`;
@@ -114,6 +116,11 @@ same session.
 Slash command suggestions complete before they run. `Tab` always completes the
 active candidate, while `Enter` completes a partial match and runs only an
 exact command. Unknown commands remain in the composer with a recovery hint.
+
+Use `/goal <objective>` to start a multi-turn Goal. Its ribbon remains visible
+while working or waiting, and mutation results, hydration, and the Goal event
+stream keep it synchronized after reconnects. See [`goal-mode.md`](goal-mode.md)
+for the lifecycle, execution-lease, guardrail, and Plan-mode contracts.
 
 Coding mode can be enabled from chat when you want code modifications routed
 through `opensquilla code-task`. With Coding mode on, code changes use the

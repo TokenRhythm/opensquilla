@@ -1,0 +1,82 @@
+name: Skill Hub Contract
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  skill-hub-contract:
+    name: skill-hub-contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install test dependencies
+        run: uv sync --extra dev --extra recommended --frozen
+
+      - name: Run offline Community Skill contracts
+        shell: bash
+        env:
+          OPENSQUILLA_STATE_DIR: ${{ runner.temp }}/opensquilla-skill-hub-state
+          OPENSQUILLA_LOG_DIR: ${{ runner.temp }}/opensquilla-skill-hub-logs
+          PYTHONUTF8: "1"
+        run: |
+          set -euo pipefail
+          uv run pytest \
+            tests/test_skills_manifest.py \
+            tests/test_skills_bundled_baseline.py \
+            tests/test_skills_hot_reload.py \
+            tests/test_skills_default_prompt_contract.py \
+            tests/test_skills_loader_namespaces.py \
+            tests/test_skills_hub_archive.py \
+            tests/test_skills_hub_clawhub.py \
+            tests/test_skills_hub_github.py \
+            tests/test_skills_hub_router.py \
+            tests/test_skills_hub_source.py \
+            tests/test_skills_hub_installer_security.py \
+            tests/test_skills_hub_lockfile_contract.py \
+            tests/test_skills_hub_doctor.py \
+            tests/test_skills/test_hub_management_service.py \
+            tests/test_skills/test_hub_scanner.py \
+            tests/test_skills/test_hub_transaction_recovery.py \
+            tests/test_skills/test_hub_transaction_process_gates.py \
+            tests/test_gateway/test_rpc_skills_install_visibility.py \
+            tests/test_gateway/test_rpc_skills_exact_identity.py \
+            tests/test_gateway/test_rpc_skills_coding_gate.py \
+            tests/test_gateway/test_rpc_skills_reload.py \
+            tests/test_gateway/test_skill_management_service_injection.py \
+            tests/test_tools/test_skill_view_resources.py \
+            tests/test_cli/test_cli_product_completeness.py \
+            tests/test_cli/test_skills_doctor_cmd.py \
+            tests/test_cli/test_skills_gateway_fallback.py \
+            tests/test_cli/test_skills_search_cmd.py \
+            tests/test_engine/turn_runner/test_provider_and_tools_stage_unit.py \
+            -m "not live_skill_hub" \
+            --strict-markers \
+            -q

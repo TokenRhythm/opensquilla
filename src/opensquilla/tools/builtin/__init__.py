@@ -15,6 +15,7 @@ _NAMES = [
     "file_authoring",
     "filesystem",
     "git",
+    "goal_control",
     "media",
     "messaging",
     "meta_tools",

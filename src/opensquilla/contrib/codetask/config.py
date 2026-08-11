@@ -15,7 +15,7 @@ from pathlib import Path
 from opensquilla.paths import default_opensquilla_home
 
 # ---------------------------------------------------------------------------
-# Agent defaults (shared profile with the swebench mode's tuned values)
+# Agent defaults for long-running repository tasks
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL = ""  # empty = router / config decides
 DEFAULT_THINKING = ""

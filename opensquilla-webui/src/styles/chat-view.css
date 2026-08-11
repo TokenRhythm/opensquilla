@@ -300,9 +300,93 @@
   scrollbar-gutter: stable;
 }
 
+/* Floating composer (existing conversation, toggle on): the dock leaves the
+   document flow and pins to the chat container's bottom edge, so the last
+   messages can scroll underneath the glass panel and the backdrop blur reads
+   through them. ResizeObserver publishes the entire dock's natural height, so
+   attachments, a growing draft, and pending work cannot cover the live edge. */
+.chat.chat--composer-floating .chat-thread {
+  padding-bottom: calc(var(--composer-dock-h, 12.5rem) + 0.5rem);
+}
+
 .chat-thread:focus-visible {
   box-shadow: inset 0 0 0 2px var(--border-focus);
   outline: none;
+}
+
+.chat-message-surface {
+  display: contents;
+}
+
+.chat-message-surface--preview {
+  user-select: none;
+}
+
+.chat-fork-transition-overlay {
+  position: absolute;
+  inset-inline: 0;
+  top: var(--sp-2);
+  z-index: 5;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.chat-fork-transition-status {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: fit-content;
+  max-width: min(calc(100% - 2rem), 42.5rem);
+  min-height: 2rem;
+  margin: var(--sp-1) auto 0;
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--bg-elevated) 94%, transparent);
+  box-shadow: var(--shadow-xs);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  pointer-events: auto;
+}
+
+.chat-fork-transition-status__spinner {
+  width: 0.875rem;
+  height: 0.875rem;
+  flex: 0 0 auto;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--text-muted);
+  border-radius: 50%;
+  animation: chat-fork-transition-spin 0.8s linear infinite;
+}
+
+.chat-fork-transition-status--error {
+  flex-wrap: wrap;
+  border-color: color-mix(in srgb, var(--warn) 36%, var(--border));
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg-elevated));
+  color: var(--text);
+}
+
+.chat-fork-transition-status__copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.chat-fork-transition-status--error > svg {
+  color: var(--warn);
+}
+
+.chat-fork-transition-status__action {
+  flex: 0 1 auto;
+  max-width: 100%;
+  min-height: 1.625rem;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-xs);
+  white-space: normal;
+}
+
+@keyframes chat-fork-transition-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* The thread scrollbar now sits at the true screen edge — give it a hit area
@@ -543,9 +627,23 @@
   flex-shrink: 0;
 }
 
+/* Floating composer (existing conversation, toggle on): the dock leaves the
+   document flow and pins to the chat container's bottom edge, so the last
+   messages can scroll underneath the glass panel and the backdrop blur reads
+   through them. The new-chat landing keeps the centered (relative) layout. */
+.chat.chat--composer-floating .chat-composer-dock {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+}
+
 .chat-composer-dock > .chat-composer {
   position: relative;
-  z-index: 2;
+  /* Do not create a parent stacking context here. Composer popovers own their
+     layer individually and must be able to rise above sibling run ribbons. */
+  z-index: auto;
 }
 
 .plan-questionnaire-dock {
@@ -596,6 +694,35 @@
 .plan-run-dock-leave-to {
   opacity: 0;
   transform: translate(-50%, 4px);
+}
+
+/* Goal run dock: in-flow bar above the composer so the active objective stays
+   visible without overlapping the absolute plan-run dock. */
+.goal-run-dock {
+  position: relative;
+  z-index: 3;
+  width: 100%;
+  max-width: var(--composer-col, 860px);
+  margin: 0 auto 8px;
+}
+
+.goal-run-dock-enter-active {
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+}
+
+.goal-run-dock-leave-active {
+  pointer-events: none;
+  transition:
+    opacity var(--dur-fast) var(--ease-in),
+    transform var(--dur-fast) var(--ease-in);
+}
+
+.goal-run-dock-enter-from,
+.goal-run-dock-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
 }
 
 @media (max-width: 640px) {
@@ -700,10 +827,6 @@
      padding), so the input panel's edges line up with the thread content. */
   width: min(100%, calc(var(--chat-col) + 3rem));
   margin: 0 auto;
-  padding: 0.75rem 1.5rem 1.875rem;
-  border-top: 0;
-  background: var(--bg-surface);
-  flex-shrink: 0;
 }
 
 .chat--new-landing .chat-composer {
@@ -1075,6 +1198,10 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .chat-fork-transition-status__spinner {
+    animation: none;
+  }
+
   .chat-drop-overlay__beacon {
     animation: none;
   }
@@ -1087,6 +1214,14 @@
 
 /* Mobile */
 @media (max-width: 768px) {
+  .chat-fork-transition-status--error {
+    width: calc(100% - 1rem);
+  }
+
+  .chat-fork-transition-status__action {
+    flex: 1 1 calc(50% - var(--sp-1));
+  }
+
   .chat--new-landing {
     padding: clamp(3.25rem, 13vh, 5.5rem) 0.75rem 1.25rem;
     gap: 0.875rem;
@@ -1121,11 +1256,12 @@
   }
 
   .chat-thread {
-    padding: 0.75rem;
+    padding: 0.75rem 0.75rem 1.5rem;
   }
 
-  .chat-composer {
-    padding: 0.5rem 0.75rem;
+  .chat.chat--composer-floating .chat-thread {
+    padding: 0.75rem;
+    padding-bottom: calc(var(--composer-dock-h, 12.5rem) + 0.5rem);
   }
 
 }

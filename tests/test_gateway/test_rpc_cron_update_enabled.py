@@ -1,11 +1,11 @@
-"""cron.update ``enabled`` toggles revive auto-stopped jobs and keep sibling fields."""
+"""Cron create/update ``enabled`` behavior stays effective and composable."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 from opensquilla.gateway.rpc import RpcContext
-from opensquilla.gateway.rpc_cron import _handle_cron_update
+from opensquilla.gateway.rpc_cron import _handle_cron_add, _handle_cron_update
 from opensquilla.scheduler.engine import SchedulerEngine
 from opensquilla.scheduler.jobs import apply_result
 from opensquilla.scheduler.payloads import make_agent_turn_payload, payload_text
@@ -33,6 +33,42 @@ async def _add_recurring_job(engine: SchedulerEngine):
 
 def _ctx(engine: SchedulerEngine) -> RpcContext:
     return RpcContext(conn_id="test", cron_scheduler=engine)
+
+
+async def test_create_enabled_false_is_persisted_as_paused(tmp_path: Path) -> None:
+    engine, store = await _make_engine(tmp_path)
+    try:
+        result = await _handle_cron_add(
+            {
+                "name": "paused reminder",
+                "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+                "payloadKind": "reminder",
+                "text": "stand up",
+                "agentId": "main",
+                "enabled": False,
+            },
+            _ctx(engine),
+        )
+
+        assert result["enabled"] is False
+        assert result["status"] == JobStatus.PAUSED.value
+        job_id = result["id"]
+        stored = await store.get(job_id)
+        assert stored is not None
+        assert stored.enabled is False
+        assert stored.status == JobStatus.PAUSED
+    finally:
+        await store.close()
+
+    reopened = JobStore(str(tmp_path / "cron.db"))
+    await reopened.open()
+    try:
+        persisted = await reopened.get(job_id)
+        assert persisted is not None
+        assert persisted.enabled is False
+        assert persisted.status == JobStatus.PAUSED
+    finally:
+        await reopened.close()
 
 
 async def test_update_enabled_true_revives_auto_disabled_job(tmp_path: Path) -> None:

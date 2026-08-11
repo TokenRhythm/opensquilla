@@ -38,6 +38,8 @@ _PROBE_TIMEOUT_SECONDS = 30.0
 _CODESIGN_PATH = Path("/usr/bin/codesign")
 _POST_INSTALL_TIMEOUT_SECONDS = 600.0
 _INSTALL_LOCK_TIMEOUT_SECONDS = 900.0
+_WINDOWS_PROMOTION_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0)
+_WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
 _SAFE_COMPONENT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SAFE_RECEIPT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _PAYLOAD_MANIFEST_VERSION = 1
@@ -1968,6 +1970,29 @@ def _quarantine_package(package: Path) -> Path:
     return quarantine
 
 
+def _promote_package_payload(payload: Path, package: Path) -> None:
+    """Atomically publish a verified payload, tolerating transient Windows locks.
+
+    Windows can briefly hold a freshly extracted executable open for indexing or
+    antivirus scanning. The component lock still guarantees that no competing
+    OpenSquilla installer can observe or replace the payload. Only the three
+    documented transient sharing/access errors are retried; all other failures
+    remain immediate and leave the staging payload intact for cleanup.
+    """
+    for delay in (*_WINDOWS_PROMOTION_RETRY_DELAYS_SECONDS, None):
+        try:
+            os.replace(payload, package)
+            return
+        except PermissionError as error:
+            if (
+                os.name != "nt"
+                or getattr(error, "winerror", None) not in _WINDOWS_TRANSIENT_REPLACE_ERRORS
+                or delay is None
+            ):
+                raise
+            time.sleep(delay)
+
+
 def _restore_quarantined_package(package: Path, quarantine: Path) -> None:
     if package.exists():
         if package.is_dir() and not package.is_symlink():
@@ -2116,7 +2141,7 @@ def _install_component_unlocked(
                     payload / ".opensquilla-toolchain.json",
                     _package_marker(descriptor, payload),
                 )
-                os.replace(payload, package)
+                _promote_package_payload(payload, package)
 
             active_path = state_root / "active" / f"{descriptor.component_id}.json"
             previous = None if quarantine is not None else _read_json(active_path)
@@ -2241,7 +2266,7 @@ def _install_brew_component(
                     payload / ".opensquilla-toolchain.json",
                     _package_marker(descriptor, payload),
                 )
-                os.replace(payload, package)
+                _promote_package_payload(payload, package)
             previous = (
                 None
                 if quarantine is not None

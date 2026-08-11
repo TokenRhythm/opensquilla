@@ -333,6 +333,23 @@ def _bool_from_env(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in _TRUE_ENV_VALUES
 
 
+def _strict_bool_from_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if normalized in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{name} must be one of: "
+        + ", ".join(
+            sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF)
+        )
+    )
+
+
 def _name_tuple_from_env(name: str) -> tuple[str, ...]:
     raw = os.environ.get(name, "")
     return tuple(item.strip() for item in raw.split(",") if item.strip())
@@ -1091,6 +1108,10 @@ class AgentBootstrapStage:
             reasoning_only_thinking_fallback=_bool_from_env(
                 "OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK",
                 AgentConfig().reasoning_only_thinking_fallback,
+            ),
+            provider_error_thinking_fallback=_strict_bool_from_env(
+                "OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK",
+                AgentConfig().provider_error_thinking_fallback,
             ),
             deadline_thinking_off_margin_seconds=_nonnegative_int_from_env(
                 "OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS",
