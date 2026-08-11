@@ -43,6 +43,22 @@ SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD = "selection_plan_evidence"
 SELECTION_PLAN_PACK_ARTIFACT_FIELD = "selection_plan_pack"
 SELECTION_PLAN_EVIDENCE_FORMAT_VERSION = 1
 
+SELECTION_PLAN_MANIFEST_BINDING_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "schema",
+        "capability",
+        "result_evidence_schema",
+        "durable_artifact_capability",
+        "results_sha256",
+        "trace_sha256",
+        "checkpoint_sha256",
+        "pack_sha256",
+        "pack_bytes",
+        "pack_object_count",
+        "compact_row_count",
+    }
+)
+
 SELECTION_PLAN_ROOT_KIND = "selection_plan"
 SELECTION_PLAN_LEAF_KINDS: Final[dict[str, str]] = {
     "registry_snapshot": "registry_snapshot",
@@ -56,6 +72,7 @@ SELECTION_PLAN_OBJECT_KINDS: Final[frozenset[str]] = frozenset(
 _CANONICAL_JSON_CONTRACT = "utf8-sort-keys-compact-no-nan"
 _EXPANDED_HASH_DOMAIN = b"opensquilla.draco-selection-plan-expanded/v1\0"
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_RAW_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _PACK_READ_CHUNK_BYTES = 256 * 1024
 
 _PACK_HEADER = {
@@ -1582,6 +1599,177 @@ class SelectionPlanPackAppender:
             pass
 
 
+def compact_selection_plan_evidence_row(
+    row: Mapping[str, Any],
+    *,
+    appender: SelectionPlanPackAppender,
+) -> dict[str, Any]:
+    """Replace every reserved inline ``selection_plan`` value with a root ref.
+
+    The row-view protocol has always treated ``selection_plan`` as a reserved
+    evidence field at any nesting depth.  The writer deliberately follows the
+    same closed namespace instead of maintaining a second, drifting path list.
+    A new runner row must be wholly inline: pre-existing refs or capability
+    markers are rejected rather than accepted as an unauthenticated downgrade.
+    Repeated plans are canonicalized and stored only once during this row.
+    """
+
+    if not isinstance(row, Mapping):
+        raise SelectionPlanEvidenceError("selection-plan row must be a JSON object")
+    if selection_plan_row_capability_signal(row):
+        raise SelectionPlanEvidenceError(
+            "new selection-plan row already contains a capability marker"
+        )
+    if selection_plan_reference_signal(row):
+        raise SelectionPlanEvidenceError(
+            "new selection-plan row already contains a root reference"
+        )
+
+    refs_by_plan: dict[bytes, dict[str, Any]] = {}
+
+    def compact(value: Any, *, field_name: str | None = None) -> Any:
+        if field_name == "selection_plan":
+            if type(value) is not dict:
+                raise SelectionPlanEvidenceError(
+                    "new selection-plan row requires an inline JSON object"
+                )
+            plan_bytes = canonical_selection_plan_json_bytes(value)
+            ref = refs_by_plan.get(plan_bytes)
+            if ref is None:
+                ref = appender.store_selection_plan(value)
+                refs_by_plan[plan_bytes] = ref
+            return copy.deepcopy(ref)
+        if isinstance(value, Mapping):
+            return {
+                key: compact(item, field_name=key)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [compact(item) for item in value]
+        return copy.deepcopy(value)
+
+    compacted = compact(row)
+    if not isinstance(compacted, dict):
+        raise SelectionPlanEvidenceError("selection-plan compact row is not an object")
+    compacted[SELECTION_PLAN_EVIDENCE_ROW_FIELD] = (
+        selection_plan_evidence_capability_contract()
+    )
+    return compacted
+
+
+def validate_compact_selection_plan_evidence_row(
+    row: Mapping[str, Any],
+    *,
+    reader: SelectionPlanPackReader | SelectionPlanPackAppender,
+) -> bool:
+    """Verify one compact row and return whether it contains at least one ref."""
+
+    expected_capability = selection_plan_evidence_capability_contract()
+    if row.get(SELECTION_PLAN_EVIDENCE_ROW_FIELD) != expected_capability:
+        raise SelectionPlanEvidenceError(
+            "compact selection-plan row lacks its exact root capability"
+        )
+    if any(
+        selection_plan_row_capability_signal(item)
+        for key, item in row.items()
+        if key != SELECTION_PLAN_EVIDENCE_ROW_FIELD
+    ):
+        raise SelectionPlanEvidenceError(
+            "compact selection-plan row contains a nested capability marker"
+        )
+    has_reference = selection_plan_reference_signal(row)
+    materialized = materialize_selection_plan_row_view(
+        row,
+        reader=reader,
+        require_references=True,
+    )
+    if selection_plan_reference_signal(materialized):
+        raise SelectionPlanEvidenceError(
+            "compact selection-plan row retained a root reference after validation"
+        )
+    return has_reference
+
+
+def selection_plan_evidence_manifest_binding(
+    *,
+    pack_index: SelectionPlanPackIndex,
+    durable_artifact_verification: Mapping[str, Any],
+    compact_row_count: int,
+) -> dict[str, Any]:
+    """Build the sole terminal manifest binding for compact DRACO evidence."""
+
+    from opensquilla.eval.draco_artifact_integrity import RESULT_EVIDENCE_SCHEMA
+    from opensquilla.eval.draco_artifact_io import (
+        durable_artifact_capability_contract,
+    )
+
+    if (
+        isinstance(compact_row_count, bool)
+        or not isinstance(compact_row_count, int)
+        or compact_row_count < 0
+    ):
+        raise SelectionPlanEvidenceError(
+            "compact selection-plan row count must be a non-negative integer"
+        )
+    if not _SHA256_RE.fullmatch(pack_index.pack_sha256):
+        raise SelectionPlanEvidenceError("selection-plan pack hash is malformed")
+    if (
+        isinstance(pack_index.pack_bytes, bool)
+        or not isinstance(pack_index.pack_bytes, int)
+        or pack_index.pack_bytes <= 0
+        or isinstance(pack_index.object_count, bool)
+        or not isinstance(pack_index.object_count, int)
+        or pack_index.object_count < 0
+    ):
+        raise SelectionPlanEvidenceError("selection-plan pack index is malformed")
+    hashes: dict[str, str] = {}
+    for key in ("results_sha256", "trace_sha256", "checkpoint_sha256"):
+        value = durable_artifact_verification.get(key)
+        if not isinstance(value, str) or not _RAW_SHA256_RE.fullmatch(value):
+            raise SelectionPlanEvidenceError(
+                f"durable artifact verification {key} is malformed"
+            )
+        hashes[key] = value
+    return {
+        "schema": SELECTION_PLAN_EVIDENCE_MANIFEST_SCHEMA,
+        "capability": selection_plan_evidence_capability_contract(),
+        "result_evidence_schema": RESULT_EVIDENCE_SCHEMA,
+        "durable_artifact_capability": durable_artifact_capability_contract(),
+        **hashes,
+        "pack_sha256": pack_index.pack_sha256,
+        "pack_bytes": pack_index.pack_bytes,
+        "pack_object_count": pack_index.object_count,
+        "compact_row_count": compact_row_count,
+    }
+
+
+def validate_selection_plan_evidence_manifest_binding(
+    binding: Mapping[str, Any],
+    *,
+    pack_index: SelectionPlanPackIndex,
+    durable_artifact_verification: Mapping[str, Any],
+    compact_row_count: int,
+) -> dict[str, Any]:
+    """Validate and detach an exact terminal selection-plan binding."""
+
+    if not isinstance(binding, Mapping) or set(binding) != set(
+        SELECTION_PLAN_MANIFEST_BINDING_FIELDS
+    ):
+        raise SelectionPlanEvidenceError(
+            "selection-plan manifest binding fields are incomplete"
+        )
+    expected = selection_plan_evidence_manifest_binding(
+        pack_index=pack_index,
+        durable_artifact_verification=durable_artifact_verification,
+        compact_row_count=compact_row_count,
+    )
+    if dict(binding) != expected:
+        raise SelectionPlanEvidenceError(
+            "selection-plan manifest binding differs from durable evidence"
+        )
+    return copy.deepcopy(expected)
+
+
 def selection_plan_reference_signal(value: Any) -> bool:
     """Return whether any nested object explicitly declares the ref schema."""
 
@@ -1704,6 +1892,7 @@ __all__ = [
     "SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD",
     "SELECTION_PLAN_EVIDENCE_MANIFEST_SCHEMA",
     "SELECTION_PLAN_EVIDENCE_ROW_FIELD",
+    "SELECTION_PLAN_MANIFEST_BINDING_FIELDS",
     "SELECTION_PLAN_OBJECT_SCHEMA",
     "SELECTION_PLAN_PACK_ARTIFACT_FIELD",
     "SELECTION_PLAN_PACK_RECORD_SCHEMA",
@@ -1719,12 +1908,16 @@ __all__ = [
     "SelectionPlanPackReader",
     "SelectionPlanReference",
     "canonical_selection_plan_json_bytes",
+    "compact_selection_plan_evidence_row",
     "expand_selection_plan",
     "is_selection_plan_reference",
     "materialize_selection_plan_row_view",
     "parse_selection_plan_reference",
     "selection_plan_evidence_capability_contract",
+    "selection_plan_evidence_manifest_binding",
     "selection_plan_reference_signal",
     "selection_plan_row_capability_signal",
     "selection_plan_summary",
+    "validate_compact_selection_plan_evidence_row",
+    "validate_selection_plan_evidence_manifest_binding",
 ]

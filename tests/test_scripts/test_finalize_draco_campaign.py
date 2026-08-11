@@ -9510,12 +9510,25 @@ def _compact_selection_plan_values(
     return value
 
 
+def _without_selection_plan_values(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _without_selection_plan_values(item)
+            for key, item in value.items()
+            if key != "selection_plan"
+        }
+    if isinstance(value, list):
+        return [_without_selection_plan_values(item) for item in value]
+    return value
+
+
 def _compact_source_fixture(
     module,
     tmp_path: Path,
     *,
     nested_row_marker: bool = False,
     embedded_plan_marker: bool = False,
+    header_only: bool = False,
 ) -> tuple[argparse.Namespace, Path, int]:
     args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
     legacy_rows = [
@@ -9559,6 +9572,10 @@ def _compact_source_fixture(
                     )
                 }
             unsealed[module.DRACO_DURABLE_RESULT_ROW_FIELD] = deepcopy(durability)
+            if header_only:
+                without_plans = _without_selection_plan_values(unsealed)
+                assert isinstance(without_plans, dict)
+                unsealed = without_plans
             compact = _compact_selection_plan_values(
                 unsealed,
                 appender=appender,
@@ -9630,6 +9647,39 @@ def _compact_source_fixture(
     args.result = [results_path]
     args.manifest = [manifest_path]
     return args, pack_path, lock_fd
+
+
+def test_compact_finalizer_accepts_header_only_zero_ref_rows_and_reseals_output(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, pack_path, lock_fd = _compact_source_fixture(
+        module,
+        tmp_path,
+        header_only=True,
+    )
+    try:
+        source_manifest = json.loads(args.manifest[0].read_text())
+        binding = source_manifest[module.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD]
+        assert binding["pack_object_count"] == 0
+        assert binding["compact_row_count"] == 0
+        with module.SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+            assert reader.index.object_count == 0
+
+        final_manifest = module.run_finalization(args)
+        assert final_manifest["status"] == "complete"
+        output_rows = [
+            json.loads(line)
+            for line in (args.output_dir / "results.jsonl").read_text().splitlines()
+        ]
+        assert output_rows
+        assert all(
+            module.SELECTION_PLAN_EVIDENCE_ROW_FIELD not in row
+            for row in output_rows
+        )
+        assert all(module.verify_result_row_evidence(row) for row in output_rows)
+    finally:
+        os.close(lock_fd)
 
 
 def _open_compact_finalizer_source_entry(module, args: argparse.Namespace):

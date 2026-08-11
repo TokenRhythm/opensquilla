@@ -10,6 +10,7 @@ import os
 import random
 import subprocess
 import sys
+import threading
 import tracemalloc
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
@@ -21,6 +22,7 @@ import pytest
 from opensquilla.engine.types import DoneEvent as AgentDoneEvent
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.eval import draco_artifact_index
+from opensquilla.eval.draco_artifact_io import DracoArtifactDurabilityError
 from opensquilla.eval.draco_result_summary import (
     MAX_STABLE_RESPONSE_ID_BYTES,
     MAX_SUMMARY_TEXT_BYTES,
@@ -7593,6 +7595,444 @@ def test_recovery_cli_arguments_are_manifested_and_reconstructed() -> None:
     assert "--finalization-aggregator-only" in reconstructed
     assert "--finalization-disable-thinking" in reconstructed
     assert "--continue-after-cost-audit-failure" in reconstructed
+
+
+def _content_addressed_writer_test_plan() -> dict[str, object]:
+    marker = "selection-plan-large-marker-" + "x" * 200_000
+    return {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "decision_id": "writer-test-decision",
+        "registry_snapshot": {"marker": marker, "models": []},
+        "ranking_parameters": {"version": "writer-test", "weights": {}},
+        "request_context": {"request": "writer-test"},
+        "selected_P": ["openrouter:test-proposer"],
+        "selected_A": "openrouter:test-aggregator",
+    }
+
+
+def _writer_test_args(input_path: Path, output_dir: Path):
+    return runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+            "--selection-plan-evidence-mode",
+            "content-addressed",
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_selection_plan_evidence_default_stays_inline_until_resume_supports_refs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    fixed_stamp = "20260811-010203"
+    unrelated_pack = output_dir / (
+        f"draco_run_{fixed_stamp}.selection-plan.pack.jsonl"
+    )
+    unrelated_pack.write_text("unrelated legacy file\n", encoding="utf-8")
+    real_strftime = runner.time.strftime
+
+    def fixed_run_stamp(format_string: str, *call_args) -> str:
+        if format_string == "%Y%m%d-%H%M%S":
+            return fixed_stamp
+        return real_strftime(format_string, *call_args)
+
+    monkeypatch.setattr(runner.time, "strftime", fixed_run_stamp)
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--groups",
+            "B0",
+            "--dry-run",
+        ]
+    )
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    real_run_one = runner.run_one
+    plan = _content_addressed_writer_test_plan()
+
+    async def row_with_plan(*call_args, **call_kwargs):
+        row = await real_run_one(*call_args, **call_kwargs)
+        row["routing_trace"] = {"selection_plan": deepcopy(plan)}
+        return row
+
+    monkeypatch.setattr(runner, "run_one", row_with_plan)
+    assert args.selection_plan_evidence_mode == "inline"
+    assert "selection_plan_evidence_mode" not in runner.manifest_args(args)
+    assert await runner.amain(args) == 0
+
+    row = json.loads(next(output_dir.glob("draco_ensemble_*.jsonl")).read_text())
+    manifest = json.loads(
+        next(output_dir.glob("draco_run_*.manifest.json")).read_text()
+    )
+    assert row["routing_trace"]["selection_plan"] == plan
+    assert runner.SELECTION_PLAN_EVIDENCE_ROW_FIELD not in row
+    assert runner.SELECTION_PLAN_EVIDENCE_ROW_FIELD not in manifest
+    assert runner.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD not in manifest
+    assert runner.SELECTION_PLAN_PACK_ARTIFACT_FIELD not in manifest["artifacts"]
+    assert unrelated_pack.read_text(encoding="utf-8") == "unrelated legacy file\n"
+
+
+@pytest.mark.asyncio
+async def test_main_runner_compacts_repeated_selection_plan_before_durable_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = _writer_test_args(input_path, output_dir)
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    real_run_one = runner.run_one
+    plan = _content_addressed_writer_test_plan()
+
+    async def run_one_with_repeated_plan(*call_args, **call_kwargs):
+        row = await real_run_one(*call_args, **call_kwargs)
+        row["routing_trace"] = {"selection_plan": deepcopy(plan)}
+        row["execution"]["routing_trace"] = {
+            "selection_plan": deepcopy(plan)
+        }
+        row["ensemble_trace"] = {
+            "calls": [{"selection_plan": deepcopy(plan)}]
+        }
+        return row
+
+    monkeypatch.setattr(runner, "run_one", run_one_with_repeated_plan)
+
+    assert await runner.amain(args) == 0
+
+    result_path = next(output_dir.glob("draco_ensemble_*.jsonl"))
+    trace_path = next(output_dir.glob("draco_run_*.trace.jsonl"))
+    manifest_path = next(output_dir.glob("draco_run_*.manifest.json"))
+    pack_path = next(output_dir.glob("draco_run_*.selection-plan.pack.jsonl"))
+    result_payload = result_path.read_text(encoding="utf-8")
+    row = json.loads(result_payload)
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ref = row["routing_trace"]["selection_plan"]
+
+    assert row[runner.SELECTION_PLAN_EVIDENCE_ROW_FIELD] == (
+        runner.selection_plan_evidence_capability_contract()
+    )
+    assert row["execution"]["routing_trace"]["selection_plan"] == ref
+    assert row["ensemble_trace"]["calls"][0]["selection_plan"] == ref
+    assert trace["routing_trace"]["selection_plan"] == ref
+    assert "selection-plan-large-marker" not in result_payload
+    assert len(json.dumps(ref)) * 20 < len(json.dumps(plan))
+    with runner.SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        assert reader.index.object_count == 4
+        assert reader.expand_selection_plan(ref) == plan
+    binding = manifest[runner.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD]
+    assert binding["pack_object_count"] == 4
+    assert binding["compact_row_count"] == 1
+    assert manifest["artifacts"][runner.SELECTION_PLAN_PACK_ARTIFACT_FIELD] == str(
+        pack_path
+    )
+
+    checkpoint_path = next(output_dir.glob("draco_run_*.checkpoint.json"))
+    real_verify = runner.verify_durable_draco_artifacts
+
+    def verify_then_replace(**call_kwargs):
+        verification = real_verify(**call_kwargs)
+        replacement = output_dir / "replacement-results.jsonl"
+        replacement.write_bytes(result_path.read_bytes())
+        os.chmod(replacement, 0o600)
+        os.replace(replacement, result_path)
+        return verification
+
+    monkeypatch.setattr(
+        runner,
+        "verify_durable_draco_artifacts",
+        verify_then_replace,
+    )
+    with pytest.raises(
+        DracoArtifactDurabilityError,
+        match="result artifact path changed after verification",
+    ):
+        runner.terminal_selection_plan_evidence_binding(
+            pack_path=pack_path,
+            results_path=result_path,
+            trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
+        )
+
+
+@pytest.mark.asyncio
+async def test_main_runner_header_only_pack_marks_rows_and_binds_zero_refs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = _writer_test_args(input_path, output_dir)
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    closed_pack_paths: set[Path] = set()
+    real_close = runner.SelectionPlanPackAppender.close
+    real_reader_init = runner.SelectionPlanPackReader.__init__
+
+    def record_pack_close(self) -> None:
+        path = Path(self.path)
+        real_close(self)
+        closed_pack_paths.add(path)
+
+    def require_closed_pack(self, path, *call_args, **call_kwargs) -> None:
+        assert Path(path) in closed_pack_paths
+        real_reader_init(self, path, *call_args, **call_kwargs)
+
+    monkeypatch.setattr(runner.SelectionPlanPackAppender, "close", record_pack_close)
+    monkeypatch.setattr(runner.SelectionPlanPackReader, "__init__", require_closed_pack)
+
+    assert await runner.amain(args) == 0
+
+    row = json.loads(next(output_dir.glob("draco_ensemble_*.jsonl")).read_text())
+    manifest = json.loads(
+        next(output_dir.glob("draco_run_*.manifest.json")).read_text()
+    )
+    pack_path = next(output_dir.glob("draco_run_*.selection-plan.pack.jsonl"))
+    assert row[runner.SELECTION_PLAN_EVIDENCE_ROW_FIELD] == (
+        runner.selection_plan_evidence_capability_contract()
+    )
+    with runner.SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        assert reader.index.object_count == 0
+    binding = manifest[runner.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD]
+    assert binding["pack_object_count"] == 0
+    assert binding["compact_row_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pack_close_failure_does_not_mask_primary_run_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = _writer_test_args(input_path, output_dir)
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    real_close = runner.AsyncSelectionPlanEvidenceWriter.aclose
+
+    async def fail_run_one(*_args, **_kwargs):
+        raise ValueError("primary task failure")
+
+    async def close_then_fail(self) -> None:
+        await real_close(self)
+        raise RuntimeError("secondary pack close failure")
+
+    monkeypatch.setattr(runner, "run_one", fail_run_one)
+    monkeypatch.setattr(
+        runner.AsyncSelectionPlanEvidenceWriter,
+        "aclose",
+        close_then_fail,
+    )
+
+    with pytest.raises(ValueError, match="primary task failure"):
+        await runner.amain(args)
+
+    manifest = json.loads(
+        next(output_dir.glob("draco_run_*.manifest.json")).read_text()
+    )
+    assert manifest["status"] == "running"
+    assert runner.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD not in manifest
+
+
+@pytest.mark.asyncio
+async def test_cleanup_without_primary_propagates_cancellation() -> None:
+    class CancelledClose:
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._cleanup_async_resource(
+            CancelledClose(),
+            label="test resource",
+            preserve_primary=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pack_compaction_cancellation_wins_over_late_worker_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_settled = threading.Event()
+
+    def fail_after_cancellation(*_args, **_kwargs):
+        worker_started.set()
+        assert release_worker.wait(timeout=10)
+        worker_settled.set()
+        raise ValueError("sensitive late compaction failure")
+
+    monkeypatch.setattr(
+        runner,
+        "compact_selection_plan_evidence_row",
+        fail_after_cancellation,
+    )
+    writer = runner.AsyncSelectionPlanEvidenceWriter(
+        SimpleNamespace(close=lambda: None)
+    )
+    compact_task = asyncio.create_task(writer.compact_row({"group": "B0"}))
+    assert await asyncio.to_thread(worker_started.wait, 10)
+    compact_task.cancel()
+    release_worker.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancellation:
+        await compact_task
+
+    assert worker_settled.is_set()
+    notes = list(getattr(cancellation.value, "__notes__", ()))
+    assert any("ValueError" in note for note in notes)
+    assert all("sensitive late compaction failure" not in note for note in notes)
+
+
+@pytest.mark.asyncio
+async def test_pack_close_cancellation_wins_over_late_worker_failure() -> None:
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_settled = threading.Event()
+
+    class LateFailingAppender:
+        def close(self) -> None:
+            worker_started.set()
+            assert release_worker.wait(timeout=10)
+            worker_settled.set()
+            raise ValueError("sensitive late close failure")
+
+    writer = runner.AsyncSelectionPlanEvidenceWriter(LateFailingAppender())
+    close_task = asyncio.create_task(writer.aclose())
+    assert await asyncio.to_thread(worker_started.wait, 10)
+    close_task.cancel()
+    release_worker.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancellation:
+        await close_task
+
+    assert worker_settled.is_set()
+    notes = list(getattr(cancellation.value, "__notes__", ()))
+    assert any("ValueError" in note for note in notes)
+    assert all("sensitive late close failure" not in note for note in notes)
+
+
+@pytest.mark.asyncio
+async def test_pack_write_failure_never_appends_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = _writer_test_args(input_path, output_dir)
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    real_run_one = runner.run_one
+    plan = _content_addressed_writer_test_plan()
+
+    async def row_with_plan(*call_args, **call_kwargs):
+        row = await real_run_one(*call_args, **call_kwargs)
+        row["routing_trace"] = {"selection_plan": plan}
+        return row
+
+    def fail_store(*_args, **_kwargs):
+        raise OSError("synthetic pack failure")
+
+    monkeypatch.setattr(runner, "run_one", row_with_plan)
+    monkeypatch.setattr(
+        runner.SelectionPlanPackAppender,
+        "store_selection_plan",
+        fail_store,
+    )
+
+    with pytest.raises(OSError, match="synthetic pack failure"):
+        await runner.amain(args)
+
+    assert next(output_dir.glob("draco_ensemble_*.jsonl")).read_text() == ""
+    manifest = json.loads(
+        next(output_dir.glob("draco_run_*.manifest.json")).read_text()
+    )
+    assert manifest["status"] == "aborted"
+    assert manifest[runner.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD][
+        "compact_row_count"
+    ] == 0
+
+
+@pytest.mark.asyncio
+async def test_pack_compaction_cancellation_settles_orphan_before_aborting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        json.dumps({"id": "task-a", "prompt": "task-a"}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = _writer_test_args(input_path, output_dir)
+    monkeypatch.setattr(runner.GatewayConfig, "load", lambda _path: GatewayConfig())
+    real_run_one = runner.run_one
+    real_compact = runner.compact_selection_plan_evidence_row
+    plan = _content_addressed_writer_test_plan()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    async def row_with_plan(*call_args, **call_kwargs):
+        row = await real_run_one(*call_args, **call_kwargs)
+        row["routing_trace"] = {"selection_plan": plan}
+        return row
+
+    def blocking_compact(*call_args, **call_kwargs):
+        worker_started.set()
+        assert release_worker.wait(timeout=10)
+        return real_compact(*call_args, **call_kwargs)
+
+    monkeypatch.setattr(runner, "run_one", row_with_plan)
+    monkeypatch.setattr(runner, "compact_selection_plan_evidence_row", blocking_compact)
+    run_task = asyncio.create_task(runner.amain(args))
+    assert await asyncio.to_thread(worker_started.wait, 10)
+    run_task.cancel()
+    release_worker.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert next(output_dir.glob("draco_ensemble_*.jsonl")).read_text() == ""
+    manifest = json.loads(
+        next(output_dir.glob("draco_run_*.manifest.json")).read_text()
+    )
+    pack_path = next(output_dir.glob("draco_run_*.selection-plan.pack.jsonl"))
+    assert manifest["status"] == "aborted"
+    binding = manifest[runner.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD]
+    assert binding["compact_row_count"] == 0
+    assert binding["pack_object_count"] == 4
+    with runner.SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        assert reader.index.object_count == 4
 
 
 @pytest.mark.asyncio

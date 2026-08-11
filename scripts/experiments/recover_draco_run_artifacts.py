@@ -22,7 +22,21 @@ from opensquilla.eval.draco_artifact_io import (
     atomic_write_text,
     durable_artifact_capability_contract,
     fsync_directory,
+    verify_durable_artifact_path_snapshots,
     verify_durable_draco_artifacts,
+)
+from opensquilla.eval.draco_selection_plan_evidence import (
+    SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
+    SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+    SELECTION_PLAN_PACK_ARTIFACT_FIELD,
+    SelectionPlanEvidenceError,
+    SelectionPlanPackReader,
+    selection_plan_evidence_capability_contract,
+    selection_plan_evidence_manifest_binding,
+    selection_plan_reference_signal,
+    selection_plan_row_capability_signal,
+    validate_compact_selection_plan_evidence_row,
+    validate_selection_plan_evidence_manifest_binding,
 )
 
 RECOVERY_SCHEMA = "opensquilla.draco-artifact-recovery/v1"
@@ -103,7 +117,119 @@ def _bound_standard_artifact_paths(
             )
     if expected["manifest_json"] != manifest_path:
         raise DracoArtifactDurabilityError("source manifest filename is not bound to its stamp")
+    capability_present = SELECTION_PLAN_EVIDENCE_ROW_FIELD in manifest
+    binding_present = SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD in manifest
+    pack_present = SELECTION_PLAN_PACK_ARTIFACT_FIELD in artifacts
+    if capability_present or binding_present or pack_present:
+        if manifest.get(SELECTION_PLAN_EVIDENCE_ROW_FIELD) != (
+            selection_plan_evidence_capability_contract()
+        ):
+            raise DracoArtifactDurabilityError(
+                "selection-plan recovery capability is incomplete"
+            )
+        raw_pack_path = artifacts.get(SELECTION_PLAN_PACK_ARTIFACT_FIELD)
+        pack_path = parent / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+        if (
+            not isinstance(raw_pack_path, str)
+            or not Path(raw_pack_path).is_absolute()
+            or Path(os.path.abspath(raw_pack_path)) != pack_path
+        ):
+            raise DracoArtifactDurabilityError(
+                "selection-plan recovery pack is not the standard stamp path"
+            )
+        status = str(manifest.get("status") or "")
+        binding = manifest.get(SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD)
+        if status == "running":
+            if binding_present:
+                raise DracoArtifactDurabilityError(
+                    "running selection-plan manifest contains a partial terminal binding"
+                )
+        elif not isinstance(binding, Mapping):
+            raise DracoArtifactDurabilityError(
+                "terminal selection-plan manifest lacks its durable binding"
+            )
+        expected[SELECTION_PLAN_PACK_ARTIFACT_FIELD] = pack_path
     return expected
+
+
+def _verify_bound_artifacts(
+    manifest: Mapping[str, Any],
+    bound_paths: Mapping[str, Path],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Verify durable rows and compact refs in one result-fd scan."""
+
+    pack_path = bound_paths.get(SELECTION_PLAN_PACK_ARTIFACT_FIELD)
+    compact_row_count = 0
+
+    def reject_compact_downgrade(row: Mapping[str, Any]) -> None:
+        if selection_plan_row_capability_signal(row) or selection_plan_reference_signal(row):
+            raise DracoArtifactDurabilityError(
+                "legacy recovery row contains undeclared compact selection-plan evidence"
+            )
+
+    if pack_path is None:
+        path_snapshots: dict[str, tuple[int, ...]] = {}
+        verification = verify_durable_draco_artifacts(
+            results_path=bound_paths["results_jsonl"],
+            trace_path=bound_paths["trace_jsonl"],
+            checkpoint_path=bound_paths["checkpoint_json"],
+            result_row_observer=reject_compact_downgrade,
+            path_snapshot_out=path_snapshots,
+        )
+        verify_durable_artifact_path_snapshots(
+            path_snapshots,
+            results_path=bound_paths["results_jsonl"],
+            trace_path=bound_paths["trace_jsonl"],
+            checkpoint_path=bound_paths["checkpoint_json"],
+        )
+        return verification, None
+
+    try:
+        with SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+            path_snapshots = {}
+            def validate_compact_row(row: Mapping[str, Any]) -> None:
+                nonlocal compact_row_count
+                compact_row_count += int(
+                    validate_compact_selection_plan_evidence_row(
+                        row,
+                        reader=reader,
+                    )
+                )
+
+            verification = verify_durable_draco_artifacts(
+                results_path=bound_paths["results_jsonl"],
+                trace_path=bound_paths["trace_jsonl"],
+                checkpoint_path=bound_paths["checkpoint_json"],
+                result_row_observer=validate_compact_row,
+                path_snapshot_out=path_snapshots,
+            )
+            reader.verify_snapshot()
+            verify_durable_artifact_path_snapshots(
+                path_snapshots,
+                results_path=bound_paths["results_jsonl"],
+                trace_path=bound_paths["trace_jsonl"],
+                checkpoint_path=bound_paths["checkpoint_json"],
+            )
+            binding = selection_plan_evidence_manifest_binding(
+                pack_index=reader.index,
+                durable_artifact_verification=verification,
+                compact_row_count=compact_row_count,
+            )
+            declared_binding = manifest.get(
+                SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD
+            )
+            if declared_binding is not None:
+                validate_selection_plan_evidence_manifest_binding(
+                    declared_binding,
+                    pack_index=reader.index,
+                    durable_artifact_verification=verification,
+                    compact_row_count=compact_row_count,
+                )
+            return verification, binding
+    except (OSError, SelectionPlanEvidenceError) as exc:
+        raise DracoArtifactDurabilityError(
+            f"selection-plan recovery evidence is invalid: {exc}"
+        ) from exc
 
 
 def _expected_keys(manifest: Mapping[str, Any]) -> set[tuple[str, str]]:
@@ -242,10 +368,9 @@ def recover_run(manifest_path: Path) -> dict[str, Any]:
                 "source manifest artifact targets changed while recovery acquired its lock"
             )
         if manifest.get("artifact_recovery") is not None:
-            verification = verify_durable_draco_artifacts(
-                results_path=results_path,
-                trace_path=trace_path,
-                checkpoint_path=checkpoint_path,
+            verification, selection_plan_binding = _verify_bound_artifacts(
+                manifest,
+                bound_paths,
             )
             recovery = manifest["artifact_recovery"]
             prior_manifest_path = Path(
@@ -282,6 +407,12 @@ def recover_run(manifest_path: Path) -> dict[str, Any]:
                 or recovery.get("results_sha256") != verification["results_sha256"]
                 or recovery.get("trace_sha256") != verification["trace_sha256"]
                 or recovery.get("checkpoint_sha256") != verification["checkpoint_sha256"]
+                or (
+                    recovery.get(SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD)
+                    != selection_plan_binding
+                    if selection_plan_binding is not None
+                    else SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD in recovery
+                )
                 or manifest.get("artifacts", {}).get("pre_recovery_manifest_json")
                 != str(prior_manifest_path)
                 or _sha256_bytes(prior_manifest_payload) != recovery.get("prior_manifest_sha256")
@@ -305,10 +436,9 @@ def recover_run(manifest_path: Path) -> dict[str, Any]:
             create=False,
         ) as writer:
             writer.repair_unpaired_result()
-        verification = verify_durable_draco_artifacts(
-            results_path=results_path,
-            trace_path=trace_path,
-            checkpoint_path=checkpoint_path,
+        verification, selection_plan_binding = _verify_bound_artifacts(
+            manifest,
+            bound_paths,
         )
         durable_keys = _durable_keys_from_verification(verification)
         ambiguous, durable_scheduled_pairs = _recovery_ledgers(
@@ -348,6 +478,10 @@ def recover_run(manifest_path: Path) -> dict[str, Any]:
             "physical_request_policy": "no_model_or_provider_calls",
             "automatic_rerun_allowed": False,
         }
+        if selection_plan_binding is not None:
+            recovery[SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD] = (
+                selection_plan_binding
+            )
         manifest["status"] = "result_incomplete"
         manifest["finished_at"] = recovered_at
         started_at = manifest.get("started_at")
@@ -358,6 +492,10 @@ def recover_run(manifest_path: Path) -> dict[str, Any]:
         )
         manifest["rows_written"] = verification["rows_written"]
         manifest["artifact_recovery"] = recovery
+        if selection_plan_binding is not None:
+            manifest[SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD] = (
+                selection_plan_binding
+            )
         manifest.pop("resume_selection", None)
         manifest["artifacts"]["pre_recovery_manifest_json"] = str(prior_manifest_path)
         if manifest.get("failure") is None:

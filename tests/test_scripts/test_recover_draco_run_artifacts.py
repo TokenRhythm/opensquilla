@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from opensquilla.eval import draco_artifact_io as artifact_io
+from opensquilla.eval import draco_selection_plan_evidence as plan_evidence
 from opensquilla.eval.draco_artifact_integrity import seal_result_row
 
 SCRIPT = (
@@ -84,6 +85,58 @@ def _running_half_pair(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return manifest_path, results_path, trace_path, checkpoint_path
 
 
+def _selection_plan() -> dict[str, object]:
+    return {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "decision_id": "recovery-plan",
+        "registry_snapshot": {"models": [{"identity": "openrouter:test"}]},
+        "ranking_parameters": {"weights": {"quality": 1.0}},
+        "request_context": {"request": "recovery"},
+        "selected_P": ["openrouter:test"],
+        "selected_A": "openrouter:test",
+    }
+
+
+def _compact_running_half_pair(
+    tmp_path: Path,
+    *,
+    include_orphan: bool = False,
+) -> tuple[Path, Path, Path, Path, Path]:
+    manifest_path, results_path, trace_path, checkpoint_path = _running_half_pair(
+        tmp_path
+    )
+    manifest = json.loads(manifest_path.read_text())
+    stamp = manifest["stamp"]
+    pack_path = tmp_path / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    source_row = json.loads(results_path.read_text())
+    source_row.pop("result_evidence_schema", None)
+    source_row.pop("result_evidence_sha256", None)
+    source_row["routing_trace"] = {"selection_plan": _selection_plan()}
+    with plan_evidence.SelectionPlanPackAppender(pack_path) as appender:
+        compact = plan_evidence.compact_selection_plan_evidence_row(
+            source_row,
+            appender=appender,
+        )
+        if include_orphan:
+            orphan = _selection_plan()
+            orphan["decision_id"] = "orphan-plan"
+            appender.store_selection_plan(orphan)
+    results_path.write_text(
+        json.dumps(seal_result_row(compact), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    manifest[plan_evidence.SELECTION_PLAN_EVIDENCE_ROW_FIELD] = (
+        plan_evidence.selection_plan_evidence_capability_contract()
+    )
+    manifest["artifacts"][plan_evidence.SELECTION_PLAN_PACK_ARTIFACT_FIELD] = str(
+        pack_path
+    )
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False) + "\n")
+    manifest_path.chmod(0o600)
+    return manifest_path, results_path, trace_path, checkpoint_path, pack_path
+
+
 def test_recover_run_repairs_half_pair_and_publishes_terminal_manifest(
     tmp_path: Path,
 ) -> None:
@@ -136,7 +189,7 @@ def test_recover_run_never_materializes_all_paired_result_rows(
     assert module.recover_run(manifest_path) == recovery
 
 
-def test_idempotent_recovery_uses_keys_from_the_verified_result_fd(
+def test_idempotent_recovery_rejects_result_replacement_after_verified_fd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -177,13 +230,87 @@ def test_idempotent_recovery_uses_keys_from_the_verified_result_fd(
         verify_then_replace_result,
     )
 
-    assert module.recover_run(manifest_path) == recovery
+    with pytest.raises(
+        artifact_io.DracoArtifactDurabilityError,
+        match="result artifact path changed after verification",
+    ):
+        module.recover_run(manifest_path)
     assert replaced is True
     assert results_path.read_bytes() == replacement_payload
     assert recovery["results_sha256"] == module._sha256_bytes(
         verified_results_payload
     )
     assert recovery["ambiguous_pairs"] == [{"group": "B0", "task_id": "task-2"}]
+
+
+def test_recover_compact_half_pair_binds_orphans_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    module = _load()
+    manifest_path, results_path, trace_path, checkpoint_path, pack_path = (
+        _compact_running_half_pair(tmp_path, include_orphan=True)
+    )
+
+    recovery = module.recover_run(manifest_path)
+
+    manifest = json.loads(manifest_path.read_text())
+    binding = manifest[plan_evidence.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD]
+    assert manifest["status"] == "result_incomplete"
+    assert recovery[plan_evidence.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD] == binding
+    assert binding["compact_row_count"] == 1
+    assert binding["pack_object_count"] == 5
+    assert trace_path.read_text()
+    assert json.loads(checkpoint_path.read_text())["rows_written"] == 1
+    with plan_evidence.SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        assert reader.index.object_count == 5
+    assert module.recover_run(manifest_path) == recovery
+    assert results_path.read_text()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["missing", "bytes", "wrong_path", "manifest_downgrade", "row_downgrade", "dangling"],
+)
+def test_recover_compact_evidence_fails_closed(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    module = _load()
+    manifest_path, results_path, _, _, pack_path = _compact_running_half_pair(
+        tmp_path
+    )
+    manifest = json.loads(manifest_path.read_text())
+    if tamper == "missing":
+        pack_path.unlink()
+    elif tamper == "bytes":
+        with pack_path.open("ab") as handle:
+            handle.write(b"tamper\n")
+    elif tamper == "wrong_path":
+        manifest["artifacts"][plan_evidence.SELECTION_PLAN_PACK_ARTIFACT_FIELD] = str(
+            tmp_path / "wrong.pack.jsonl"
+        )
+        manifest_path.write_text(json.dumps(manifest) + "\n")
+    elif tamper == "manifest_downgrade":
+        manifest.pop(plan_evidence.SELECTION_PLAN_EVIDENCE_ROW_FIELD)
+        manifest_path.write_text(json.dumps(manifest) + "\n")
+    else:
+        row = json.loads(results_path.read_text())
+        row.pop("result_evidence_schema", None)
+        row.pop("result_evidence_sha256", None)
+        if tamper == "row_downgrade":
+            row.pop(plan_evidence.SELECTION_PLAN_EVIDENCE_ROW_FIELD)
+        else:
+            row["routing_trace"]["selection_plan"]["sha256"] = (
+                "sha256:" + "f" * 64
+            )
+        results_path.write_text(
+            json.dumps(seal_result_row(row), ensure_ascii=False) + "\n"
+        )
+
+    with pytest.raises(
+        (artifact_io.DracoArtifactDurabilityError, plan_evidence.SelectionPlanEvidenceError),
+    ):
+        module.recover_run(manifest_path)
 
 
 def test_recover_run_refuses_an_active_runner_lock(tmp_path: Path) -> None:

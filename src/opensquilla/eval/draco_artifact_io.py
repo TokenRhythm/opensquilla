@@ -15,9 +15,10 @@ import json
 import os
 import stat
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from opensquilla.eval.draco_artifact_integrity import (
@@ -276,7 +277,12 @@ def _checkpoint_payload_for(
 
 
 def _open_readonly_artifact(path: Path, *, artifact: str) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -294,6 +300,40 @@ def _open_readonly_artifact(path: Path, *, artifact: str) -> int:
             f"{artifact} artifact is not a regular non-symlink file"
         )
     return fd
+
+
+def _readonly_artifact_signature(file_stat: os.stat_result) -> tuple[int, ...]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _verify_readonly_artifact_snapshot(
+    path: Path,
+    fd: int,
+    initial_signature: tuple[int, ...],
+    *,
+    artifact: str,
+) -> None:
+    """Require the scanned descriptor and its pathname to retain one identity."""
+
+    if _readonly_artifact_signature(os.fstat(fd)) != initial_signature:
+        raise DracoArtifactDurabilityError(
+            f"{artifact} artifact changed while it was being verified"
+        )
+    path_fd = _open_readonly_artifact(path, artifact=artifact)
+    try:
+        if _readonly_artifact_signature(os.fstat(path_fd)) != initial_signature:
+            raise DracoArtifactDurabilityError(
+                f"{artifact} artifact path was replaced while it was being verified"
+            )
+    finally:
+        os.close(path_fd)
 
 
 def _parse_readonly_result_line(
@@ -348,8 +388,10 @@ def verify_durable_draco_artifacts(
     results_path: Path,
     trace_path: Path,
     checkpoint_path: Path,
+    result_row_observer: Callable[[Mapping[str, Any]], None] | None = None,
+    path_snapshot_out: dict[str, tuple[int, ...]] | None = None,
 ) -> dict[str, Any]:
-    """Verify a finalized result/trace/checkpoint set without mutating it."""
+    """Verify one bound snapshot, optionally observing each authenticated row."""
 
     results_path = Path(results_path)
     trace_path = Path(trace_path)
@@ -369,6 +411,9 @@ def verify_durable_draco_artifacts(
         os.close(trace_fd)
         os.close(results_fd)
         raise
+    results_signature = _readonly_artifact_signature(os.fstat(results_fd))
+    trace_signature = _readonly_artifact_signature(os.fstat(trace_fd))
+    checkpoint_signature = _readonly_artifact_signature(os.fstat(checkpoint_fd))
     results: list[_ArtifactLine] = []
     traces: list[_ArtifactLine] = []
     result_identities: set[tuple[str, str, str]] = set()
@@ -427,11 +472,13 @@ def verify_durable_draco_artifacts(
                             f"blank trace row at line {line_number}"
                         )
                     expected = _serialized_line(trace_row_from_result(result_row))
-                    del result_row
                     if trace_line != expected:
                         raise DracoArtifactDurabilityError(
                             f"trace projection mismatch at row {line_number}"
                         )
+                    if result_row_observer is not None:
+                        result_row_observer(MappingProxyType(result_row))
+                    del result_row
                     trace_identity = result_identity
                     if trace_identity in trace_identities:
                         raise DracoArtifactDurabilityError(
@@ -456,6 +503,24 @@ def verify_durable_draco_artifacts(
                     )
                 checkpoint_payload = checkpoint_handle.read()
                 checkpoint_digest = hashlib.sha256(checkpoint_payload).hexdigest()
+                _verify_readonly_artifact_snapshot(
+                    results_path,
+                    results_handle.fileno(),
+                    results_signature,
+                    artifact="result",
+                )
+                _verify_readonly_artifact_snapshot(
+                    trace_path,
+                    trace_handle.fileno(),
+                    trace_signature,
+                    artifact="trace",
+                )
+                _verify_readonly_artifact_snapshot(
+                    checkpoint_path,
+                    checkpoint_handle.fileno(),
+                    checkpoint_signature,
+                    artifact="checkpoint",
+                )
     try:
         checkpoint = json.loads(checkpoint_payload.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -472,6 +537,18 @@ def verify_durable_draco_artifacts(
         raise DracoArtifactDurabilityError(
             "artifact checkpoint conflicts with finalized durable rows"
         )
+    if path_snapshot_out is not None:
+        if path_snapshot_out:
+            raise DracoArtifactDurabilityError(
+                "durable artifact path snapshot output must start empty"
+            )
+        path_snapshot_out.update(
+            {
+                "results_jsonl": results_signature,
+                "trace_jsonl": trace_signature,
+                "checkpoint_json": checkpoint_signature,
+            }
+        )
     return {
         **expected,
         "results_sha256": results_digest.hexdigest(),
@@ -479,6 +556,35 @@ def verify_durable_draco_artifacts(
         "checkpoint_sha256": checkpoint_digest,
         "durable_result_keys": tuple(durable_result_keys),
     }
+
+
+def verify_durable_artifact_path_snapshots(
+    snapshots: Mapping[str, tuple[int, ...]],
+    *,
+    results_path: Path,
+    trace_path: Path,
+    checkpoint_path: Path,
+) -> None:
+    """Recheck pathname identities returned by the bound-fd verifier."""
+
+    for key, path, artifact in (
+        ("results_jsonl", Path(results_path), "result"),
+        ("trace_jsonl", Path(trace_path), "trace"),
+        ("checkpoint_json", Path(checkpoint_path), "checkpoint"),
+    ):
+        expected = snapshots.get(key)
+        if not isinstance(expected, tuple):
+            raise DracoArtifactDurabilityError(
+                f"durable {artifact} artifact snapshot is malformed"
+            )
+        fd = _open_readonly_artifact(path, artifact=artifact)
+        try:
+            if _readonly_artifact_signature(os.fstat(fd)) != expected:
+                raise DracoArtifactDurabilityError(
+                    f"{artifact} artifact path changed after verification"
+                )
+        finally:
+            os.close(fd)
 
 
 class DurableDracoArtifactWriter:

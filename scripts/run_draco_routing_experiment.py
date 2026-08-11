@@ -98,6 +98,8 @@ from opensquilla.eval.draco_artifact_io import (
     durable_artifact_capability_contract,
     fsync_directory,
     iter_verified_result_rows,
+    verify_durable_artifact_path_snapshots,
+    verify_durable_draco_artifacts,
 )
 from opensquilla.eval.draco_experiment_config import (
     DracoEnsembleMemberConfig,
@@ -114,6 +116,17 @@ from opensquilla.eval.draco_result_summary import (
     build_result_summary_fact,
     result_failures_and_coverage,
     summarize_result_facts,
+)
+from opensquilla.eval.draco_selection_plan_evidence import (
+    SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
+    SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+    SELECTION_PLAN_PACK_ARTIFACT_FIELD,
+    SelectionPlanPackAppender,
+    SelectionPlanPackReader,
+    compact_selection_plan_evidence_row,
+    selection_plan_evidence_capability_contract,
+    selection_plan_evidence_manifest_binding,
+    validate_compact_selection_plan_evidence_row,
 )
 from opensquilla.eval.draco_task_supervisor import DracoRollingTaskWindow
 from opensquilla.eval.draco_usage_evidence import (
@@ -222,6 +235,13 @@ RUNNER_MODE = TOOL_MODE_PROVIDER_ONLY
 RUNNER_MODE_PROVIDER = "provider"
 RUNNER_MODE_AGENT_LOOP = "agent_loop"
 DEFAULT_DRACO_RUNNER_MODE = RUNNER_MODE_AGENT_LOOP
+SELECTION_PLAN_EVIDENCE_MODE_INLINE = "inline"
+SELECTION_PLAN_EVIDENCE_MODE_CONTENT_ADDRESSED = "content-addressed"
+SUPPORTED_SELECTION_PLAN_EVIDENCE_MODES = (
+    SELECTION_PLAN_EVIDENCE_MODE_INLINE,
+    SELECTION_PLAN_EVIDENCE_MODE_CONTENT_ADDRESSED,
+)
+DEFAULT_SELECTION_PLAN_EVIDENCE_MODE = SELECTION_PLAN_EVIDENCE_MODE_INLINE
 DEFAULT_AGENT_MAX_ITERATIONS = 12
 DEFAULT_DEADLINE_WRAPUP_MARGIN_SECONDS = 0
 DEFAULT_DEADLINE_WRAPUP_DISABLE_TOOLS = False
@@ -12492,6 +12512,137 @@ def trace_row(row: dict[str, Any]) -> dict[str, Any]:
     return trace_row_from_result(row)
 
 
+async def _settled_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Wait for a blocking artifact mutation to settle before propagating cancel."""
+
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:
+            if task.done() and task.cancelled():
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "selection-plan pack worker was cancelled during "
+                        "cancellation settlement"
+                    )
+                    raise cancellation from None
+                raise RuntimeError(
+                    "selection-plan pack worker was cancelled before settlement"
+                ) from exc
+            if cancellation is None:
+                cancellation = exc
+            continue
+        except BaseException as worker_exc:
+            if cancellation is None:
+                raise
+            cancellation.add_note(
+                "selection-plan pack worker settled with "
+                f"{type(worker_exc).__name__}; original cancellation preserved"
+            )
+            raise cancellation from None
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+class AsyncSelectionPlanEvidenceWriter:
+    """Single-flight event-loop boundary around the synchronous pack appender."""
+
+    def __init__(self, appender: SelectionPlanPackAppender) -> None:
+        self._appender = appender
+        self._lock = asyncio.Lock()
+        self._closed = False
+
+    async def compact_row(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("selection-plan pack writer is closed")
+            compacted = await _settled_to_thread(
+                compact_selection_plan_evidence_row,
+                row,
+                appender=self._appender,
+            )
+            if not isinstance(compacted, dict):
+                raise RuntimeError("selection-plan compact worker returned a non-object")
+            return compacted
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            await _settled_to_thread(self._appender.close)
+
+
+async def _cleanup_async_resource(
+    resource: Any,
+    *,
+    label: str,
+    preserve_primary: bool,
+) -> bool:
+    """Close an async resource without replacing an active business failure."""
+
+    if resource is None:
+        return True
+    try:
+        await resource.aclose()
+    except BaseException as cleanup_exc:
+        if not preserve_primary:
+            raise
+        print(
+            f"Failed to close {label}: {type(cleanup_exc).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    return True
+
+
+def terminal_selection_plan_evidence_binding(
+    *,
+    pack_path: Path,
+    results_path: Path,
+    trace_path: Path,
+    checkpoint_path: Path,
+) -> dict[str, Any]:
+    """Authenticate durable rows and their pack into one terminal contract."""
+
+    compact_row_count = 0
+    with SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        path_snapshots: dict[str, tuple[int, ...]] = {}
+        def observe_result_row(row: Mapping[str, Any]) -> None:
+            nonlocal compact_row_count
+            compact_row_count += int(
+                validate_compact_selection_plan_evidence_row(
+                    row,
+                    reader=reader,
+                )
+            )
+
+        verification = verify_durable_draco_artifacts(
+            results_path=results_path,
+            trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
+            result_row_observer=observe_result_row,
+            path_snapshot_out=path_snapshots,
+        )
+        reader.verify_snapshot()
+        verify_durable_artifact_path_snapshots(
+            path_snapshots,
+            results_path=results_path,
+            trace_path=trace_path,
+            checkpoint_path=checkpoint_path,
+        )
+        return selection_plan_evidence_manifest_binding(
+            pack_index=reader.index,
+            durable_artifact_verification=verification,
+            compact_row_count=compact_row_count,
+        )
+
+
 def percentile(values: list[int], pct: float) -> float:
     if not values:
         return 0.0
@@ -14904,6 +15055,13 @@ def manifest_args(args: argparse.Namespace) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for key in keys:
         payload[key] = _json_value(getattr(args, key, None))
+    selection_plan_mode = getattr(
+        args,
+        "selection_plan_evidence_mode",
+        DEFAULT_SELECTION_PLAN_EVIDENCE_MODE,
+    )
+    if selection_plan_mode != DEFAULT_SELECTION_PLAN_EVIDENCE_MODE:
+        payload["selection_plan_evidence_mode"] = selection_plan_mode
     bundle = getattr(args, "_draco_experiment_config_bundle", None)
     if isinstance(bundle, DracoExperimentConfigBundle):
         effective_path = getattr(args, "_effective_experiment_config_path", None)
@@ -15698,6 +15856,8 @@ def write_manifest(
     tool_policy: dict[str, Any] | None = None,
     command: dict[str, Any] | None = None,
     failure: dict[str, Any] | None = None,
+    selection_plan_enabled: bool = False,
+    selection_plan_binding: Mapping[str, Any] | None = None,
 ) -> None:
     policy = tool_policy or benchmark_tool_policy(args)
     generation_policy = generation_thinking_policy(args)
@@ -15760,6 +15920,32 @@ def write_manifest(
         payload["summary"] = summary
     if failure is not None:
         payload["failure"] = failure
+    if selection_plan_enabled:
+        raw_pack_path = artifacts.get(SELECTION_PLAN_PACK_ARTIFACT_FIELD)
+        if not isinstance(raw_pack_path, str) or not Path(raw_pack_path).is_absolute():
+            raise ValueError(
+                "content-addressed selection-plan manifest lacks its absolute pack artifact"
+            )
+        payload[SELECTION_PLAN_EVIDENCE_ROW_FIELD] = (
+            selection_plan_evidence_capability_contract()
+        )
+        if status == "running":
+            if selection_plan_binding is not None:
+                raise ValueError(
+                    "running selection-plan manifest cannot publish a terminal binding"
+                )
+        else:
+            if selection_plan_binding is None:
+                raise ValueError(
+                    "terminal selection-plan manifest requires its durable binding"
+                )
+            payload[SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD] = dict(
+                selection_plan_binding
+            )
+    elif selection_plan_binding is not None:
+        raise ValueError(
+            "selection-plan binding cannot be published without its capability"
+        )
     atomic_write_text(
         path,
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -16022,11 +16208,22 @@ async def _amain_with_run_lock(
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     output_dir = output_dir.resolve(strict=True)
+    content_addressed_selection_plans = (
+        getattr(
+            args,
+            "selection_plan_evidence_mode",
+            DEFAULT_SELECTION_PLAN_EVIDENCE_MODE,
+        )
+        == SELECTION_PLAN_EVIDENCE_MODE_CONTENT_ADDRESSED
+    )
     stamp = time.strftime("%Y%m%d-%H%M%S")
     run_started_at = time.time()
     jsonl_path = output_dir / f"draco_ensemble_{stamp}.jsonl"
     trace_path = output_dir / f"draco_run_{stamp}.trace.jsonl"
     checkpoint_path = output_dir / f"draco_run_{stamp}.checkpoint.json"
+    selection_plan_pack_path = (
+        output_dir / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    )
     manifest_path = output_dir / f"draco_run_{stamp}.manifest.json"
     command_path = output_dir / f"draco_run_{stamp}.command.txt"
     summary_json_path = jsonl_path.with_suffix(".summary.json")
@@ -16043,6 +16240,7 @@ async def _amain_with_run_lock(
         command_path,
         summary_json_path,
         jsonl_path.with_suffix(".md"),
+        *((selection_plan_pack_path,) if content_addressed_selection_plans else ()),
     )
     if any(path.exists() for path in protected_paths):
         run_lock.close()
@@ -16059,12 +16257,25 @@ async def _amain_with_run_lock(
         "summary_json": str(summary_json_path),
         "summary_markdown": str(jsonl_path.with_suffix(".md")),
     }
+    if content_addressed_selection_plans:
+        artifacts[SELECTION_PLAN_PACK_ARTIFACT_FIELD] = str(
+            selection_plan_pack_path
+        )
     try:
         artifacts.update(write_experiment_config_artifacts(output_dir, args=args, stamp=stamp))
         command = write_command_file(command_path, args=args, stamp=stamp)
     except BaseException:
         run_lock.close()
         raise
+    selection_plan_writer: AsyncSelectionPlanEvidenceWriter | None = None
+    if content_addressed_selection_plans:
+        try:
+            selection_plan_writer = AsyncSelectionPlanEvidenceWriter(
+                SelectionPlanPackAppender(selection_plan_pack_path)
+            )
+        except BaseException:
+            run_lock.close()
+            raise
     try:
         artifact_writer = AsyncDurableDracoArtifactWriter(
             DurableDracoArtifactWriter(
@@ -16074,6 +16285,11 @@ async def _amain_with_run_lock(
             )
         )
     except BaseException:
+        await _cleanup_async_resource(
+            selection_plan_writer,
+            label="selection-plan pack",
+            preserve_primary=True,
+        )
         run_lock.close()
         raise
     try:
@@ -16088,9 +16304,19 @@ async def _amain_with_run_lock(
             artifacts=artifacts,
             tool_policy=manifest_tool_policy,
             command=command,
+            selection_plan_enabled=content_addressed_selection_plans,
         )
     except BaseException:
-        await artifact_writer.aclose()
+        await _cleanup_async_resource(
+            artifact_writer,
+            label="durable artifact writer",
+            preserve_primary=True,
+        )
+        await _cleanup_async_resource(
+            selection_plan_writer,
+            label="selection-plan pack",
+            preserve_primary=True,
+        )
         run_lock.close()
         raise
 
@@ -16201,6 +16427,8 @@ async def _amain_with_run_lock(
                         row,
                         non_byok_audit=audit,
                     )
+                if selection_plan_writer is not None:
+                    row = await selection_plan_writer.compact_row(row)
                 row[DRACO_DURABLE_RESULT_ROW_FIELD] = durable_artifact_capability_contract()
                 row = seal_result_row(row)
                 trace_value = trace_row(row)
@@ -16222,28 +16450,47 @@ async def _amain_with_run_lock(
             exc,
             rows_written=rows_persisted,
         )
-        try:
-            write_manifest(
-                manifest_path,
-                args=args,
-                stamp=stamp,
-                status="aborted",
-                started_at=run_started_at,
-                finished_at=time.time(),
-                tasks=tasks,
-                groups=groups,
-                artifacts=artifacts,
-                rows_written=rows_persisted,
-                tool_policy=manifest_tool_policy,
-                command=command,
-                failure=failure,
-            )
-        except Exception as manifest_exc:
-            print(
-                f"Failed to publish aborted manifest: {type(manifest_exc).__name__}",
-                file=sys.stderr,
-                flush=True,
-            )
+        pack_closed = await _cleanup_async_resource(
+            selection_plan_writer,
+            label="selection-plan pack",
+            preserve_primary=True,
+        )
+        if pack_closed:
+            try:
+                selection_plan_binding = (
+                    await _settled_to_thread(
+                        terminal_selection_plan_evidence_binding,
+                        pack_path=selection_plan_pack_path,
+                        results_path=jsonl_path,
+                        trace_path=trace_path,
+                        checkpoint_path=checkpoint_path,
+                    )
+                    if content_addressed_selection_plans
+                    else None
+                )
+                write_manifest(
+                    manifest_path,
+                    args=args,
+                    stamp=stamp,
+                    status="aborted",
+                    started_at=run_started_at,
+                    finished_at=time.time(),
+                    tasks=tasks,
+                    groups=groups,
+                    artifacts=artifacts,
+                    rows_written=rows_persisted,
+                    tool_policy=manifest_tool_policy,
+                    command=command,
+                    failure=failure,
+                    selection_plan_enabled=content_addressed_selection_plans,
+                    selection_plan_binding=selection_plan_binding,
+                )
+            except BaseException as manifest_exc:
+                print(
+                    f"Failed to publish aborted manifest: {type(manifest_exc).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         run_lock.close()
         raise
     try:
@@ -16257,6 +16504,11 @@ async def _amain_with_run_lock(
             ),
         )
     except BaseException:
+        await _cleanup_async_resource(
+            selection_plan_writer,
+            label="selection-plan pack",
+            preserve_primary=True,
+        )
         run_lock.close()
         raise
     manifest_failure: dict[str, Any] | None = None
@@ -16314,6 +16566,17 @@ async def _amain_with_run_lock(
             summary_json_path,
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
         )
+        if selection_plan_writer is not None:
+            await selection_plan_writer.aclose()
+            selection_plan_binding = await _settled_to_thread(
+                terminal_selection_plan_evidence_binding,
+                pack_path=selection_plan_pack_path,
+                results_path=jsonl_path,
+                trace_path=trace_path,
+                checkpoint_path=checkpoint_path,
+            )
+        else:
+            selection_plan_binding = None
         write_manifest(
             manifest_path,
             args=args,
@@ -16329,6 +16592,8 @@ async def _amain_with_run_lock(
             tool_policy=manifest_tool_policy,
             command=command,
             failure=manifest_failure,
+            selection_plan_enabled=content_addressed_selection_plans,
+            selection_plan_binding=selection_plan_binding,
         )
         print(f"wrote {jsonl_path}")
         print(f"wrote {trace_path}")
@@ -16342,6 +16607,11 @@ async def _amain_with_run_lock(
                 print(f"wrote {path}")
         return 2 if manifest_failure is not None else 0
     finally:
+        await _cleanup_async_resource(
+            selection_plan_writer,
+            label="selection-plan pack",
+            preserve_primary=sys.exc_info()[0] is not None,
+        )
         run_lock.close()
 
 
@@ -16401,6 +16671,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("reports/draco"))
+    parser.add_argument(
+        "--selection-plan-evidence-mode",
+        choices=SUPPORTED_SELECTION_PLAN_EVIDENCE_MODES,
+        default=DEFAULT_SELECTION_PLAN_EVIDENCE_MODE,
+        help=(
+            "Write legacy inline selection plans (default until resume supports compact "
+            "sources), or opt in to content-addressed pack evidence."
+        ),
+    )
     parser.add_argument(
         "--groups",
         required=True,

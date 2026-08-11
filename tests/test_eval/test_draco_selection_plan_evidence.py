@@ -23,9 +23,13 @@ from opensquilla.eval.draco_selection_plan_evidence import (
     SelectionPlanPackAppender,
     SelectionPlanPackReader,
     canonical_selection_plan_json_bytes,
+    compact_selection_plan_evidence_row,
     expand_selection_plan,
     materialize_selection_plan_row_view,
     parse_selection_plan_reference,
+    selection_plan_evidence_manifest_binding,
+    validate_compact_selection_plan_evidence_row,
+    validate_selection_plan_evidence_manifest_binding,
 )
 
 
@@ -830,3 +834,114 @@ def test_ref_schema_and_expanded_hash_are_domain_separated(tmp_path: Path) -> No
     with SelectionPlanPackReader(path) as reader:
         with pytest.raises(SelectionPlanEvidenceError, match="expanded selection plan differs"):
             reader.expand_selection_plan(tampered)
+
+
+def _durable_verification() -> dict[str, object]:
+    return {
+        "results_sha256": "1" * 64,
+        "trace_sha256": "2" * 64,
+        "checkpoint_sha256": "3" * 64,
+    }
+
+
+def test_writer_compacts_reserved_selection_plan_fields_once_per_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "selection-plans.jsonl"
+    plan = _plan()
+    row = {
+        "routing_trace": {"selection_plan": deepcopy(plan)},
+        "execution": {
+            "generation_attempts": [
+                {"run": {"routing_trace": {"selection_plan": deepcopy(plan)}}}
+            ]
+        },
+        "ensemble_trace": {"calls": [{"selection_plan": deepcopy(plan)}]},
+    }
+    with SelectionPlanPackAppender(path) as appender:
+        calls = 0
+        original_store = appender.store_selection_plan
+
+        def counted_store(value: object) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return original_store(value)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(appender, "store_selection_plan", counted_store)
+        compact = compact_selection_plan_evidence_row(row, appender=appender)
+        assert calls == 1
+        assert appender.index.object_count == 4
+        assert validate_compact_selection_plan_evidence_row(
+            compact,
+            reader=appender,
+        ) is True
+
+    first_ref = compact["routing_trace"]["selection_plan"]
+    assert compact["execution"]["generation_attempts"][0]["run"][
+        "routing_trace"
+    ]["selection_plan"] == first_ref
+    assert compact["ensemble_trace"]["calls"][0]["selection_plan"] == first_ref
+    assert row["routing_trace"]["selection_plan"] == plan
+
+
+def test_writer_header_only_row_and_zero_object_binding(tmp_path: Path) -> None:
+    path = tmp_path / "selection-plans.jsonl"
+    with SelectionPlanPackAppender(path) as appender:
+        compact = compact_selection_plan_evidence_row(
+            {"group": "B0", "task_id": "task-1"},
+            appender=appender,
+        )
+        assert validate_compact_selection_plan_evidence_row(
+            compact,
+            reader=appender,
+        ) is False
+        binding = selection_plan_evidence_manifest_binding(
+            pack_index=appender.index,
+            durable_artifact_verification=_durable_verification(),
+            compact_row_count=0,
+        )
+        assert binding["pack_object_count"] == 0
+        assert binding["compact_row_count"] == 0
+        assert validate_selection_plan_evidence_manifest_binding(
+            binding,
+            pack_index=appender.index,
+            durable_artifact_verification=_durable_verification(),
+            compact_row_count=0,
+        ) == binding
+
+
+@pytest.mark.parametrize("inline_value", [None, "business text", [], 7])
+def test_writer_rejects_non_mapping_reserved_selection_plan(
+    tmp_path: Path,
+    inline_value: object,
+) -> None:
+    with SelectionPlanPackAppender(tmp_path / "selection-plans.jsonl") as appender:
+        with pytest.raises(
+            SelectionPlanEvidenceError,
+            match="requires an inline JSON object",
+        ):
+            compact_selection_plan_evidence_row(
+                {"metadata": {"selection_plan": inline_value}},
+                appender=appender,
+            )
+
+
+def test_terminal_binding_rejects_tamper(tmp_path: Path) -> None:
+    with SelectionPlanPackAppender(tmp_path / "selection-plans.jsonl") as appender:
+        binding = selection_plan_evidence_manifest_binding(
+            pack_index=appender.index,
+            durable_artifact_verification=_durable_verification(),
+            compact_row_count=0,
+        )
+        binding["results_sha256"] = "f" * 64
+        with pytest.raises(
+            SelectionPlanEvidenceError,
+            match="differs from durable evidence",
+        ):
+            validate_selection_plan_evidence_manifest_binding(
+                binding,
+                pack_index=appender.index,
+                durable_artifact_verification=_durable_verification(),
+                compact_row_count=0,
+            )

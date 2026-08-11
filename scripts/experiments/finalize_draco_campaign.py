@@ -44,6 +44,7 @@ from opensquilla.eval.draco_selection_plan_evidence import (
     SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
     SELECTION_PLAN_EVIDENCE_MANIFEST_SCHEMA,
     SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+    SELECTION_PLAN_MANIFEST_BINDING_FIELDS,
     SELECTION_PLAN_PACK_ARTIFACT_FIELD,
     SelectionPlanEvidenceError,
     SelectionPlanPackReader,
@@ -51,6 +52,7 @@ from opensquilla.eval.draco_selection_plan_evidence import (
     selection_plan_evidence_capability_contract,
     selection_plan_reference_signal,
     selection_plan_row_capability_signal,
+    validate_selection_plan_evidence_manifest_binding,
 )
 from opensquilla.provider.protocol import (
     provider_retry_expanded_proposer_identities,
@@ -1912,23 +1914,6 @@ def validate_source_policy_history(
     return failures
 
 
-_SELECTION_PLAN_MANIFEST_BINDING_FIELDS = frozenset(
-    {
-        "schema",
-        "capability",
-        "result_evidence_schema",
-        "durable_artifact_capability",
-        "results_sha256",
-        "trace_sha256",
-        "checkpoint_sha256",
-        "pack_sha256",
-        "pack_bytes",
-        "pack_object_count",
-        "compact_row_count",
-    }
-)
-
-
 def _selection_plan_row_has_exact_root_capability(
     row: Mapping[str, Any],
     expected_capability: Mapping[str, Any],
@@ -1990,7 +1975,7 @@ def _selection_plan_manifest_contract(
         or artifact_verification is None
         or capability != expected_capability
         or not isinstance(binding, Mapping)
-        or set(binding) != _SELECTION_PLAN_MANIFEST_BINDING_FIELDS
+        or set(binding) != SELECTION_PLAN_MANIFEST_BINDING_FIELDS
         or binding.get("schema") != SELECTION_PLAN_EVIDENCE_MANIFEST_SCHEMA
         or binding.get("capability") != expected_capability
         or binding.get("result_evidence_schema") != RESULT_EVIDENCE_SCHEMA
@@ -2011,23 +1996,23 @@ def _selection_plan_manifest_contract(
         or int(binding["pack_bytes"]) <= 0
         or isinstance(binding.get("pack_object_count"), bool)
         or not isinstance(binding.get("pack_object_count"), int)
-        or int(binding["pack_object_count"]) <= 0
+        or int(binding["pack_object_count"]) < 0
         or isinstance(binding.get("compact_row_count"), bool)
         or not isinstance(binding.get("compact_row_count"), int)
-        or int(binding["compact_row_count"]) <= 0
+        or int(binding["compact_row_count"]) < 0
         or binding.get("compact_row_count") != compact_row_count
     ):
         raise FinalizationError(
             f"selection-plan evidence pack binding is malformed: {manifest_path}"
         )
-    if not result_rows or any(
+    if any(
         not isinstance(row, Mapping)
         or not _selection_plan_row_has_exact_root_capability(
             row,
             expected_capability,
         )
         for row in result_rows
-    ) or not row_ref_present:
+    ):
         raise FinalizationError(
             f"selection-plan evidence row capability was stripped or downgraded: {manifest_path}"
         )
@@ -2047,6 +2032,15 @@ def _selection_plan_manifest_contract(
     ):
         raise FinalizationError(
             f"manifest selection-plan pack path is not stamp-bound: {manifest_path}"
+        )
+    artifact_recovery = payload.get("artifact_recovery")
+    if (
+        isinstance(artifact_recovery, Mapping)
+        and artifact_recovery.get(SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD)
+        != dict(binding)
+    ):
+        raise FinalizationError(
+            f"artifact recovery lacks the selection-plan durable binding: {manifest_path}"
         )
     return {
         "capability": copy.deepcopy(expected_capability),
@@ -2960,6 +2954,15 @@ def open_source_selection_plan_views(
                     f"selection-plan pack binding failed for {raw_index.path}: {exc}"
                 ) from exc
             try:
+                durable_artifacts = source.get("durable_artifacts")
+                if not isinstance(durable_artifacts, Mapping):
+                    raise FinalizationError(
+                        f"selection-plan source lacks durable verification: {raw_index.path}"
+                    )
+                compact_row_count = sum(
+                    selection_plan_reference_signal(record.row)
+                    for record in raw_index.records
+                )
                 if (
                     reader.index.pack_sha256 != binding.get("pack_sha256")
                     or reader.index.pack_bytes != binding.get("pack_bytes")
@@ -2968,6 +2971,12 @@ def open_source_selection_plan_views(
                     raise FinalizationError(
                         f"selection-plan pack digest/count differs for {raw_index.path}"
                     )
+                validate_selection_plan_evidence_manifest_binding(
+                    binding,
+                    pack_index=reader.index,
+                    durable_artifact_verification=durable_artifacts,
+                    compact_row_count=compact_row_count,
+                )
                 records: list[SourceRecord] = []
                 for record in raw_index.records:
                     expanded = materialize_selection_plan_row_view(
