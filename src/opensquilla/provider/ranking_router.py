@@ -21,6 +21,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import cache
 from importlib import resources
+from types import MappingProxyType
 from typing import Any
 
 import structlog
@@ -5995,6 +5996,73 @@ def _template_for_model(
     return None
 
 
+@dataclass(frozen=True)
+class _PackagedRegistryTemplateIndex:
+    """Read-only lookup tables for the already validated packaged registry."""
+
+    snapshot_version: str
+    schema_version: str
+    templates: tuple[Mapping[str, Any], ...]
+    exact_model_ids: Mapping[str, Mapping[str, Any]]
+    unique_basenames: Mapping[str, Mapping[str, Any]]
+
+
+def _compile_packaged_registry_template_index(
+    snapshot: Mapping[str, Any],
+) -> _PackagedRegistryTemplateIndex:
+    """Compile deterministic lookup tables without changing template semantics."""
+
+    models = snapshot.get("models")
+    if not isinstance(models, list):
+        raise DynamicRankingError("router_dynamic model registry has no models list")
+    templates = tuple(models)
+    exact_model_ids: dict[str, Mapping[str, Any]] = {}
+    unique_basenames: dict[str, Mapping[str, Any]] = {}
+    ambiguous_basenames: set[str] = set()
+    for row in templates:
+        facts = row.get("registry_facts")
+        if not isinstance(facts, Mapping):
+            continue
+        candidate = str(facts.get("model_id") or "").strip().lower()
+        # Keep the first row, exactly as the pre-index linear lookup does.
+        exact_model_ids.setdefault(candidate, row)
+        basename = candidate.rsplit("/", 1)[-1]
+        if basename in ambiguous_basenames:
+            continue
+        if basename in unique_basenames:
+            unique_basenames.pop(basename)
+            ambiguous_basenames.add(basename)
+            continue
+        unique_basenames[basename] = row
+    return _PackagedRegistryTemplateIndex(
+        snapshot_version=str(snapshot.get("snapshot_version") or "mock-unknown"),
+        schema_version=str(snapshot.get("schema_version") or "step2-model-registry-v1"),
+        templates=templates,
+        exact_model_ids=MappingProxyType(exact_model_ids),
+        unique_basenames=MappingProxyType(unique_basenames),
+    )
+
+
+@cache
+def _packaged_registry_template_index() -> _PackagedRegistryTemplateIndex:
+    """Return indexes for the validated, process-local packaged registry only."""
+
+    return _compile_packaged_registry_template_index(_packaged_registry_snapshot())
+
+
+def _template_for_packaged_model(
+    template_index: _PackagedRegistryTemplateIndex,
+    model_id: str,
+) -> dict[str, Any] | None:
+    """Look up a packaged template while retaining caller-visible copy isolation."""
+
+    target = model_id.strip().lower()
+    row = template_index.exact_model_ids.get(target)
+    if row is None and "/" not in target:
+        row = template_index.unique_basenames.get(target)
+    return copy.deepcopy(dict(row)) if row is not None else None
+
+
 def build_model_registry_snapshot(
     *,
     inherited_provider: str,
@@ -6010,15 +6078,23 @@ def build_model_registry_snapshot(
     """Compose the mock snapshot with runtime and operator-defined deployments."""
 
     effective_config = _resolve_ranking_config(ranking_config)
-    base = (
-        _validate_registry_snapshot(packaged_snapshot, effective_config)
-        if packaged_snapshot is not None
-        else load_model_registry_snapshot()
-    )
-    templates_raw = base.get("models")
-    if not isinstance(templates_raw, list):
-        raise DynamicRankingError("router_dynamic model registry has no models list")
-    templates = list(templates_raw)
+    template_index: _PackagedRegistryTemplateIndex | None = None
+    if packaged_snapshot is None:
+        # The cached source has passed strict snapshot and provenance validation
+        # in _packaged_registry_snapshot().  Arbitrary caller snapshots retain
+        # the historical validate-and-linear-lookup path below.
+        template_index = _packaged_registry_template_index()
+        templates = template_index.templates
+        snapshot_version = template_index.snapshot_version
+        schema_version = template_index.schema_version
+    else:
+        base = _validate_registry_snapshot(packaged_snapshot, effective_config)
+        templates_raw = base.get("models")
+        if not isinstance(templates_raw, list):
+            raise DynamicRankingError("router_dynamic model registry has no models list")
+        templates = list(templates_raw)
+        snapshot_version = str(base.get("snapshot_version") or "mock-unknown")
+        schema_version = str(base.get("schema_version") or "step2-model-registry-v1")
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     rows_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
@@ -6044,7 +6120,11 @@ def build_model_registry_snapshot(
                 if isinstance(existing_facts, dict):
                     existing_facts["roles"] = list(dict.fromkeys(roles))
             return
-        row = _template_for_model(templates, model_normalized) or _synthesized_model(
+        row = (
+            _template_for_packaged_model(template_index, model_normalized)
+            if template_index is not None
+            else _template_for_model(templates, model_normalized)
+        ) or _synthesized_model(
             provider=provider_normalized,
             model_id=model_normalized,
             source=source,
@@ -6120,8 +6200,8 @@ def build_model_registry_snapshot(
         )
 
     return {
-        "snapshot_version": str(base.get("snapshot_version") or "mock-unknown"),
-        "schema_version": str(base.get("schema_version") or "step2-model-registry-v1"),
+        "snapshot_version": snapshot_version,
+        "schema_version": schema_version,
         "models": rows,
     }
 

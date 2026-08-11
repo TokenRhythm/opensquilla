@@ -1846,6 +1846,119 @@ def test_ambiguous_bare_model_name_uses_synthesized_profile() -> None:
     assert anchor["static_profile"]["capability_dist_prior"]["reasoning"] == 0.74
 
 
+def test_packaged_registry_template_index_preserves_exact_and_basename_semantics(
+) -> None:
+    first_exact = _model("vendor/shared", provider="provider-a", capability=0.91)
+    second_exact = _model("vendor/shared", provider="provider-b", capability=0.11)
+    first_basename = _model("other/duplicate", provider="provider-c")
+    second_basename = _model("another/duplicate", provider="provider-d")
+    unique_basename = _model("vendor/unique", provider="provider-e", capability=0.67)
+    index = ranking_router._compile_packaged_registry_template_index(
+        {
+            "schema_version": "test",
+            "snapshot_version": "test-v1",
+            "models": [
+                first_exact,
+                second_exact,
+                first_basename,
+                second_basename,
+                unique_basename,
+            ],
+        }
+    )
+
+    exact = ranking_router._template_for_packaged_model(index, "VENDOR/SHARED")
+    unique = ranking_router._template_for_packaged_model(index, "unique")
+
+    assert exact is not None
+    assert exact["registry_facts"]["provider"] == "provider-a"
+    assert unique is not None
+    assert unique["static_profile"]["capability_dist_prior"]["reasoning"] == 0.67
+    assert ranking_router._template_for_packaged_model(index, "duplicate") is None
+
+    exact["static_profile"]["capability_dist_prior"]["reasoning"] = 0.0
+    reread = ranking_router._template_for_packaged_model(index, "vendor/shared")
+    assert reread is not None
+    assert reread["static_profile"]["capability_dist_prior"]["reasoning"] == 0.91
+
+
+def test_default_packaged_template_index_matches_linear_snapshot_build() -> None:
+    kwargs = {
+        "inherited_provider": "openrouter",
+        "inherited_model": "openai/gpt-5.6-sol",
+        "routed_tier": "c2",
+        "operator_candidates": [
+            {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-5",
+                "role": "aggregator",
+                "source": "test-operator",
+            }
+        ],
+        "legacy_model_options": ["google/gemini-3.1-pro-preview"],
+        "router_tiers": {
+            "c3": {
+                "provider": "openrouter",
+                "model": "x-ai/grok-4.5",
+                "thinking_level": "high",
+            }
+        },
+    }
+    expected = build_model_registry_snapshot(
+        **kwargs,
+        packaged_snapshot=load_model_registry_snapshot(),
+    )
+    actual = build_model_registry_snapshot(**kwargs)
+
+    assert canonical_json_sha256(actual) == canonical_json_sha256(expected)
+    actual["models"][0]["static_profile"]["capability_dist_prior"]["reasoning"] = 0.0
+    assert canonical_json_sha256(build_model_registry_snapshot(**kwargs)) == (
+        canonical_json_sha256(expected)
+    )
+
+
+def test_explicit_legacy_registry_snapshot_skips_packaged_template_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    historical = load_model_registry_snapshot(
+        base_version="curated-openrouter-step2-2026-07-31.1"
+    )
+    legacy = ranking_router._legacy_registry_snapshot_projection(historical)
+    monkeypatch.setattr(
+        ranking_router,
+        "_packaged_registry_template_index",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected packaged fast path")),
+    )
+
+    replay = build_model_registry_snapshot(
+        inherited_provider="openrouter",
+        inherited_model="openai/gpt-5.6-sol",
+        routed_tier="c2",
+        operator_candidates=[
+            {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-5",
+                "role": "aggregator",
+                "source": "legacy-golden",
+            }
+        ],
+        legacy_model_options=["google/gemini-3.1-pro-preview"],
+        router_tiers={
+            "c3": {
+                "provider": "openrouter",
+                "model": "x-ai/grok-4.5",
+                "thinking_level": "high",
+            }
+        },
+        packaged_snapshot=legacy,
+    )
+
+    assert replay["schema_version"] == "step2-model-registry-v1"
+    assert canonical_json_sha256(replay) == (
+        "f7ec984706f8c6d7f5c691630d41c5735e7d5b0ebd8e79e7cf175b24fda6093a"
+    )
+
+
 def test_operator_candidates_only_use_explicit_aggregator_role_for_aggregation() -> None:
     snapshot = build_model_registry_snapshot(
         inherited_provider="anchor-provider",
