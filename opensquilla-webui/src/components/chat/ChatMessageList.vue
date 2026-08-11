@@ -21,7 +21,14 @@
       :show-turn-outcome="isTurnTip(index)"
       :is-streaming="isStreaming"
       :is-goal-source="isGoalSource(message)"
+      :can-reuse-prompt-annotations="canReusePromptAnnotations === true"
+      :workbench-resource-preview-enabled="workbenchResourcePreviewEnabled === true"
+      :workbench-resource-edit-enabled="workbenchResourceEditEnabled === true"
+      :workbench-attachment-resources="workbenchAttachmentResources"
       @edit="$emit('editMessage', $event)"
+      @edit-attachment="$emit('editAttachment', $event)"
+      @preview-attachment="$emit('previewAttachment', $event)"
+      @reuse-prompt-annotation="$emit('reusePromptAnnotation', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
     />
     <CompactionEvent
@@ -100,6 +107,8 @@ import {
   type GoalSnapshot,
 } from '@/composables/chat/useChatGoals'
 import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 
 const props = defineProps<{
@@ -123,6 +132,10 @@ const props = defineProps<{
   sessionKey?: string
   authToken?: string
   workbenchEnabled?: boolean
+  workbenchResourcePreviewEnabled?: boolean
+  workbenchResourceEditEnabled?: boolean
+  workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
+  canReusePromptAnnotations?: boolean
   forkBusy?: boolean
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
@@ -133,6 +146,9 @@ const props = defineProps<{
 
 defineEmits<{
   editMessage: [message: ChatRenderedMessage]
+  editAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  previewAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
   regenerateMessage: [message: ChatRenderedMessage]
   toggleShareMessage: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]

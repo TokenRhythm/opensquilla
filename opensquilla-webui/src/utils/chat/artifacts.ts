@@ -18,6 +18,11 @@ const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
 }
 
 const VIDEO_EXTENSIONS = new Set(['m4v', 'mov', 'mp4', 'ogv', 'webm'])
+const OFFICE_EXTENSIONS = new Set([
+  'doc', 'docm', 'docx', 'dot', 'dotm', 'dotx', 'odt', 'ott', 'rtf',
+  'csv', 'fods', 'ods', 'ots', 'xls', 'xlsb', 'xlsm', 'xlsx', 'xlt', 'xltm', 'xltx',
+  'odp', 'otp', 'pot', 'potm', 'potx', 'pps', 'ppsm', 'ppsx', 'ppt', 'pptm', 'pptx',
+])
 
 export function artifactMime(artifact: ArtifactPayload): string {
   return artifact?.mime
@@ -34,6 +39,10 @@ export function artifactExtension(name: string): string {
   const idx = trimmed.lastIndexOf('.')
   if (idx < 0 || idx === trimmed.length - 1) return ''
   return trimmed.slice(idx + 1)
+}
+
+export function isOfficeArtifact(artifact: ArtifactPayload): boolean {
+  return OFFICE_EXTENSIONS.has(artifactExtension(artifactName(artifact)))
 }
 
 export function isVideoArtifact(artifact: ArtifactPayload): boolean {

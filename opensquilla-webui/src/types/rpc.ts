@@ -37,6 +37,8 @@ export interface RawSessionTask {
   finishedAt?: number | string
   turn_outcome?: Record<string, unknown>
   turnOutcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
   steer_capability?: import('./chat').ChatSteerCapability
   steerCapability?: import('./chat').ChatSteerCapability
 }
@@ -272,6 +274,15 @@ export interface WarningPayload extends SessionEventPayload {
   code?: string
 }
 
+/** Content-free invalidation signal for one stable Artifact IDE document. */
+export interface ArtifactStateEventPayload extends SessionEventPayload {
+  artifactEventSeq?: number
+  documentId?: string
+  revisionId?: string | null
+  changeSetId?: string | null
+  action?: string
+}
+
 export interface CronResultMessagePayload {
   role?: string
   text?: string
@@ -453,6 +464,8 @@ export interface ChatSendParams {
   clientRequestId?: string
   /** Stable client identity for reconciling the optimistic user row. */
   clientMessageId?: string
+  /** Ordered durable drafts consumed atomically with this chat ingress. */
+  promptAnnotationIds?: string[]
   _source?: { elevated?: string; runMode?: 'safe' | 'full' }
   intent?: string
   workspaceId?: string
@@ -479,6 +492,8 @@ export interface ChatSendResponse {
   terminal_message?: string
   terminalMessage?: string
   reason?: string
+  acceptedPromptAnnotationIds?: string[]
+  accepted_prompt_annotation_ids?: string[]
 }
 
 /** Server-owned recovery record for one unaccepted manual MetaSkill launch. */
@@ -564,6 +579,8 @@ export interface ChatHistoryAttachmentPayload {
   dataUrl?: unknown
   data_url?: unknown
   sha256_ref?: unknown
+  attachmentId?: unknown
+  attachment_id?: unknown
   download_url?: unknown
   kind?: unknown
   [key: string]: unknown
@@ -577,6 +594,8 @@ export interface ChatHistoryMessage {
   id?: string
   message_id?: string
   attachments?: ChatHistoryAttachmentPayload[]
+  promptAnnotations?: unknown[]
+  prompt_annotations?: unknown[]
   artifacts?: ArtifactPayload[]
   router_decision?: RouterDecisionPayload | null
   routerDecision?: RouterDecisionPayload | null
@@ -638,6 +657,8 @@ export interface ChatHistoryTurnOutcome {
   started_at?: string | number
   finished_at?: string | number
   outcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {
@@ -799,6 +820,7 @@ export interface RpcEventMap {
   'session.event.tool_use_delta': ToolDeltaPayload
   'session.event.tool_result': ToolResultPayload
   'session.event.artifact': ArtifactPayload
+  'session.event.artifact_state': ArtifactStateEventPayload
   'session.event.router_decision': RouterDecisionPayload
   'session.event.ensemble_progress': EnsembleProgressPayload
   'session.event.router_control_replay': SessionEventPayload

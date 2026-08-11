@@ -7,7 +7,10 @@
       'chat--drag-over': threadDragOver,
       'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
       'chat--composer-floating': composerFxEnabled && !isNewChatLanding,
-      'chat--composer-collapsed': composerCollapsed && composerFxEnabled && !isNewChatLanding,
+      'chat--composer-collapsed': composerCollapsed
+        && activePromptAnnotations.length === 0
+        && composerFxEnabled
+        && !isNewChatLanding,
     }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
@@ -38,9 +41,11 @@
         :copy-icon="sessionCopyIcon"
         :copy-live-text="sessionCopyLiveText"
         :deliverable-count="headerDeliverableCount"
+        :workbench-resource-count="headerWorkbenchResourceCount"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
         @open-deliverables="openDeliverables"
+        @open-workbench="openWorkbenchResources"
         @start-share="startShareMode"
         @copy-session-key="onSessionCopyClick"
       />
@@ -188,6 +193,10 @@
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
           :workbench-enabled="workbenchEnabled"
+          :workbench-resource-preview-enabled="attachmentWorkbenchPreviewEnabled"
+          :workbench-resource-edit-enabled="attachmentWorkbenchEditEnabled"
+          :workbench-attachment-resources="attachmentWorkbenchResources"
+          :can-reuse-prompt-annotations="promptAnnotationDesktopAvailable"
           :share-mode="shareMode"
           :selected-message-ids="selectedShareMessageIds"
           :strip-time-prefix="stripTimePrefix"
@@ -211,6 +220,9 @@
           :goal-elapsed="goalLastElapsed"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
+          @edit-attachment="editAttachmentResource"
+          @preview-attachment="previewAttachmentResource"
+          @reuse-prompt-annotation="reusePromptAnnotation"
           @regenerate-message="regenerateMessage"
           @toggle-share-message="toggleShareMessage"
           @download-artifact="downloadArtifact"
@@ -609,6 +621,7 @@
       :project-workspace="activeWorkspace"
       :project-workspace-status="activeWorkspaceStatus"
       :project-status-message="activeProjectStatusMessage"
+      :prompt-annotations="activePromptAnnotations"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
       :can-choose-project="rpc.canChooseProject"
       :plan-mode-available="planUiAvailable"
@@ -645,6 +658,9 @@
       @stop="onComposerStop"
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
+      @update-prompt-annotation="updatePromptAnnotation"
+      @discard-prompt-annotation="discardPromptAnnotation"
+      @jump-prompt-annotation="jumpPromptAnnotation"
       @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
       @refresh-prompt-cache-keepalive="void refreshPromptCacheKeepaliveStatus()"
     />
@@ -723,8 +739,16 @@ import { useRpcStore } from '@/stores/rpc'
 import { useRpcCall } from '@/composables/useRpc'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
+import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
+import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
+import { createResourceCollectionWorkbenchItem } from '@/workbench/workbenchResourceItems'
 import { usePlatform } from '@/platform'
+import { createRpcArtifactPromptAnnotationProvider } from '@/workbench/artifactPromptAnnotationProvider'
+import {
+  focusArtifactPromptAnnotation,
+  reuseArtifactPromptAnnotation,
+} from '@/workbench/promptAnnotations'
 import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
@@ -901,6 +925,12 @@ import type {
   PromptCacheKeepaliveStatus,
   PromptCacheKeepaliveStatusUpdate,
 } from '@/types/promptCacheKeepalive'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import type { WorkbenchResource } from '@/types/workbenchResources'
+import {
+  createWorkbenchResourceRef,
+  workbenchResourceRefId,
+} from '@/types/workbenchResources'
 import type {
   CollaborationMode,
   PlanCardAction,
@@ -911,11 +941,22 @@ import {
   artifactCategory,
   artifactDownloadUrl,
   isInlineMediaArtifact,
+  isOfficeArtifact,
 } from '@/utils/chat/artifacts'
 import {
   artifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
 } from '@/workbench/artifactItems'
+import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
+import {
+  artifactPayloadFromWorkbenchResource,
+  resourceFromPreparedPreview,
+  workbenchResourceKey,
+} from '@/workbench/workbenchResourceItems'
+import {
+  workbenchResourceActionReasonCode,
+  workbenchResourceUnavailableReasonKey,
+} from '@/workbench/resourceCapabilityPresentation'
 import {
   artifactUsesWorkbenchPreview,
   artifactWorkbenchPreviewKind,
@@ -1019,6 +1060,10 @@ let releaseOptionalRpcAdmission: (() => void) | null =
 let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
+const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
+const workbenchResourcesStore = useWorkbenchResourcesStore()
+const artifactPromptAnnotationProvider = createRpcArtifactPromptAnnotationProvider(rpc)
+artifactPromptAnnotationsStore.setProvider(artifactPromptAnnotationProvider)
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
@@ -1078,7 +1123,6 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
-
 function clearPendingComposerScrollIntent() {
   pendingComposerScrollIntent = null
   if (composerScrollIntentTimer !== null) {
@@ -1115,6 +1159,118 @@ function currentThreadScrollIntent(): ComposerScrollIntent {
 
 watch(composerFxEnabled, resetComposerRetraction, { flush: 'sync' })
 watch(sessionKey, resetComposerRetraction, { flush: 'sync' })
+const promptAnnotationsEnabled = computed(() => (
+  appStore.features.artifactPromptAnnotations === true
+))
+const workbenchResourcesEnabled = computed(() => (
+  appStore.features.documentWorkbenchResources === true
+  || promptAnnotationsEnabled.value
+))
+const attachmentWorkbenchPreviewEnabled = computed(() => (
+  workbenchEnabled.value
+  && workbenchResourcesEnabled.value
+  && rpc.supportsMethod('workbench.resources.list')
+  && rpc.supportsMethod('workbench.resources.get')
+))
+const attachmentWorkbenchEditEnabled = computed(() => (
+  attachmentWorkbenchPreviewEnabled.value
+  && rpc.supportsMethod('documents.import')
+))
+const activePromptAnnotations = computed(() =>
+  promptAnnotationsEnabled.value
+    ? artifactPromptAnnotationsStore.activeDraftsForSession(sessionKey.value)
+    : [])
+const sendablePromptAnnotationIds = computed(() =>
+  promptAnnotationsEnabled.value
+    ? artifactPromptAnnotationsStore.sendableDraftsForSession(sessionKey.value)
+      .map(annotation => annotation.annotationId)
+    : [])
+
+function promptAnnotationBlockedMessage(): string {
+  if (!promptAnnotationsEnabled.value) return ''
+  const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value)
+  if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
+  if (reason === 'stale') return t('chat.promptAnnotations.staleBlocked')
+  if (reason === 'empty') return t('chat.promptAnnotations.emptyBlocked')
+  if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
+  return ''
+}
+
+async function updatePromptAnnotation(annotationId: string, body: string) {
+  try {
+    await artifactPromptAnnotationsStore.update(annotationId, body)
+  } catch {
+    pushToast(t('chat.promptAnnotations.updateFailed'), { tone: 'danger' })
+  }
+}
+
+async function discardPromptAnnotation(annotationId: string) {
+  try {
+    await artifactPromptAnnotationsStore.discard(annotationId)
+  } catch {
+    pushToast(t('chat.promptAnnotations.discardFailed'), { tone: 'danger' })
+  }
+}
+
+function promptAnnotationRpcErrorCode(error: unknown): string {
+  if (!error || typeof error !== 'object') return ''
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'string' ? code : ''
+}
+
+async function jumpPromptAnnotation(annotationId: string) {
+  const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
+  if (!annotation) return
+  const activated = await focusArtifactPromptAnnotation({
+    annotationId,
+    documentId: annotation.documentId,
+    sessionKey: annotation.sessionKey,
+  })
+  if (!activated) {
+    pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
+    return
+  }
+  // A stale draft is never sent through the focus RPC. Activating the panel
+  // above starts the trusted re-selection flow, which mints a fresh anchor.
+  if (annotation.freshness === 'stale') return
+  try {
+    await artifactPromptAnnotationsStore.focus(annotationId)
+  } catch (error) {
+    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_REVISION_CHANGED') {
+      artifactPromptAnnotationsStore.markAnnotationStale(
+        annotationId,
+        'head-changed',
+      )
+      await focusArtifactPromptAnnotation({
+        annotationId,
+        documentId: annotation.documentId,
+        sessionKey: annotation.sessionKey,
+      })
+      return
+    }
+    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_ANNOTATION_NOT_DRAFT') {
+      await artifactPromptAnnotationsStore.load(annotation.sessionKey, { force: true })
+    }
+    pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
+  }
+}
+
+async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
+  if (
+    !promptAnnotationsEnabled.value
+    || !annotation.body.trim()
+    || !sessionKey.value
+    || !workbenchEnabled.value
+  ) return
+  const activated = await reuseArtifactPromptAnnotation({
+    body: annotation.body,
+    documentId: annotation.documentId,
+    sessionKey: sessionKey.value,
+  })
+  if (!activated) {
+    pushToast(t('chat.promptAnnotations.reuseUnavailable'), { tone: 'warn' })
+  }
+}
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
@@ -1122,6 +1278,12 @@ const promptCacheKeepaliveAvailable = computed(() => (
   && rpc.supportsMethod('sessions.promptCacheKeepalive.set')
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
+const promptAnnotationDesktopAvailable = computed(() => (
+  workbenchEnabled.value
+  && promptAnnotationsEnabled.value
+  && platform.id === 'desktop'
+  && platform.capabilities.hasNativeWorkbenchSurfaces === true
+))
 const inputText = ref('')
 const composerRevision = ref(0)
 const aborted = ref(false)
@@ -1757,6 +1919,7 @@ const chatRenderedMessages = useChatRenderedMessages({
   isSubagentCompletionMessage,
   timeTranslator: t,
 })
+
 const { renderedMessages, routerDecisionCells } = chatRenderedMessages
 
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
@@ -2125,6 +2288,10 @@ const liveSendBlockedReason = computed<string | null>(() => {
       : 'chat.liveSendBlockedConnecting',
   )
 })
+const promptAnnotationSendBlockedReason = computed<string | null>(() =>
+  promptAnnotationBlockedMessage() || null)
+const effectiveSendBlockedReason = computed<string | null>(() =>
+  liveSendBlockedReason.value || promptAnnotationSendBlockedReason.value)
 isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
 watch(livePhase, (phase, previousPhase) => {
   if (
@@ -2565,11 +2732,21 @@ const chatSend = useChatSend({
   composerRevision,
   pendingSessionIntent,
   pendingWorkspaceId,
-  sendBlockedReason: liveSendBlockedReason,
+  sendBlockedReason: effectiveSendBlockedReason,
   validateActiveProjectBeforeSend,
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
   pendingForkBeforeMessageId,
+  promptAnnotationIds: sendablePromptAnnotationIds,
+  idempotentReplayBlockedReason: liveSendBlockedReason,
+  preparePromptAnnotationsForSend: async (ids, prepareOptions) => {
+    const prepared = await artifactPromptAnnotationsStore.prepareForSend(ids)
+    return prepared && (prepareOptions?.isCurrent?.() ?? true)
+  },
+  promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
+  acknowledgePromptAnnotations: (requestedIds, acceptedIds) => {
+    artifactPromptAnnotationsStore.acknowledgeAccepted(requestedIds, acceptedIds)
+  },
   materializeDraftSession: key => {
     if (!isDraftRoute()) return
     const workspaceId = pendingWorkspaceId.value
@@ -3344,7 +3521,9 @@ const composerPlaceholder = computed(() => {
 })
 
 const hasSendContent = computed(() => {
-  return inputText.value.trim().length > 0 || pendingAttachments.value.some(isSendableAttachment)
+  return inputText.value.trim().length > 0
+    || pendingAttachments.value.some(isSendableAttachment)
+    || activePromptAnnotations.value.length > 0
 })
 const composerHasSendContent = computed(() =>
   replanActive.value ? inputText.value.trim().length > 0 : hasSendContent.value,
@@ -3496,7 +3675,7 @@ const composerSendBlockedMessage = computed(() =>
       )
     : '')
   || modelImageSendBlockedMessage.value
-  || liveSendBlockedReason.value
+  || effectiveSendBlockedReason.value
   || activeProjectComposerBlockMessage.value,
 )
 
@@ -3818,7 +3997,102 @@ async function downloadAttachment(attachment: DisplayAttachment): Promise<boolea
   return true
 }
 
+async function attachmentWorkbenchResource(
+  attachment: DisplayAttachment,
+): Promise<WorkbenchResource | null> {
+  if (!workbenchResourcesEnabled.value || !workbenchEnabled.value) return null
+  if (!attachment.attachmentId || !sessionKey.value) return null
+  const ref = {
+    type: 'attachment' as const,
+    attachmentId: attachment.attachmentId,
+    id: attachment.attachmentId,
+  }
+  let resource = workbenchResourcesStore.find(sessionKey.value, ref)
+  if (!resource) {
+    await workbenchResourcesStore.load(sessionKey.value, true)
+    resource = workbenchResourcesStore.find(sessionKey.value, ref)
+  }
+  if (resource) {
+    resource = await workbenchResourcesStore.resolve(sessionKey.value, ref) || resource
+  }
+  if (!resource) {
+    pushToast(t('workbench.resources.actionFailed'), { tone: 'danger' })
+  }
+  return resource
+}
+
+async function previewAttachmentResource(attachment: DisplayAttachment) {
+  const resource = await attachmentWorkbenchResource(attachment)
+  if (!resource || !sessionKey.value) return
+  if (!resource.capabilities.preview) {
+    pushToast(t(workbenchResourceUnavailableReasonKey(
+      workbenchResourceActionReasonCode(resource.capabilities, 'preview'),
+    )), { tone: 'warn' })
+    return
+  }
+  const preview = await workbenchResourcesStore.preview(
+    sessionKey.value,
+    resource.resource,
+  )
+  if (!preview) return
+  const preparedResource = resourceFromPreparedPreview(preview)
+  const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+    artifact: artifactPayloadFromWorkbenchResource(preparedResource),
+    nativeHtml: false,
+    preparedPreview: preview.preview,
+    previewLeaseEligible: false,
+    resourceIdentity: workbenchResourceKey(resource.resource),
+    sessionKey: sessionKey.value,
+  }))
+  if (!opened) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+}
+
+async function editAttachmentResource(attachment: DisplayAttachment) {
+  const resource = await attachmentWorkbenchResource(attachment)
+  if (!resource || !sessionKey.value) return
+  if (!resource.capabilities.edit) {
+    pushToast(t(workbenchResourceUnavailableReasonKey(
+      workbenchResourceActionReasonCode(resource.capabilities, 'edit'),
+    )), { tone: 'warn' })
+    return
+  }
+  try {
+    const imported = await workbenchResourcesStore.importDocument(
+      sessionKey.value,
+      resource,
+    )
+    const artifact = artifactPayloadFromRevision(imported.revision)
+    artifact.documentId = imported.document.documentId
+    artifact.revisionId = imported.revision.revisionId
+    const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+      artifact,
+      nativeHtml: Boolean(
+        platform.capabilities.hasNativeWorkbenchSurfaces
+        && platform.workbench.native,
+      ),
+      previewLeaseEligible: true,
+      resourceIdentity: `document:${imported.document.documentId}`,
+      sessionKey: sessionKey.value,
+    }))
+    if (!opened) {
+      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+      return
+    }
+    pushToast(t('workbench.resources.imported', { name: resource.name }), { tone: 'ok' })
+  } catch (error) {
+    pushToast(
+      error instanceof Error ? error.message : t('workbench.resources.actionFailed'),
+      { tone: 'danger', duration: 9000 },
+    )
+  }
+}
+
 async function downloadArtifact(artifact: ArtifactPayload) {
+  // A published delivery is an immutable snapshot. Document-head downloads
+  // are separate workbench actions and must not change what this chat card
+  // resolves to after later edits.
   const token = readAuthToken()
   const url = artifactDownloadUrl(artifact, window.location.origin, {
     sessionKey: sessionKey.value,
@@ -3847,11 +4121,30 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   }
 }
 
+function artifactUsesDocumentWorkbench(artifact: ArtifactPayload): boolean {
+  return artifactUsesWorkbenchPreview(artifact) || isOfficeArtifact(artifact)
+}
+
 const sessionWorkbenchArtifacts = computed(() =>
-  sessionArtifacts.value.filter(artifactUsesWorkbenchPreview),
+  sessionArtifacts.value.filter(artifactUsesDocumentWorkbench),
 )
 
 const headerDeliverableCount = computed(() => sessionArtifacts.value.length)
+const workbenchResourceSnapshot = computed(() => workbenchResourcesStore.snapshot(sessionKey.value))
+const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResource>>(() => (
+  new Map(
+    workbenchResourceSnapshot.value.resources
+      .filter(resource => resource.resource.type === 'attachment')
+      .map(resource => [workbenchResourceRefId(resource.resource), resource]),
+  )
+))
+const headerWorkbenchResourceCount = computed(() => (
+  workbenchResourcesEnabled.value
+  && workbenchEnabled.value
+  && workbenchResourceSnapshot.value.available
+    ? workbenchResourceSnapshot.value.totalCount
+    : 0
+))
 
 const deliverablesOpen = ref(false)
 
@@ -3874,7 +4167,7 @@ function openDeliverables() {
       ) return false
       const artifact = artifactFromWorkbenchItem(item)
       if (!artifact) return false
-      return artifactUsesWorkbenchPreview(artifact)
+      return artifactUsesDocumentWorkbench(artifact)
     })
     if (recentPreview) {
       workbenchStore.activateItem(recentPreview.id)
@@ -3892,6 +4185,23 @@ function openDeliverables() {
   deliverablesOpen.value = true
 }
 
+function openWorkbenchResources() {
+  if (!workbenchEnabled.value || !workbenchResourcesEnabled.value || !sessionKey.value) return
+  const snapshot = workbenchResourceSnapshot.value
+  if (!snapshot.available) {
+    openDeliverables()
+    return
+  }
+  const opened = workbenchStore.openItem(createResourceCollectionWorkbenchItem({
+    resources: snapshot.resources,
+    sessionKey: sessionKey.value,
+    title: t('workbench.resources.title'),
+  }))
+  if (!opened) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+}
+
 function focusInlineDeliverable(artifact: ArtifactPayload): boolean {
   const reduceMotion = typeof window !== 'undefined'
     && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
@@ -3902,8 +4212,24 @@ function focusInlineDeliverable(artifact: ArtifactPayload): boolean {
   )
 }
 
+let workbenchArtifactInventoryFingerprint = ''
+
 watch(sessionArtifacts, artifacts => {
   if (!sessionKey.value) return
+  const nextInventoryFingerprint = [
+    sessionKey.value,
+    ...artifacts.map(artifact => String(
+      artifact.id || artifact.key || artifact.download_url || artifact.name || '',
+    )),
+  ].join('\u0000')
+  if (
+    nextInventoryFingerprint !== workbenchArtifactInventoryFingerprint
+    && workbenchResourcesEnabled.value
+    && workbenchEnabled.value
+  ) {
+    workbenchArtifactInventoryFingerprint = nextInventoryFingerprint
+    void workbenchResourcesStore.load(sessionKey.value, true).catch(() => undefined)
+  }
   artifactImageLightbox.updateNavigation(artifacts, sessionKey.value)
   if (!workbenchEnabled.value) return
   for (const item of workbenchStore.items) {
@@ -3923,6 +4249,59 @@ watch(sessionArtifacts, artifacts => {
   }
 })
 
+function openLegacyArtifactWorkbench(artifact: ArtifactPayload): boolean {
+  const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+    artifact,
+    navigationArtifacts: sessionArtifacts.value,
+    nativeHtml: Boolean(
+      platform.capabilities.hasNativeWorkbenchSurfaces
+      && platform.workbench.native,
+    ),
+    sessionKey: sessionKey.value,
+  }))
+  if (!opened) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+  return opened
+}
+
+async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
+  const artifactId = typeof artifact.id === 'string' ? artifact.id.trim() : ''
+  if (!artifactId || !sessionKey.value) {
+    openLegacyArtifactWorkbench(artifact)
+    return
+  }
+  try {
+    const ref = createWorkbenchResourceRef('deliverable', artifactId)
+    const resource = await workbenchResourcesStore.resolve(sessionKey.value, ref)
+    if (!resource?.capabilities.preview) {
+      openLegacyArtifactWorkbench(artifact)
+      return
+    }
+    const preview = await workbenchResourcesStore.preview(sessionKey.value, ref)
+    if (!preview) {
+      openLegacyArtifactWorkbench(artifact)
+      return
+    }
+    const preparedResource = resourceFromPreparedPreview(preview)
+    const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+      artifact: artifactPayloadFromWorkbenchResource(preparedResource),
+      navigationArtifacts: sessionArtifacts.value,
+      nativeHtml: false,
+      preparedPreview: preview.preview,
+      previewLeaseEligible: false,
+      resourceIdentity: workbenchResourceKey(ref),
+      sessionKey: sessionKey.value,
+    }))
+    if (!opened) {
+      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+    }
+  } catch {
+    // Mixed-version fallback: old Gateways retain the existing artifact preview.
+    openLegacyArtifactWorkbench(artifact)
+  }
+}
+
 function openArtifact(artifact: ArtifactPayload): boolean {
   // Generated images are also inline media. Route every visual artifact to
   // the authenticated lightbox before the inline-focus fallback so clicking
@@ -3937,24 +4316,24 @@ function openArtifact(artifact: ArtifactPayload): boolean {
   }
   if (
     isInlineMediaArtifact(artifact)
-    || artifactWorkbenchPreviewKind(artifact) === 'unsupported'
+    || (
+      artifactWorkbenchPreviewKind(artifact) === 'unsupported'
+      && !isOfficeArtifact(artifact)
+    )
   ) {
     return focusInlineDeliverable(artifact)
   }
   if (!workbenchEnabled.value || !sessionKey.value) return false
-  const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
-    artifact,
-    navigationArtifacts: sessionArtifacts.value,
-    nativeHtml: Boolean(
-      platform.capabilities.hasNativeWorkbenchSurfaces
-      && platform.workbench.native,
-    ),
-    sessionKey: sessionKey.value,
-  }))
-  if (!opened) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  if (
+    attachmentWorkbenchPreviewEnabled.value
+    && typeof artifact.id === 'string'
+    && artifact.id.trim()
+    && !(typeof artifact.documentId === 'string' && artifact.documentId.trim())
+  ) {
+    void openDeliverableWorkbenchResource(artifact)
+    return true
   }
-  return opened
+  return openLegacyArtifactWorkbench(artifact)
 }
 
 function closeDeliverables() {
@@ -4900,6 +5279,7 @@ onUnmounted(() => {
   cleanupSessionArtifacts()
   cleanupStream()
   cleanupCompaction()
+  artifactPromptAnnotationsStore.setProvider(null)
   cleanupVoiceInput()
   chatApprovals.cleanup()
   metaRuns.cleanup()
@@ -5078,10 +5458,12 @@ watch(sessionKey, () => {
   // Retire any in-flight page walk and clear the old Session before starting
   // the new one, so a late response cannot leak deliverables across tabs/routes.
   resetSessionArtifacts()
-  if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
   if (sessionKey.value && pendingSessionIntent.value !== 'new_chat') void loadSessionArtifacts()
+  if (sessionKey.value && promptAnnotationsEnabled.value) {
+    void artifactPromptAnnotationsStore.load(sessionKey.value)
+  }
 })
 
 // Hello refreshes method capabilities on reconnect. Retry the durable index
@@ -5094,6 +5476,9 @@ watch(() => rpc.state, (state, previous) => {
     && pendingSessionIntent.value !== 'new_chat'
   ) {
     void loadSessionArtifactsAfterReconnect()
+    if (promptAnnotationsEnabled.value) {
+      void artifactPromptAnnotationsStore.load(sessionKey.value, { force: true })
+    }
   }
 })
 

@@ -4,7 +4,7 @@
     class="chat-composer"
     :class="{
       'chat-composer--new-landing': isNewLanding,
-      'chat-composer--collapsed': collapsed,
+      'chat-composer--collapsed': collapsed && promptAnnotations.length === 0,
       'chat-composer--floating': floating,
       'chat-composer--docked': !floating,
     }"
@@ -34,6 +34,95 @@
             <button class="attachment-action attachment-remove" :title="t('chat.remove')" :aria-label="t('chat.remove')" @click="emit('removeAttachment', i)">
               <Icon name="x" :size="12" />
             </button>
+          </div>
+        </div>
+      </div>
+      <div v-if="promptAnnotations.length > 0" class="chat-collapse-region">
+        <div
+          class="chat-prompt-annotations"
+          :aria-label="t('chat.promptAnnotations.draftLabel')"
+          aria-live="polite"
+          data-testid="composer-prompt-annotations"
+        >
+          <div
+            v-for="annotation in promptAnnotations"
+            :key="annotation.annotationId"
+            class="chat-prompt-annotation-chip"
+            :class="{ 'is-stale': annotation.freshness === 'stale' }"
+            :data-annotation-id="annotation.annotationId"
+            :data-freshness="annotation.freshness"
+            role="group"
+          >
+            <span class="chat-prompt-annotation-chip__icon" aria-hidden="true">
+              <Icon name="fileCode" :size="14" />
+            </span>
+            <form
+              v-if="editingAnnotationId === annotation.annotationId"
+              class="chat-prompt-annotation-chip__editor"
+              @submit.prevent="saveAnnotationEdit(annotation.annotationId)"
+            >
+              <input
+                ref="annotationInputEl"
+                v-model="annotationDraftBody"
+                type="text"
+                :maxlength="promptAnnotationMaxBodyLength"
+                :aria-label="t('chat.promptAnnotations.editLabel')"
+                @keydown.esc.prevent="cancelAnnotationEdit"
+              />
+              <button
+                type="submit"
+                :disabled="annotationDraftBody.trim().length === 0 || annotationDraftTooLong"
+              >
+                {{ t('common.save') }}
+              </button>
+              <button type="button" @click="cancelAnnotationEdit">
+                {{ t('common.cancel') }}
+              </button>
+            </form>
+            <template v-else>
+              <button
+                type="button"
+                class="chat-prompt-annotation-chip__main"
+                :title="annotation.body"
+                @click="emit('jumpPromptAnnotation', annotation.annotationId)"
+              >
+                <span class="chat-prompt-annotation-chip__meta">
+                  {{ annotation.documentName }} ·
+                  {{ annotation.tagName ? `<${annotation.tagName}>` : t('chat.promptAnnotations.element') }}
+                </span>
+                <span
+                  class="chat-prompt-annotation-chip__status"
+                  data-state="ready"
+                  data-testid="prompt-annotation-ready-status"
+                >
+                  {{ t('chat.promptAnnotations.draftLabel') }}
+                </span>
+                <span class="chat-prompt-annotation-chip__text">
+                  {{ annotation.body || t('chat.promptAnnotations.emptyDraft') }}
+                </span>
+                <span v-if="annotation.freshness === 'stale'" class="chat-prompt-annotation-chip__stale">
+                  {{ t('chat.promptAnnotations.stale') }}
+                </span>
+              </button>
+              <button
+                type="button"
+                class="attachment-action"
+                :aria-label="t('chat.promptAnnotations.editLabel')"
+                :title="t('chat.promptAnnotations.editLabel')"
+                @click="beginAnnotationEdit(annotation)"
+              >
+                <Icon name="edit" :size="12" />
+              </button>
+              <button
+                type="button"
+                class="attachment-action attachment-remove"
+                :aria-label="t('chat.promptAnnotations.removeLabel')"
+                :title="t('chat.promptAnnotations.removeLabel')"
+                @click="emit('discardPromptAnnotation', annotation.annotationId)"
+              >
+                <Icon name="x" :size="12" />
+              </button>
+            </template>
           </div>
         </div>
       </div>
@@ -373,6 +462,11 @@ import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { CollaborationMode } from '@/types/plans'
 import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
+import type { PromptAnnotation } from '@/types/promptAnnotations'
+import {
+  PROMPT_ANNOTATION_MAX_BODY_LENGTH,
+  promptAnnotationBodyWithinLimit,
+} from '@/types/promptAnnotations'
 import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachments'
 
 interface ChatComposerExpose {
@@ -414,6 +508,7 @@ const props = withDefaults(defineProps<{
   projectWorkspace?: { id: string; name: string; path: string } | null
   projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
   projectStatusMessage?: string
+  promptAnnotations?: readonly PromptAnnotation[]
   canCloseProject?: boolean
   canChooseProject?: boolean
   planModeAvailable?: boolean
@@ -438,6 +533,7 @@ const props = withDefaults(defineProps<{
   inputDisabled: false,
   safeSetupAvailable: false,
   floating: false,
+  promptAnnotations: () => [],
 })
 
 const emit = defineEmits<{
@@ -463,6 +559,9 @@ const emit = defineEmits<{
   stop: []
   chooseProject: []
   closeProject: []
+  updatePromptAnnotation: [annotationId: string, body: string]
+  discardPromptAnnotation: [annotationId: string]
+  jumpPromptAnnotation: [annotationId: string]
   openPromptCacheKeepalive: []
   refreshPromptCacheKeepalive: []
   /** Request the parent to restore the full (expanded) composer. */
@@ -478,9 +577,39 @@ const fileInputEl = ref<HTMLInputElement | null>(null)
 const addMenuOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const moreActionsOpen = ref(false)
+const editingAnnotationId = ref('')
+const annotationDraftBody = ref('')
+const annotationInputEl = ref<HTMLInputElement[] | null>(null)
+const promptAnnotationMaxBodyLength = PROMPT_ANNOTATION_MAX_BODY_LENGTH
+const annotationDraftTooLong = computed(() => (
+  !promptAnnotationBodyWithinLimit(annotationDraftBody.value)
+))
 const showProjectContext = computed(() =>
   Boolean(props.projectWorkspace && (props.canCloseProject || props.projectStatusMessage)),
 )
+
+function beginAnnotationEdit(annotation: PromptAnnotation) {
+  editingAnnotationId.value = annotation.annotationId
+  annotationDraftBody.value = annotation.body
+  void nextTick(() => {
+    const inputs = annotationInputEl.value
+    const input = Array.isArray(inputs) ? inputs[inputs.length - 1] : inputs
+    input?.focus()
+    input?.select()
+  })
+}
+
+function cancelAnnotationEdit() {
+  editingAnnotationId.value = ''
+  annotationDraftBody.value = ''
+}
+
+function saveAnnotationEdit(annotationId: string) {
+  const body = annotationDraftBody.value.trim()
+  if (!body || !promptAnnotationBodyWithinLimit(body)) return
+  emit('updatePromptAnnotation', annotationId, body)
+  cancelAnnotationEdit()
+}
 const promptCacheKeepaliveStatusText = computed(() => {
   const status = props.promptCacheKeepaliveStatus
   if (!status || status.state === 'off') return ''
@@ -805,6 +934,7 @@ defineExpose<ChatComposerExpose>({
 .chat-project-chip[data-status="error"] {
   background: color-mix(in srgb, var(--warn) 7%, transparent);
 }
+
 .chat-coding-mode-chip {
   flex: 0 0 auto;
   min-height: 30px;
@@ -931,6 +1061,114 @@ defineExpose<ChatComposerExpose>({
   flex-wrap: wrap;
   gap: 0.375rem;
   margin-bottom: 0.5rem;
+}
+
+.chat-prompt-annotations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem 0;
+}
+
+.chat-prompt-annotation-chip {
+  display: flex;
+  align-items: center;
+  min-width: min(18rem, 100%);
+  max-width: min(30rem, 100%);
+  min-height: 2.5rem;
+  padding: 0.25rem 0.375rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  color: var(--text);
+}
+
+.chat-prompt-annotation-chip.is-stale {
+  border-color: color-mix(in srgb, var(--warn) 54%, var(--border));
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));
+}
+
+.chat-prompt-annotation-chip__icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-inline: 0.25rem;
+  color: var(--accent);
+}
+
+.chat-prompt-annotation-chip__main {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 0.125rem;
+  padding: 0.25rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-prompt-annotation-chip__main:hover,
+.chat-prompt-annotation-chip__main:focus-visible {
+  outline: 0;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.chat-prompt-annotation-chip__meta,
+.chat-prompt-annotation-chip__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-prompt-annotation-chip__meta {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+
+.chat-prompt-annotation-chip__text {
+  font-size: var(--fs-sm);
+}
+
+.chat-prompt-annotation-chip__status {
+  justify-self: start;
+  padding: 0.0625rem 0.375rem;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.chat-prompt-annotation-chip__stale {
+  color: var(--warn);
+  font-size: var(--fs-xs);
+}
+
+.chat-prompt-annotation-chip__editor {
+  display: grid;
+  flex: 1 1 auto;
+  grid-template-columns: minmax(8rem, 1fr) auto auto;
+  gap: 0.25rem;
+}
+
+.chat-prompt-annotation-chip__editor input {
+  min-width: 0;
+  padding: 0.375rem 0.5rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text);
+}
+
+.chat-prompt-annotation-chip__editor button {
+  padding: 0.25rem 0.5rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  cursor: pointer;
 }
 
 .attachment-chip {

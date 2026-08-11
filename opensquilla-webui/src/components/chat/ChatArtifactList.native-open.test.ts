@@ -112,6 +112,32 @@ describe('ChatArtifactList native HTML open', () => {
     app.unmount()
   })
 
+  it('routes Office files to the Workbench download-only document panel', async () => {
+    const fetchImpl = vi.fn()
+    vi.stubGlobal('fetch', fetchImpl)
+    const onOpen = vi.fn()
+    const officeArtifact: ArtifactPayload = {
+      id: 'art-office',
+      name: 'deck.pptx',
+      mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      download_url: '/api/v1/artifacts/art-office',
+    }
+    const { app, el } = await mountList({
+      isOwner: false,
+      artifact: officeArtifact,
+      preferWorkbench: true,
+      onOpen,
+    })
+
+    expect(el.textContent).toContain('Open')
+    el.querySelector<HTMLButtonElement>('.msg-artifact-body')?.click()
+    await nextTick()
+
+    expect(onOpen).toHaveBeenCalledWith(officeArtifact)
+    expect(fetchImpl).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
   it('keeps video in the transcript player even when Workbench routing is preferred', async () => {
     const fetchImpl = vi.fn(async () => new Response('video', {
       status: 200,

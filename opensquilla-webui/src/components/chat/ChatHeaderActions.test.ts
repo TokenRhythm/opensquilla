@@ -5,8 +5,8 @@ import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
 
-type Action = 'deliverables' | 'share' | 'copy-session-key'
 type LayoutName = 'wide' | 'compact' | 'tight'
+type Action = 'workbench' | 'deliverables' | 'share' | 'copy-session-key'
 
 type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
@@ -18,11 +18,13 @@ const BASE_PROPS = {
   copyIcon: 'copy' as const,
   copyLiveText: '',
   deliverableCount: 2,
+  workbenchResourceCount: 0,
   shareMode: false,
   shareableMessageCount: 3,
 }
 
 const messages = {
+  workbench: { resources: { count: 'Workbench ({count})' } },
   chat: {
     copied: 'Copied',
     copySessionKey: 'Copy session ID',
@@ -122,6 +124,7 @@ async function mountHeader(
 ) {
   headerWidth = width
   const handlers = {
+    workbench: vi.fn(),
     deliverables: vi.fn(),
     share: vi.fn(),
     copy: vi.fn(),
@@ -132,6 +135,7 @@ async function mountHeader(
     ...BASE_PROPS,
     ...overrides,
     onOpenDeliverables: handlers.deliverables,
+    onOpenWorkbench: handlers.workbench,
     onStartShare: handlers.share,
     onCopySessionKey: handlers.copy,
   })
@@ -275,6 +279,21 @@ describe('ChatHeaderActions', () => {
     expect(title.nextElementSibling).toBe(copy)
     expect(identity.nextElementSibling).toBe(spacer)
     expect(spacer.nextElementSibling?.classList.contains('chat-header__actions')).toBe(true)
+  })
+
+  it('shows Workbench as a distinct resource action without changing deliverable count', async () => {
+    const { el, handlers } = await mountHeader(800, { workbenchResourceCount: 5 })
+    const workbench = el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-session-action-workbench"]',
+    )
+    const deliverables = el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-session-action-deliverables"]',
+    )
+    expect(workbench?.textContent).toContain('Workbench (5)')
+    expect(deliverables?.getAttribute('aria-label')).toBe('Deliverables (2)')
+    expect(deliverables?.querySelector('.chat-header__count-badge')?.textContent).toBe('2')
+    workbench?.click()
+    expect(handlers.workbench).toHaveBeenCalledOnce()
   })
 
   it.each([

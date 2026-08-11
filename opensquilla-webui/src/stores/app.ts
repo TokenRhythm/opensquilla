@@ -439,6 +439,18 @@ export const useAppStore = defineStore('app', () => {
     // Application-level artifact Workbench. Operators can temporarily disable
     // it to retain the previous Drawer/lightbox flow for one release cycle.
     artifactWorkbench: true,
+    // Resource discovery/import/publish is a separate lifecycle from prompt
+    // annotations. Keep it release-gated independently so the Workbench can
+    // later support uploaded HTML and Office sources without enabling DOM
+    // selection. Enabling the annotation flag still implies this capability
+    // for compatibility with existing feature test shells.
+    documentWorkbenchResources: false,
+    // Release gate for source-backed preview annotations. Keep disabled until
+    // offline, real Electron, and live-provider certification all pass.
+    // Release-gated until offline, native Electron, and live Direct/Router/Ensemble
+    // certification all pass. Tests and development shells may opt in through
+    // window.OPENSQUILLA_FEATURES without changing the production default.
+    artifactPromptAnnotations: false,
     ...((window as FeatureWindow).OPENSQUILLA_FEATURES || {}),
   })
 

@@ -56,6 +56,53 @@ function renderedMessagesFor(
   })
 }
 
+describe('useChatRenderedMessages annotation-only user turns', () => {
+  it('keeps the live optimistic row when prompt annotations are the only visible payload', () => {
+    const api = renderedMessagesFor([{
+      role: 'user',
+      text: '',
+      ts: 1,
+      clientId: 'client-annotation-1',
+      promptAnnotations: [{
+        annotationId: 'annotation-1',
+        documentId: 'document-1',
+        documentName: 'page.html',
+        revisionId: 'revision-1',
+        generation: 1,
+        anchorId: 'anchor-1',
+        body: 'Make the primary action red.',
+        tagName: 'button',
+        locator: { start_offset: 7 },
+        quote: '<button>',
+        sourceExcerpt: null,
+        sentOrder: 0,
+      }],
+    }])
+
+    expect(api.renderedMessages.value).toHaveLength(1)
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      displayRole: 'user',
+      text: '',
+      clientId: 'client-annotation-1',
+      promptAnnotations: [{
+        annotationId: 'annotation-1',
+        body: 'Make the primary action red.',
+      }],
+    })
+  })
+
+  it('still suppresses internal empty control turns without visible payload', () => {
+    const api = renderedMessagesFor([{
+      role: 'user',
+      text: '',
+      ts: 1,
+      clientId: 'client-control-1',
+    }])
+
+    expect(api.renderedMessages.value).toEqual([])
+  })
+})
+
 describe('useChatRenderedMessages maintenance events', () => {
   it('localizes projected relative times for shared chat consumers', () => {
     const api = renderedMessagesFor(

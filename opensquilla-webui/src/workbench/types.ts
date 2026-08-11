@@ -15,6 +15,7 @@ export type WorkbenchHostKind = 'dom' | 'native-webcontents'
 export type WorkbenchPanelKind =
   | 'artifact-collection'
   | 'artifact-preview'
+  | 'resource-collection'
   | 'browser'
   | 'frontend-preview'
   | 'file'
@@ -110,6 +111,8 @@ export interface WorkbenchRuntimeContext {
 }
 
 export interface WorkbenchPanelRuntime {
+  /** Persist pending user work before the owning descriptor is removed. */
+  beforeClose?(): boolean | Promise<boolean>
   setComponentHandle?(handle: unknown): void | Promise<void>
   handleComponentEvent?(
     event: WorkbenchComponentEvent,

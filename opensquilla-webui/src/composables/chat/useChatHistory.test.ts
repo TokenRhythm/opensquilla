@@ -64,6 +64,56 @@ function historyMessage(id: string): NonNullable<ChatHistoryResponse['messages']
 }
 
 describe('useChatHistory canonical pagination', () => {
+  it('restores nested prompt annotation snapshots on an annotation-only user row', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'user-annotation-1',
+          message_id: 'user-annotation-1',
+          role: 'user',
+          text: '',
+          timestamp: '2026-07-06T00:00:00Z',
+          promptAnnotations: [{
+            version: 1,
+            annotationId: 'annotation-history-1',
+            order: 2,
+            body: 'Make the primary action red.',
+            document: { id: 'document-1', name: 'page.html', kind: 'html' },
+            revision: { id: 'revision-3', generation: 3, sha256: 'a'.repeat(64) },
+            anchor: {
+              id: 'anchor-2',
+              kind: 'dom_source',
+              tagName: 'BUTTON',
+              locator: { start_offset: 7 },
+              quote: '<button>',
+            },
+          }],
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'user',
+      text: '',
+      restoredFromHistory: true,
+      promptAnnotations: [{
+        annotationId: 'annotation-history-1',
+        documentId: 'document-1',
+        documentName: 'page.html',
+        revisionId: 'revision-3',
+        generation: 3,
+        anchorId: 'anchor-2',
+        body: 'Make the primary action red.',
+        tagName: 'button',
+        sentOrder: 2,
+      }],
+    })
+  })
+
   it('does not expose an ordinary send disposition as same-turn steer status', async () => {
     const { api, messages } = makeHistory(false, {
       response: {

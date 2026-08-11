@@ -34,6 +34,18 @@ function failedCall(): ChatToolCallRenderItem {
   }
 }
 
+function failedDocumentApplyCall(): ChatToolCallRenderItem {
+  return {
+    ...failedCall(),
+    toolId: 'failed-document-apply',
+    renderKey: 'failed-document-apply',
+    name: 'document_apply',
+    displayName: 'Apply document change',
+    result: 'Proposal validation failed',
+    resultPreview: 'Proposal validation failed',
+  }
+}
+
 function successfulCall(toolId: string, name: string): ChatToolCallRenderItem {
   return {
     ...failedCall(),
@@ -711,6 +723,39 @@ describe('AssistantMessage activity disclosure', () => {
     const activity = el.querySelector('.assistant-activity')
     expect(activity).toBeNull()
     expect(el.querySelector('.tool-row--error')).toBeNull()
+  })
+
+  it('keeps a failed document apply visible and summarizes a later corrected receipt', async () => {
+    const failedApply = timelineGroup(failedDocumentApplyCall())
+    if (failedApply.type !== 'tool-group') throw new Error('expected tool group')
+    failedApply.group.isError = true
+    failedApply.group.status = 'error'
+    const successfulApply = timelineGroup(successfulCall('applied-document', 'document_apply'))
+    const el = mountMessage(baseMessage({
+      timelineItems: [failedApply, successfulApply],
+      toolCalls: [failedDocumentApplyCall(), successfulCall('applied-document', 'document_apply')],
+      parts: [],
+      statusHistory: [],
+      turnOutcome: {
+        turnId: 'turn-document-apply',
+        status: 'succeeded',
+        documentMutationOutcome: {
+          version: 1,
+          status: 'applied',
+          corrected: true,
+          proposalAttempts: 2,
+        },
+      },
+    }))
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('false')
+    expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
+      .toContain('Corrected and applied')
+    expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
+    expect(activity?.textContent).toContain('Proposal validation failed')
   })
 
   it('hides restored failures whose error state only survived on the group', async () => {

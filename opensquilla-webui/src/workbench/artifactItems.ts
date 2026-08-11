@@ -1,6 +1,8 @@
 import type { ArtifactPayload } from '@/types/rpc'
+import type { WorkbenchPreviewDescriptor } from '@/types/workbenchResources'
 import {
   artifactFileTitle,
+  isOfficeArtifact,
 } from '@/utils/chat/artifacts'
 import {
   artifactUsesWorkbenchPreview,
@@ -69,11 +71,12 @@ function artifactIdentity(artifact: ArtifactPayload): string {
 export function artifactWorkbenchItemId(
   sessionKey: string,
   artifact: ArtifactPayload,
+  resourceIdentity?: string,
 ): string {
   return [
     'artifact-preview',
     privateIdentityDigest(sessionKey),
-    artifactIdentityToken(artifactIdentity(artifact)),
+    artifactIdentityToken(resourceIdentity || artifactIdentity(artifact)),
   ].join(':')
 }
 
@@ -108,17 +111,23 @@ export function createArtifactPreviewWorkbenchItem(options: {
   artifact: ArtifactPayload
   navigationArtifacts?: readonly ArtifactPayload[]
   nativeHtml: boolean
+  preparedPreview?: WorkbenchPreviewDescriptor
+  previewLeaseEligible?: boolean
+  resourceIdentity?: string
   sessionKey: string
 }): WorkbenchItem {
   const {
     artifact,
     navigationArtifacts = [],
     nativeHtml,
+    preparedPreview,
+    previewLeaseEligible = true,
+    resourceIdentity,
     sessionKey,
   } = options
   const kind = artifactWorkbenchPreviewKind(artifact)
   return {
-    id: artifactWorkbenchItemId(sessionKey, artifact),
+    id: artifactWorkbenchItemId(sessionKey, artifact, resourceIdentity),
     kind: 'artifact-preview',
     title: artifactFileTitle(artifact),
     scope: { type: 'session', id: sessionKey },
@@ -130,10 +139,47 @@ export function createArtifactPreviewWorkbenchItem(options: {
     payload: {
       artifact,
       navigationArtifacts: [...navigationArtifacts],
-      resourceIdentity: artifactIdentity(artifact),
+      ...(preparedPreview
+        ? {
+            preparedPreview: {
+              ...preparedPreview,
+              resource: { ...preparedPreview.resource },
+              ...(preparedPreview.adapter
+                ? { adapter: { ...preparedPreview.adapter } }
+                : {}),
+            },
+          }
+        : {}),
+      previewLeaseEligible,
+      resourceIdentity: resourceIdentity || artifactIdentity(artifact),
       sessionKey,
     },
   }
+}
+
+/**
+ * Returns only the fail-closed preview policy accepted by the Workbench RPC.
+ * Arbitrary item payloads cannot opt a normal document preview into this path.
+ */
+export function preparedPreviewFromWorkbenchItem(
+  item: WorkbenchItem | null,
+): WorkbenchPreviewDescriptor | null {
+  if (item?.kind !== 'artifact-preview') return null
+  const value = item.payload.preparedPreview
+  if (!value || typeof value !== 'object') return null
+  const preview = value as Record<string, unknown>
+  const resource = preview.resource
+  if (!resource || typeof resource !== 'object') return null
+  const ref = resource as Record<string, unknown>
+  if (
+    preview.mode !== 'isolated'
+    || preview.sandboxProfile !== 'opaque-offline'
+    || preview.network !== false
+    || typeof preview.protocolVersion !== 'number'
+    || typeof ref.type !== 'string'
+    || typeof ref.id !== 'string'
+  ) return null
+  return value as WorkbenchPreviewDescriptor
 }
 
 export function artifactsFromWorkbenchItem(
@@ -176,7 +222,7 @@ export function previewableNavigationArtifactsFromWorkbenchItem(
   item: WorkbenchItem | null,
 ): readonly ArtifactPayload[] {
   return navigationArtifactsFromWorkbenchItem(item)
-    .filter(artifactUsesWorkbenchPreview)
+    .filter(artifact => artifactUsesWorkbenchPreview(artifact) || isOfficeArtifact(artifact))
 }
 
 export function sessionKeyFromWorkbenchItem(item: WorkbenchItem | null): string {

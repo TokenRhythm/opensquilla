@@ -1,5 +1,6 @@
 import type { ArtifactPayload } from './rpc'
 import type { SessionSteerV2Params } from './rpc'
+import type { PromptAnnotationSnapshot } from './promptAnnotations'
 import type { IconName } from '@/utils/icons'
 
 export interface Attachment {
@@ -32,6 +33,8 @@ export interface DisplayAttachment {
   localFile?: File
   download_url?: string
   sha256_ref?: string
+  /** Session-scoped opaque identity for Workbench preview/import actions. */
+  attachmentId?: string
 }
 
 /**
@@ -225,6 +228,39 @@ export interface ChatSteerCapability {
   reason?: string
 }
 
+export type DocumentMutationStatus =
+  | 'not_attempted'
+  | 'applied'
+  | 'not_applied'
+  | 'conflict'
+  | 'ambiguous'
+
+export type DocumentMutationPhase = 'proposal' | 'commit'
+
+export type DocumentMutationRetryPolicy =
+  | 'same_turn'
+  | 'new_turn'
+  | 'refresh'
+  | 'reconcile'
+  | 'never'
+
+/**
+ * Authoritative document-side effect receipt projected onto one completed turn.
+ * Assistant prose and generic task completion never participate in this state.
+ */
+export interface DocumentMutationOutcome {
+  version: number
+  status: DocumentMutationStatus
+  phase?: DocumentMutationPhase
+  code?: string
+  retryPolicy?: DocumentMutationRetryPolicy
+  attemptId?: string
+  changeSetId?: string
+  resultRevisionId?: string
+  proposalAttempts?: number
+  corrected?: boolean
+}
+
 export interface ChatTurnOutcome {
   turnId: string
   taskId?: string
@@ -235,6 +271,7 @@ export interface ChatTurnOutcome {
   startedAt?: number | string
   finishedAt?: number | string
   retryable?: boolean
+  documentMutationOutcome?: DocumentMutationOutcome
 }
 
 export interface ChatRunTask {
@@ -255,6 +292,8 @@ export interface ChatRunTask {
   steerCapability?: ChatSteerCapability
   turn_outcome?: Record<string, unknown>
   turnOutcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
 }
 
 export interface ChatRunStatus {
@@ -462,6 +501,7 @@ export interface ChatMessage {
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timeline?: ChatTimelineSegment[]
   attachments?: DisplayAttachment[]
+  promptAnnotations?: PromptAnnotationSnapshot[]
   provenanceKind?: string
   provenanceSourceSessionKey?: string
   provenanceSourceTool?: string
@@ -553,10 +593,10 @@ export interface ChatRenderedMessage {
   isStreaming?: boolean
   messageId?: string
   restoredFromHistory?: boolean
+  /** Durable server turn identity restored from transcript context once assigned. */
+  turnId?: string
   /** Stable identity of the owning user turn for client-only UI continuity. */
   turnKey?: string
-  /** Durable server turn identity restored from transcript turn_context. */
-  turnId?: string
   /** Internal-input provenance copied from the source ChatMessage. */
   turnInputMode?: string
   /** Runtime turn kind copied from the source ChatMessage. */
@@ -567,6 +607,7 @@ export interface ChatRenderedMessage {
   turnOutcome?: ChatTurnOutcome
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
+  promptAnnotations?: PromptAnnotationSnapshot[]
   toolCalls?: ChatToolCall[]
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timelineItems?: ChatStreamTimelineItem[]

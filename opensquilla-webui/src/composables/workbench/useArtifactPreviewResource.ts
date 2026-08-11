@@ -112,6 +112,15 @@ function isSameOriginHttpUrl(url: string, baseOrigin: string): boolean {
   }
 }
 
+function isInlineWorkbenchAttachmentUrl(artifact: ArtifactPayload, url: string): boolean {
+  if (artifact.workbenchResourceType !== 'attachment') return false
+  // Inline transcript attachments are returned only by the authenticated
+  // read-only resource lookup. Keep the exception narrow: base64 data with a
+  // concrete MIME type, never an arbitrary URL or executable data shorthand.
+  return /^data:[a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*(?:;charset=[^;,]+)?;base64,[a-z0-9+/=]*$/i
+    .test(url)
+}
+
 function defaultCreateObjectUrl(blob: Blob): string {
   return URL.createObjectURL(blob)
 }
@@ -324,7 +333,8 @@ export function createArtifactPreviewResource(
 
     const baseOrigin = options.baseOrigin?.() || defaultBaseOrigin()
     const url = artifactAccessUrl(artifact, baseOrigin)
-    if (!url || !isSameOriginHttpUrl(url, baseOrigin)) {
+    const inlineAttachment = isInlineWorkbenchAttachmentUrl(artifact, url)
+    if (!url || (!inlineAttachment && !isSameOriginHttpUrl(url, baseOrigin))) {
       setFailure('error', 'missing-url')
       return
     }
@@ -344,7 +354,7 @@ export function createArtifactPreviewResource(
     try {
       const response = await fetchImpl(url, {
         method: 'GET',
-        credentials: 'same-origin',
+        credentials: inlineAttachment ? 'omit' : 'same-origin',
         headers: artifactAccessHeaders(url, {
           authToken: options.authToken?.() || '',
           baseOrigin,

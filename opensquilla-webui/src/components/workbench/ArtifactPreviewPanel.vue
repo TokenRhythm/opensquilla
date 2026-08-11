@@ -212,6 +212,8 @@ const props = withDefaults(defineProps<{
   previewErrorMessage?: string
   previewLaunchUrl?: string
   previewMode?: 'full' | 'offline'
+  previewNetworkAllowed?: boolean
+  previewSandboxProfile?: 'default' | 'opaque-offline'
   sessionKey?: string
   showHeader?: boolean
   suspended?: boolean
@@ -225,6 +227,8 @@ const props = withDefaults(defineProps<{
   previewErrorMessage: '',
   previewLaunchUrl: '',
   previewMode: 'offline',
+  previewNetworkAllowed: true,
+  previewSandboxProfile: 'default',
   sessionKey: '',
   showHeader: true,
   suspended: false,
@@ -274,6 +278,8 @@ const resourceSignature = computed(() => [
   props.previewErrorMessage,
   props.previewLaunchUrl,
   props.previewMode,
+  props.previewNetworkAllowed ? 'network' : 'no-network',
+  props.previewSandboxProfile,
 ].join('\u0000'))
 
 watch(
@@ -323,16 +329,24 @@ const isRenderable = computed(() =>
   || preview.state.value === 'ready-with-warnings'
   || preview.state.value === 'missing-resource')
 
+const opaqueOfflinePreview = computed(() =>
+  props.previewSandboxProfile === 'opaque-offline'
+  || props.previewNetworkAllowed === false)
+
+const fullHtmlPreview = computed(() =>
+  props.previewMode === 'full'
+  && !opaqueOfflinePreview.value)
+
 const showOfflineWebLimits = computed(() =>
   !props.nativeHtml
-  && props.previewMode === 'offline'
+  && !fullHtmlPreview.value
   && preview.kind.value === 'html')
 
-const htmlSandbox = computed(() => props.previewMode === 'full'
+const htmlSandbox = computed(() => fullHtmlPreview.value
   ? 'allow-scripts allow-same-origin allow-forms allow-modals allow-pointer-lock allow-presentation'
   : 'allow-scripts')
 
-const htmlPermissions = computed(() => props.previewMode === 'full'
+const htmlPermissions = computed(() => fullHtmlPreview.value
   ? 'camera; microphone; geolocation; clipboard-read; clipboard-write; fullscreen; display-capture'
   : '')
 

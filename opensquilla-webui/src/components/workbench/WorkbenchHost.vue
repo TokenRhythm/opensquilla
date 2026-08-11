@@ -163,7 +163,7 @@ import {
   workbenchLayoutMode,
 } from '@/workbench/layout'
 import { useWorkbenchStore } from '@/workbench/store'
-import type { NativeSurfaceRect } from '@/workbench/types'
+import type { NativeSurfaceRect, WorkbenchItem } from '@/workbench/types'
 import WorkbenchResizer from './WorkbenchResizer.vue'
 
 type WorkbenchResizerHandle = { cancel: () => boolean }
@@ -181,6 +181,7 @@ const props = withDefaults(defineProps<{
   closeItemLabel?: string
   resizeLabel?: string
   pixelsLabel?: string
+  beforeCloseItem?: (item: WorkbenchItem) => boolean | Promise<boolean>
 }>(), {
   enabled: true,
   routeActive: true,
@@ -287,7 +288,9 @@ function collapseWorkbench() {
   emit('collapsed')
 }
 
-function closeWorkbenchItem(id: string) {
+async function closeWorkbenchItem(id: string) {
+  const item = store.items.find(candidate => candidate.id === id)
+  if (!item || props.beforeCloseItem && !await props.beforeCloseItem(item)) return
   if (!store.closeItem(id)) return
   if (!store.activeItem) {
     emit('emptied')

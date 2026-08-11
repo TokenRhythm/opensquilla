@@ -755,6 +755,7 @@ function withoutFailedActivityRows(
 
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
+    const documentApplyGroup = isDocumentApplyToolName(item.group.operationKey)
 
     const failedCalls = item.group.calls.filter(
       call => call.isError || call.status === 'error',
@@ -764,24 +765,32 @@ function withoutFailedActivityRows(
     if (
       (item.group.isError || item.group.status === 'error')
       && failedCalls.length === 0
+      && !documentApplyGroup
     ) {
       return []
     }
 
     const calls = item.group.calls.filter(
-      call => !call.isError && call.status !== 'error',
+      call => (
+        (!call.isError && call.status !== 'error')
+        || isDocumentApplyToolName(call.name)
+      ),
     )
     if (calls.length === 0) return []
 
     const isRunning = calls.some(call => call.isRunning)
+    const isError = calls.some(call => call.isError || call.status === 'error')
+      || (documentApplyGroup && (item.group.isError || item.group.status === 'error'))
     return [{
       ...item,
       group: {
         ...item.group,
         calls,
         isRunning,
-        isError: false,
-        status: isRunning
+        isError,
+        status: isError
+          ? 'error'
+          : isRunning
           ? ''
           : calls.every(call => call.status === 'success')
             ? 'success'
@@ -789,6 +798,13 @@ function withoutFailedActivityRows(
       },
     }]
   })
+}
+
+function isDocumentApplyToolName(value: string | undefined): boolean {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return false
+  const segments = normalized.split(/[.:/]/)
+  return segments[segments.length - 1] === 'document_apply'
 }
 
 const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {

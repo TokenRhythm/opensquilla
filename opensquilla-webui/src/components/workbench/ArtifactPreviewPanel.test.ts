@@ -72,6 +72,8 @@ describe('ArtifactPreviewPanel', () => {
     expect(frame).not.toBeNull()
     expect(frame?.getAttribute('sandbox')).toBe('allow-scripts')
     expect(frame?.getAttribute('sandbox')).not.toContain('allow-same-origin')
+    expect(frame?.getAttribute('sandbox')).not.toContain('allow-forms')
+    expect(frame?.getAttribute('allow')).toBe('')
     expect(frame?.getAttribute('referrerpolicy')).toBe('no-referrer')
     expect(frame?.getAttribute('tabindex')).toBe('0')
     expect(createObjectUrl).toHaveBeenCalledOnce()
@@ -79,6 +81,32 @@ describe('ArtifactPreviewPanel', () => {
 
     mounted.unmount()
     expect(revokeObjectUrl).toHaveBeenCalledWith('about:blank#artifact-preview')
+  })
+
+  it('keeps a prepared opaque preview isolated even when the saved mode is full', async () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank#prepared-preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      '<html><body><form><input></form></body></html>',
+      { status: 200, headers: { 'Content-Type': 'text/html' } },
+    )))
+
+    const mounted = mountPanel({
+      artifact: artifact(),
+      previewMode: 'full',
+      previewNetworkAllowed: false,
+      previewSandboxProfile: 'opaque-offline',
+    })
+    await settlePreview()
+
+    const frame = mounted.element.querySelector<HTMLIFrameElement>(
+      '.artifact-preview__frame--html',
+    )
+    expect(frame?.getAttribute('sandbox')).toBe('allow-scripts')
+    expect(frame?.getAttribute('sandbox')).not.toContain('allow-same-origin')
+    expect(frame?.getAttribute('sandbox')).not.toContain('allow-forms')
+    expect(frame?.getAttribute('allow')).toBe('')
+    mounted.unmount()
   })
 
   it('can omit its header when embedded in the workbench chrome', async () => {

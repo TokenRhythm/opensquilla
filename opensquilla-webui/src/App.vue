@@ -318,6 +318,11 @@
       </main>
       <AppWorkbench
         :enabled="appStore.features.artifactWorkbench === true"
+        :workbench-resources-enabled="(
+          appStore.features.documentWorkbenchResources === true
+          || appStore.features.artifactPromptAnnotations === true
+        )"
+        :prompt-annotations-enabled="appStore.features.artifactPromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="currentSessionKey"
         :modal-blocked="workbenchModalBlocked"

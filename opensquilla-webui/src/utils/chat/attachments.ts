@@ -228,6 +228,11 @@ export function normalizeDisplayAttachment(
         : undefined,
     download_url: typeof record.download_url === 'string' ? record.download_url : undefined,
     sha256_ref: sha || undefined,
+    attachmentId: typeof record.attachmentId === 'string' && record.attachmentId.trim()
+      ? record.attachmentId.trim()
+      : typeof record.attachment_id === 'string' && record.attachment_id.trim()
+        ? record.attachment_id.trim()
+        : undefined,
   }
 }
 

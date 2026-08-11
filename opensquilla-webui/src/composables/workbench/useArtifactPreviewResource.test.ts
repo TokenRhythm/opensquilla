@@ -134,6 +134,38 @@ describe('createArtifactPreviewResource', () => {
     expect(controller.errorCode.value).toBe('missing-url')
   })
 
+  it('renders an authenticated inline attachment locally without widening URL trust', async () => {
+    const observed: { blob?: Blob } = {}
+    const inlineUrl = 'data:text/html;base64,PGgxPklubGluZTwvaDE+'
+    const fetchImpl = vi.fn().mockResolvedValue(response('<h1>Inline</h1>', 'text/html'))
+    const controller = createArtifactPreviewResource({
+      artifact: () => artifact({
+        id: undefined,
+        name: 'inline.html',
+        mime: 'text/html',
+        download_url: inlineUrl,
+        workbenchResourceType: 'attachment',
+      }),
+      createObjectUrl: blob => {
+        observed.blob = blob
+        return 'blob:inline-preview'
+      },
+      fetchImpl,
+      revokeObjectUrl: vi.fn(),
+    })
+
+    await controller.load()
+
+    expect(fetchImpl).toHaveBeenCalledWith(inlineUrl, expect.objectContaining({
+      credentials: 'omit',
+      headers: {},
+      redirect: 'error',
+    }))
+    expect(controller.state.value).toBe('ready')
+    expect(controller.objectUrl.value).toBe('blob:inline-preview')
+    expect(await observed.blob?.text()).toContain("connect-src 'none'")
+  })
+
   it('emits native HTML bytes and reports unresolved relative resources', async () => {
     const nativeReady = vi.fn<(resource: NativeHtmlArtifactResource) => void>()
     const controller = createArtifactPreviewResource({
