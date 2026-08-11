@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -110,6 +111,128 @@ def test_router_dynamic_logs_every_ranking_stage_in_sequence() -> None:
         "unsupported_level_fallbacks",
         "policy_versions",
     }.intersection(captured[-1])
+    assert "role_reliability_coverage" not in captured[-1]
+
+
+def test_router_dynamic_logs_selected_role_reliability_coverage() -> None:
+    plan: dict[str, Any] = {
+        "strategy": "router_dynamic",
+        "ranking_parameters": {
+            "role_reliability": {
+                "penalty_weight": 0.4,
+                "prior_success": 10,
+                "prior_failure": 0,
+            }
+        },
+        "task_analyzer": {},
+        "session": {},
+        "hard_filter": {},
+        "model_scores": [
+            {
+                "identity": "provider:model-a",
+                "role_reliability": {
+                    "role": "proposer",
+                    "success": 4,
+                    "failure": 1,
+                    "observed": 5,
+                },
+            },
+            {
+                "identity": "provider:model-b",
+                "role_reliability": {
+                    "role": "proposer",
+                    "success": 0,
+                    "failure": 0,
+                    "observed": 0,
+                },
+            },
+        ],
+        "aggregator": {
+            "selected": {
+                "identity": "provider:model-c",
+                "role_reliability": {
+                    "role": "aggregator",
+                    "success": 9,
+                    "failure": 1,
+                    "observed": 10,
+                },
+            }
+        },
+        "selected_P": ["provider:model-a", "provider:model-b"],
+        "selected_A": "provider:model-c",
+    }
+    original = deepcopy(plan)
+
+    with structlog.testing.capture_logs() as captured:
+        log_ensemble_decision_steps(
+            decision_id="reliability-coverage",
+            selection_mode="router_dynamic",
+            profile_name="router_dynamic/c2",
+            selection_plan=plan,
+        )
+
+    assert plan == original
+    coverage = captured[-1]["role_reliability_coverage"]
+    assert coverage == {
+        "schema": "opensquilla.role-reliability-coverage/v1",
+        "coverage_unit": "selected_model_identity",
+        "proposer": {
+            "selected_count": 2,
+            "observed_selected_count": 1,
+            "zero_observation_selected_count": 1,
+            "window_observed_attempt_count": 5,
+            "coverage_basis_points": 5000,
+        },
+        "aggregator": {
+            "selected_count": 1,
+            "observed_selected_count": 1,
+            "zero_observation_selected_count": 0,
+            "window_observed_attempt_count": 10,
+            "coverage_basis_points": 10_000,
+        },
+    }
+    assert [row["sequence"] for row in captured] == list(
+        range(1, len(captured) + 1)
+    )
+    assert captured[-1]["event"] == "llm_ensemble.routing.decision_completed"
+
+
+def test_router_dynamic_omits_malformed_reliability_coverage_fail_open() -> None:
+    plan: dict[str, Any] = {
+        "strategy": "router_dynamic",
+        "ranking_parameters": {"role_reliability": {"penalty_weight": 0.4}},
+        "task_analyzer": {},
+        "session": {},
+        "hard_filter": {},
+        "model_scores": [
+            {
+                "identity": "provider:model-a",
+                "role_reliability": {
+                    "role": "proposer",
+                    "success": 1,
+                    "failure": 0,
+                    "observed": 2,
+                },
+            }
+        ],
+        "aggregator": {"selected": {"identity": "provider:model-b"}},
+        "selected_P": ["provider:model-a"],
+        "selected_A": "provider:model-b",
+    }
+
+    with structlog.testing.capture_logs() as captured:
+        log_ensemble_decision_steps(
+            decision_id="malformed-reliability-coverage",
+            selection_mode="router_dynamic",
+            profile_name="router_dynamic/c2",
+            selection_plan=plan,
+        )
+
+    assert "role_reliability_coverage" not in captured[-1]
+    assert not any(
+        row["event"] == "llm_ensemble.routing.decision_log_failed"
+        for row in captured
+    )
 
 
 def test_router_dynamic_logs_thinking_assignment_audit_fields() -> None:

@@ -9,6 +9,8 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+ROLE_RELIABILITY_COVERAGE_SCHEMA = "opensquilla.role-reliability-coverage/v1"
+
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
@@ -52,6 +54,102 @@ def _candidate_fields(candidate: Mapping[str, Any]) -> dict[str, Any]:
             "thinking_level_mapping",
         )
         if key in candidate
+    }
+
+
+def _strict_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _role_reliability_observations(
+    row: Mapping[str, Any],
+    *,
+    role: str,
+) -> int | None:
+    reliability = row.get("role_reliability")
+    if not isinstance(reliability, Mapping) or reliability.get("role") != role:
+        return None
+    success = _strict_nonnegative_int(reliability.get("success"))
+    failure = _strict_nonnegative_int(reliability.get("failure"))
+    observed = _strict_nonnegative_int(reliability.get("observed"))
+    if (
+        success is None
+        or failure is None
+        or observed is None
+        or observed != success + failure
+    ):
+        return None
+    return observed
+
+
+def _coverage_summary(observations: Sequence[int]) -> dict[str, int]:
+    selected_count = len(observations)
+    observed_selected_count = sum(value > 0 for value in observations)
+    return {
+        "selected_count": selected_count,
+        "observed_selected_count": observed_selected_count,
+        "zero_observation_selected_count": selected_count - observed_selected_count,
+        "window_observed_attempt_count": sum(observations),
+        "coverage_basis_points": (
+            (observed_selected_count * 10_000 + selected_count // 2)
+            // selected_count
+        ),
+    }
+
+
+def _role_reliability_coverage(
+    plan: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    ranking_parameters = plan.get("ranking_parameters")
+    if not isinstance(ranking_parameters, Mapping) or not isinstance(
+        ranking_parameters.get("role_reliability"), Mapping
+    ):
+        return None
+    selected_p_raw = plan.get("selected_P")
+    selected_a = plan.get("selected_A")
+    if (
+        not isinstance(selected_p_raw, Sequence)
+        or isinstance(selected_p_raw, (str, bytes))
+        or not selected_p_raw
+        or any(not isinstance(identity, str) or not identity for identity in selected_p_raw)
+        or len(set(selected_p_raw)) != len(selected_p_raw)
+        or not isinstance(selected_a, str)
+        or not selected_a
+    ):
+        return None
+    selected_p = list(selected_p_raw)
+    score_rows = _rows(plan.get("model_scores"))
+    proposer_observations: list[int] = []
+    for identity in selected_p:
+        matches = [row for row in score_rows if row.get("identity") == identity]
+        if len(matches) != 1:
+            return None
+        observed = _role_reliability_observations(matches[0], role="proposer")
+        if observed is None:
+            return None
+        proposer_observations.append(observed)
+    aggregator = plan.get("aggregator")
+    if not isinstance(aggregator, Mapping):
+        return None
+    aggregator_selected = aggregator.get("selected")
+    if (
+        not isinstance(aggregator_selected, Mapping)
+        or aggregator_selected.get("identity") != selected_a
+    ):
+        return None
+    aggregator_observed = _role_reliability_observations(
+        aggregator_selected,
+        role="aggregator",
+    )
+    if aggregator_observed is None:
+        return None
+    return {
+        "schema": ROLE_RELIABILITY_COVERAGE_SCHEMA,
+        "coverage_unit": "selected_model_identity",
+        "proposer": _coverage_summary(proposer_observations),
+        "aggregator": _coverage_summary([aggregator_observed]),
     }
 
 
@@ -381,6 +479,10 @@ def log_ensemble_decision_steps(
                     ),
                 }
             )
+        if selection_mode == "router_dynamic":
+            reliability_coverage = _role_reliability_coverage(plan)
+            if reliability_coverage is not None:
+                completed_fields["role_reliability_coverage"] = reliability_coverage
         emit(
             "llm_ensemble.routing.decision_completed",
             **completed_fields,
