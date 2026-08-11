@@ -220,7 +220,10 @@ async def filter_skills(ctx: TurnContext) -> TurnContext:
     filter_enabled = getattr(skills_cfg, "filter_enabled", False) if skills_cfg else False
     max_chars = getattr(skills_cfg, "max_skills_prompt_chars", 8000)
     injection_mode = getattr(skills_cfg, "injection_mode", "system")
-    semantic_message = getattr(ctx, "semantic_message", None)
+    routing_hint = getattr(ctx, "routing_hint", None)
+    semantic_message = routing_hint
+    if semantic_message is None:
+        semantic_message = getattr(ctx, "semantic_message", None)
     if semantic_message is None:
         semantic_message = getattr(ctx, "raw_message", None)
     if semantic_message is None:
@@ -322,9 +325,13 @@ async def filter_skills(ctx: TurnContext) -> TurnContext:
         mode=injection_mode,
         strategy=getattr(skills_cfg, "filter_strategy", "lexical") if filter_enabled else "off",
         query_preview=(
-            semantic_message[:60] + "..."
-            if isinstance(semantic_message, str) and len(semantic_message) > 60
-            else semantic_message
+            "[goal objective]"
+            if routing_hint is not None
+            else (
+                semantic_message[:60] + "..."
+                if isinstance(semantic_message, str) and len(semantic_message) > 60
+                else semantic_message
+            )
         ),
         pinned_skills=pinned_ids,
         filtered_skills=filtered_ids,

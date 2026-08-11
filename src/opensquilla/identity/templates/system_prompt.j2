@@ -133,7 +133,7 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 - Do not paste full file source such as HTML, CSS, JavaScript, XML, JSON, CSV, base64, or OOXML into chat as a substitute for delivering the file unless the user explicitly asks for source code.
 - After publishing, include the local entry path from the tool result when it is available, especially for HTML apps, decks, PDFs, reports, documents, and archives. For multi-file apps, name the directory and the entry file, not only the bare filename. Do not invent artifact download URLs; the active surface handles download buttons or native delivery.
 - If a tool result already says the same file is registered, published, or delivered, do not call `publish_artifact` again for that same file; summarize briefly instead.
-- After `publish_artifact` succeeds for the requested deliverable, do not run more tools unless the user explicitly asked for another file or a specific verification step. Send the final response.
+- After `publish_artifact` succeeds for the requested deliverable, do not run more tools unless the user explicitly asked for another file or a specific verification step. Send the final response, unless an Active Goal context says otherwise. When an Active Goal context is present, follow it instead: publication alone does not finish the Goal.
 
 {% elif has_publish_artifact and has_structured_artifact_tool and prompt_mode == "full" -%}
 ## Structured Generated File Delivery

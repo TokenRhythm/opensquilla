@@ -126,6 +126,38 @@ async def test_reserve_is_inert_until_activation(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
+async def test_transferable_explicit_intent_release_survives_caller_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = TaskRuntime(storage=_TrackingStorage(), turn_handler=_noop_turn_handler)
+    session_key = "agent-1::cancelled-intent-release"
+    lease = await runtime.acquire_explicit_ingress_intent(session_key)
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    original_release = runtime._release_explicit_ingress_intent
+
+    async def delayed_release(key: str, state: Any) -> None:
+        release_started.set()
+        await allow_release.wait()
+        await original_release(key, state)
+
+    monkeypatch.setattr(runtime, "_release_explicit_ingress_intent", delayed_release)
+    caller = asyncio.create_task(lease.release())
+    await asyncio.wait_for(release_started.wait(), timeout=1.0)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert await runtime.has_explicit_ingress_intent(session_key) is True
+
+    allow_release.set()
+    assert lease._release_task is not None
+    await asyncio.wait_for(lease._release_task, timeout=1.0)
+
+    assert await runtime.has_explicit_ingress_intent(session_key) is False
+    assert session_key not in runtime._ingress_intent_states
+
+
+@pytest.mark.asyncio
 async def test_reserve_preserves_task_id_without_capturing_accepted_config() -> None:
     storage = _TrackingStorage()
     config_captures: list[dict[str, str]] = []
@@ -759,6 +791,72 @@ async def test_direct_collect_admission_serializes_miss_through_activation() -> 
     release_blocker.set()
     await runtime.wait(blocker.task_id, timeout=1.0)
     await runtime.wait(first_handle.task_id, timeout=1.0)
+    assert runtime._collect_admission_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_collect_admission_reclaims_registry_after_concurrent_unique_sessions() -> None:
+    runtime = TaskRuntime(storage=_TrackingStorage(), turn_handler=_noop_turn_handler)
+    active_by_session: dict[str, int] = {}
+    max_active_by_session: dict[str, int] = {}
+    start = asyncio.Event()
+
+    async def borrow(session_key: str) -> None:
+        await start.wait()
+        async with runtime.collect_admission(session_key):
+            active = active_by_session.get(session_key, 0) + 1
+            active_by_session[session_key] = active
+            max_active_by_session[session_key] = max(
+                max_active_by_session.get(session_key, 0),
+                active,
+            )
+            await asyncio.sleep(0)
+            active_by_session[session_key] = active - 1
+
+    session_keys = [f"agent-1::admission-registry-{index}" for index in range(100)]
+    borrowers = [
+        asyncio.create_task(borrow(session_key))
+        for session_key in session_keys
+        for _ in range(4)
+    ]
+    start.set()
+    await asyncio.gather(*borrowers)
+
+    assert max_active_by_session == dict.fromkeys(session_keys, 1)
+    assert runtime._collect_admission_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_collect_admission_reclaims_registry_after_waiter_cancellation() -> None:
+    runtime = TaskRuntime(storage=_TrackingStorage(), turn_handler=_noop_turn_handler)
+    session_key = "agent-1::admission-cancelled-waiters"
+    holder_entered = asyncio.Event()
+    release_holder = asyncio.Event()
+
+    async def hold() -> None:
+        async with runtime.collect_admission(session_key):
+            holder_entered.set()
+            await release_holder.wait()
+
+    async def wait() -> None:
+        async with runtime.collect_admission(session_key):
+            return
+
+    holder = asyncio.create_task(hold())
+    await asyncio.wait_for(holder_entered.wait(), timeout=1.0)
+    waiters = [asyncio.create_task(wait()) for _ in range(50)]
+    await asyncio.sleep(0)
+
+    for waiter in waiters[::2]:
+        waiter.cancel()
+    await asyncio.gather(*waiters[::2], return_exceptions=True)
+    release_holder.set()
+    await asyncio.wait_for(
+        asyncio.gather(holder, *waiters[1::2]),
+        timeout=1.0,
+    )
+
+    assert runtime._collect_admission_locks == {}
 
 
 @pytest.mark.asyncio

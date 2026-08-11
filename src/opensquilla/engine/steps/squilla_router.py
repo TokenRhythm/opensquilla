@@ -1079,6 +1079,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         semantic_message = getattr(ctx, "raw_message", None)
     if semantic_message is None:
         semantic_message = ctx.message
+    routing_message = getattr(ctx, "routing_hint", None) or semantic_message
     if ":subagent:" in ctx.session_key:
         return ctx
 
@@ -1156,7 +1157,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
 
     # Empty-text guard for the ML text classifier: only reached for non-image
     # turns (the vision bypass above already handled empty-caption images).
-    if not semantic_message.strip():
+    if not routing_message.strip():
         return ctx
 
     # Order valid_tiers by the canonical c0<c1<c2<c3 ladder rather than TOML
@@ -1269,7 +1270,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         },
     )
     tier_name, confidence, source, extra = await strategy.classify(
-        semantic_message,
+        routing_message,
         valid_tiers,
         routing_history=routing_history,
         **classify_context,
@@ -1326,7 +1327,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         routing_extra = ctx.metadata.setdefault("routing_extra", extra or {})
     else:
         routing_extra = ctx.metadata.get("routing_extra")
-    material_estimated_tokens = _material_estimated_tokens(ctx, semantic_message)
+    material_estimated_tokens = _material_estimated_tokens(ctx, routing_message)
     budget_input = _budget_gate_input_for_turn(
         ctx,
         router_cfg,
@@ -1345,7 +1346,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     policy_result = _POLICY_ENGINE.run(
         PolicyInputs(
             decision=decision,
-            message=semantic_message,
+            message=routing_message,
             router_cfg=router_cfg,
             tiers=tiers,
             valid_tiers=valid_tiers,
@@ -1433,6 +1434,8 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         extra = ctx.metadata.get("routing_extra")
         if extra:
             entry_payload = _routing_history_entry(
+                # Routing hints are process-local. Keep history on the generic
+                # system event rather than persisting a Goal objective.
                 text=semantic_message,
                 extra=extra,
                 decision=decision,

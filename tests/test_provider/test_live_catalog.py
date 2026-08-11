@@ -327,9 +327,9 @@ def test_scoped_live_entries_outrank_corrections_without_leaking() -> None:
 
 
 def test_scoped_live_keeps_corrections_reasoning_dialect() -> None:
-    # The relay rejects thinking-toggle payloads, so its corrections rows
-    # pin reasoning_format="none". Live ingest claims no reasoning fields;
-    # capabilities must stay exactly as the ladder decided them.
+    # The mixed-family catalog remains neutral at reasoning_format="none";
+    # exact official V4 wire controls do not mutate catalog capabilities.
+    # Live ingest claims no reasoning fields, so the ladder remains unchanged.
     catalog = ModelCatalog()
     catalog.set_live_provider_entries(
         "tokenrhythm",

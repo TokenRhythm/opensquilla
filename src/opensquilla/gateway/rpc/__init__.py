@@ -60,6 +60,7 @@ import opensquilla.gateway.rpc_config  # noqa: E402, F401
 import opensquilla.gateway.rpc_cron  # noqa: E402, F401
 import opensquilla.gateway.rpc_diagnostics  # noqa: E402, F401
 import opensquilla.gateway.rpc_doctor  # noqa: E402, F401
+import opensquilla.gateway.rpc_goals  # noqa: E402, F401
 import opensquilla.gateway.rpc_logs  # noqa: E402, F401
 import opensquilla.gateway.rpc_memory  # noqa: E402, F401
 import opensquilla.gateway.rpc_memory_import  # noqa: E402, F401

@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-async function mountSkillsView(reloadResult: Record<string, unknown> = {
+async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<Record<string, unknown>> = {
   success: true,
   changed: true,
   partial: false,
@@ -10,10 +10,10 @@ async function mountSkillsView(reloadResult: Record<string, unknown> = {
   removed: [],
   modified: [],
   errors: [],
-}, loadDataResult: boolean | undefined = undefined) {
+}, loadDataResult: boolean | undefined = undefined, queueBusy = false) {
   vi.resetModules()
 
-  const { createApp, defineComponent, h, nextTick, ref } = await import('vue')
+  const { createApp, defineComponent, h, KeepAlive, nextTick, ref } = await import('vue')
   const { createPinia, setActivePinia } = await import('pinia')
   const i18n = (await import('@/i18n')).default
 
@@ -65,11 +65,14 @@ async function mountSkillsView(reloadResult: Record<string, unknown> = {
       },
     }),
   }))
-  vi.doMock('@/components/skills/SkillsRegistryPanel.vue', () => ({
+  vi.doMock('@/components/skills/SkillsAddDrawer.vue', () => ({
     default: defineComponent({
-      name: 'SkillsRegistryPanelStub',
-      setup() {
-        return () => h('section', { 'data-testid': 'registry-panel' }, 'registry')
+      name: 'SkillsAddDrawerStub',
+      props: { open: Boolean },
+      setup(props) {
+        return () => props.open
+          ? h('section', { 'data-testid': 'skills-add-drawer' }, 'add skill')
+          : null
       },
     }),
   }))
@@ -130,20 +133,38 @@ async function mountSkillsView(reloadResult: Record<string, unknown> = {
     }),
   }))
   vi.doMock('@/composables/skills/useSkillRegistry', () => ({
-    useSkillRegistry: () => ({
-      registryQuery: ref(''),
-      githubUrl: ref(''),
-      registryResults: ref([]),
-      registryLoading: ref(false),
-      installingId: ref(null),
-      installingDepsId: ref(null),
-      uninstallingName: ref(null),
-      searchRegistry: vi.fn(async () => {}),
-      installGithub: vi.fn(async () => {}),
-      installSkill: vi.fn(async () => {}),
-      installDeps: vi.fn(async () => true),
-      uninstallSkill: vi.fn(async () => true),
-    }),
+    useSkillRegistry: (_rpc: unknown, _loadData: unknown, mutationGate: {
+      acquire: (owner: string) => boolean
+      busy: { value: boolean }
+    }) => {
+      const queueRunning = ref(queueBusy)
+      if (queueBusy) mutationGate.acquire('install_queue')
+      return {
+        registryQuery: ref(''),
+        githubUrl: ref(''),
+        registryResults: ref([]),
+        registryLoading: ref(false),
+        registryDiagnostics: ref([]),
+        registrySearchError: ref(''),
+        installingId: ref(null),
+        installActivities: ref({
+          clawhub: { items: [], refreshWarning: '' },
+          github: { items: [], refreshWarning: '' },
+        }),
+        runningSource: ref(queueBusy ? 'clawhub' : null),
+        queueRunning,
+        mutationBusy: mutationGate.busy,
+        installingDepsId: ref(null),
+        uninstallingName: ref(null),
+        searchRegistry: vi.fn(async () => {}),
+        installGithub: vi.fn(async () => {}),
+        installSkill: vi.fn(async () => {}),
+        retryQueueItem: vi.fn(async () => {}),
+        clearInstallActivity: vi.fn(),
+        installDeps: vi.fn(async () => true),
+        uninstallSkill: vi.fn(async () => true),
+      }
+    },
   }))
   vi.doMock('@/composables/skills/useSkillsCatalog', () => ({
     skillLayerHelp: (key: string) => `help:${key}`,
@@ -173,7 +194,15 @@ async function mountSkillsView(reloadResult: Record<string, unknown> = {
   const el = document.createElement('div')
   document.body.appendChild(el)
 
-  const app = createApp(Component)
+  const viewActive = ref(true)
+  const Root = defineComponent({
+    setup() {
+      return () => h(KeepAlive, null, {
+        default: () => viewActive.value ? h(Component) : null,
+      })
+    },
+  })
+  const app = createApp(Root)
   app.use(pinia)
   app.use(i18n)
   app.mount(el)
@@ -189,6 +218,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> = {
     rpcCall,
     waitForConnection,
     pushToast,
+    viewActive,
   }
 }
 
@@ -204,7 +234,7 @@ afterEach(() => {
   vi.doUnmock('@/components/skills/SkillDetailDialog.vue')
   vi.doUnmock('@/components/skills/SkillGroup.vue')
   vi.doUnmock('@/components/skills/PendingSkillProposals.vue')
-  vi.doUnmock('@/components/skills/SkillsRegistryPanel.vue')
+  vi.doUnmock('@/components/skills/SkillsAddDrawer.vue')
   vi.doUnmock('@/components/skills/SkillsStats.vue')
   vi.doUnmock('@/composables/skills/useSkillProposals')
   vi.doUnmock('@/composables/skills/useSkillRegistry')
@@ -214,15 +244,14 @@ afterEach(() => {
 })
 
 describe('SkillsView stats navigation', () => {
-  it('returns to Installed when a status tile is clicked from Community', async () => {
+  it('keeps the catalog visible when a status tile is selected', async () => {
     const { app, el, nextTick, setStatusFilter } = await mountSkillsView()
-    const installedPanel = el.querySelector<HTMLElement>('#sk-panel-installed')
-    const registryPanel = el.querySelector<HTMLElement>('#sk-panel-registry')
+    const catalog = el.querySelector<HTMLElement>('[data-testid="skills-catalog"]')
 
-    el.querySelector<HTMLButtonElement>('#sk-tab-registry')?.click()
-    await nextTick()
-    expect(installedPanel?.style.display).toBe('none')
-    expect(registryPanel?.style.display).not.toBe('none')
+    expect(catalog).not.toBeNull()
+    expect(el.querySelector('[role="tablist"]')).toBeNull()
+    expect(document.querySelector('.sk-add-drawer')).toBeNull()
+    expect(el.querySelector('[data-testid="skills-add-trigger"]')?.getAttribute('aria-expanded')).toBe('false')
 
     el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
     await nextTick()
@@ -230,19 +259,12 @@ describe('SkillsView stats navigation', () => {
     await nextTick()
 
     expect(setStatusFilter).toHaveBeenCalledWith('needs-setup')
-    expect(installedPanel?.style.display).not.toBe('none')
-    expect(registryPanel?.style.display).toBe('none')
-    expect(el.querySelector('#sk-tab-installed')?.getAttribute('aria-selected')).toBe('true')
+    expect(catalog?.isConnected).toBe(true)
     app.unmount()
   })
 
-  it('returns to Installed before scrolling to proposed skills', async () => {
+  it('scrolls to proposed skills without changing surfaces', async () => {
     const { app, el, nextTick, scrollIntoView } = await mountSkillsView()
-    const installedPanel = el.querySelector<HTMLElement>('#sk-panel-installed')
-    const registryPanel = el.querySelector<HTMLElement>('#sk-panel-registry')
-
-    el.querySelector<HTMLButtonElement>('#sk-tab-registry')?.click()
-    await nextTick()
 
     el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
     await nextTick()
@@ -250,14 +272,70 @@ describe('SkillsView stats navigation', () => {
     await nextTick()
     await nextTick()
 
-    expect(installedPanel?.style.display).not.toBe('none')
-    expect(registryPanel?.style.display).toBe('none')
+    expect(el.querySelector('[data-testid="skills-catalog"]')).not.toBeNull()
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' })
     app.unmount()
   })
 })
 
 describe('SkillsView catalog reload', () => {
+  it('defers activation refreshes while an install batch owns the catalog', async () => {
+    const { app, loadData, nextTick, viewActive } = await mountSkillsView(
+      undefined,
+      undefined,
+      true,
+    )
+
+    expect(loadData).not.toHaveBeenCalled()
+    viewActive.value = false
+    await nextTick()
+    viewActive.value = true
+    await nextTick()
+    expect(loadData).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('disables manual catalog reload while the install queue owns mutations', async () => {
+    const { app, el, nextTick, rpcCall } = await mountSkillsView(undefined, undefined, true)
+
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
+    await nextTick()
+    const reload = el.querySelector<HTMLButtonElement>('[data-testid="skills-reload"]')
+    expect(reload?.disabled).toBe(true)
+    expect(el.querySelector<HTMLButtonElement>('[data-testid="skills-add-trigger"]')?.disabled)
+      .toBe(false)
+    reload?.click()
+    expect(rpcCall).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('blocks Add Skill while manual reload owns mutations', async () => {
+    let finishReload: ((value: Record<string, unknown>) => void) | undefined
+    const reloadPending = new Promise<Record<string, unknown>>((resolve) => {
+      finishReload = resolve
+    })
+    const { app, el, nextTick, rpcCall } = await mountSkillsView(reloadPending)
+
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-reload"]')?.click()
+    await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith('skills.reload'))
+    expect(el.querySelector<HTMLButtonElement>('[data-testid="skills-add-trigger"]')?.disabled)
+      .toBe(true)
+
+    finishReload?.({
+      success: true,
+      changed: false,
+      partial: false,
+      generation: 2,
+    })
+    await vi.waitFor(() => {
+      expect(el.querySelector<HTMLButtonElement>('[data-testid="skills-add-trigger"]')?.disabled)
+        .toBe(false)
+    })
+    app.unmount()
+  })
+
   it('does not force reload when the view is displayed', async () => {
     const { app, rpcCall } = await mountSkillsView()
 

@@ -382,23 +382,29 @@ def memory_flush_session_cmd(
 ) -> None:
     """Flush a local session transcript into searchable durable memory."""
 
+    from opensquilla.recovery import guarded_desktop_profile
+
     try:
-        result = asyncio.run(
-            run_memory_flush_session(
-                key=key,
-                session_db_path=session_db_path,
-                workspace=workspace or None,
-                config_path=config_path or None,
-                agent_id=agent_id or None,
-                message_window=message_window or None,
-                flush_max_chars=flush_max_chars,
-                segment_mode=segment_mode,
-                segment_max_chars=segment_max_chars,
-                segment_overlap_messages=segment_overlap_messages,
-                timeout=timeout,
-                usage_path=usage_path or None,
+        # build_services() may recover managed-Skill transaction state. Retain
+        # the same profile capability for the complete local writer lifetime,
+        # matching the agent, standalone chat, and Gateway entry points.
+        with guarded_desktop_profile():
+            result = asyncio.run(
+                run_memory_flush_session(
+                    key=key,
+                    session_db_path=session_db_path,
+                    workspace=workspace or None,
+                    config_path=config_path or None,
+                    agent_id=agent_id or None,
+                    message_window=message_window or None,
+                    flush_max_chars=flush_max_chars,
+                    segment_mode=segment_mode,
+                    segment_max_chars=segment_max_chars,
+                    segment_overlap_messages=segment_overlap_messages,
+                    timeout=timeout,
+                    usage_path=usage_path or None,
+                )
             )
-        )
     except (KeyError, RuntimeError, ValueError) as exc:
         if json_output:
             typer.echo(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))

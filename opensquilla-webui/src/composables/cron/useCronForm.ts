@@ -35,7 +35,7 @@ export function useCronForm(options: UseCronFormOptions) {
     every: '',
     at: '',
     tz: '',
-    payloadKind: 'reminder',
+    payloadKind: 'agent_turn',
     agentId: 'main',
     workspaceId: '',
     workspaceRequired: false,
@@ -90,7 +90,9 @@ export function useCronForm(options: UseCronFormOptions) {
     panelOpen.value = true
     const tpl = template || {}
     form.templateId = job ? (job.templateId || '') : (tpl.id || '')
-    const payloadKind = job ? (job.payloadKind || 'agent_turn') : (tpl.payloadKind || 'reminder')
+    // A newly-authored scheduled task should execute its instruction. Static
+    // delivery remains available as an explicit no-model reminder mode.
+    const payloadKind = job ? (job.payloadKind || 'agent_turn') : (tpl.payloadKind || 'agent_turn')
     const sessionTarget = job
       ? (job.sessionTarget || job.session_target || 'isolated')
       : (tpl.sessionTarget || (payloadKind === 'system_event' ? 'main' : 'isolated'))
@@ -98,7 +100,10 @@ export function useCronForm(options: UseCronFormOptions) {
     form.name = job ? (job.name || '') : (tpl.name || '')
     form.message = job ? (job.message || job.prompt || '') : (tpl.message || '')
     form.type = job ? (job.scheduleKind || job.schedule_kind || 'cron') : (tpl.scheduleKind || tpl.schedule_kind || 'cron')
-    form.cron = job ? (job.expression || '') : (tpl.expression || '')
+    // Keep the friendly default and the submitted schedule in sync. Previously
+    // the panel rendered 09:00 from a display-only fallback while sending an
+    // empty expression on the first save.
+    form.cron = job ? (job.expression || '') : (tpl.expression || '0 9 * * *')
     form.enabled = job ? !!job.enabled : true
     form.agentId = job ? (job.agentId || 'main') : (tpl.agentId || 'main')
     form.workspaceId = job ? (job.workspaceId || '') : (tpl.workspaceId || '')

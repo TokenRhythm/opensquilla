@@ -111,11 +111,19 @@ interface PendingQueueItem {
   deliveryState?: 'steering' | 'retryable'
 }
 
+type PendingSteerBlocker =
+  | 'controlInput'
+  | 'attachment'
+  | 'capability'
+  | 'otherDelivery'
+  | 'steering'
+
 const props = defineProps<{
   items: PendingQueueItem[]
   maxPending: number
   imageBlockedMessage?: string
   steerAvailable?: boolean
+  steerUnavailableMessage?: string
 }>()
 
 const emit = defineEmits<{
@@ -156,29 +164,38 @@ function attachmentBlockMessage(item: PendingQueueItem): string {
   return ''
 }
 
-function isSteerDisabled(item: PendingQueueItem): boolean {
-  if (
-    isControlInput(item.text)
-    || Boolean(item.attachments?.length)
-    || (!props.steerAvailable && item.deliveryState !== 'retryable')
-  ) return true
-  return props.items.some(
+function pendingSteerBlocker(item: PendingQueueItem): PendingSteerBlocker | null {
+  if (isControlInput(item.text)) return 'controlInput'
+  if (item.attachments?.length) return 'attachment'
+  if (!props.steerAvailable && item.deliveryState !== 'retryable') return 'capability'
+  if (props.items.some(
     candidate => candidate !== item && Boolean(candidate.deliveryState),
-  ) || isSteering(item)
+  )) return 'otherDelivery'
+  if (isSteering(item)) return 'steering'
+  return null
+}
+
+function isSteerDisabled(item: PendingQueueItem): boolean {
+  return pendingSteerBlocker(item) !== null
 }
 
 function steerTitle(item: PendingQueueItem): string {
-  return attachmentBlockMessage(item)
-    || (
-      isControlInput(item.text) || !props.steerAvailable
-        ? t('chat.sendQueues')
-        : ''
-    )
-    || (
-      item.deliveryState === 'retryable'
+  switch (pendingSteerBlocker(item)) {
+    case 'controlInput':
+      return t('chat.sendQueues')
+    case 'attachment':
+      return attachmentBlockMessage(item) || t('chat.pending.steerUnavailable.attachment')
+    case 'capability':
+      return props.steerUnavailableMessage?.trim() || t('chat.sendQueues')
+    case 'otherDelivery':
+      return t('chat.pending.steerUnavailable.deliveryInProgress')
+    case 'steering':
+      return t('chat.pending.steerUnavailable.steeringInProgress')
+    default:
+      return item.deliveryState === 'retryable'
         ? t('chat.retry')
         : t('chat.pending.steerHint')
-    )
+  }
 }
 
 function attachmentStatusId(index: number): string {

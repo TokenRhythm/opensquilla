@@ -304,6 +304,38 @@ async def test_boot_lifecycle_listener_skips_subagent_tasks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_projection_waits_for_authoritative_task_persistence() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-terminal-write-failed",
+            task_status=AgentTaskStatus.SUCCEEDED,
+            run_kind="goal",
+            terminal_reason="completed",
+            terminal_persisted=False,
+        )
+    )
+
+    assert manager.finish_calls == []
+    assert manager.update_calls == []
+    assert events == []
+    assert session.status == SessionStatus.RUNNING
+
+
+@pytest.mark.asyncio
 async def test_task_running_broadcasts_change_for_already_running_session() -> None:
     session = _make_session(status=SessionStatus.RUNNING)
     manager = _SessionManager(session)

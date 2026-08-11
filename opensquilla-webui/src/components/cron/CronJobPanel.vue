@@ -28,28 +28,31 @@
 
             <div class="cron-field">
               <label class="cron-field__label" for="cp-type">{{ t('cronSkills.panel.scheduleType') }}</label>
-              <select id="cp-type" v-model="form.type" class="cron-field__input">
-                <option value="cron">{{ t('cronSkills.panel.friendlyTypeCron') }}</option>
-                <option value="every">{{ t('cronSkills.panel.friendlyTypeEvery') }}</option>
-                <option value="at">{{ t('cronSkills.panel.friendlyTypeAt') }}</option>
-              </select>
+              <CronSelect id="cp-type" v-model="form.type" :options="scheduleTypeOptions" :aria-label="t('cronSkills.panel.scheduleType')" />
             </div>
 
             <div v-show="form.type === 'cron'" class="cron-field">
               <label class="cron-field__label" for="cp-repeat-kind">{{ t('cronSkills.panel.executionFrequency') }}</label>
-              <select id="cp-repeat-kind" v-model="friendlyScheduleKind" class="cron-field__input"><option value="daily">{{ t('cronSkills.panel.daily') }}</option><option value="weekdays">{{ t('cronSkills.panel.weekdays') }}</option><option value="weekly">{{ t('cronSkills.panel.weekly') }}</option><option value="monthly">{{ t('cronSkills.panel.monthly') }}</option><option value="custom">{{ t('cronSkills.panel.customAdvancedTime') }}</option></select>
+              <CronSelect id="cp-repeat-kind" v-model="friendlyScheduleKind" :options="frequencyOptions" :aria-label="t('cronSkills.panel.executionFrequency')" />
               <div v-if="friendlyScheduleKind !== 'custom'" class="cron-friendly-time-row">
-                <div v-if="friendlyScheduleKind === 'weekly'" class="cron-friendly-time-field"><label class="cron-field__label" for="cp-weekday">{{ t('cronSkills.panel.weekday') }}</label><select id="cp-weekday" v-model="friendlyWeekday" class="cron-field__input"><option value="1">{{ t('cronSkills.explain.dow.mon') }}</option><option value="2">{{ t('cronSkills.explain.dow.tue') }}</option><option value="3">{{ t('cronSkills.explain.dow.wed') }}</option><option value="4">{{ t('cronSkills.explain.dow.thu') }}</option><option value="5">{{ t('cronSkills.explain.dow.fri') }}</option><option value="6">{{ t('cronSkills.explain.dow.sat') }}</option><option value="0">{{ t('cronSkills.explain.dow.sun') }}</option></select></div>
-                <div v-if="friendlyScheduleKind === 'monthly'" class="cron-friendly-time-field"><label class="cron-field__label" for="cp-month-day">{{ t('cronSkills.panel.date') }}</label><select id="cp-month-day" v-model="friendlyMonthDay" class="cron-field__input"><option v-for="day in 28" :key="day" :value="String(day)">{{ t('cronSkills.panel.monthlyDay', { day }) }}</option></select></div>
-                <div class="cron-friendly-time-field"><label class="cron-field__label" for="cp-friendly-time">{{ t('cronSkills.panel.specificTime') }}</label><input id="cp-friendly-time" v-model="friendlyTime" class="cron-field__input cron-friendly-time-input" type="time" step="60"></div>
+                <div v-if="friendlyScheduleKind === 'weekly'" class="cron-friendly-time-field"><label class="cron-field__label" for="cp-weekday">{{ t('cronSkills.panel.weekday') }}</label><CronSelect id="cp-weekday" v-model="friendlyWeekday" :options="weekdayOptions" :aria-label="t('cronSkills.panel.weekday')" /></div>
+                <div v-if="friendlyScheduleKind === 'monthly'" class="cron-friendly-time-field"><label class="cron-field__label" for="cp-month-day">{{ t('cronSkills.panel.date') }}</label><CronSelect id="cp-month-day" v-model="friendlyMonthDay" :options="monthDayOptions" :aria-label="t('cronSkills.panel.date')" /></div>
+                <div class="cron-friendly-time-field">
+                  <span class="cron-field__label">{{ t('cronSkills.panel.specificTime') }}</span>
+                  <div class="cron-time-picker">
+                    <CronSelect id="cp-friendly-hour" v-model="friendlyHour" embedded :options="hourOptions" :aria-label="`${t('cronSkills.panel.specificTime')} hour`" />
+                    <span class="cron-time-selects__separator" aria-hidden="true">:</span>
+                    <CronSelect id="cp-friendly-minute" v-model="friendlyMinute" embedded :options="minuteOptions" :aria-label="`${t('cronSkills.panel.specificTime')} minute`" />
+                  </div>
+                </div>
               </div>
               <div v-else class="cron-field__hint cron-custom-time-hint"><span>{{ t('cronSkills.panel.customTimeHint') }}</span><button type="button" class="btn btn--ghost" @click="openAdvancedSchedule">{{ t('cronSkills.panel.openAdvancedTime') }}</button></div>
             </div>
-            <div v-show="form.type === 'every'" class="cron-field"><label class="cron-field__label" for="cp-every-friendly">{{ t('cronSkills.panel.everyHowOften') }}</label><div class="cron-friendly-time-row"><input id="cp-every-friendly" v-model.number="friendlyEveryAmount" class="cron-field__input" type="number" min="1"><select v-model="friendlyEveryUnit" class="cron-field__input" :aria-label="t('cronSkills.panel.timeUnit')" @change="syncFriendlyEvery"><option value="minutes">{{ t('cronSkills.panel.minutes') }}</option><option value="hours">{{ t('cronSkills.panel.hours') }}</option><option value="days">{{ t('cronSkills.panel.days') }}</option></select></div></div>
+            <div v-show="form.type === 'every'" class="cron-field"><label class="cron-field__label" for="cp-every-friendly">{{ t('cronSkills.panel.everyHowOften') }}</label><div class="cron-friendly-time-row"><input id="cp-every-friendly" v-model.number="friendlyEveryAmount" class="cron-field__input" type="number" min="1"><CronSelect v-model="friendlyEveryUnit" :options="everyUnitOptions" :aria-label="t('cronSkills.panel.timeUnit')" @change="syncFriendlyEvery" /></div></div>
             <div v-show="form.type === 'at'" class="cron-field"><label class="cron-field__label" for="cp-at-friendly">{{ t('cronSkills.panel.dateAndTime') }}</label><input id="cp-at-friendly" v-model="friendlyAt" class="cron-field__input" type="datetime-local"></div>
             <div class="cron-field">
               <label class="cron-field__label" for="cp-payload-kind-simple">{{ t('cronSkills.panel.jobMode') }}</label>
-              <select id="cp-payload-kind-simple" v-model="form.payloadKind" class="cron-field__input" @change="emit('payloadKindChange')"><option value="reminder">{{ t('cronSkills.panel.modeReminder') }}</option><option value="agent_turn">{{ t('cronSkills.panel.modeAgentTurn') }}</option><option value="system_event">{{ t('cronSkills.panel.modeSystemEvent') }}</option></select>
+              <CronSelect id="cp-payload-kind-simple" v-model="form.payloadKind" :options="jobModeOptions" :aria-label="t('cronSkills.panel.jobMode')" @change="emit('payloadKindChange')" />
               <div class="cron-field__hint">{{ jobModeHint }}</div>
             </div>
             <div v-if="form.payloadKind === 'agent_turn'" class="cron-field">
@@ -57,23 +60,13 @@
                 {{ t('cronSkills.panel.projectWorkspace') }}
                 <span v-if="form.workspaceRequired" aria-hidden="true">*</span>
               </label>
-              <select
+              <CronSelect
                 id="cp-workspace"
                 v-model="form.workspaceId"
-                class="cron-field__input"
-                :required="form.workspaceRequired"
+                :options="workspaceOptions"
+                :aria-label="t('cronSkills.panel.projectWorkspace')"
                 :disabled="projectWorkspacesLoading"
-              >
-                <option value="" :disabled="form.workspaceRequired">{{ t('cronSkills.panel.noWorkspace') }}</option>
-                <option
-                  v-for="workspace in projectWorkspaces"
-                  :key="workspace.id"
-                  :value="workspace.id"
-                  :disabled="!workspace.available"
-                >
-                  {{ workspace.name }}{{ workspace.available ? '' : ` · ${t('cronSkills.panel.workspaceUnavailable')}` }}
-                </option>
-              </select>
+              />
               <div class="cron-field__hint">
                 {{ form.workspaceRequired ? t('cronSkills.panel.workspaceRequiredHint') : t('cronSkills.panel.workspaceOptionalHint') }}
               </div>
@@ -85,16 +78,13 @@
                 <div class="cron-field"><label class="cron-field__label" for="cp-cron">{{ t('cronSkills.panel.cronExpression') }}</label><input id="cp-cron" v-model="form.cron" class="cron-field__input cron-field__input--mono" type="text" placeholder="0 9 * * 1-5" autocomplete="off" spellcheck="false" @input="emit('cronInput')"><div class="cron-field__hint">{{ t('cronSkills.panel.advancedTimeHint') }}</div><div v-if="cronExplainHuman" class="cron-explain" :class="{ 'is-valid': cronExplainValid, 'is-invalid': cronExplainInvalid }"><div class="cron-explain__human">{{ cronExplainHuman }}</div></div></div>
                 <div class="cron-field"><label class="cron-field__label" for="cp-tz">{{ t('cronSkills.panel.timezone') }}</label><input id="cp-tz" v-model="form.tz" class="cron-field__input cron-field__input--mono" type="text" placeholder="Asia/Shanghai" autocomplete="off" spellcheck="false"><div class="cron-field__hint">{{ t('cronSkills.panel.timezoneSimpleHint') }}</div></div>
                 <div class="cron-field"><label class="cron-field__label" for="cp-agent-id">{{ t('cronSkills.panel.agentId') }}</label><input id="cp-agent-id" v-model="form.agentId" class="cron-field__input" type="text" placeholder="main"></div>
-                <div v-show="form.payloadKind === 'agent_turn'" class="cron-field"><label class="cron-field__label" for="cp-session-target">{{ t('cronSkills.panel.sessionTarget') }}</label><select id="cp-session-target" v-model="form.sessionTarget" class="cron-field__input" @change="emit('sessionTargetChange')"><option value="main">{{ t('cronSkills.panel.targetMain') }}</option><option value="current">{{ t('cronSkills.panel.targetCurrent') }}</option><option value="isolated">{{ t('cronSkills.panel.targetIsolated') }}</option><option value="session">{{ t('cronSkills.panel.targetNamed') }}</option></select><div class="cron-field__hint">{{ sessionTargetHint }}</div></div>
+                <div v-show="form.payloadKind === 'agent_turn'" class="cron-field"><label class="cron-field__label" for="cp-session-target">{{ t('cronSkills.panel.sessionTarget') }}</label><CronSelect id="cp-session-target" v-model="form.sessionTarget" :options="sessionTargetOptions" :aria-label="t('cronSkills.panel.sessionTarget')" @change="emit('sessionTargetChange')" /><div class="cron-field__hint">{{ sessionTargetHint }}</div></div>
                 <div v-show="showTargetSessionRow" class="cron-field"><label class="cron-field__label" for="cp-target-session-key">{{ targetSessionLabel }}</label><input id="cp-target-session-key" v-model="form.targetSessionKey" class="cron-field__input" type="text" placeholder="agent:main:webchat:abc123"><div class="cron-field__hint">{{ targetSessionHint }}</div></div>                <details class="cron-advanced">
                 <summary class="cron-advanced__summary">{{ t('cronSkills.panel.advancedSummary') }}</summary>
                 <div class="cron-advanced__body">
                 <div class="cron-field">
                 <label class="cron-field__label" for="cp-wake-mode">{{ t('cronSkills.panel.wakeMode') }}</label>
-                <select id="cp-wake-mode" v-model="form.wakeMode" class="cron-field__input">
-                <option value="now">{{ t('cronSkills.panel.wakeNow') }}</option>
-                <option value="next-heartbeat">{{ t('cronSkills.panel.wakeNextHeartbeat') }}</option>
-                </select>
+                <CronSelect id="cp-wake-mode" v-model="form.wakeMode" :options="wakeModeOptions" :aria-label="t('cronSkills.panel.wakeMode')" />
                 <i18n-t keypath="cronSkills.panel.wakeModeHint" tag="div" class="cron-field__hint">
                 <template #code><code>next-heartbeat</code></template>
                 </i18n-t>
@@ -102,12 +92,7 @@
 
                 <div class="cron-field">
                 <label class="cron-field__label" for="cp-delivery-mode">{{ t('cronSkills.panel.deliveryMode') }}</label>
-                <select id="cp-delivery-mode" v-model="form.deliveryMode" class="cron-field__input">
-                <option value="">{{ t('cronSkills.panel.deliveryDefault') }}</option>
-                <option value="none">{{ t('cronSkills.panel.deliveryNone') }}</option>
-                <option value="announce">{{ t('cronSkills.panel.deliveryAnnounce') }}</option>
-                <option value="webhook">{{ t('cronSkills.panel.deliveryWebhook') }}</option>
-                </select>
+                <CronSelect id="cp-delivery-mode" v-model="form.deliveryMode" :options="deliveryModeOptions" :aria-label="t('cronSkills.panel.deliveryMode')" />
                 </div>
 
                 <div v-show="form.deliveryMode === 'announce'" class="cron-field">
@@ -142,11 +127,7 @@
                 <div class="cron-advanced__body">
                 <div class="cron-field">
                 <label class="cron-field__label" for="cp-fd-mode">{{ t('cronSkills.panel.routeFailuresTo') }}</label>
-                <select id="cp-fd-mode" v-model="form.fdMode" class="cron-field__input">
-                <option value="">{{ t('cronSkills.panel.fdDisabled') }}</option>
-                <option value="channel">{{ t('cronSkills.panel.fdChannel') }}</option>
-                <option value="webhook">{{ t('cronSkills.panel.fdWebhook') }}</option>
-                </select>
+                <CronSelect id="cp-fd-mode" v-model="form.fdMode" :options="failureDeliveryModeOptions" :aria-label="t('cronSkills.panel.routeFailuresTo')" />
                 </div>
                 <div v-show="form.fdMode === 'channel'" class="cron-field">
                 <label class="cron-field__label" for="cp-fd-channel">{{ t('cronSkills.panel.channel') }}</label>
@@ -196,6 +177,7 @@ import { computed, nextTick, ref, toRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
+import CronSelect, { type CronSelectOption } from '@/components/cron/CronSelect.vue'
 import type { CronJob, CronJobFormModel } from '@/types/cron'
 import type { ProjectWorkspaceItem } from '@/types/rpc'
 import {
@@ -225,6 +207,72 @@ const props = defineProps<{
 
 const form = defineModel<CronJobFormModel>('form', { required: true })
 const friendlyEveryUnit = ref<'minutes' | 'hours' | 'days'>('minutes')
+const scheduleTypeOptions = computed<CronSelectOption[]>(() => [
+  { value: 'cron', label: t('cronSkills.panel.friendlyTypeCron') },
+  { value: 'every', label: t('cronSkills.panel.friendlyTypeEvery') },
+  { value: 'at', label: t('cronSkills.panel.friendlyTypeAt') },
+])
+const frequencyOptions = computed<CronSelectOption[]>(() => [
+  { value: 'daily', label: t('cronSkills.panel.daily') },
+  { value: 'weekdays', label: t('cronSkills.panel.weekdays') },
+  { value: 'weekly', label: t('cronSkills.panel.weekly') },
+  { value: 'monthly', label: t('cronSkills.panel.monthly') },
+  { value: 'custom', label: t('cronSkills.panel.customAdvancedTime') },
+])
+const weekdayOptions = computed<CronSelectOption[]>(() => [
+  { value: '1', label: t('cronSkills.explain.dow.mon') },
+  { value: '2', label: t('cronSkills.explain.dow.tue') },
+  { value: '3', label: t('cronSkills.explain.dow.wed') },
+  { value: '4', label: t('cronSkills.explain.dow.thu') },
+  { value: '5', label: t('cronSkills.explain.dow.fri') },
+  { value: '6', label: t('cronSkills.explain.dow.sat') },
+  { value: '0', label: t('cronSkills.explain.dow.sun') },
+])
+const monthDayOptions = computed<CronSelectOption[]>(() => Array.from({ length: 28 }, (_, index) => ({
+  value: String(index + 1),
+  label: t('cronSkills.panel.monthlyDay', { day: index + 1 }),
+})))
+const hourOptions: CronSelectOption[] = Array.from({ length: 24 }, (_, hour) => ({ value: String(hour).padStart(2, '0'), label: String(hour).padStart(2, '0') }))
+const minuteOptions: CronSelectOption[] = Array.from({ length: 60 }, (_, minute) => ({ value: String(minute).padStart(2, '0'), label: String(minute).padStart(2, '0') }))
+const jobModeOptions = computed<CronSelectOption[]>(() => [
+  { value: 'agent_turn', label: t('cronSkills.panel.modeAgentTurn') },
+  { value: 'reminder', label: t('cronSkills.panel.modeReminder') },
+  { value: 'system_event', label: t('cronSkills.panel.modeSystemEvent') },
+])
+const everyUnitOptions = computed<CronSelectOption[]>(() => [
+  { value: 'minutes', label: t('cronSkills.panel.minutes') },
+  { value: 'hours', label: t('cronSkills.panel.hours') },
+  { value: 'days', label: t('cronSkills.panel.days') },
+])
+const workspaceOptions = computed<CronSelectOption[]>(() => [
+  { value: '', label: t('cronSkills.panel.noWorkspace'), disabled: form.value.workspaceRequired },
+  ...props.projectWorkspaces.map(workspace => ({
+    value: workspace.id,
+    label: `${workspace.name}${workspace.available ? '' : ` · ${t('cronSkills.panel.workspaceUnavailable')}`}`,
+    disabled: !workspace.available,
+  })),
+])
+const sessionTargetOptions = computed<CronSelectOption[]>(() => [
+  { value: 'main', label: t('cronSkills.panel.targetMain') },
+  { value: 'current', label: t('cronSkills.panel.targetCurrent') },
+  { value: 'isolated', label: t('cronSkills.panel.targetIsolated') },
+  { value: 'session', label: t('cronSkills.panel.targetNamed') },
+])
+const wakeModeOptions = computed<CronSelectOption[]>(() => [
+  { value: 'now', label: t('cronSkills.panel.wakeNow') },
+  { value: 'next-heartbeat', label: t('cronSkills.panel.wakeNextHeartbeat') },
+])
+const deliveryModeOptions = computed<CronSelectOption[]>(() => [
+  { value: '', label: t('cronSkills.panel.deliveryDefault') },
+  { value: 'none', label: t('cronSkills.panel.deliveryNone') },
+  { value: 'announce', label: t('cronSkills.panel.deliveryAnnounce') },
+  { value: 'webhook', label: t('cronSkills.panel.deliveryWebhook') },
+])
+const failureDeliveryModeOptions = computed<CronSelectOption[]>(() => [
+  { value: '', label: t('cronSkills.panel.fdDisabled') },
+  { value: 'channel', label: t('cronSkills.panel.fdChannel') },
+  { value: 'webhook', label: t('cronSkills.panel.fdWebhook') },
+])
 const everyUnitSeconds = computed(() => friendlyEveryUnit.value === 'days' ? 86400 : friendlyEveryUnit.value === 'hours' ? 3600 : 60)
 const friendlyEveryAmount = computed({ get: () => Math.max(1, Math.round((Number(form.value.every) || 60) / everyUnitSeconds.value)), set: value => { form.value.every = String(Math.max(1, Number(value) || 1) * everyUnitSeconds.value) } })
 const friendlyAt = computed({
@@ -260,6 +308,8 @@ function openAdvancedSchedule() {
   nextTick(() => document.querySelector<HTMLInputElement>('#cp-cron')?.focus())
 }
 const friendlyTime = computed({ get: () => { const [minute, hour] = cronParts(); return `${hour.padStart(2, '0')}:${minute.padStart(2, '0')}` }, set: value => setFriendlyCron(friendlyScheduleKind.value, value) })
+const friendlyHour = computed({ get: () => friendlyTime.value.split(':')[0], set: value => { friendlyTime.value = `${value}:${friendlyMinute.value}` } })
+const friendlyMinute = computed({ get: () => friendlyTime.value.split(':')[1], set: value => { friendlyTime.value = `${friendlyHour.value}:${value}` } })
 const friendlyWeekday = computed({ get: () => { const weekday = cronParts()[4]; return /^[0-6]$/.test(weekday) ? weekday : '1' }, set: value => setFriendlyCron('weekly', friendlyTime.value, value) })
 const friendlyMonthDay = computed({ get: () => { const day = cronParts()[2]; return /^(?:[1-9]|1\d|2[0-8])$/.test(day) ? day : '1' }, set: value => setFriendlyCron('monthly', friendlyTime.value, friendlyWeekday.value, value) })
 function syncFriendlyEvery() { friendlyEveryAmount.value = friendlyEveryAmount.value }

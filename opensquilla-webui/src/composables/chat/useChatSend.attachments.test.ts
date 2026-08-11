@@ -2395,6 +2395,7 @@ describe('useChatSend attachment payloads', () => {
       sessionKey: childSessionKey,
       taskId: 'task-child',
       source: 'webui_stale_send',
+      scope: 'task',
     })
     expect(harness.options.aborted.value).toBe(true)
     expect(harness.options.activeStreamTaskId.value).toBe(STOPPED_STREAM_TASK_ID)
@@ -3186,6 +3187,7 @@ describe('useChatSend attachment payloads', () => {
       sessionKey: childSessionKey,
       taskId: 'task-child',
       source: 'webui_stale_send',
+      scope: 'task',
     })
     expect(harness.options.messages.value.find(
       message => message.clientId === optimisticClientId,
@@ -3246,6 +3248,7 @@ describe('useChatSend attachment payloads', () => {
       sessionKey: childSessionKey,
       taskId: 'task-child-late',
       source: 'webui_stale_send',
+      scope: 'task',
     })
     expect(adoptResponseSession).not.toHaveBeenCalled()
     expect(sessionKey.value).toBe(otherSessionKey)
@@ -3521,6 +3524,12 @@ describe('useChatSend attachment payloads', () => {
     const user = options.messages.value[0]
     api.onStop()
 
+    expect(rpc.call).toHaveBeenCalledWith('chat.abort', {
+      sessionKey: 'agent:main:webchat:test',
+      source: 'webui_stop',
+      scope: 'task',
+    })
+
     expect(user).toMatchObject({
       role: 'user',
       turnOutcome: {
@@ -3584,7 +3593,7 @@ describe('useChatSend attachment payloads', () => {
     expect(restoreSteerIntoComposer).not.toHaveBeenCalled()
   })
 
-  it('stops the whole session that owns the stream without trusting a stale task id', () => {
+  it('stops only the authoritative task that owns the stream', () => {
     const activeStreamTaskId = ref('task-old')
     const activeStreamSessionKey = ref('agent:main:webchat:old')
     const { api, rpc, stream } = makeOptions({
@@ -3598,9 +3607,32 @@ describe('useChatSend attachment payloads', () => {
 
     expect(rpc.call).toHaveBeenCalledWith('chat.abort', {
       sessionKey: 'agent:main:webchat:old',
+      taskId: 'task-old',
       source: 'webui_stop',
+      scope: 'task',
     })
     expect(activeStreamTaskId.value).not.toBe('task-old')
+  })
+
+  it('prefers the server steer turn when the rendered stream id is stale', () => {
+    const { api, rpc, stream } = makeOptions({
+      activeStreamTaskId: ref('task-rendered-stale'),
+      activeSteerCapability: ref({
+        mode: 'same_turn',
+        expected_turn_id: 'task-authoritative',
+        input_kinds: ['text'],
+      }),
+    })
+    stream.isStreaming.value = true
+
+    api.onStop()
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.abort', {
+      sessionKey: 'agent:main:webchat:test',
+      taskId: 'task-authoritative',
+      source: 'webui_stop',
+      scope: 'task',
+    })
   })
 
   it('stops an active subagent group after the parent stream has ended', () => {
@@ -3664,6 +3696,7 @@ describe('useChatSend attachment payloads', () => {
       sessionKey: 'agent:main:webchat:test',
       taskId: 'task-A',
       source: 'webui_stale_send',
+      scope: 'task',
     })
   })
 })

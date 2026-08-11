@@ -1392,7 +1392,8 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     run = next(
         step
         for step in steps
-        if step.get("name") == "Run production-dist chat recovery browser contract"
+        if step.get("name")
+        == "Run production-dist chat and Goal recovery browser contracts"
     )
 
     assert job["needs"] == ["classify-changes", "frontend-check"]
@@ -1403,6 +1404,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     assert job["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
     assert job["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
     assert "history-hydration.spec.ts" in run["run"]
+    assert "goal-mode.spec.ts" in run["run"]
 
 
 def test_windows_smoke_does_not_install_bun_by_default() -> None:

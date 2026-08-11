@@ -5,6 +5,7 @@ import { useChatRenderedMessages } from './useChatRenderedMessages'
 import type { ChatMessage, ChatRouterTierConfig } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
+import type { TimeTranslator } from '@/utils/messageTime'
 
 function renderedMessagesForRouterVisualMode(
   visualMode: 'real_candidates' | 'legacy_grid',
@@ -36,6 +37,7 @@ function renderedMessagesFor(
   messages: ChatMessage[],
   interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map()),
   routerVisualEffectsEnabled = false,
+  timeTranslator?: TimeTranslator,
 ) {
   return useChatRenderedMessages({
     messages: ref<ChatMessage[]>(messages),
@@ -50,10 +52,24 @@ function renderedMessagesFor(
     stripGeneratedArtifactMarkers: text => text,
     stripTimePrefix: text => text,
     isSubagentCompletionMessage: () => false,
+    timeTranslator,
   })
 }
 
 describe('useChatRenderedMessages maintenance events', () => {
+  it('localizes projected relative times for shared chat consumers', () => {
+    const api = renderedMessagesFor(
+      [{ role: 'user', text: 'hello', ts: Date.now() - 5 * 60_000 }],
+      undefined,
+      false,
+      (key, named) => `localized:${key}:${named?.n ?? ''}`,
+    )
+
+    expect(api.renderedMessages.value[0]?.timeStr).toBe(
+      'localized:chat.time.minutesAgo:5',
+    )
+  })
+
   it('preserves the dedicated compaction payload for ChatMessageList', () => {
     const api = renderedMessagesFor([{
       role: 'maintenance',
