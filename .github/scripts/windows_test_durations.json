@@ -804,6 +804,7 @@
     "tests/test_sandbox/test_frontend_sandbox_assets.py": 0.072,
     "tests/test_sandbox/test_governance.py": 0.014,
     "tests/test_sandbox/test_guest_profile.py": 0.01,
+    "tests/test_sandbox/test_in_process_network_precondition.py": 0.01,
     "tests/test_sandbox/test_inprocess_managed_network.py": 2.118,
     "tests/test_sandbox/test_legacy_codec.py": 0.01,
     "tests/test_sandbox/test_linux_bwrap.py": 0.01,

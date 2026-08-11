@@ -102,17 +102,24 @@ def search_status(
     table.add_column("active", no_wrap=True)
     table.add_column("configured", no_wrap=True)
     table.add_column("buildable", no_wrap=True)
+    table.add_column("network", no_wrap=True)
     table.add_column("fallback")
     table.add_column("error")
+    network_blocked = str(payload.get("networkBlockedReason") or "")
     table.add_row(
         str(payload.get("provider") or ""),
         "yes" if payload.get("provider") == payload.get("activeProvider") else "no",
         "yes" if payload.get("configured") else "no",
         "yes" if payload.get("buildable") else "no",
+        "blocked" if network_blocked else "ok",
         str(payload.get("fallbackPolicy") or ""),
         str(payload.get("error") or ""),
     )
     console.print(table)
+    # A provider that is configured and buildable can still be refused before it
+    # is reached. Say so here rather than letting the next query be the message.
+    if network_blocked:
+        console.print(f"[yellow]Queries are blocked from here:[/yellow] {network_blocked}")
 
 
 @search_app.command("query")

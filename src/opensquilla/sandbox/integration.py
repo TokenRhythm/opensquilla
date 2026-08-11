@@ -1847,6 +1847,73 @@ async def _run_in_process_with_managed_network(
         await proxy.stop()
 
 
+def effective_network_mode(
+    action_kind: str,
+    *,
+    hints: LevelHints | None = None,
+    runtime: SandboxRuntime | None = None,
+) -> NetworkMode | None:
+    """Resolve the network mode :func:`gate_action` would pick for this action.
+
+    Level selection and policy construction are the pure half of gating, so a
+    caller that only needs to know the posture can run them directly instead of
+    restating the rule. Restating it is what lets a readiness surface drift from
+    the runtime: the mode depends on the resolved :class:`SecurityLevel`, not on
+    the configured run mode, so deriving it from configuration alone gets the
+    answer wrong exactly when grading has promoted or demoted an action.
+
+    ``None`` means no runtime is configured yet and the question has no answer.
+    """
+    rt = runtime or get_runtime()
+    if rt is None:
+        return None
+    level = (
+        select_level(action_kind, hints)
+        if rt.effective.grading_enabled
+        else rt.effective.default_level
+    )
+    policy = build_policy(
+        level,
+        action_kind,
+        rt.workspace,
+        rt.settings,
+        trusted=(hints is None or hints.trusted_source),
+        hints=hints,
+    )
+    return policy.network
+
+
+def in_process_network_precondition(
+    action_kind: str = "web.fetch",
+    *,
+    runtime: SandboxRuntime | None = None,
+) -> str | None:
+    """Explain why an in-process network tool would be denied from here, or None.
+
+    Readiness surfaces answer whether a tool is *configured*. This answers the
+    other half — whether the posture in the current calling context lets it reach
+    the network — so a surface cannot report a tool ready and then have the very
+    next query refused.
+
+    Only the two preconditions :func:`guard_in_process_network_action` settles
+    before any approval machinery are reported, so this stays a pure read: a
+    readiness poll must not enqueue approvals or write denial-ledger entries. A
+    ``None`` result therefore means nothing known blocks the call, not that a
+    particular host will be allowed.
+    """
+    mode = effective_network_mode(action_kind, runtime=runtime)
+    if mode is None:
+        return None
+    if mode == NetworkMode.NONE and _is_in_process_network_action(action_kind):
+        return "Sandbox network is disabled for this in-process network tool."
+    if mode == NetworkMode.PROXY_ALLOWLIST and _current_run_context_for_network_proxy() is None:
+        return (
+            "NetworkMode.PROXY_ALLOWLIST requires Run Context grants to run "
+            "in-process network tools through the managed proxy."
+        )
+    return None
+
+
 async def guard_in_process_network_action(
     *,
     action_kind: str,
