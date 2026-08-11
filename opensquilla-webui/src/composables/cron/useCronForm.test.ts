@@ -80,6 +80,21 @@ describe('cron form default schedule', () => {
     expect(payload.schedule).toMatchObject({ kind: 'cron', expr: DEFAULT_CRON_EXPRESSION })
   })
 
+  it('posts the disabled state selected for a new job', async () => {
+    const form = cronForm()
+    form.openPanel(null)
+    form.form.name = 'Paused reminder'
+    form.form.message = 'stand up'
+    form.form.enabled = false
+
+    await form.saveJob()
+
+    expect(rpcCall).toHaveBeenCalledTimes(1)
+    const [method, payload] = rpcCall.mock.calls[0] as [string, Record<string, unknown>]
+    expect(method).toBe('cron.create')
+    expect(payload.enabled).toBe(false)
+  })
+
   it('renders the schedule preview immediately instead of the empty placeholder', () => {
     const form = cronForm()
     form.openPanel(null)
