@@ -107,6 +107,17 @@ import {
 import {
   NativeWorkbenchSurfaceManager,
 } from './native-workbench-surface.js'
+import {
+  parseNativeWorkbenchAnnotationModeRequest,
+  parseNativeWorkbenchAnnotationOverlayCloseRequest,
+  parseNativeWorkbenchAnnotationOverlayShowRequest,
+} from './native-workbench-annotation-contract.js'
+import { DesktopArtifactBridge } from './desktop-artifact-bridge.js'
+import {
+  DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV,
+  DESKTOP_ARTIFACT_BRIDGE_URL_ENV,
+  DesktopArtifactBridgeLoopbackTransport,
+} from './desktop-artifact-bridge-loopback.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 import {
   buildRendererConsoleLogEntry,
@@ -548,6 +559,20 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
     window.webContents.send('desktop:workbench:surface-event', event)
   },
 })
+const desktopArtifactBridge = new DesktopArtifactBridge({
+  getActiveTarget: () => nativeWorkbenchSurfaces.getActiveArtifactBridgeTarget(),
+})
+const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
+  desktopArtifactBridge,
+  {
+    audit: entry => desktopLog(entry.event, {
+      operation: entry.operation,
+      outcome: entry.outcome,
+      code: entry.code,
+      durationMs: entry.durationMs,
+    }),
+  },
+)
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
 }
@@ -607,6 +632,11 @@ function desktopChildEnvironment(
   additions: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { ...process.env }
+  // Never let inherited/stale bridge credentials flow into helper, recovery,
+  // probe, or migration children. startGateway adds its freshly generated
+  // process-lifetime credentials only to the owned Gateway spawn.
+  delete environment[DESKTOP_ARTIFACT_BRIDGE_URL_ENV]
+  delete environment[DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV]
   return {
     ...environment,
     ...additions,
@@ -7893,6 +7923,18 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('gateway-start')
   const runtime = await resolveGatewayRuntime()
 
+  // Start the main-process-only bridge before the final port-selection await.
+  // Its random endpoint and 256-bit token are injected only into this owned
+  // Gateway child below; they are never copied into the renderer environment.
+  let artifactBridgeEnvironment: NodeJS.ProcessEnv = {}
+  try {
+    artifactBridgeEnvironment = await desktopArtifactBridgeLoopback.start()
+  } catch {
+    // The editor transport is additive. If loopback binding is unavailable,
+    // keep the Gateway and download/source workflows usable with every native
+    // capability disabled instead of weakening the transport boundary.
+    desktopLog('desktop_artifact_bridge_transport_unavailable')
+  }
   const port = await findGatewayPort()
   // This is the final await before spawn. Update, quit, cleanup, and recovery
   // close writer/lifecycle admission before draining current children; an
@@ -7947,6 +7989,7 @@ async function startGateway(): Promise<GatewayState> {
     OPENSQUILLA_NODE_BIN_DIR: nodeBinCandidates.join(pathDelimiter()),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
+    ...artifactBridgeEnvironment,
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
@@ -8171,6 +8214,10 @@ async function createMainWindow(): Promise<BrowserWindow> {
       desktopLog(entry.event, entry.detail)
     }
   }
+  const releaseRendererOwnedArtifactPreviews = (): void => {
+    void nativeWorkbenchSurfaces.destroyAll()
+    void artifactPreviewLeaseBroker.revokeAll()
+  }
 
   // Forward renderer console errors to desktop.log. The Control UI runs
   // in the renderer, so a purely front-end failure (a thrown error, an unhandled
@@ -8198,6 +8245,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // the reason and exit code gives a first, always-present breadcrumb.
   window.webContents.on('render-process-gone', (_event, details) => {
     flushRendererConsoleSuppression()
+    releaseRendererOwnedArtifactPreviews()
     const entry = buildRendererGoneLogEntry({
       reason: details.reason,
       exitCode: details.exitCode,
@@ -8252,7 +8300,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     // must remove them before boot/recovery/another Control UI can become
     // visible; same-document SPA navigation keeps the Workbench lifecycle in
     // Vue and is intentionally left alone.
-    if (isMainFrame && !isInPlace) void nativeWorkbenchSurfaces.destroyAll()
+    if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()
   })
 
   window.on('close', (event) => handleMainWindowClose(window, event))
@@ -10403,6 +10451,68 @@ ipcMain.handle('desktop:workbench:capabilities', (event) => {
     ? { ...NATIVE_WORKBENCH_CAPABILITIES, modes: ['offline'] as const }
     : NATIVE_WORKBENCH_CAPABILITIES
 })
+ipcMain.handle('desktop:workbench:artifact:capabilities', (event) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return desktopArtifactBridge.getCapabilities()
+})
+ipcMain.handle('desktop:workbench:annotation:capabilities', async (event) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  return await nativeWorkbenchSurfaces.getArtifactAnnotationCapabilities()
+})
+ipcMain.handle('desktop:workbench:annotation:set-mode', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return await nativeWorkbenchSurfaces.setArtifactAnnotationMode(
+      parseNativeWorkbenchAnnotationModeRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:annotation:show-overlay', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return await nativeWorkbenchSurfaces.showArtifactAnnotationOverlay(
+      parseNativeWorkbenchAnnotationOverlayShowRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:annotation:close-overlay', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return nativeWorkbenchSurfaces.closeArtifactAnnotationOverlay(
+      parseNativeWorkbenchAnnotationOverlayCloseRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:artifact:capture-selection', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.captureSelection(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:browser-inspect', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.browserInspect(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:browser-act', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.browserAct(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:screenshot', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.screenshot(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:office-flush', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.officeFlush(payload)
+})
+ipcMain.handle('desktop:workbench:artifact:reload-surface', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
+  return await desktopArtifactBridge.reloadSurface(payload)
+})
 ipcMain.handle('desktop:workbench:preview-lease:create', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
   return await artifactPreviewLeaseBroker.create(payload)
@@ -10419,16 +10529,19 @@ ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknow
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
   try {
     const request = parseNativeWorkbenchCreateRequest(payload)
-    if (
-      request.kind === 'artifact-preview'
-      && !artifactPreviewLeaseBroker.authorizesSurface(request.payload)
-    ) {
-      return {
-        ok: false,
-        message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
+    let activePreviewArtifactId: string | null = null
+    if (request.kind === 'artifact-preview') {
+      activePreviewArtifactId = artifactPreviewLeaseBroker.resolveSurfaceArtifactId(
+        request.payload,
+      )
+      if (!activePreviewArtifactId) {
+        return {
+          ok: false,
+          message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
+        }
       }
     }
-    return await nativeWorkbenchSurfaces.createSurface(request)
+    return await nativeWorkbenchSurfaces.createSurface(request, activePreviewArtifactId)
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
@@ -12622,6 +12735,7 @@ app.on('before-quit', (event) => {
     isQuitting = true
     setAppExitPhase('committed', 'Windows session ending')
     destroyWindowsTray()
+    void desktopArtifactBridgeLoopback.close()
     stopGateway()
     return
   }
@@ -12633,6 +12747,7 @@ app.on('before-quit', (event) => {
     if (updateInstallHandoffReady) {
       setAppExitPhase('committed', 'desktop updater owns exit')
       destroyWindowsTray()
+      void desktopArtifactBridgeLoopback.close()
       return
     }
     event.preventDefault()
@@ -12697,6 +12812,7 @@ app.on('before-quit', (event) => {
       if (exited) {
         setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
         destroyWindowsTray()
+        void desktopArtifactBridgeLoopback.close()
         app.exit(0)
         return
       }
@@ -12722,6 +12838,7 @@ app.on('before-quit', (event) => {
   }
   setAppExitPhase('committed', 'no lifecycle-owned Gateway remains')
   destroyWindowsTray()
+  void desktopArtifactBridgeLoopback.close()
   stopGateway()
 })
 
@@ -12746,7 +12863,10 @@ app.on('activate', () => {
   revealDesktopApp()
 })
 
-app.on('will-quit', destroyWindowsTray)
+app.on('will-quit', () => {
+  destroyWindowsTray()
+  void desktopArtifactBridgeLoopback.close()
+})
 
 configureChromiumKeychainPolicy()
 

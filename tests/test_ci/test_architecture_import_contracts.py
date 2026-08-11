@@ -15,6 +15,10 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # Format-specific delivery validation reuses canonical attachment MIME and
     # container signatures; contracts remains implementation-free.
     ("artifact_validation.py", "contracts"),
+    # ArtifactSession is a durable lower-level domain. It uses the shared
+    # async-SQLite compatibility shim, while Gateway, session lifecycle, and
+    # context-bound tools consume its public service without an import cycle.
+    ("artifact_session", "compat"),
     ("channels", "engine"),
     ("channels", "contracts"),
     ("channels", "gateway"),
@@ -86,6 +90,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("eval", "provider"),
     ("gateway", "agents"),
     ("gateway", "application"),
+    ("gateway", "artifact_session"),
     ("gateway", "chat"),
     ("gateway", "channels"),
     ("gateway", "contracts"),
@@ -153,6 +158,10 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # the lower-level memory package remains independent of migration internals.
     ("profile_import_io.py", "migration"),
     ("permissions.py", "sandbox"),
+    # Prompt-annotation rendering is a package-neutral transcript/runtime
+    # protocol facade. It uses only the low-level injection guard so chat and
+    # engine do not import Gateway or the durable ArtifactSession package.
+    ("prompt_annotations.py", "safety"),
     # turn_error_writer scrubs free-text error records through the low-level
     # observability.redact utility before insert — sound downward layering.
     ("persistence", "observability"),
@@ -192,6 +201,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # Self-learning's opt-in audit sidecar reuses the decision-log redactor;
     # observability is a leaf package, so this closes no cycle.
     ("squilla_router", "observability"),
+    ("session", "artifact_session"),
     ("session", "compat"),
     ("session", "engine"),
     ("session", "gateway"),
@@ -208,6 +218,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("skills", "safety"),
     ("skills", "tools"),
     ("tools", "agents"),
+    ("tools", "artifact_session"),
     ("tools", "channels"),
     ("tools", "engine"),
     ("tools", "gateway"),

@@ -1056,7 +1056,7 @@ jobs:
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
-                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
               ;;
@@ -1080,7 +1080,7 @@ jobs:
               entries=(
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
-                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
               ;;
