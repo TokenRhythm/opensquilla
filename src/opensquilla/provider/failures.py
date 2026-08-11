@@ -177,6 +177,26 @@ _MODEL_UNAVAILABLE_SUBSTRINGS = (
 
 # Family-independent kinds checked before any family table.
 _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
+    # Provider-specific adapters use several raw spellings for exhausted
+    # credits.  Normalize them once here so every runtime consumer (including
+    # Goal settlement) observes the same failure taxonomy.
+    FailureMatcher(
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        status_codes=frozenset({402}),
+    ),
+    FailureMatcher(
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        raw_codes=frozenset(
+            {
+                "billing_hard_limit",
+                "insufficient_quota",
+                "provider_quota_exceeded",
+                "usage_limit",
+                "usage_limit_reached",
+                "usage_limited",
+            }
+        ),
+    ),
     # Local composite-provider validation.  This must classify before a
     # provider-family "does not support" matcher can turn it into
     # UNSUPPORTED_FEATURE: that kind deliberately hops to a fallback provider,

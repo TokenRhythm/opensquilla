@@ -840,6 +840,7 @@ describe('projectAssistantActivityTimeline', () => {
           category: 'maintenance',
           state: 'skipped',
           source: 'automatic',
+          reason: 'within_compaction_budget',
         },
         {
           action: 'context_compaction',
@@ -871,6 +872,24 @@ describe('projectAssistantActivityTimeline', () => {
       ['stale', 'chat.compact.cancelled', false],
       ['cancelled', 'chat.compact.cancelled', false],
     ])
+  })
+
+  it('does not describe a non-benign compaction veto as within budget', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      statusHistory: [{
+        action: 'context_compaction',
+        label: '',
+        at: 1_000,
+        id: 'cmp-no-boundary',
+        category: 'maintenance',
+        state: 'skipped',
+        source: 'automatic',
+        reason: 'no_safe_turn_boundary',
+      }],
+    })
+
+    expect(projection.statusSteps[0]?.label.code).toBe('chat.compact.skipped')
   })
 
   it('merges adjacent automatic completions and keeps durable metadata', () => {

@@ -665,3 +665,18 @@ describe('useChatPlans', () => {
     expect(api.pendingAction.value).toBeNull()
   })
 })
+  it('does not hide published Goal-owned PlanRun compatibility snapshots', () => {
+    const { api, handlers } = harness()
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+    })
+    api.subscribe()
+
+    handlers.get('session.event.plan_run')?.({
+      session_key: SESSION_ONE,
+      plan_run: run('running', { driverKind: 'goal', driverId: 'goal-1' }),
+    })
+
+    expect(api.activePlanRun.value?.driverKind).toBe('goal')
+  })

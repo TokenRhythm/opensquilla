@@ -119,6 +119,36 @@ describe('SkillDetailDialog behavior contract', () => {
     expect(mounted.host.textContent).not.toContain('Stale ImageMagick')
   })
 
+  it.each([
+    ['shadowed', 'loaded'],
+    ['disabled', 'loaded'],
+    ['hidden', 'loaded'],
+    ['active', 'not_discovered'],
+  ] as const)('hides dependency mutations for a %s/%s lifecycle candidate', async (
+    selectionState,
+    loadState,
+  ) => {
+    const mounted = mountDialog({
+      name: 'shared',
+      active: false,
+      status: 'needs_setup',
+      missing_bins: ['ffmpeg'],
+      install: [{ id: 'ffmpeg', kind: 'brew', label: 'Install candidate FFmpeg', bins: ['ffmpeg'] }],
+      lifecycle: {
+        install_state: 'tracked',
+        load_state: loadState,
+        selection_state: selectionState,
+        compatibility_state: 'instruction_only',
+        readiness_state: 'needs_setup',
+      },
+    })
+    await nextTick()
+
+    expect(mounted.dialog.textContent).not.toContain('Install candidate FFmpeg')
+    expect(mounted.dialog.querySelector('.sk-detail__install-row button')).toBeNull()
+    expect(mounted.installDeps).not.toHaveBeenCalled()
+  })
+
   it('updates its accessible name for the selected skill or proposal', async () => {
     const mounted = mountDialog({ name: 'alpha' })
     await nextTick()

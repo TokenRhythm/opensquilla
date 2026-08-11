@@ -9,13 +9,15 @@
     <div class="sk-grid sk-tile-grid">
       <SkillTile
         v-for="skill in skills"
-        :key="skill.name"
+        :key="skillCatalogKey(skill)"
         variant="installed"
         :name="skill.name"
         :description="skill.description"
         :description-zh="skill.description_zh"
         :emoji="skill.emoji"
         :meta="meta"
+        :lifecycle-label="skillLifecyclePresentation(skill, 'installed')?.label"
+        :lifecycle-tone="skillLifecyclePresentation(skill, 'installed')?.tone"
         :status-dot-class="skillStatusDotClass(skill)"
         :status-dot-title="skillStatusDotTitle(skill)"
         @open="emit('open', skill)"
@@ -29,6 +31,8 @@ import Icon from '@/components/Icon.vue'
 import SkillTile from '@/components/skills/SkillTile.vue'
 import type { Skill } from '@/types/skills'
 import {
+  skillCatalogKey,
+  skillLifecyclePresentation,
   skillStatusDotClass,
   skillStatusDotTitle,
 } from '@/composables/skills/useSkillsCatalog'

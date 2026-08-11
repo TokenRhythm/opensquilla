@@ -335,7 +335,6 @@ def build_data_buckets(home: Path, config: Any | None) -> list[DataBucket]:
         DataBucket("workspace", home / "workspace", "user-data", PURGE_STATE),
         DataBucket("session archive", home / "session-archive", "user-data", PURGE_STATE),
         DataBucket("code-task runs", home / "code-task", "user-data", PURGE_STATE),
-        DataBucket("swebench artifacts", home / "swebench", "user-data", PURGE_STATE),
         DataBucket("migration backups", home / "migration", "user-data", PURGE_STATE),
     ]
 
@@ -348,7 +347,6 @@ def build_data_buckets(home: Path, config: Any | None) -> list[DataBucket]:
         ("log dir", _env_path("OPENSQUILLA_LOG_DIR")),
         ("turn-call log dir", _env_path("OPENSQUILLA_TURN_CALL_LOG_DIR")),
         ("session archive dir", _env_path("OPENSQUILLA_SESSION_ARCHIVE_DIR")),
-        ("swebench artifacts dir", _env_path("OPENSQUILLA_SWEBENCH_ARTIFACTS_DIR")),
     ]
     if config is not None:
         try:

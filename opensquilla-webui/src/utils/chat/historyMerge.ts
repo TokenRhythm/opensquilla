@@ -227,6 +227,7 @@ function assistantIndexesForTurn(messages: ChatMessage[], userIndex: number): nu
 function reconcileOptimisticTurnFields(
   prev: ChatMessage[],
   incoming: ChatMessage[],
+  consumedOptimisticRows?: Set<ChatMessage>,
 ): ChatMessage[] {
   const reconciled = reconcileHistoryMessages(prev, incoming)
   const merged = reconciled === incoming ? incoming.slice() : reconciled
@@ -259,6 +260,7 @@ function reconcileOptimisticTurnFields(
     const incomingAssistantIndex = incomingAssistants[0]
     const serverAssistant = merged[incomingAssistantIndex]
     merged[incomingAssistantIndex] = mergeLiveOnlyFields(previousAssistant, serverAssistant)
+    consumedOptimisticRows?.add(previousAssistant)
   })
 
   return merged
@@ -478,17 +480,48 @@ export function reconcileRunningHistoryMessages(
     }
   }
 
+  const liveAnchor = prev[liveAnchorUserIndex]
+  const incomingIds = new Set(incoming.map(message => message.messageId).filter(Boolean))
+  const preserveConfirmedAnchor = Boolean(
+    liveAnchor?.role === 'user'
+    && liveAnchor.restoredFromHistory !== true
+    && liveAnchor.messageId
+    && !incomingIds.has(liveAnchor.messageId),
+  )
   const liveTail = prev.slice(liveAnchorUserIndex + 1)
-  if (liveTail.length === 0) return reconcileHistoryMessages(prev, incoming)
+  if (liveTail.length === 0) {
+    const merged = reconcileHistoryMessages(prev, incoming)
+    // A mutation-confirmed user row can arrive locally after an older,
+    // non-empty history request was already in flight. Its durable message id
+    // proves that it is not an optimistic draft, so retain it until a later
+    // canonical snapshot contains the same row.
+    if (preserveConfirmedAnchor) {
+      return [...merged, liveAnchor]
+    }
+    return merged
+  }
 
-  const merged = reconcileHistoryMessages(prev, incoming)
+  const consumedOptimisticRows = new Set<ChatMessage>()
+  const merged = reconcileOptimisticTurnFields(prev, incoming, consumedOptimisticRows)
   const existingIds = new Set(merged.map(msg => msg.messageId).filter(Boolean))
   const existingFallbackKeys = new Set(merged.map(fallbackMessageKey))
-  const tailToPreserve = liveTail.filter(msg => {
+  const confirmedAnchorToPreserve = (
+    preserveConfirmedAnchor
+    && liveAnchor.messageId
+    && !existingIds.has(liveAnchor.messageId)
+  ) ? [liveAnchor] : []
+  const tailToPreserve = [...confirmedAnchorToPreserve, ...liveTail.filter(msg => {
+    if (consumedOptimisticRows.has(msg)) return false
     if (msg.messageId) return !existingIds.has(msg.messageId)
     return !existingFallbackKeys.has(fallbackMessageKey(msg))
-  })
+  })]
   if (tailToPreserve.length === 0) return merged
+  if (confirmedAnchorToPreserve.length > 0) {
+    // The incoming snapshot predates this server-confirmed input. Keep the
+    // complete older transcript in place, then append the confirmed input and
+    // its live tail in causal order.
+    return [...merged, ...tailToPreserve]
+  }
 
   const insertAfter = insertionIndexForLiveTail(merged, prev[liveAnchorUserIndex])
   if (insertAfter < 0) return [...merged, ...tailToPreserve]

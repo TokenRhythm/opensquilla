@@ -680,12 +680,12 @@ reasoning_format = "qwen_token_plan"
 # provider/live_catalog.py). Windows, output limits, and prices below are
 # that listing's published values (refreshed 2026-08; CNY per Mtok
 # converted at ~6.975 CNY/USD) so offline boots budget close to the
-# platform. Every served model streams DeepSeek-style reasoning_content
-# unconditionally, but the endpoint rejects thinking-toggle payloads
-# (UNKNOWN_FIELD 400), so reasoning_format stays "none": display-side
-# parsing needs no format, and "none" keeps the request builder from
-# injecting a deepseek thinking object. Vision is published for the kimi
-# rows and qwen3.8-max; explicit API declarations remain authoritative.
+# platform. Every served model streams DeepSeek-style reasoning_content,
+# while the mixed-family catalog keeps reasoning_format="none" so metadata
+# alone cannot grant one request dialect to every model. Exact official V4
+# compatibility rules own their thinking controls and bounded replay without
+# changing this neutral catalog shape. Vision is published for the kimi rows
+# and qwen3.8-max; explicit API declarations remain authoritative.
 
 [tokenrhythm."deepseek-v4-flash"]
 context_window = 1000000
@@ -697,6 +697,18 @@ reasoning_format = "none"
 input_cost_per_mtok = 0.14336917562724014
 output_cost_per_mtok = 0.2867383512544803
 cache_read_cost_per_mtok = 0.02867383512544803
+
+[tokenrhythm."deepseek-v4-flash-0731"]
+context_window = 1000000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
+status = "testing"
+input_cost_per_mtok = 0.14336917562724014
+output_cost_per_mtok = 0.2867383512544803
+cache_read_cost_per_mtok = 0.002867383512544803
 
 [tokenrhythm."deepseek-v4-pro"]
 context_window = 1000000

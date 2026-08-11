@@ -31,6 +31,7 @@ from opensquilla.provider.types import (
     ModelCapabilities,
     ProviderHeartbeatEvent,
     ProviderRequestCorrelation,
+    ReasoningDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
     ToolUseEndEvent,
@@ -1488,6 +1489,89 @@ def test_openrouter_deepseek_v4_returns_reasoning_content_from_details(
     }
     assert captured["payload"]["reasoning"] == {"effort": "high"}
     assert done.reasoning_content == "I considered the request."
+
+
+def test_tokenrhythm_stream_normalizes_reasoning_alias_but_withholds_text_replay(
+    monkeypatch: Any,
+) -> None:
+    captured_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_payloads.append(json.loads(request.content.decode("utf-8")))
+        chunks = [
+            {
+                "model": "deepseek-v4-flash-0731",
+                "choices": [
+                    {
+                        "delta": {"reasoning": "supplier-specific reasoning"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "model": "deepseek-v4-flash-0731",
+                "choices": [{"delta": {"content": "ok"}, "finish_reason": None}],
+            },
+            {
+                "model": "deepseek-v4-flash-0731",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+            },
+        ]
+        body = b"".join(f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body + b"data: [DONE]\n\n",
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        patched_async_client,
+    )
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-flash-0731",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    first_events = _collect_events(provider, ChatConfig())
+    reasoning = "".join(
+        event.text for event in first_events if isinstance(event, ReasoningDeltaEvent)
+    )
+    first_done = next(event for event in first_events if isinstance(event, DoneEvent))
+    assert reasoning == "supplier-specific reasoning"
+    assert first_done.reasoning_content == reasoning
+
+    async def replay() -> None:
+        async for _ in provider.chat(
+            [
+                Message(
+                    role="assistant",
+                    content="ok",
+                    reasoning_content=first_done.reasoning_content,
+                ),
+                Message(role="user", content="continue"),
+            ],
+            config=ChatConfig(),
+        ):
+            pass
+
+    asyncio.run(replay())
+
+    assert captured_payloads[1]["messages"][0] == {
+        "role": "assistant",
+        "content": "ok",
+        "reasoning_content": "",
+    }
 
 
 def _collect_events(

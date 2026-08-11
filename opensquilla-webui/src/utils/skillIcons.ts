@@ -32,7 +32,6 @@ const EXACT_SKILL_ICONS: Record<string, IconName> = {
   memory: 'sessions',
   tmux: 'monitor',
   'sub-agent': 'agents',
-  'swe-bench': 'listChecks',
   'code-task': 'fileCode',
   'meta-skill-creator': 'skills',
   'skill-creator': 'skills',

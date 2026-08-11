@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,10 @@ from rich.table import Table
 import opensquilla.cli.tui.adapters.input_bridge as _input_bridge
 from opensquilla.cli.chat.session_state import ChatSessionState, messages_to_markdown
 from opensquilla.cli.chat.turn import TurnResult
-from opensquilla.cli.gateway_client import GatewayRPCError, session_history_all
+from opensquilla.cli.gateway_client import (
+    GatewayRPCError,
+    session_history_all,
+)
 from opensquilla.cli.tui.adapters.commands import render_help_table, render_keys_table
 from opensquilla.cli.tui.adapters.slash_common import (
     compact_skipped_line,
@@ -109,7 +113,8 @@ class GatewayClientLike(Protocol):
         message: str,
         attachments: list[dict] | None = None,
         elevated: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]: ...
+    ) -> AsyncIterator[dict[str, Any]]:
+        pass
 
     async def resolve_approval(
         self,
@@ -117,9 +122,11 @@ class GatewayClientLike(Protocol):
         approved: bool,
         *,
         choice: str | None = None,
-    ) -> Any: ...
+    ) -> Any:
+        pass
 
-    async def abort_session(self, key: str) -> dict[str, Any]: ...
+    async def abort_session(self, key: str) -> dict[str, Any]:
+        pass
 
     async def session_history(
         self,
@@ -142,11 +149,35 @@ class GatewayClientLike(Protocol):
 
     async def set_model_routing(self, mode: str) -> dict[str, Any]: ...
 
+class GatewayTurnStreamClient(Protocol):
+    """Client surface consumed by the shared gateway stream renderer."""
+
+    def send_message(
+        self,
+        session_key: str,
+        message: str,
+        attachments: list[dict] | None = None,
+        elevated: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        pass
+
+    async def resolve_approval(
+        self,
+        approval_id: str,
+        approved: bool,
+        *,
+        choice: str | None = None,
+    ) -> Any:
+        pass
+
+    async def abort_session(self, key: str) -> dict[str, Any]:
+        pass
+
 
 class GatewayStreamResponse(Protocol):
     async def __call__(
         self,
-        client: GatewayClientLike,
+        client: GatewayTurnStreamClient,
         session_key: str,
         message: str,
         elevated_state: dict[str, str | None] | None = None,
@@ -157,7 +188,7 @@ class GatewayStreamResponse(Protocol):
 
 
 async def stream_response_gateway(
-    client: GatewayClientLike,
+    client: GatewayTurnStreamClient,
     session_key: str,
     message: str,
     elevated_state: dict[str, str | None] | None = None,
@@ -341,6 +372,375 @@ async def _requested_session_model(context: GatewaySlashContext) -> str | None:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# /goal (gateway mode): thin goals.* RPC controls                              #
+# --------------------------------------------------------------------------- #
+
+
+def _goal_reason_text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _goal_has_unsettled_task(goal: dict[str, Any]) -> bool:
+    active_task_id = goal.get("activeTaskId")
+    execution_state = _goal_reason_text(goal.get("executionState"))
+    has_active_task = isinstance(active_task_id, str) and bool(active_task_id)
+    return has_active_task or execution_state in {"queued", "working"}
+
+
+def _goal_rpc_error_text(error: GatewayRPCError) -> str:
+    """Render stable Goal errors without leaking brittle server prose."""
+
+    messages = {
+        "GOAL_BUSY": (
+            "This Gateway cannot apply that Goal action while its current task "
+            "is settling. Wait for the task to settle or update the Gateway."
+        ),
+        "GOAL_NOT_FOUND": "This session no longer has that Goal.",
+        "GOAL_ACTIVE": "This session already has an unfinished Goal.",
+        "GOAL_NOT_RESUMABLE": "This Goal is not currently resumable.",
+        "STALE_GOAL": (
+            "The Goal changed before this action was applied; inspect its status and retry."
+        ),
+        "PLAN_MODE_ACTIVE": (
+            "Goal execution is waiting for Default mode; finish or leave Plan mode first."
+        ),
+        "PLAN_RUN_ACTIVE": "Goal execution is waiting for the active Plan run to finish.",
+        "EXECUTION_LEASE_REQUIRED": (
+            "This connection does not own Goal execution; resume or take over the Goal first."
+        ),
+        "GOAL_EXECUTION_DISABLED": "Goal execution is disabled by the Gateway configuration.",
+        "SESSION_GENERATION_CHANGED": (
+            "The session generation changed; reopen the current session and retry."
+        ),
+        "IDEMPOTENCY_CONFLICT": (
+            "That Goal request id was already used for different input; retry the command."
+        ),
+        "INVALID_GOAL_OBJECTIVE": "Enter a valid, non-empty Goal objective.",
+        "INVALID_GOAL_COMMAND": "The Gateway rejected an invalid Goal command.",
+        "INVALID_GOAL_GUARDRAIL": "The Goal guardrail values are invalid.",
+        "INVALID_GOAL_STATUS": "The requested Goal status is invalid.",
+        "INVALID_GOAL_REASON": "The requested Goal reason is invalid.",
+    }
+    return messages.get(error.code or "", str(error))
+
+
+def _goal_snapshot(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    goal = payload.get("goal")
+    return goal if isinstance(goal, dict) else None
+
+
+def _goal_objective(goal: dict[str, Any]) -> str:
+    # ``goalText`` keeps same-series Gateway compatibility while the current
+    # contract exposes the user-authored value as ``objective``.
+    return str(goal.get("objective") or goal.get("goalText") or "")
+
+
+def _print_goal_help() -> None:
+    console.print(
+        "[red]Usage: /goal [status|capabilities|pause|resume|clear [--confirm]|"
+        "edit <objective>|set <objective>|<objective>][/red]"
+    )
+
+
+def _print_goal_status(payload: dict[str, Any]) -> bool:
+    """Render a canonical ``goals.status`` payload; return whether a Goal exists."""
+    goal = _goal_snapshot(payload)
+    if goal is None:
+        console.print(f"[{ACCENT}]goal[/] [dim]No active goal[/dim]")
+        return False
+    console.print(f"[{ACCENT}]goal[/] [dim]{_goal_objective(goal)}[/dim]")
+    console.print(f"[{ACCENT}]status[/] [dim]{str(goal.get('status') or '')}[/dim]")
+    execution_state = _goal_reason_text(goal.get("executionState"))
+    if execution_state:
+        console.print(f"[{ACCENT}]execution[/] [dim]{execution_state}[/dim]")
+    deferred_reason = _goal_reason_text(goal.get("continuationDeferredReason"))
+    if deferred_reason:
+        console.print(f"[{ACCENT}]waiting[/] [dim]{deferred_reason}[/dim]")
+    turns_started = goal.get("turnsStarted", goal.get("turns"))
+    turns_settled = goal.get("turnsSettled")
+    if isinstance(turns_started, int) and not isinstance(turns_started, bool):
+        turns = str(turns_started)
+        if isinstance(turns_settled, int) and not isinstance(turns_settled, bool):
+            turns = f"{turns_settled}/{turns_started} settled"
+        console.print(f"[{ACCENT}]turns[/] [dim]{turns}[/dim]")
+    pause_reason = _goal_reason_text(goal.get("pauseReason"))
+    if pause_reason:
+        console.print(f"[{ACCENT}]paused[/] [dim]{pause_reason}[/dim]")
+    reason = _goal_reason_text(goal.get("blockedReason")) or _goal_reason_text(
+        goal.get("terminalReason")
+    )
+    if reason:
+        console.print(f"[{ACCENT}]reason[/] [dim]{reason}[/dim]")
+    return True
+
+
+def _print_goal_capabilities(payload: dict[str, Any]) -> None:
+    capabilities = payload.get("capabilities")
+    values = capabilities if isinstance(capabilities, dict) else payload
+    enabled = values.get("executionEnabled", values.get("enabled"))
+    if isinstance(enabled, bool):
+        label = "enabled" if enabled else "disabled"
+        color = "green" if enabled else "yellow"
+        console.print(f"[{ACCENT}]goal[/] [{color}]{label}[/{color}]")
+    else:
+        console.print(f"[{ACCENT}]goal[/] [green]available[/green]")
+    maximum = values.get("maxObjectiveChars")
+    if isinstance(maximum, int) and not isinstance(maximum, bool):
+        console.print(f"[{ACCENT}]objective limit[/] [dim]{maximum} characters[/dim]")
+
+
+def _goal_expected_fence(payload: Any) -> tuple[dict[str, Any], str, int] | None:
+    goal = _goal_snapshot(payload)
+    if goal is None:
+        return None
+    goal_id = goal.get("goalId")
+    revision = goal.get("stateRevision")
+    if (
+        not isinstance(goal_id, str)
+        or not goal_id
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 0
+    ):
+        raise ValueError("Gateway returned a Goal without a valid mutation fence")
+    return goal, goal_id, revision
+
+
+def _goal_mutation_params(
+    session_key: str,
+    *,
+    goal_id: str,
+    state_revision: int,
+) -> dict[str, Any]:
+    return {
+        "sessionKey": session_key,
+        "expectedGoalId": goal_id,
+        "expectedStateRevision": state_revision,
+        "clientRequestId": str(uuid.uuid4()),
+    }
+
+
+def _goal_reattach_params(
+    session_key: str,
+    goal: dict[str, Any],
+    *,
+    goal_id: str,
+) -> dict[str, Any]:
+    """Build the exact generation fence for an explicit detached-Goal takeover."""
+
+    session_id = goal.get("sessionId")
+    epoch = goal.get("epoch")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("Gateway returned a detached Goal without a valid session id")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        raise ValueError("Gateway returned a detached Goal without a valid session epoch")
+    return {
+        "sessionKey": session_key,
+        "sessionId": session_id,
+        "epoch": epoch,
+        "expectedGoalId": goal_id,
+        "takeover": True,
+        "sourceKind": "cli",
+    }
+
+
+async def _goal_current_fence(
+    client: GatewayClientLike,
+    session_key: str,
+) -> tuple[dict[str, Any], str, int] | None:
+    payload = await client.call("goals.status", {"sessionKey": session_key})
+    return _goal_expected_fence(payload)
+
+
+async def _handle_goal_command(argument: str, context: GatewaySlashContext) -> bool:
+    """Dispatch one gateway-mode ``/goal`` invocation as a thin RPC client."""
+    client = context.client
+    key = context.state.session_key
+    raw = argument.strip()
+    command, separator, remainder = raw.partition(" ")
+    word = command.lower()
+    objective = remainder.strip() if separator else ""
+
+    if word in {"help", "-h", "--help"}:
+        _print_goal_help()
+        return True
+
+    if word in {"", "status"}:
+        try:
+            payload = await client.call("goals.status", {"sessionKey": key})
+        except GatewayRPCError as exc:
+            console.print(
+                error_panel(_goal_rpc_error_text(exc), title="Goal status failed")
+            )
+        else:
+            present = _print_goal_status(payload if isinstance(payload, dict) else {})
+            if not raw and not present:
+                _print_goal_help()
+        return True
+
+    if word == "capabilities":
+        try:
+            payload = await client.call("goals.capabilities", {"sessionKey": key})
+        except GatewayRPCError as exc:
+            console.print(
+                error_panel(_goal_rpc_error_text(exc), title="Goal capabilities failed")
+            )
+        else:
+            _print_goal_capabilities(payload if isinstance(payload, dict) else {})
+        return True
+
+    if word in {"edit", "set"} and not objective:
+        _print_goal_help()
+        return True
+
+    if word == "edit":
+        try:
+            fence = await _goal_current_fence(client, key)
+            if fence is None:
+                console.print(f"[{ACCENT}]goal[/] [dim]No active goal to edit[/dim]")
+                return True
+            _before, goal_id, revision = fence
+            params = _goal_mutation_params(
+                key,
+                goal_id=goal_id,
+                state_revision=revision,
+            )
+            params["objective"] = objective
+            payload = await client.call("goals.edit", params)
+        except (GatewayRPCError, ValueError) as exc:
+            detail = _goal_rpc_error_text(exc) if isinstance(exc, GatewayRPCError) else str(exc)
+            console.print(error_panel(detail, title="Goal edit failed"))
+            return True
+        goal = _goal_snapshot(payload)
+        label = _goal_objective(goal) if goal is not None else objective
+        action = "edited and reactivated" if _before.get("status") == "complete" else "edited"
+        console.print(f"[{ACCENT}]goal[/] [green]{action}[/green]: [bold]{label}[/bold]")
+        console.print(
+            "[dim]The new objective applies at the next safe model boundary, "
+            "or in the next eligible Goal turn.[/dim]"
+        )
+        return True
+
+    if word == "clear":
+        if objective not in {"", "--confirm"}:
+            _print_goal_help()
+            return True
+        try:
+            fence = await _goal_current_fence(client, key)
+            if fence is None:
+                console.print(f"[{ACCENT}]goal[/] [dim]No active goal to clear[/dim]")
+                return True
+            before, goal_id, revision = fence
+            if not objective:
+                console.print(f"[{ACCENT}]goal[/] [yellow]removal requires confirmation[/yellow]")
+                console.print(
+                    "[dim]OpenSquilla will stop tracking this Goal and stop continuing "
+                    "it automatically; the current task, conversation, and artifacts "
+                    "will remain.[/dim]"
+                )
+                console.print(
+                    "[bold]Run /goal clear --confirm to remove this Goal.[/bold]"
+                )
+                return True
+            params = _goal_mutation_params(
+                key,
+                goal_id=goal_id,
+                state_revision=revision,
+            )
+            payload = await client.call("goals.clear", params)
+        except (GatewayRPCError, ValueError) as exc:
+            detail = _goal_rpc_error_text(exc) if isinstance(exc, GatewayRPCError) else str(exc)
+            console.print(error_panel(detail, title="Goal clear failed"))
+            return True
+        label_goal = _goal_snapshot(payload) or before
+        label = _goal_objective(label_goal)
+        console.print(
+            f"[{ACCENT}]goal[/] [yellow]tracking removed[/yellow]"
+            + (f" [dim]{label}[/dim]" if label else "")
+        )
+        console.print("[dim]Current tasks, transcript entries, and artifacts remain.[/dim]")
+        return True
+
+    if word in {"pause", "resume"}:
+        title = f"Goal {word} failed"
+        try:
+            fence = await _goal_current_fence(client, key)
+            if fence is None:
+                console.print(f"[{ACCENT}]goal[/] [dim]No active goal to {word}[/dim]")
+                return True
+            before, goal_id, revision = fence
+            method = f"goals.{word}"
+            if (
+                word == "resume"
+                and before.get("status") == "active"
+                and before.get("continuationDeferredReason") == "owner_disconnected"
+            ):
+                method = "goals.reattach"
+                params = _goal_reattach_params(key, before, goal_id=goal_id)
+            else:
+                params = _goal_mutation_params(
+                    key,
+                    goal_id=goal_id,
+                    state_revision=revision,
+                )
+                if word == "resume":
+                    params["sourceKind"] = "cli"
+            payload = await client.call(method, params)
+        except (GatewayRPCError, ValueError) as exc:
+            detail = _goal_rpc_error_text(exc) if isinstance(exc, GatewayRPCError) else str(exc)
+            console.print(error_panel(detail, title=title))
+            return True
+        label_goal = _goal_snapshot(payload) or before
+        label = _goal_objective(label_goal)
+        color = "green" if word == "resume" else "yellow"
+        summary = {
+            "pause": "automatic continuation paused",
+            "resume": "automatic continuation enabled",
+        }[word]
+        console.print(
+            f"[{ACCENT}]goal[/] [{color}]{summary}[/{color}]"
+            + (f" [dim]{label}[/dim]" if label else "")
+        )
+        if word == "pause" and _goal_has_unsettled_task(label_goal):
+            console.print("[dim]The current task continues; use Stop to cancel it.[/dim]")
+        elif word == "resume":
+            if _goal_has_unsettled_task(label_goal):
+                console.print(
+                    "[dim]The current Goal task remains the owner; "
+                    "no duplicate was started.[/dim]"
+                )
+            else:
+                console.print(
+                    "[dim]Work starts when the shared session idle gate is eligible.[/dim]"
+                )
+        return True
+
+    # Preserve the original shorthand: ``/goal <objective>`` is ``goals.set``.
+    # ``/goal set <objective>`` is the explicit equivalent.
+    set_objective = objective if word == "set" else raw
+    try:
+        payload = await client.call(
+            "goals.set",
+            {
+                "sessionKey": key,
+                "objective": set_objective,
+                "clientRequestId": str(uuid.uuid4()),
+                "clientMessageId": str(uuid.uuid4()),
+                "sourceKind": "cli",
+            },
+        )
+    except GatewayRPCError as exc:
+        console.print(error_panel(_goal_rpc_error_text(exc), title="Goal set failed"))
+        return True
+    goal = _goal_snapshot(payload)
+    label = _goal_objective(goal) if goal is not None else set_objective
+    console.print(f"[{ACCENT}]goal[/] [green]set[/green]: [bold]{label}[/bold]")
+    return True
+
+
 async def _dispatch_gateway_slash_command(
     cmd: str,
     context: GatewaySlashContext,
@@ -455,6 +855,10 @@ async def _dispatch_gateway_slash_command(
             f"[{ACCENT}]permissions[/] [dim]{state.elevated or 'normal'}[/dim]"
         )
         return True
+
+    if parts := _slash_parts(cmd, "/goal"):
+        argument = parts[1].strip() if len(parts) > 1 else ""
+        return await _handle_goal_command(argument, context)
 
     if parts := _slash_parts(cmd, "/sessions"):
         limit = 10

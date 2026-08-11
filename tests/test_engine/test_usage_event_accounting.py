@@ -736,6 +736,128 @@ def _tokenrhythm_receipt(*, usd_nanos: int) -> ProviderBillingReceipt:
     )
 
 
+def _usd_receipt(
+    *,
+    status: str,
+    amount_nanos: int | None,
+    usd_nanos: int | None,
+) -> ProviderBillingReceipt:
+    return ProviderBillingReceipt(
+        currency="USD",
+        status=status,  # type: ignore[arg-type]
+        amount_nanos=amount_nanos,
+        usd_equivalent_nanos=usd_nanos,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+
+
+@pytest.mark.parametrize(
+    ("row_overrides", "expected_billed_nanos", "expected_source"),
+    [
+        ({"billed_cost": 0.25, "cost_source": "provider_billed"}, 250_000_000, "provider_billed"),
+        ({"billed_cost": 0.25, "cost_source": "openrouter_usage"}, 250_000_000, "provider_billed"),
+        ({"billed_cost": 0.25}, 250_000_000, "provider_billed"),
+        (
+            {"billed_cost_usd": 0.25, "cost_source": "provider_billed"},
+            250_000_000,
+            "provider_billed",
+        ),
+        (
+            {"billedCost": 0.25, "costSource": "provider_billed"},
+            250_000_000,
+            "provider_billed",
+        ),
+        (
+            {
+                "billed_cost": 0.05,
+                "billing_receipt": _usd_receipt(
+                    status="confirmed",
+                    amount_nanos=300_000_000,
+                    usd_nanos=300_000_000,
+                ),
+            },
+            300_000_000,
+            "provider_billed",
+        ),
+        (
+            {
+                "billed_cost": 0.0,
+                "billing_receipt": _usd_receipt(
+                    status="confirmed",
+                    amount_nanos=0,
+                    usd_nanos=0,
+                ),
+            },
+            0,
+            "provider_billed",
+        ),
+        (
+            {
+                "billed_cost": 0.25,
+                "cost_source": "provider_billed",
+                "billing_receipt": _usd_receipt(
+                    status="pending",
+                    amount_nanos=250_000_000,
+                    usd_nanos=None,
+                ),
+            },
+            0,
+            "unavailable",
+        ),
+        ({"billed_cost": 0.0, "cost_source": "free"}, 0, "free"),
+    ],
+    ids=[
+        "provider-billed",
+        "openrouter-usage",
+        "legacy-positive-bill",
+        "billed-cost-usd-alias",
+        "camel-case-aliases",
+        "confirmed-authoritative-amount",
+        "confirmed-zero",
+        "pending",
+        "explicit-free",
+    ],
+)
+def test_receipt_only_normalization_uses_canonical_billed_semantics_without_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+    row_overrides: dict[str, Any],
+    expected_billed_nanos: int,
+    expected_source: str,
+) -> None:
+    def fail_if_pricing_is_resolved(model: str, provider: str) -> ResolvedModelPrice:
+        raise AssertionError(f"unexpected price resolution for {provider}/{model}")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.usage_accounting.resolve_model_price",
+        fail_if_pricing_is_resolved,
+    )
+    row = {
+        "provider": "fake",
+        "model": "model-a",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        **row_overrides,
+    }
+    result = normalize_provider_usage(
+        ProviderError(
+            message="failed after usage",
+            code="500",
+            model_usage_breakdown=[row],
+        ),
+        default_provider="fake",
+        default_model="model-a",
+        completed_at_ms=1234,
+        resolve_estimates=False,
+    )
+
+    assert result.billed_cost_nanos == expected_billed_nanos
+    assert result.estimated_cost_nanos == 0
+    assert result.cost_source == expected_source
+    assert result.items[0].billed_cost_nanos == expected_billed_nanos
+    assert result.items[0].estimated_cost_nanos == 0
+    assert result.items[0].cost_source == expected_source
+
+
 def test_tokenrhythm_single_done_reconciles_native_receipt_and_all_token_buckets() -> None:
     receipt = _tokenrhythm_receipt(usd_nanos=2_000)
     event = ProviderDone(

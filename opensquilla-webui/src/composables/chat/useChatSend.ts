@@ -794,6 +794,10 @@ export function useChatSend(options: UseChatSendOptions) {
       sessionKey: acceptedSessionKey,
       source: 'webui_stale_send',
     }
+    // A user Stop that raced durable ingress is still task-scoped. If an
+    // older/partial response has no task id, tell the gateway to fail closed
+    // instead of falling back to the legacy whole-session abort surface.
+    if (force) params.scope = 'task'
     if (taskId) params.taskId = taskId
     options.rpc.call('chat.abort', params).catch(() => {
       if (force) reportAbortFailure([requestSessionKey, acceptedSessionKey])
@@ -1799,6 +1803,7 @@ export function useChatSend(options: UseChatSendOptions) {
     options.aborted.value = true
     const handoff = handoffCanStop ? activeResponseHandoff : null
     if (handoff) handoff.stoppedByUser = true
+    const taskAcceptancePending = Boolean(handoff || activeFreshSendToken !== null)
     const abortSessionKey = handoff?.targetSessionKey
       || options.activeStreamSessionKey.value
       || options.sessionKey.value
@@ -1861,7 +1866,15 @@ export function useChatSend(options: UseChatSendOptions) {
     // Be honest if the abort can't reach the gateway (e.g. the socket dropped):
     // we still tear the local stream down for responsiveness, but the user must
     // know the server-side run may keep going rather than trust a false "stopped".
-    const abortParams: Record<string, string> = { sessionKey: abortSessionKey, source: 'webui_stop' }
+    const abortParams: Record<string, string> = {
+      sessionKey: abortSessionKey,
+      source: 'webui_stop',
+    }
+    // Known turns and in-flight send acceptance are precise task Stops. The
+    // no-id/no-acceptance case is the existing task-group Stop surface, which
+    // intentionally retains legacy session-tree cancellation semantics.
+    if (stoppedTurnId || taskAcceptancePending) abortParams.scope = 'task'
+    if (stoppedTurnId) abortParams.taskId = stoppedTurnId
     options.rpc.call('chat.abort', abortParams)
       .then(() => options.scheduleHistorySync())
       .catch(() => {

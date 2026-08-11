@@ -425,7 +425,6 @@ are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 - `stack-trace-go-probe`
 - `stack-trace-js-probe`
 - `stack-trace-python-probe`
-- `swe-bench`
 - `stack-trace-rust-probe`
 - `sub-agent`
 - `srt-from-script`

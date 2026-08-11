@@ -721,10 +721,10 @@ _EXPECTED_CAPS: dict[tuple[str, str, str], tuple[bool, bool, bool, str]] = {
     ("tencent_tokenhub_intl", "gpt-5.5", ""): (False, True, True, "none"),
     ("tencent_tokenhub_intl", "hy3", ""): (False, True, False, "none"),
     ("tencent_tokenhub_intl", "hy3-preview", ""): (False, True, False, "none"),
-    # tokenrhythm: the [tokenrhythm.*] corrections rows pin
-    # reasoning_format="none" (the relay streams reasoning_content on its
-    # own but rejects thinking toggles), so effective supports_reasoning is
-    # False everywhere; vision only on the live-verified kimi rows.
+    # tokenrhythm: the mixed-family catalog stays at reasoning_format="none",
+    # so effective catalog supports_reasoning remains False. Exact official V4
+    # request controls live in compat policy instead; vision is limited to the
+    # live-verified kimi rows.
     ("tokenrhythm", "totally-unknown-model-x1", ""): (False, True, False, "none"),
     ("tokenrhythm", "gpt-4o", ""): (False, True, False, "none"),
     ("tokenrhythm", "deepseek-r1", ""): (False, True, False, "none"),

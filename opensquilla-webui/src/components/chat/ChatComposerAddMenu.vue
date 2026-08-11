@@ -43,6 +43,29 @@
         </span>
       </span>
     </button>
+    <button
+      v-if="goalModeAvailable"
+      type="button"
+      class="composer-add-menu__item"
+      role="menuitem"
+      :disabled="goalModeBusy || goalModeActive || goalModeExisting"
+      :aria-pressed="goalModeActive"
+      @click="activateGoalMode"
+    >
+      <span class="composer-add-menu__icon" aria-hidden="true">
+        <Icon name="target" :size="17" />
+      </span>
+      <span class="composer-add-menu__copy">
+        <strong>{{ t('chat.goal.modeLabel') }}</strong>
+        <span>
+          {{ goalModeActive
+            ? t('chat.goal.modeReady')
+            : goalModeExisting
+              ? t('chat.goal.activeTitle')
+              : t('chat.goal.modeDescription') }}
+        </span>
+      </span>
+    </button>
   </section>
 </template>
 
@@ -53,12 +76,17 @@ import Icon from '@/components/Icon.vue'
 
 defineProps<{
   attachmentsDisabled?: boolean
+  goalModeActive: boolean
+  goalModeAvailable: boolean
+  goalModeBusy: boolean
+  goalModeExisting: boolean
   planModeActive: boolean
   planModeAvailable: boolean
   planModeBusy: boolean
 }>()
 
 const emit = defineEmits<{
+  activateGoalMode: []
   activatePlanMode: []
   attachFiles: []
   close: []
@@ -74,6 +102,11 @@ function attachFiles() {
 
 function activatePlanMode() {
   emit('activatePlanMode')
+  emit('close')
+}
+
+function activateGoalMode() {
+  emit('activateGoalMode')
   emit('close')
 }
 

@@ -360,6 +360,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         messageId: msg.messageId,
         restoredFromHistory: msg.restoredFromHistory,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
+        turnId: messageTurnId || undefined,
         inputDisposition: msg.inputDisposition,
         inputDispositionRevision: msg.inputDispositionRevision,
         maintenance: msg.maintenance,

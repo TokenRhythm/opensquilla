@@ -2,6 +2,12 @@ import createDOMPurify from 'dompurify'
 import { marked } from 'marked'
 import type { ArtifactPayload } from '@/types/rpc'
 import { artifactExtension, artifactMime, artifactName } from '@/utils/chat/artifacts'
+import { strictStrikethrough } from '@/utils/markdown/strikethrough'
+
+// `marked` is a shared singleton, so declare the rule here too: a markdown
+// artifact renders the same text as the chat bubble it came from, and must not
+// depend on whether the chat renderer happens to have been imported first.
+marked.use(strictStrikethrough)
 
 export const ARTIFACT_TEXT_PREVIEW_LIMIT = 5 * 1024 * 1024
 export const ARTIFACT_BINARY_PREVIEW_LIMIT = 30 * 1024 * 1024

@@ -244,6 +244,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
 
         kwargs: dict[str, Any] = {
             "semantic_message": request.semantic_message,
+            "routing_hint": request.routing_hint,
             "ingress_pipeline_steps": request.ingress_pipeline_steps,
             "prev_assistant_text": request.prev_assistant_text,
             "prev_assistant_usage": request.prev_assistant_usage,

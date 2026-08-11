@@ -419,6 +419,7 @@ export interface ChatMaintenanceEvent {
   state: 'running' | 'completed' | 'skipped' | 'stale' | 'cancelled' | 'failed'
   durability: string
   detail?: string
+  reason?: string
   removedCount?: number
   keptCount?: number
 }
@@ -519,6 +520,8 @@ export interface ChatRenderedMessage {
   restoredFromHistory?: boolean
   /** Stable identity of the owning user turn for client-only UI continuity. */
   turnKey?: string
+  /** Durable server turn identity restored from transcript turn_context. */
+  turnId?: string
   inputDisposition?: ChatSteerDisposition
   maintenance?: ChatMaintenanceEvent
   inputDispositionRevision?: number

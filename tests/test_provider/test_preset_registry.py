@@ -160,9 +160,13 @@ def test_tokenrhythm_curated_ladder() -> None:
     for name, model in expected_models.items():
         assert tiers[name]["provider"] == "tokenrhythm", name
         assert tiers[name]["model"] == model, name
-        # The endpoint rejects thinking-toggle request fields, so the curated
-        # ladder must not carry a thinking_level for the request builder.
+        # Packaged routes preserve the provider default; explicit turn-level
+        # controls remain separate from this mixed-family router ladder.
         assert "thinking_level" not in tiers[name], name
+    assert "deepseek-v4-flash-0731" not in {
+        preset.default_model,
+        *(entry["model"] for entry in tiers.values()),
+    }
     assert tiers["image_model"]["supports_image"] is True
     assert tiers["image_model"]["image_only"] is True
 

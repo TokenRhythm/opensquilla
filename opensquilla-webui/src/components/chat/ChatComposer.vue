@@ -98,9 +98,14 @@
               <ChatComposerAddMenu
                 v-if="addMenuOpen"
                 :attachments-disabled="replanActive"
+                :goal-mode-active="goalDraftArmed"
+                :goal-mode-available="goalModeAvailable === true"
+                :goal-mode-busy="goalModeBusy === true"
+                :goal-mode-existing="goalModeExisting === true"
                 :plan-mode-active="collaborationMode === 'plan'"
                 :plan-mode-available="planModeAvailable === true"
                 :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
+                @activate-goal-mode="emit('armGoal')"
                 @activate-plan-mode="emit('setCollaborationMode', 'plan')"
                 @attach-files="fileInputEl?.click()"
                 @close="addMenuOpen = false"
@@ -284,6 +289,10 @@
               </div>
             </div>
           </div>
+          <ChatComposerGoalMode
+            :active="goalDraftArmed"
+            @disarm="emit('disarmGoal')"
+          />
           <ChatComposerPlanMode
             :available="planModeAvailable === true"
             :mode="collaborationMode || 'default'"
@@ -355,6 +364,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { IconName } from '@/utils/icons'
 import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
+import ChatComposerGoalMode from '@/components/chat/ChatComposerGoalMode.vue'
 import ChatComposerModelRouting from '@/components/chat/ChatComposerModelRouting.vue'
 import ChatComposerPlanMode from '@/components/chat/ChatComposerPlanMode.vue'
 import ChatComposerRunMode from '@/components/chat/ChatComposerRunMode.vue'
@@ -394,6 +404,10 @@ const props = withDefaults(defineProps<{
   modelRoutingSettingsBusy: boolean
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
+  goalDraftArmed?: boolean
+  goalModeAvailable?: boolean
+  goalModeBusy?: boolean
+  goalModeExisting?: boolean
   voiceBusy: boolean
   voiceRecording: boolean
   voiceReady: boolean
@@ -420,6 +434,7 @@ const props = withDefaults(defineProps<{
   canChooseProject: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
+  goalDraftArmed: false,
   inputDisabled: false,
   safeSetupAvailable: false,
   floating: false,
@@ -439,6 +454,8 @@ const emit = defineEmits<{
   setModelRoutingMode: [mode: ModelRoutingMode]
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
+  armGoal: []
+  disarmGoal: []
   cancelReplan: []
   voiceInput: []
   voiceSetup: []
