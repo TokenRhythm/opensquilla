@@ -173,6 +173,8 @@ def test_persist_transcripts_disabled_skips_disk_copy(tmp_path: Path) -> None:
     )
     parsed = json.loads(envelope)
     persisted = parsed["attachments"][0]
+    attachment_id = persisted.pop("attachment_id")
+    assert attachment_id.startswith("att_")
     assert persisted == {
         "name": "r.pdf",
         "mime": "application/pdf",
@@ -196,14 +198,17 @@ def test_transcript_dedup_within_session(tmp_path: Path) -> None:
         "name": "r.pdf",
         "_was_staged": True,
     }
-    build_transcript_attachment_envelope(
+    first_envelope, _ = build_transcript_attachment_envelope(
         text="first", attachments=[staged], session_id="s1",
         media_root=tmp_path, persist_enabled=True,
     )
-    build_transcript_attachment_envelope(
+    second_envelope, _ = build_transcript_attachment_envelope(
         text="second", attachments=[staged], session_id="s1",
         media_root=tmp_path, persist_enabled=True,
     )
+    first_id = json.loads(first_envelope)["attachments"][0]["attachment_id"]
+    second_id = json.loads(second_envelope)["attachments"][0]["attachment_id"]
+    assert first_id != second_id
     sha = hashlib.sha256(pdf).hexdigest()
     files = list((tmp_path / "transcripts" / "s1").iterdir())
     assert [f.name for f in files] == [sha], files

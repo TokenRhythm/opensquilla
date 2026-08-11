@@ -1830,11 +1830,11 @@ class SessionManager:
     ) -> None:
         """Carry a parent session's attachment/artifact material into a forked child.
 
-        ``branch`` copies transcript rows, but the artifact and attachment material
-        stores are keyed by session id, so without this the child's generated images,
-        generated files, and uploaded attachments resolve to an empty bucket and fail
-        to preview or replay. Runs off the event loop and never raises: a copy failure
-        must not abort the fork, whose session row is committed by the caller next.
+        ``branch`` copies transcript rows, but artifact and attachment material stores
+        are keyed by session id. ArtifactSession documents additionally need a new,
+        generation-one metadata lineage that points back to each parent's current head.
+        Runs off the event loop where appropriate and never raises: a copy failure must
+        not abort the fork, whose session row is committed by the caller next.
         """
         media_root = self._media_root
         if media_root is None:
@@ -1844,20 +1844,30 @@ class SessionManager:
         _log = _structlog.get_logger(__name__)
 
         attachment_hashes: set[str] | None = None
-        artifact_ids: set[str] | None = None
+        transcript_artifact_ids: set[str] | None = None
         if material_references is not None:
-            attachment_hashes, artifact_ids = material_references
+            attachment_hashes, transcript_artifact_ids = material_references
 
-        def _run() -> None:
+        def _copy_files(head_artifact_ids: tuple[str, ...]) -> None:
             from opensquilla.artifacts import ArtifactStore
-            from opensquilla.attachment_refs import copy_transcript_material
 
-            ArtifactStore(media_root).copy_session_artifacts(
+            store = ArtifactStore(media_root)
+            store.copy_session_artifacts(
                 source_session_id=source_session_id,
                 target_session_id=target_session_id,
                 target_session_key=target_session_key,
-                artifact_ids=artifact_ids,
+                artifact_ids=transcript_artifact_ids,
             )
+            store.copy_artifact_heads_for_fork(
+                source_session_id=source_session_id,
+                target_session_id=target_session_id,
+                target_session_key=target_session_key,
+                artifact_ids=head_artifact_ids,
+            )
+
+        def _copy_attachments() -> None:
+            from opensquilla.attachment_refs import copy_transcript_material
+
             copy_transcript_material(
                 media_root=media_root,
                 source_session_id=source_session_id,
@@ -1866,7 +1876,26 @@ class SessionManager:
             )
 
         try:
-            await asyncio.to_thread(_run)
+            from opensquilla.artifact_session import (
+                Actor,
+                ActorKind,
+                ArtifactSessionService,
+            )
+
+            service = await ArtifactSessionService.from_session_storage(self._storage)
+            snapshots = await service.snapshot_session_heads(session_id=source_session_id)
+            await asyncio.to_thread(
+                _copy_files,
+                tuple(snapshot.revision.artifact_id for snapshot in snapshots),
+            )
+            await service.fork_session_heads(
+                source_session_id=source_session_id,
+                target_session_id=target_session_id,
+                target_session_key=target_session_key,
+                snapshots=snapshots,
+                actor=Actor(ActorKind.SYSTEM, "session-fork"),
+            )
+            await asyncio.to_thread(_copy_attachments)
         except Exception:
             _log.warning(
                 "session.fork.material_copy_failed",
