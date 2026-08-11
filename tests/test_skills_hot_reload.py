@@ -5,9 +5,11 @@ import os
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.skills import loader as skill_loader_module
 from opensquilla.skills.loader import MAX_SKILL_FILE_BYTES, SkillLoader
 
 
@@ -592,6 +594,12 @@ def test_mutation_guard_hides_in_progress_write_until_next_access(tmp_path: Path
 def test_load_all_compatibility_probe_is_monotonic_throttled(
     tmp_path: Path, monkeypatch
 ) -> None:
+    monotonic_now = 10.0
+    monkeypatch.setattr(
+        skill_loader_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: monotonic_now),
+    )
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     loader = _loader(root, tmp_path)
@@ -610,7 +618,7 @@ def test_load_all_compatibility_probe_is_monotonic_throttled(
     loader.load_all()
     assert calls == 0
 
-    loader._last_probe_at = 0.0
+    monotonic_now += skill_loader_module._COMPAT_PROBE_INTERVAL_SECONDS
     loader.load_all()
     assert calls == 1
 
