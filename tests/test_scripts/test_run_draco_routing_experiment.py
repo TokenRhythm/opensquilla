@@ -3263,6 +3263,96 @@ def test_g1_attempt_consistency_ignores_only_analyzer_receipt_serialization(
     )
 
 
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_g1_missing_top_level_routing_backfills_only_from_matching_calls(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider import thinking_execution
+
+    routing_plan, physical_plan = _g1_lifecycle_receipt_serialization_plans()
+    monkeypatch.setattr(
+        module,
+        "ensemble_call_trace_sequence",
+        lambda _trace: ([{"selection_plan": physical_plan}], []),
+    )
+    monkeypatch.setattr(
+        thinking_execution,
+        "validate_thinking_execution_call",
+        lambda _prior, call: (call["selection_plan"], ""),
+    )
+    result = module.RunResult(
+        final_text="",
+        done=DoneEvent(ensemble_trace={"selection_plan": physical_plan}),
+        error="tool-enabled aggregation requires 2 fully completed proposer drafts",
+        routing_trace={},
+    )
+
+    assert module.backfill_g1_result_routing_trace_from_ensemble(
+        routing_plan,
+        result,
+    )
+    assert result.routing_trace["selection_plan"] == physical_plan
+    assert result.routing_trace["selection_plan_backfill"] == {
+        "source": "ensemble_call_trace",
+        "call_count": 1,
+    }
+    assert module.g1_attempt_plan_consistency_reason(routing_plan, result) == ""
+    assert result.error.startswith("tool-enabled aggregation requires 2")
+
+    tampered = deepcopy(physical_plan)
+    tampered["selected_A"] = "openrouter:tampered"
+    monkeypatch.setattr(
+        module,
+        "ensemble_call_trace_sequence",
+        lambda _trace: ([{"selection_plan": tampered}], []),
+    )
+    rejected = module.RunResult(
+        final_text="",
+        done=DoneEvent(ensemble_trace={"selection_plan": tampered}),
+        error="HTTP 402: insufficient credits",
+        routing_trace={},
+    )
+    assert not module.backfill_g1_result_routing_trace_from_ensemble(
+        routing_plan,
+        rejected,
+    )
+    assert rejected.routing_trace == {}
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+@pytest.mark.parametrize(
+    "existing_value",
+    [None, "corrupt-plan", [], {}],
+    ids=["none", "string", "list", "empty-mapping"],
+)
+def test_g1_routing_backfill_preserves_existing_selection_plan_evidence(
+    module,
+    existing_value: object,
+) -> None:
+    expected_plan, physical_plan = _g1_lifecycle_receipt_serialization_plans()
+    original_routing = {
+        "selection_plan": deepcopy(existing_value),
+        "preexisting_evidence": True,
+    }
+    result = module.RunResult(
+        final_text="",
+        done=DoneEvent(ensemble_trace={"selection_plan": physical_plan}),
+        error="HTTP 402: insufficient credits",
+        routing_trace=deepcopy(original_routing),
+    )
+
+    assert not module.backfill_g1_result_routing_trace_from_ensemble(
+        expected_plan,
+        result,
+    )
+    assert result.routing_trace == original_routing
+    assert (
+        module.g1_attempt_plan_consistency_reason(expected_plan, result)
+        == "g1_attempt_plan_provenance_invalid"
+    )
+
+
 @pytest.mark.parametrize("implementation", ["finalizer", "resume"])
 def test_g1_lifecycle_plan_ignores_real_analyzer_receipt_serialization(
     implementation: str,
@@ -4882,6 +4972,47 @@ async def test_transient_generation_failure_retries_same_roster_without_rebuild(
         for attempt in attempts
     )
     assert not hasattr(provider, "_draco_selected_retry_provider")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_invalid_native_recovery_roster_is_structured_pre_call_failure(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _k21_router_dynamic_plan()
+    plan["backup_P"] = [plan["selected_P"][0], "openrouter:b1"]
+    assert module.g1_provider_native_recovery_policy_reason(plan) == (
+        "invalid_g1_proposer_recovery_roster"
+    )
+
+    class Provider:
+        selection_plan = deepcopy(plan)
+
+    async def unexpected_paid_call(*_args, **_kwargs):
+        raise AssertionError("an invalid recovery roster must fail before a paid call")
+
+    monkeypatch.setattr(module, "collect_run", unexpected_paid_call)
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        Provider(),
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=2,
+    )
+
+    assert selected_attempt == 0
+    assert result.error == "invalid_g1_proposer_recovery_roster"
+    assert result.done is None
+    assert len(attempts) == 1
+    assert attempts[0]["attempt_kind"] == "generation_pre_call_guard"
+    assert attempts[0]["retry_reason"] == result.error
+    assert attempts[0]["retry_suppressed_reason"] == result.error
+    assert attempts[0]["will_retry"] is False
+    assert attempts[0]["run"]["llm_request_count"] == 0
+    assert attempts[0]["run"]["routing_trace"]["pre_call_guard"]["error"] == (
+        result.error
+    )
 
 
 @pytest.mark.asyncio
@@ -8157,6 +8288,7 @@ def test_no_done_paid_setup_unknown_usage_is_counted(module) -> None:
     assert summary["llm_request_count"] == 1
     assert summary["usage_unknown_count"] == 1
     assert summary["usage"]["model_usage_breakdown"] == [unknown_analyzer]
+    assert summary["setup_usage"] == [unknown_analyzer]
 
 
 def test_error_diagnostic_reconciles_skewed_trace_and_disjoint_receipt() -> None:
