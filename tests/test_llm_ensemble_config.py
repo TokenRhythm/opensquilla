@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import sys
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -10,11 +13,16 @@ import pytest
 
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
 from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
+from opensquilla.provider import ranking_router
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
 from opensquilla.provider.openai import _build_openai_wire_messages
 from opensquilla.provider.ranking_router import (
     DynamicRankingError,
+    _is_validated_ranking_config,
+    _prepare_effective_ranking_config,
+    canonical_json_bytes,
+    canonical_json_sha256,
     load_model_registry_snapshot,
 )
 from opensquilla.provider.selector import ProviderConfig
@@ -487,6 +495,137 @@ def test_llm_ensemble_can_refreeze_an_allowlisted_historical_ranking_base() -> N
     )
     assert "role_reliability" not in historical["base_config"]
     assert cfg.llm_ensemble.ranking_config_resolution_snapshot() == historical
+
+
+def test_llm_ensemble_prepared_ranking_cache_reuses_only_authenticated_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = GatewayConfig(llm_ensemble={"selection_mode": "router_dynamic"})
+    ensemble = cfg.llm_ensemble
+    prepared = ensemble.prepared_ranking_config()
+    expected = ensemble.ranking_config_resolution_snapshot()
+    original_validate = ranking_router._validate_ranking_config
+    validation_count = 0
+
+    def counted_validate(*args: Any, **kwargs: Any) -> Any:
+        nonlocal validation_count
+        validation_count += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(ranking_router, "_validate_ranking_config", counted_validate)
+    for _ in range(100):
+        cached = ensemble.prepared_ranking_config()
+        assert cached is prepared
+        assert (
+            _prepare_effective_ranking_config(
+                cached,
+                thinking_assignment_enabled=(
+                    ensemble.ranking_thinking_assignment_enabled
+                ),
+            )
+            is prepared
+        )
+
+    assert validation_count == 0
+    assert _is_validated_ranking_config(prepared) is True
+    assert canonical_json_sha256(prepared) == expected["effective_sha256"]
+    assert json.loads(canonical_json_bytes(prepared)) == expected["effective_config"]
+
+    # A byte-identical ordinary dict has no cache authority. It is validated
+    # and detached before becoming a distinct immutable root.
+    external = ensemble.ranking_config_effective_snapshot()
+    external_prepared = _prepare_effective_ranking_config(
+        external,
+        thinking_assignment_enabled=ensemble.ranking_thinking_assignment_enabled,
+    )
+    assert validation_count == 1
+    assert external_prepared is not prepared
+    external["rerank"]["similarity_penalty_weight"] = 0.0
+    assert external_prepared["rerank"]["similarity_penalty_weight"] != 0.0
+
+
+def test_llm_ensemble_prepared_ranking_cache_refreeze_evicts_without_turn_drift() -> None:
+    cfg = GatewayConfig(llm_ensemble={"selection_mode": "router_dynamic"})
+    ensemble = cfg.llm_ensemble
+    old_prepared = ensemble.prepared_ranking_config()
+    old_reference = weakref.ref(old_prepared)
+    old_sha256 = canonical_json_sha256(old_prepared)
+
+    ensemble.ranking_config_override = {"thinking_assignment": {"enabled": True}}
+    new_resolution = ensemble.freeze_ranking_config()
+    new_prepared = ensemble.prepared_ranking_config()
+
+    assert new_prepared is not old_prepared
+    assert old_prepared["schema_version"] == "step2-ranking-config-v3"
+    assert new_prepared["schema_version"] == "step2-ranking-config-v4"
+    assert ensemble.ranking_thinking_assignment_enabled is True
+    assert canonical_json_sha256(new_prepared) == new_resolution["effective_sha256"]
+    assert canonical_json_sha256(new_prepared) != old_sha256
+    assert canonical_json_sha256(old_prepared) == old_sha256
+    assert _prepare_effective_ranking_config(
+        old_prepared,
+        thinking_assignment_enabled=False,
+    ) is old_prepared
+
+    del old_prepared
+    gc.collect()
+    assert old_reference() is None
+
+
+def test_llm_ensemble_prepared_ranking_cache_deepcopy_and_gc_lifecycle() -> None:
+    cfg = GatewayConfig(llm_ensemble={"selection_mode": "router_dynamic"})
+    prepared = cfg.llm_ensemble.prepared_ranking_config()
+    prepared_reference = weakref.ref(prepared)
+    copied = cfg.model_copy(deep=True)
+
+    assert copied.llm_ensemble.prepared_ranking_config() is prepared
+    del prepared
+    del cfg
+    gc.collect()
+    assert prepared_reference() is not None
+
+    del copied
+    gc.collect()
+    assert prepared_reference() is None
+
+
+def test_llm_ensemble_prepared_ranking_cache_concurrent_refreeze_pairs_state() -> None:
+    cfg = GatewayConfig(llm_ensemble={"selection_mode": "router_dynamic"})
+    ensemble = cfg.llm_ensemble
+    current = ensemble.freeze_ranking_config()
+    historical = ensemble.freeze_ranking_config(
+        base_version="step2-ranking-2026-08-02.2"
+    )
+    allowed_hashes = {current["effective_sha256"], historical["effective_sha256"]}
+
+    def refreeze(base_version: str | None) -> None:
+        for _ in range(20):
+            ensemble.freeze_ranking_config(base_version=base_version)
+
+    def read_pairs() -> None:
+        for _ in range(200):
+            state = ensemble._ranking_config_frozen_state
+            assert state is not None
+            resolution, prepared = state
+            assert _is_validated_ranking_config(prepared) is True
+            assert resolution["effective_sha256"] in allowed_hashes
+            assert canonical_json_sha256(resolution["effective_config"]) == (
+                resolution["effective_sha256"]
+            )
+            assert canonical_json_sha256(prepared) == resolution["effective_sha256"]
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(refreeze, None),
+            executor.submit(
+                refreeze,
+                "step2-ranking-2026-08-02.2",
+            ),
+            executor.submit(read_pairs),
+            executor.submit(read_pairs),
+        ]
+        for future in futures:
+            future.result()
 
 
 def test_llm_ensemble_explicit_legacy_thinking_switch_conflict_fails_closed() -> None:

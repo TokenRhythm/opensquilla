@@ -580,7 +580,7 @@ async def test_router_dynamic_wrap_is_not_credential_gated(
     }.intersection(turn.metadata["router_dynamic_decision"])
 
 
-async def test_router_dynamic_full_turn_prepares_ranking_config_once(
+async def test_router_dynamic_full_turn_reuses_startup_prepared_ranking_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.provider import ranking_router
@@ -623,7 +623,7 @@ async def test_router_dynamic_full_turn_prepares_ranking_config_once(
 
     assert isinstance(provider, EnsembleProvider)
     assert turn.metadata["ensemble_enabled"] is True
-    assert validation_count == 1
+    assert validation_count == 0
     assert len(prepared_ids) >= 3
     assert len(set(prepared_ids)) == 1
 
@@ -813,8 +813,8 @@ async def test_router_dynamic_analyzer_admission_deadline_matches_execution_budg
     resolution["effective_config"] = ranking_config
     monkeypatch.setattr(
         type(config.llm_ensemble),
-        "ranking_config_resolution_snapshot",
-        lambda _self: deepcopy(resolution),
+        "prepared_ranking_config",
+        lambda _self: deepcopy(ranking_config),
     )
     monkeypatch.setattr(
         "opensquilla.engine.runtime.time",
@@ -1519,6 +1519,69 @@ async def test_router_dynamic_thinking_unavailable_fails_closed(
         )
 
 
+@pytest.mark.parametrize(
+    ("frozen_mode", "refrozen_mode", "expect_fail_closed"),
+    [(True, False, True), (False, True, False)],
+    ids=["old-enabled-new-disabled", "old-disabled-new-enabled"],
+)
+async def test_router_dynamic_selection_error_uses_inflight_frozen_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    frozen_mode: bool,
+    refrozen_mode: bool,
+    expect_fail_closed: bool,
+) -> None:
+    config = _static_b5_config(
+        selection_mode="router_dynamic",
+        ranking_thinking_assignment_enabled=frozen_mode,
+    )
+
+    async def analyzed_task(**kwargs: Any) -> TaskAnalysisResult:
+        ensemble = config.llm_ensemble
+        ensemble.ranking_thinking_assignment_enabled = refrozen_mode
+        resolution = ensemble.freeze_ranking_config()
+        assert resolution["thinking_assignment_enabled"] is refrozen_mode
+        return _successful_chain_analysis(kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.analyze_task_with_fallback_chain",
+        analyzed_task,
+    )
+
+    def fail_thinking_assignment(**_kwargs: Any) -> None:
+        raise DynamicRankingError(
+            "router_dynamic has no proposer: thinking_level_unavailable"
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ranking_router.rank_models",
+        fail_thinking_assignment,
+    )
+    runner = TurnRunner(provider_selector=None, config=config)
+    run = runner._run_pipeline(
+        "high-risk request",
+        f"agent:main:router-dynamic-refreeze-{frozen_mode}",
+        _Provider(),
+        _FakeSelector(provider="groq", api_key="sk-groq-synthetic"),
+        [],
+        "system prompt",
+        [],
+    )
+
+    if expect_fail_closed:
+        with pytest.raises(
+            DynamicRankingError,
+            match="thinking_level_unavailable",
+        ):
+            await run
+    else:
+        turn, provider = await run
+        assert isinstance(provider, _Provider)
+        assert not isinstance(provider, EnsembleProvider)
+        assert turn.metadata["ensemble_wrap_skipped_reason"] == (
+            "router_dynamic_ranking_unavailable"
+        )
+
+
 async def test_router_dynamic_analyzer_cleanup_failure_aborts_the_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1594,7 +1657,7 @@ async def test_router_dynamic_config_load_failure_fails_open_before_analysis(
     monkeypatch.setattr(
         (
             "opensquilla.gateway.config.LlmEnsembleConfig."
-            "ranking_config_resolution_snapshot"
+            "prepared_ranking_config"
         ),
         fail_config_load,
     )

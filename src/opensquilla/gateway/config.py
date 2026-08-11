@@ -646,6 +646,10 @@ class LlmEnsembleCanaryRolloutConfig(BaseModel):
         return self
 
 
+_RANKING_CONFIG_FROZEN_STATE_LOCK = threading.RLock()
+_RankingConfigFrozenState = tuple[dict[str, Any], Mapping[str, Any]]
+
+
 class LlmEnsembleConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_LLM_ENSEMBLE_",
@@ -680,7 +684,10 @@ class LlmEnsembleConfig(BaseSettings):
     # policy.  The ranking layer validates, fingerprints, and freezes the
     # merged effective configuration before any model call.
     ranking_config_override: dict[str, Any] = Field(default_factory=dict)
-    _ranking_config_resolution_frozen: dict[str, Any] | None = PrivateAttr(
+    # One atomic, per-config cache slot. The plain resolution remains the
+    # public serialization/replay surface while the second member is the
+    # factory-authenticated immutable graph reused by live turns.
+    _ranking_config_frozen_state: _RankingConfigFrozenState | None = PrivateAttr(
         default=None
     )
     proposer_tools: bool = False
@@ -838,18 +845,25 @@ class LlmEnsembleConfig(BaseSettings):
         *,
         base_version: str | None = None,
     ) -> dict[str, Any]:
-        """Validate and detach the selected router policy for this config."""
+        """Validate, fingerprint, and atomically publish one router policy."""
 
-        from opensquilla.provider.ranking_router import ranking_config_resolution
-
-        legacy_thinking_switch = (
-            self.ranking_thinking_assignment_enabled
-            if "ranking_thinking_assignment_enabled" in self.model_fields_set
-            else None
+        from opensquilla.provider.ranking_router import (
+            _canonical_hash,
+            _is_validated_ranking_config,
+            _prepare_effective_ranking_config,
+            ranking_config_resolution,
         )
+
+        with _RANKING_CONFIG_FROZEN_STATE_LOCK:
+            legacy_thinking_switch = (
+                self.ranking_thinking_assignment_enabled
+                if "ranking_thinking_assignment_enabled" in self.model_fields_set
+                else None
+            )
+            override = copy.deepcopy(self.ranking_config_override) or None
         resolution = ranking_config_resolution(
             thinking_assignment_enabled=legacy_thinking_switch,
-            override=(self.ranking_config_override or None),
+            override=override,
             base_version=base_version,
         )
         if "proposer_backup_count" in self.model_fields_set:
@@ -874,15 +888,44 @@ class LlmEnsembleConfig(BaseSettings):
         self.validate_router_dynamic_recovery_chain(
             effective_config=resolution.get("effective_config"),
         )
-        self.ranking_config_override = (
-            copy.deepcopy(normalized) if isinstance(normalized, dict) else {}
+        effective = resolution.get("effective_config")
+        expected_sha256 = resolution.get("effective_sha256")
+        thinking_assignment_enabled = (
+            resolution.get("thinking_assignment_enabled") is True
         )
-        object.__setattr__(
-            self,
-            "ranking_thinking_assignment_enabled",
-            resolution.get("thinking_assignment_enabled") is True,
+        if (
+            not isinstance(effective, Mapping)
+            or not isinstance(expected_sha256, str)
+            or _canonical_hash(effective) != expected_sha256
+        ):
+            raise ValueError(
+                "frozen router_dynamic ranking config hash binding is invalid"
+            )
+        prepared = _prepare_effective_ranking_config(
+            effective,
+            thinking_assignment_enabled=thinking_assignment_enabled,
         )
-        self._ranking_config_resolution_frozen = copy.deepcopy(resolution)
+        if (
+            not _is_validated_ranking_config(prepared)
+            or _canonical_hash(prepared) != expected_sha256
+        ):
+            raise ValueError(
+                "prepared router_dynamic ranking config differs from its frozen hash"
+            )
+        frozen_resolution = copy.deepcopy(resolution)
+        state = (frozen_resolution, prepared)
+        with _RANKING_CONFIG_FROZEN_STATE_LOCK:
+            self.ranking_config_override = (
+                copy.deepcopy(normalized) if isinstance(normalized, dict) else {}
+            )
+            object.__setattr__(
+                self,
+                "ranking_thinking_assignment_enabled",
+                thinking_assignment_enabled,
+            )
+            # Publishing one tuple keeps resolution/hash and prepared identity
+            # paired for concurrent readers. Refreeze is the sole eviction.
+            self._ranking_config_frozen_state = state
         return copy.deepcopy(resolution)
 
     def validate_router_dynamic_recovery_chain(
@@ -902,7 +945,9 @@ class LlmEnsembleConfig(BaseSettings):
             return
         effective = effective_config
         if not isinstance(effective, Mapping):
-            resolution = self._ranking_config_resolution_frozen
+            with _RANKING_CONFIG_FROZEN_STATE_LOCK:
+                state = self._ranking_config_frozen_state
+            resolution = state[0] if state is not None else None
             effective = (
                 resolution.get("effective_config")
                 if isinstance(resolution, Mapping)
@@ -942,9 +987,33 @@ class LlmEnsembleConfig(BaseSettings):
     def ranking_config_resolution_snapshot(self) -> dict[str, Any]:
         """Return the startup-frozen ranking resolution as a detached copy."""
 
-        if self._ranking_config_resolution_frozen is None:
-            return self.freeze_ranking_config()
-        return copy.deepcopy(self._ranking_config_resolution_frozen)
+        with _RANKING_CONFIG_FROZEN_STATE_LOCK:
+            state = self._ranking_config_frozen_state
+            if state is not None:
+                return copy.deepcopy(state[0])
+        return self.freeze_ranking_config()
+
+    def prepared_ranking_config(self) -> Mapping[str, Any]:
+        """Return the authenticated immutable policy cached for live turns.
+
+        Capacity is one graph per ``LlmEnsembleConfig``. Refreeze atomically
+        replaces the slot; any in-flight turn keeps the old immutable root
+        alive until its final reference is released.
+        """
+
+        from opensquilla.provider.ranking_router import (
+            _is_validated_ranking_config,
+        )
+
+        with _RANKING_CONFIG_FROZEN_STATE_LOCK:
+            state = self._ranking_config_frozen_state
+        if state is None:
+            self.freeze_ranking_config()
+            with _RANKING_CONFIG_FROZEN_STATE_LOCK:
+                state = self._ranking_config_frozen_state
+        if state is None or not _is_validated_ranking_config(state[1]):
+            raise ValueError("prepared router_dynamic ranking config is unavailable")
+        return state[1]
 
     def ranking_config_override_snapshot(self) -> dict[str, Any]:
         """Return the validated sparse override captured at config freeze time."""

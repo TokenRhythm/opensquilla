@@ -6854,10 +6854,15 @@ class TurnRunner:
                 turn.metadata["routed_model_before_ensemble"] = (
                     turn.model or getattr(current_provider_config, "model", "")
                 )
+                # The mode belongs to this turn's immutable ranking root. Keep
+                # it stable through error classification even if a concurrent
+                # config refreeze publishes a different mode.
+                thinking_assignment_enabled = False
                 try:
                     ranking_inputs: dict[str, Any] | None = None
                     if selection_mode == "router_dynamic":
                         from opensquilla.provider.ranking_router import (
+                            RANKING_CONFIG_SCHEMA_VERSION,
                             DynamicRankingError,
                             TaskAnalyzerCandidate,
                             _prepare_effective_ranking_config,
@@ -6870,12 +6875,40 @@ class TurnRunner:
                             task_analyzer_policy,
                         )
 
-                        frozen_resolution_snapshot = getattr(
+                        prepared_ranking_config = getattr(
                             ensemble_cfg,
-                            "ranking_config_resolution_snapshot",
+                            "prepared_ranking_config",
                             None,
                         )
-                        if callable(frozen_resolution_snapshot):
+                        frozen_resolution_snapshot = None
+                        if callable(prepared_ranking_config):
+                            ranking_config = prepared_ranking_config()
+                            if not isinstance(ranking_config, Mapping):
+                                raise DynamicRankingError(
+                                    "prepared router_dynamic ranking config is unavailable"
+                                )
+                            # Derive the mode from the same immutable root. A
+                            # concurrent refreeze may update the config object,
+                            # but an in-flight turn must keep its old pair.
+                            thinking_policy = ranking_config.get(
+                                "thinking_assignment"
+                            )
+                            thinking_assignment_enabled = bool(
+                                ranking_config.get("schema_version")
+                                == RANKING_CONFIG_SCHEMA_VERSION
+                                and isinstance(thinking_policy, Mapping)
+                                and thinking_policy.get("enabled") is True
+                            )
+                        else:
+                            frozen_resolution_snapshot = getattr(
+                                ensemble_cfg,
+                                "ranking_config_resolution_snapshot",
+                                None,
+                            )
+                        if (
+                            not callable(prepared_ranking_config)
+                            and callable(frozen_resolution_snapshot)
+                        ):
                             frozen_resolution = frozen_resolution_snapshot()
                             ranking_config = frozen_resolution.get(
                                 "effective_config"
@@ -6890,7 +6923,7 @@ class TurnRunner:
                                 )
                                 is True
                             )
-                        else:
+                        elif not callable(prepared_ranking_config):
                             thinking_assignment_enabled = bool(
                                 getattr(
                                     ensemble_cfg,
@@ -7162,13 +7195,6 @@ class TurnRunner:
                     )
                     raise
                 except dynamic_selection_errors as exc:
-                    thinking_assignment_enabled = bool(
-                        getattr(
-                            getattr(turn_config, "llm_ensemble", None),
-                            "ranking_thinking_assignment_enabled",
-                            False,
-                        )
-                    )
                     thinking_fail_closed = (
                         thinking_assignment_enabled
                         and (

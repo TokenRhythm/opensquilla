@@ -4204,6 +4204,94 @@ def test_router_dynamic_selection_plan_is_materialized_without_rewriting_members
     )
 
 
+def test_router_dynamic_direct_build_reuses_prepared_config_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+        },
+    )
+    ensemble_type = type(config.llm_ensemble)
+    original_prepared = ensemble_type.prepared_ranking_config
+    cache_reads = 0
+
+    def counted_prepared(self: Any) -> Any:
+        nonlocal cache_reads
+        cache_reads += 1
+        return original_prepared(self)
+
+    def reject_plain_snapshot(_self: Any) -> Any:
+        raise AssertionError("direct build must not deepcopy the frozen resolution")
+
+    monkeypatch.setattr(ensemble_type, "prepared_ranking_config", counted_prepared)
+    monkeypatch.setattr(
+        ensemble_type,
+        "ranking_config_resolution_snapshot",
+        reject_plain_snapshot,
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+    )
+
+    assert provider.selection_plan["ranking_config_hash"]
+    assert cache_reads == 1
+
+
+def test_router_dynamic_inflight_prepared_config_keeps_its_frozen_mode() -> None:
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+        },
+    )
+    old_resolution = config.llm_ensemble.ranking_config_resolution_snapshot()
+    old_prepared = config.llm_ensemble.prepared_ranking_config()
+    config.llm_ensemble.ranking_config_override = {
+        "thinking_assignment": {"enabled": True}
+    }
+    config.llm_ensemble.freeze_ranking_config()
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+        ranking_inputs={"ranking_config": old_prepared},
+    )
+
+    assert config.llm_ensemble.ranking_thinking_assignment_enabled is True
+    assert provider.selection_plan["ranking_config_hash"] == (
+        old_resolution["effective_sha256"]
+    )
+    assert provider.selection_plan.get("thinking_assignment") is None
+
+
 def test_router_dynamic_invalid_analysis_materializes_fixed_complete_only_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

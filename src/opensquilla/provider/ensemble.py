@@ -20217,10 +20217,12 @@ def _build_router_dynamic_members(
     """Build members from the profile-driven Step2 ranking decision."""
 
     from .ranking_router import (
+        RANKING_CONFIG_SCHEMA_VERSION,
         DynamicRankingError,
         TaskAnalysisResult,
         _canonical_hash,
         _detached_ranking_config,
+        _is_validated_ranking_config,
         _legacy_registry_snapshot_projection,
         _prepare_effective_ranking_config,
         _request_context_hash,
@@ -20254,26 +20256,42 @@ def _build_router_dynamic_members(
         ensemble_cfg
     )
     min_success_explicit = "min_successful_proposers" in ensemble_fields_set
-    frozen_resolution_snapshot = getattr(
+    prepared_ranking_config = getattr(
         ensemble_cfg,
-        "ranking_config_resolution_snapshot",
+        "prepared_ranking_config",
         None,
     )
-    frozen_resolution = (
-        frozen_resolution_snapshot()
-        if callable(frozen_resolution_snapshot)
-        else None
-    )
-    thinking_assignment_enabled = (
-        frozen_resolution.get("thinking_assignment_enabled") is True
-        if isinstance(frozen_resolution, Mapping)
-        else getattr(
-            ensemble_cfg,
-            "ranking_thinking_assignment_enabled",
-            False,
+    if callable(prepared_ranking_config):
+        frozen_resolution = None
+        thinking_assignment_enabled = (
+            getattr(
+                ensemble_cfg,
+                "ranking_thinking_assignment_enabled",
+                False,
+            )
+            is True
         )
-        is True
-    )
+    else:
+        frozen_resolution_snapshot = getattr(
+            ensemble_cfg,
+            "ranking_config_resolution_snapshot",
+            None,
+        )
+        frozen_resolution = (
+            frozen_resolution_snapshot()
+            if callable(frozen_resolution_snapshot)
+            else None
+        )
+        thinking_assignment_enabled = (
+            frozen_resolution.get("thinking_assignment_enabled") is True
+            if isinstance(frozen_resolution, Mapping)
+            else getattr(
+                ensemble_cfg,
+                "ranking_thinking_assignment_enabled",
+                False,
+            )
+            is True
+        )
     inputs = dict(ranking_inputs or {})
     raw_generation_policy = inputs.get("generation_policy")
     generation_policy = (
@@ -20284,11 +20302,11 @@ def _build_router_dynamic_members(
     registry_allowlist = inputs.get("registry_allowlist")
     ranking_config = inputs.get("ranking_config")
     if not isinstance(ranking_config, Mapping):
-        frozen_effective = (
-            frozen_resolution.get("effective_config")
-            if isinstance(frozen_resolution, Mapping)
-            else None
-        )
+        frozen_effective = None
+        if callable(prepared_ranking_config):
+            frozen_effective = prepared_ranking_config()
+        elif isinstance(frozen_resolution, Mapping):
+            frozen_effective = frozen_resolution.get("effective_config")
         if isinstance(frozen_effective, Mapping):
             ranking_config = frozen_effective
         else:
@@ -20306,6 +20324,15 @@ def _build_router_dynamic_members(
                 thinking_assignment_enabled=thinking_assignment_enabled,
                 override=frozen_override or None,
             )
+    if _is_validated_ranking_config(ranking_config):
+        # Bind the mode to the exact immutable root carried by this turn. A
+        # config refreeze may already have published a newer root and mode.
+        thinking_policy = ranking_config.get("thinking_assignment")
+        thinking_assignment_enabled = bool(
+            ranking_config.get("schema_version") == RANKING_CONFIG_SCHEMA_VERSION
+            and isinstance(thinking_policy, Mapping)
+            and thinking_policy.get("enabled") is True
+        )
     ranking_config = _prepare_effective_ranking_config(
         ranking_config,
         thinking_assignment_enabled=thinking_assignment_enabled,
