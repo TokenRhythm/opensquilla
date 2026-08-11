@@ -102,6 +102,11 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "task_analyzer_observed": False,
         "aggregator_recovery_observed": False,
         "aggregator_stage_observed": False,
+        "aggregator_physical_request_count_observed": False,
+        "runtime_health_filter_observed": False,
+        "aggregator_final_request_usage_container_observed": False,
+        "aggregator_final_request_usage_projection_complete": False,
+        "aggregator_final_request_usage_observed": False,
         "trace_size_observed": True,
         "trace_compact_json_bytes": len(
             json.dumps(
@@ -121,12 +126,60 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "proposer_elapsed_observation_count": 2,
         "proposer_candidate_elapsed_ms_max": 250,
         "proposer_candidate_elapsed_ms_total": 370,
+        "proposer_runtime_health_observed": False,
+        "proposer_runtime_health_observation_count": 0,
+        "proposer_runtime_health_tracked_observation_count": 0,
+        "proposer_runtime_health_tracked_count": 0,
+        "proposer_runtime_health_state_observation_count": 0,
+        "proposer_runtime_health_healthy_count": 0,
+        "proposer_runtime_health_benched_count": 0,
+        "proposer_runtime_health_half_open_count": 0,
+        "proposer_runtime_health_unknown_state_count": 0,
+        "proposer_runtime_health_probe_observation_count": 0,
+        "proposer_runtime_health_probe_count": 0,
+        "proposer_runtime_health_benched_deferred_count": 0,
+        "proposer_runtime_health_half_open_busy_deferred_count": 0,
+        "proposer_runtime_health_unknown_deferred_count": 0,
+        "proposer_logical_terminal_http_status_observed": False,
+        "proposer_logical_terminal_http_status_observation_count": 0,
+        "proposer_logical_terminal_rate_limited_count": 0,
+        "proposer_logical_terminal_upstream_5xx_count": 0,
+        "proposer_physical_request_count_observation_count": 0,
+        "proposer_physical_request_count_observed": False,
+        "proposer_unknown_usage_count_observation_count": 0,
+        "proposer_unknown_usage_count_observed": False,
+        "proposer_usage_observed": False,
+        "proposer_usage_projection_complete": False,
+        "proposer_usage_container_observation_count": 0,
+        "proposer_usage_row_scan_count": 0,
+        "proposer_usage_row_scan_capped": False,
+        "proposer_usage_receipt_count": 0,
+        "proposer_usage_unknown_row_count": 0,
+        "proposer_usage_malformed_row_count": 0,
+        "proposer_usage_row_count_observed": False,
+        "proposer_input_tokens_observation_count": 0,
+        "proposer_output_tokens_observation_count": 0,
+        "proposer_reasoning_tokens_observation_count": 0,
+        "proposer_cache_read_tokens_observation_count": 0,
+        "proposer_cache_write_tokens_observation_count": 0,
+        "proposer_billed_cost_usd_observation_count": 0,
         "admission_observation_count": 3,
         "admission_wait_observation_count": 3,
         "admission_timeout_count": 1,
         "admission_rejected_count": 0,
         "admission_wait_ms_max": 50,
         "admission_wait_ms_total": 60,
+        "proposer_admission_observed": True,
+        "proposer_admission_projection_complete": False,
+        "proposer_admission_observation_count": 2,
+        "proposer_admission_wait_observation_count": 2,
+        "proposer_admission_admitted_count_lower_bound": 1,
+        "proposer_admission_timeout_count_lower_bound": 1,
+        "proposer_admission_rejected_count_lower_bound": 0,
+        "proposer_admission_wait_ms_max_lower_bound": 50,
+        "proposer_admission_wait_ms_total_lower_bound": 57,
+        "aggregator_admission_observed": False,
+        "aggregator_admission_projection_complete": False,
         "quorum_observed": True,
         "quorum_reached_observed": True,
         "quorum_reached": True,
@@ -241,6 +294,7 @@ def test_terminal_trace_projects_analyzer_and_aggregator_recovery() -> None:
     assert metrics["aggregator_primary_attempt_count"] == 1
     assert metrics["aggregator_continuation_attempt_count"] == 1
     assert metrics["aggregator_request_started_count"] == 2
+    assert metrics["aggregator_physical_request_count_observed"] is True
     assert metrics["aggregator_physical_request_count"] == 2
     assert metrics["aggregator_succeeded_attempt_count"] == 1
     assert metrics["aggregator_failed_attempt_count"] == 1
@@ -256,6 +310,641 @@ def test_terminal_trace_projects_analyzer_and_aggregator_recovery() -> None:
     assert metrics["aggregator_continuation_count"] == 1
     assert metrics["aggregator_same_model_recovery_count"] == 0
     assert private_text not in json.dumps(metrics, sort_keys=True)
+
+
+def test_terminal_trace_projects_role_health_admission_usage_and_failures() -> None:
+    private_text = "private provider/model/error/identity text"
+    trace: dict[str, Any] = {
+        "selection_plan": {
+            "runtime_health_filter": {
+                "enabled": True,
+                "input_candidate_count": 3,
+                "fresh_deployment_count": 2,
+                "requires_rerank": True,
+                "active_unavailable_by_role": {
+                    "proposer": 1,
+                    "aggregator": 2,
+                },
+                "filtered_by_role": {"proposer": 1, "aggregator": 1},
+                "half_open_by_role": {"proposer": 1, "aggregator": 0},
+                "never_strand_minimum_by_role": {
+                    "proposer": 2,
+                    "aggregator": 1,
+                },
+                "never_strand_exempt_identities_by_role": {
+                    "proposer": [private_text],
+                    "aggregator": [private_text, private_text],
+                },
+                "never_strand": True,
+            }
+        },
+        "candidates": [
+            {
+                "request_started": True,
+                "physical_request_count": 2,
+                "usage_missing_count": 1,
+                "error_code": "429",
+                "execution": {
+                    "admission": {"outcome": "admitted", "wait_ms": 5},
+                    "runtime_health_admission": {
+                        "state": "healthy",
+                        "reason": "",
+                        "probe": False,
+                        "tracked": True,
+                    },
+                },
+                "model_usage_breakdown": [
+                    {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "reasoning_tokens": 1,
+                        "cached_tokens": 4,
+                        "cache_write_tokens": 3,
+                        "billed_cost": 0.12,
+                        "provider": private_text,
+                    },
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "billed_cost": 0.0,
+                        "usage_unknown": True,
+                        "provider_usage": {"usage_unknown": True},
+                        "requested_model": private_text,
+                    },
+                ],
+            },
+            {
+                "request_started": False,
+                "physical_request_count": 0,
+                "usage_missing_count": 0,
+                "error_code": private_text,
+                "execution": {
+                    "admission": {"outcome": "timeout", "wait_ms": 7},
+                    "runtime_health_admission": {
+                        "state": "benched",
+                        "reason": "runtime_deployment_benched",
+                        "probe": False,
+                        "tracked": True,
+                    },
+                },
+                "model_usage_breakdown": [],
+            },
+            {
+                "request_started": True,
+                "physical_request_count": 1,
+                "usage_missing_count": 0,
+                "error_code": "503",
+                "execution": {
+                    "runtime_health_admission": {
+                        "state": "half_open",
+                        "reason": "",
+                        "probe": True,
+                        "tracked": True,
+                    }
+                },
+                "model_usage_breakdown": [
+                    {
+                        "input_tokens": 20,
+                        "output_tokens": 4,
+                        "reasoning_tokens": 2,
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "billed_cost": 0.34,
+                        "model": private_text,
+                    }
+                ],
+            },
+        ],
+        "aggregator_recovery": {
+            "attempts": [
+                {
+                    "kind": "primary",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "outcome": "failed",
+                    "code": "503",
+                },
+                {
+                    "kind": "model_fallback",
+                    "request_started": False,
+                    "physical_request_count": 0,
+                    "outcome": "runtime_health_deferred",
+                    "code": "runtime_deployment_half_open_busy",
+                },
+                {
+                    "kind": "continuation",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "outcome": "succeeded",
+                    "code": private_text,
+                },
+            ],
+            "success": True,
+            "selected_kind": "continuation",
+        },
+        "final_request": {
+            "role": "aggregator",
+            "execution": {
+                "admission": {
+                    "role": "aggregator_recovery",
+                    "outcome": "admitted",
+                    "wait_ms": 2,
+                }
+            },
+            "usage": {
+                "input_tokens": 30,
+                "output_tokens": 6,
+                "reasoning_tokens": 3,
+                "cached_tokens": 5,
+                "cache_write_tokens": 1,
+                "billed_cost": 0.56,
+                "provider": private_text,
+                "model": private_text,
+            },
+        },
+    }
+    before = deepcopy(trace)
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert trace == before
+    assert metrics["runtime_health_filter_observed"] is True
+    assert metrics["runtime_health_fresh_deployment_count"] == 2
+    assert metrics["runtime_health_proposer_half_open_count"] == 1
+    assert metrics["runtime_health_aggregator_active_unavailable_count"] == 2
+    assert metrics["runtime_health_proposer_never_strand_exempt_count"] == 1
+    assert metrics["runtime_health_aggregator_never_strand_exempt_count"] == 2
+    assert metrics["proposer_runtime_health_observation_count"] == 3
+    assert metrics["proposer_runtime_health_tracked_count"] == 3
+    assert metrics["proposer_runtime_health_healthy_count"] == 1
+    assert metrics["proposer_runtime_health_benched_count"] == 1
+    assert metrics["proposer_runtime_health_half_open_count"] == 1
+    assert metrics["proposer_runtime_health_probe_count"] == 1
+    assert metrics["proposer_runtime_health_benched_deferred_count"] == 1
+    assert metrics["proposer_logical_terminal_rate_limited_count"] == 1
+    assert metrics["proposer_logical_terminal_upstream_5xx_count"] == 1
+    assert metrics["aggregator_runtime_health_deferred_count"] == 1
+    assert metrics[
+        "aggregator_runtime_health_half_open_busy_deferred_count"
+    ] == 1
+    assert metrics["aggregator_logical_terminal_upstream_5xx_count"] == 1
+    assert metrics["proposer_admission_observation_count"] == 2
+    assert metrics["proposer_admission_projection_complete"] is False
+    assert metrics["proposer_admission_admitted_count_lower_bound"] == 1
+    assert metrics["proposer_admission_timeout_count_lower_bound"] == 1
+    assert metrics["proposer_admission_wait_ms_total_lower_bound"] == 12
+    assert metrics["aggregator_admission_observation_count"] == 1
+    assert metrics["aggregator_admission_projection_complete"] is False
+    assert metrics["aggregator_admission_admitted_count_lower_bound"] == 1
+    assert metrics["aggregator_admission_wait_ms_total_lower_bound"] == 2
+    assert "aggregator_admission_admitted_count" not in metrics
+    assert metrics["proposer_physical_request_count"] == 3
+    assert metrics["proposer_unknown_usage_count"] == 1
+    assert metrics["proposer_usage_projection_complete"] is False
+    assert metrics["proposer_usage_row_count_observed"] is False
+    assert metrics["proposer_usage_receipt_count"] == 2
+    assert metrics["proposer_usage_unknown_row_count"] == 1
+    assert "proposer_input_tokens" not in metrics
+    assert "proposer_output_tokens" not in metrics
+    assert "proposer_reasoning_tokens" not in metrics
+    assert "proposer_cache_read_tokens" not in metrics
+    assert "proposer_cache_write_tokens" not in metrics
+    assert "proposer_cache_hit_request_count" not in metrics
+    assert "proposer_billed_cost_usd" not in metrics
+    assert metrics["aggregator_physical_request_count"] == 2
+    assert metrics["aggregator_physical_request_count_observed"] is True
+    assert metrics["aggregator_final_request_usage_projection_complete"] is True
+    assert metrics["aggregator_final_request_usage_observed"] is True
+    assert metrics["aggregator_final_request_input_tokens"] == 30
+    assert metrics["aggregator_final_request_cache_read_tokens"] == 5
+    assert metrics["aggregator_final_request_cache_hit"] is True
+    assert metrics[
+        "aggregator_final_request_billed_cost_usd"
+    ] == pytest.approx(0.56)
+    assert private_text not in json.dumps(metrics, sort_keys=True)
+
+
+def test_proposer_admission_exactness_requires_one_to_one_attempt_evidence() -> None:
+    exact = build_ensemble_execution_metrics(
+        {
+            "candidates": [
+                {
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "usage_missing_count": 1,
+                    "execution": {
+                        "admission": {
+                            "outcome": "admitted",
+                            "wait_ms": 3,
+                        }
+                    },
+                },
+                {
+                    "request_started": False,
+                    "physical_request_count": 0,
+                    "usage_missing_count": 0,
+                    "error_code": "ensemble_provider_admission_timeout",
+                    "execution": {
+                        "admission": {
+                            "outcome": "timeout",
+                            "wait_ms": 11,
+                        }
+                    },
+                },
+            ]
+        },
+        terminal_outcome="failed",
+    )
+
+    assert exact["proposer_admission_projection_complete"] is True
+    assert exact["proposer_admission_admitted_count"] == 1
+    assert exact["proposer_admission_timeout_count"] == 1
+    assert exact["proposer_admission_wait_ms_total"] == 14
+    assert "proposer_admission_admitted_count_lower_bound" not in exact
+
+    hidden_error = build_ensemble_execution_metrics(
+        {
+            "candidates": [
+                {
+                    "request_started": False,
+                    "physical_request_count": 0,
+                    "usage_missing_count": 0,
+                    "error_code": "ensemble_provider_admission_timeout",
+                }
+            ]
+        },
+        terminal_outcome="failed",
+    )
+    assert hidden_error["proposer_admission_observed"] is True
+    assert hidden_error["proposer_admission_projection_complete"] is False
+    assert "proposer_admission_timeout_count" not in hidden_error
+
+    multi_request = build_ensemble_execution_metrics(
+        {
+            "candidates": [
+                {
+                    "request_started": True,
+                    "physical_request_count": 2,
+                    "usage_missing_count": 2,
+                    "execution": {
+                        "admission": {
+                            "outcome": "admitted",
+                            "wait_ms": 5,
+                        }
+                    },
+                }
+            ]
+        },
+        terminal_outcome="failed",
+    )
+    assert multi_request["proposer_admission_projection_complete"] is False
+    assert multi_request["proposer_admission_admitted_count_lower_bound"] == 1
+    assert "proposer_admission_admitted_count" not in multi_request
+
+
+def test_aggregator_admission_exactness_requires_one_joined_attempt() -> None:
+    exact = build_ensemble_execution_metrics(
+        {
+            "aggregator_recovery": {
+                "attempts": [
+                    {
+                        "kind": "primary",
+                        "request_started": True,
+                        "physical_request_count": 1,
+                        "outcome": "succeeded",
+                    }
+                ]
+            },
+            "final_request": {
+                "role": "aggregator",
+                "execution": {
+                    "admission": {
+                        "role": "aggregator",
+                        "outcome": "admitted",
+                        "wait_ms": 4,
+                    }
+                },
+            },
+        },
+        terminal_outcome="completed",
+    )
+
+    assert exact["aggregator_admission_observed"] is True
+    assert exact["aggregator_admission_projection_complete"] is True
+    assert exact["aggregator_admission_admitted_count"] == 1
+    assert exact["aggregator_admission_wait_ms_total"] == 4
+    assert "aggregator_admission_admitted_count_lower_bound" not in exact
+
+    missing_attempt_evidence = build_ensemble_execution_metrics(
+        {
+            "final_request": {
+                "role": "aggregator",
+                "execution": {
+                    "admission": {
+                        "role": "aggregator",
+                        "outcome": "admitted",
+                        "wait_ms": 2,
+                    }
+                },
+            }
+        },
+        terminal_outcome="completed",
+    )
+    assert missing_attempt_evidence["aggregator_admission_projection_complete"] is False
+    assert missing_attempt_evidence["aggregator_admission_admitted_count_lower_bound"] == 1
+
+
+@pytest.mark.parametrize("recovery_kind", ["continuation", "model_fallback"])
+def test_aggregator_admission_is_lower_bound_after_multiple_attempts(
+    recovery_kind: str,
+) -> None:
+    metrics = build_ensemble_execution_metrics(
+        {
+            "aggregator_recovery": {
+                "attempts": [
+                    {
+                        "kind": "primary",
+                        "request_started": True,
+                        "physical_request_count": 1,
+                        "outcome": "failed",
+                    },
+                    {
+                        "kind": recovery_kind,
+                        "request_started": True,
+                        "physical_request_count": 1,
+                        "outcome": "succeeded",
+                    },
+                ]
+            },
+            "final_request": {
+                "role": "aggregator",
+                "execution": {
+                    "admission": {
+                        "role": "aggregator_recovery",
+                        "outcome": "admitted",
+                        "wait_ms": 3,
+                    }
+                },
+            },
+        },
+        terminal_outcome="completed",
+    )
+
+    assert metrics["aggregator_admission_observed"] is True
+    assert metrics["aggregator_admission_projection_complete"] is False
+    assert metrics["aggregator_admission_admitted_count_lower_bound"] == 1
+    assert metrics["aggregator_admission_wait_ms_total_lower_bound"] == 3
+    assert "aggregator_admission_admitted_count" not in metrics
+
+
+def test_proposer_usage_totals_require_every_physical_usage_receipt() -> None:
+    complete = build_ensemble_execution_metrics(
+        {
+            "candidates": [
+                {
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "usage_missing_count": 0,
+                    "model_usage_breakdown": [
+                        {
+                            "input_tokens": 12,
+                            "output_tokens": 3,
+                            "reasoning_tokens": 2,
+                            "cached_tokens": 4,
+                            "cache_write_tokens": 1,
+                            "billed_cost": 0.25,
+                        }
+                    ],
+                }
+            ]
+        },
+        terminal_outcome="completed",
+    )
+
+    assert complete["proposer_usage_projection_complete"] is True
+    assert complete["proposer_input_tokens"] == 12
+    assert complete["proposer_cache_hit_request_count"] == 1
+    assert complete["proposer_billed_cost_usd"] == pytest.approx(0.25)
+
+    missing = build_ensemble_execution_metrics(
+        {
+            "candidates": [
+                {
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "usage_missing_count": 1,
+                    "model_usage_breakdown": [
+                        {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "billed_cost": 0.0,
+                            "usage_unknown": True,
+                        }
+                    ],
+                }
+            ]
+        },
+        terminal_outcome="failed",
+    )
+    assert missing["proposer_unknown_usage_count"] == 1
+    assert missing["proposer_usage_projection_complete"] is False
+    assert "proposer_input_tokens" not in missing
+    assert "proposer_billed_cost_usd" not in missing
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.0,
+            "usage_missing_count": 1,
+        },
+        {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.0,
+        },
+        {
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "billed_cost": 0.1,
+        },
+    ],
+)
+def test_aggregator_final_usage_omits_missing_or_incomplete_evidence(
+    usage: dict[str, Any],
+) -> None:
+    metrics = build_ensemble_execution_metrics(
+        {"final_request": {"role": "aggregator", "usage": usage}},
+        terminal_outcome="completed",
+    )
+
+    assert metrics["aggregator_final_request_usage_container_observed"] is True
+    assert metrics["aggregator_final_request_usage_projection_complete"] is False
+    assert metrics["aggregator_final_request_usage_observed"] is False
+    assert "aggregator_final_request_input_tokens" not in metrics
+    assert "aggregator_final_request_billed_cost_usd" not in metrics
+
+
+def test_contradictory_predispatch_evidence_is_not_health_unavailable() -> None:
+    metrics = build_ensemble_execution_metrics(
+        {
+            "candidates": [
+                {
+                    "request_started": False,
+                    "physical_request_count": 1,
+                    "usage_missing_count": 1,
+                    "execution": {
+                        "runtime_health_admission": {
+                            "tracked": True,
+                            "state": "benched",
+                            "reason": "runtime_deployment_benched",
+                            "probe": False,
+                        }
+                    },
+                }
+            ],
+            "aggregator_recovery": {
+                "attempts": [
+                    {
+                        "kind": "model_fallback",
+                        "request_started": False,
+                        "physical_request_count": 1,
+                        "outcome": "runtime_health_deferred",
+                        "code": "runtime_deployment_benched",
+                    }
+                ]
+            },
+        },
+        terminal_outcome="failed",
+    )
+
+    assert metrics["proposer_runtime_health_benched_deferred_count"] == 0
+    assert metrics["aggregator_unavailable_attempt_count"] == 0
+    assert metrics["aggregator_runtime_health_deferred_count"] == 0
+    assert metrics["aggregator_unknown_outcome_attempt_count"] == 1
+
+
+def test_role_metric_projection_omits_unproven_or_capped_aggregates() -> None:
+    private_text = "private model/code/text"
+    malformed_trace = {
+        "candidates": [
+            {
+                "request_started": True,
+                "physical_request_count": 1,
+                "usage_missing_count": 1,
+                "error_code": private_text,
+                "execution": {
+                    "runtime_health_admission": {
+                        "state": private_text,
+                        "reason": private_text,
+                        "probe": 1,
+                        "tracked": "yes",
+                    }
+                },
+                "model_usage_breakdown": [
+                    {
+                        "usage_unknown": True,
+                        "provider_usage": {"usage_unknown": True},
+                        "provider": private_text,
+                    },
+                    private_text,
+                    {
+                        "input_tokens": True,
+                        "output_tokens": -1,
+                        "reasoning_tokens": float("nan"),
+                        "cached_tokens": "3",
+                        "cache_write_tokens": None,
+                        "billed_cost": 10**1000,
+                    },
+                ],
+            }
+        ],
+        "final_request": {
+            "role": "aggregator",
+            "usage": {
+                "input_tokens": True,
+                "cached_tokens": -1,
+                "billed_cost": 10**1000,
+                "model": private_text,
+            },
+        },
+    }
+
+    metrics = build_ensemble_execution_metrics(
+        malformed_trace,
+        terminal_outcome="failed",
+    )
+
+    assert metrics["proposer_runtime_health_unknown_state_count"] == 1
+    assert metrics["proposer_logical_terminal_http_status_observed"] is False
+    assert metrics["proposer_usage_unknown_row_count"] == 1
+    assert metrics["proposer_usage_malformed_row_count"] == 1
+    assert metrics["proposer_usage_projection_complete"] is False
+    assert metrics["proposer_usage_receipt_count"] == 1
+    assert metrics["proposer_input_tokens_observation_count"] == 0
+    assert metrics["proposer_billed_cost_usd_observation_count"] == 0
+    assert "proposer_input_tokens" not in metrics
+    assert "proposer_billed_cost_usd" not in metrics
+    assert metrics["aggregator_final_request_usage_container_observed"] is True
+    assert metrics["aggregator_final_request_usage_projection_complete"] is False
+    assert metrics["aggregator_final_request_usage_observed"] is False
+    assert "aggregator_final_request_input_tokens_observed" not in metrics
+    assert "aggregator_final_request_billed_cost_usd_observed" not in metrics
+    assert "aggregator_final_request_billed_cost_usd" not in metrics
+    assert private_text not in json.dumps(metrics, sort_keys=True)
+
+    capped_trace = {
+        "candidates": [
+            {
+                "physical_request_count": 1,
+                "usage_missing_count": 0,
+                "model_usage_breakdown": [
+                    {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "billed_cost": 0.01,
+                    }
+                ],
+            }
+            for _ in range(65)
+        ]
+    }
+    capped = build_ensemble_execution_metrics(
+        capped_trace,
+        terminal_outcome="completed",
+    )
+
+    assert capped["proposer_candidate_scan_capped"] is True
+    assert capped["proposer_physical_request_count_observed"] is False
+    assert "proposer_physical_request_count" not in capped
+    assert capped["proposer_usage_row_scan_capped"] is True
+    assert capped["proposer_usage_projection_complete"] is False
+    assert capped["proposer_usage_row_count_observed"] is False
+    assert "proposer_usage_row_count" not in capped
+    assert "proposer_input_tokens" not in capped
 
 
 def test_preinitialized_recovery_block_does_not_enter_aggregator_denominator() -> None:
@@ -284,6 +973,8 @@ def test_preinitialized_recovery_block_does_not_enter_aggregator_denominator() -
     assert metrics["aggregator_recovery_attempts_observed"] is True
     assert metrics["aggregator_recovery_attempt_count"] == 0
     assert metrics["aggregator_stage_observed"] is False
+    assert metrics["aggregator_physical_request_count_observed"] is False
+    assert "aggregator_physical_request_count" not in metrics
     assert metrics["aggregator_recovery_success_observed"] is False
     assert "aggregator_recovery_success" not in metrics
     assert metrics["aggregator_recovery_exhausted_observed"] is False
@@ -440,7 +1131,8 @@ def test_stage_projection_is_bounded_and_malformed_values_are_omitted() -> None:
     assert metrics["aggregator_unavailable_attempt_count"] == 16
     assert metrics["aggregator_unknown_outcome_attempt_count"] == 0
     assert metrics["aggregator_request_started_count"] == 0
-    assert metrics["aggregator_physical_request_count"] == 0
+    assert metrics["aggregator_physical_request_count_observed"] is False
+    assert "aggregator_physical_request_count" not in metrics
     assert metrics["aggregator_selected_kind"] == "unknown"
     assert metrics["aggregator_fallback_index_observed"] is False
     assert "aggregator_fallback_index" not in metrics
