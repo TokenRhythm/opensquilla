@@ -6790,6 +6790,389 @@ def test_legacy_b2_attempt_error_requires_terminal_reclassification_proof(
         module.bind_selected_generation_attempts([invalid_record], [invalid_record])
 
 
+def _stub_selected_attempt_binding_helpers(
+    module,
+    monkeypatch,
+    *,
+    identity_calls: dict[str, int] | None = None,
+) -> None:
+    def fake_generation_identity(row):
+        if identity_calls is not None:
+            identity_calls["count"] += 1
+        return str(row["binding_identity"])
+
+    monkeypatch.setattr(module, "generation_identity", fake_generation_identity)
+    monkeypatch.setattr(
+        module,
+        "usage_generation_identity_contract",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        module,
+        "_canonicalized_run",
+        lambda run, **_kwargs: run,
+    )
+    monkeypatch.setattr(
+        module,
+        "run_expected_request_count",
+        lambda run: int(run["request_count"]),
+    )
+    monkeypatch.setattr(
+        module,
+        "canonical_run_usage_units",
+        lambda run, **_kwargs: list(run["units"]),
+    )
+
+
+def _selected_attempt_binding_record(
+    module,
+    tmp_path: Path,
+    *,
+    group: str,
+    task_id: str,
+    identity: str,
+    final_sha: str,
+    usage_marker: str,
+    attempt_ids: list[str],
+    line: int,
+):
+    usage = {"marker": usage_marker}
+    return module.SourceRecord(
+        path=tmp_path / "binding-wave.jsonl",
+        source_index=0,
+        line=line,
+        row={
+            "group": group,
+            "task_id": task_id,
+            "binding_identity": identity,
+            "final_text_sha256": final_sha,
+            "usage": usage,
+            "execution": {
+                "generation_attempts": [
+                    {
+                        "attempt_id": attempt_id,
+                        "run": {
+                            "final_text_sha256": final_sha,
+                            "usage": usage,
+                            "request_count": 1,
+                            "units": [{"attempt_id": attempt_id}],
+                            "error": "",
+                        },
+                    }
+                    for attempt_id in attempt_ids
+                ]
+            },
+        },
+    )
+
+
+def _legacy_bind_selected_generation_attempts_reference(
+    module,
+    records,
+    selected,
+):
+    bindings: dict[str, str] = {}
+    for selected_record in selected:
+        selected_identity = module.generation_identity(selected_record.row)
+        selected_final_sha = str(selected_record.row.get("final_text_sha256") or "")
+        selected_usage = module.usage_generation_identity_contract(
+            selected_record.row.get("usage")
+        )
+        matching_ids: set[str] = set()
+        for candidate in records:
+            if (
+                candidate.key != selected_record.key
+                or module.generation_identity(candidate.row) != selected_identity
+            ):
+                continue
+            execution = candidate.row.get("execution")
+            attempts = (
+                execution.get("generation_attempts")
+                if isinstance(execution, module.Mapping)
+                and isinstance(execution.get("generation_attempts"), list)
+                else []
+            )
+            for attempt in attempts:
+                if not isinstance(attempt, module.Mapping):
+                    continue
+                run = attempt.get("run")
+                attempt_id = str(attempt.get("attempt_id") or "")
+                canonical_run = (
+                    module._canonicalized_run(
+                        run,
+                        identity_seed=f"generation-attempt:{attempt_id}",
+                    )
+                    if isinstance(run, module.Mapping)
+                    else None
+                )
+                if (
+                    canonical_run is None
+                    or str(canonical_run.get("final_text_sha256") or "")
+                    != selected_final_sha
+                    or module.usage_generation_identity_contract(
+                        canonical_run.get("usage")
+                    )
+                    != selected_usage
+                    or module.run_expected_request_count(canonical_run) <= 0
+                    or len(
+                        module.canonical_run_usage_units(
+                            canonical_run,
+                            identity_seed=f"generation-attempt:{attempt_id}",
+                        )
+                    )
+                    != module.run_expected_request_count(canonical_run)
+                ):
+                    continue
+                run_error = str(canonical_run.get("error") or "")
+                if (
+                    run_error
+                    and not module.audit_only_error_text(
+                        run_error,
+                        degraded_success=module.explicit_degraded_success(
+                            selected_record.row
+                        ),
+                    )
+                    and not module.selected_legacy_attempt_error_is_reclassified(
+                        selected_record.row,
+                        attempt,
+                    )
+                ):
+                    continue
+                if module.HEX32.fullmatch(attempt_id):
+                    matching_ids.add(attempt_id)
+        pair = f"{selected_record.key[0]}/{selected_record.key[1]}"
+        if len(matching_ids) != 1:
+            raise module.FinalizationError(
+                f"{pair} selected final answer is not bound to exactly one "
+                f"successful physical generation attempt: {sorted(matching_ids)}"
+            )
+        bindings[pair] = next(iter(matching_ids))
+    if len(bindings) != len(selected):
+        raise module.FinalizationError(
+            "selected generation attempt binding is incomplete"
+        )
+    return bindings
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["valid", "missing", "ambiguous", "duplicate_selected", "empty"],
+)
+def test_selected_attempt_binding_single_pass_matches_legacy_semantics(
+    module,
+    monkeypatch,
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    _stub_selected_attempt_binding_helpers(module, monkeypatch)
+    selected_a = _selected_attempt_binding_record(
+        module,
+        tmp_path,
+        group="B0",
+        task_id="task-a",
+        identity="identity-a",
+        final_sha="final-a",
+        usage_marker="usage-a",
+        attempt_ids=["d" * 32],
+        line=100,
+    )
+    selected_b = _selected_attempt_binding_record(
+        module,
+        tmp_path,
+        group="B1",
+        task_id="task-b",
+        identity="identity-b",
+        final_sha="final-b",
+        usage_marker="usage-b",
+        attempt_ids=["e" * 32],
+        line=101,
+    )
+    candidate_a = _selected_attempt_binding_record(
+        module,
+        tmp_path,
+        group="B0",
+        task_id="task-a",
+        identity="identity-a",
+        final_sha="final-a",
+        usage_marker="usage-a",
+        attempt_ids=["a" * 32],
+        line=1,
+    )
+    candidate_b = _selected_attempt_binding_record(
+        module,
+        tmp_path,
+        group="B1",
+        task_id="task-b",
+        identity="identity-b",
+        final_sha="final-b",
+        usage_marker="usage-b",
+        attempt_ids=["b" * 32],
+        line=2,
+    )
+    unrelated = _selected_attempt_binding_record(
+        module,
+        tmp_path,
+        group="B4",
+        task_id="task-c",
+        identity="identity-c",
+        final_sha="final-c",
+        usage_marker="usage-c",
+        attempt_ids=["f" * 32],
+        line=3,
+    )
+    if scenario == "valid":
+        records = [candidate_a, unrelated, candidate_b, candidate_a]
+        selected = [selected_a, selected_b]
+    elif scenario == "missing":
+        records = [unrelated, candidate_b]
+        selected = [selected_a, selected_b]
+    elif scenario == "ambiguous":
+        ambiguous_a = _selected_attempt_binding_record(
+            module,
+            tmp_path,
+            group="B0",
+            task_id="task-a",
+            identity="identity-a",
+            final_sha="final-a",
+            usage_marker="usage-a",
+            attempt_ids=["c" * 32],
+            line=4,
+        )
+        records = [candidate_a, candidate_b, ambiguous_a]
+        selected = [selected_a, selected_b]
+    elif scenario == "duplicate_selected":
+        records = [candidate_a]
+        selected = [selected_a, selected_a]
+    else:
+        records = [unrelated]
+        selected = []
+
+    def outcome(callable_):
+        try:
+            return "return", callable_()
+        except Exception as exc:  # noqa: BLE001 - differential captures exact legacy behavior
+            return "error", type(exc), str(exc)
+
+    legacy = outcome(
+        lambda: _legacy_bind_selected_generation_attempts_reference(
+            module,
+            records,
+            selected,
+        )
+    )
+    single_pass = outcome(
+        lambda: module.bind_selected_generation_attempts(records, selected)
+    )
+    assert single_pass == legacy
+
+
+def test_selected_attempt_binding_iterates_history_once(
+    module,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    identity_calls = {"count": 0}
+    _stub_selected_attempt_binding_helpers(
+        module,
+        monkeypatch,
+        identity_calls=identity_calls,
+    )
+    selected_a = _selected_attempt_binding_record(
+        module,
+        tmp_path,
+        group="B0",
+        task_id="task-a",
+        identity="identity-a",
+        final_sha="final-a",
+        usage_marker="usage-a",
+        attempt_ids=[],
+        line=100,
+    )
+    selected_b = _selected_attempt_binding_record(
+        module,
+        tmp_path,
+        group="B1",
+        task_id="task-b",
+        identity="identity-b",
+        final_sha="final-b",
+        usage_marker="usage-b",
+        attempt_ids=[],
+        line=101,
+    )
+    candidates = [
+        _selected_attempt_binding_record(
+            module,
+            tmp_path,
+            group="B0",
+            task_id="task-a",
+            identity="identity-a",
+            final_sha="final-a",
+            usage_marker="usage-a",
+            attempt_ids=["a" * 32],
+            line=1,
+        ),
+        _selected_attempt_binding_record(
+            module,
+            tmp_path,
+            group="B4",
+            task_id="task-c",
+            identity="identity-c",
+            final_sha="final-c",
+            usage_marker="usage-c",
+            attempt_ids=["c" * 32],
+            line=2,
+        ),
+        _selected_attempt_binding_record(
+            module,
+            tmp_path,
+            group="B0",
+            task_id="task-a",
+            identity="identity-a",
+            final_sha="final-a",
+            usage_marker="usage-a",
+            attempt_ids=["a" * 32],
+            line=3,
+        ),
+        _selected_attempt_binding_record(
+            module,
+            tmp_path,
+            group="B1",
+            task_id="task-b",
+            identity="identity-b",
+            final_sha="final-b",
+            usage_marker="usage-b",
+            attempt_ids=["b" * 32],
+            line=4,
+        ),
+    ]
+
+    class CountingSequence:
+        def __init__(self, values):
+            self.values = values
+            self.iteration_count = 0
+
+        def __iter__(self):
+            self.iteration_count += 1
+            if self.iteration_count > 1:
+                raise AssertionError("source history was iterated more than once")
+            return iter(self.values)
+
+    history = CountingSequence(candidates)
+    assert module.bind_selected_generation_attempts(
+        history,
+        [selected_a, selected_b],
+    ) == {
+        "B0/task-a": "a" * 32,
+        "B1/task-b": "b" * 32,
+    }
+    assert history.iteration_count == 1
+    relevant_candidate_count = sum(
+        candidate.key in {selected_a.key, selected_b.key}
+        for candidate in candidates
+    )
+    assert identity_calls["count"] == 2 + relevant_candidate_count
+
+
 def _campaign(
     module,
     tmp_path: Path,

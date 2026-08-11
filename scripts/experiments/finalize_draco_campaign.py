@@ -10940,56 +10940,80 @@ def bind_selected_generation_attempts(
     records: Sequence[SourceRecord],
     selected: Sequence[SourceRecord],
 ) -> dict[str, str]:
-    """Bind every selected answer to exactly one successful physical attempt."""
+    """Bind every selected answer with one streaming source-history pass."""
 
-    bindings: dict[str, str] = {}
+    selected_specs: list[tuple[SourceRecord, str, str, dict[str, Any]]] = []
+    spec_indexes_by_key_and_identity: dict[
+        tuple[str, str],
+        dict[str, list[int]],
+    ] = defaultdict(lambda: defaultdict(list))
     for selected_record in selected:
         selected_identity = generation_identity(selected_record.row)
-        selected_final_sha = str(selected_record.row.get("final_text_sha256") or "")
-        selected_usage = usage_generation_identity_contract(selected_record.row.get("usage"))
-        matching_ids: set[str] = set()
-        for candidate in records:
-            if (
-                candidate.key != selected_record.key
-                or generation_identity(candidate.row) != selected_identity
-            ):
-                continue
-            execution = candidate.row.get("execution")
-            attempts = (
-                execution.get("generation_attempts")
-                if isinstance(execution, Mapping)
-                and isinstance(execution.get("generation_attempts"), list)
-                else []
+        spec_index = len(selected_specs)
+        selected_specs.append(
+            (
+                selected_record,
+                selected_identity,
+                str(selected_record.row.get("final_text_sha256") or ""),
+                usage_generation_identity_contract(selected_record.row.get("usage")),
             )
-            for attempt in attempts:
-                if not isinstance(attempt, Mapping):
-                    continue
-                run = attempt.get("run")
-                attempt_id = str(attempt.get("attempt_id") or "")
-                canonical_run = (
-                    _canonicalized_run(
-                        run,
-                        identity_seed=f"generation-attempt:{attempt_id}",
-                    )
-                    if isinstance(run, Mapping)
-                    else None
+        )
+        spec_indexes_by_key_and_identity[selected_record.key][selected_identity].append(
+            spec_index
+        )
+
+    if not selected_specs:
+        return {}
+    matching_ids_by_spec: list[set[str]] = [set() for _ in selected_specs]
+    for candidate in records:
+        specs_by_identity = spec_indexes_by_key_and_identity.get(candidate.key)
+        if not specs_by_identity:
+            continue
+        spec_indexes = specs_by_identity.get(generation_identity(candidate.row))
+        if not spec_indexes:
+            continue
+        execution = candidate.row.get("execution")
+        attempts = (
+            execution.get("generation_attempts")
+            if isinstance(execution, Mapping)
+            and isinstance(execution.get("generation_attempts"), list)
+            else []
+        )
+        for attempt in attempts:
+            if not isinstance(attempt, Mapping):
+                continue
+            run = attempt.get("run")
+            attempt_id = str(attempt.get("attempt_id") or "")
+            canonical_run = (
+                _canonicalized_run(
+                    run,
+                    identity_seed=f"generation-attempt:{attempt_id}",
                 )
+                if isinstance(run, Mapping)
+                else None
+            )
+            if canonical_run is None:
+                continue
+            request_count = run_expected_request_count(canonical_run)
+            if request_count <= 0 or len(
+                canonical_run_usage_units(
+                    canonical_run,
+                    identity_seed=f"generation-attempt:{attempt_id}",
+                )
+            ) != request_count:
+                continue
+            canonical_final_sha = str(canonical_run.get("final_text_sha256") or "")
+            canonical_usage = usage_generation_identity_contract(canonical_run.get("usage"))
+            run_error = str(canonical_run.get("error") or "")
+            for spec_index in spec_indexes:
+                selected_record, _, selected_final_sha, selected_usage = selected_specs[
+                    spec_index
+                ]
                 if (
-                    canonical_run is None
-                    or str(canonical_run.get("final_text_sha256") or "") != selected_final_sha
-                    or usage_generation_identity_contract(canonical_run.get("usage"))
-                    != selected_usage
-                    or run_expected_request_count(canonical_run) <= 0
-                    or len(
-                        canonical_run_usage_units(
-                            canonical_run,
-                            identity_seed=f"generation-attempt:{attempt_id}",
-                        )
-                    )
-                    != run_expected_request_count(canonical_run)
+                    canonical_final_sha != selected_final_sha
+                    or canonical_usage != selected_usage
                 ):
                     continue
-                run_error = str(canonical_run.get("error") or "")
                 if (
                     run_error
                     and not audit_only_error_text(
@@ -11003,7 +11027,11 @@ def bind_selected_generation_attempts(
                 ):
                     continue
                 if HEX32.fullmatch(attempt_id):
-                    matching_ids.add(attempt_id)
+                    matching_ids_by_spec[spec_index].add(attempt_id)
+
+    bindings: dict[str, str] = {}
+    for spec_index, (selected_record, _, _, _) in enumerate(selected_specs):
+        matching_ids = matching_ids_by_spec[spec_index]
         pair = f"{selected_record.key[0]}/{selected_record.key[1]}"
         if len(matching_ids) != 1:
             raise FinalizationError(
