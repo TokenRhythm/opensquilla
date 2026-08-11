@@ -589,7 +589,7 @@ def test_packaged_ranking_config_is_versioned_validated_and_isolated() -> None:
     assert first["role_reliability"] == {
         "penalty_weight": pytest.approx(0.40),
         "prior_success": 10,
-        "prior_failure": 0,
+        "prior_failure": 1,
     }
     assert first["proposer_count"]["backup_count"] == 2
     assert first["aggregator"]["candidate_count"] == 3
@@ -921,14 +921,14 @@ def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(
         (
             False,
             "step2-ranking-config-v3",
-            "step2-ranking-2026-08-11.1",
-            "8e78140419906b29c5c8e4e80e5057ee5a87d308c950e36b49e7d9995b2e338f",
+            "step2-ranking-2026-08-11.2",
+            "cdb2727e95533d9c49579b9bb82b40ad801f816e2f151b8bc4e8f1540bbb7fbe",
         ),
         (
             True,
             "step2-ranking-config-v4",
-            "step2-ranking-2026-08-11.1",
-            "44085643f6272e143a6200fe222462ac8e3943c9eb381de121bf1ca9d3ffc132",
+            "step2-ranking-2026-08-11.2",
+            "a3a5076a5019d66ee21b23a94853ebf3832f81bf7e85484f9cdd97c5c5927e73",
         ),
     ],
 )
@@ -1021,7 +1021,7 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert historical["base_sha256"] == (
         "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
-    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-11.1"
+    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-11.2"
     assert "role_reliability" in default["base_config"]
 
     previous_reliability = ranking_config_resolution(
@@ -1033,6 +1033,76 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
         "prior_success": 9,
         "prior_failure": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("thinking_assignment_enabled", "schema_version", "sha256"),
+    [
+        (
+            False,
+            "step2-ranking-config-v3",
+            "8e78140419906b29c5c8e4e80e5057ee5a87d308c950e36b49e7d9995b2e338f",
+        ),
+        (
+            True,
+            "step2-ranking-config-v4",
+            "44085643f6272e143a6200fe222462ac8e3943c9eb381de121bf1ca9d3ffc132",
+        ),
+    ],
+)
+def test_previous_zero_failure_prior_base_reconstructs_frozen_identity(
+    thinking_assignment_enabled: bool,
+    schema_version: str,
+    sha256: str,
+) -> None:
+    resolution = ranking_config_resolution(
+        thinking_assignment_enabled=thinking_assignment_enabled,
+        base_version="step2-ranking-2026-08-11.1",
+    )
+
+    assert resolution["base_config"]["schema_version"] == schema_version
+    assert resolution["base_config"]["config_version"] == (
+        "step2-ranking-2026-08-11.1"
+    )
+    assert resolution["base_config"]["role_reliability"] == {
+        "penalty_weight": pytest.approx(0.40),
+        "prior_success": 10,
+        "prior_failure": 0,
+    }
+    assert resolution["base_sha256"] == sha256
+    assert resolution["effective_sha256"] == sha256
+
+
+@pytest.mark.parametrize(
+    ("thinking_assignment_enabled", "effective_sha256"),
+    [
+        (
+            False,
+            "ab2c6f116c24a66efc5a2aa2fc162f3a4b3a24976a6cd230913794bade6a98db",
+        ),
+        (
+            True,
+            "0f4c53386ffa303ae3bc2200c42b64e913492d282fc61f4c92c499e3a16e0ee7",
+        ),
+    ],
+)
+def test_previous_zero_failure_prior_override_remains_hash_bound(
+    thinking_assignment_enabled: bool,
+    effective_sha256: str,
+) -> None:
+    resolution = ranking_config_resolution(
+        thinking_assignment_enabled=thinking_assignment_enabled,
+        base_version="step2-ranking-2026-08-11.1",
+        override={"penalties": {"task_cost_weights": {"medium": 0.17}}},
+    )
+
+    assert resolution["override_sha256"] == (
+        "c2ac5b1a3c8ed7e88dcebefdabb4bcffcc3dd5daeead645def2ce9c847cb9a89"
+    )
+    assert resolution["effective_config"]["config_version"] == (
+        "step2-ranking-2026-08-11.1+override.c2ac5b1a3c8e"
+    )
+    assert resolution["effective_sha256"] == effective_sha256
 
 
 def test_ranking_base_selector_rejects_unallowlisted_version() -> None:
@@ -1055,7 +1125,7 @@ def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
     }
     assert snapshot == resolution["effective_config"]
     assert resolution["effective_config"]["config_version"] == (
-        "step2-ranking-2026-08-11.1+override."
+        "step2-ranking-2026-08-11.2+override."
         f"{resolution['override_sha256'][:12]}"
     )
     assert resolution["effective_sha256"] != resolution["base_sha256"]
@@ -1227,10 +1297,10 @@ def test_ranking_config_override_resolves_against_selected_thinking_base() -> No
     assert "thinking_assignment" in thinking["effective_config"]
     suffix = legacy["override_sha256"][:12]
     assert legacy["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-11.1+override.{suffix}"
+        f"step2-ranking-2026-08-11.2+override.{suffix}"
     )
     assert thinking["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-11.1+override.{suffix}"
+        f"step2-ranking-2026-08-11.2+override.{suffix}"
     )
 
 
@@ -1561,11 +1631,13 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
         current["models"][0],
         load_ranking_config(),
     )
-    assert ranking_router._role_reliability_score(
+    current_reliability = ranking_router._role_reliability_score(
         current_model,
         "proposer",
         load_ranking_config(),
-    )["penalty"] == 0.0
+    )
+    assert current_reliability["failure_rate"] == pytest.approx(1 / 11)
+    assert current_reliability["penalty"] == pytest.approx(0.40 / 11)
     assert historical["snapshot_version"] == "curated-openrouter-step2-2026-07-31.1"
     assert "role_reliability_snapshot" not in historical
     assert all(
@@ -4527,7 +4599,11 @@ def test_ranking_without_user_profile_bypasses_all_profile_effects() -> None:
     }
     for row in disabled.trace["model_scores"]:
         assert row["S_user"] == 0.0
-        assert row["S_qual_clean"] == row["S_match"]
+        assert row["S_qual_before_reliability"] == row["S_match"]
+        assert row["S_qual_clean"] == pytest.approx(
+            row["S_match"] - row["role_reliability"]["penalty"],
+            abs=1e-6,
+        )
         assert row["cost_weight"] == pytest.approx(0.10)
         assert row["latency_weight"] == pytest.approx(0.08)
 
@@ -4758,7 +4834,7 @@ def test_cost_and_latency_break_quality_ties_in_proposer_selection() -> None:
     assert efficient_score["S_base_clean"] > expensive_score["S_base_clean"]
 
 
-def test_zero_role_reliability_observations_have_no_penalty() -> None:
+def test_zero_role_reliability_observations_use_cold_start_prior() -> None:
     model = _with_role_reliability(_model("zero-observations"))
 
     decision = _decision(
@@ -4767,14 +4843,28 @@ def test_zero_role_reliability_observations_have_no_penalty() -> None:
         user_profile_enabled=False,
     )
 
+    expected_failure_rate = 1 / 11
+    expected_penalty = 0.40 * expected_failure_rate
     proposer_score = decision.trace["model_scores"][0]
     aggregator_score = decision.trace["aggregator"]["selected"]
-    assert proposer_score["S_qual_before_reliability"] == proposer_score["S_qual_clean"]
-    assert proposer_score["role_reliability"]["failure_rate"] == 0.0
-    assert proposer_score["role_reliability"]["penalty"] == 0.0
-    assert aggregator_score["S_agg_qual_before_reliability"] == aggregator_score["S_agg_qual"]
-    assert aggregator_score["role_reliability"]["failure_rate"] == 0.0
-    assert aggregator_score["role_reliability"]["penalty"] == 0.0
+    assert proposer_score["role_reliability"]["failure_rate"] == pytest.approx(
+        expected_failure_rate,
+        abs=1e-6,
+    )
+    assert proposer_score["role_reliability"]["penalty"] == pytest.approx(
+        expected_penalty,
+        abs=1e-6,
+    )
+    assert proposer_score["S_qual_before_reliability"] > proposer_score["S_qual_clean"]
+    assert aggregator_score["role_reliability"]["failure_rate"] == pytest.approx(
+        expected_failure_rate,
+        abs=1e-6,
+    )
+    assert aggregator_score["role_reliability"]["penalty"] == pytest.approx(
+        expected_penalty,
+        abs=1e-6,
+    )
+    assert aggregator_score["S_agg_qual_before_reliability"] > aggregator_score["S_agg_qual"]
 
 
 def test_reliability_cold_start_penalty_is_monotonic() -> None:
@@ -4797,12 +4887,52 @@ def test_reliability_cold_start_penalty_is_monotonic() -> None:
     after_failure = failure_rate(success=0, failure=1)
     after_recovery = failure_rate(success=1, failure=1)
 
-    assert cold_start == 0.0
-    assert after_success == 0.0
-    assert after_failure == pytest.approx(1 / 11, abs=1e-6)
-    assert cold_start < after_failure
-    assert after_recovery == pytest.approx(1 / 12, abs=1e-6)
-    assert after_recovery < after_failure
+    assert cold_start == pytest.approx(1 / 11, abs=1e-6)
+    assert after_success == pytest.approx(1 / 12, abs=1e-6)
+    assert after_failure == pytest.approx(1 / 6, abs=1e-6)
+    assert after_recovery == pytest.approx(2 / 13, abs=1e-6)
+    assert after_success < cold_start < after_recovery < after_failure
+
+
+def test_cold_start_does_not_outrank_high_confidence_reliability() -> None:
+    cold_start = _with_role_reliability(
+        _model("cold-start", provider="provider-cold", roles=["proposer"]),
+    )
+    failure_free = _with_role_reliability(
+        _model("failure-free", provider="provider-success", roles=["proposer"]),
+        proposer=(50, 0),
+    )
+    one_failure = _with_role_reliability(
+        _model("one-failure", provider="provider-observed", roles=["proposer"]),
+        proposer=(49, 1),
+    )
+    aggregator = _model(
+        "aggregator",
+        provider="provider-aggregator",
+        roles=["aggregator"],
+    )
+
+    decision = _decision(
+        cold_start,
+        failure_free,
+        one_failure,
+        aggregator,
+        analysis=_analysis(tier=1),
+        user_profile_enabled=False,
+    )
+    scores = {row["model"]: row for row in decision.trace["model_scores"]}
+
+    assert scores["cold-start"]["role_reliability"]["failure_rate"] == (
+        pytest.approx(1 / 11, abs=1e-6)
+    )
+    assert scores["failure-free"]["role_reliability"]["failure_rate"] == (
+        pytest.approx(1 / 61, abs=1e-6)
+    )
+    assert scores["one-failure"]["role_reliability"]["failure_rate"] == (
+        pytest.approx(2 / 61, abs=1e-6)
+    )
+    assert scores["failure-free"]["S_qual_clean"] > scores["cold-start"]["S_qual_clean"]
+    assert scores["one-failure"]["S_qual_clean"] > scores["cold-start"]["S_qual_clean"]
 
 
 def test_archived_config_without_reliability_policy_keeps_legacy_trace_shape() -> None:
@@ -4866,12 +4996,12 @@ def test_role_reliability_is_isolated_between_proposer_and_aggregator() -> None:
     )
     assert proposer_trace["role_reliability"]["role"] == "proposer"
     assert proposer_trace["role_reliability"]["failure_rate"] == pytest.approx(
-        0.0,
+        1 / 61,
         abs=1e-6,
     )
     assert aggregator_trace["role_reliability"]["role"] == "aggregator"
     assert aggregator_trace["role_reliability"]["failure_rate"] == pytest.approx(
-        0.0,
+        1 / 61,
         abs=1e-6,
     )
 
@@ -4882,7 +5012,8 @@ def test_reliability_penalty_changes_initial_order_and_quality_floor() -> None:
         proposer=(0, 50),
     )
     reliable = _with_role_reliability(
-        _model("reliable", provider="provider-b", roles=["proposer"], capability=0.70)
+        _model("reliable", provider="provider-b", roles=["proposer"], capability=0.70),
+        proposer=(50, 0),
     )
     aggregator = _model("aggregator", provider="provider-c", roles=["aggregator"])
     no_penalty_config = load_ranking_config()
@@ -4914,8 +5045,12 @@ def test_reliability_penalty_changes_initial_order_and_quality_floor() -> None:
     unreliable_trace = next(
         row for row in penalized.trace["model_scores"] if row["model"] == "unreliable"
     )
-    assert unreliable_trace["role_reliability"]["failure_rate"] == pytest.approx(5 / 6)
-    assert unreliable_trace["role_reliability"]["penalty"] == pytest.approx(1 / 3)
+    assert unreliable_trace["role_reliability"]["failure_rate"] == pytest.approx(
+        51 / 61
+    )
+    assert unreliable_trace["role_reliability"]["penalty"] == pytest.approx(
+        0.40 * 51 / 61
+    )
 
 
 def test_reliability_penalty_changes_greedy_marginal_selection() -> None:
@@ -4961,7 +5096,9 @@ def test_reliability_penalty_changes_greedy_marginal_selection() -> None:
         for row in penalized.trace["selection_steps"][1]["top_candidates"]
         if row["identity"] == "provider-b:unreliable"
     )
-    assert unstable_candidate["reliability_penalty"] == pytest.approx(1 / 3)
+    assert unstable_candidate["reliability_penalty"] == pytest.approx(
+        0.40 * 51 / 61
+    )
 
 
 def test_reliability_penalty_orders_proposer_and_aggregator_fallbacks() -> None:
@@ -5614,7 +5751,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     assert disabled.trace["ranking_version"] == "step2-ranking-v2"
     assert (
         disabled.trace["ranking_config_hash"]
-        == "8e78140419906b29c5c8e4e80e5057ee5a87d308c950e36b49e7d9995b2e338f"
+        == "cdb2727e95533d9c49579b9bb82b40ad801f816e2f151b8bc4e8f1540bbb7fbe"
     )
     for field in (
         "ranking_thinking_assignment_enabled",

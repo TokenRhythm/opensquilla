@@ -48,8 +48,9 @@ RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.1"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.1"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.2"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.2"
+_PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.1"
 _PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-10.1"
 _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-05.1"
 _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-07-27.1"
@@ -64,6 +65,7 @@ _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
 )
 _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
     {
+        _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION,
         _PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION,
         "step2-ranking-2026-08-02.2",
         _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION,
@@ -2524,19 +2526,27 @@ def _ranking_config_for_base_version(
         )
     historical = _detached_ranking_config(packaged)
     historical["config_version"] = requested
-    analyzer = historical.get("task_analyzer")
-    if isinstance(analyzer, dict):
-        for key in (
-            "fallback_chain",
-            "total_timeout_seconds",
-            "payload_max_chars",
-            "payload_max_bytes",
-            "payload_max_estimated_tokens",
-            "schema_repair_max_retries",
-        ):
-            analyzer.pop(key, None)
-    if requested == _PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION:
-        pass
+    if requested != _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION:
+        analyzer = historical.get("task_analyzer")
+        if isinstance(analyzer, dict):
+            for key in (
+                "fallback_chain",
+                "total_timeout_seconds",
+                "payload_max_chars",
+                "payload_max_bytes",
+                "payload_max_estimated_tokens",
+                "schema_repair_max_retries",
+            ):
+                analyzer.pop(key, None)
+    if requested in {
+        _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION,
+        _PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION,
+    }:
+        historical["role_reliability"] = {
+            "penalty_weight": 0.40,
+            "prior_success": 10,
+            "prior_failure": 0,
+        }
     elif requested == _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION:
         historical["role_reliability"] = {
             "penalty_weight": 0.40,
