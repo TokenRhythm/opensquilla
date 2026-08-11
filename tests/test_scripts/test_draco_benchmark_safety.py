@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -11,9 +12,28 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.eval import draco_selection_plan_evidence as plan_evidence
 from opensquilla.eval.draco_artifact_integrity import (
     seal_result_row,
     trace_row_from_result,
+)
+from opensquilla.eval.draco_artifact_io import (
+    DRACO_DURABLE_RESULT_ROW_FIELD,
+    DRACO_RUN_MANIFEST_SCHEMA_V2,
+    DurableDracoArtifactWriter,
+    durable_artifact_capability_contract,
+    verify_durable_draco_artifacts,
+)
+from opensquilla.eval.draco_selection_plan_evidence import (
+    SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
+    SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+    SELECTION_PLAN_PACK_ARTIFACT_FIELD,
+    SelectionPlanPackAppender,
+    SelectionPlanPackReader,
+    compact_selection_plan_evidence_row,
+    selection_plan_evidence_capability_contract,
+    selection_plan_evidence_manifest_binding,
+    selection_plan_reference_signal,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +83,286 @@ def test_cost_audit_rejects_non_object_jsonl_rows(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit, match="must be an object"):
         module.load_rows(path)
+
+
+def _write_compact_cost_audit_bundle(
+    tmp_path: Path,
+    *,
+    task_id: str = "task-1",
+) -> dict[str, Path]:
+    stamp = "20260811-120000"
+    result = tmp_path / f"draco_ensemble_{stamp}.jsonl"
+    trace = tmp_path / f"draco_run_{stamp}.trace.jsonl"
+    checkpoint = tmp_path / f"draco_run_{stamp}.checkpoint.json"
+    manifest = tmp_path / f"draco_run_{stamp}.manifest.json"
+    pack = tmp_path / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    durable_capability = durable_artifact_capability_contract()
+    with SelectionPlanPackAppender(pack) as appender:
+        compact_row = compact_selection_plan_evidence_row(
+            {
+                "group": "B2",
+                "task_id": task_id,
+                "row_index": 1,
+                "task_input_sha256": "sha256:" + "a" * 64,
+                "run_compatibility_fingerprint": "sha256:" + "b" * 64,
+                "routing_trace": {
+                    "selection_plan": {
+                        "strategy": "router_dynamic",
+                        "selected_P": ["openrouter:model-a"],
+                    }
+                },
+            },
+            appender=appender,
+        )
+    compact_row[DRACO_DURABLE_RESULT_ROW_FIELD] = durable_capability
+    compact_row = seal_result_row(compact_row)
+    with DurableDracoArtifactWriter(
+        results_path=result,
+        trace_path=trace,
+        checkpoint_path=checkpoint,
+    ) as writer:
+        assert writer.append(compact_row, trace_row_from_result(compact_row))
+    durable_verification = verify_durable_draco_artifacts(
+        results_path=result,
+        trace_path=trace,
+        checkpoint_path=checkpoint,
+    )
+    with SelectionPlanPackReader(pack, owner_only=True) as reader:
+        binding = selection_plan_evidence_manifest_binding(
+            pack_index=reader.index,
+            durable_artifact_verification=durable_verification,
+            compact_row_count=int(selection_plan_reference_signal(compact_row)),
+        )
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": DRACO_RUN_MANIFEST_SCHEMA_V2,
+                "stamp": stamp,
+                "status": "complete",
+                "groups": ["B2"],
+                "durable_artifact_capability": durable_capability,
+                "run_compatibility": {
+                    "contracts": {
+                        "B2": {
+                            "durable_artifact_capability": durable_capability,
+                        }
+                    }
+                },
+                "artifacts": {
+                    "results_jsonl": str(result),
+                    "trace_jsonl": str(trace),
+                    "checkpoint_json": str(checkpoint),
+                    "manifest_json": str(manifest),
+                    SELECTION_PLAN_PACK_ARTIFACT_FIELD: str(pack),
+                },
+                SELECTION_PLAN_EVIDENCE_ROW_FIELD: (
+                    selection_plan_evidence_capability_contract()
+                ),
+                SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD: binding,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "result": result,
+        "trace": trace,
+        "checkpoint": checkpoint,
+        "manifest": manifest,
+        "pack": pack,
+    }
+
+
+def test_cost_audit_authenticates_compact_bundle_without_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(COST_AUDIT_SCRIPT, "audit_draco_compact_bundle_test")
+    paths = _write_compact_cost_audit_bundle(tmp_path)
+
+    def reject_expansion(*_args, **_kwargs):
+        raise AssertionError("compact audit preflight must not expand selection plans")
+
+    monkeypatch.setattr(
+        plan_evidence.SelectionPlanPackReader,
+        "expand_selection_plan",
+        reject_expansion,
+    )
+    rows, trace_rows, manifest_path, manifest = module.load_audit_artifact_rows(
+        paths["result"],
+        trace_jsonl=paths["trace"],
+        manifest_path=None,
+    )
+
+    assert manifest_path == paths["manifest"]
+    assert manifest == json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    assert selection_plan_reference_signal(rows[0])
+    assert trace_rows == [trace_row_from_result(rows[0])]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_manifest", "missing_pack", "tampered_pack", "downgraded_binding"],
+)
+def test_cost_audit_fails_closed_for_invalid_compact_bundle(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        COST_AUDIT_SCRIPT,
+        f"audit_draco_invalid_compact_bundle_{mutation}_test",
+    )
+    paths = _write_compact_cost_audit_bundle(tmp_path)
+    if mutation == "missing_manifest":
+        paths["manifest"].unlink()
+    elif mutation == "missing_pack":
+        paths["pack"].unlink()
+    elif mutation == "tampered_pack":
+        with paths["pack"].open("ab") as handle:
+            handle.write(b"{}\n")
+    else:
+        manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+        manifest.pop(SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD)
+        paths["manifest"].write_text(
+            json.dumps(manifest, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(SystemExit, match="Invalid compact DRACO artifact bundle"):
+        module.load_audit_artifact_rows(
+            paths["result"],
+            trace_jsonl=paths["trace"],
+            manifest_path=paths["manifest"],
+        )
+
+
+def test_cost_audit_compact_bundle_rejects_unbound_trace(tmp_path: Path) -> None:
+    module = _load_module(COST_AUDIT_SCRIPT, "audit_draco_unbound_compact_trace_test")
+    paths = _write_compact_cost_audit_bundle(tmp_path)
+    unbound_trace = tmp_path / "copied.trace.jsonl"
+    unbound_trace.write_bytes(paths["trace"].read_bytes())
+
+    with pytest.raises(SystemExit, match="bound standard trace sibling"):
+        module.load_audit_artifact_rows(
+            paths["result"],
+            trace_jsonl=unbound_trace,
+            manifest_path=paths["manifest"],
+        )
+
+
+@pytest.mark.parametrize("replacement_kind", ["legacy", "compact"])
+def test_cost_audit_rejects_parent_directory_snapshot_replacement(
+    replacement_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        COST_AUDIT_SCRIPT,
+        f"audit_draco_parent_snapshot_{replacement_kind}_test",
+    )
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    paths = _write_compact_cost_audit_bundle(bundle_dir)
+    saved_dir = tmp_path / "saved-bundle"
+    real_directory_snapshot = module._BoundDirectorySnapshot
+
+    class ReplacingDirectorySnapshot(real_directory_snapshot):
+        def __enter__(self):
+            value = super().__enter__()
+            bundle_dir.rename(saved_dir)
+            bundle_dir.mkdir()
+            if replacement_kind == "compact":
+                _write_compact_cost_audit_bundle(bundle_dir, task_id="unbound-task")
+            else:
+                paths["result"].write_text(
+                    json.dumps({"group": "B2", "task_id": "unbound-task"}) + "\n",
+                    encoding="utf-8",
+                )
+                paths["trace"].write_text(
+                    json.dumps({"group": "ATTACK", "task_id": "unbound"}) + "\n",
+                    encoding="utf-8",
+                )
+            return value
+
+        def __exit__(self, exc_type, exc, traceback):
+            shutil.rmtree(bundle_dir)
+            saved_dir.rename(bundle_dir)
+            return super().__exit__(exc_type, exc, traceback)
+
+    monkeypatch.setattr(
+        module,
+        "_BoundDirectorySnapshot",
+        ReplacingDirectorySnapshot,
+    )
+
+    with pytest.raises(SystemExit, match="authenticated bundle"):
+        module.load_audit_artifact_rows(
+            paths["result"],
+            trace_jsonl=paths["trace"],
+            manifest_path=paths["manifest"],
+        )
+
+
+def test_cost_audit_preserves_legacy_row_loading(tmp_path: Path) -> None:
+    module = _load_module(COST_AUDIT_SCRIPT, "audit_draco_legacy_bundle_test")
+    result = tmp_path / "legacy-result.jsonl"
+    trace = tmp_path / "legacy-trace.jsonl"
+    result_row = {"group": "B2", "task_id": "legacy-task"}
+    trace_row = {"group": "B2", "task_id": "legacy-task"}
+    result.write_text(json.dumps(result_row) + "\n", encoding="utf-8")
+    trace.write_text(json.dumps(trace_row) + "\n", encoding="utf-8")
+
+    rows, trace_rows, manifest_path, manifest = module.load_audit_artifact_rows(
+        result,
+        trace_jsonl=trace,
+        manifest_path=None,
+    )
+
+    assert rows == [result_row]
+    assert trace_rows == [trace_row]
+    assert manifest_path is None
+    assert manifest is None
+
+
+@pytest.mark.parametrize("symlink_kind", ["directory", "file"])
+def test_cost_audit_preserves_legacy_symlink_loading(
+    symlink_kind: str,
+    tmp_path: Path,
+) -> None:
+    module = _load_module(
+        COST_AUDIT_SCRIPT,
+        f"audit_draco_legacy_{symlink_kind}_symlink_test",
+    )
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    actual_result = actual / "legacy-result.jsonl"
+    actual_trace = actual / "legacy-trace.jsonl"
+    result_row = {"group": "B2", "task_id": "legacy-task"}
+    trace_row = {"group": "B2", "task_id": "legacy-task"}
+    actual_result.write_text(json.dumps(result_row) + "\n", encoding="utf-8")
+    actual_trace.write_text(json.dumps(trace_row) + "\n", encoding="utf-8")
+    if symlink_kind == "directory":
+        alias = tmp_path / "alias"
+        alias.symlink_to(actual, target_is_directory=True)
+        result = alias / actual_result.name
+        trace = alias / actual_trace.name
+    else:
+        result = actual / "result-link.jsonl"
+        trace = actual / "trace-link.jsonl"
+        result.symlink_to(actual_result)
+        trace.symlink_to(actual_trace)
+
+    rows, trace_rows, manifest_path, manifest = module.load_audit_artifact_rows(
+        result,
+        trace_jsonl=trace,
+        manifest_path=None,
+    )
+
+    assert rows == [result_row]
+    assert trace_rows == [trace_row]
+    assert manifest_path is None
+    assert manifest is None
 
 
 def test_formal_wrapper_keeps_reference_input_and_direct_openrouter_runtime() -> None:

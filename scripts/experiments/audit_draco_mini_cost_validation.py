@@ -4,10 +4,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Iterable
+from contextlib import ExitStack
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -17,6 +20,17 @@ from opensquilla.eval.draco_artifact_integrity import (
     RESULT_EVIDENCE_SCHEMA,
     trace_row_from_result,
     verify_result_row_evidence,
+)
+from opensquilla.eval.draco_resume_source_index import (
+    DracoResumeSourceError,
+    ResumeSourceIndex,
+)
+from opensquilla.eval.draco_selection_plan_evidence import (
+    SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
+    SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+    SELECTION_PLAN_PACK_ARTIFACT_FIELD,
+    selection_plan_reference_signal,
+    selection_plan_row_capability_signal,
 )
 
 EXPECTED_MODELS = (
@@ -71,6 +85,18 @@ EXPECTED_BLOCKED_DOMAINS = [
     "research.perplexity.ai",
 ]
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+STANDARD_RESULT_NAME_PATTERN = re.compile(
+    r"^draco_ensemble_(?P<stamp>[0-9]{8}-[0-9]{6})\.jsonl$"
+)
+MAX_BOUND_MANIFEST_BYTES = 64 * 1024 * 1024
+BOUND_FILE_SIGNATURE_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
 
 
 def canonical_frozen_model(
@@ -517,6 +543,413 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _standard_compact_artifact_paths(result_jsonl: Path) -> dict[str, Path] | None:
+    match = STANDARD_RESULT_NAME_PATTERN.fullmatch(result_jsonl.name)
+    if match is None:
+        return None
+    stamp = match.group("stamp")
+    parent = Path(os.path.abspath(result_jsonl.parent))
+    return {
+        "results_jsonl": parent / f"draco_ensemble_{stamp}.jsonl",
+        "trace_jsonl": parent / f"draco_run_{stamp}.trace.jsonl",
+        "manifest_json": parent / f"draco_run_{stamp}.manifest.json",
+        SELECTION_PLAN_PACK_ARTIFACT_FIELD: (
+            parent / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+        ),
+    }
+
+
+def _manifest_declares_compact_evidence(manifest: dict[str, Any]) -> bool:
+    artifacts = manifest.get("artifacts")
+    return bool(
+        SELECTION_PLAN_EVIDENCE_ROW_FIELD in manifest
+        or SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD in manifest
+        or (
+            isinstance(artifacts, dict)
+            and SELECTION_PLAN_PACK_ARTIFACT_FIELD in artifacts
+        )
+    )
+
+
+def _parse_indexed_result_row(payload: bytes, *, line_number: int) -> dict[str, Any]:
+    text = payload.decode("utf-8")
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON on line {line_number}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SystemExit(f"JSONL row on line {line_number} must be an object")
+    return value
+
+
+def _bound_file_signature(file_stat: os.stat_result) -> tuple[int, ...]:
+    return tuple(int(getattr(file_stat, field)) for field in BOUND_FILE_SIGNATURE_FIELDS)
+
+
+def _open_bound_regular(
+    path: Path,
+    *,
+    label: str,
+    directory_fd: int | None = None,
+    nofollow: bool = True,
+) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    if nofollow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = (
+            os.open(path.name, flags, dir_fd=directory_fd)
+            if directory_fd is not None
+            else os.open(path, flags)
+        )
+    except OSError as exc:
+        raise SystemExit(f"Cannot open bound {label}: {path}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SystemExit(f"Bound {label} is not a regular file: {path}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+class _BoundDirectorySnapshot:
+    """Pin the directory used to discover one stamped artifact family."""
+
+    def __init__(self, path: Path, *, nofollow: bool = True) -> None:
+        self.path = Path(os.path.abspath(path))
+        self.nofollow = nofollow
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        if nofollow:
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            self._fd: int | None = os.open(self.path, flags)
+        except OSError as exc:
+            raise SystemExit(f"Cannot open bound artifact directory: {self.path}") from exc
+        self._signature = _bound_file_signature(os.fstat(self._fd))
+
+    @property
+    def fd(self) -> int:
+        if self._fd is None:
+            raise SystemExit("Bound artifact directory is closed")
+        return self._fd
+
+    def contains(self, path: Path) -> bool:
+        return Path(os.path.abspath(path.parent)) == self.path
+
+    def entry_exists(self, path: Path) -> bool:
+        if not self.contains(path):
+            return False
+        try:
+            os.stat(path.name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def verify_path(self) -> None:
+        if self._fd is None:
+            raise SystemExit("Bound artifact directory is closed")
+        if _bound_file_signature(os.fstat(self._fd)) != self._signature:
+            raise SystemExit("Bound artifact directory changed during audit")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        if self.nofollow:
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            path_fd = os.open(self.path, flags)
+        except OSError as exc:
+            raise SystemExit("Bound artifact directory path changed during audit") from exc
+        try:
+            if _bound_file_signature(os.fstat(path_fd)) != self._signature:
+                raise SystemExit("Bound artifact directory path changed during audit")
+        finally:
+            os.close(path_fd)
+
+    def close(self) -> None:
+        if self._fd is None:
+            return
+        fd = self._fd
+        self._fd = None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def __enter__(self) -> _BoundDirectorySnapshot:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        try:
+            if exc_type is None:
+                self.verify_path()
+        finally:
+            self.close()
+
+
+class _BoundFileSnapshot:
+    """Read one regular file from a pinned directory and retain its identity."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        label: str,
+        directory: _BoundDirectorySnapshot | None = None,
+        nofollow: bool = True,
+    ) -> None:
+        self.path = Path(os.path.abspath(path))
+        self.label = label
+        if directory is not None and not directory.contains(self.path):
+            raise SystemExit(f"Bound {label} is outside its pinned directory")
+        self._fd: int | None = _open_bound_regular(
+            self.path,
+            label=label,
+            directory_fd=directory.fd if directory is not None else None,
+            nofollow=nofollow,
+        )
+        self.nofollow = nofollow
+        self._signature = _bound_file_signature(os.fstat(self._fd))
+
+    @property
+    def signature(self) -> tuple[int, ...]:
+        return self._signature
+
+    def load_rows(self) -> list[dict[str, Any]]:
+        if self._fd is None:
+            raise SystemExit(f"Bound {self.label} snapshot is closed")
+        rows: list[dict[str, Any]] = []
+        with os.fdopen(os.dup(self._fd), encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise SystemExit(f"Invalid JSON on line {line_number}: {exc}") from exc
+                if not isinstance(value, dict):
+                    raise SystemExit(f"JSONL row on line {line_number} must be an object")
+                rows.append(value)
+        self.verify_inode()
+        return rows
+
+    def load_json_object(self) -> tuple[dict[str, Any], str]:
+        if self._fd is None:
+            raise SystemExit(f"Bound {self.label} snapshot is closed")
+        size = int(os.fstat(self._fd).st_size)
+        if size <= 0 or size > MAX_BOUND_MANIFEST_BYTES:
+            raise SystemExit(f"Bound {self.label} is outside its byte limit")
+        payload = bytearray(size)
+        completed = 0
+        while completed < size:
+            chunk = os.pread(self._fd, size - completed, completed)
+            if not chunk:
+                raise SystemExit(f"Bound {self.label} ended before its declared size")
+            payload[completed : completed + len(chunk)] = chunk
+            completed += len(chunk)
+        self.verify_inode()
+        try:
+            value = json.loads(payload.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"Bound {self.label} is not valid JSON") from exc
+        if not isinstance(value, dict):
+            raise SystemExit(f"Bound {self.label} must contain a JSON object")
+        return value, hashlib.sha256(payload).hexdigest()
+
+    def verify_inode(self) -> None:
+        if self._fd is None or _bound_file_signature(os.fstat(self._fd)) != self._signature:
+            raise SystemExit(f"Bound {self.label} changed during audit")
+
+    def verify_path(self) -> None:
+        self.verify_inode()
+        path_fd = _open_bound_regular(
+            self.path,
+            label=self.label,
+            nofollow=self.nofollow,
+        )
+        try:
+            if _bound_file_signature(os.fstat(path_fd)) != self._signature:
+                raise SystemExit(f"Bound {self.label} path changed during audit")
+        finally:
+            os.close(path_fd)
+
+    def close(self) -> None:
+        if self._fd is None:
+            return
+        fd = self._fd
+        self._fd = None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def __enter__(self) -> _BoundFileSnapshot:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        try:
+            if exc_type is None:
+                self.verify_path()
+        finally:
+            self.close()
+
+
+def load_audit_artifact_rows(
+    result_jsonl: Path,
+    *,
+    trace_jsonl: Path,
+    manifest_path: Path | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Path | None, dict[str, Any] | None]:
+    """Load one audit input, strictly binding compact artifacts when signalled.
+
+    Legacy JSONL keeps the historical loader and optional-manifest behavior.
+    Compact rows are re-read through ``ResumeSourceIndex`` so its existing
+    terminal bundle verifier authenticates the durable trio, selection-plan
+    pack, and manifest binding without expanding any selection plan.  The
+    trace and manifest used by this audit are read before the index's final
+    snapshot verification, so a pathname replacement cannot swap in an
+    unauthenticated audit input.
+    """
+
+    expected = _standard_compact_artifact_paths(result_jsonl)
+    absolute_result = Path(os.path.abspath(result_jsonl))
+    absolute_trace = Path(os.path.abspath(trace_jsonl))
+    with ExitStack() as snapshots:
+        result_directory = snapshots.enter_context(
+            _BoundDirectorySnapshot(absolute_result.parent, nofollow=False)
+        )
+        result_snapshot = snapshots.enter_context(
+            _BoundFileSnapshot(
+                absolute_result,
+                label="result JSONL",
+                directory=result_directory,
+                nofollow=False,
+            )
+        )
+        rows = result_snapshot.load_rows()
+        compact_row_signal = any(
+            selection_plan_row_capability_signal(row)
+            or selection_plan_reference_signal(row)
+            for row in rows
+        )
+        pack_present = bool(
+            expected is not None
+            and result_directory.entry_exists(
+                expected[SELECTION_PLAN_PACK_ARTIFACT_FIELD]
+            )
+        )
+        manifest_snapshot: _BoundFileSnapshot | None = None
+        manifest: dict[str, Any] | None = None
+        manifest_sha256 = ""
+        manifest_error: SystemExit | None = None
+        if expected is not None and result_directory.entry_exists(expected["manifest_json"]):
+            try:
+                manifest_snapshot = snapshots.enter_context(
+                    _BoundFileSnapshot(
+                        expected["manifest_json"],
+                        label="compact DRACO manifest",
+                        directory=result_directory,
+                        nofollow=False,
+                    )
+                )
+                manifest, manifest_sha256 = manifest_snapshot.load_json_object()
+            except SystemExit as exc:
+                manifest_error = exc
+        compact_candidate = bool(
+            compact_row_signal
+            or pack_present
+            or (
+                manifest is not None
+                and _manifest_declares_compact_evidence(manifest)
+            )
+        )
+        trace_snapshot = snapshots.enter_context(
+            _BoundFileSnapshot(
+                absolute_trace,
+                label="trace JSONL",
+                directory=(
+                    result_directory
+                    if result_directory.contains(absolute_trace)
+                    else None
+                ),
+                nofollow=False,
+            )
+        )
+        trace_rows = trace_snapshot.load_rows()
+        if not compact_candidate:
+            return rows, trace_rows, manifest_path, None
+
+        if expected is None or absolute_result != expected["results_jsonl"]:
+            raise SystemExit(
+                "Compact selection-plan evidence requires a standard stamped result path"
+            )
+        if absolute_trace != expected["trace_jsonl"]:
+            raise SystemExit(
+                "Compact selection-plan evidence requires its bound standard trace sibling"
+            )
+        if manifest_path is not None and (
+            Path(os.path.abspath(manifest_path)) != expected["manifest_json"]
+        ):
+            raise SystemExit(
+                "Compact selection-plan evidence requires its bound standard manifest sibling"
+            )
+        if manifest_snapshot is None or manifest is None:
+            detail = str(manifest_error) if manifest_error is not None else "manifest is missing"
+            raise SystemExit(f"Invalid compact DRACO artifact bundle: {detail}")
+
+        bound_manifest_path = expected["manifest_json"]
+        try:
+            with ResumeSourceIndex([result_jsonl], force_spool=False) as source_index:
+                with source_index.open_source(result_jsonl, source_index=0) as indexed_rows:
+                    for _indexed in indexed_rows:
+                        pass
+                source_snapshots = getattr(source_index, "_sources", None)
+                source_snapshot = (
+                    source_snapshots.get(0)
+                    if isinstance(source_snapshots, dict)
+                    else None
+                )
+                compact_bundle = getattr(source_snapshot, "compact_bundle", None)
+                if compact_bundle is None:
+                    raise SystemExit(
+                        "Compact DRACO audit lost its authenticated bundle snapshot"
+                    )
+                if (
+                    manifest_snapshot.signature != compact_bundle.manifest_signature
+                    or manifest_sha256 != compact_bundle.manifest_sha256
+                    or result_snapshot.signature
+                    != compact_bundle.artifact_path_snapshots.get("results_jsonl")
+                    or trace_snapshot.signature
+                    != compact_bundle.artifact_path_snapshots.get("trace_jsonl")
+                ):
+                    raise SystemExit(
+                        "Compact DRACO audit inputs differ from the authenticated bundle snapshot"
+                    )
+                source_index.seal()
+        except DracoResumeSourceError as exc:
+            raise SystemExit(f"Invalid compact DRACO artifact bundle: {exc}") from exc
+
+        return rows, trace_rows, bound_manifest_path, manifest
+
+
 def markdown(report: dict[str, Any]) -> str:
     config = report.get("configuration_summary") or {}
     runner = config.get("runner") or {}
@@ -901,8 +1334,11 @@ def main() -> int:
         if not isinstance(validation_manifest, dict):
             parser.error("OpenRouter validation manifest must contain a JSON object")
 
-    rows = load_rows(args.result_jsonl)
-    trace_rows = load_rows(args.trace_jsonl)
+    rows, trace_rows, args.manifest, bound_compact_manifest = load_audit_artifact_rows(
+        args.result_jsonl,
+        trace_jsonl=args.trace_jsonl,
+        manifest_path=args.manifest,
+    )
     b2_rows = [row for row in rows if row.get("group") == "B2"]
     task_ids = [str(row.get("task_id") or "") for row in b2_rows]
     task_counts = Counter(task_ids)
@@ -1840,7 +2276,11 @@ def main() -> int:
     benchmark_preflight_counts: dict[str, int] = {}
     validation_preflight_counts = manifest_preflight_counts(validation_manifest)
     if args.manifest:
-        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+        manifest = (
+            bound_compact_manifest
+            if bound_compact_manifest is not None
+            else json.loads(args.manifest.read_text(encoding="utf-8"))
+        )
         benchmark_preflight_counts = manifest_preflight_counts(manifest)
         manifest_pass = bool(
             manifest.get("status") == "complete"
