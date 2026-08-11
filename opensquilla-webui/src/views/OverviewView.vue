@@ -194,7 +194,7 @@ import { useRpcStore } from '@/stores/rpc'
 import { useRequest } from '@/composables/useRequest'
 import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
-import { SESSION_LIST_VIEW, normalizeSessionItem } from '@/composables/useSessions'
+import { normalizeSessionItem } from '@/composables/useSessions'
 import type { SessionsListResponse } from '@/types/rpc'
 import type { UsageSnapshot } from '@/types/usage'
 import { useToasts } from '@/composables/useToasts'
@@ -298,6 +298,7 @@ const platform = usePlatform()
 // ---------------------------------------------------------------------------
 
 const HIDDEN_EVIDENCE_KEYS = new Set(['restart_required', 'restartRequired'])
+const SESSION_COUNT_VIEW = 'session-count-v1'
 
 // Per-panel useRequest instances
 const { data: statusData, refresh: refreshStatus } = useRequest<StatusData>(
@@ -352,19 +353,33 @@ async function refreshUsage(): Promise<UsageData | null> {
     // the Sessions page. The ledger's sessionCount only covers sessions that
     // produced usage records, so a session created without a provider call
     // (e.g. "No provider available") would otherwise read 0 here.
-    let totalSessions = snapshot.totals.sessions
+    let totalSessions = Math.max(
+      usageData.value?.totalSessions ?? 0,
+      snapshot.totals.sessions,
+    )
     try {
       const list = await rpc.call<SessionsListResponse>('sessions.list', {
         limit: 200,
-        view: SESSION_LIST_VIEW,
+        view: SESSION_COUNT_VIEW,
       })
-      const rows = (list?.sessions || []).filter(
-        (item) => normalizeSessionItem(item) !== null,
-      )
-      totalSessions = rows.length
+      const exactCount = list?.totalCount ?? list?.total_count
+      if (Number.isInteger(exactCount) && Number(exactCount) >= 0) {
+        totalSessions = Number(exactCount)
+      } else {
+        // Older gateways return a bounded list and may use the legacy `keys`
+        // field. Treat it as another lower bound without discarding a newer
+        // ledger or last-known exact count.
+        const legacyRows = list?.sessions ?? list?.keys
+        if (Array.isArray(legacyRows)) {
+          const validRows = legacyRows.filter(
+            (item) => normalizeSessionItem(item) !== null,
+          )
+          totalSessions = Math.max(totalSessions, validRows.length)
+        }
+      }
     } catch {
-      // sessions.list is the source of truth; a ledger count stays as a
-      // lower-bound fallback when it is unavailable.
+      // Preserve the last exact total while the ledger remains a lower-bound
+      // fallback during a transient sessions.list failure.
     }
     const result = {
       totalSessions,

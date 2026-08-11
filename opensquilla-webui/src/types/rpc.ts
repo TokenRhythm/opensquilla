@@ -125,6 +125,11 @@ export type RawSessionListEntry = RawSessionItem | string
 export interface SessionsListResponse {
   sessions?: RawSessionListEntry[]
   keys?: RawSessionListEntry[]
+  /** Number of rows returned in this page. */
+  count?: number
+  /** Exact number of sessions visible to the caller, independent of page size. */
+  totalCount?: number
+  total_count?: number
 }
 
 export interface ProjectWorkspaceItem {

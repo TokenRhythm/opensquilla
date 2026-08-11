@@ -4105,8 +4105,22 @@ class SessionStorage:
         return len(session_keys)
 
     @_serialized_read
-    async def count_sessions(self) -> int:
-        async with self.conn.execute("SELECT COUNT(*) FROM sessions") as cur:
+    async def count_sessions(self, guest_owner_id: str | None = None) -> int:
+        where = ""
+        params: tuple[str, ...] = ()
+        if guest_owner_id is not None:
+            owner_id = str(guest_owner_id).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", owner_id):
+                return 0
+            where = (
+                "WHERE session_key GLOB ? "
+                "AND (length(session_key) - length(replace(session_key, ':', ''))) = 5"
+            )
+            params = (f"agent:?*:webchat:guest:{owner_id}:?*",)
+        async with self.conn.execute(
+            f"SELECT COUNT(*) FROM sessions {where}",  # noqa: S608 - fixed clause
+            params,
+        ) as cur:
             row = await cur.fetchone()
         return row[0] if row else 0
 

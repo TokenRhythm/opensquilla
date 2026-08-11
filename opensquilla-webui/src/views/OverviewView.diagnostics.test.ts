@@ -18,6 +18,7 @@ interface MountOptions {
   ) => Record<string, unknown> | Promise<Record<string, unknown>>
   /** Response for sessions.list; null makes the call reject. */
   sessionsList?: unknown | null
+  sessionsListHandler?: (callIndex: number) => unknown | Promise<unknown>
 }
 
 interface PushArg {
@@ -71,6 +72,7 @@ async function mountOverview(options: MountOptions = {}) {
   const copyText = vi.fn(async (_text: string) => {})
   const rpcOn = vi.fn(() => () => {})
   let doctorCallIndex = 0
+  let sessionsListCallIndex = 0
   const rpcCall = vi.fn(async (method: string, params?: unknown) => {
     if (method === 'doctor.status') {
       if (options.report === null) throw new Error('doctor unavailable')
@@ -95,6 +97,9 @@ async function mountOverview(options: MountOptions = {}) {
       }
     }
     if (method === 'sessions.list') {
+      if (options.sessionsListHandler) {
+        return options.sessionsListHandler(sessionsListCallIndex++)
+      }
       if (options.sessionsList === null) throw new Error('sessions unavailable')
       return options.sessionsList ?? { sessions: [], count: 0 }
     }
@@ -233,7 +238,7 @@ describe('OverviewView status lifecycle', () => {
       ([method]) => method === 'sessions.list',
     )
     expect(sessionsListCalls.length).toBeGreaterThan(0)
-    expect(sessionsListCalls[0][1]).toEqual({ limit: 200, view: 'session-list-v1' })
+    expect(sessionsListCalls[0][1]).toEqual({ limit: 200, view: 'session-count-v1' })
     expect(rpcOn).not.toHaveBeenCalled()
   })
 
@@ -249,6 +254,56 @@ describe('OverviewView status lifecycle', () => {
     })
     await flush()
     const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
+  })
+
+  it('uses the exact total when the stored session count exceeds the list page limit', async () => {
+    const { el, flush } = await mountOverview({
+      sessionsList: {
+        sessions: Array.from({ length: 200 }, (_, index) => ({
+          key: `agent:main:webchat:session-${index}`,
+          title: `Session ${index}`,
+        })),
+        count: 200,
+        totalCount: 201,
+      },
+    })
+    await flush()
+    const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
+  })
+
+  it('accepts the legacy keys-only sessions.list response', async () => {
+    const { el, flush } = await mountOverview({
+      sessionsList: {
+        keys: ['agent:main:webchat:legacy-without-usage'],
+        count: 1,
+      },
+    })
+    await flush()
+    const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
+  })
+
+  it('keeps the last exact total across a transient sessions.list failure', async () => {
+    const { el, flush } = await mountOverview({
+      sessionsListHandler: (callIndex) => {
+        if (callIndex === 0) {
+          return {
+            sessions: [{ key: 'agent:main:webchat:persisted', title: 'Persisted' }],
+            count: 1,
+            totalCount: 1,
+          }
+        }
+        throw new Error('sessions unavailable')
+      },
+    })
+    await flush()
+    const card = el.querySelector('[title="Total sessions across all statuses"]')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
+
+    el.querySelector<HTMLButtonElement>('.ov-status-actions .btn--ghost')!.click()
+    await flush()
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
   })
 
