@@ -162,42 +162,44 @@ Router-supported provider profiles depend on the installed build and configured
 provider. Read [`features/squilla-router.md`](features/squilla-router.md) before
 using direct model runs for evaluation.
 
-## Context Budget And Compaction
+## Context Budget and Compaction
 
-Two independent limits decide when a turn's history is compacted. They are set
-in different places and answer different questions, so a session can be
-compacted by one while the other is nowhere near its threshold.
+Ordinary turns are shaped in the shared turn runner. Of the three top-level
+settings below, only `preflight_compact_ratio` controls the automatic preflight
+trigger. The other two are retained for compatibility and limited maintenance
+paths; they do not form a second gate before an ordinary turn.
 
-| Setting | Default | Measured against |
+| Setting | Default | Current scope |
 | --- | --- | --- |
-| `context_budget_tokens` | `100000` | A flat token count. Not derived from the model. |
-| `context_overflow_policy` | `auto_summarize` | What to do once the budget is exceeded. |
-| `preflight_compact_ratio` | `0.85` | A fraction of the **resolved model context window**. |
+| `preflight_compact_ratio` | `0.85` | Ratio of effective token and character capacity available to compactable durable history. |
+| `context_budget_tokens` | `100000` | Upper bound for manual compaction targets; not an automatic next-turn threshold. |
+| `context_overflow_policy` | `auto_summarize` | Compatibility-only value; it does not change ordinary turn behaviour. |
 
-`context_budget_tokens` is the gateway's cap on the estimated payload of the
-next turn — stored history plus the new message. It is a flat number: the
-gateway compares against it without consulting the model, so the same 100k
-applies whether the session runs on a 32k model or a 1M one.
+Before an eligible durable session loads history, the turn runner calculates
+the capacity left for compactable history. That calculation starts from the
+provider and model's effective context window, then accounts for output and
+thinking reserves, the fixed system/tool/request envelope, the active user
+request and attachments, and any provider character limit. Compaction is
+attempted when durable history exceeds `preflight_compact_ratio` of either the
+remaining token capacity or the remaining character capacity. The current
+request is protected, and ephemeral `cron:` and `subagent:` sessions skip this
+preflight path.
 
-`preflight_compact_ratio` is the separate, model-aware guard inside the turn
-runner. It compacts once durable history passes that fraction of the window
-the provider and model actually resolved to.
+Lower `preflight_compact_ratio` to compact earlier or raise it, up to `1.0`,
+to compact later. This setting does not enlarge a model's physical context
+window, disable provider limits, or prevent the live request recovery that may
+run as tool results grow during a turn.
 
-The practical consequences:
+`context_budget_tokens` is a flat application cap in its current, narrower
+scope. It bounds the consumer window used by manual session compaction and the
+standalone `/compact` command. It is combined with the resolved model window
+and can only reduce that window; it is not compared with every ordinary turn's
+history plus new message.
 
-- On a model whose window is well above `context_budget_tokens`, the flat cap
-  is what fires first. Raise `context_budget_tokens` to use more of the window;
-  leave it low to hold down per-turn cost.
-- On a model whose window is below `context_budget_tokens`, the flat cap never
-  fires and the model-aware preflight is what protects the turn.
-
-Policies for `context_overflow_policy`:
-
-| Policy | Behaviour |
-| --- | --- |
-| `auto_summarize` | Summarise older history and retry the turn once. Default. |
-| `hard_truncate` | Drop oldest turns until the payload fits. |
-| `refuse` | Fail the turn with a stable error envelope instead of dropping context. |
+`context_overflow_policy` accepts `auto_summarize`, `hard_truncate`, and
+`refuse` for configuration compatibility. The ordinary shared turn path does
+not consult this setting, so do not rely on `refuse` as a fail-closed control or
+on the other values to select ordinary-turn compaction behaviour.
 
 All three keys are read from the top level of `opensquilla.toml`:
 

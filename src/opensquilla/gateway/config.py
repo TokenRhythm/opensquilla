@@ -61,13 +61,11 @@ _LEGACY_CONTROL_UI_FRONTEND_WARNING = (
 
 
 class ContextOverflowPolicy(StrEnum):
-    """What to do when a turn's effective input size exceeds the budget.
+    """Compatibility values for the legacy gateway overflow helper.
 
-    The default is :attr:`AUTO_SUMMARIZE` so that
-    existing deployments degrade gracefully — older history is summarised
-    and the turn retried once. ``HARD_TRUNCATE`` drops oldest turns until
-    the payload fits. ``REFUSE`` short-circuits the turn with a stable
-    error envelope for operators who want explicit backpressure.
+    The shared turn path does not consult this setting. The values remain
+    loadable for existing configurations and describe the branches available
+    when the legacy helper is invoked directly.
     """
 
     AUTO_SUMMARIZE = "auto_summarize"
@@ -2630,10 +2628,11 @@ class GatewayConfig(BaseSettings):
             )
         return self
 
-    # --- Context overflow policy -----------------------------------------
-    # Budget and policy consulted in gateway/rpc_chat.py before dispatching
-    # a turn. ``context_budget_tokens`` is a soft cap: when an estimated
-    # turn payload exceeds this, the policy branch fires.
+    # --- Context compaction compatibility --------------------------------
+    # ``preflight_compact_ratio`` controls the shared TurnRunner preflight.
+    # ``context_budget_tokens`` remains a manual compaction cap, and
+    # ``context_overflow_policy`` remains loadable for config compatibility;
+    # neither forms a synchronous gate before an ordinary turn.
     context_budget_tokens: int = 100_000
     context_overflow_policy: ContextOverflowPolicy = ContextOverflowPolicy.AUTO_SUMMARIZE
     preflight_compact_ratio: float = Field(default=0.85, gt=0.0, le=1.0)

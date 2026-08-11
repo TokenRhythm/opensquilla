@@ -470,13 +470,11 @@ async def _enforce_context_overflow(
     session_key: str,
     message: str,
 ) -> dict | None:
-    """Apply the configured context-overflow policy before a turn runs.
+    """Invoke the legacy context-overflow helper for compatibility callers.
 
-    Returns a stable error envelope when the policy is REFUSE and the
-    payload exceeds the budget; returns ``None`` for every other path
-    (policy consults pass, HARD_TRUNCATE dropped some history in place,
-    AUTO_SUMMARIZE kicked off a compaction). The caller short-circuits
-    on a non-None return.
+    Built-in ``chat.send`` does not call this function. Compatibility callers
+    receive a stable error envelope when the policy is REFUSE and the payload
+    exceeds the budget; every other branch returns ``None``.
     """
 
     config = ctx.config if isinstance(ctx.config, GatewayConfig) else GatewayConfig()

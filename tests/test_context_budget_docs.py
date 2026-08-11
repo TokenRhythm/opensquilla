@@ -1,10 +1,4 @@
-"""Keep the context-budget documentation describing the shipped values.
-
-``context_budget_tokens`` is a flat cap that never consults the model, so the
-number written down is the only way a reader learns where compaction actually
-starts on their model. Documentation that has drifted from the code is worse
-here than none: it tells someone with a 1M-token window that they are using it.
-"""
+"""Keep the context-compaction documentation aligned with shipped settings."""
 
 from __future__ import annotations
 
@@ -67,8 +61,7 @@ def test_example_context_budget_keys_still_load_from_the_top_level(tmp_path: Pat
     assert loaded.preflight_compact_ratio == 0.7
 
 
-def test_every_overflow_policy_is_documented() -> None:
-    """A new policy that nobody can discover is a policy nobody will use."""
+def test_compatibility_policy_values_are_not_presented_as_turn_controls() -> None:
     guide = _read(_GUIDE)
     example = _read(_EXAMPLE)
 
@@ -76,17 +69,18 @@ def test_every_overflow_policy_is_documented() -> None:
         assert policy.value in guide, f"{policy.value} is missing from {_GUIDE}"
         assert policy.value in example, f"{policy.value} is missing from {_EXAMPLE}"
 
+    assert "Compatibility-only value" in guide
+    assert "does not change ordinary turn behaviour" in guide
+    assert "context_overflow_policy is compatibility-only" in example
+    assert "refuse is not a fail-closed control" in example
 
-def test_guide_separates_the_flat_cap_from_the_model_aware_ratio() -> None:
-    """The two limits are the whole point: one ignores the model, one does not.
 
-    ``apply_context_overflow_policy`` takes no model, provider, or window
-    argument, so its budget cannot track the window. Losing that distinction in
-    the docs is what leaves an operator unable to explain why a large-window
-    session compacted early.
-    """
-    guide = _read(_GUIDE)
+def test_guide_describes_the_active_preflight_and_limited_flat_cap_scopes() -> None:
+    guide = " ".join(_read(_GUIDE).split())
 
-    assert "context_budget_tokens" in guide
-    assert "preflight_compact_ratio" in guide
-    assert "context window" in guide.lower()
+    assert "effective token and character capacity" in guide
+    assert "active user request and attachments" in guide
+    assert "The current request is protected" in guide
+    assert "not an automatic next-turn threshold" in guide
+    assert "manual session compaction" in guide
+    assert "not compared with every ordinary turn's history plus new message" in guide
