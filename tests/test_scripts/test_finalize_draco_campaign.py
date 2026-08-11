@@ -18,6 +18,9 @@ from opensquilla.eval.draco_artifact_integrity import (
 )
 from opensquilla.eval.draco_artifact_io import DurableDracoArtifactWriter
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
+from opensquilla.eval.draco_selection_plan_evidence import (
+    SelectionPlanPackAppender,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "experiments" / "finalize_draco_campaign.py"
@@ -9470,6 +9473,524 @@ def test_finalization_rechecks_result_after_index_reuse(
         assert not args.output_dir.exists()
     finally:
         os.close(lock_fd)
+
+
+def _compact_selection_plan_values(
+    value: object,
+    *,
+    appender: SelectionPlanPackAppender,
+    field_name: str | None = None,
+    embedded_plan_marker: tuple[str, object] | None = None,
+) -> object:
+    if isinstance(value, dict):
+        if field_name == "selection_plan":
+            selection_plan = deepcopy(value)
+            if embedded_plan_marker is not None:
+                marker_field, marker_value = embedded_plan_marker
+                selection_plan[marker_field] = deepcopy(marker_value)
+            return appender.store_selection_plan(selection_plan)
+        return {
+            key: _compact_selection_plan_values(
+                item,
+                appender=appender,
+                field_name=key,
+                embedded_plan_marker=embedded_plan_marker,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _compact_selection_plan_values(
+                item,
+                appender=appender,
+                embedded_plan_marker=embedded_plan_marker,
+            )
+            for item in value
+        ]
+    return value
+
+
+def _compact_source_fixture(
+    module,
+    tmp_path: Path,
+    *,
+    nested_row_marker: bool = False,
+    embedded_plan_marker: bool = False,
+) -> tuple[argparse.Namespace, Path, int]:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    legacy_rows = [
+        json.loads(line)
+        for line in args.result[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    stamp = "20260811-010101"
+    results_path = tmp_path / f"draco_ensemble_{stamp}.jsonl"
+    trace_path = tmp_path / f"draco_run_{stamp}.trace.jsonl"
+    checkpoint_path = tmp_path / f"draco_run_{stamp}.checkpoint.json"
+    manifest_path = tmp_path / f"draco_run_{stamp}.manifest.json"
+    pack_path = tmp_path / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    capability = module.selection_plan_evidence_capability_contract()
+    durability = module.durable_artifact_capability_contract()
+    manifest = json.loads(args.manifest[0].read_text(encoding="utf-8"))
+    compatibility = deepcopy(manifest["run_compatibility"])
+    for group in module.GROUPS:
+        contract = deepcopy(compatibility["contracts"][group])
+        contract["durable_artifact_capability"] = deepcopy(durability)
+        compatibility["contracts"][group] = contract
+        compatibility["fingerprints"][group] = module.canonical_sha256(
+            contract,
+            prefix=True,
+        )
+
+    compact_rows: list[dict[str, object]] = []
+    with SelectionPlanPackAppender(pack_path) as appender:
+        for legacy_row in legacy_rows:
+            unsealed = deepcopy(legacy_row)
+            unsealed["run_compatibility_fingerprint"] = compatibility[
+                "fingerprints"
+            ][str(unsealed["group"])]
+            unsealed[module.SELECTION_PLAN_EVIDENCE_ROW_FIELD] = deepcopy(
+                capability
+            )
+            if nested_row_marker:
+                unsealed["nested_capability_probe"] = {
+                    module.SELECTION_PLAN_EVIDENCE_ROW_FIELD: deepcopy(
+                        capability
+                    )
+                }
+            unsealed[module.DRACO_DURABLE_RESULT_ROW_FIELD] = deepcopy(durability)
+            compact = _compact_selection_plan_values(
+                unsealed,
+                appender=appender,
+                embedded_plan_marker=(
+                    (
+                        module.SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+                        capability,
+                    )
+                    if embedded_plan_marker
+                    else None
+                ),
+            )
+            assert isinstance(compact, dict)
+            compact_rows.append(module.seal_result_row(compact))
+        pack_sha256 = appender.index.pack_sha256
+        pack_bytes = appender.index.pack_bytes
+        pack_object_count = appender.index.object_count
+
+    with DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+        create=True,
+    ) as writer:
+        for row in compact_rows:
+            assert writer.append(row, canonical_trace_row_from_result(row))
+    artifact_verification = module.verify_durable_draco_artifacts(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+
+    manifest.update(
+        {
+            "schema": module.DRACO_RUN_MANIFEST_SCHEMA_V2,
+            "stamp": stamp,
+            "rows_written": len(compact_rows),
+            "durable_artifact_capability": deepcopy(durability),
+            "run_compatibility": compatibility,
+            module.SELECTION_PLAN_EVIDENCE_ROW_FIELD: deepcopy(capability),
+            module.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD: {
+                "schema": module.SELECTION_PLAN_EVIDENCE_MANIFEST_SCHEMA,
+                "capability": deepcopy(capability),
+                "result_evidence_schema": module.RESULT_EVIDENCE_SCHEMA,
+                "durable_artifact_capability": deepcopy(durability),
+                "results_sha256": artifact_verification["results_sha256"],
+                "trace_sha256": artifact_verification["trace_sha256"],
+                "checkpoint_sha256": artifact_verification[
+                    "checkpoint_sha256"
+                ],
+                "pack_sha256": pack_sha256,
+                "pack_bytes": pack_bytes,
+                "pack_object_count": pack_object_count,
+                "compact_row_count": sum(
+                    module.selection_plan_reference_signal(row)
+                    for row in compact_rows
+                ),
+            },
+            "artifacts": {
+                "results_jsonl": str(results_path),
+                "trace_jsonl": str(trace_path),
+                "checkpoint_json": str(checkpoint_path),
+                "manifest_json": str(manifest_path),
+                module.SELECTION_PLAN_PACK_ARTIFACT_FIELD: str(pack_path),
+            },
+        }
+    )
+    _owner_json(manifest_path, manifest)
+    args.result = [results_path]
+    args.manifest = [manifest_path]
+    return args, pack_path, lock_fd
+
+
+def _open_compact_finalizer_source_entry(module, args: argparse.Namespace):
+    raw_indexes = module.read_source_shard_indexes(args.result)
+    _, _, _, manifest_sources = module.load_manifest_contracts(
+        args.manifest,
+        result_paths=args.result,
+        groups=module.GROUPS,
+        result_indexes=raw_indexes,
+    )
+    views = module.open_source_selection_plan_views(
+        raw_indexes,
+        manifest_sources,
+    )
+    return raw_indexes, manifest_sources, views
+
+
+def test_compact_finalizer_source_entry_binds_and_expands_after_raw_evidence(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _compact_source_fixture(module, tmp_path)
+    views = ()
+    try:
+        raw_indexes, manifest_sources, views = _open_compact_finalizer_source_entry(
+            module,
+            args,
+        )
+        raw_record = raw_indexes[0].records[-1]
+        expanded_record = views[0].records[-1]
+        assert module.selection_plan_reference_signal(raw_record.row)
+        assert not module.selection_plan_reference_signal(expanded_record.row)
+        assert (
+            module.SELECTION_PLAN_EVIDENCE_ROW_FIELD not in expanded_record.row
+        )
+        assert expanded_record.path == raw_record.path
+        assert expanded_record.source_index == raw_record.source_index
+        assert expanded_record.line == raw_record.line
+        assert views[0].raw_index is raw_indexes[0]
+        assert manifest_sources[0]["result_sha256"] == raw_indexes[0].sha256
+        assert (
+            expanded_record.row["routing_trace"]["selection_plan"]["decision_id"]
+            == raw_record.row["routing_trace"]["selection_plan"]["summary"][
+                "decision_id"
+            ]
+        )
+        module.verify_and_close_source_selection_plan_views(views)
+        views = ()
+        final_manifest = module.run_finalization(args)
+        assert final_manifest["status"] == "complete"
+        final_rows = [
+            json.loads(line)
+            for line in (args.output_dir / "results.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert all(
+            not module.selection_plan_reference_signal(row) for row in final_rows
+        )
+        assert all(
+            not module.selection_plan_row_capability_signal(row)
+            for row in final_rows
+        )
+        assert all(module.verify_result_row_evidence(row) for row in final_rows)
+    finally:
+        for view in views:
+            view.close()
+        os.close(lock_fd)
+
+
+@pytest.mark.parametrize(
+    ("fixture_kwargs", "error_match"),
+    [
+        (
+            {"nested_row_marker": True},
+            "row capability was stripped or downgraded",
+        ),
+        (
+            {"embedded_plan_marker": True},
+            "retains a reserved capability marker",
+        ),
+    ],
+)
+def test_compact_finalizer_rejects_non_root_reserved_capability_markers(
+    module,
+    tmp_path: Path,
+    fixture_kwargs: dict[str, bool],
+    error_match: str,
+) -> None:
+    args, _, lock_fd = _compact_source_fixture(
+        module,
+        tmp_path,
+        **fixture_kwargs,
+    )
+    try:
+        with pytest.raises(module.FinalizationError, match=error_match):
+            module.run_finalization(args)
+        assert not args.output_dir.exists()
+    finally:
+        os.close(lock_fd)
+
+
+def test_legacy_inline_finalizer_source_view_is_identity_and_byte_preserving(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    source_bytes = args.result[0].read_bytes()
+    views = ()
+    try:
+        indexes = module.read_source_shard_indexes(args.result)
+        _, _, _, manifest_sources = module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=module.GROUPS,
+            result_indexes=indexes,
+        )
+        views = module.open_source_selection_plan_views(indexes, manifest_sources)
+        assert views[0].raw_index is indexes[0]
+        assert views[0].records[0] is indexes[0].records[0]
+        assert args.result[0].read_bytes() == source_bytes
+        module.verify_and_close_source_selection_plan_views(views)
+        views = ()
+    finally:
+        for view in views:
+            view.close()
+        os.close(lock_fd)
+
+
+def test_finalizer_closes_bound_pack_reader_after_business_exception(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _, lock_fd = _compact_source_fixture(module, tmp_path)
+    opened_views: list[object] = []
+    original_open = module.open_source_selection_plan_views
+
+    def tracked_open(*call_args: object, **call_kwargs: object):
+        views = original_open(*call_args, **call_kwargs)
+        opened_views.extend(views)
+        return views
+
+    def fail_after_open(_records: object) -> object:
+        raise RuntimeError("business validation failed after pack open")
+
+    monkeypatch.setattr(module, "open_source_selection_plan_views", tracked_open)
+    monkeypatch.setattr(module, "validate_source_policy_history", fail_after_open)
+    try:
+        with pytest.raises(RuntimeError, match="business validation failed"):
+            module.run_finalization(args)
+        assert opened_views
+        assert all(view.reader is None for view in opened_views)
+    finally:
+        os.close(lock_fd)
+
+
+def test_compact_finalizer_rejects_raw_ref_tamper_before_manifest_or_pack_use(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _compact_source_fixture(module, tmp_path)
+    try:
+        rows = [
+            json.loads(line)
+            for line in args.result[0].read_text(encoding="utf-8").splitlines()
+        ]
+        ref = rows[-1]["routing_trace"]["selection_plan"]
+        ref["expanded_bytes"] += 1
+        args.result[0].write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        with pytest.raises(module.FinalizationError, match="not sealed or was mutated"):
+            module.read_source_shard_indexes(args.result)
+    finally:
+        os.close(lock_fd)
+
+
+def test_compact_finalizer_rejects_missing_pack_and_wrong_stamp_path(
+    module,
+    tmp_path: Path,
+) -> None:
+    missing_args, missing_pack, missing_lock_fd = _compact_source_fixture(
+        module,
+        tmp_path / "missing",
+    )
+    try:
+        missing_pack.unlink()
+        raw_indexes = module.read_source_shard_indexes(missing_args.result)
+        _, _, _, sources = module.load_manifest_contracts(
+            missing_args.manifest,
+            result_paths=missing_args.result,
+            groups=module.GROUPS,
+            result_indexes=raw_indexes,
+        )
+        with pytest.raises(module.FinalizationError, match="pack binding failed"):
+            module.open_source_selection_plan_views(raw_indexes, sources)
+    finally:
+        os.close(missing_lock_fd)
+
+    wrong_args, _, wrong_lock_fd = _compact_source_fixture(
+        module,
+        tmp_path / "wrong-path",
+    )
+    try:
+        manifest = json.loads(wrong_args.manifest[0].read_text(encoding="utf-8"))
+        manifest["artifacts"][module.SELECTION_PLAN_PACK_ARTIFACT_FIELD] = str(
+            (tmp_path / "wrong-path" / "other.pack.jsonl").resolve()
+        )
+        _owner_json(wrong_args.manifest[0], manifest)
+        raw_indexes = module.read_source_shard_indexes(wrong_args.result)
+        with pytest.raises(module.FinalizationError, match="pack path is not stamp-bound"):
+            module.load_manifest_contracts(
+                wrong_args.manifest,
+                result_paths=wrong_args.result,
+                groups=module.GROUPS,
+                result_indexes=raw_indexes,
+            )
+    finally:
+        os.close(wrong_lock_fd)
+
+
+@pytest.mark.parametrize("field", ["pack_sha256", "pack_object_count"])
+def test_compact_finalizer_rejects_pack_digest_or_count_binding(
+    module,
+    tmp_path: Path,
+    field: str,
+) -> None:
+    args, _, lock_fd = _compact_source_fixture(module, tmp_path)
+    try:
+        manifest = json.loads(args.manifest[0].read_text(encoding="utf-8"))
+        binding = manifest[module.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD]
+        if field == "pack_sha256":
+            binding[field] = "sha256:" + "0" * 64
+        else:
+            binding[field] += 1
+        _owner_json(args.manifest[0], manifest)
+        raw_indexes = module.read_source_shard_indexes(args.result)
+        _, _, _, sources = module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=module.GROUPS,
+            result_indexes=raw_indexes,
+        )
+        with pytest.raises(module.FinalizationError, match="digest/count differs"):
+            module.open_source_selection_plan_views(raw_indexes, sources)
+    finally:
+        os.close(lock_fd)
+
+
+def test_compact_finalizer_binds_durable_results_to_raw_shard_hash(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _compact_source_fixture(module, tmp_path)
+    try:
+        raw_index = module.read_source_shard_indexes(args.result)[0]
+        forged_index = module.SourceShardIndex(
+            path=raw_index.path,
+            source_index=raw_index.source_index,
+            sha256="0" * 64,
+            records=raw_index.records,
+        )
+        with pytest.raises(module.FinalizationError, match="raw shard index"):
+            module.load_manifest_contracts(
+                args.manifest,
+                result_paths=args.result,
+                groups=module.GROUPS,
+                result_indexes=(forged_index,),
+            )
+    finally:
+        os.close(lock_fd)
+
+
+def test_compact_finalizer_rejects_pack_replacement_at_single_reader_open(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, pack_path, lock_fd = _compact_source_fixture(module, tmp_path)
+    try:
+        raw_indexes = module.read_source_shard_indexes(args.result)
+        _, _, _, sources = module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=module.GROUPS,
+            result_indexes=raw_indexes,
+        )
+        replacement = tmp_path / "replacement-selection-plan.pack.jsonl"
+        with SelectionPlanPackAppender(replacement):
+            pass
+        original_reader = module.SelectionPlanPackReader
+        original_require = module.require_regular_file
+
+        def replace_then_open(path: Path, *call_args: object, **call_kwargs: object):
+            moved = tmp_path / "pre-open-selection-plan.pack.jsonl"
+            pack_path.rename(moved)
+            replacement.rename(pack_path)
+            return original_reader(path, *call_args, **call_kwargs)
+
+        def no_pack_prelookup(
+            path: Path,
+            *,
+            owner_only: bool = True,
+        ) -> Path:
+            if Path(path) == pack_path:
+                raise AssertionError("pack path was looked up before reader open")
+            return original_require(path, owner_only=owner_only)
+
+        monkeypatch.setattr(module, "SelectionPlanPackReader", replace_then_open)
+        monkeypatch.setattr(module, "require_regular_file", no_pack_prelookup)
+        with pytest.raises(module.FinalizationError, match="digest/count differs"):
+            module.open_source_selection_plan_views(raw_indexes, sources)
+    finally:
+        os.close(lock_fd)
+
+
+def test_compact_finalizer_rejects_capability_downgrade_and_path_replacement(
+    module,
+    tmp_path: Path,
+) -> None:
+    downgrade_args, _, downgrade_lock_fd = _compact_source_fixture(
+        module,
+        tmp_path / "downgrade",
+    )
+    try:
+        manifest = json.loads(
+            downgrade_args.manifest[0].read_text(encoding="utf-8")
+        )
+        manifest.pop(module.SELECTION_PLAN_EVIDENCE_ROW_FIELD)
+        _owner_json(downgrade_args.manifest[0], manifest)
+        raw_indexes = module.read_source_shard_indexes(downgrade_args.result)
+        with pytest.raises(module.FinalizationError, match="capability or durable binding"):
+            module.load_manifest_contracts(
+                downgrade_args.manifest,
+                result_paths=downgrade_args.result,
+                groups=module.GROUPS,
+                result_indexes=raw_indexes,
+            )
+    finally:
+        os.close(downgrade_lock_fd)
+
+    replace_args, pack_path, replace_lock_fd = _compact_source_fixture(
+        module,
+        tmp_path / "replace",
+    )
+    views = ()
+    try:
+        _, _, views = _open_compact_finalizer_source_entry(module, replace_args)
+        moved = pack_path.with_name("original-selection-plan.pack.jsonl")
+        pack_path.rename(moved)
+        with SelectionPlanPackAppender(pack_path):
+            pass
+        with pytest.raises(module.FinalizationError, match="changed during finalization"):
+            module.verify_and_close_source_selection_plan_views(views)
+        views = ()
+    finally:
+        for view in views:
+            view.close()
+        os.close(replace_lock_fd)
 
 
 def test_attempt_id_payload_conflict_and_legacy_mix_are_fatal(module, tmp_path: Path) -> None:

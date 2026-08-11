@@ -4,6 +4,8 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import zlib
 from copy import deepcopy
 from dataclasses import replace
@@ -22,6 +24,7 @@ from opensquilla.eval.draco_selection_plan_evidence import (
     SelectionPlanPackReader,
     canonical_selection_plan_json_bytes,
     expand_selection_plan,
+    materialize_selection_plan_row_view,
     parse_selection_plan_reference,
 )
 
@@ -175,6 +178,96 @@ def test_legacy_inline_plan_is_returned_by_identity_and_ref_requires_pack(
         assert expand_selection_plan(ref, reader=reader) == inline
     with pytest.raises(SelectionPlanEvidenceError, match="requires its bound pack"):
         expand_selection_plan(ref)
+
+
+def test_row_view_is_detached_and_expands_each_ref_once_per_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "selection-plans.jsonl"
+    plan = _plan()
+    with SelectionPlanPackAppender(path) as appender:
+        ref = appender.store_selection_plan(plan)
+    compact = {
+        "routing_trace": {"selection_plan": deepcopy(ref)},
+        "ensemble_trace": {
+            "calls": [
+                {"selection_plan": deepcopy(ref)},
+                {"selection_plan": deepcopy(ref)},
+            ]
+        },
+    }
+
+    with SelectionPlanPackReader(path) as reader:
+        original_expand = reader.expand_selection_plan
+        expanded_refs: list[object] = []
+
+        def counted_expand(value: object) -> object:
+            expanded_refs.append(value)
+            return original_expand(value)
+
+        monkeypatch.setattr(reader, "expand_selection_plan", counted_expand)
+        view = materialize_selection_plan_row_view(
+            compact,
+            reader=reader,
+            require_references=True,
+        )
+
+    assert len(expanded_refs) == 1
+    assert compact["routing_trace"]["selection_plan"] == ref
+    routing_plan = view["routing_trace"]["selection_plan"]
+    call_plans = [
+        call["selection_plan"] for call in view["ensemble_trace"]["calls"]
+    ]
+    assert routing_plan == plan
+    assert call_plans == [plan, plan]
+    assert routing_plan is not call_plans[0]
+    call_plans[0]["decision_id"] = "detached-mutation"
+    assert routing_plan["decision_id"] == "decision-1"
+
+
+def test_row_view_preserves_old_inline_identity_and_rejects_compact_downgrade(
+    tmp_path: Path,
+) -> None:
+    inline_row = {"routing_trace": {"selection_plan": _plan()}}
+    assert (
+        materialize_selection_plan_row_view(
+            inline_row,
+            reader=None,
+            require_references=False,
+        )
+        is inline_row
+    )
+
+    path = tmp_path / "selection-plans.jsonl"
+    with SelectionPlanPackAppender(path):
+        pass
+    with SelectionPlanPackReader(path) as reader:
+        with pytest.raises(SelectionPlanEvidenceError, match="inline plan"):
+            materialize_selection_plan_row_view(
+                inline_row,
+                reader=reader,
+                require_references=True,
+            )
+
+
+@pytest.mark.parametrize("inline_value", [[{"inline": True}], "inline", 7])
+def test_compact_row_rejects_non_mapping_inline_selection_plan_values(
+    tmp_path: Path,
+    inline_value: object,
+) -> None:
+    path = tmp_path / "selection-plans.jsonl"
+    with SelectionPlanPackAppender(path):
+        pass
+    row = {"routing_trace": {"selection_plan": inline_value}}
+
+    with SelectionPlanPackReader(path) as reader:
+        with pytest.raises(SelectionPlanEvidenceError, match="inline plan"):
+            materialize_selection_plan_row_view(
+                row,
+                reader=reader,
+                require_references=True,
+            )
 
 
 def test_reopened_appender_is_content_idempotent(tmp_path: Path) -> None:
@@ -470,6 +563,25 @@ def test_cyclic_input_and_wrong_leaf_kind_are_rejected_without_partial_batch(
         assert appender.index.object_count == 1
 
 
+def test_fixed_object_dag_rejects_refs_outside_direct_root_leaf_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "selection-plans.jsonl"
+    with SelectionPlanPackAppender(path) as appender:
+        leaf_ref = appender.append_object(
+            "registry_snapshot",
+            {"snapshot": "one"},
+        )
+        with pytest.raises(SelectionPlanEvidenceError, match="fixed leaf fields"):
+            appender.store_selection_plan({"opaque": leaf_ref})
+        with pytest.raises(SelectionPlanEvidenceError, match="leaf contains"):
+            appender.append_object(
+                "ranking_parameters",
+                {"opaque": {"nested": leaf_ref}},
+            )
+        assert appender.index.object_count == 1
+
+
 def test_expanded_summary_object_count_and_pack_caps_are_fail_closed(
     tmp_path: Path,
 ) -> None:
@@ -517,6 +629,47 @@ def test_expanded_summary_object_count_and_pack_caps_are_fail_closed(
         assert appender.index.object_count == 0
 
 
+def test_cumulative_uncompressed_cap_stops_before_next_record_decompression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "aggregate-uncompressed.jsonl"
+    with SelectionPlanPackAppender(path) as appender:
+        appender.append_object("registry_snapshot", {"payload": "x" * 512})
+        appender.append_object("ranking_parameters", {"payload": "y" * 512})
+        locations = tuple(appender.index.objects.values())
+        first_size = locations[0].uncompressed_bytes
+        total_size = appender.index.uncompressed_bytes
+
+    low_limits = replace(
+        DEFAULT_SELECTION_PLAN_EVIDENCE_LIMITS,
+        pack_uncompressed_bytes=total_size - 1,
+    )
+    original_decompress = evidence._bounded_zlib_decompress
+    decompressions: list[int] = []
+
+    def counted_decompress(*args: object, **kwargs: object) -> bytes:
+        decompressions.append(1)
+        return original_decompress(*args, **kwargs)
+
+    monkeypatch.setattr(evidence, "_bounded_zlib_decompress", counted_decompress)
+    with pytest.raises(SelectionPlanEvidenceLimitError, match="cumulative"):
+        SelectionPlanPackReader(path, limits=low_limits)
+    assert len(decompressions) == 1
+
+    append_path = tmp_path / "aggregate-append.jsonl"
+    append_limits = replace(
+        DEFAULT_SELECTION_PLAN_EVIDENCE_LIMITS,
+        pack_uncompressed_bytes=first_size + 1,
+    )
+    with SelectionPlanPackAppender(append_path, limits=append_limits) as appender:
+        appender.append_object("registry_snapshot", {"payload": "x" * 512})
+        with pytest.raises(SelectionPlanEvidenceLimitError, match="cumulative"):
+            appender.append_object("ranking_parameters", {"payload": "y" * 512})
+        assert appender.index.object_count == 1
+        assert appender.index.uncompressed_bytes == first_size
+
+
 def test_object_uncompressed_and_record_line_caps_are_enforced(tmp_path: Path) -> None:
     object_limits = replace(
         DEFAULT_SELECTION_PLAN_EVIDENCE_LIMITS,
@@ -557,6 +710,110 @@ def test_fd_bound_reader_survives_path_replacement(tmp_path: Path) -> None:
             reader.verify_snapshot()
     finally:
         os.close(fd)
+
+
+def test_path_bound_reader_resolves_original_fd_but_rejects_path_replacement(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "selection-plans.jsonl"
+    original = _plan()
+    with SelectionPlanPackAppender(path) as appender:
+        ref = appender.store_selection_plan(original)
+
+    with SelectionPlanPackReader(path) as reader:
+        moved = tmp_path / "original-pack.jsonl"
+        path.rename(moved)
+        with SelectionPlanPackAppender(path):
+            pass
+        assert reader.expand_selection_plan(ref) == original
+        with pytest.raises(SelectionPlanEvidenceError, match="path was replaced"):
+            reader.verify_snapshot()
+
+
+def test_owner_only_reader_checks_mode_on_the_opened_pack_fd(tmp_path: Path) -> None:
+    path = tmp_path / "selection-plans.jsonl"
+    with SelectionPlanPackAppender(path) as appender:
+        appender.store_selection_plan(_plan())
+    path.chmod(0o640)
+
+    with pytest.raises(SelectionPlanEvidenceError, match="must be owner-only"):
+        SelectionPlanPackReader(path, owner_only=True)
+
+
+def test_fifo_pack_fails_without_blocking_and_closes_the_opened_fd(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "selection-plan.fifo"
+    os.mkfifo(path, 0o600)
+    script = """
+import json
+import os
+import sys
+from pathlib import Path
+import opensquilla.eval.draco_selection_plan_evidence as evidence
+
+opened = []
+closed = []
+original_open = os.open
+original_close = os.close
+
+def tracked_open(*args, **kwargs):
+    fd = original_open(*args, **kwargs)
+    opened.append(fd)
+    return fd
+
+def tracked_close(fd):
+    closed.append(fd)
+    return original_close(fd)
+
+evidence.os.open = tracked_open
+evidence.os.close = tracked_close
+try:
+    evidence.SelectionPlanPackReader(Path(sys.argv[1]), owner_only=True)
+except evidence.SelectionPlanEvidenceError as exc:
+    print(json.dumps({"closed": bool(opened) and opened[-1] in closed, "error": str(exc)}))
+else:
+    raise SystemExit("FIFO was accepted")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    result = json.loads(completed.stdout)
+    assert result["closed"] is True
+    assert "not a regular file" in result["error"]
+
+
+def test_owner_only_mode_is_rechecked_for_reader_and_reopened_appender(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "selection-plans.jsonl"
+    with SelectionPlanPackAppender(path) as appender:
+        appender.store_selection_plan(_plan())
+
+    with SelectionPlanPackReader(path, owner_only=True) as reader:
+        path.chmod(0o644)
+        with pytest.raises(SelectionPlanEvidenceError, match="must be owner-only"):
+            reader.verify_snapshot()
+
+    opened_fds: list[int] = []
+    original_open_regular = evidence._open_regular
+
+    def tracked_open_regular(*args: object, **kwargs: object) -> int:
+        fd = original_open_regular(*args, **kwargs)
+        opened_fds.append(fd)
+        return fd
+
+    monkeypatch.setattr(evidence, "_open_regular", tracked_open_regular)
+    with pytest.raises(SelectionPlanEvidenceError, match="must be owner-only"):
+        SelectionPlanPackAppender(path, create=False)
+    assert opened_fds
+    with pytest.raises(OSError):
+        os.fstat(opened_fds[-1])
 
 
 def test_ref_schema_and_expanded_hash_are_domain_separated(tmp_path: Path) -> None:

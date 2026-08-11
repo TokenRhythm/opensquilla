@@ -40,6 +40,18 @@ from opensquilla.eval.draco_artifact_io import (
     durable_artifact_capability_contract,
     verify_durable_draco_artifacts,
 )
+from opensquilla.eval.draco_selection_plan_evidence import (
+    SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
+    SELECTION_PLAN_EVIDENCE_MANIFEST_SCHEMA,
+    SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+    SELECTION_PLAN_PACK_ARTIFACT_FIELD,
+    SelectionPlanEvidenceError,
+    SelectionPlanPackReader,
+    materialize_selection_plan_row_view,
+    selection_plan_evidence_capability_contract,
+    selection_plan_reference_signal,
+    selection_plan_row_capability_signal,
+)
 from opensquilla.provider.protocol import (
     provider_retry_expanded_proposer_identities,
 )
@@ -823,6 +835,37 @@ class SourceShardIndex:
     source_index: int
     sha256: str
     records: tuple[SourceRecord, ...]
+
+
+@dataclass
+class SourceShardSelectionPlanView:
+    """Detached business rows plus the still-bound pack reader for one shard."""
+
+    raw_index: SourceShardIndex
+    records: tuple[SourceRecord, ...]
+    reader: SelectionPlanPackReader | None = None
+    pack_path: Path | None = None
+
+    @property
+    def pack_snapshot(self) -> tuple[Path, str] | None:
+        if self.reader is None or self.pack_path is None:
+            return None
+        return self.pack_path, self.reader.index.pack_sha256.removeprefix("sha256:")
+
+    def verify_snapshot(self) -> None:
+        if self.reader is not None:
+            self.reader.verify_snapshot()
+
+    def close(self) -> None:
+        if self.reader is not None:
+            self.reader.close()
+            self.reader = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
 
 
 class _HashingRawReader(io.RawIOBase):
@@ -1869,6 +1912,149 @@ def validate_source_policy_history(
     return failures
 
 
+_SELECTION_PLAN_MANIFEST_BINDING_FIELDS = frozenset(
+    {
+        "schema",
+        "capability",
+        "result_evidence_schema",
+        "durable_artifact_capability",
+        "results_sha256",
+        "trace_sha256",
+        "checkpoint_sha256",
+        "pack_sha256",
+        "pack_bytes",
+        "pack_object_count",
+        "compact_row_count",
+    }
+)
+
+
+def _selection_plan_row_has_exact_root_capability(
+    row: Mapping[str, Any],
+    expected_capability: Mapping[str, Any],
+) -> bool:
+    if row.get(SELECTION_PLAN_EVIDENCE_ROW_FIELD) != expected_capability:
+        return False
+    return not any(
+        selection_plan_row_capability_signal(item)
+        for key, item in row.items()
+        if key != SELECTION_PLAN_EVIDENCE_ROW_FIELD
+    )
+
+
+def _selection_plan_manifest_contract(
+    *,
+    payload: Mapping[str, Any],
+    artifacts: Any,
+    result_rows: Sequence[Any],
+    durable_v2: bool,
+    artifact_verification: Mapping[str, Any] | None,
+    manifest_path: Path,
+    expected_durability: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Validate every downgrade signal before a compact row is expanded."""
+
+    manifest_capability_present = SELECTION_PLAN_EVIDENCE_ROW_FIELD in payload
+    manifest_binding_present = SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD in payload
+    pack_artifact_present = bool(
+        isinstance(artifacts, Mapping)
+        and SELECTION_PLAN_PACK_ARTIFACT_FIELD in artifacts
+    )
+    row_capability_present = any(
+        isinstance(row, Mapping) and selection_plan_row_capability_signal(row)
+        for row in result_rows
+    )
+    row_ref_present = any(
+        isinstance(row, Mapping) and selection_plan_reference_signal(row)
+        for row in result_rows
+    )
+    compact_row_count = sum(
+        isinstance(row, Mapping) and selection_plan_reference_signal(row)
+        for row in result_rows
+    )
+    signaled = bool(
+        manifest_capability_present
+        or manifest_binding_present
+        or pack_artifact_present
+        or row_capability_present
+        or row_ref_present
+    )
+    if not signaled:
+        return None
+
+    expected_capability = selection_plan_evidence_capability_contract()
+    capability = payload.get(SELECTION_PLAN_EVIDENCE_ROW_FIELD)
+    binding = payload.get(SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD)
+    if (
+        not durable_v2
+        or artifact_verification is None
+        or capability != expected_capability
+        or not isinstance(binding, Mapping)
+        or set(binding) != _SELECTION_PLAN_MANIFEST_BINDING_FIELDS
+        or binding.get("schema") != SELECTION_PLAN_EVIDENCE_MANIFEST_SCHEMA
+        or binding.get("capability") != expected_capability
+        or binding.get("result_evidence_schema") != RESULT_EVIDENCE_SCHEMA
+        or binding.get("durable_artifact_capability") != expected_durability
+        or binding.get("results_sha256")
+        != artifact_verification.get("results_sha256")
+        or binding.get("trace_sha256") != artifact_verification.get("trace_sha256")
+        or binding.get("checkpoint_sha256")
+        != artifact_verification.get("checkpoint_sha256")
+    ):
+        raise FinalizationError(
+            f"selection-plan evidence capability or durable binding is incomplete: {manifest_path}"
+        )
+    if (
+        not SHA256_VALUE.fullmatch(str(binding.get("pack_sha256") or ""))
+        or isinstance(binding.get("pack_bytes"), bool)
+        or not isinstance(binding.get("pack_bytes"), int)
+        or int(binding["pack_bytes"]) <= 0
+        or isinstance(binding.get("pack_object_count"), bool)
+        or not isinstance(binding.get("pack_object_count"), int)
+        or int(binding["pack_object_count"]) <= 0
+        or isinstance(binding.get("compact_row_count"), bool)
+        or not isinstance(binding.get("compact_row_count"), int)
+        or int(binding["compact_row_count"]) <= 0
+        or binding.get("compact_row_count") != compact_row_count
+    ):
+        raise FinalizationError(
+            f"selection-plan evidence pack binding is malformed: {manifest_path}"
+        )
+    if not result_rows or any(
+        not isinstance(row, Mapping)
+        or not _selection_plan_row_has_exact_root_capability(
+            row,
+            expected_capability,
+        )
+        for row in result_rows
+    ) or not row_ref_present:
+        raise FinalizationError(
+            f"selection-plan evidence row capability was stripped or downgraded: {manifest_path}"
+        )
+    raw_pack_path = (
+        artifacts.get(SELECTION_PLAN_PACK_ARTIFACT_FIELD)
+        if isinstance(artifacts, Mapping)
+        else None
+    )
+    stamp = payload.get("stamp")
+    expected_pack_path = manifest_path.parent / (
+        f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    )
+    if (
+        not isinstance(raw_pack_path, str)
+        or not Path(raw_pack_path).is_absolute()
+        or Path(os.path.abspath(raw_pack_path)) != expected_pack_path
+    ):
+        raise FinalizationError(
+            f"manifest selection-plan pack path is not stamp-bound: {manifest_path}"
+        )
+    return {
+        "capability": copy.deepcopy(expected_capability),
+        "binding": copy.deepcopy(dict(binding)),
+        "pack_path": str(expected_pack_path),
+    }
+
+
 def load_manifest_contracts(
     paths: Sequence[Path],
     *,
@@ -2080,6 +2266,14 @@ def load_manifest_contracts(
                 raise FinalizationError(
                     f"manifest durable artifact binding failed: {path}: {exc}"
                 ) from exc
+        if (
+            artifact_verification is not None
+            and result_index is not None
+            and artifact_verification["results_sha256"] != result_index.sha256
+        ):
+            raise FinalizationError(
+                f"manifest durable result hash differs from its raw shard index: {path}"
+            )
         if artifact_recovery is not None:
             if artifact_verification is None:
                 raise FinalizationError(
@@ -2250,6 +2444,15 @@ def load_manifest_contracts(
             raise FinalizationError(
                 f"manifest durable capability was stripped from sealed rows: {path}"
             )
+        selection_plan_contract = _selection_plan_manifest_contract(
+            payload=payload,
+            artifacts=artifacts,
+            result_rows=result_rows,
+            durable_v2=durable_v2,
+            artifact_verification=artifact_verification,
+            manifest_path=path,
+            expected_durability=expected_durability,
+        )
         if isinstance(artifact_recovery, Mapping):
             assert recovery_prior_manifest is not None
             prior_resume = recovery_prior_manifest.get("resume_selection")
@@ -2680,6 +2883,10 @@ def load_manifest_contracts(
         }
         if artifact_verification is not None:
             source_record["durable_artifacts"] = artifact_verification
+        if selection_plan_contract is not None:
+            source_record[SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD] = (
+                selection_plan_contract
+            )
         if isinstance(artifact_recovery, Mapping):
             source_record["artifact_recovery"] = dict(artifact_recovery)
         source_evidence.append(source_record)
@@ -2691,6 +2898,140 @@ def load_manifest_contracts(
         key_fingerprint,
         source_evidence,
     )
+
+
+def open_source_selection_plan_views(
+    raw_indexes: Sequence[SourceShardIndex],
+    manifest_sources: Sequence[Mapping[str, Any]],
+) -> tuple[SourceShardSelectionPlanView, ...]:
+    """Bind one pack per signaled shard and build detached business rows."""
+
+    if len(raw_indexes) != len(manifest_sources):
+        raise FinalizationError(
+            "selection-plan source views do not align with manifest sources"
+        )
+    views: list[SourceShardSelectionPlanView] = []
+    try:
+        for raw_index, source in zip(raw_indexes, manifest_sources, strict=True):
+            if (
+                source.get("result_path") != str(raw_index.path)
+                or source.get("result_sha256") != raw_index.sha256
+                or source.get("rows_written") != len(raw_index.records)
+            ):
+                raise FinalizationError(
+                    f"selection-plan source view is not bound to raw shard: {raw_index.path}"
+                )
+            contract = source.get(SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD)
+            raw_signal = any(
+                selection_plan_row_capability_signal(record.row)
+                or selection_plan_reference_signal(record.row)
+                for record in raw_index.records
+            )
+            if contract is None:
+                if raw_signal:
+                    raise FinalizationError(
+                        f"selection-plan evidence signal was downgraded to legacy: {raw_index.path}"
+                    )
+                views.append(
+                    SourceShardSelectionPlanView(
+                        raw_index=raw_index,
+                        records=raw_index.records,
+                    )
+                )
+                continue
+            if not isinstance(contract, Mapping):
+                raise FinalizationError(
+                    f"selection-plan manifest source contract is malformed: {raw_index.path}"
+                )
+            binding = contract.get("binding")
+            raw_pack_path = contract.get("pack_path")
+            if not isinstance(binding, Mapping) or not isinstance(raw_pack_path, str):
+                raise FinalizationError(
+                    f"selection-plan manifest source binding is malformed: {raw_index.path}"
+                )
+            try:
+                pack_path = Path(raw_pack_path)
+                reader = SelectionPlanPackReader(
+                    pack_path,
+                    owner_only=True,
+                )
+            except (OSError, SelectionPlanEvidenceError, FinalizationError) as exc:
+                raise FinalizationError(
+                    f"selection-plan pack binding failed for {raw_index.path}: {exc}"
+                ) from exc
+            try:
+                if (
+                    reader.index.pack_sha256 != binding.get("pack_sha256")
+                    or reader.index.pack_bytes != binding.get("pack_bytes")
+                    or reader.index.object_count != binding.get("pack_object_count")
+                ):
+                    raise FinalizationError(
+                        f"selection-plan pack digest/count differs for {raw_index.path}"
+                    )
+                records: list[SourceRecord] = []
+                for record in raw_index.records:
+                    expanded = materialize_selection_plan_row_view(
+                        record.row,
+                        reader=reader,
+                        require_references=True,
+                    )
+                    detached_row = dict(expanded)
+                    detached_row.pop(SELECTION_PLAN_EVIDENCE_ROW_FIELD, None)
+                    if selection_plan_row_capability_signal(detached_row):
+                        raise FinalizationError(
+                            "expanded selection-plan row retains a reserved capability marker"
+                        )
+                    if selection_plan_reference_signal(detached_row):
+                        raise FinalizationError(
+                            "expanded selection-plan row retains a content-addressed ref"
+                        )
+                    records.append(
+                        SourceRecord(
+                            path=record.path,
+                            source_index=record.source_index,
+                            line=record.line,
+                            row=detached_row,
+                        )
+                    )
+                reader.verify_snapshot()
+            except (OSError, SelectionPlanEvidenceError, FinalizationError) as exc:
+                reader.close()
+                if isinstance(exc, FinalizationError):
+                    raise
+                raise FinalizationError(
+                    f"selection-plan row expansion failed for {raw_index.path}: {exc}"
+                ) from exc
+            view = SourceShardSelectionPlanView(
+                raw_index=raw_index,
+                records=tuple(records),
+                reader=reader,
+                pack_path=pack_path,
+            )
+            views.append(view)
+    except BaseException:
+        for view in views:
+            view.close()
+        raise
+    return tuple(views)
+
+
+def verify_and_close_source_selection_plan_views(
+    views: Sequence[SourceShardSelectionPlanView],
+) -> None:
+    """Reverify every bound pack at the final source snapshot boundary."""
+
+    try:
+        for view in views:
+            try:
+                view.verify_snapshot()
+            except (OSError, SelectionPlanEvidenceError) as exc:
+                path = view.pack_path or view.raw_index.path
+                raise FinalizationError(
+                    f"selection-plan pack changed during finalization: {path}: {exc}"
+                ) from exc
+    finally:
+        for view in views:
+            view.close()
 
 
 _THINKING_SETTINGS = frozenset(
@@ -15029,7 +15370,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
+def _run_finalization_with_selection_plan_views(
+    args: argparse.Namespace,
+    selection_plan_view_holder: list[SourceShardSelectionPlanView],
+) -> dict[str, Any]:
     groups = normalize_groups(args.groups)
     expected_task_concurrency = getattr(
         args,
@@ -15056,25 +15400,11 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     input_path = require_regular_file(args.input, owner_only=False)
     tasks = read_tasks(input_path)
     frozen_input_sha256 = validate_frozen_draco_input(input_path, tasks)
-    source_indexes = read_source_shard_indexes(args.result)
-    source_records = [
-        record for source_index in source_indexes for record in source_index.records
-    ]
+    raw_source_indexes = read_source_shard_indexes(args.result)
     source_snapshots = {
-        str(source_index.path): source_index.sha256 for source_index in source_indexes
+        str(source_index.path): source_index.sha256
+        for source_index in raw_source_indexes
     }
-    unexpected_source_groups = sorted(
-        {record.key[0] for record in source_records if record.key[0] not in set(groups)}
-    )
-    if unexpected_source_groups:
-        raise FinalizationError(
-            "result sources contain groups outside the active finalization scope: "
-            f"{unexpected_source_groups}"
-        )
-    source_policy_findings = validate_source_policy_history(source_records)
-    finalization_warnings: list[Any] = [
-        {"kind": "source_policy_finding", **finding} for finding in source_policy_findings
-    ]
     critical_source_snapshots = dict(source_snapshots)
     for raw_path in (
         input_path,
@@ -15105,8 +15435,34 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         groups=groups,
         expected_task_concurrency=expected_task_concurrency,
         expected_judge_concurrency=expected_judge_concurrency,
-        result_indexes=source_indexes,
+        result_indexes=raw_source_indexes,
     )
+    source_views = open_source_selection_plan_views(
+        raw_source_indexes,
+        manifest_sources,
+    )
+    selection_plan_view_holder.extend(source_views)
+    source_records = [
+        record for view in source_views for record in view.records
+    ]
+    for view in source_views:
+        pack_snapshot = view.pack_snapshot
+        if pack_snapshot is not None:
+            pack_path, pack_sha256 = pack_snapshot
+            critical_source_snapshots[str(pack_path)] = pack_sha256
+    unexpected_source_groups = sorted(
+        {record.key[0] for record in source_records if record.key[0] not in set(groups)}
+    )
+    if unexpected_source_groups:
+        raise FinalizationError(
+            "result sources contain groups outside the active finalization scope: "
+            f"{unexpected_source_groups}"
+        )
+    source_policy_findings = validate_source_policy_history(source_records)
+    finalization_warnings: list[Any] = [
+        {"kind": "source_policy_finding", **finding}
+        for finding in source_policy_findings
+    ]
     finalization_warnings.extend(
         {
             "kind": "source_manifest_audit_warning",
@@ -15315,6 +15671,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         "task_count": len(tasks),
         "task_ids": [str(task["id"]) for task in tasks],
     }
+    verify_and_close_source_selection_plan_views(source_views)
     verify_source_snapshots(critical_source_snapshots)
     report = experiment_results_markdown(
         task_count=len(tasks),
@@ -15417,6 +15774,18 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         manifest_base=manifest_base,
         report_markdown=report,
     )
+
+
+def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
+    selection_plan_views: list[SourceShardSelectionPlanView] = []
+    try:
+        return _run_finalization_with_selection_plan_views(
+            args,
+            selection_plan_views,
+        )
+    finally:
+        for view in selection_plan_views:
+            view.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

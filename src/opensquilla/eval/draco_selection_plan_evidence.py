@@ -1,15 +1,17 @@
 """Content-addressed selection-plan evidence primitives for DRACO artifacts.
 
-This module deliberately has no runner, finalizer, or manifest integration.  It
-defines the versioned object/ref/pack protocol and a bounded, offset-based
-reader that later integrations can bind to their existing durable transaction.
-Object payloads are never retained in a process-wide cache.
+This module defines the versioned object/ref/pack protocol, its immutable
+capability signal, and a bounded, offset-based reader/row-view boundary.
+Runner and finalizer integrations remain responsible for binding a pack to
+their durable transaction. Object payloads are never retained in a
+process-wide cache.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import fcntl
 import hashlib
 import json
@@ -30,6 +32,16 @@ SELECTION_PLAN_PACK_SCHEMA = "opensquilla.draco-selection-plan-pack/v1"
 SELECTION_PLAN_PACK_RECORD_SCHEMA = (
     "opensquilla.draco-selection-plan-pack-record/v1"
 )
+SELECTION_PLAN_EVIDENCE_CAPABILITY_SCHEMA = (
+    "opensquilla.draco-selection-plan-evidence-capability/v1"
+)
+SELECTION_PLAN_EVIDENCE_MANIFEST_SCHEMA = (
+    "opensquilla.draco-selection-plan-evidence-manifest/v1"
+)
+SELECTION_PLAN_EVIDENCE_ROW_FIELD = "selection_plan_evidence_capability"
+SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD = "selection_plan_evidence"
+SELECTION_PLAN_PACK_ARTIFACT_FIELD = "selection_plan_pack"
+SELECTION_PLAN_EVIDENCE_FORMAT_VERSION = 1
 
 SELECTION_PLAN_ROOT_KIND = "selection_plan"
 SELECTION_PLAN_LEAF_KINDS: Final[dict[str, str]] = {
@@ -55,6 +67,20 @@ _PACK_HEADER = {
     "ref_schema": SELECTION_PLAN_REF_SCHEMA,
     "schema": SELECTION_PLAN_PACK_SCHEMA,
 }
+
+
+def selection_plan_evidence_capability_contract() -> dict[str, Any]:
+    """Return the closed signal that prevents ref/pack downgrade to inline."""
+
+    return {
+        "schema": SELECTION_PLAN_EVIDENCE_CAPABILITY_SCHEMA,
+        "format_version": SELECTION_PLAN_EVIDENCE_FORMAT_VERSION,
+        "ref_schema": SELECTION_PLAN_REF_SCHEMA,
+        "pack_schema": SELECTION_PLAN_PACK_SCHEMA,
+        "pack_record_schema": SELECTION_PLAN_PACK_RECORD_SCHEMA,
+        "object_schema": SELECTION_PLAN_OBJECT_SCHEMA,
+        "row_view": "bound-fd-offset-index-per-record",
+    }
 
 _RECORD_FIELDS = frozenset(
     {
@@ -139,6 +165,7 @@ class SelectionPlanEvidenceLimits:
     summary_identity_count: int = 16
     pack_object_count: int = 100_000
     pack_bytes: int = 1024 * 1024 * 1024
+    pack_uncompressed_bytes: int = 4 * 1024 * 1024 * 1024
     record_line_bytes: int = 6 * 1024 * 1024
 
     def __post_init__(self) -> None:
@@ -487,6 +514,30 @@ def is_selection_plan_reference(value: Any) -> bool:
     return isinstance(value, Mapping) and value.get("schema") == SELECTION_PLAN_REF_SCHEMA
 
 
+def _nested_selection_plan_reference_signal(value: Any) -> bool:
+    """Find a reserved ref declaration without looping on hostile containers."""
+
+    pending = [value]
+    seen: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if isinstance(item, Mapping):
+            if is_selection_plan_reference(item):
+                return True
+            identity = id(item)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            identity = id(item)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            pending.extend(item)
+    return False
+
+
 @dataclass(frozen=True)
 class SelectionPlanObjectLocation:
     """Compact offset metadata retained after a one-pass pack scan."""
@@ -508,6 +559,7 @@ class SelectionPlanPackIndex:
     schema: str
     pack_sha256: str
     pack_bytes: int
+    uncompressed_bytes: int
     object_count: int
     device: int
     inode: int
@@ -606,6 +658,10 @@ def _object_dependencies(
     limits: SelectionPlanEvidenceLimits,
 ) -> tuple[SelectionPlanReference, ...]:
     if kind != SELECTION_PLAN_ROOT_KIND:
+        if _nested_selection_plan_reference_signal(payload):
+            raise SelectionPlanEvidenceError(
+                "selection-plan leaf contains a reserved object ref"
+            )
         return ()
     dependencies: list[SelectionPlanReference] = []
     for field_name, leaf_kind in SELECTION_PLAN_LEAF_KINDS.items():
@@ -618,6 +674,14 @@ def _object_dependencies(
                 limits=limits,
             )
         )
+    if any(
+        _nested_selection_plan_reference_signal(item)
+        for field_name, item in payload.items()
+        if field_name not in SELECTION_PLAN_LEAF_KINDS
+    ):
+        raise SelectionPlanEvidenceError(
+            "selection-plan root contains a ref outside its fixed leaf fields"
+        )
     return tuple(dependencies)
 
 
@@ -625,6 +689,7 @@ def _decode_record_line(
     line: bytes,
     *,
     limits: SelectionPlanEvidenceLimits,
+    remaining_uncompressed_bytes: int | None = None,
 ) -> _DecodedRecord:
     if not line.endswith(b"\n") or line == b"\n":
         raise SelectionPlanEvidenceError("selection-plan pack record is not one JSON line")
@@ -665,6 +730,13 @@ def _decode_record_line(
         label="selection-plan object byte count",
         maximum=limits.object_uncompressed_bytes,
     )
+    if (
+        remaining_uncompressed_bytes is not None
+        and uncompressed_bytes > remaining_uncompressed_bytes
+    ):
+        raise SelectionPlanEvidenceLimitError(
+            "selection-plan pack exceeds its cumulative uncompressed byte cap"
+        )
     compressed_bytes = _strict_nonnegative_int(
         record.get("compressed_bytes"),
         label="compressed selection-plan object byte count",
@@ -798,6 +870,7 @@ def _scan_pack_fd(
 
     digest = hashlib.sha256()
     locations: dict[str, SelectionPlanObjectLocation] = {}
+    uncompressed_bytes = 0
     buffer = bytearray()
     buffer_start = 0
     read_offset = 0
@@ -834,7 +907,13 @@ def _scan_pack_fd(
                     raise SelectionPlanEvidenceLimitError(
                         "selection-plan pack exceeds its object-count cap"
                     )
-                decoded = _decode_record_line(line, limits=limits)
+                decoded = _decode_record_line(
+                    line,
+                    limits=limits,
+                    remaining_uncompressed_bytes=(
+                        limits.pack_uncompressed_bytes - uncompressed_bytes
+                    ),
+                )
                 if decoded.sha256 in locations:
                     raise SelectionPlanEvidenceError(
                         "selection-plan pack contains a duplicate content address"
@@ -849,6 +928,7 @@ def _scan_pack_fd(
                     line_sha256=_sha256(line),
                     dependencies=decoded.dependencies,
                 )
+                uncompressed_bytes += decoded.uncompressed_bytes
             cursor = newline + 1
         if cursor:
             del buffer[:cursor]
@@ -872,6 +952,7 @@ def _scan_pack_fd(
         schema=SELECTION_PLAN_PACK_SCHEMA,
         pack_sha256=f"sha256:{digest.hexdigest()}",
         pack_bytes=file_stat.st_size,
+        uncompressed_bytes=uncompressed_bytes,
         object_count=len(locations),
         device=file_stat.st_dev,
         inode=file_stat.st_ino,
@@ -992,7 +1073,7 @@ def _open_regular(path: Path, flags: int, mode: int | None = None) -> int:
         os,
         "O_NOFOLLOW",
         0,
-    )
+    ) | getattr(os, "O_NONBLOCK", 0)
     fd = (
         os.open(path, effective_flags, mode)
         if mode is not None
@@ -1005,6 +1086,13 @@ def _open_regular(path: Path, flags: int, mode: int | None = None) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def _require_owner_only_fd(fd: int) -> None:
+    if stat.S_IMODE(os.fstat(fd).st_mode) & 0o077:
+        raise SelectionPlanEvidenceError(
+            "selection-plan pack must be owner-only"
+        )
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -1036,13 +1124,17 @@ class SelectionPlanPackReader:
         self,
         path: Path,
         *,
+        owner_only: bool = False,
         limits: SelectionPlanEvidenceLimits = DEFAULT_SELECTION_PLAN_EVIDENCE_LIMITS,
     ) -> None:
         self.path = Path(path)
         self._limits = limits
+        self._owner_only = owner_only
         self._fd = _open_regular(self.path, os.O_RDONLY)
         self._closed = False
         try:
+            if owner_only:
+                _require_owner_only_fd(self._fd)
             self._index = _scan_pack_fd(self._fd, limits=limits).index
         except BaseException:
             self.close()
@@ -1053,6 +1145,7 @@ class SelectionPlanPackReader:
         cls,
         fd: int,
         *,
+        owner_only: bool = False,
         limits: SelectionPlanEvidenceLimits = DEFAULT_SELECTION_PLAN_EVIDENCE_LIMITS,
     ) -> SelectionPlanPackReader:
         """Bind to the same inode through a private descriptor duplicate."""
@@ -1060,9 +1153,12 @@ class SelectionPlanPackReader:
         instance = cls.__new__(cls)
         instance.path = None
         instance._limits = limits
+        instance._owner_only = owner_only
         instance._fd = os.dup(fd)
         instance._closed = False
         try:
+            if owner_only:
+                _require_owner_only_fd(instance._fd)
             instance._index = _scan_pack_fd(instance._fd, limits=limits).index
         except BaseException:
             instance.close()
@@ -1111,18 +1207,44 @@ class SelectionPlanPackReader:
         )
 
     def verify_snapshot(self) -> None:
-        """Re-scan the bound inode and require the original exact pack bytes."""
+        """Require both the bound inode bytes and its current path identity."""
 
-        scanned = _scan_pack_fd(self._require_open(), limits=self._limits).index
+        bound_fd = self._require_open()
+        if self._owner_only:
+            _require_owner_only_fd(bound_fd)
+        scanned = _scan_pack_fd(bound_fd, limits=self._limits).index
         if (
             scanned.pack_sha256 != self._index.pack_sha256
             or scanned.pack_bytes != self._index.pack_bytes
+            or scanned.uncompressed_bytes != self._index.uncompressed_bytes
+            or scanned.object_count != self._index.object_count
             or scanned.device != self._index.device
             or scanned.inode != self._index.inode
         ):
             raise SelectionPlanEvidenceError(
                 "selection-plan pack changed after its source snapshot"
             )
+        if self.path is None:
+            return
+        try:
+            path_fd = _open_regular(self.path, os.O_RDONLY)
+        except OSError as exc:
+            raise SelectionPlanEvidenceError(
+                "selection-plan pack path no longer resolves to its bound inode"
+            ) from exc
+        try:
+            if self._owner_only:
+                _require_owner_only_fd(path_fd)
+            path_stat = os.fstat(path_fd)
+            if (
+                path_stat.st_dev != self._index.device
+                or path_stat.st_ino != self._index.inode
+            ):
+                raise SelectionPlanEvidenceError(
+                    "selection-plan pack path was replaced after indexing"
+                )
+        finally:
+            os.close(path_fd)
 
     def close(self) -> None:
         if self._closed:
@@ -1171,6 +1293,9 @@ class SelectionPlanPackAppender:
                 flags,
                 0o600 if create else None,
             )
+            if create and hasattr(os, "fchmod"):
+                os.fchmod(self._fd, 0o600)
+            _require_owner_only_fd(self._fd)
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
@@ -1178,8 +1303,6 @@ class SelectionPlanPackAppender:
                     "selection-plan pack is locked by another appender"
                 ) from exc
             if create:
-                if hasattr(os, "fchmod"):
-                    os.fchmod(self._fd, 0o600)
                 _write_all(self._fd, _PACK_HEADER_LINE)
                 os.fsync(self._fd)
                 _fsync_directory(self.path.parent)
@@ -1187,6 +1310,7 @@ class SelectionPlanPackAppender:
             self._locations = dict(scanned.index.objects)
             self._digest = scanned.digest.copy()
             self._pack_bytes = scanned.index.pack_bytes
+            self._uncompressed_bytes = scanned.index.uncompressed_bytes
             self._snapshot_signature = _file_signature(os.fstat(self._fd))
         except BaseException:
             self.close()
@@ -1221,6 +1345,7 @@ class SelectionPlanPackAppender:
             schema=SELECTION_PLAN_PACK_SCHEMA,
             pack_sha256=f"sha256:{self._digest.hexdigest()}",
             pack_bytes=self._pack_bytes,
+            uncompressed_bytes=self._uncompressed_bytes,
             object_count=len(self._locations),
             device=file_stat.st_dev,
             inode=file_stat.st_ino,
@@ -1232,6 +1357,7 @@ class SelectionPlanPackAppender:
         self,
         start_offset: int,
         prior_digest: Any,
+        prior_uncompressed_bytes: int,
     ) -> None:
         fd = self._require_open()
         try:
@@ -1253,6 +1379,7 @@ class SelectionPlanPackAppender:
         }
         self._digest = prior_digest
         self._pack_bytes = start_offset
+        self._uncompressed_bytes = prior_uncompressed_bytes
         self._snapshot_signature = _file_signature(file_stat)
 
     @property
@@ -1311,9 +1438,17 @@ class SelectionPlanPackAppender:
             raise SelectionPlanEvidenceLimitError(
                 "selection-plan pack exceeds its total byte cap"
             )
+        if (
+            self._uncompressed_bytes + decoded.uncompressed_bytes
+            > self._limits.pack_uncompressed_bytes
+        ):
+            raise SelectionPlanEvidenceLimitError(
+                "selection-plan pack exceeds its cumulative uncompressed byte cap"
+            )
 
         start_offset = self._pack_bytes
         prior_digest = self._digest.copy()
+        prior_uncompressed_bytes = self._uncompressed_bytes
         write_started = False
         try:
             if os.lseek(fd, 0, os.SEEK_END) != start_offset:
@@ -1344,12 +1479,14 @@ class SelectionPlanPackAppender:
             )
             self._digest.update(line)
             self._pack_bytes = end_offset
+            self._uncompressed_bytes += decoded.uncompressed_bytes
             self._snapshot_signature = _file_signature(os.fstat(fd))
         except BaseException:
             if write_started and not self._closed:
                 self._rollback_to(
                     start_offset,
                     prior_digest,
+                    prior_uncompressed_bytes,
                 )
             raise
         return decoded
@@ -1371,6 +1508,7 @@ class SelectionPlanPackAppender:
         skeleton = dict(plan)
         start_offset = self._pack_bytes
         prior_digest = self._digest.copy()
+        prior_uncompressed_bytes = self._uncompressed_bytes
         try:
             for field_name, leaf_kind in SELECTION_PLAN_LEAF_KINDS.items():
                 if field_name not in skeleton:
@@ -1389,7 +1527,11 @@ class SelectionPlanPackAppender:
             root_record = self._append_object(SELECTION_PLAN_ROOT_KIND, skeleton)
         except BaseException:
             if not self._closed and self._pack_bytes != start_offset:
-                self._rollback_to(start_offset, prior_digest)
+                self._rollback_to(
+                    start_offset,
+                    prior_digest,
+                    prior_uncompressed_bytes,
+                )
             raise
         return SelectionPlanReference(
             kind=SELECTION_PLAN_ROOT_KIND,
@@ -1440,6 +1582,100 @@ class SelectionPlanPackAppender:
             pass
 
 
+def selection_plan_reference_signal(value: Any) -> bool:
+    """Return whether any nested object explicitly declares the ref schema."""
+
+    return _nested_selection_plan_reference_signal(value)
+
+
+def selection_plan_row_capability_signal(value: Any) -> bool:
+    """Return whether the reserved row capability marker appears anywhere."""
+
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, Mapping):
+            if SELECTION_PLAN_EVIDENCE_ROW_FIELD in item:
+                return True
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
+
+
+def materialize_selection_plan_row_view(
+    row: Mapping[str, Any],
+    *,
+    reader: SelectionPlanPackReader | SelectionPlanPackAppender | None,
+    require_references: bool,
+) -> Mapping[str, Any]:
+    """Build one detached expanded row without retaining a cross-row cache.
+
+    A compact row may repeat one plan reference in routing, attempt, and
+    physical-call mirrors. The full canonical ref is memoized only during this
+    call, so each distinct ref is resolved once per record while every
+    placement receives an independent detached copy.
+    """
+
+    if not isinstance(row, Mapping):
+        raise SelectionPlanEvidenceError("selection-plan row must be a JSON object")
+    has_reference_signal = selection_plan_reference_signal(row)
+    if not require_references and not has_reference_signal:
+        return row
+    if reader is None:
+        raise SelectionPlanEvidenceError(
+            "content-addressed selection-plan row requires its bound pack"
+        )
+
+    expanded_by_ref: dict[bytes, dict[str, Any]] = {}
+
+    def detached(value: Any, *, field_name: str | None = None) -> Any:
+        if (
+            field_name == "selection_plan"
+            and require_references
+            and not is_selection_plan_reference(value)
+        ):
+            raise SelectionPlanEvidenceError(
+                "compact selection-plan row contains an inline plan"
+            )
+        if isinstance(value, Mapping):
+            if is_selection_plan_reference(value):
+                if field_name != "selection_plan":
+                    raise SelectionPlanEvidenceError(
+                        "selection-plan root ref appears outside a selection_plan field"
+                    )
+                cache_key = _canonical_json_bytes(
+                    dict(value),
+                    label="selection-plan root ref",
+                )
+                expanded = expanded_by_ref.get(cache_key)
+                if expanded is None:
+                    resolved = reader.expand_selection_plan(value)
+                    if not isinstance(resolved, dict):
+                        raise SelectionPlanEvidenceError(
+                            "selection-plan root ref did not resolve to an object"
+                        )
+                    if selection_plan_reference_signal(resolved):
+                        raise SelectionPlanEvidenceError(
+                            "expanded selection plan retains a nested root ref"
+                        )
+                    expanded = copy.deepcopy(resolved)
+                    expanded_by_ref[cache_key] = expanded
+                return copy.deepcopy(expanded)
+            return {
+                key: detached(item, field_name=key)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [detached(item) for item in value]
+        return value
+
+    materialized = detached(row)
+    if not isinstance(materialized, dict):
+        raise SelectionPlanEvidenceError("selection-plan row view is not an object")
+    return materialized
+
+
 def expand_selection_plan(
     value: Any,
     *,
@@ -1463,7 +1699,13 @@ def expand_selection_plan(
 __all__ = [
     "DEFAULT_SELECTION_PLAN_EVIDENCE_LIMITS",
     "SELECTION_PLAN_LEAF_KINDS",
+    "SELECTION_PLAN_EVIDENCE_CAPABILITY_SCHEMA",
+    "SELECTION_PLAN_EVIDENCE_FORMAT_VERSION",
+    "SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD",
+    "SELECTION_PLAN_EVIDENCE_MANIFEST_SCHEMA",
+    "SELECTION_PLAN_EVIDENCE_ROW_FIELD",
     "SELECTION_PLAN_OBJECT_SCHEMA",
+    "SELECTION_PLAN_PACK_ARTIFACT_FIELD",
     "SELECTION_PLAN_PACK_RECORD_SCHEMA",
     "SELECTION_PLAN_PACK_SCHEMA",
     "SELECTION_PLAN_REF_SCHEMA",
@@ -1479,6 +1721,10 @@ __all__ = [
     "canonical_selection_plan_json_bytes",
     "expand_selection_plan",
     "is_selection_plan_reference",
+    "materialize_selection_plan_row_view",
     "parse_selection_plan_reference",
+    "selection_plan_evidence_capability_contract",
+    "selection_plan_reference_signal",
+    "selection_plan_row_capability_signal",
     "selection_plan_summary",
 ]
