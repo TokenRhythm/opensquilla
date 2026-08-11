@@ -29,6 +29,10 @@ from opensquilla.eval.draco_result_summary import (
     DracoResultSummaryProjectionError,
     compact_cost_merge_account,
 )
+from opensquilla.eval.draco_selection_plan_evidence import (
+    LazySelectionPlanMapping,
+    selection_plan_reference_signal,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import ensemble as ensemble_provider
 from opensquilla.provider.ensemble import (
@@ -7627,6 +7631,78 @@ def _writer_test_args(input_path: Path, output_dir: Path):
     )
 
 
+def _write_compact_resume_bundle(
+    directory: Path,
+    rows: list[dict[str, object]],
+    *,
+    stamp: str = "20260811-130000",
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    results_path = directory / f"draco_ensemble_{stamp}.jsonl"
+    trace_path = directory / f"draco_run_{stamp}.trace.jsonl"
+    checkpoint_path = directory / f"draco_run_{stamp}.checkpoint.json"
+    manifest_path = directory / f"draco_run_{stamp}.manifest.json"
+    pack_path = directory / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    durable_capability = runner.durable_artifact_capability_contract()
+    compact_rows: list[dict[str, object]] = []
+    with runner.SelectionPlanPackAppender(pack_path) as appender:
+        for row in rows:
+            compact = runner.compact_selection_plan_evidence_row(
+                row,
+                appender=appender,
+            )
+            compact[runner.DRACO_DURABLE_RESULT_ROW_FIELD] = durable_capability
+            compact_rows.append(runner.seal_result_row(compact))
+    with runner.DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        for row in compact_rows:
+            assert writer.append(row, runner.trace_row(row))
+    verification = runner.verify_durable_draco_artifacts(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+    compact_row_count = sum(
+        selection_plan_reference_signal(row) for row in compact_rows
+    )
+    with runner.SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        binding = runner.selection_plan_evidence_manifest_binding(
+            pack_index=reader.index,
+            durable_artifact_verification=verification,
+            compact_row_count=compact_row_count,
+        )
+    groups = list(dict.fromkeys(str(row["group"]) for row in rows))
+    manifest = {
+        "schema": runner.DRACO_RUN_MANIFEST_SCHEMA_V2,
+        "stamp": stamp,
+        "status": "complete",
+        "groups": groups,
+        "durable_artifact_capability": durable_capability,
+        "run_compatibility": {
+            "contracts": {
+                group: {"durable_artifact_capability": durable_capability}
+                for group in groups
+            }
+        },
+        "artifacts": {
+            "results_jsonl": str(results_path),
+            "trace_jsonl": str(trace_path),
+            "checkpoint_json": str(checkpoint_path),
+            "manifest_json": str(manifest_path),
+            runner.SELECTION_PLAN_PACK_ARTIFACT_FIELD: str(pack_path),
+        },
+        runner.SELECTION_PLAN_EVIDENCE_ROW_FIELD: (
+            runner.selection_plan_evidence_capability_contract()
+        ),
+        runner.SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD: binding,
+    }
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    return results_path
+
+
 @pytest.mark.asyncio
 async def test_selection_plan_evidence_default_stays_inline_until_resume_supports_refs(
     tmp_path: Path,
@@ -12124,9 +12200,11 @@ async def test_resume_missing_non_byok_receipt_reruns_only_missing_judge(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("compact_source", [False, True])
 async def test_resume_metadata_only_repairs_once_without_generation_or_judge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    compact_source: bool,
 ) -> None:
     task = {"id": "task-a", "prompt": "same prompt"}
     input_path = tmp_path / "tasks.jsonl"
@@ -12165,8 +12243,22 @@ async def test_resume_metadata_only_repairs_once_without_generation_or_judge(
             "quality_total": 80.0,
         }
     )
-    resume_path = tmp_path / "prior.jsonl"
-    resume_path.write_text(json.dumps(prior) + "\n", encoding="utf-8")
+    selection_plan = {
+        "strategy": "fixed",
+        "request_context": {"task": "resume-metadata-only"},
+    }
+    if compact_source:
+        prior["execution"] = {
+            "provider_calls": [{"selection_plan": selection_plan}],
+        }
+        prior = resume_runner.seal_result_row(prior)
+        resume_path = _write_compact_resume_bundle(
+            tmp_path / "prior-bundle",
+            [prior],
+        )
+    else:
+        resume_path = tmp_path / "prior.jsonl"
+        resume_path.write_text(json.dumps(prior) + "\n", encoding="utf-8")
     args = resume_runner.build_parser().parse_args(
         [
             "--input",
@@ -12232,6 +12324,9 @@ async def test_resume_metadata_only_repairs_once_without_generation_or_judge(
     assert status == 0
     resume_states = args._resume_group_task_states
     assert resume_states.source_index.materialized_row_count == 1
+    assert resume_states.source_index.selection_plan_materialized_row_count == int(
+        compact_source
+    )
     assert resume_states.source_index.closed
     assert ("B0", "task-a") not in resume_states
     assert call_counts == {"generation": 0, "judge": 0, "metadata": 1}
@@ -12245,6 +12340,10 @@ async def test_resume_metadata_only_repairs_once_without_generation_or_judge(
         )
     )
     execution = repaired["execution"]
+    assert runner.SELECTION_PLAN_EVIDENCE_ROW_FIELD not in repaired
+    assert not selection_plan_reference_signal(repaired)
+    if compact_source:
+        assert execution["provider_calls"][0]["selection_plan"] == selection_plan
     assert execution["generation_reused"] is True
     assert execution["judge_reran"] is False
     assert execution["metadata_repair_attempted"] is True
@@ -12258,6 +12357,267 @@ async def test_resume_metadata_only_repairs_once_without_generation_or_judge(
     assert preflight["status"] == "skipped_not_required"
     assert preflight["preflight_calls"] == {"web_search": 0, "web_fetch": 0}
     assert manifest["resume_selection"]["model_regenerate_pair_count"] == 0
+
+
+def test_resume_compact_complete_pair_keeps_selection_plan_lazy(
+    tmp_path: Path,
+) -> None:
+    task = {"id": "task-a", "prompt": "same prompt"}
+    model = str(resume_runner.GROUP_SPECS["B0"]["model"])
+    selection_plan = {
+        "strategy": "fixed",
+        "request_context": {"task": "complete-pair"},
+    }
+    prior = resume_runner.seal_result_row(
+        {
+            "group": "B0",
+            "provider_spec": dict(resume_runner.GROUP_SPECS["B0"]),
+            "routing_trace": {
+                "applied_model": model,
+                "fallback_model": model,
+            },
+            "task_id": "task-a",
+            "prompt_sha256": resume_runner.text_sha256(task["prompt"]),
+            "task_input_sha256": resume_runner.canonical_json_sha256(task),
+            "run_compatibility_fingerprint": "sha256:run-contract",
+            "error": None,
+            "final_text": "accepted generation",
+            "llm_request_count": 1,
+            "usage": {
+                "provider": "openrouter",
+                "model": model,
+                "requested_provider": "openrouter",
+                "requested_model": model,
+                "input_tokens": 3,
+                "output_tokens": 1,
+                "billed_cost": 0.01,
+                "cost_source": "provider_billed",
+                "provider_usage": _openrouter_exact_evidence(
+                    0.01,
+                    "compact-complete-pair",
+                ),
+            },
+            "judge": _complete_legacy_judge("compact-complete-judge"),
+            "quality_total": 80.0,
+            "execution": {
+                "provider_calls": [{"selection_plan": selection_plan}],
+            },
+        }
+    )
+    resume_path = _write_compact_resume_bundle(
+        tmp_path / "prior-bundle",
+        [prior],
+    )
+    states, audit = resume_runner.load_resume_group_task_states(
+        resume_paths=[resume_path],
+        selected_keys={("B0", "task-a")},
+        prompt_hashes={"task-a": resume_runner.text_sha256(task["prompt"])},
+        task_input_hashes={
+            "task-a": resume_runner.canonical_json_sha256(task),
+        },
+        run_compatibility_fingerprints={"B0": "sha256:run-contract"},
+        run_compatibility_contracts={
+            "B0": {
+                "resolved_llm_runtime": {"provider": "openrouter"},
+            }
+        },
+    )
+    try:
+        state = states[("B0", "task-a")]
+        assert state["action"] == "complete"
+
+        def contains_lazy_plan(value: object) -> bool:
+            if isinstance(value, LazySelectionPlanMapping):
+                return True
+            if isinstance(value, Mapping):
+                return any(contains_lazy_plan(item) for item in value.values())
+            if isinstance(value, list):
+                return any(contains_lazy_plan(item) for item in value)
+            return False
+
+        assert not contains_lazy_plan(state)
+        assert audit["strict_valid_pair_count"] == 1
+        assert states.source_index.materialized_row_count == 0
+        assert states.source_index.selection_plan_materialized_row_count == 0
+        assert (
+            states.source_index.selection_plan_classification_materialization_count
+            == 0
+        )
+    finally:
+        states.close()
+
+
+def test_resume_compact_legacy_attempt_fingerprint_matches_inline(
+    tmp_path: Path,
+) -> None:
+    task = {"id": "task-a", "prompt": "same prompt"}
+    model = str(resume_runner.GROUP_SPECS["B0"]["model"])
+    selection_plan = {
+        "strategy": "fixed",
+        "request_context": {"task": "legacy-attempt-fingerprint"},
+    }
+    prior = resume_runner.seal_result_row(
+        {
+            "group": "B0",
+            "provider_spec": dict(resume_runner.GROUP_SPECS["B0"]),
+            "routing_trace": {
+                "applied_model": model,
+                "fallback_model": model,
+            },
+            "task_id": "task-a",
+            "prompt_sha256": resume_runner.text_sha256(task["prompt"]),
+            "task_input_sha256": resume_runner.canonical_json_sha256(task),
+            "run_compatibility_fingerprint": "sha256:run-contract",
+            "error": None,
+            "final_text": "accepted generation",
+            "llm_request_count": 1,
+            "usage": {
+                "provider": "openrouter",
+                "model": model,
+                "requested_provider": "openrouter",
+                "requested_model": model,
+                "input_tokens": 3,
+                "output_tokens": 1,
+                "billed_cost": 0.01,
+                "cost_source": "provider_billed",
+                "provider_usage": _openrouter_exact_evidence(
+                    0.01,
+                    "compact-legacy-attempt",
+                ),
+            },
+            "judge": _complete_legacy_judge("compact-legacy-attempt-judge"),
+            "quality_total": 80.0,
+            # No strict schema or cumulative declaration: this intentionally
+            # exercises the historical canonical attempt fingerprint.
+            "execution": {
+                "generation_attempts": [
+                    {
+                        "attempt": 1,
+                        "selection_plan": selection_plan,
+                        "run": {"llm_request_count": 1},
+                    }
+                ]
+            },
+        }
+    )
+    inline_path = tmp_path / "inline-legacy-attempt.jsonl"
+    inline_path.write_text(json.dumps(prior) + "\n", encoding="utf-8")
+    compact_path = _write_compact_resume_bundle(
+        tmp_path / "compact-legacy-attempt",
+        [prior],
+    )
+
+    projections: list[dict[str, object]] = []
+    materialization_counts: list[int] = []
+    for source_path in (inline_path, compact_path):
+        states, _ = resume_runner.load_resume_group_task_states(
+            resume_paths=[source_path],
+            selected_keys={("B0", "task-a")},
+            prompt_hashes={"task-a": resume_runner.text_sha256(task["prompt"])},
+            task_input_hashes={
+                "task-a": resume_runner.canonical_json_sha256(task),
+            },
+            run_compatibility_fingerprints={"B0": "sha256:run-contract"},
+            run_compatibility_contracts={
+                "B0": {"resolved_llm_runtime": {"provider": "openrouter"}}
+            },
+        )
+        try:
+            state = states[("B0", "task-a")]
+            projections.append(
+                {
+                    key: state[key]
+                    for key in (
+                        "action",
+                        "generation_reasons",
+                        "prior_generation_attempts_used",
+                        "observed_unique_generation_attempt_count",
+                    )
+                }
+            )
+            materialization_counts.append(
+                states.source_index.selection_plan_classification_materialization_count
+            )
+        finally:
+            states.close()
+
+    assert projections[0] == projections[1]
+    assert projections[0]["prior_generation_attempts_used"] == 1
+    assert materialization_counts == [0, 1]
+
+
+def test_resume_large_legacy_row_is_parsed_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resume_path = tmp_path / "large-legacy-source.jsonl"
+    large_padding = "x" * (2 * 1024 * 1024)
+    resume_path.write_text(
+        json.dumps(
+            {
+                "group": "B0",
+                "task_id": "not-selected",
+                "padding": large_padding,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    actual_loads = json.loads
+    large_parse_count = 0
+
+    def recording_loads(value, *args, **kwargs):
+        nonlocal large_parse_count
+        if isinstance(value, (bytes, bytearray, str)) and len(value) > len(large_padding):
+            large_parse_count += 1
+        return actual_loads(value, *args, **kwargs)
+
+    # Both the source index and runner import the stdlib JSON module.  Counting
+    # at that shared boundary proves the normal legacy row is not parsed once
+    # for downgrade detection and then a second time for classification.
+    monkeypatch.setattr(resume_runner.json, "loads", recording_loads)
+    states, audit = resume_runner.load_resume_group_task_states(
+        resume_paths=[resume_path],
+        selected_keys=set(),
+        prompt_hashes={},
+        task_input_hashes={},
+        run_compatibility_fingerprints={},
+    )
+    try:
+        assert states == {}
+        assert audit["matching_attempt_count"] == 0
+        assert large_parse_count == 1
+    finally:
+        states.close()
+
+
+@pytest.mark.parametrize("force_spool", [False, True])
+def test_resume_legacy_utf8_bom_rejection_matches_historical_loader(
+    tmp_path: Path,
+    force_spool: bool,
+) -> None:
+    resume_path = tmp_path / "bom-legacy-source.jsonl"
+    resume_path.write_bytes(
+        b"\xef\xbb\xbf"
+        + json.dumps({"group": "B0", "task_id": "task-a"}).encode("utf-8")
+        + b"\n"
+    )
+    source_rows = resume_runner.ResumeSourceIndex(
+        [resume_path],
+        force_spool=force_spool,
+    )
+    try:
+        with pytest.raises(ValueError, match="invalid resume JSONL"):
+            resume_runner._load_resume_group_task_states_from_index(
+                source_rows=source_rows,
+                resume_paths=[resume_path],
+                selected_keys={("B0", "task-a")},
+                prompt_hashes={"task-a": "sha256:prompt"},
+                task_input_hashes={"task-a": "sha256:task"},
+                run_compatibility_fingerprints={"B0": "sha256:run"},
+            )
+    finally:
+        source_rows.close(verify=False)
 
 
 def _bound_resume_states_for_amain(source_path: Path):
@@ -13437,6 +13797,42 @@ def _strict_attempt_resume_row(
         },
         "usage": {},
     }
+
+
+def test_resume_strict_attempt_row_is_bounded_by_formal_attempt_cap(
+    tmp_path: Path,
+) -> None:
+    row = _strict_attempt_resume_row(
+        attempt_id="a" * 32,
+        cumulative_budget=1,
+        generation_completed_at=1.0,
+    )
+    template = row["execution"]["generation_attempts"][0]
+    row["execution"]["generation_attempts"] = [
+        {
+            **deepcopy(template),
+            "attempt_id": character * 32,
+            "attempt": index,
+        }
+        for index, character in enumerate(("a", "b", "c", "d"), start=1)
+    ]
+    row["generation_attempt_count"] = 4
+    row["actual_spend_metrics"]["generation_attempt_count"] = 4
+    row["generation_attempt_budget_used"] = 3
+    source_path = tmp_path / "over-cap-strict-attempts.jsonl"
+    source_path.write_text(
+        json.dumps(resume_runner.seal_result_row(row)) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="exceeds its formal cap"):
+        resume_runner.load_resume_group_task_states(
+            resume_paths=[source_path],
+            selected_keys={("B1", "task-1")},
+            prompt_hashes={"task-1": resume_runner.text_sha256("same prompt")},
+            task_input_hashes={"task-1": "sha256:task-input"},
+            run_compatibility_fingerprints={"B1": "sha256:run-contract"},
+        )
 
 
 def test_resume_strict_attempt_evidence_uses_contract_generation_budget(

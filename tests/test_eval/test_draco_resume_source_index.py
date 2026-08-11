@@ -1,23 +1,51 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import gc
 import io
 import json
 import os
 import re
 import tracemalloc
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
 
 from opensquilla.eval import draco_resume_source_index as resume_source_index
-from opensquilla.eval.draco_artifact_integrity import seal_result_row
+from opensquilla.eval import draco_selection_plan_evidence as plan_evidence
+from opensquilla.eval.draco_artifact_integrity import (
+    seal_result_row,
+    trace_row_from_result,
+    verify_result_row_evidence,
+)
+from opensquilla.eval.draco_artifact_io import (
+    DRACO_DURABLE_RESULT_ROW_FIELD,
+    DRACO_RUN_MANIFEST_SCHEMA_V2,
+    DurableDracoArtifactWriter,
+    durable_artifact_capability_contract,
+    verify_durable_draco_artifacts,
+)
 from opensquilla.eval.draco_resume_source_index import (
     DracoResumeSourceError,
     ResumeGroupTaskStates,
     ResumeRowLocator,
     ResumeSourceIndex,
+)
+from opensquilla.eval.draco_selection_plan_evidence import (
+    SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD,
+    SELECTION_PLAN_EVIDENCE_ROW_FIELD,
+    SELECTION_PLAN_PACK_ARTIFACT_FIELD,
+    LazySelectionPlanMapping,
+    SelectionPlanEvidenceError,
+    SelectionPlanPackAppender,
+    SelectionPlanPackReader,
+    compact_selection_plan_evidence_row,
+    lazy_selection_plan_row_view,
+    selection_plan_evidence_capability_contract,
+    selection_plan_evidence_manifest_binding,
+    selection_plan_reference_signal,
 )
 
 
@@ -37,6 +65,78 @@ def _write_rows(path: Path, rows: list[dict[str, object]]) -> None:
         for row in rows:
             handle.write(json.dumps(row, separators=(",", ":")).encode())
             handle.write(b"\n")
+
+
+def _write_compact_source_bundle(
+    directory: Path,
+    rows: list[dict[str, object]],
+    *,
+    stamp: str = "20260811-120000",
+) -> tuple[Path, Path, list[dict[str, object]]]:
+    results_path = directory / f"draco_ensemble_{stamp}.jsonl"
+    trace_path = directory / f"draco_run_{stamp}.trace.jsonl"
+    checkpoint_path = directory / f"draco_run_{stamp}.checkpoint.json"
+    manifest_path = directory / f"draco_run_{stamp}.manifest.json"
+    pack_path = directory / f"draco_run_{stamp}.selection-plan.pack.jsonl"
+    compact_rows: list[dict[str, object]] = []
+    durable_capability = durable_artifact_capability_contract()
+    with SelectionPlanPackAppender(pack_path) as appender:
+        for row in rows:
+            compact = compact_selection_plan_evidence_row(row, appender=appender)
+            compact[DRACO_DURABLE_RESULT_ROW_FIELD] = durable_capability
+            compact_rows.append(seal_result_row(compact))
+    with DurableDracoArtifactWriter(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    ) as writer:
+        for row in compact_rows:
+            assert writer.append(row, trace_row_from_result(row))
+    verification = verify_durable_draco_artifacts(
+        results_path=results_path,
+        trace_path=trace_path,
+        checkpoint_path=checkpoint_path,
+    )
+    compact_row_count = sum(
+        selection_plan_reference_signal(row) for row in compact_rows
+    )
+    with SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        binding = selection_plan_evidence_manifest_binding(
+            pack_index=reader.index,
+            durable_artifact_verification=verification,
+            compact_row_count=compact_row_count,
+        )
+    groups = list(dict.fromkeys(str(row["group"]) for row in rows))
+    artifacts = {
+        "results_jsonl": str(results_path),
+        "trace_jsonl": str(trace_path),
+        "checkpoint_json": str(checkpoint_path),
+        "manifest_json": str(manifest_path),
+        SELECTION_PLAN_PACK_ARTIFACT_FIELD: str(pack_path),
+    }
+    manifest = {
+        "schema": DRACO_RUN_MANIFEST_SCHEMA_V2,
+        "stamp": stamp,
+        "status": "complete",
+        "groups": groups,
+        "durable_artifact_capability": durable_capability,
+        "run_compatibility": {
+            "contracts": {
+                group: {"durable_artifact_capability": durable_capability}
+                for group in groups
+            }
+        },
+        "artifacts": artifacts,
+        SELECTION_PLAN_EVIDENCE_ROW_FIELD: (
+            selection_plan_evidence_capability_contract()
+        ),
+        SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD: binding,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return results_path, manifest_path, compact_rows
 
 
 def _scan_source(
@@ -64,6 +164,690 @@ def _scan(
     locators = _scan_source(index, path, source_index=0)
     index.seal()
     return locators
+
+
+def test_lazy_selection_plan_row_view_resolves_once_and_never_leaks_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pack_path = tmp_path / "selection-plan.pack.jsonl"
+    plan = {
+        "strategy": "router_dynamic",
+        "selected_P": ["openrouter:model-a"],
+        "request_context": {"task": "bounded"},
+    }
+    with SelectionPlanPackAppender(pack_path) as appender:
+        compact = compact_selection_plan_evidence_row(
+            {
+                "group": "G1",
+                "task_id": "task-1",
+                "routing_trace": {"selection_plan": plan},
+                "execution": {
+                    "provider_calls": [{"selection_plan": plan}],
+                },
+            },
+            appender=appender,
+        )
+
+    with SelectionPlanPackReader(pack_path) as reader:
+        actual_expand = reader.expand_selection_plan
+        expand_count = 0
+
+        def recording_expand(value: object) -> object:
+            nonlocal expand_count
+            expand_count += 1
+            return actual_expand(value)
+
+        monkeypatch.setattr(reader, "expand_selection_plan", recording_expand)
+        view = lazy_selection_plan_row_view(
+            compact,
+            reader=reader,
+            require_references=True,
+        )
+        routing_plan = view["routing_trace"]["selection_plan"]
+        call_plan = view["execution"]["provider_calls"][0]["selection_plan"]
+        assert isinstance(routing_plan, LazySelectionPlanMapping)
+        assert isinstance(call_plan, LazySelectionPlanMapping)
+        assert expand_count == 0
+
+        request_context = routing_plan["request_context"]
+        assert isinstance(request_context, dict)
+        request_context["task"] = "mutated"
+        assert routing_plan["request_context"] == {"task": "bounded"}
+        assert call_plan["strategy"] == "router_dynamic"
+        assert expand_count == 1
+        assert not selection_plan_reference_signal(dict(routing_plan))
+        copied_plan = copy.deepcopy(call_plan)
+        assert copied_plan == plan
+        assert isinstance(copied_plan, dict)
+        assert not selection_plan_reference_signal(copied_plan)
+        assert expand_count == 1
+        with pytest.raises(TypeError):
+            json.dumps(routing_plan)
+        assert isinstance(routing_plan, Mapping)
+
+
+@pytest.mark.parametrize("force_spool", [False, True])
+def test_compact_source_bundle_classifies_lazily_and_consumes_sealed_inline(
+    tmp_path: Path,
+    force_spool: bool,
+) -> None:
+    plan = {
+        "strategy": "router_dynamic",
+        "selected_P": ["openrouter:model-a"],
+        "request_context": {"task": "bounded"},
+    }
+    results_path, _, _ = _write_compact_source_bundle(
+        tmp_path,
+        [
+            {
+                "group": "B1",
+                "task_id": "task-1",
+                "final_text": "accepted",
+                "routing_trace": {"selection_plan": plan},
+                "execution": {
+                    "provider_calls": [{"selection_plan": plan}],
+                },
+            }
+        ],
+    )
+    index = ResumeSourceIndex([results_path], force_spool=force_spool)
+    with index.open_source(results_path, source_index=0) as source:
+        indexed = next(source)
+        raw = json.loads(indexed.payload)
+        locator = indexed.locator.bind(group="B1", task_id="task-1")
+        view, preverified = index.classification_row(locator, raw)
+        assert preverified is True
+        assert SELECTION_PLAN_EVIDENCE_ROW_FIELD not in view
+        routing_plan = view["routing_trace"]["selection_plan"]
+        call_plan = view["execution"]["provider_calls"][0]["selection_plan"]
+        assert isinstance(routing_plan, LazySelectionPlanMapping)
+        assert index.selection_plan_classification_materialization_count == 0
+        assert routing_plan["strategy"] == "router_dynamic"
+        assert call_plan["request_context"] == {"task": "bounded"}
+        assert index.selection_plan_classification_materialization_count == 1
+        with pytest.raises(StopIteration):
+            next(source)
+    index.seal()
+
+    assert index.materialized_row_count == 0
+    assert index.selection_plan_materialized_row_count == 0
+    consumed = index.consume_row(locator)
+    assert verify_result_row_evidence(consumed)
+    assert SELECTION_PLAN_EVIDENCE_ROW_FIELD not in consumed
+    assert not selection_plan_reference_signal(consumed)
+    assert consumed["routing_trace"]["selection_plan"] == plan
+    assert consumed["execution"]["provider_calls"][0]["selection_plan"] == plan
+    assert index.materialized_row_count == 1
+    assert index.selection_plan_materialized_row_count == 1
+    index.close()
+
+
+def test_compact_header_only_source_never_materializes_a_plan(tmp_path: Path) -> None:
+    results_path, _, _ = _write_compact_source_bundle(
+        tmp_path,
+        [
+            {
+                "group": "B1",
+                "task_id": "task-1",
+                "final_text": "accepted",
+            }
+        ],
+    )
+    index = ResumeSourceIndex([results_path])
+    with index.open_source(results_path, source_index=0) as source:
+        indexed = next(source)
+        raw = json.loads(indexed.payload)
+        locator = indexed.locator.bind(group="B1", task_id="task-1")
+        view, preverified = index.classification_row(locator, raw)
+        assert preverified is True
+        assert SELECTION_PLAN_EVIDENCE_ROW_FIELD not in view
+        assert index.selection_plan_classification_materialization_count == 0
+        with pytest.raises(StopIteration):
+            next(source)
+    index.seal()
+    consumed = index.consume_row(locator)
+    assert verify_result_row_evidence(consumed)
+    assert SELECTION_PLAN_EVIDENCE_ROW_FIELD not in consumed
+    assert index.selection_plan_materialized_row_count == 0
+    index.close()
+
+
+@pytest.mark.parametrize("force_spool", [False, True])
+def test_compact_complete_scan_has_no_eager_expand_or_per_row_pack_rescan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force_spool: bool,
+) -> None:
+    plan = {
+        "strategy": "router_dynamic",
+        "request_context": {"padding": "x" * (256 * 1024)},
+    }
+    results_path, _, _ = _write_compact_source_bundle(
+        tmp_path,
+        [
+            {
+                "group": "B1",
+                "task_id": f"task-{index}",
+                "final_text": "accepted",
+                "routing_trace": {"selection_plan": plan},
+            }
+            for index in range(8)
+        ],
+    )
+    actual_scan = plan_evidence._scan_pack_fd
+    actual_expand = SelectionPlanPackReader.expand_selection_plan
+    scan_count = 0
+    expand_count = 0
+
+    def recording_scan(*args, **kwargs):
+        nonlocal scan_count
+        scan_count += 1
+        return actual_scan(*args, **kwargs)
+
+    def recording_expand(self, value):
+        nonlocal expand_count
+        expand_count += 1
+        return actual_expand(self, value)
+
+    monkeypatch.setattr(plan_evidence, "_scan_pack_fd", recording_scan)
+    monkeypatch.setattr(
+        SelectionPlanPackReader,
+        "expand_selection_plan",
+        recording_expand,
+    )
+    index = ResumeSourceIndex([results_path], force_spool=force_spool)
+    with index.open_source(results_path, source_index=0) as source:
+        for indexed in source:
+            raw = json.loads(indexed.payload)
+            locator = indexed.locator.bind(
+                group=str(raw["group"]),
+                task_id=str(raw["task_id"]),
+            )
+            view, preverified = index.classification_row(locator, raw)
+            assert preverified is True
+            assert isinstance(
+                view["routing_trace"]["selection_plan"],
+                LazySelectionPlanMapping,
+            )
+    index.seal()
+
+    assert scan_count == 1
+    assert expand_count == 0
+    assert index.selection_plan_classification_materialization_count == 0
+    index.close()
+    assert scan_count == 2
+    assert expand_count == 0
+
+
+@pytest.mark.parametrize("force_spool", [False, True])
+def test_lazy_classification_plan_expires_with_its_source_line_scope(
+    tmp_path: Path,
+    force_spool: bool,
+) -> None:
+    results_path, _, _ = _write_compact_source_bundle(
+        tmp_path,
+        [
+            {
+                "group": "B1",
+                "task_id": "task-1",
+                "final_text": "accepted",
+                "routing_trace": {
+                    "selection_plan": {"strategy": "router_dynamic"}
+                },
+            }
+        ],
+    )
+    index = ResumeSourceIndex([results_path], force_spool=force_spool)
+    with index.open_source(results_path, source_index=0) as source:
+        indexed = next(source)
+        raw = json.loads(indexed.payload)
+        locator = indexed.locator.bind(group="B1", task_id="task-1")
+        view, _ = index.classification_row(locator, raw)
+        lazy_plan = view["routing_trace"]["selection_plan"]
+        assert isinstance(lazy_plan, LazySelectionPlanMapping)
+        with pytest.raises(StopIteration):
+            next(source)
+
+    with pytest.raises(SelectionPlanEvidenceError, match="escaped.*scan scope"):
+        lazy_plan["strategy"]
+    index.seal()
+    index.close()
+
+
+def test_compact_strict_attempt_batch_loads_parent_once_without_pack_rescan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt_ids = [character * 32 for character in ("a", "b", "c", "d")]
+    attempt_plans = [
+        {
+            "strategy": f"attempt-{index}",
+            "request_context": {"padding": character * 64_000},
+        }
+        for index, character in enumerate(("a", "b", "c", "d"), start=1)
+    ]
+    results_path, _, _ = _write_compact_source_bundle(
+        tmp_path,
+        [
+            {
+                "group": "G1",
+                "task_id": "task-1",
+                "final_text": "accepted",
+                "routing_trace": {
+                    "selection_plan": {
+                        "strategy": "unrelated-parent",
+                        "request_context": {"padding": "p" * 64_000},
+                    }
+                },
+                "execution": {
+                    "generation_attempts": [
+                        {
+                            "attempt_id": attempt_id,
+                            "attempt": index + 1,
+                            "selection_plan": attempt_plans[index],
+                        }
+                        for index, attempt_id in enumerate(attempt_ids)
+                    ]
+                },
+            }
+        ],
+    )
+    actual_scan = plan_evidence._scan_pack_fd
+    actual_expand = SelectionPlanPackReader.expand_selection_plan
+    scan_count = 0
+    expand_count = 0
+
+    def recording_scan(*args, **kwargs):
+        nonlocal scan_count
+        scan_count += 1
+        return actual_scan(*args, **kwargs)
+
+    def recording_expand(self, value):
+        nonlocal expand_count
+        expand_count += 1
+        return actual_expand(self, value)
+
+    monkeypatch.setattr(plan_evidence, "_scan_pack_fd", recording_scan)
+    monkeypatch.setattr(
+        SelectionPlanPackReader,
+        "expand_selection_plan",
+        recording_expand,
+    )
+    index = ResumeSourceIndex([results_path], force_spool=True)
+    locator = _scan(index, results_path)[0]
+    requested_indices = (1, 3)
+    attempts = index.load_attempts(
+        [
+            (locator, attempt_index, attempt_ids[attempt_index])
+            for attempt_index in requested_indices
+        ]
+    )
+
+    assert [attempt["attempt_id"] for attempt in attempts] == [
+        attempt_ids[index] for index in requested_indices
+    ]
+    assert [attempt["selection_plan"] for attempt in attempts] == [
+        attempt_plans[index] for index in requested_indices
+    ]
+    assert index.attempt_payload_load_count == 1
+    assert index.selection_plan_materialized_row_count == 0
+    assert scan_count == 1
+    assert expand_count == 2
+    index.close()
+    assert scan_count == 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "running",
+        "unknown_terminal",
+        "missing_binding",
+        "missing_capability",
+        "wrong_pack_path",
+    ],
+)
+def test_compact_source_rejects_partial_or_nonterminal_manifest(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [{"group": "B1", "task_id": "task-1", "final_text": "accepted"}],
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mutation == "running":
+        manifest["status"] = "running"
+    elif mutation == "unknown_terminal":
+        manifest["status"] = "purported_terminal"
+    elif mutation == "missing_binding":
+        manifest.pop(SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD)
+    elif mutation == "missing_capability":
+        manifest.pop(SELECTION_PLAN_EVIDENCE_ROW_FIELD)
+    else:
+        manifest["artifacts"][SELECTION_PLAN_PACK_ARTIFACT_FIELD] = str(
+            tmp_path / "wrong.selection-plan.pack.jsonl"
+        )
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    index = ResumeSourceIndex([results_path])
+    with pytest.raises(DracoResumeSourceError, match="compact resume manifest"):
+        _scan(index, results_path)
+    index.close(verify=False)
+
+
+def test_legacy_load_attempt_preserves_stale_parent_seal_compatibility(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "legacy-strict-attempt.jsonl"
+    row = seal_result_row(
+        {
+            "group": "G1",
+            "task_id": "task-1",
+            "final_text": "accepted",
+            "execution": {
+                "generation_attempts": [
+                    {
+                        "attempt_id": "attempt-1",
+                        "attempt": 1,
+                        "run": {"llm_request_count": 1},
+                    }
+                ]
+            },
+        }
+    )
+    row["final_text"] = "historically repaired without resealing"
+    _write_rows(source_path, [row])
+    index = ResumeSourceIndex([source_path])
+    locator = _scan(index, source_path)[0]
+
+    attempt = index.load_attempt(
+        locator,
+        attempt_index=0,
+        attempt_id="attempt-1",
+    )
+
+    assert attempt["attempt"] == 1
+    assert index.attempt_payload_load_count == 1
+    index.close()
+
+
+def test_compact_row_without_sibling_manifest_fails_closed(tmp_path: Path) -> None:
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [{"group": "B1", "task_id": "task-1", "final_text": "accepted"}],
+    )
+    manifest_path.unlink()
+    index = ResumeSourceIndex([results_path])
+    with pytest.raises(DracoResumeSourceError, match="undeclared compact"):
+        _scan(index, results_path)
+    index.close(verify=False)
+
+
+def test_compact_sibling_manifest_rejects_utf8_bom(tmp_path: Path) -> None:
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [{"group": "B1", "task_id": "task-1", "final_text": "accepted"}],
+    )
+    manifest_path.write_bytes(b"\xef\xbb\xbf" + manifest_path.read_bytes())
+    index = ResumeSourceIndex([results_path])
+
+    with pytest.raises(DracoResumeSourceError, match="not valid JSON"):
+        _scan(index, results_path)
+    index.close(verify=False)
+
+
+def test_compact_pack_tamper_fails_before_any_source_row(tmp_path: Path) -> None:
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [
+            {
+                "group": "B1",
+                "task_id": "task-1",
+                "final_text": "accepted",
+                "routing_trace": {"selection_plan": {"strategy": "fixed"}},
+            }
+        ],
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    pack_path = Path(manifest["artifacts"][SELECTION_PLAN_PACK_ARTIFACT_FIELD])
+    with pack_path.open("ab") as handle:
+        handle.write(b"tamper")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    index = ResumeSourceIndex([results_path])
+    with pytest.raises(DracoResumeSourceError, match="binding failed"):
+        _scan(index, results_path)
+    index.close(verify=False)
+
+
+def test_compact_dangling_row_ref_fails_even_with_rebound_pack_manifest(
+    tmp_path: Path,
+) -> None:
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [
+            {
+                "group": "B1",
+                "task_id": "task-1",
+                "final_text": "accepted",
+                "routing_trace": {"selection_plan": {"strategy": "fixed"}},
+            }
+        ],
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifacts = manifest["artifacts"]
+    pack_path = Path(artifacts[SELECTION_PLAN_PACK_ARTIFACT_FIELD])
+    pack_lines = pack_path.read_bytes().splitlines(keepends=True)
+    assert len(pack_lines) >= 2
+    pack_path.write_bytes(b"".join(pack_lines[:-1]))
+    pack_path.chmod(0o600)
+    verification = verify_durable_draco_artifacts(
+        results_path=results_path,
+        trace_path=Path(artifacts["trace_jsonl"]),
+        checkpoint_path=Path(artifacts["checkpoint_json"]),
+    )
+    with SelectionPlanPackReader(pack_path, owner_only=True) as reader:
+        manifest[SELECTION_PLAN_EVIDENCE_MANIFEST_FIELD] = (
+            selection_plan_evidence_manifest_binding(
+                pack_index=reader.index,
+                durable_artifact_verification=verification,
+                compact_row_count=1,
+            )
+        )
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    index = ResumeSourceIndex([results_path])
+    with pytest.raises(DracoResumeSourceError, match="binding failed"):
+        _scan(index, results_path)
+    index.close(verify=False)
+
+
+def test_compact_raw_seal_is_checked_before_lazy_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results_path, _, _ = _write_compact_source_bundle(
+        tmp_path,
+        [
+            {
+                "group": "B1",
+                "task_id": "task-1",
+                "final_text": "accepted",
+                "routing_trace": {"selection_plan": {"strategy": "fixed"}},
+            }
+        ],
+    )
+    index = ResumeSourceIndex([results_path])
+    source = index.iter_source(results_path, source_index=0)
+    indexed = next(source)
+    raw = json.loads(indexed.payload)
+    locator = indexed.locator.bind(group="B1", task_id="task-1")
+    raw["final_text"] = "tampered after parse"
+    lazy_called = False
+
+    def forbidden_lazy_view(*_args, **_kwargs):
+        nonlocal lazy_called
+        lazy_called = True
+        raise AssertionError("lazy view must not run before raw seal verification")
+
+    monkeypatch.setattr(
+        resume_source_index,
+        "lazy_selection_plan_row_view",
+        forbidden_lazy_view,
+    )
+    with pytest.raises(DracoResumeSourceError, match="evidence verification"):
+        index.classification_row(locator, raw)
+    assert lazy_called is False
+    source.close()
+    index.close(verify=False)
+
+
+def test_compact_pack_fifo_fails_fast(tmp_path: Path) -> None:
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [{"group": "B1", "task_id": "task-1", "final_text": "accepted"}],
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    pack_path = Path(manifest["artifacts"][SELECTION_PLAN_PACK_ARTIFACT_FIELD])
+    pack_path.unlink()
+    os.mkfifo(pack_path, 0o600)
+
+    index = ResumeSourceIndex([results_path])
+    started = os.times().elapsed
+    with pytest.raises(DracoResumeSourceError, match="binding failed"):
+        _scan(index, results_path)
+    assert os.times().elapsed - started < 1.0
+    index.close(verify=False)
+
+
+@pytest.mark.parametrize("artifact", ["manifest", "pack"])
+def test_compact_sibling_path_replacement_fails_final_snapshot(
+    tmp_path: Path,
+    artifact: str,
+) -> None:
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [{"group": "B1", "task_id": "task-1", "final_text": "accepted"}],
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    target = (
+        manifest_path
+        if artifact == "manifest"
+        else Path(manifest["artifacts"][SELECTION_PLAN_PACK_ARTIFACT_FIELD])
+    )
+    replacement_payload = target.read_bytes()
+    index = ResumeSourceIndex([results_path], force_spool=False)
+    _scan(index, results_path)
+    target.rename(target.with_suffix(target.suffix + ".original"))
+    target.write_bytes(replacement_payload)
+    if artifact == "pack":
+        target.chmod(0o600)
+
+    with pytest.raises(DracoResumeSourceError, match="changed|replaced"):
+        index.close()
+    assert index.closed
+
+
+def test_forced_spool_rejects_same_bytes_pack_inode_replacement(
+    tmp_path: Path,
+) -> None:
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [{"group": "B1", "task_id": "task-1", "final_text": "accepted"}],
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    pack_path = Path(manifest["artifacts"][SELECTION_PLAN_PACK_ARTIFACT_FIELD])
+    pack_payload = pack_path.read_bytes()
+    index = ResumeSourceIndex([results_path], force_spool=True)
+    _scan(index, results_path)
+    pack_path.rename(pack_path.with_suffix(pack_path.suffix + ".original"))
+    pack_path.write_bytes(pack_payload)
+    pack_path.chmod(0o600)
+
+    with pytest.raises(DracoResumeSourceError, match="bound inode"):
+        index.close()
+    assert index.closed
+
+
+def test_manifest_path_replacement_during_final_hash_is_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [{"group": "B1", "task_id": "task-1", "final_text": "accepted"}],
+    )
+    index = ResumeSourceIndex([results_path], force_spool=False)
+    _scan(index, results_path)
+    manifest_stat = manifest_path.stat()
+    manifest_payload = manifest_path.read_bytes()
+    actual_hash_fd = resume_source_index._hash_fd
+    replaced = False
+
+    def replace_after_hash(fd: int, *, expected_size: int) -> str:
+        nonlocal replaced
+        digest = actual_hash_fd(fd, expected_size=expected_size)
+        current = os.fstat(fd)
+        if not replaced and (
+            current.st_dev,
+            current.st_ino,
+        ) == (manifest_stat.st_dev, manifest_stat.st_ino):
+            replaced = True
+            manifest_path.rename(
+                manifest_path.with_suffix(manifest_path.suffix + ".original")
+            )
+            manifest_path.write_bytes(manifest_payload)
+        return digest
+
+    monkeypatch.setattr(resume_source_index, "_hash_fd", replace_after_hash)
+    with pytest.raises(
+        DracoResumeSourceError,
+        match="changed during verification|path was replaced",
+    ):
+        index.close()
+    assert replaced is True
+    assert index.closed
+
+
+def test_compact_close_does_not_mask_primary_error(tmp_path: Path) -> None:
+    class PrimaryError(RuntimeError):
+        pass
+
+    results_path, manifest_path, _ = _write_compact_source_bundle(
+        tmp_path,
+        [{"group": "B1", "task_id": "task-1", "final_text": "accepted"}],
+    )
+    index = ResumeSourceIndex([results_path], force_spool=False)
+    _scan(index, results_path)
+    with pytest.raises(PrimaryError, match="business failure"):
+        with index:
+            manifest_path.rename(manifest_path.with_suffix(".replaced"))
+            raise PrimaryError("business failure")
+    assert index.closed
+
+
+def test_compact_cancellation_closes_bound_pack_reader(tmp_path: Path) -> None:
+    results_path, _, _ = _write_compact_source_bundle(
+        tmp_path,
+        [{"group": "B1", "task_id": "task-1", "final_text": "accepted"}],
+    )
+    index = ResumeSourceIndex([results_path], force_spool=False)
+    _scan(index, results_path)
+    bundle = index._sources[0].compact_bundle  # noqa: SLF001 - close gate.
+    assert bundle is not None
+    assert bundle.reader is not None
+    pack_fd = bundle.reader._fd  # noqa: SLF001 - close gate.
+
+    with pytest.raises(asyncio.CancelledError):
+        with index:
+            raise asyncio.CancelledError
+
+    assert index.closed
+    with pytest.raises(OSError):
+        os.fstat(pack_fd)
 
 
 def test_large_complete_history_keeps_only_locators_until_one_pending_consume(

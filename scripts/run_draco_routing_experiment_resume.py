@@ -18505,7 +18505,7 @@ def ensemble_generation_completion_reasons(
         final_trace.get("selection_strategy")
         or (
             final_trace.get("selection_plan", {}).get("strategy")
-            if isinstance(final_trace.get("selection_plan"), dict)
+            if isinstance(final_trace.get("selection_plan"), Mapping)
             else ""
         )
         or ""
@@ -18514,11 +18514,11 @@ def ensemble_generation_completion_reasons(
         reasons.append("wrong_executed_selection_mode")
 
     executed_plan = final_trace.get("selection_plan")
-    if spec.get("kind") == "selection_mode" and not isinstance(expected_plan, dict):
+    if spec.get("kind") == "selection_mode" and not isinstance(expected_plan, Mapping):
         reasons.append("missing_expected_selection_plan")
-    if spec.get("kind") == "selection_mode" and not isinstance(executed_plan, dict):
+    if spec.get("kind") == "selection_mode" and not isinstance(executed_plan, Mapping):
         reasons.append("missing_executed_selection_plan")
-    if isinstance(expected_plan, dict) and isinstance(executed_plan, dict):
+    if isinstance(expected_plan, Mapping) and isinstance(executed_plan, Mapping):
         expected_models_value = expected_plan.get("proposer_models")
         normalized_expected_models = (
             [model.strip() if isinstance(model, str) else "" for model in expected_models_value]
@@ -18667,7 +18667,7 @@ def ensemble_generation_completion_reasons(
         if not isinstance(ensemble, Mapping):
             reasons.append("missing_expected_b2_ensemble_contract")
         else:
-            if not isinstance(executed_plan, dict):
+            if not isinstance(executed_plan, Mapping):
                 reasons.append("missing_executed_selection_plan")
             expected_members = ensemble.get("proposers")
             members = (
@@ -18693,7 +18693,7 @@ def ensemble_generation_completion_reasons(
                 not isinstance(successful, int) or successful < expected_minimum
             ):
                 reasons.append("insufficient_b2_configured_quorum")
-            if isinstance(executed_plan, dict):
+            if isinstance(executed_plan, Mapping):
                 if expected_models and executed_plan.get("proposer_models") != expected_models:
                     reasons.append("wrong_b2_proposer_lineup")
                 if expected_selected_p and executed_plan.get("selected_P") != expected_selected_p:
@@ -19864,12 +19864,13 @@ def resume_row_completion_state(
     expected_run_compatibility_contract: Mapping[str, Any] | None = None,
     require_openrouter_non_byok: bool = False,
     judge_required: bool = True,
+    result_evidence_preverified: bool = False,
 ) -> dict[str, Any]:
     """Classify a prior row without conflating generation, Judge, and metadata."""
 
     generation_reasons: list[str] = []
     identity_metadata_reasons: list[str] = []
-    if not verify_result_row_evidence(row):
+    if not result_evidence_preverified and not verify_result_row_evidence(row):
         generation_reasons.append("invalid_result_evidence")
     row_error = str(row.get("error") or "")
     stored_non_byok = row.get("openrouter_non_byok_audit")
@@ -20319,18 +20320,28 @@ def _load_resume_group_task_states_from_index(
             and isinstance(execution.get("generation_attempts"), list)
             else []
         )
-        return canonical_json_sha256(
-            {
-                "group": row.get("group"),
-                "task_id": row.get("task_id"),
-                "prompt_sha256": row.get("prompt_sha256"),
-                "started_at": row.get("started_at"),
-                "final_text_sha256": (
-                    row.get("final_text_sha256") or text_sha256(str(row.get("final_text") or ""))
-                ),
-                "generation_attempts": attempts,
-            }
-        )
+        # A compact source exposes selection plans as guarded lazy Mappings.
+        # Deepcopy is the deliberate transient materialization boundary: the
+        # lazy type returns an ordinary inline dict, so canonical bytes remain
+        # identical to the historical inline fingerprint and no ref/reader can
+        # escape into retained state.
+        fingerprint_attempts = copy.deepcopy(attempts)
+        try:
+            return canonical_json_sha256(
+                {
+                    "group": row.get("group"),
+                    "task_id": row.get("task_id"),
+                    "prompt_sha256": row.get("prompt_sha256"),
+                    "started_at": row.get("started_at"),
+                    "final_text_sha256": (
+                        row.get("final_text_sha256")
+                        or text_sha256(str(row.get("final_text") or ""))
+                    ),
+                    "generation_attempts": fingerprint_attempts,
+                }
+            )
+        finally:
+            del fingerprint_attempts
 
     def _attempt_evidence_location(path: Path, line_number: int) -> str:
         return f"{path}:{line_number}"
@@ -20529,6 +20540,10 @@ def _load_resume_group_task_states_from_index(
                 f"actual-spend generation attempt count contradicts evidence at {location}"
             )
         expected_budget_limit = _generation_attempt_limit(key[0])
+        if observed_count > expected_budget_limit:
+            raise ValueError(
+                f"generation attempt row exceeds its formal cap at {location}"
+            )
         budget_limit = row.get("generation_attempt_budget_limit")
         if budget_limit != expected_budget_limit:
             raise ValueError(f"generation attempt budget limit differs at {location}")
@@ -20545,6 +20560,9 @@ def _load_resume_group_task_states_from_index(
         known_locations = strict_attempt_locations.setdefault(key, {})
         prior_declared = declared_attempt_budget_used.get(key, 0)
         new_attempt_count = 0
+        prior_comparisons: list[
+            tuple[str, Mapping[str, Any], ResumeRowLocator, int]
+        ] = []
         for attempt_position, attempt in enumerate(attempts):
             if not isinstance(attempt, Mapping):
                 raise ValueError(f"generation attempt evidence row is invalid at {location}")
@@ -20627,23 +20645,41 @@ def _load_resume_group_task_states_from_index(
                 strict_attempt_owners[attempt_id] = key
             else:
                 prior_locator, prior_position = prior_location
-                prior_payload = source_rows.load_attempt(
-                    prior_locator,
-                    attempt_index=prior_position,
-                    attempt_id=attempt_id,
-                )
-                try:
-                    if not _strict_attempt_payload_is_monotonic_enrichment(
-                        prior_payload,
+                prior_comparisons.append(
+                    (
+                        attempt_id,
                         attempt,
-                    ):
-                        raise ValueError(
-                            "generation attempt identity has conflicting evidence at "
-                            f"{location}: {attempt_id}"
-                        )
-                finally:
-                    del prior_payload
+                        prior_locator,
+                        prior_position,
+                    )
+                )
             known_locations[attempt_id] = (row_locator, attempt_position)
+
+        prior_payloads = source_rows.load_attempts(
+            [
+                (prior_locator, prior_position, attempt_id)
+                for (
+                    attempt_id,
+                    _attempt,
+                    prior_locator,
+                    prior_position,
+                ) in prior_comparisons
+            ]
+        )
+        for prior_payload, (attempt_id, attempt, _, _) in zip(
+            prior_payloads,
+            prior_comparisons,
+            strict=True,
+        ):
+            if not _strict_attempt_payload_is_monotonic_enrichment(
+                prior_payload,
+                attempt,
+            ):
+                raise ValueError(
+                    "generation attempt identity has conflicting evidence at "
+                    f"{location}: {attempt_id}"
+                )
+        del prior_payloads
 
         prior_generation_used = (
             execution.get("prior_generation_attempts_used")
@@ -20690,22 +20726,27 @@ def _load_resume_group_task_states_from_index(
             for indexed_line in resume_fh:
                 line_number = indexed_line.locator.line_number
                 line = indexed_line.payload
-                try:
-                    line_text = line.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise ValueError(
-                        f"invalid resume JSONL at {path}:{line_number}: {exc}"
-                    ) from exc
-                if not line_text.strip():
-                    continue
-                try:
-                    prior_row = json.loads(line_text)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"invalid resume JSONL at {path}:{line_number}: {exc}"
-                    ) from exc
-                if not isinstance(prior_row, dict):
-                    raise ValueError(f"resume JSONL row is not an object at {path}:{line_number}")
+                prior_row = indexed_line.parsed_row
+                if prior_row is None:
+                    try:
+                        line_text = line.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise ValueError(
+                            f"invalid resume JSONL at {path}:{line_number}: {exc}"
+                        ) from exc
+                    if not line_text.strip():
+                        continue
+                    try:
+                        prior_row = json.loads(line_text)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"invalid resume JSONL at {path}:{line_number}: {exc}"
+                        ) from exc
+                    if not isinstance(prior_row, dict):
+                        raise ValueError(
+                            "resume JSONL row is not an object at "
+                            f"{path}:{line_number}"
+                        )
                 key = (
                     str(prior_row.get("group") or ""),
                     str(prior_row.get("task_id") or ""),
@@ -20715,6 +20756,12 @@ def _load_resume_group_task_states_from_index(
                 row_locator = indexed_line.locator.bind(
                     group=key[0],
                     task_id=key[1],
+                )
+                prior_row, result_evidence_preverified = (
+                    source_rows.classification_row(
+                        row_locator,
+                        prior_row,
+                    )
                 )
                 matching_attempts += 1
                 row_attempt_count = _row_generation_attempt_count(prior_row)
@@ -20845,6 +20892,7 @@ def _load_resume_group_task_states_from_index(
                     ),
                     require_openrouter_non_byok=require_openrouter_non_byok,
                     judge_required=judge_required,
+                    result_evidence_preverified=result_evidence_preverified,
                 )
                 if state["action"] != "complete":
                     invalid_attempts += 1
@@ -20895,6 +20943,7 @@ def _load_resume_group_task_states_from_index(
                 current = best.get(key)
                 if current is None or _selection_rank(candidate) > _selection_rank(current):
                     best[key] = candidate
+                del prior_row
     source_rows.seal()
     for key, state in best.items():
         declared = declared_attempt_budget_used.get(key, 0)
@@ -20934,19 +20983,20 @@ def _load_resume_group_task_states_from_index(
                     "current G1 run compatibility contract is unavailable for "
                     f"{key[0]}/{key[1]}"
                 )
+            attempt_requests = [
+                (attempt_locator, attempt_position, attempt_id)
+                for attempt_id, (
+                    attempt_locator,
+                    attempt_position,
+                ) in strict_attempt_locations.get(key, {}).items()
+            ]
+            if len(attempt_requests) > _generation_attempt_limit(key[0]):
+                raise ValueError(
+                    "strict generation history exceeds its formal reconstruction cap"
+                )
             state["g1_frozen_resume_lifecycle"] = (
                 reconstruct_g1_cross_wave_frozen_lifecycle(
-                    attempts=[
-                        source_rows.load_attempt(
-                            attempt_locator,
-                            attempt_index=attempt_position,
-                            attempt_id=attempt_id,
-                        )
-                        for attempt_id, (
-                            attempt_locator,
-                            attempt_position,
-                        ) in strict_attempt_locations.get(key, {}).items()
-                    ],
+                    attempts=source_rows.load_attempts(attempt_requests),
                     current_run_compatibility_contract=current_contract,
                 )
             )

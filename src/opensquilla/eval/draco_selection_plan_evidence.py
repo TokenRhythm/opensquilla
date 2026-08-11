@@ -20,7 +20,7 @@ import os
 import re
 import stat
 import zlib
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -580,7 +580,9 @@ class SelectionPlanPackIndex:
     object_count: int
     device: int
     inode: int
+    mode: int
     mtime_ns: int
+    ctime_ns: int
     objects: Mapping[str, SelectionPlanObjectLocation]
 
     def location(self, sha256: str) -> SelectionPlanObjectLocation:
@@ -843,10 +845,13 @@ _PACK_HEADER_LINE = _canonical_json_bytes(
 ) + b"\n"
 
 
-def _file_signature(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+def _file_signature(
+    file_stat: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
     return (
         file_stat.st_dev,
         file_stat.st_ino,
+        file_stat.st_mode,
         file_stat.st_size,
         file_stat.st_mtime_ns,
         file_stat.st_ctime_ns,
@@ -973,7 +978,9 @@ def _scan_pack_fd(
         object_count=len(locations),
         device=file_stat.st_dev,
         inode=file_stat.st_ino,
+        mode=end_stat.st_mode,
         mtime_ns=end_stat.st_mtime_ns,
+        ctime_ns=end_stat.st_ctime_ns,
         objects=MappingProxyType(locations),
     )
     return _ScannedPack(index=index, digest=digest)
@@ -1182,6 +1189,37 @@ class SelectionPlanPackReader:
             raise
         return instance
 
+    @classmethod
+    def from_index(
+        cls,
+        path: Path,
+        index: SelectionPlanPackIndex,
+        *,
+        owner_only: bool = False,
+        limits: SelectionPlanEvidenceLimits = DEFAULT_SELECTION_PLAN_EVIDENCE_LIMITS,
+    ) -> SelectionPlanPackReader:
+        """Reopen an already scanned pack without another whole-pack scan.
+
+        The immutable index retains the original inode signature and every
+        record's line hash.  Reopens bind that exact inode snapshot; individual
+        objects are authenticated by their indexed line hash, and the owner
+        performs one final whole-pack verification at its commit boundary.
+        """
+
+        instance = cls.__new__(cls)
+        instance.path = Path(path)
+        instance._limits = limits
+        instance._owner_only = owner_only
+        instance._fd = _open_regular(instance.path, os.O_RDONLY)
+        instance._closed = False
+        instance._index = index
+        try:
+            instance.verify_identity()
+        except BaseException:
+            instance.close()
+            raise
+        return instance
+
     @property
     def index(self) -> SelectionPlanPackIndex:
         return self._index
@@ -1223,12 +1261,55 @@ class SelectionPlanPackReader:
             limits=self._limits,
         )
 
+    def verify_identity(self) -> None:
+        """Verify the bound inode/path signature without rescanning pack bytes."""
+
+        bound_fd = self._require_open()
+        if self._owner_only:
+            _require_owner_only_fd(bound_fd)
+        bound_stat = os.fstat(bound_fd)
+        expected = (
+            self._index.device,
+            self._index.inode,
+            self._index.mode,
+            self._index.pack_bytes,
+            self._index.mtime_ns,
+            self._index.ctime_ns,
+        )
+        if self.path is not None:
+            try:
+                path_fd = _open_regular(self.path, os.O_RDONLY)
+            except OSError as exc:
+                raise SelectionPlanEvidenceError(
+                    "selection-plan pack path no longer resolves to its bound inode"
+                ) from exc
+            try:
+                if self._owner_only:
+                    _require_owner_only_fd(path_fd)
+                if _file_signature(os.fstat(path_fd)) != expected:
+                    raise SelectionPlanEvidenceError(
+                        "selection-plan pack path was replaced after indexing"
+                    )
+            finally:
+                os.close(path_fd)
+        observed = _file_signature(bound_stat)
+        if observed != expected:
+            # A descriptor-only reader has no pathname contract. Renaming its
+            # still-bound inode can legitimately advance ctime while leaving
+            # its bytes, mode, inode, size, and mtime intact.
+            if self.path is None and observed[:-1] == expected[:-1]:
+                return
+            raise SelectionPlanEvidenceError(
+                "selection-plan pack identity changed after indexing"
+            )
+
     def verify_snapshot(self) -> None:
         """Require both the bound inode bytes and its current path identity."""
 
         bound_fd = self._require_open()
         if self._owner_only:
             _require_owner_only_fd(bound_fd)
+        self.verify_identity()
         scanned = _scan_pack_fd(bound_fd, limits=self._limits).index
         if (
             scanned.pack_sha256 != self._index.pack_sha256
@@ -1237,31 +1318,17 @@ class SelectionPlanPackReader:
             or scanned.object_count != self._index.object_count
             or scanned.device != self._index.device
             or scanned.inode != self._index.inode
+            or scanned.mode != self._index.mode
+            or scanned.mtime_ns != self._index.mtime_ns
+            or (
+                self.path is not None
+                and scanned.ctime_ns != self._index.ctime_ns
+            )
         ):
             raise SelectionPlanEvidenceError(
                 "selection-plan pack changed after its source snapshot"
             )
-        if self.path is None:
-            return
-        try:
-            path_fd = _open_regular(self.path, os.O_RDONLY)
-        except OSError as exc:
-            raise SelectionPlanEvidenceError(
-                "selection-plan pack path no longer resolves to its bound inode"
-            ) from exc
-        try:
-            if self._owner_only:
-                _require_owner_only_fd(path_fd)
-            path_stat = os.fstat(path_fd)
-            if (
-                path_stat.st_dev != self._index.device
-                or path_stat.st_ino != self._index.inode
-            ):
-                raise SelectionPlanEvidenceError(
-                    "selection-plan pack path was replaced after indexing"
-                )
-        finally:
-            os.close(path_fd)
+        self.verify_identity()
 
     def close(self) -> None:
         if self._closed:
@@ -1296,7 +1363,7 @@ class SelectionPlanPackAppender:
         self._limits = limits
         self._closed = False
         self._fd: int | None = None
-        self._snapshot_signature: tuple[int, int, int, int, int] | None = None
+        self._snapshot_signature: tuple[int, int, int, int, int, int] | None = None
         if create and len(_PACK_HEADER_LINE) > limits.pack_bytes:
             raise SelectionPlanEvidenceLimitError(
                 "selection-plan pack header exceeds the total pack cap"
@@ -1366,7 +1433,9 @@ class SelectionPlanPackAppender:
             object_count=len(self._locations),
             device=file_stat.st_dev,
             inode=file_stat.st_ino,
+            mode=file_stat.st_mode,
             mtime_ns=file_stat.st_mtime_ns,
+            ctime_ns=file_stat.st_ctime_ns,
             objects=objects,
         )
 
@@ -1657,12 +1726,19 @@ def compact_selection_plan_evidence_row(
     return compacted
 
 
-def validate_compact_selection_plan_evidence_row(
+def validate_compact_selection_plan_evidence_row_structure(
     row: Mapping[str, Any],
     *,
-    reader: SelectionPlanPackReader | SelectionPlanPackAppender,
+    pack_index: SelectionPlanPackIndex,
+    limits: SelectionPlanEvidenceLimits = DEFAULT_SELECTION_PLAN_EVIDENCE_LIMITS,
 ) -> bool:
-    """Verify one compact row and return whether it contains at least one ref."""
+    """Validate compact placement/refs against an already authenticated index.
+
+    This deliberately does not decompress an object.  The pack scan has
+    already authenticated its DAG, while first access verifies each referenced
+    record line plus the expanded hash/summary.  A successful owner performs a
+    final whole-pack snapshot verification before releasing the source index.
+    """
 
     expected_capability = selection_plan_evidence_capability_contract()
     if row.get(SELECTION_PLAN_EVIDENCE_ROW_FIELD) != expected_capability:
@@ -1677,7 +1753,60 @@ def validate_compact_selection_plan_evidence_row(
         raise SelectionPlanEvidenceError(
             "compact selection-plan row contains a nested capability marker"
         )
-    has_reference = selection_plan_reference_signal(row)
+    has_reference = False
+
+    def validate(value: Any, *, field_name: str | None = None) -> None:
+        nonlocal has_reference
+        if field_name == "selection_plan":
+            if not is_selection_plan_reference(value):
+                raise SelectionPlanEvidenceError(
+                    "compact selection-plan row contains an inline plan"
+                )
+            if not isinstance(value, Mapping):  # pragma: no cover - narrowed above.
+                raise SelectionPlanEvidenceError(
+                    "selection-plan root ref must be an object"
+                )
+            reference = parse_selection_plan_reference(
+                value,
+                expected_kind=SELECTION_PLAN_ROOT_KIND,
+                limits=limits,
+            )
+            location = pack_index.location(reference.sha256)
+            if (
+                location.kind != reference.kind
+                or location.uncompressed_bytes != reference.uncompressed_bytes
+            ):
+                raise SelectionPlanEvidenceError(
+                    "selection-plan ref header differs from its indexed object"
+                )
+            has_reference = True
+            return
+        if isinstance(value, Mapping):
+            if is_selection_plan_reference(value):
+                raise SelectionPlanEvidenceError(
+                    "selection-plan root ref appears outside a selection_plan field"
+                )
+            for key, item in value.items():
+                validate(item, field_name=key)
+        elif isinstance(value, list):
+            for item in value:
+                validate(item)
+
+    validate(row)
+    return has_reference
+
+
+def validate_compact_selection_plan_evidence_row(
+    row: Mapping[str, Any],
+    *,
+    reader: SelectionPlanPackReader | SelectionPlanPackAppender,
+) -> bool:
+    """Verify one compact row and return whether it contains at least one ref."""
+
+    has_reference = validate_compact_selection_plan_evidence_row_structure(
+        row,
+        pack_index=reader.index,
+    )
     materialized = materialize_selection_plan_row_view(
         row,
         reader=reader,
@@ -1864,6 +1993,172 @@ def materialize_selection_plan_row_view(
     return materialized
 
 
+class _LazySelectionPlanResolver:
+    """Resolve each distinct root ref once within one transient row view."""
+
+    __slots__ = (
+        "_access_guard",
+        "_expanded_by_ref",
+        "_on_materialize",
+        "_reader",
+    )
+
+    def __init__(
+        self,
+        reader: SelectionPlanPackReader | SelectionPlanPackAppender,
+        *,
+        on_materialize: Callable[[], None] | None,
+        access_guard: Callable[[], None] | None,
+    ) -> None:
+        self._reader = reader
+        self._on_materialize = on_materialize
+        self._access_guard = access_guard
+        self._expanded_by_ref: dict[bytes, dict[str, Any]] = {}
+
+    def resolve(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        if self._access_guard is not None:
+            self._access_guard()
+        cache_key = _canonical_json_bytes(
+            dict(value),
+            label="selection-plan root ref",
+        )
+        expanded = self._expanded_by_ref.get(cache_key)
+        if expanded is None:
+            resolved = self._reader.expand_selection_plan(value)
+            if not isinstance(resolved, dict):
+                raise SelectionPlanEvidenceError(
+                    "selection-plan root ref did not resolve to an object"
+                )
+            if selection_plan_reference_signal(resolved):
+                raise SelectionPlanEvidenceError(
+                    "expanded selection plan retains a nested root ref"
+                )
+            expanded = copy.deepcopy(resolved)
+            self._expanded_by_ref[cache_key] = expanded
+            if self._on_materialize is not None:
+                self._on_materialize()
+        return expanded
+
+
+class LazySelectionPlanMapping(Mapping[str, Any]):
+    """Read-only plan view that resolves its authenticated root ref on demand.
+
+    Values are detached on every access so callers cannot mutate the memoized
+    plan shared by repeated mirrors in the same source row.  The object is a
+    ``Mapping``, not a ``dict``: JSON writers must explicitly materialize it
+    and therefore cannot accidentally persist the hidden root reference.
+    """
+
+    __slots__ = ("_reference", "_resolver")
+
+    def __init__(
+        self,
+        reference: Mapping[str, Any],
+        *,
+        resolver: _LazySelectionPlanResolver,
+    ) -> None:
+        parse_selection_plan_reference(
+            reference,
+            expected_kind=SELECTION_PLAN_ROOT_KIND,
+        )
+        self._reference = copy.deepcopy(dict(reference))
+        self._resolver = resolver
+
+    def _expanded(self) -> dict[str, Any]:
+        return self._resolver.resolve(self._reference)
+
+    def __getitem__(self, key: str) -> Any:
+        return copy.deepcopy(self._expanded()[key])
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(tuple(self._expanded()))
+
+    def __len__(self) -> int:
+        return len(self._expanded())
+
+    def materialize(self) -> dict[str, Any]:
+        """Return one wholly detached inline plan."""
+
+        return copy.deepcopy(self._expanded())
+
+    def __copy__(self) -> dict[str, Any]:
+        """Copies cross the lazy boundary as ordinary inline evidence."""
+
+        return self.materialize()
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        """Never copy the authenticated ref or its descriptor-bound resolver."""
+
+        existing = memo.get(id(self))
+        if isinstance(existing, dict):
+            return existing
+        materialized = copy.deepcopy(self._expanded(), memo)
+        memo[id(self)] = materialized
+        return materialized
+
+    def __repr__(self) -> str:
+        return "LazySelectionPlanMapping(<authenticated>)"
+
+
+def lazy_selection_plan_row_view(
+    row: Mapping[str, Any],
+    *,
+    reader: SelectionPlanPackReader | SelectionPlanPackAppender | None,
+    require_references: bool,
+    on_materialize: Callable[[], None] | None = None,
+    access_guard: Callable[[], None] | None = None,
+) -> Mapping[str, Any]:
+    """Build a detached row whose selection plans resolve only on access.
+
+    This is a read-only classification boundary.  Durable writers must use
+    :func:`materialize_selection_plan_row_view` and reseal the resulting row.
+    """
+
+    if not isinstance(row, Mapping):
+        raise SelectionPlanEvidenceError("selection-plan row must be a JSON object")
+    has_reference_signal = selection_plan_reference_signal(row)
+    if not require_references and not has_reference_signal:
+        return row
+    if reader is None:
+        raise SelectionPlanEvidenceError(
+            "content-addressed selection-plan row requires its bound pack"
+        )
+    resolver = _LazySelectionPlanResolver(
+        reader,
+        on_materialize=on_materialize,
+        access_guard=access_guard,
+    )
+
+    def detached(value: Any, *, field_name: str | None = None) -> Any:
+        if field_name == "selection_plan" and require_references:
+            if not is_selection_plan_reference(value):
+                raise SelectionPlanEvidenceError(
+                    "compact selection-plan row contains an inline plan"
+                )
+            if not isinstance(value, Mapping):  # pragma: no cover - narrowed above.
+                raise SelectionPlanEvidenceError(
+                    "selection-plan root ref must be an object"
+                )
+            return LazySelectionPlanMapping(value, resolver=resolver)
+        if isinstance(value, Mapping):
+            if is_selection_plan_reference(value):
+                raise SelectionPlanEvidenceError(
+                    "selection-plan root ref appears outside a selection_plan field"
+                )
+            return {
+                key: detached(item, field_name=key)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [detached(item) for item in value]
+        return copy.deepcopy(value)
+
+    materialized = detached(row)
+    if not isinstance(materialized, dict):
+        raise SelectionPlanEvidenceError("selection-plan row view is not an object")
+    return materialized
+
+
 def expand_selection_plan(
     value: Any,
     *,
@@ -1902,6 +2197,7 @@ __all__ = [
     "SelectionPlanEvidenceError",
     "SelectionPlanEvidenceLimitError",
     "SelectionPlanEvidenceLimits",
+    "LazySelectionPlanMapping",
     "SelectionPlanObjectLocation",
     "SelectionPlanPackAppender",
     "SelectionPlanPackIndex",
@@ -1912,6 +2208,7 @@ __all__ = [
     "expand_selection_plan",
     "is_selection_plan_reference",
     "materialize_selection_plan_row_view",
+    "lazy_selection_plan_row_view",
     "parse_selection_plan_reference",
     "selection_plan_evidence_capability_contract",
     "selection_plan_evidence_manifest_binding",
@@ -1919,5 +2216,6 @@ __all__ = [
     "selection_plan_row_capability_signal",
     "selection_plan_summary",
     "validate_compact_selection_plan_evidence_row",
+    "validate_compact_selection_plan_evidence_row_structure",
     "validate_selection_plan_evidence_manifest_binding",
 ]
