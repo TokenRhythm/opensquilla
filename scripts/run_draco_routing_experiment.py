@@ -7326,6 +7326,9 @@ def run_result_summary(
         "final_text_chars": len(result.final_text),
         "final_text_sha256": text_sha256(result.final_text),
         "usage": usage,
+        # Preserve the paid setup rows as an immutable mirror of their
+        # aggregate usage entries for resume/finalizer reconciliation.
+        "setup_usage": copy.deepcopy(result.setup_usage),
         "trace_events": result.trace_events,
         "setup_latency_ms": result.setup_latency_ms,
         "routing_trace": result.routing_trace,
@@ -10012,6 +10015,55 @@ def g1_execution_plan_mutation_reason(
     )
 
 
+def backfill_g1_result_routing_trace_from_ensemble(
+    expected_plan: Mapping[str, Any],
+    result: RunResult,
+) -> bool:
+    """Recover a missing top-level plan from matching physical call traces."""
+
+    if not expected_plan:
+        return False
+    routing = result.routing_trace
+    if not isinstance(routing, Mapping) or "selection_plan" in routing:
+        return False
+    done = result.done
+    trace = done.ensemble_trace if done is not None else None
+    if not isinstance(trace, Mapping) or not trace:
+        return False
+    calls, sequence_reasons = ensemble_call_trace_sequence(trace)
+    if sequence_reasons or not calls:
+        return False
+    try:
+        expected_hash = canonical_json_sha256(
+            g1_immutable_selection_plan_payload(expected_plan)
+        )
+        observed_plan: dict[str, Any] | None = None
+        for call in calls:
+            physical_plan = call.get("selection_plan")
+            if (
+                not isinstance(physical_plan, Mapping)
+                or canonical_json_sha256(
+                    g1_immutable_selection_plan_payload(physical_plan)
+                )
+                != expected_hash
+            ):
+                return False
+            if observed_plan is None:
+                observed_plan = copy.deepcopy(dict(physical_plan))
+        if observed_plan is None:
+            return False
+        recovered_routing = copy.deepcopy(dict(routing))
+    except Exception:  # noqa: BLE001 - contradictory evidence remains unmodified
+        return False
+    recovered_routing["selection_plan"] = observed_plan
+    recovered_routing["selection_plan_backfill"] = {
+        "source": "ensemble_call_trace",
+        "call_count": len(calls),
+    }
+    result.routing_trace = recovered_routing
+    return True
+
+
 def g1_attempt_plan_consistency_reason(
     expected_plan: Mapping[str, Any],
     result: RunResult,
@@ -10211,8 +10263,6 @@ async def collect_generation_with_retries(
         if group == "G1"
         else ""
     )
-    if native_g1_recovery_reason:
-        raise ValueError(native_g1_recovery_reason)
     provider_native_g1_recovery = bool(
         group == "G1"
         and g1_provider_native_recovery_enabled(initial_selection_plan)
@@ -10521,6 +10571,18 @@ async def collect_generation_with_retries(
         bounded_generation_attempts(max_attempts),
         total_attempt_budget_limit - attempt_offset,
     )
+    if native_g1_recovery_reason:
+        return fail_before_generation_call(
+            native_g1_recovery_reason,
+            attempt_id=uuid.uuid4().hex,
+            attempt_index=attempt_offset + 1,
+            attempt_started_at=time.time(),
+            selection_plan=(
+                initial_selection_plan
+                if isinstance(initial_selection_plan, Mapping)
+                else {}
+            ),
+        )
     for local_attempt_index in range(1, attempt_limit + 1):
         attempt_index = attempt_offset + local_attempt_index
         attempt_id = uuid.uuid4().hex
@@ -10739,6 +10801,11 @@ async def collect_generation_with_retries(
             expected_provider=expected_provider,
             expected_selection_plan=expected_selection_plan,
         )
+        if adaptive_g1 or provider_native_g1_recovery:
+            backfill_g1_result_routing_trace_from_ensemble(
+                expected_selection_plan,
+                result,
+            )
         if paid_attempt_sink is not None:
             paid_attempt_sink["stage"] = "generation_retry_reason"
         reason = generation_retry_reason(
