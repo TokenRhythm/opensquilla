@@ -158,6 +158,44 @@ def test_canary_projector_row_satisfies_fixed_reason_and_task_fields() -> None:
     validate_ensemble_execution_metrics(row)
 
 
+def test_persistent_canary_projector_row_satisfies_closed_transport_contract() -> None:
+    receipt = {
+        "schema": "opensquilla.ensemble-canary-persistent-rollout/v1",
+        "role": "proposer",
+        "available": True,
+        "allowed": True,
+        "probe": False,
+        "admission_reason": "active",
+        "state_before": "active",
+        "mutation_available": True,
+        "mutation_applied": True,
+        "mutation_reason": "applied",
+        "state_after": "active",
+        "latch_reason": "none",
+        "provider_outcome": "success",
+        "usage_outcome": "observed",
+        "cancelled_before_request": False,
+        "rollback_transition": False,
+        "recovery_transition": False,
+        "recovery_successes": 0,
+    }
+    row = build_ensemble_execution_metrics(
+        {
+            "canary_persistent_rollout": {
+                "schema": "opensquilla.ensemble-canary-persistent-rollout/v1",
+                "enabled": True,
+                "receipt_count": 1,
+                "receipts": [receipt],
+            }
+        },
+        terminal_outcome="completed",
+    )
+
+    validate_ensemble_execution_metrics(row)
+    assert row["canary_persistent_rollout_projection_complete"] is True
+    assert row["canary_persistent_rollout_provider_success_count"] == 1
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

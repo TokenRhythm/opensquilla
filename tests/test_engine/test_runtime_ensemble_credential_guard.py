@@ -4,6 +4,7 @@ import sys
 import time as stdlib_time
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -75,6 +76,58 @@ def _static_b5_config(**ensemble_overrides: Any) -> GatewayConfig:
         squilla_router=SquillaRouterConfig(enabled=False),
         llm_ensemble={"enabled": True, **ensemble_overrides},
     )
+
+
+def _persistent_canary_config(state_dir: Path) -> GatewayConfig:
+    return GatewayConfig(
+        state_dir=str(state_dir),
+        squilla_router=SquillaRouterConfig(enabled=False),
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "canary_rollout": {
+                "enabled": True,
+                "global_basis_points": 100,
+                "proposer": {
+                    "basis_points": 100,
+                    "max_candidates_per_decision": 1,
+                },
+                "auto_rollback": {"enabled": True},
+            },
+        },
+    )
+
+
+def test_persistent_canary_ledger_is_lazy_and_reused_per_turn_runner(
+    tmp_path: Path,
+) -> None:
+    disabled = GatewayConfig(state_dir=str(tmp_path / "disabled"))
+    runner = TurnRunner(provider_selector=None, config=disabled)
+
+    assert runner._persistent_canary_rollout_ledger(disabled) is None
+    assert not (tmp_path / "disabled").exists()
+
+    enabled = _persistent_canary_config(tmp_path / "enabled")
+    first = runner._persistent_canary_rollout_ledger(enabled)
+    second = runner._persistent_canary_rollout_ledger(enabled)
+
+    assert first is not None
+    assert second is first
+    assert first.path == tmp_path / "enabled" / "canary_rollout.sqlite3"
+    assert first.path.is_file()
+
+
+def test_persistent_canary_ledger_state_dir_drift_is_permanently_fail_closed(
+    tmp_path: Path,
+) -> None:
+    first_config = _persistent_canary_config(tmp_path / "first")
+    second_config = _persistent_canary_config(tmp_path / "second")
+    runner = TurnRunner(provider_selector=None, config=first_config)
+
+    assert runner._persistent_canary_rollout_ledger(first_config) is not None
+    assert runner._persistent_canary_rollout_ledger(second_config) is None
+    assert runner._persistent_canary_rollout_ledger(first_config) is None
+    assert not (tmp_path / "second").exists()
 
 
 def _successful_chain_analysis(

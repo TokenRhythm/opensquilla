@@ -15,8 +15,25 @@ from typing import Any
 
 from typer.testing import CliRunner
 
+from opensquilla.canary_rollout import (
+    CanaryAttemptOutcome,
+    CanaryProviderOutcome,
+    CanaryQualityOutcome,
+    CanaryRolloutLedger,
+    CanaryRolloutRole,
+    CanaryRolloutScope,
+    CanaryUsageOutcome,
+    canary_rollout_policy_sha256,
+)
+from opensquilla.cli import router_cmd
 from opensquilla.cli.main import app
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.persistence.router_decision_writer import RouterDecisionWriter
+from opensquilla.provider.ensemble import _materialize_persistent_canary_policy
+from opensquilla.recovery.locking import (
+    acquire_gateway_legacy_lease,
+    release_gateway_legacy_lease,
+)
 
 runner = CliRunner()
 
@@ -62,6 +79,53 @@ def _env(monkeypatch: Any, tmp_path: Path, db: Path | None) -> None:
 
 def _output_file(tmp_path: Path) -> Path:
     return tmp_path / "home" / "state" / "router_calibration.json"
+
+
+def _canary_config(state_root: Path) -> GatewayConfig:
+    return GatewayConfig(
+        state_dir=str(state_root),
+        llm_ensemble={
+            "canary_rollout": {
+                "enabled": True,
+                "global_basis_points": 100,
+                "proposer": {
+                    "basis_points": 100,
+                    "max_candidates_per_decision": 1,
+                },
+                "auto_rollback": {"enabled": True},
+            }
+        },
+    )
+
+
+def _seed_canary_rollback(
+    state_root: Path,
+) -> tuple[GatewayConfig, CanaryRolloutLedger, CanaryRolloutScope, Any]:
+    config = _canary_config(state_root)
+    rollout = config.llm_ensemble.canary_rollout.model_dump(mode="json")
+    policy = _materialize_persistent_canary_policy(rollout)
+    assert policy is not None
+    scope = CanaryRolloutScope.from_identity(
+        policy_sha256=canary_rollout_policy_sha256(rollout),
+        role=CanaryRolloutRole.PROPOSER,
+        provider="fake",
+        model="private-canary",
+    )
+    ledger = CanaryRolloutLedger(CanaryRolloutLedger.default_path(state_root))
+    admission = ledger.begin_attempt(scope, policy)
+    assert admission.allowed
+    result = ledger.settle_attempt(
+        scope,
+        policy,
+        admission.token,
+        CanaryAttemptOutcome(
+            provider=CanaryProviderOutcome.RATE_LIMITED,
+            usage=CanaryUsageOutcome.NOT_APPLICABLE,
+            quality=CanaryQualityOutcome.NOT_APPLICABLE,
+        ),
+    )
+    assert result.applied
+    return config, ledger, scope, policy
 
 
 def test_calibrate_dry_run_prints_without_writing(tmp_path: Path, monkeypatch: Any) -> None:
@@ -113,3 +177,135 @@ def test_calibrate_missing_db_is_neutral_no_crash(tmp_path: Path, monkeypatch: A
     assert result.exit_code == 0, result.output
     assert "samples:          0" in result.output
     assert not _output_file(tmp_path).exists()
+
+
+def test_canary_rollout_status_and_offline_reset_exact_scope(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config, ledger, scope, policy = _seed_canary_rollback(tmp_path / "state")
+    monkeypatch.setattr(router_cmd, "_load_canary_admin_config", lambda: config)
+    arguments = [
+        "--provider",
+        "fake",
+        "--model",
+        "private-canary",
+        "--role",
+        "proposer",
+        "--json",
+    ]
+
+    status = runner.invoke(app, ["router", "canary-rollout-status", *arguments])
+
+    assert status.exit_code == 0, status.output
+    status_payload = json.loads(status.output)
+    assert status_payload["found"] is True
+    assert status_payload["state"] == "rolled_back"
+    assert status_payload["latch_reason"] == "rate_limited"
+    assert status_payload["policy_sha256_prefix"] == scope.policy_sha256[:12]
+
+    reset = runner.invoke(
+        app,
+        ["router", "canary-rollout-reset", *arguments, "--yes"],
+    )
+
+    assert reset.exit_code == 0, reset.output
+    reset_payload = json.loads(reset.output)
+    assert reset_payload["state"] == "active"
+    assert reset_payload["window_attempts"] == 0
+    assert ledger.snapshot(scope, policy).state.value == "active"
+
+
+def test_canary_rollout_reset_refuses_live_gateway_lock(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config, _ledger, _scope, _policy = _seed_canary_rollback(tmp_path / "state")
+    monkeypatch.setattr(router_cmd, "_load_canary_admin_config", lambda: config)
+    lease = acquire_gateway_legacy_lease(config.state_dir or "")
+    assert lease is not None
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "router",
+                "canary-rollout-reset",
+                "--provider",
+                "fake",
+                "--model",
+                "private-canary",
+                "--yes",
+            ],
+        )
+    finally:
+        release_gateway_legacy_lease(lease)
+
+    assert result.exit_code == 1
+    assert "stop it before reset" in result.output
+
+
+def test_canary_rollout_historical_hash_works_when_current_policy_is_disabled(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    enabled, _ledger, scope, _policy = _seed_canary_rollback(tmp_path / "state")
+    disabled = GatewayConfig(state_dir=enabled.state_dir)
+    monkeypatch.setattr(router_cmd, "_load_canary_admin_config", lambda: disabled)
+
+    result = runner.invoke(
+        app,
+        [
+            "router",
+            "canary-rollout-status",
+            "--provider",
+            "fake",
+            "--model",
+            "private-canary",
+            "--policy-sha256",
+            scope.policy_sha256,
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["state"] == "rolled_back"
+
+
+def test_canary_rollout_cli_rejects_bad_hash_and_wildcard_identity(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = GatewayConfig(state_dir=str(tmp_path / "state"))
+    monkeypatch.setattr(router_cmd, "_load_canary_admin_config", lambda: config)
+
+    bad_hash = runner.invoke(
+        app,
+        [
+            "router",
+            "canary-rollout-status",
+            "--provider",
+            "fake",
+            "--model",
+            "private-canary",
+            "--policy-sha256",
+            "BAD",
+        ],
+    )
+    wildcard = runner.invoke(
+        app,
+        [
+            "router",
+            "canary-rollout-status",
+            "--provider",
+            "",
+            "--model",
+            "*",
+            "--policy-sha256",
+            "a" * 64,
+        ],
+    )
+
+    assert bad_hash.exit_code == 2
+    assert "lowercase SHA-256" in bad_hash.output
+    assert wildcard.exit_code == 2
+    assert "provider and model are required" in wildcard.output

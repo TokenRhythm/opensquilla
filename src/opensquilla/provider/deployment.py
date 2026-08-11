@@ -20,6 +20,9 @@ from typing import Any
 import structlog
 
 from opensquilla.endpoint_identity import base_url_allows_credential_reuse
+from opensquilla.routing_identity import (
+    canonicalize_provider_routing_upstream as canonicalize_provider_routing_upstream,
+)
 
 from .environment import environment_value
 from .registry import UnknownProviderError, get_provider_spec
@@ -29,28 +32,6 @@ log = structlog.get_logger(__name__)
 
 CredentialPoolAcquirer = Callable[[str, list[str], str], Any | None]
 EnvironmentReader = Callable[[str], str]
-
-
-def canonicalize_provider_routing_upstream(value: object) -> str:
-    """Return the stable, secret-free identity of one routing upstream.
-
-    OpenRouter provider pins already use a case-folded alphanumeric identity
-    in ranking evidence.  Health telemetry must use exactly the same shape on
-    both its write and read paths, otherwise names such as
-    ``google-ai-studio`` and ``googleaistudio`` create separate circuits.
-
-    ``auto`` deliberately maps to the empty identity: before a response there
-    is no trustworthy way to know which OpenRouter upstream served the call,
-    so runtime health remains conservatively scoped to ``(provider, model)``.
-    Credential identity is also intentionally absent; credentials are secret
-    and current provider events do not expose a stable non-secret scope.  Auth
-    failures therefore remain telemetry-only and never bench a deployment.
-    """
-
-    raw = str(value or "").strip().casefold()
-    if not raw or raw == "auto":
-        return ""
-    return "".join(character for character in raw if character.isalnum())
 
 
 class CredentialPoolExhaustedError(RuntimeError):

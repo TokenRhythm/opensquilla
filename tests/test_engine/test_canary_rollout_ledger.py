@@ -1,14 +1,13 @@
-"""Persistent canary rollout ledger kernel.
-
-These tests exercise infrastructure only.  No serving config or runtime path
-constructs the ledger in this stage.
-"""
+"""Persistent canary rollout ledger and its cycle-free public boundary."""
 
 from __future__ import annotations
 
 import hashlib
 import multiprocessing
+import os
 import sqlite3
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -16,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from opensquilla.engine.routing.canary_rollout import (
+from opensquilla.canary_rollout import (
     CanaryAdmissionReason,
     CanaryAttemptOutcome,
     CanaryLatchReason,
@@ -30,6 +29,7 @@ from opensquilla.engine.routing.canary_rollout import (
     CanaryRolloutState,
     CanaryUsageOutcome,
     canary_deployment_sha256,
+    canary_rollout_policy_sha256,
 )
 
 POLICY_SHA256 = hashlib.sha256(b"canary-policy").hexdigest()
@@ -54,6 +54,49 @@ UPSTREAM_5XX = CanaryAttemptOutcome(
     usage=CanaryUsageOutcome.NOT_APPLICABLE,
     quality=CanaryQualityOutcome.NOT_APPLICABLE,
 )
+
+
+def test_canary_rollout_import_orders_and_legacy_module_remain_compatible() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(repository / "src"),
+            environment.get("PYTHONPATH", ""),
+        ]
+    ).rstrip(os.pathsep)
+    import_orders = (
+        (
+            "import opensquilla.gateway.config; "
+            "import opensquilla.provider; "
+            "import opensquilla.engine.routing.canary_rollout"
+        ),
+        (
+            "import opensquilla.provider; "
+            "import opensquilla.gateway.config; "
+            "import opensquilla.engine.runtime"
+        ),
+    )
+    for source in import_orders:
+        completed = subprocess.run(
+            [sys.executable, "-c", source],
+            cwd=repository,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    from opensquilla.engine.routing import canary_rollout as legacy
+    from opensquilla.provider.deployment import (
+        canonicalize_provider_routing_upstream as deployment_canonicalize,
+    )
+    from opensquilla.routing_identity import canonicalize_provider_routing_upstream
+
+    assert legacy.CanaryRolloutLedger is CanaryRolloutLedger
+    assert deployment_canonicalize is canonicalize_provider_routing_upstream
 
 
 def _scope(
@@ -94,6 +137,60 @@ def _admit_and_settle(
     )
     assert settled.available
     assert settled.applied
+
+
+def test_rollout_policy_sha256_uses_canonical_json_and_rejects_nonfinite() -> None:
+    first = {
+        "enabled": True,
+        "policy_version": "router-canary-v1",
+        "nested": {"x": 1},
+    }
+    second = {
+        "nested": {"x": 1},
+        "policy_version": "router-canary-v1",
+        "enabled": True,
+    }
+
+    assert canary_rollout_policy_sha256(first) == canary_rollout_policy_sha256(second)
+    assert canary_rollout_policy_sha256({"bad": float("nan")}) == hashlib.sha256(
+        b'{"config_valid":false,"policy_version":"router-canary-v1"}'
+    ).hexdigest()
+
+
+def test_admin_snapshot_and_reset_use_authenticated_stored_contract(
+    tmp_path: Path,
+) -> None:
+    ledger = CanaryRolloutLedger(tmp_path / "canary.sqlite3")
+    scope = _scope("admin")
+    policy = _policy()
+    _admit_and_settle(ledger, scope, policy, RATE_LIMITED, now_ms=100)
+
+    snapshot = ledger.admin_snapshot(scope, now_ms=102)
+    assert snapshot.available is True
+    assert snapshot.state is CanaryRolloutState.ROLLED_BACK
+    assert snapshot.latch_reason is CanaryLatchReason.RATE_LIMITED
+
+    reset = ledger.admin_manual_reset(scope, now_ms=103)
+    assert reset.available is True
+    assert reset.applied is True
+    assert reset.reason is CanaryMutationReason.APPLIED
+    assert reset.snapshot.state is CanaryRolloutState.ACTIVE
+    assert reset.snapshot.window_attempts == 0
+    assert ledger.snapshot(scope, policy, now_ms=104).state is CanaryRolloutState.ACTIVE
+
+
+def test_admin_reset_unknown_scope_does_not_create_state(tmp_path: Path) -> None:
+    ledger = CanaryRolloutLedger(tmp_path / "canary.sqlite3")
+    scope = _scope("unknown-admin")
+
+    reset = ledger.admin_manual_reset(scope, now_ms=100)
+
+    assert reset.available is True
+    assert reset.applied is False
+    assert reset.reason is CanaryMutationReason.UNKNOWN_SCOPE
+    snapshot = ledger.admin_snapshot(scope, now_ms=101)
+    assert snapshot.available is True
+    assert snapshot.found is False
 
 
 def _persisted_ledger_rows(database: Path) -> tuple[tuple[tuple[Any, ...], ...], ...]:

@@ -116,6 +116,10 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "canary_physical_budget_accounting_observed": False,
         "canary_physical_budget_conservation_observed": False,
         "canary_physical_budget_exhausted_observed": False,
+        "canary_persistent_rollout_observed": False,
+        "canary_persistent_rollout_projection_complete": False,
+        "canary_persistent_rollout_enabled_observed": False,
+        "canary_persistent_rollout_receipt_count_observed": False,
         "aggregator_final_request_usage_container_observed": False,
         "aggregator_final_request_usage_projection_complete": False,
         "aggregator_final_request_usage_observed": False,
@@ -232,6 +236,31 @@ def _canary_reason_counts(**overrides: int) -> dict[str, int]:
     }
     counts.update(overrides)
     return counts
+
+
+def _persistent_canary_receipt(**overrides: Any) -> dict[str, Any]:
+    receipt: dict[str, Any] = {
+        "schema": "opensquilla.ensemble-canary-persistent-rollout/v1",
+        "role": "proposer",
+        "available": True,
+        "allowed": True,
+        "probe": False,
+        "admission_reason": "active",
+        "state_before": "active",
+        "mutation_available": True,
+        "mutation_applied": True,
+        "mutation_reason": "applied",
+        "state_after": "active",
+        "latch_reason": "none",
+        "provider_outcome": "success",
+        "usage_outcome": "observed",
+        "cancelled_before_request": False,
+        "rollback_transition": False,
+        "recovery_transition": False,
+        "recovery_successes": 0,
+    }
+    receipt.update(overrides)
+    return receipt
 
 
 def test_canary_trace_projects_only_fixed_low_cardinality_evidence() -> None:
@@ -824,6 +853,138 @@ def test_canary_rollout_conservation_rejects_reason_sum_drift(
     assert metrics["canary_rollout_conservation_observed"] is True
     assert metrics["canary_rollout_conservation_valid"] is False
     assert metrics["canary_rollout_projection_complete"] is False
+
+
+def test_persistent_canary_rollout_projects_closed_aggregate_receipt_counts() -> None:
+    private_text = "private token policy hash provider model deployment"
+    receipts = [
+        _persistent_canary_receipt(
+            state_after="rolled_back",
+            latch_reason="rate_limited",
+            provider_outcome="rate_limited",
+            usage_outcome="missing",
+            rollback_transition=True,
+        ),
+        _persistent_canary_receipt(
+            available=True,
+            allowed=False,
+            admission_reason="latched",
+            state_before="rolled_back",
+            mutation_available=False,
+            mutation_applied=False,
+            mutation_reason="not_attempted",
+            state_after="rolled_back",
+            latch_reason="rate_limited",
+            provider_outcome="not_applicable",
+            usage_outcome="not_applicable",
+            cancelled_before_request=True,
+        ),
+    ]
+    trace = {
+        "canary_persistent_rollout": {
+            "schema": "opensquilla.ensemble-canary-persistent-rollout/v1",
+            "enabled": True,
+            "receipt_count": len(receipts),
+            "receipts": receipts,
+        },
+        "private_trace": private_text,
+    }
+    before = deepcopy(trace)
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert trace == before
+    assert metrics["canary_persistent_rollout_observed"] is True
+    assert metrics["canary_persistent_rollout_projection_complete"] is True
+    assert metrics["canary_persistent_rollout_enabled_observed"] is True
+    assert metrics["canary_persistent_rollout_enabled"] is True
+    assert metrics["canary_persistent_rollout_receipt_count_observed"] is True
+    assert metrics["canary_persistent_rollout_receipt_count"] == 2
+    assert metrics["canary_persistent_rollout_admission_allowed_count"] == 1
+    assert metrics["canary_persistent_rollout_admission_denied_count"] == 1
+    assert metrics["canary_persistent_rollout_admission_unavailable_count"] == 0
+    assert metrics["canary_persistent_rollout_probe_count"] == 0
+    assert metrics["canary_persistent_rollout_settled_count"] == 1
+    assert metrics["canary_persistent_rollout_cancelled_before_request_count"] == 0
+    assert metrics["canary_persistent_rollout_mutation_unavailable_count"] == 0
+    assert metrics["canary_persistent_rollout_rollback_transition_count"] == 1
+    assert metrics["canary_persistent_rollout_recovery_transition_count"] == 0
+    assert metrics["canary_persistent_rollout_provider_rate_limited_count"] == 1
+    assert metrics["canary_persistent_rollout_provider_success_count"] == 0
+    assert metrics["canary_persistent_rollout_usage_missing_count"] == 1
+    assert metrics["canary_persistent_rollout_usage_observed_count"] == 0
+    serialized = json.dumps(metrics, sort_keys=True)
+    assert private_text not in serialized
+    for forbidden in ("token", "policy_sha256", "deployment", "provider", "model"):
+        assert forbidden not in metrics
+
+
+def test_persistent_canary_rollout_empty_receipt_set_is_complete() -> None:
+    metrics = build_ensemble_execution_metrics(
+        {
+            "canary_persistent_rollout": {
+                "schema": "opensquilla.ensemble-canary-persistent-rollout/v1",
+                "enabled": True,
+                "receipt_count": 0,
+                "receipts": [],
+            }
+        },
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_persistent_rollout_projection_complete"] is True
+    assert metrics["canary_persistent_rollout_receipt_count"] == 0
+    assert metrics["canary_persistent_rollout_admission_allowed_count"] == 0
+    assert metrics["canary_persistent_rollout_settled_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"receipt_count": 2},
+        {"enabled": False},
+        {"private_policy_sha256": "a" * 64},
+        {
+            "receipts": [
+                _persistent_canary_receipt(rollback_transition=True)
+            ]
+        },
+        {
+            "receipts": [
+                _persistent_canary_receipt(
+                    provider_outcome="private-provider-model"
+                )
+            ]
+        },
+        {"receipts": [_persistent_canary_receipt(private_token="secret")]},
+    ],
+)
+def test_persistent_canary_rollout_rejects_incomplete_or_private_receipts(
+    mutation: dict[str, Any],
+) -> None:
+    evidence: dict[str, Any] = {
+        "schema": "opensquilla.ensemble-canary-persistent-rollout/v1",
+        "enabled": True,
+        "receipt_count": 1,
+        "receipts": [_persistent_canary_receipt()],
+    }
+    evidence.update(mutation)
+
+    metrics = build_ensemble_execution_metrics(
+        {"canary_persistent_rollout": evidence},
+        terminal_outcome="completed",
+    )
+
+    assert metrics["canary_persistent_rollout_observed"] is True
+    assert metrics["canary_persistent_rollout_projection_complete"] is False
+    assert "canary_persistent_rollout_admission_allowed_count" not in metrics
+    assert not any(
+        key in metrics
+        for key in ("private_policy_sha256", "private_token", "provider", "model")
+    )
 
 
 def test_canary_budget_rejection_requires_prior_reservation_evidence() -> None:

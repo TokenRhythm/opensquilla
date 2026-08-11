@@ -575,6 +575,87 @@ def _default_llm_ensemble_canary_aggregator() -> LlmEnsembleCanaryRoleConfig:
     )
 
 
+class LlmEnsembleCanaryAutoRollbackConfig(BaseModel):
+    """Persistent same-host rollout latch; disabled until explicitly enabled."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    enabled: bool = False
+    window_max_attempts: int = Field(default=50, ge=20, le=10_000, strict=True)
+    window_max_age_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=30 * 24 * 60 * 60,
+        strict=True,
+    )
+    max_consecutive_provider_failures: int = Field(
+        default=3,
+        ge=1,
+        le=10_000,
+        strict=True,
+    )
+    max_rate_limited_count: int = Field(default=0, ge=0, le=10_000, strict=True)
+    max_usage_missing_count: int = Field(default=0, ge=0, le=10_000, strict=True)
+    rollback_cooldown_seconds: int = Field(
+        default=3_600,
+        ge=1,
+        le=30 * 24 * 60 * 60,
+        strict=True,
+    )
+    half_open_successes_required: int = Field(default=3, ge=1, le=100, strict=True)
+    half_open_probe_spacing_seconds: int = Field(
+        default=30,
+        ge=0,
+        le=30 * 24 * 60 * 60,
+        strict=True,
+    )
+    half_open_probe_lease_seconds: int = Field(
+        default=3_600,
+        ge=1,
+        le=24 * 60 * 60,
+        strict=True,
+    )
+    active_attempt_lease_seconds: int = Field(
+        default=3_600,
+        ge=1,
+        le=24 * 60 * 60,
+        strict=True,
+    )
+    scope_retention_seconds: int = Field(
+        default=7 * 24 * 60 * 60,
+        ge=1,
+        le=365 * 24 * 60 * 60,
+        strict=True,
+    )
+    max_scopes: int = Field(default=1_024, ge=1, le=100_000, strict=True)
+    max_pending_per_scope: int = Field(default=64, ge=1, le=10_000, strict=True)
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _reject_coerced_auto_rollback_boolean(cls, value: object) -> object:
+        if not isinstance(value, bool):
+            raise ValueError("canary auto rollback enabled must be a boolean")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_kernel_bounds(self) -> LlmEnsembleCanaryAutoRollbackConfig:
+        if self.max_consecutive_provider_failures > self.window_max_attempts:
+            raise ValueError("canary auto rollback consecutive failures exceed its window")
+        if self.max_rate_limited_count > self.window_max_attempts:
+            raise ValueError("canary auto rollback rate-limit count exceeds its window")
+        if self.max_usage_missing_count > self.window_max_attempts:
+            raise ValueError("canary auto rollback usage-missing count exceeds its window")
+        if self.half_open_successes_required - 1 > self.window_max_attempts:
+            raise ValueError("canary auto rollback window cannot retain recovery proof")
+        if self.half_open_probe_spacing_seconds > self.rollback_cooldown_seconds:
+            raise ValueError("canary auto rollback probe spacing exceeds cooldown")
+        if self.rollback_cooldown_seconds < self.active_attempt_lease_seconds:
+            raise ValueError("canary auto rollback cooldown must cover active attempt lease")
+        if self.scope_retention_seconds < self.window_max_age_seconds:
+            raise ValueError("canary auto rollback retention must cover its window")
+        return self
+
+
 class LlmEnsembleCanaryRolloutConfig(BaseModel):
     """Fail-closed live rollout policy for registry rows marked ``canary``."""
 
@@ -591,6 +672,9 @@ class LlmEnsembleCanaryRolloutConfig(BaseModel):
     )
     aggregator: LlmEnsembleCanaryRoleConfig = Field(
         default_factory=_default_llm_ensemble_canary_aggregator
+    )
+    auto_rollback: LlmEnsembleCanaryAutoRollbackConfig = Field(
+        default_factory=LlmEnsembleCanaryAutoRollbackConfig
     )
 
     @field_validator("enabled", "require_schema_valid_analysis", mode="before")
@@ -642,6 +726,16 @@ class LlmEnsembleCanaryRolloutConfig(BaseModel):
         if self.enabled and self.proposer.basis_points == 0:
             raise ValueError(
                 "enabled router-canary-v1 requires a non-zero proposer cohort"
+            )
+        if self.auto_rollback.enabled and not self.enabled:
+            raise ValueError("canary auto rollback requires the live rollout to be enabled")
+        if (
+            self.auto_rollback.enabled
+            and self.auto_rollback.window_max_attempts
+            < self.proposer.min_observations
+        ):
+            raise ValueError(
+                "canary auto rollback window must cover proposer min_observations"
             )
         return self
 

@@ -19,6 +19,7 @@ import json
 import os
 import platform
 import re
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Mapping, Sequence
@@ -3135,6 +3136,14 @@ class TurnRunner:
         # It stores route identifiers only; prompt and candidate content never
         # enter this cache.
         self._router_dynamic_last_routes: dict[str, dict[str, Any]] = {}
+        # A TurnRunner may serve concurrent sessions, but every live canary
+        # turn in the process must share one same-host durable rollout ledger.
+        # Bind the state path on first explicit enablement; a hot state_dir
+        # change is fail-closed until the runner is restarted.
+        self._canary_rollout_ledger_lock = threading.Lock()
+        self._canary_rollout_ledger: Any | None = None
+        self._canary_rollout_ledger_path: Path | None = None
+        self._canary_rollout_ledger_path_drifted = False
         # TurnRunner stage decomposition InputStage instance. Holds no per-turn state;
         # constructed once. Active unconditionally as of.
         self._input_stage = InputStage(extra_ctx=_TurnRunnerExtraContextAdapter())
@@ -3225,6 +3234,42 @@ class TurnRunner:
         # Compatibility for direct callers that still install a complete
         # config object in accepted_turn_config_scope().
         return accepted
+
+    def _persistent_canary_rollout_ledger(self, turn_config: Any) -> Any | None:
+        """Return the runner-owned ledger only for explicit live enablement."""
+
+        ensemble_config = getattr(turn_config, "llm_ensemble", None)
+        rollout_config = getattr(ensemble_config, "canary_rollout", None)
+        auto_rollback = getattr(rollout_config, "auto_rollback", None)
+        if getattr(auto_rollback, "enabled", False) is not True:
+            return None
+        raw_state_dir = str(getattr(turn_config, "state_dir", "") or "").strip()
+        if not raw_state_dir:
+            return None
+        try:
+            state_dir = Path(raw_state_dir).expanduser().resolve(strict=False)
+            from opensquilla.canary_rollout import (
+                CanaryRolloutLedger,
+            )
+
+            ledger_path = CanaryRolloutLedger.default_path(state_dir)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        with self._canary_rollout_ledger_lock:
+            if self._canary_rollout_ledger_path_drifted:
+                return None
+            if self._canary_rollout_ledger_path is None:
+                self._canary_rollout_ledger_path = ledger_path
+            elif self._canary_rollout_ledger_path != ledger_path:
+                self._canary_rollout_ledger_path_drifted = True
+                self._canary_rollout_ledger = None
+                return None
+            if self._canary_rollout_ledger is None:
+                try:
+                    self._canary_rollout_ledger = CanaryRolloutLedger(ledger_path)
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    return None
+            return self._canary_rollout_ledger
 
     @property
     def router_control_hold_store(self) -> RouterControlHoldStore:
@@ -6723,12 +6768,16 @@ class TurnRunner:
             )
             selection_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
             provider_health_ledger = None
+            canary_rollout_ledger = None
             if selection_mode == "router_dynamic":
                 from opensquilla.engine.routing.health import (
                     get_provider_health_ledger,
                 )
 
                 provider_health_ledger = get_provider_health_ledger()
+                canary_rollout_ledger = (
+                    self._persistent_canary_rollout_ledger(turn_config)
+                )
             dynamic_cleanup_errors: tuple[type[Exception], ...] = ()
             dynamic_selection_errors: tuple[type[Exception], ...] = ()
             if selection_mode == "router_dynamic":
@@ -7184,6 +7233,7 @@ class TurnRunner:
                         _session_key=turn.session_key,
                         _fallback_selector=cloned_selector,
                         _provider_health_ledger=provider_health_ledger,
+                        _canary_rollout_ledger=canary_rollout_ledger,
                         _absolute_deadline=turn_absolute_deadline,
                     )
                 except dynamic_cleanup_errors as exc:

@@ -71,6 +71,16 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.canary_rollout.proposer.max_candidates_per_decision == 0
     assert ensemble.canary_rollout.aggregator.basis_points == 0
     assert ensemble.canary_rollout.aggregator.max_candidates_per_decision == 0
+    auto_rollback = ensemble.canary_rollout.auto_rollback
+    assert auto_rollback.enabled is False
+    assert auto_rollback.window_max_attempts == 50
+    assert auto_rollback.window_max_age_seconds == 300
+    assert auto_rollback.max_consecutive_provider_failures == 3
+    assert auto_rollback.max_rate_limited_count == 0
+    assert auto_rollback.max_usage_missing_count == 0
+    assert auto_rollback.rollback_cooldown_seconds == 3_600
+    assert auto_rollback.half_open_successes_required == 3
+    assert auto_rollback.scope_retention_seconds == 7 * 24 * 60 * 60
     assert ensemble.shuffle_candidates is True
     assert ensemble.candidate_order_seed is None
     assert ensemble.record_candidates is False
@@ -184,6 +194,78 @@ def test_llm_ensemble_accepts_bounded_proposer_canary_rollout() -> None:
     assert rollout.proposer.basis_points == 250
     assert rollout.proposer.max_candidates_per_decision == 1
     assert rollout.aggregator.basis_points == 0
+
+
+def test_llm_ensemble_accepts_explicit_persistent_canary_auto_rollback() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "canary_rollout": {
+                "enabled": True,
+                "global_basis_points": 500,
+                "proposer": {
+                    "basis_points": 250,
+                    "max_candidates_per_decision": 1,
+                    "min_observations": 20,
+                },
+                "auto_rollback": {
+                    "enabled": True,
+                    "window_max_attempts": 50,
+                },
+            }
+        }
+    )
+
+    auto_rollback = cfg.llm_ensemble.canary_rollout.auto_rollback
+    assert auto_rollback.enabled is True
+    assert auto_rollback.window_max_attempts == 50
+    assert auto_rollback.active_attempt_lease_seconds == 3_600
+
+
+@pytest.mark.parametrize(
+    "auto_rollback",
+    [
+        {"enabled": "true"},
+        {"enabled": True, "window_max_attempts": 20},
+        {
+            "enabled": True,
+            "rollback_cooldown_seconds": 60,
+            "active_attempt_lease_seconds": 61,
+        },
+        {
+            "enabled": True,
+            "window_max_age_seconds": 301,
+            "scope_retention_seconds": 300,
+        },
+        {"enabled": False, "unexpected": 1},
+    ],
+)
+def test_llm_ensemble_rejects_unsafe_persistent_canary_auto_rollback(
+    auto_rollback: dict[str, Any],
+) -> None:
+    rollout: dict[str, Any] = {"auto_rollback": auto_rollback}
+    if auto_rollback.get("enabled") is True:
+        rollout.update(
+            {
+                "enabled": True,
+                "global_basis_points": 100,
+                "proposer": {
+                    "basis_points": 100,
+                    "max_candidates_per_decision": 1,
+                    "min_observations": 50,
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="canary|extra|boolean|window|cooldown|retention"):
+        GatewayConfig(llm_ensemble={"canary_rollout": rollout})
+
+
+def test_llm_ensemble_rejects_auto_rollback_without_live_rollout() -> None:
+    with pytest.raises(ValueError, match="requires the live rollout"):
+        GatewayConfig(
+            llm_ensemble={
+                "canary_rollout": {"auto_rollback": {"enabled": True}}
+            }
+        )
 
 
 @pytest.mark.parametrize(

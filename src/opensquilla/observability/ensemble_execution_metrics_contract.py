@@ -87,6 +87,30 @@ _FIXED_FIELDS = frozenset(
     canary_physical_budget_refunded
     canary_physical_budget_rejected
     canary_physical_budget_reserved
+    canary_persistent_rollout_admission_allowed_count
+    canary_persistent_rollout_admission_denied_count
+    canary_persistent_rollout_admission_unavailable_count
+    canary_persistent_rollout_cancelled_before_request_count
+    canary_persistent_rollout_enabled
+    canary_persistent_rollout_enabled_observed
+    canary_persistent_rollout_mutation_unavailable_count
+    canary_persistent_rollout_observed
+    canary_persistent_rollout_probe_count
+    canary_persistent_rollout_projection_complete
+    canary_persistent_rollout_provider_configuration_failure_count
+    canary_persistent_rollout_provider_invalid_response_count
+    canary_persistent_rollout_provider_rate_limited_count
+    canary_persistent_rollout_provider_success_count
+    canary_persistent_rollout_provider_transport_failure_count
+    canary_persistent_rollout_provider_unknown_failure_count
+    canary_persistent_rollout_provider_upstream_5xx_count
+    canary_persistent_rollout_receipt_count
+    canary_persistent_rollout_receipt_count_observed
+    canary_persistent_rollout_recovery_transition_count
+    canary_persistent_rollout_rollback_transition_count
+    canary_persistent_rollout_settled_count
+    canary_persistent_rollout_usage_missing_count
+    canary_persistent_rollout_usage_observed_count
     canary_rollout_admitted_counts_observed
     canary_rollout_aggregator_admitted_count
     canary_rollout_conservation_observed
@@ -367,6 +391,7 @@ _BOOLEAN_FIELDS = frozenset(
         "canary_rollout_conservation_valid",
         "canary_physical_budget_conservation_valid",
         "canary_physical_budget_exhausted",
+        "canary_persistent_rollout_enabled",
         "aggregator_final_request_cache_hit",
         "quorum_reached",
     }

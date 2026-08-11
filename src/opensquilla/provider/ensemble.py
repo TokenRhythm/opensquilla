@@ -21,6 +21,23 @@ from typing import Any, Literal
 
 import structlog
 
+from opensquilla.canary_rollout import (
+    CanaryAdmission,
+    CanaryAdmissionReason,
+    CanaryAttemptOutcome,
+    CanaryMutationReason,
+    CanaryMutationResult,
+    CanaryProviderOutcome,
+    CanaryQualityOutcome,
+    CanaryRolloutLedger,
+    CanaryRolloutPolicy,
+    CanaryRolloutRole,
+    CanaryRolloutScope,
+    CanaryRolloutSnapshot,
+    CanaryRolloutState,
+    CanaryUsageOutcome,
+    canary_rollout_policy_sha256,
+)
 from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.provider.aggregator_prompt import (
     AGGREGATOR_PROMPT_VERSION_CURRENT,
@@ -31,6 +48,7 @@ from opensquilla.safety.injection_guard import wrap_untrusted
 from opensquilla.usage_evidence import (
     USAGE_EVIDENCE_SCHEMA,
     is_missing_usage_placeholder,
+    usage_units,
 )
 
 from .admission import (
@@ -169,6 +187,12 @@ _CANARY_RUNTIME_HEALTH_UNAVAILABLE_CODE = (
     "ensemble_canary_runtime_health_unavailable"
 )
 _CANARY_FALLBACK_BLOCKED_CODE = "ensemble_canary_fallback_blocked"
+_CANARY_PERSISTENT_ROLLOUT_DENIED_CODE = (
+    "ensemble_canary_persistent_rollout_denied"
+)
+_CANARY_PERSISTENT_ROLLOUT_SCHEMA = (
+    "opensquilla.ensemble-canary-persistent-rollout/v1"
+)
 _ENSEMBLE_PROPOSER_CLOSE_TIMEOUT_CODE = "ensemble_proposer_close_timeout"
 _PROPOSER_RECOVERY_BUDGET_OVERRUN_CODE = "proposer_recovery_budget_overrun"
 _PROPOSER_RECOVERY_EVIDENCE_UNPROVEN_CODE = (
@@ -415,12 +439,245 @@ class _EnsemblePreDispatchDeadlineError(TimeoutError):
     """The absolute budget expired after admission but before provider chat."""
 
 
+def _persistent_canary_provider_outcome(
+    event: StreamEvent,
+    *,
+    provider_name: str,
+) -> CanaryProviderOutcome | None:
+    if isinstance(event, DoneEvent):
+        return CanaryProviderOutcome.SUCCESS
+    if not isinstance(event, ErrorEvent):
+        return None
+    raw_code = str(event.code or "")
+    status_code = int(raw_code) if raw_code.isdigit() else None
+    kind = classify_provider_error(
+        provider_name=provider_name,
+        status_code=status_code,
+        raw_code=raw_code,
+        message=str(event.message or ""),
+    )
+    if kind is ProviderFailureKind.RATE_LIMITED:
+        return CanaryProviderOutcome.RATE_LIMITED
+    if kind is ProviderFailureKind.PROVIDER_OVERLOADED:
+        return CanaryProviderOutcome.UPSTREAM_5XX
+    if kind is ProviderFailureKind.TRANSPORT_TRANSIENT:
+        return CanaryProviderOutcome.TRANSPORT_FAILURE
+    if kind in {
+        ProviderFailureKind.AUTH_INVALID,
+        ProviderFailureKind.MODEL_NOT_FOUND,
+        ProviderFailureKind.INSUFFICIENT_CREDITS,
+        ProviderFailureKind.UNSUPPORTED_FEATURE,
+    }:
+        return CanaryProviderOutcome.CONFIGURATION_FAILURE
+    if kind in {
+        ProviderFailureKind.BAD_REQUEST,
+        ProviderFailureKind.CONTEXT_OVERFLOW,
+        ProviderFailureKind.POLICY_REFUSAL,
+        ProviderFailureKind.EMPTY_RESPONSE,
+        ProviderFailureKind.MALFORMED_RESPONSE,
+    }:
+        return CanaryProviderOutcome.INVALID_RESPONSE
+    return CanaryProviderOutcome.UNKNOWN_FAILURE
+
+
+def _persistent_canary_done_has_usage_evidence(event: DoneEvent) -> bool:
+    if int(event.usage_missing_count or 0) != 0:
+        return False
+    try:
+        units = usage_units(
+            {
+                "model_usage_breakdown": event.model_usage_breakdown,
+                "usage_missing_count": event.usage_missing_count,
+                "input_tokens": event.input_tokens,
+                "output_tokens": event.output_tokens,
+                "reasoning_tokens": event.reasoning_tokens,
+                "cached_tokens": event.cached_tokens,
+                "cache_write_tokens": event.cache_write_tokens,
+                "billed_cost": event.billed_cost,
+                "billing_receipt": event.billing_receipt,
+                "cost_source": event.cost_source,
+                "provider_usage": event.provider_usage,
+                "provider": event.provider,
+                "model": event.model,
+            }
+        )
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return bool(units) and not any(
+        is_missing_usage_placeholder(unit) for unit in units
+    )
+
+
+def _persistent_canary_usage_outcome(event: StreamEvent) -> CanaryUsageOutcome:
+    if isinstance(event, DoneEvent):
+        observed = _persistent_canary_done_has_usage_evidence(event)
+    elif isinstance(event, ErrorEvent):
+        if int(event.usage_missing_count or 0) != 0:
+            observed = False
+        elif event.diagnostic_done is not None:
+            observed = _persistent_canary_done_has_usage_evidence(
+                event.diagnostic_done
+            )
+        else:
+            try:
+                units = usage_units(
+                    {"model_usage_breakdown": event.model_usage_breakdown}
+                )
+            except (OverflowError, TypeError, ValueError):
+                units = []
+            observed = bool(units) and not any(
+                is_missing_usage_placeholder(unit) for unit in units
+            )
+    else:
+        observed = False
+    return (
+        CanaryUsageOutcome.OBSERVED
+        if observed
+        else CanaryUsageOutcome.MISSING
+    )
+
+
+def _persistent_canary_fallback_outcome() -> CanaryAttemptOutcome:
+    return CanaryAttemptOutcome(
+        provider=CanaryProviderOutcome.TRANSPORT_FAILURE,
+        usage=CanaryUsageOutcome.MISSING,
+        quality=CanaryQualityOutcome.UNOBSERVED,
+    )
+
+
+@dataclass
+class _PersistentCanaryAttempt:
+    """One admitted ledger token; the token never enters logs or trace."""
+
+    ledger: CanaryRolloutLedger = field(repr=False)
+    scope: CanaryRolloutScope = field(repr=False)
+    policy: CanaryRolloutPolicy = field(repr=False)
+    admission: CanaryAdmission
+    role: str
+    provider_name: str = field(repr=False)
+    receipt_sink: Callable[[dict[str, Any]], None] = field(repr=False)
+    _finished: bool = False
+
+    @staticmethod
+    def _state_value(snapshot: CanaryRolloutSnapshot) -> str:
+        return snapshot.state.value
+
+    def _emit_receipt(
+        self,
+        *,
+        mutation: CanaryMutationResult | None,
+        outcome: CanaryAttemptOutcome | None,
+        cancelled: bool,
+    ) -> None:
+        state_after = (
+            mutation.snapshot.state
+            if mutation is not None
+            else self.admission.snapshot.state
+        )
+        latch_reason = (
+            mutation.snapshot.latch_reason
+            if mutation is not None
+            else self.admission.snapshot.latch_reason
+        )
+        receipt = {
+            "schema": _CANARY_PERSISTENT_ROLLOUT_SCHEMA,
+            "role": self.role,
+            "available": self.admission.available,
+            "allowed": self.admission.allowed,
+            "probe": self.admission.probe,
+            "admission_reason": self.admission.reason.value,
+            "state_before": self._state_value(self.admission.snapshot),
+            "mutation_available": (
+                mutation.available if mutation is not None else False
+            ),
+            "mutation_applied": (
+                mutation.applied if mutation is not None else False
+            ),
+            "mutation_reason": (
+                mutation.reason.value if mutation is not None else "not_attempted"
+            ),
+            "state_after": state_after.value,
+            "latch_reason": latch_reason.value if latch_reason is not None else "none",
+            "provider_outcome": (
+                outcome.provider.value if outcome is not None else "not_applicable"
+            ),
+            "usage_outcome": (
+                outcome.usage.value if outcome is not None else "not_applicable"
+            ),
+            "cancelled_before_request": cancelled,
+            "rollback_transition": bool(
+                self.admission.snapshot.state is CanaryRolloutState.ACTIVE
+                and state_after is CanaryRolloutState.ROLLED_BACK
+            ),
+            "recovery_transition": bool(
+                self.admission.probe
+                and state_after is CanaryRolloutState.ACTIVE
+            ),
+            "recovery_successes": (
+                mutation.snapshot.recovery_successes
+                if mutation is not None
+                else self.admission.snapshot.recovery_successes
+            ),
+        }
+        try:
+            self.receipt_sink(receipt)
+        except Exception:  # noqa: BLE001 - evidence projection cannot alter settlement
+            pass
+
+    def settle(self, outcome: CanaryAttemptOutcome) -> CanaryMutationResult | None:
+        if self._finished:
+            return None
+        self._finished = True
+        mutation: CanaryMutationResult | None = None
+        try:
+            mutation = self.ledger.settle_attempt(
+                self.scope,
+                self.policy,
+                self.admission.token,
+                outcome,
+            )
+            return mutation
+        except Exception:  # noqa: BLE001 - a ledger failure is fail closed for canary
+            return None
+        finally:
+            self._emit_receipt(
+                mutation=mutation,
+                outcome=outcome,
+                cancelled=False,
+            )
+
+    def cancel(self) -> CanaryMutationResult | None:
+        if self._finished:
+            return None
+        self._finished = True
+        mutation: CanaryMutationResult | None = None
+        try:
+            mutation = self.ledger.cancel_attempt(
+                self.scope,
+                self.policy,
+                self.admission.token,
+            )
+            return mutation
+        except Exception:  # noqa: BLE001 - cancellation evidence remains fail closed
+            return None
+        finally:
+            self._emit_receipt(
+                mutation=mutation,
+                outcome=None,
+                cancelled=True,
+            )
+
+
 @dataclass
 class _CanaryPhysicalRequestReservation:
     """One private, single-use reservation at the provider chat boundary."""
 
     _budget: _CanaryPhysicalRequestBudget
     _token: int
+    _persistent_attempt: _PersistentCanaryAttempt | None = field(
+        default=None,
+        repr=False,
+    )
     _settled: bool = False
 
     def commit(self) -> None:
@@ -433,7 +690,21 @@ class _CanaryPhysicalRequestReservation:
         if self._settled:
             return
         self._budget._settle(self._token, committed=False)
+        if self._persistent_attempt is not None:
+            self._persistent_attempt.cancel()
         self._settled = True
+
+    def settle_persistent(
+        self,
+        outcome: CanaryAttemptOutcome,
+    ) -> CanaryMutationResult | None:
+        self.commit()
+        if self._persistent_attempt is None:
+            return None
+        return self._persistent_attempt.settle(outcome)
+
+    def finish_unproven(self) -> CanaryMutationResult | None:
+        return self.settle_persistent(_persistent_canary_fallback_outcome())
 
 
 @dataclass
@@ -442,7 +713,6 @@ class _CanaryPhysicalRequestEvidenceGuard:
 
     reservation: _CanaryPhysicalRequestReservation | None
     _event_count: int = 0
-    _zero_request_terminal: bool = False
     _finished: bool = False
 
     @staticmethod
@@ -456,27 +726,91 @@ class _CanaryPhysicalRequestEvidenceGuard:
             and int(event.usage_missing_count or 0) == 0
         )
 
-    def observe(self, event: StreamEvent) -> None:
-        if self.reservation is None or self._finished:
-            return
-        self._event_count += 1
-        if self._event_count == 1 and self._proves_zero_request(event):
-            # Keep the reservation active until the terminal iterator is
-            # closed. A malformed provider that emits another event loses the
-            # refund and remains conservatively counted.
-            self._zero_request_terminal = True
-            return
-        self._zero_request_terminal = False
-        self.reservation.commit()
+    @staticmethod
+    def is_terminal(event: StreamEvent) -> bool:
+        return isinstance(event, (DoneEvent, ErrorEvent))
 
-    def finish(self) -> None:
+    def observe(self, event: StreamEvent) -> StreamEvent:
+        if self.reservation is None or self._finished:
+            return event
+        if self.is_terminal(event):
+            raise RuntimeError("terminal canary events require close verification")
+        self._event_count += 1
+        self.reservation.commit()
+        return event
+
+    def finalize_terminal(
+        self,
+        event: StreamEvent,
+        *,
+        close_proven: bool,
+    ) -> StreamEvent:
+        if self.reservation is None or self._finished:
+            return event
+        self._event_count += 1
+        self._finished = True
+        if (
+            close_proven
+            and self._event_count == 1
+            and self._proves_zero_request(event)
+        ):
+            self.reservation.refund()
+            return event
+        if not close_proven:
+            self.reservation.finish_unproven()
+            if isinstance(event, DoneEvent):
+                return ErrorEvent(
+                    message="persistent canary stream close was not proven",
+                    code=_CANARY_PERSISTENT_ROLLOUT_DENIED_CODE,
+                    diagnostic_done=event,
+                    usage_missing_count=int(event.usage_missing_count or 0),
+                    request_started=True,
+                    physical_request_count=1,
+                )
+            return event
+        provider_outcome = _persistent_canary_provider_outcome(
+            event,
+            provider_name=(
+                self.reservation._persistent_attempt.provider_name
+                if self.reservation._persistent_attempt is not None
+                else ""
+            ),
+        )
+        if provider_outcome is None:
+            self.reservation.commit()
+            return event
+        outcome = CanaryAttemptOutcome(
+            provider=provider_outcome,
+            usage=_persistent_canary_usage_outcome(event),
+            quality=CanaryQualityOutcome.UNOBSERVED,
+        )
+        mutation = self.reservation.settle_persistent(outcome)
+        if (
+            isinstance(event, DoneEvent)
+            and self.reservation._persistent_attempt is not None
+            and (
+                mutation is None
+                or not mutation.available
+                or not mutation.applied
+                or mutation.reason is not CanaryMutationReason.APPLIED
+            )
+        ):
+            return ErrorEvent(
+                message="persistent canary settlement was not proven",
+                code=_CANARY_PERSISTENT_ROLLOUT_DENIED_CODE,
+                diagnostic_done=event,
+                usage_missing_count=int(event.usage_missing_count or 0),
+                request_started=True,
+                physical_request_count=1,
+            )
+        return event
+
+    def finish(self, *, close_proven: bool) -> None:
         if self.reservation is None or self._finished:
             return
         self._finished = True
-        if self._zero_request_terminal and self._event_count == 1:
-            self.reservation.refund()
-        else:
-            self.reservation.commit()
+        del close_proven
+        self.reservation.finish_unproven()
 
 
 class _CanaryPhysicalRequestStream:
@@ -490,6 +824,7 @@ class _CanaryPhysicalRequestStream:
         self._stream = stream
         self._iterator = stream.__aiter__()
         self._evidence = _CanaryPhysicalRequestEvidenceGuard(reservation)
+        self._closed = False
 
     def __aiter__(self) -> _CanaryPhysicalRequestStream:
         return self
@@ -497,21 +832,58 @@ class _CanaryPhysicalRequestStream:
     async def __anext__(self) -> StreamEvent:
         try:
             event = await self._iterator.__anext__()
-        except BaseException:
-            self._evidence.finish()
+        except StopAsyncIteration:
+            try:
+                await self._close_underlying()
+            except BaseException:
+                self._evidence.finish(close_proven=False)
+                raise
+            self._evidence.finish(close_proven=True)
             raise
-        self._evidence.observe(event)
-        return event
+        except BaseException:
+            self._evidence.finish(close_proven=False)
+            raise
+        if not self._evidence.is_terminal(event):
+            return self._evidence.observe(event)
+        try:
+            extra_event = await self._iterator.__anext__()
+        except StopAsyncIteration:
+            try:
+                await self._close_underlying()
+            except BaseException:
+                self._evidence.finalize_terminal(
+                    event,
+                    close_proven=False,
+                )
+                raise
+            return self._evidence.finalize_terminal(
+                event,
+                close_proven=True,
+            )
+        except BaseException:
+            self._evidence.finalize_terminal(event, close_proven=False)
+            raise
+        self._evidence.finalize_terminal(event, close_proven=False)
+        del extra_event
+        raise RuntimeError("provider emitted an event after its terminal canary event")
+
+    async def _close_underlying(self) -> None:
+        if self._closed:
+            return
+        close = getattr(self._iterator, "aclose", None)
+        if not callable(close) and self._iterator is not self._stream:
+            close = getattr(self._stream, "aclose", None)
+        if callable(close):
+            await close()
+        self._closed = True
 
     async def aclose(self) -> None:
+        close_proven = False
         try:
-            close = getattr(self._iterator, "aclose", None)
-            if not callable(close) and self._iterator is not self._stream:
-                close = getattr(self._stream, "aclose", None)
-            if callable(close):
-                await close()
+            await self._close_underlying()
+            close_proven = True
         finally:
-            self._evidence.finish()
+            self._evidence.finish(close_proven=close_proven)
 
 
 def _guard_canary_physical_request_stream(
@@ -2237,6 +2609,56 @@ def _materialize_canary_runtime_policy(
         return raw, False
 
 
+def _materialize_persistent_canary_policy(
+    rollout_config: Mapping[str, Any],
+) -> CanaryRolloutPolicy | None:
+    """Build the v1 ledger contract only for an explicitly enabled policy."""
+
+    auto_raw = rollout_config.get("auto_rollback")
+    proposer_raw = rollout_config.get("proposer")
+    if not isinstance(auto_raw, Mapping) or auto_raw.get("enabled") is not True:
+        return None
+    if not isinstance(proposer_raw, Mapping):
+        return None
+    try:
+        min_attempts = int(proposer_raw["min_observations"])
+        return CanaryRolloutPolicy(
+            window_max_attempts=int(auto_raw["window_max_attempts"]),
+            window_max_age_s=int(auto_raw["window_max_age_seconds"]),
+            min_attempts=min_attempts,
+            max_provider_failure_basis_points=int(
+                proposer_raw["max_failure_basis_points"]
+            ),
+            max_consecutive_provider_failures=int(
+                auto_raw["max_consecutive_provider_failures"]
+            ),
+            max_rate_limited_count=int(auto_raw["max_rate_limited_count"]),
+            max_usage_missing_count=int(auto_raw["max_usage_missing_count"]),
+            quality_gate_enabled=False,
+            min_quality_attempts=min_attempts,
+            min_quality_coverage_basis_points=0,
+            max_quality_failure_basis_points=0,
+            rollback_cooldown_s=int(auto_raw["rollback_cooldown_seconds"]),
+            half_open_successes_required=int(
+                auto_raw["half_open_successes_required"]
+            ),
+            half_open_probe_spacing_s=int(
+                auto_raw["half_open_probe_spacing_seconds"]
+            ),
+            half_open_probe_lease_s=int(
+                auto_raw["half_open_probe_lease_seconds"]
+            ),
+            active_attempt_lease_s=int(
+                auto_raw["active_attempt_lease_seconds"]
+            ),
+            scope_retention_s=int(auto_raw["scope_retention_seconds"]),
+            max_scopes=int(auto_raw["max_scopes"]),
+            max_pending_per_scope=int(auto_raw["max_pending_per_scope"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _apply_canary_candidate_filter(
     snapshot: Mapping[str, Any],
     *,
@@ -2560,22 +2982,7 @@ def _apply_canary_candidate_filter(
     for facts, _ in eligible_proposers[max_candidates:]:
         add_reason(facts, "proposer", "canary_candidate_cap")
 
-    try:
-        policy_payload = json.dumps(
-            policy,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (OverflowError, TypeError, ValueError):
-        policy_payload = json.dumps(
-            {"config_valid": False, "policy_version": policy_version},
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    policy_sha256 = hashlib.sha256(policy_payload.encode("utf-8")).hexdigest()
+    policy_sha256 = canary_rollout_policy_sha256(policy)
     return {
         "schema": _CANARY_ROLLOUT_SCHEMA,
         "enabled": enabled,
@@ -4780,6 +5187,9 @@ class EnsembleProvider:
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
         _provider_health_ledger: Any | None = None,
         _canary_request_budget: _CanaryPhysicalRequestBudget | None = None,
+        _canary_rollout_ledger: CanaryRolloutLedger | None = None,
+        _canary_rollout_policy: CanaryRolloutPolicy | None = None,
+        _canary_rollout_policy_sha256: str = "",
         _selector_blocked_canary_identities: Sequence[str] = (),
         _selector_canary_governance_active: bool | None = None,
         _fallback_single_canary_blocked: bool = False,
@@ -5036,6 +5446,18 @@ class EnsembleProvider:
             if managed_canary_member_present
             else None
         )
+        self._canary_rollout_ledger = _canary_rollout_ledger
+        self._canary_rollout_policy = _canary_rollout_policy
+        self._canary_rollout_policy_sha256 = str(
+            _canary_rollout_policy_sha256 or ""
+        )
+        if (
+            self._canary_rollout_policy is None
+            and self._canary_rollout_policy_sha256
+        ):
+            raise ValueError("canary rollout policy identity lacks a policy")
+        self._canary_rollout_receipts: list[dict[str, Any]] = []
+        self._canary_rollout_receipt_count = 0
         self._selector_blocked_canary_identities = frozenset(
             str(identity or "").strip().casefold()
             for identity in _selector_blocked_canary_identities
@@ -5578,6 +6000,48 @@ class EnsembleProvider:
             self.fallback_model,
         )
 
+    def _record_canary_rollout_receipt(self, receipt: dict[str, Any]) -> None:
+        # A root decision can start only one managed physical canary, but it
+        # may reject several fallback candidates before that point.  Keep the
+        # evidence bounded even if a malformed retry chain violates its cap.
+        self._canary_rollout_receipt_count += 1
+        if len(self._canary_rollout_receipts) < 8:
+            self._canary_rollout_receipts.append(_json_safe(dict(receipt)))
+
+    def _record_canary_rollout_denial(
+        self,
+        admission: CanaryAdmission,
+        *,
+        role: str,
+    ) -> None:
+        snapshot = admission.snapshot
+        self._record_canary_rollout_receipt(
+            {
+                "schema": _CANARY_PERSISTENT_ROLLOUT_SCHEMA,
+                "role": role,
+                "available": admission.available,
+                "allowed": admission.allowed,
+                "probe": admission.probe,
+                "admission_reason": admission.reason.value,
+                "state_before": snapshot.state.value,
+                "mutation_available": False,
+                "mutation_applied": False,
+                "mutation_reason": "not_attempted",
+                "state_after": snapshot.state.value,
+                "latch_reason": (
+                    snapshot.latch_reason.value
+                    if snapshot.latch_reason is not None
+                    else "none"
+                ),
+                "provider_outcome": "not_applicable",
+                "usage_outcome": "not_applicable",
+                "cancelled_before_request": True,
+                "rollback_transition": False,
+                "recovery_transition": False,
+                "recovery_successes": snapshot.recovery_successes,
+            }
+        )
+
     def _reserve_canary_physical_request(
         self,
         member: EnsembleMemberConfig,
@@ -5618,6 +6082,71 @@ class EnsembleProvider:
                 request_started=False,
                 physical_request_count=0,
             )
+        persistent_policy = self._canary_rollout_policy
+        if persistent_policy is None:
+            return reservation, None
+        ledger = self._canary_rollout_ledger
+        policy_sha256 = self._canary_rollout_policy_sha256
+        normalized_role = (
+            CanaryRolloutRole.AGGREGATOR
+            if str(role).startswith("aggregator")
+            else CanaryRolloutRole.PROPOSER
+        )
+        admission: CanaryAdmission
+        if ledger is None or re.fullmatch(r"[0-9a-f]{64}", policy_sha256) is None:
+            admission = CanaryAdmission(
+                available=False,
+                allowed=False,
+                reason=CanaryAdmissionReason.LEDGER_UNAVAILABLE,
+                snapshot=CanaryRolloutSnapshot.unavailable(),
+            )
+        else:
+            scope: CanaryRolloutScope | None = None
+            try:
+                scope = CanaryRolloutScope.from_identity(
+                    policy_sha256=policy_sha256,
+                    role=normalized_role,
+                    provider=member.provider_config.provider,
+                    model=member.provider_config.model,
+                    upstream=self._member_runtime_health_upstream(member),
+                )
+                admission = ledger.begin_attempt(scope, persistent_policy)
+            except Exception:  # noqa: BLE001 - persistent canary is fail closed
+                admission = CanaryAdmission(
+                    available=False,
+                    allowed=False,
+                    reason=CanaryAdmissionReason.LEDGER_UNAVAILABLE,
+                    snapshot=CanaryRolloutSnapshot.unavailable(),
+                )
+        if (
+            not admission.available
+            or not admission.allowed
+            or ledger is None
+            or scope is None
+        ):
+            reservation.refund()
+            self._record_canary_rollout_denial(
+                admission,
+                role=normalized_role.value,
+            )
+            return None, ErrorEvent(
+                message=(
+                    "persistent canary rollout admission was denied: "
+                    f"{admission.reason.value}"
+                ),
+                code=_CANARY_PERSISTENT_ROLLOUT_DENIED_CODE,
+                request_started=False,
+                physical_request_count=0,
+            )
+        reservation._persistent_attempt = _PersistentCanaryAttempt(
+            ledger=ledger,
+            scope=scope,
+            policy=persistent_policy,
+            admission=admission,
+            role=normalized_role.value,
+            provider_name=member.provider_config.provider,
+            receipt_sink=self._record_canary_rollout_receipt,
+        )
         return reservation, None
 
     def _reset_usage_accounting_snapshot(
@@ -7858,6 +8387,8 @@ class EnsembleProvider:
             )
             return
         self._reset_usage_accounting_snapshot(accounting_state)
+        self._canary_rollout_receipts.clear()
+        self._canary_rollout_receipt_count = 0
         self._current_proposer_recovery_trace = None
         self._current_proposer_quorum_trace = None
         self._active_chat = True
@@ -13753,6 +14284,14 @@ class EnsembleProvider:
             trace["canary_physical_budget"] = {
                 "schema": "opensquilla.ensemble-canary-physical-budget/v1",
                 **self._canary_request_budget.snapshot(),
+            }
+        if self._canary_rollout_policy is not None:
+            receipts = _json_safe(self._canary_rollout_receipts)
+            trace["canary_persistent_rollout"] = {
+                "schema": _CANARY_PERSISTENT_ROLLOUT_SCHEMA,
+                "enabled": True,
+                "receipt_count": self._canary_rollout_receipt_count,
+                "receipts": receipts,
             }
         final_request: dict[str, Any] = {
             "role": final_request_role,
@@ -20460,7 +20999,7 @@ def _build_router_dynamic_members(
     analyzer_execution_contract: dict[str, Any] | None = None
     analyzer_execution_validation: dict[str, Any] | None = None
     if task_analysis_supplied and task_analysis.source != "frozen_replay":
-        from opensquilla.eval.draco_task_analyzer_execution import (
+        from opensquilla.draco_task_analyzer_execution import (
             task_analyzer_execution_contract_from_ranking_config,
             validate_task_analyzer_execution_trace,
             validated_task_analyzer_execution_contract,
@@ -22082,6 +22621,11 @@ class _DefaultRouterDynamicRetryFactory:
         repr=False,
         compare=False,
     )
+    canary_rollout_ledger: CanaryRolloutLedger | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     absolute_deadline: float | None = None
 
     def __call__(
@@ -22107,6 +22651,7 @@ class _DefaultRouterDynamicRetryFactory:
             _session_key=self.session_key,
             _fallback_selector=self.fallback_selector,
             _provider_health_ledger=self.provider_health_ledger,
+            _canary_rollout_ledger=self.canary_rollout_ledger,
             _absolute_deadline=self.absolute_deadline,
         )
 
@@ -22127,6 +22672,7 @@ def build_ensemble_provider_from_config(
     _session_key: str = "",
     _fallback_selector: Any | None = None,
     _provider_health_ledger: Any | None = None,
+    _canary_rollout_ledger: CanaryRolloutLedger | None = None,
     _absolute_deadline: float | None = None,
 ) -> EnsembleProvider:
     ensemble_cfg = getattr(config, "llm_ensemble", None)
@@ -22223,6 +22769,29 @@ def build_ensemble_provider_from_config(
         ).strip().casefold()
         != "experiment"
     )
+    strict_canary_config, strict_canary_config_valid = (
+        _materialize_canary_runtime_policy(
+            getattr(ensemble_cfg, "canary_rollout", None)
+        )
+    )
+    persistent_canary_policy = (
+        _materialize_persistent_canary_policy(strict_canary_config)
+        if live_canary_governance_active and strict_canary_config_valid
+        else None
+    )
+    canary_trace = selection_plan.get("canary_rollout")
+    canary_trace_map = canary_trace if isinstance(canary_trace, Mapping) else {}
+    persistent_canary_policy_sha256 = str(
+        canary_trace_map.get("policy_sha256") or ""
+    )
+    if persistent_canary_policy is not None and not re.fullmatch(
+        r"[0-9a-f]{64}",
+        persistent_canary_policy_sha256,
+    ):
+        # A managed canary must never run when its durable policy identity is
+        # absent or malformed.  Keep the policy enabled with no ledger so the
+        # physical-boundary guard rejects it rather than silently downgrading.
+        _canary_rollout_ledger = None
     # Static and custom lineups share the fixed-lineup defaults family
     # (quorum replacement, 300/480s timeouts, no shuffle, quorum grace).
     # Dynamic modes keep legacy timeouts/shuffle but bound the post-quorum tail.
@@ -22574,6 +23143,13 @@ def build_ensemble_provider_from_config(
         _member_request_budget_bindings=request_budget_bindings,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
         _provider_health_ledger=live_provider_health_ledger,
+        _canary_rollout_ledger=_canary_rollout_ledger,
+        _canary_rollout_policy=persistent_canary_policy,
+        _canary_rollout_policy_sha256=(
+            persistent_canary_policy_sha256
+            if persistent_canary_policy is not None
+            else ""
+        ),
         _selector_blocked_canary_identities=tuple(
             sorted(live_canary_identities)
         ),
@@ -22627,6 +23203,7 @@ def build_ensemble_provider_from_config(
                     session_key=_session_key,
                     fallback_selector=_fallback_selector,
                     provider_health_ledger=_provider_health_ledger,
+                    canary_rollout_ledger=_canary_rollout_ledger,
                     absolute_deadline=_absolute_deadline,
                 )
             )

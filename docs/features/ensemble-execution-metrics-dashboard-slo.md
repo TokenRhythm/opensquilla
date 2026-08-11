@@ -54,9 +54,10 @@ alert ruler、通知目标或可加载 dashboard。因此不能把 JSONL 文件�
 并接入真实 backend 时，collector 只能消费通过 `transport_schema`、`event` 和
 `schema` 三重过滤且通过同一 allowlist 的 rows。
 
-snapshot build/filter/score latency、snapshot cache hit、metrics delivery
-coverage 与 canary automatic rollback 仍保持 unavailable；本 transport 不增加
-任何这些 producer evidence，也不得为它们建立 query 或 alert。
+snapshot build/filter/score latency、snapshot cache hit 与 metrics delivery
+coverage 仍保持 unavailable；本 transport 不增加这些 producer evidence，也不得
+为它们建立 query 或 alert。Same-host persistent canary rollback 已有独立 receipt
+projection，仍不代表 multi-host coordination、quality rollback 或 latency evidence。
 
 主要解决：为后续真实采集器提供可解析、低基数、空间有界的本地交接面，同时
 明确它没有越级完成 dashboard、告警或缺失 producer 的观测能力。
@@ -296,12 +297,21 @@ Aggregator usage 只覆盖 `final_request`，不覆盖失败、continuation 或 
 | `canary_physical_budget_conservation_observed`、`canary_physical_budget_conservation_valid` | accounting observed | v1 要求 `limit == 1`、`committed + reserved <= limit`，且 `rejected > 0` 时 committed/reserved/refunded 至少一项 > 0；refunded/rejected 是累计结算事件，不进入 active balance。 |
 | `canary_physical_budget_projection_complete`、`canary_physical_budget_{limit,committed,reserved,rejected,refunded}` | accounting 完整且 conservation valid | 可用于精确 per-turn budget 聚合。 |
 | `canary_physical_budget_exhausted_observed`、`canary_physical_budget_exhausted` | projection complete；`rejected > 0` | 本 turn 是否至少有一次 reservation 被物理上限阻止。 |
+| `canary_persistent_rollout_observed` | top-level schema 精确等于 `opensquilla.ensemble-canary-persistent-rollout/v1` | 同机持久 rollback receipt gate；未知 schema 不投影。 |
+| `canary_persistent_rollout_projection_complete` | enabled 固定为 true；top-level 只有固定四字段；receipt count 与 ≤8 行完全一致；每行字段集合、固定枚举、布尔/整数和 admission→mutation→transition 守恒全部合法 | 只有此 gate 为真时才能消费下列 aggregate counts。0 receipt 是合法完整事件。 |
+| `canary_persistent_rollout_{enabled,receipt_count}_observed`、对应 value | strict bool；严格非负且 ≤8 的整数 | 配置已接入和本 turn receipt 行数的字段级证据。 |
+| `canary_persistent_rollout_{admission_allowed,admission_denied,admission_unavailable,probe,settled,cancelled_before_request,mutation_unavailable,rollback_transition,recovery_transition}_count` | projection complete | admission、settlement 与 durable state transition 的固定聚合；denied 不计入 cancelled-before-request。 |
+| `canary_persistent_rollout_provider_{success,rate_limited,upstream_5xx,transport_failure,invalid_response,configuration_failure,unknown_failure}_count` | projection complete；只统计已越过物理边界并 settle 的 receipt | provider terminal outcome 固定枚举计数。 |
+| `canary_persistent_rollout_usage_{observed,missing}_count` | projection complete；只统计 settled receipt | billable usage receipt 是否完整。 |
 
 投影明确丢弃 policy/root hash、policy version、bucket、model/provider/deployment identity 和任意 reason 文本。畸形或未知 schema 只留下 observed/complete gate，不把不可信 count 当作 0 或 exact value。
 
 `reason_counts` 统计的是 role-scoped exclusion occurrence，不是 unique canary。Producer 只有发现至少一个 canary 才写 rollout receipt；每个 input canary 固定产生一个 aggregator `role_disabled` occurrence，每个未 admitted proposer 再产生一个 proposer exclusion occurrence，所以总数必须满足上述守恒式，也可能大于 `input_canary_count`。因此禁止用 reason/input 计算 rejection rate；`role_disabled` 同时包含固定的 aggregator 禁用，不能直接解释为 proposer 配置故障。
 
-这些字段只证明单个 terminal trace 内的筛选与物理上限。跨 turn 持久 cohort、promotion、自动回滚 decision/reason/outcome、post-rollback health 与自动回滚延迟仍 unavailable。
+Persistent receipt 证明同一台主机、同一 state directory 内多个 worker 共享的 SQLite
+ledger 已完成 admission/settlement 及 rollback/recovery transition。它仍不证明跨主机
+一致性；不支持 network filesystem；v1 quality gate 固定 unavailable；promotion、
+false-rollback、post-rollback service health 与自动回滚延迟仍 unavailable。
 
 主要解决：让 canary 是否被 gate、为何被固定家族拦截，以及单次物理请求硬上限是否生效可审计，同时不把 per-turn receipt 冒充持续 rollout 控制面。
 
@@ -320,8 +330,9 @@ Aggregator usage 只覆盖 `final_request`，不覆盖失败、continuation 或 
 | Aggregator | stage、attempt kinds/outcomes、selected kind、physical counts、recovery state | stage success/degraded/exhausted、outcome mix、selected-kind mix、physical requests | 空预初始化 recovery block 不进 stage denominator；capped attempts 不进总量 SLO | 主要解决：把 aggregator recovery 的质量损失和调用放大可视化。 |
 | Role usage / cost / cache | proposer projection complete；aggregator final usage complete；top-level unknown | tokens、unknown ratio、observed billed cost、cache-hit share、coverage | 不完整 role totals 不补零；aggregator final cost 明确不是全 aggregator cost | 主要解决：在费用与 cache 面板中保留 usage 证据完整性。 |
 | Canary rollout / physical budget | rollout/task/reason observed fields；rollout/budget conservation 与 complete；budget exhausted | input/admitted、task gate、固定 reason family、config invalid、budget rejection/refund 与两类 conservation | admission/reason sums 只消费 rollout complete；budget totals 只消费 budget complete；字段级 rate 使用各自 observed gate；不展示 hash、bucket 或 identity | 主要解决：发现 canary gate 漂移、配置失效和单次物理上限异常。 |
+| Canary persistent rollback | persistent observed/complete；admission、settlement、provider/usage outcome、rollback/recovery transition counts | projection coverage、ledger unavailable、usage missing、rollback/recovery transition 与固定 provider outcome trends | aggregate 只消费 persistent complete；denominator 为 0 时 unavailable；严禁把 policy/deployment hash、provider/model 或 token 变成 label | 主要解决：观测同机持久 safety latch 是否真实阻断、落闩与恢复，而不泄露 identity。 |
 | Data quality / privacy | 所有 observed、projection complete、scan capped、trace cap、unexpected keys | coverage rates、cap rates、字段类型错误计数（由 ingestion 层）、cardinality | denominator 只用对应 evidence gate；禁止采集原始 trace | 主要解决：让 SLO 数据质量本身可审计。 |
-| Canary automatic rollback | 无跨 turn 持久状态、rollback decision/outcome/timestamp | 显示 `unavailable`，列出缺少的持久 control-plane evidence | 禁止用 rollout rejection、budget exhausted、`fallback_used` 或 aggregator fallback 代替自动回滚 | 主要解决：防止用单 turn 安全门禁假装自动回滚闭环。 |
+| Canary rollback residuals | 无跨主机一致性、quality outcome、decision timestamp 或 post-rollback health | 已实现的 same-host counts 正常展示；multi-host/quality/latency/false-rollback 面板显示 `unavailable` | 禁止用 rollout rejection、budget exhausted、`fallback_used` 或 aggregator fallback 补齐残余指标 | 主要解决：区分已实现的持久安全闩与尚无证据的 rollout 质量闭环。 |
 
 ## 5. SLI / SLO 公式
 
@@ -520,11 +531,46 @@ canary_budget_exhaustion_rate =
 
 主要解决：验证 rollout 输入、固定 gate 与一请求硬上限确实按 producer 合同运行。
 
-### 5.11 Canary automatic rollback（unavailable）
+### 5.11 Same-host persistent canary rollback
 
-v1 现在有单 turn rollout 与 physical-budget receipt，但没有跨 turn 持久 cohort 状态、canary attempt outcome 关联、promotion/rollback decision、rollback reason、decision timestamp 或 post-rollback outcome。`canary_physical_budget_exhausted`、固定 rejection reasons、`fallback_used`、`aggregator_selected_kind` 和 model fallback 都不能替代自动回滚。因此 automatic rollback rate、false rollback rate、post-rollback success rate，尤其自动回滚延迟，仍全部 unavailable；相关自动告警必须保持禁用，canary 自动放量不得仅依赖本 schema。
+```text
+persistent_projection_coverage =
+  count(canary_persistent_rollout_projection_complete == true)
+  / count(canary_persistent_rollout_observed == true)
 
-主要解决：阻止单 turn gate 或普通 fallback 被误用为跨 turn canary 安全闭环。
+persistent_admission_unavailable_rate =
+  sum(canary_persistent_rollout_admission_unavailable_count | projection_complete)
+  / sum(canary_persistent_rollout_receipt_count | projection_complete)
+
+persistent_mutation_unavailable_rate =
+  sum(canary_persistent_rollout_mutation_unavailable_count | projection_complete)
+  / sum(canary_persistent_rollout_admission_allowed_count | projection_complete)
+
+persistent_usage_missing_rate =
+  sum(canary_persistent_rollout_usage_missing_count | projection_complete)
+  / sum(canary_persistent_rollout_settled_count | projection_complete)
+
+persistent_rollback_transition_rate =
+  sum(canary_persistent_rollout_rollback_transition_count | projection_complete)
+  / sum(canary_persistent_rollout_settled_count | projection_complete)
+```
+
+上式中的 `projection_complete` 均指
+`canary_persistent_rollout_projection_complete == true`。建议 projection coverage 为
+100%；admission 或 mutation unavailable 任一非零立即 critical；usage missing 任一
+非零立即 warning。Rollback transition 是安全闩触发趋势，不是业务失败率，也不能
+作为 promotion SLO。Recovery transition 单独显示 count，不以 canary 请求数构造
+“恢复成功率”。
+
+同机 ledger 已关联 physical attempt outcome、usage evidence 与 durable
+rollback/recovery transition，但没有可投影的 latch timestamp、可信 quality outcome、
+跨主机共识或 post-rollback service health。因此 automatic rollback latency、false
+rollback rate、quality rollback rate 和 multi-host rollout safety 仍 unavailable。
+`canary_physical_budget_exhausted`、普通 rollout rejection、`fallback_used`、
+`aggregator_selected_kind` 和 model fallback 都不能替代这些指标。
+
+主要解决：为已实现的 same-host 持久安全闩提供低基数闭环，同时明确剩余的
+multi-host、quality 与 latency 证据缺口。
 
 ## 6. 告警阈值建议
 
@@ -547,7 +593,7 @@ v1 现在有单 turn rollout 与 physical-budget receipt，但没有跨 turn 持
 | Canary rollout conservation | 任一 conservation false | 立即 critical | rollout conservation observed | 主要解决：发现 admission、固定 reason counts 或 gate 状态自相矛盾。 |
 | Canary budget conservation | 任一 conservation false | 立即 critical | budget accounting/conservation observed | 主要解决：发现一请求硬上限 receipt 自相矛盾。 |
 | Canary budget exhaustion | `>3×七日同小时基线` | 只人工升级，不自动 rollback | exhausted observed ≥20 | 主要解决：发现额外 canary reservation 突增，同时避免把安全拒绝当失败。 |
-| Canary automatic rollback | disabled / unavailable | disabled / unavailable | 缺跨 turn producer evidence | 主要解决：避免伪造自动回滚和回滚延迟告警。 |
+| Canary persistent rollback availability | admission 或 mutation unavailable 任一非零 | 任一非零立即 critical | persistent projection complete 且 receipt count >0 | 主要解决：发现同机持久 safety ledger 无法可靠 admission/settle；不把 transition count 误作失败率或延迟。 |
 
 ## 7. Privacy、retention 与 cardinality gates
 
@@ -581,4 +627,4 @@ v1 现在有单 turn rollout 与 physical-budget receipt，但没有跨 turn 持
 
 6. 在 2–4 周基线期只启用 data-quality、cleanup 和极端 failure 告警，随后再校准第 6 节百分比阈值。主要解决：减少无基线情况下的告警噪音。
 
-7. Canary promotion/rollback 必须由独立、已审计且跨 turn 持久的 producer 提供 cohort、decision、timestamp 与 outcome evidence；在此之前保持 automatic rollback rate/latency SLO 和自动告警禁用。主要解决：避免把 per-turn rollout/budget receipt 或 ensemble fallback 当成 canary safety signal。
+7. Same-host automatic rollback 只使用已审计的持久 ledger receipt 与本节 persistent complete gate；启用前必须满足本地 `state_dir`、精确 status/reset 运维流程和同机 worker 共享数据库约束。当前 receipt 不提供 latch timestamp、可信 quality outcome、跨主机共识或 post-rollback service health，因此 automatic rollback latency、false-rollback、quality 与 multi-host SLO/自动告警继续禁用。主要解决：既允许消费已经落地的同机 safety signal，又避免把 per-turn rollout/budget receipt、ensemble fallback 或 transition count 伪装成尚不存在的安全 SLO。

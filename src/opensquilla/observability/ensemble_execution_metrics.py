@@ -43,6 +43,86 @@ _CANARY_ROLLOUT_SCHEMA = "opensquilla.ensemble-canary-rollout/v1"
 _CANARY_PHYSICAL_BUDGET_SCHEMA = (
     "opensquilla.ensemble-canary-physical-budget/v1"
 )
+_CANARY_PERSISTENT_ROLLOUT_SCHEMA = (
+    "opensquilla.ensemble-canary-persistent-rollout/v1"
+)
+_MAX_CANARY_PERSISTENT_RECEIPTS = 8
+_CANARY_PERSISTENT_RECEIPT_FIELDS = frozenset(
+    {
+        "schema",
+        "role",
+        "available",
+        "allowed",
+        "probe",
+        "admission_reason",
+        "state_before",
+        "mutation_available",
+        "mutation_applied",
+        "mutation_reason",
+        "state_after",
+        "latch_reason",
+        "provider_outcome",
+        "usage_outcome",
+        "cancelled_before_request",
+        "rollback_transition",
+        "recovery_transition",
+        "recovery_successes",
+    }
+)
+_CANARY_PERSISTENT_STATES = frozenset({"active", "rolled_back", "half_open"})
+_CANARY_PERSISTENT_ADMISSION_REASONS = frozenset(
+    {
+        "active",
+        "half_open_probe",
+        "latched",
+        "half_open_busy",
+        "recovery_wait",
+        "pending_capacity",
+        "scope_capacity",
+        "ledger_unavailable",
+    }
+)
+_CANARY_PERSISTENT_MUTATION_REASONS = frozenset(
+    {
+        "applied",
+        "duplicate",
+        "cancelled",
+        "unknown_token",
+        "token_conflict",
+        "unknown_scope",
+        "ledger_unavailable",
+        "not_attempted",
+    }
+)
+_CANARY_PERSISTENT_LATCH_REASONS = frozenset(
+    {
+        "none",
+        "configuration_failure",
+        "rate_limited",
+        "usage_missing",
+        "consecutive_provider_failures",
+        "provider_failure_rate",
+        "quality_coverage_insufficient",
+        "quality_failure_rate",
+        "attempt_abandoned",
+        "probe_failed",
+        "probe_abandoned",
+        "policy_contract_mismatch",
+    }
+)
+_CANARY_PERSISTENT_PROVIDER_OUTCOME_SUFFIXES = (
+    ("success", "success"),
+    ("rate_limited", "rate_limited"),
+    ("upstream_5xx", "upstream_5xx"),
+    ("transport_failure", "transport_failure"),
+    ("invalid_response", "invalid_response"),
+    ("configuration_failure", "configuration_failure"),
+    ("unknown_failure", "unknown_failure"),
+)
+_CANARY_PERSISTENT_PROVIDER_OUTCOMES = frozenset(
+    {source for source, _ in _CANARY_PERSISTENT_PROVIDER_OUTCOME_SUFFIXES}
+)
+_CANARY_PERSISTENT_USAGE_OUTCOMES = frozenset({"observed", "missing"})
 _CANARY_TASK_RISKS = frozenset({"low", "medium", "high", "unknown"})
 _CANARY_REASON_METRIC_SUFFIXES = (
     ("canary_policy_invalid", "policy_invalid"),
@@ -945,6 +1025,215 @@ def _project_canary_physical_budget_metrics(
     )
 
 
+def _project_persistent_canary_rollout_metrics(
+    trace: Mapping[str, Any],
+    metrics: dict[str, Any],
+) -> None:
+    raw_evidence = trace.get("canary_persistent_rollout")
+    observed = bool(
+        type(raw_evidence) is dict
+        and raw_evidence.get("schema") == _CANARY_PERSISTENT_ROLLOUT_SCHEMA
+    )
+    metrics["canary_persistent_rollout_observed"] = observed
+    metrics["canary_persistent_rollout_projection_complete"] = False
+    metrics["canary_persistent_rollout_enabled_observed"] = False
+    metrics["canary_persistent_rollout_receipt_count_observed"] = False
+    if not observed:
+        return
+
+    evidence = raw_evidence
+    raw_enabled = evidence.get("enabled")
+    enabled_observed = type(raw_enabled) is bool
+    metrics["canary_persistent_rollout_enabled_observed"] = enabled_observed
+    if enabled_observed:
+        metrics["canary_persistent_rollout_enabled"] = raw_enabled
+
+    receipt_count = _non_negative_int(evidence.get("receipt_count"))
+    receipt_count_observed = bool(
+        receipt_count is not None
+        and receipt_count <= _MAX_CANARY_PERSISTENT_RECEIPTS
+    )
+    metrics["canary_persistent_rollout_receipt_count_observed"] = (
+        receipt_count_observed
+    )
+    if receipt_count_observed:
+        metrics["canary_persistent_rollout_receipt_count"] = receipt_count
+
+    raw_receipts = evidence.get("receipts")
+    if not (
+        set(evidence) == {"schema", "enabled", "receipt_count", "receipts"}
+        and raw_enabled is True
+        and receipt_count_observed
+        and type(raw_receipts) is list
+        and len(raw_receipts) == receipt_count
+        and len(raw_receipts) <= _MAX_CANARY_PERSISTENT_RECEIPTS
+    ):
+        return
+
+    counters = {
+        "admission_allowed": 0,
+        "admission_denied": 0,
+        "admission_unavailable": 0,
+        "probe": 0,
+        "settled": 0,
+        "cancelled_before_request": 0,
+        "mutation_unavailable": 0,
+        "rollback_transition": 0,
+        "recovery_transition": 0,
+        "usage_observed": 0,
+        "usage_missing": 0,
+        **{
+            f"provider_{suffix}": 0
+            for _, suffix in _CANARY_PERSISTENT_PROVIDER_OUTCOME_SUFFIXES
+        },
+    }
+    for raw_receipt in raw_receipts:
+        if (
+            type(raw_receipt) is not dict
+            or set(raw_receipt) != _CANARY_PERSISTENT_RECEIPT_FIELDS
+            or raw_receipt.get("schema") != _CANARY_PERSISTENT_ROLLOUT_SCHEMA
+        ):
+            return
+        receipt = raw_receipt
+        role = _enum_token(receipt.get("role"))
+        available = receipt.get("available")
+        allowed = receipt.get("allowed")
+        probe = receipt.get("probe")
+        admission_reason = _enum_token(receipt.get("admission_reason"))
+        state_before = _enum_token(receipt.get("state_before"))
+        mutation_available = receipt.get("mutation_available")
+        mutation_applied = receipt.get("mutation_applied")
+        mutation_reason = _enum_token(receipt.get("mutation_reason"))
+        state_after = _enum_token(receipt.get("state_after"))
+        latch_reason = _enum_token(receipt.get("latch_reason"))
+        provider_outcome = _enum_token(receipt.get("provider_outcome"))
+        usage_outcome = _enum_token(receipt.get("usage_outcome"))
+        cancelled_before_request = receipt.get("cancelled_before_request")
+        rollback_transition = receipt.get("rollback_transition")
+        recovery_transition = receipt.get("recovery_transition")
+        recovery_successes = _non_negative_int(
+            receipt.get("recovery_successes")
+        )
+        if not (
+            role in {"proposer", "aggregator"}
+            and type(available) is bool
+            and type(allowed) is bool
+            and type(probe) is bool
+            and admission_reason in _CANARY_PERSISTENT_ADMISSION_REASONS
+            and state_before in _CANARY_PERSISTENT_STATES
+            and type(mutation_available) is bool
+            and type(mutation_applied) is bool
+            and mutation_reason in _CANARY_PERSISTENT_MUTATION_REASONS
+            and state_after in _CANARY_PERSISTENT_STATES
+            and latch_reason in _CANARY_PERSISTENT_LATCH_REASONS
+            and provider_outcome
+            in _CANARY_PERSISTENT_PROVIDER_OUTCOMES | {"not_applicable"}
+            and usage_outcome
+            in _CANARY_PERSISTENT_USAGE_OUTCOMES | {"not_applicable"}
+            and type(cancelled_before_request) is bool
+            and type(rollback_transition) is bool
+            and type(recovery_transition) is bool
+            and recovery_successes is not None
+        ):
+            return
+        if not (
+            (available or admission_reason == "ledger_unavailable")
+            and (not available or admission_reason != "ledger_unavailable")
+            and (not allowed or available)
+            and (probe == (admission_reason == "half_open_probe"))
+            and (
+                not allowed
+                or admission_reason in {"active", "half_open_probe"}
+            )
+            and (
+                allowed
+                or admission_reason not in {"active", "half_open_probe"}
+            )
+            and (not probe or state_before == "half_open")
+            and (probe or admission_reason != "half_open_probe")
+            and (not mutation_applied or mutation_available)
+            and (
+                mutation_applied
+                == (mutation_reason in {"applied", "cancelled"})
+            )
+            and (
+                mutation_available
+                or mutation_reason in {"ledger_unavailable", "not_attempted"}
+            )
+            and (
+                not mutation_available
+                or mutation_reason not in {"ledger_unavailable", "not_attempted"}
+            )
+            and rollback_transition
+            == (state_before == "active" and state_after == "rolled_back")
+            and recovery_transition == (probe and state_after == "active")
+        ):
+            return
+
+        if not allowed:
+            if not (
+                mutation_available is False
+                and mutation_applied is False
+                and mutation_reason == "not_attempted"
+                and state_after == state_before
+                and provider_outcome == "not_applicable"
+                and usage_outcome == "not_applicable"
+                and cancelled_before_request is True
+                and rollback_transition is False
+                and recovery_transition is False
+            ):
+                return
+        elif cancelled_before_request:
+            if not (
+                provider_outcome == "not_applicable"
+                and usage_outcome == "not_applicable"
+            ):
+                return
+        elif not (
+            provider_outcome in _CANARY_PERSISTENT_PROVIDER_OUTCOMES
+            and usage_outcome in _CANARY_PERSISTENT_USAGE_OUTCOMES
+        ):
+            return
+
+        if allowed:
+            counters["admission_allowed"] += 1
+            if cancelled_before_request:
+                counters["cancelled_before_request"] += 1
+            else:
+                counters["settled"] += 1
+                counters[f"provider_{provider_outcome}"] += 1
+                counters[f"usage_{usage_outcome}"] += 1
+            if mutation_available is False:
+                counters["mutation_unavailable"] += 1
+        else:
+            counters["admission_denied"] += 1
+        if available is False:
+            counters["admission_unavailable"] += 1
+        if probe:
+            counters["probe"] += 1
+        if rollback_transition:
+            counters["rollback_transition"] += 1
+        if recovery_transition:
+            counters["recovery_transition"] += 1
+
+    assert receipt_count is not None
+    if not (
+        counters["admission_allowed"] + counters["admission_denied"]
+        == receipt_count
+        and counters["settled"]
+        + counters["cancelled_before_request"]
+        == counters["admission_allowed"]
+        and counters["probe"] <= counters["admission_allowed"]
+        and counters["rollback_transition"]
+        <= counters["admission_allowed"]
+        and counters["recovery_transition"] <= counters["settled"]
+    ):
+        return
+    for suffix, value in counters.items():
+        metrics[f"canary_persistent_rollout_{suffix}_count"] = value
+    metrics["canary_persistent_rollout_projection_complete"] = True
+
+
 def _project_proposer_runtime_health_and_failures(
     candidates: list[Any],
     *,
@@ -1720,6 +2009,7 @@ def build_ensemble_execution_metrics(
     _project_runtime_health_filter_metrics(trace, metrics)
     _project_canary_rollout_metrics(trace, metrics)
     _project_canary_physical_budget_metrics(trace, metrics)
+    _project_persistent_canary_rollout_metrics(trace, metrics)
     _project_aggregator_final_request_usage(trace, metrics)
 
     trace_size, trace_size_capped, trace_size_cap_reason = (

@@ -675,7 +675,7 @@ def test_selector_fallback_wrapper_skips_benched_fallback() -> None:
     ledger = _ledger()
     wrapper = _SelectorFallbackProvider(provider, selector, health_ledger=ledger)
     ledger.record_failure("ollama", "model-b", ProviderFailureKind.RATE_LIMITED)
-    wrapper._skip_benched_fallbacks()
+    wrapper._skip_benched_fallbacks(provider)
     assert selector.current_config.model == "model-c"
 
 
@@ -687,7 +687,7 @@ def test_selector_fallback_wrapper_keeps_last_deployment_despite_bench() -> None
     wrapper = _SelectorFallbackProvider(provider, selector, health_ledger=ledger)
     ledger.record_failure("ollama", "model-b", ProviderFailureKind.RATE_LIMITED)
     ledger.record_failure("ollama", "model-c", ProviderFailureKind.RATE_LIMITED)
-    wrapper._skip_benched_fallbacks()
+    wrapper._skip_benched_fallbacks(provider)
     # Every remaining deployment is benched: the exemption keeps the current
     # link instead of stranding the turn.
     assert selector.current_config.model == "model-b"
@@ -698,7 +698,7 @@ def test_selector_fallback_wrapper_without_ledger_is_a_noop() -> None:
     provider = selector.resolve()
     provider = selector.next_fallback()
     wrapper = _SelectorFallbackProvider(provider, selector)
-    wrapper._skip_benched_fallbacks()
+    wrapper._skip_benched_fallbacks(provider)
     assert selector.current_config.model == "model-b"
 
 

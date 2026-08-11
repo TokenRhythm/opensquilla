@@ -4323,7 +4323,7 @@ def frozen_task_analysis_contract_reasons(
     elif (authorized_routes := _frozen_task_analyzer_routes(source_config)) is None:
         reasons.append("invalid_frozen_task_analysis_source_analyzer_identity")
     if schema == FROZEN_TASK_ANALYSIS_SCHEMA_V3:
-        from opensquilla.eval.draco_task_analyzer_execution import (
+        from opensquilla.draco_task_analyzer_execution import (
             task_analyzer_execution_contract_matches_source,
             validated_task_analyzer_execution_contract,
         )

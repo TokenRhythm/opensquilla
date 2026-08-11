@@ -8,15 +8,27 @@ import time
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal
 
 import pytest
 import structlog.testing
 
+from opensquilla.canary_rollout import (
+    CanaryRolloutLedger,
+    CanaryRolloutPolicy,
+    CanaryRolloutRole,
+    CanaryRolloutScope,
+    CanaryRolloutState,
+    CanaryUsageOutcome,
+)
 from opensquilla.engine.routing.health import ProviderHealthLedger
 from opensquilla.engine.usage_accounting import normalize_provider_usage
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.observability.ensemble_execution_metrics import (
+    build_ensemble_execution_metrics,
+)
 from opensquilla.provider import (
     ChatConfig,
     ContentBlockDocument,
@@ -59,13 +71,16 @@ from opensquilla.provider.ensemble import (
     _deduplicate_continuation,
     _done_event_with_physical_attempt_id,
     _error_event_physical_request_count,
+    _guard_canary_physical_request_stream,
     _is_thinking_parameter_rejection,
     _json_safe,
     _materialize_canary_runtime_policy,
+    _materialize_persistent_canary_policy,
     _member_chat_config,
     _member_execution_trace,
     _member_from_ref,
     _MemberRequestBudgetBinding,
+    _persistent_canary_usage_outcome,
     _proposer_chat_config,
     _rollup_cost_source,
     _stream_with_heartbeats,
@@ -19911,6 +19926,26 @@ def _canary_rollout_policy() -> dict[str, Any]:
     return cfg.llm_ensemble.canary_rollout.model_dump(mode="json")
 
 
+def _persistent_rollout_policy() -> CanaryRolloutPolicy:
+    rollout = _canary_rollout_policy()
+    auto_rollback = rollout["auto_rollback"]
+    assert isinstance(auto_rollback, dict)
+    auto_rollback["enabled"] = True
+    policy = _materialize_persistent_canary_policy(rollout)
+    assert policy is not None
+    return policy
+
+
+def _persistent_rollout_scope(model: str) -> CanaryRolloutScope:
+    return CanaryRolloutScope.from_identity(
+        policy_sha256="a" * 64,
+        role=CanaryRolloutRole.PROPOSER,
+        provider="fake",
+        model=model,
+        upstream="",
+    )
+
+
 def _canary_rollout_snapshot(
     *models: str,
     success: int = 20,
@@ -20677,6 +20712,358 @@ async def test_canary_zero_request_terminal_refunds_root_budget(
         "rejected": 0,
         "refunded": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (DoneEvent(), CanaryUsageOutcome.MISSING),
+        (DoneEvent(model="reported-model"), CanaryUsageOutcome.OBSERVED),
+        (
+            DoneEvent(model="reported-model", usage_missing_count=1),
+            CanaryUsageOutcome.MISSING,
+        ),
+        (
+            ErrorEvent(
+                model_usage_breakdown=[
+                    {"role": "usage_missing", "input_tokens": 0}
+                ]
+            ),
+            CanaryUsageOutcome.MISSING,
+        ),
+        (
+            ErrorEvent(
+                model_usage_breakdown=[
+                    {"model": "reported-model", "input_tokens": 1}
+                ]
+            ),
+            CanaryUsageOutcome.OBSERVED,
+        ),
+    ],
+)
+def test_persistent_canary_usage_requires_a_real_receipt_unit(
+    event: DoneEvent | ErrorEvent,
+    expected: CanaryUsageOutcome,
+) -> None:
+    assert _persistent_canary_usage_outcome(event) is expected
+
+
+def test_persistent_canary_receipts_normalize_role_and_preserve_overflow_count(
+    tmp_path: Path,
+) -> None:
+    policy = _persistent_rollout_policy()
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/persistent-canary-role",
+        proposers=[replace(_member("canary"), canary_runtime_managed=True)],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        _provider_health_ledger=_fresh_canary_health_ledger("canary"),
+        _canary_rollout_ledger=CanaryRolloutLedger(tmp_path / "rollout.sqlite3"),
+        _canary_rollout_policy=policy,
+        _canary_rollout_policy_sha256="a" * 64,
+    )
+
+    reservation, error = provider._reserve_canary_physical_request(
+        provider.proposers[0],
+        role="proposer_recovery",
+    )
+
+    assert error is None
+    assert reservation is not None
+    reservation.refund()
+    assert provider._canary_rollout_receipts[0]["role"] == "proposer"
+    for index in range(8):
+        provider._record_canary_rollout_receipt({"index": index})
+    assert provider._canary_rollout_receipt_count == 9
+    assert len(provider._canary_rollout_receipts) == 8
+
+
+@pytest.mark.asyncio
+async def test_persistent_canary_success_is_settled_and_traced_without_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "canary": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="canary")]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="answer"), DoneEvent(model="agg")]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    policy = _persistent_rollout_policy()
+    ledger = CanaryRolloutLedger(tmp_path / "rollout.sqlite3")
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/persistent-canary",
+        proposers=[replace(_member("canary"), canary_runtime_managed=True)],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        _provider_health_ledger=_fresh_canary_health_ledger("canary"),
+        _canary_rollout_ledger=ledger,
+        _canary_rollout_policy=policy,
+        _canary_rollout_policy_sha256="a" * 64,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    rollout_trace = done.ensemble_trace["canary_persistent_rollout"]
+    assert rollout_trace["schema"] == (
+        "opensquilla.ensemble-canary-persistent-rollout/v1"
+    )
+    assert rollout_trace["enabled"] is True
+    assert rollout_trace["receipt_count"] == 1
+    [receipt] = rollout_trace["receipts"]
+    assert receipt["role"] == "proposer"
+    assert receipt["provider_outcome"] == "success"
+    assert receipt["usage_outcome"] == "observed"
+    assert receipt["mutation_applied"] is True
+    serialized = json.dumps(rollout_trace, sort_keys=True)
+    assert "a" * 64 not in serialized
+    assert not {"provider", "model", "deployment", "token"} & set(receipt)
+    metrics = build_ensemble_execution_metrics(
+        done.ensemble_trace,
+        terminal_outcome="completed",
+    )
+    assert metrics["canary_persistent_rollout_projection_complete"] is True
+    assert metrics["canary_persistent_rollout_provider_success_count"] == 1
+    assert metrics["canary_persistent_rollout_usage_observed_count"] == 1
+    snapshot = ledger.snapshot(_persistent_rollout_scope("canary"), policy)
+    assert snapshot.available is True
+    assert snapshot.state is CanaryRolloutState.ACTIVE
+    assert snapshot.window_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_persistent_canary_rate_limit_rolls_back_across_provider_instances(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "canary": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="rate limited",
+                        code="429",
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                ]
+            ),
+            "agg": _FakePlan([DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    policy = _persistent_rollout_policy()
+    ledger = CanaryRolloutLedger(tmp_path / "rollout.sqlite3")
+
+    def build_provider() -> EnsembleProvider:
+        return EnsembleProvider(
+            profile_name="router_dynamic/persistent-canary",
+            proposers=[
+                replace(_member("canary"), canary_runtime_managed=True)
+            ],
+            aggregator=_member("agg"),
+            min_successful_proposers=1,
+            all_failed_policy="error",
+            shuffle_candidates=False,
+            aggregator_tools=False,
+            _provider_health_ledger=_fresh_canary_health_ledger("canary"),
+            _canary_rollout_ledger=ledger,
+            _canary_rollout_policy=policy,
+            _canary_rollout_policy_sha256="a" * 64,
+        )
+
+    await _collect(build_provider())
+    assert [row["model"] for row in registry.calls] == ["canary"]
+    snapshot = ledger.snapshot(_persistent_rollout_scope("canary"), policy)
+    assert snapshot.available is True
+    assert snapshot.state is CanaryRolloutState.ROLLED_BACK
+    assert snapshot.rate_limited == 1
+
+    second = await _collect(build_provider())
+
+    assert [row["model"] for row in registry.calls] == ["canary"]
+    error = next(event for event in second if isinstance(event, ErrorEvent))
+    [candidate] = error.ensemble_trace["candidates"]
+    assert candidate["error_code"] == (
+        "ensemble_canary_persistent_rollout_denied"
+    )
+    [receipt] = error.ensemble_trace["canary_persistent_rollout"]["receipts"]
+    assert receipt["allowed"] is False
+    assert receipt["state_before"] == "rolled_back"
+
+
+@pytest.mark.asyncio
+async def test_persistent_canary_zero_request_terminal_cancels_ledger_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "canary": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="local validation",
+                        code="local_validation",
+                        request_started=False,
+                        physical_request_count=0,
+                    )
+                ]
+            ),
+            "agg": _FakePlan([DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    policy = _persistent_rollout_policy()
+    ledger = CanaryRolloutLedger(tmp_path / "rollout.sqlite3")
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/persistent-canary",
+        proposers=[replace(_member("canary"), canary_runtime_managed=True)],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        _provider_health_ledger=_fresh_canary_health_ledger("canary"),
+        _canary_rollout_ledger=ledger,
+        _canary_rollout_policy=policy,
+        _canary_rollout_policy_sha256="a" * 64,
+    )
+
+    events = await _collect(provider)
+
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    [receipt] = error.ensemble_trace["canary_persistent_rollout"]["receipts"]
+    assert receipt["cancelled_before_request"] is True
+    assert receipt["mutation_applied"] is True
+    snapshot = ledger.snapshot(_persistent_rollout_scope("canary"), policy)
+    assert snapshot.available is True
+    assert snapshot.state is CanaryRolloutState.ACTIVE
+    assert snapshot.window_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_persistent_canary_close_failure_is_settled_conservatively(
+    tmp_path: Path,
+) -> None:
+    class _TerminalCloseFailureStream:
+        def __init__(self) -> None:
+            self._done = False
+
+        def __aiter__(self) -> _TerminalCloseFailureStream:
+            return self
+
+        async def __anext__(self) -> StreamEvent:
+            if self._done:
+                raise StopAsyncIteration
+            self._done = True
+            return DoneEvent(model="canary")
+
+        async def aclose(self) -> None:
+            raise RuntimeError("close failed")
+
+    policy = _persistent_rollout_policy()
+    ledger = CanaryRolloutLedger(tmp_path / "rollout.sqlite3")
+    member = replace(_member("canary"), canary_runtime_managed=True)
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/persistent-canary",
+        proposers=[member],
+        aggregator=_member("agg"),
+        _provider_health_ledger=_fresh_canary_health_ledger("canary"),
+        _canary_rollout_ledger=ledger,
+        _canary_rollout_policy=policy,
+        _canary_rollout_policy_sha256="a" * 64,
+    )
+    reservation, error = provider._reserve_canary_physical_request(
+        member,
+        role="proposer",
+    )
+    assert error is None
+    assert reservation is not None
+    guarded = _guard_canary_physical_request_stream(
+        _TerminalCloseFailureStream(),
+        reservation,
+    )
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await guarded.__anext__()
+
+    snapshot = ledger.snapshot(_persistent_rollout_scope("canary"), policy)
+    assert snapshot.available is True
+    assert snapshot.state is CanaryRolloutState.ROLLED_BACK
+    assert snapshot.usage_missing == 1
+    [receipt] = provider._canary_rollout_receipts
+    assert receipt["provider_outcome"] == "transport_failure"
+    assert receipt["usage_outcome"] == "missing"
+    assert receipt["mutation_applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_persistent_canary_unproven_settlement_replaces_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def terminal_stream() -> AsyncIterator[StreamEvent]:
+        yield DoneEvent(model="canary")
+
+    policy = _persistent_rollout_policy()
+    ledger = CanaryRolloutLedger(tmp_path / "rollout.sqlite3")
+    member = replace(_member("canary"), canary_runtime_managed=True)
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/persistent-canary",
+        proposers=[member],
+        aggregator=_member("agg"),
+        _provider_health_ledger=_fresh_canary_health_ledger("canary"),
+        _canary_rollout_ledger=ledger,
+        _canary_rollout_policy=policy,
+        _canary_rollout_policy_sha256="a" * 64,
+    )
+    reservation, error = provider._reserve_canary_physical_request(
+        member,
+        role="proposer",
+    )
+    assert error is None
+    assert reservation is not None
+    monkeypatch.setattr(
+        ledger,
+        "settle_attempt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("storage unavailable")
+        ),
+    )
+    guarded = _guard_canary_physical_request_stream(
+        terminal_stream(),
+        reservation,
+    )
+
+    event = await guarded.__anext__()
+
+    assert isinstance(event, ErrorEvent)
+    assert event.code == "ensemble_canary_persistent_rollout_denied"
+    assert isinstance(event.diagnostic_done, DoneEvent)
+    [receipt] = provider._canary_rollout_receipts
+    assert receipt["mutation_available"] is False
+    assert receipt["mutation_applied"] is False
 
 
 def _runtime_health_snapshot(
