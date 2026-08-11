@@ -78,6 +78,11 @@ from opensquilla.engine.types import (
 from opensquilla.engine.types import (
     WarningEvent as AgentWarningEvent,
 )
+from opensquilla.eval.draco_artifact_index import (
+    load_tasks,
+    parse_maybe_json,
+    result_key_coverage,
+)
 from opensquilla.eval.draco_artifact_integrity import (
     compact_tool_result_diagnostic,
     seal_result_row,
@@ -1727,37 +1732,6 @@ class DryEnsembleProvider:
         return []
 
 
-def load_tasks(path: Path, *, max_tasks: int = 0) -> list[dict[str, Any]]:
-    tasks: list[dict[str, Any]] = []
-    task_id_lines: dict[str, int] = {}
-    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw.strip()
-        if not line:
-            continue
-        payload = json.loads(line)
-        task_id = str(payload.get("id") or payload.get("task_id") or "").strip()
-        prompt = str(payload.get("prompt") or payload.get("problem") or "").strip()
-        if not task_id or not prompt:
-            raise ValueError(f"{path}:{lineno} requires non-empty id/task_id and prompt/problem")
-        prior_lineno = task_id_lines.get(task_id)
-        if prior_lineno is not None:
-            raise ValueError(
-                f"{path}:{lineno} duplicate task id {task_id!r}; "
-                f"first declared on line {prior_lineno}"
-            )
-        task_id_lines[task_id] = lineno
-        payload["id"] = task_id
-        payload["prompt"] = prompt
-        if "rubric" in payload:
-            payload["rubric"] = parse_maybe_json(payload["rubric"])
-        elif "answer" in payload:
-            payload["rubric"] = parse_maybe_json(payload["answer"])
-        tasks.append(payload)
-        if max_tasks and len(tasks) >= max_tasks:
-            break
-    return tasks
-
-
 def select_tasks_by_ids(
     tasks: list[dict[str, Any]],
     requested_task_ids: list[str] | None,
@@ -1802,36 +1776,6 @@ def parse_groups(raw: str) -> list[str]:
     if duplicates:
         raise ValueError(f"duplicate group(s): {', '.join(duplicates)}")
     return groups
-
-
-def result_key_coverage(
-    rows: list[dict[str, Any]],
-    *,
-    expected_keys: set[tuple[str, str]],
-) -> dict[str, Any]:
-    """Audit exact one-row coverage for every normalized group/task key."""
-
-    counts: dict[tuple[str, str], int] = {}
-    for row in rows:
-        key = (
-            str(row.get("group") or "").strip().upper(),
-            str(row.get("task_id") or "").strip(),
-        )
-        counts[key] = counts.get(key, 0) + 1
-    actual_keys = set(counts)
-    missing = sorted(expected_keys - actual_keys)
-    unexpected = sorted(actual_keys - expected_keys)
-    duplicates = sorted(key for key, count in counts.items() if count > 1)
-    row = {
-        "pass": not missing and not unexpected and not duplicates,
-        "expected_row_count": len(expected_keys),
-        "actual_row_count": len(rows),
-        "actual_unique_key_count": len(actual_keys),
-        "missing_keys": [list(key) for key in missing],
-        "unexpected_keys": [list(key) for key in unexpected],
-        "duplicate_keys": [{"key": list(key), "count": counts[key]} for key in duplicates],
-    }
-    return row
 
 
 def normalize_domain(value: Any) -> str:
@@ -3543,18 +3487,6 @@ def profile_aggregator_timeout_seconds(
         aggregator_timeout_override=aggregator_timeout_override,
         expand_to_requested_timeout=expand_to_requested_timeout,
     )[1]
-
-
-def parse_maybe_json(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    stripped = value.strip()
-    if not stripped:
-        return value
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        return value
 
 
 def extract_json_object(text: str) -> dict[str, Any] | None:

@@ -17,6 +17,7 @@ import pytest
 
 from opensquilla.engine.types import DoneEvent as AgentDoneEvent
 from opensquilla.engine.types import ThinkingLevel
+from opensquilla.eval import draco_artifact_index
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import ensemble as ensemble_provider
 from opensquilla.provider.ensemble import (
@@ -7362,6 +7363,48 @@ def test_result_key_coverage_requires_exactly_one_row_per_key(module) -> None:
     assert invalid["missing_keys"] == [["G1", "task-a"]]
     assert invalid["unexpected_keys"] == [["B4", "task-a"]]
     assert invalid["duplicate_keys"] == [{"key": ["B2", "task-a"], "count": 2}]
+
+
+def test_draco_artifact_index_helpers_are_direct_compatibility_reexports() -> None:
+    resume_runner = _load_resume_runner()
+
+    for name in ("parse_maybe_json", "load_tasks", "result_key_coverage"):
+        shared = getattr(draco_artifact_index, name)
+        assert getattr(runner, name) is shared
+        assert getattr(resume_runner, name) is shared
+
+
+def test_shared_load_tasks_preserves_normalization_and_early_limit(tmp_path: Path) -> None:
+    input_path = tmp_path / "tasks.jsonl"
+    input_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "task_id": " task-a ",
+                        "problem": " prompt ",
+                        "rubric": json.dumps({"criterion": "exact"}),
+                    }
+                ),
+                "{not-valid-json",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    tasks = draco_artifact_index.load_tasks(input_path, max_tasks=1)
+
+    assert tasks == [
+        {
+            "task_id": " task-a ",
+            "problem": " prompt ",
+            "rubric": {"criterion": "exact"},
+            "id": "task-a",
+            "prompt": "prompt",
+        }
+    ]
+    assert draco_artifact_index.parse_maybe_json("plain rubric") == "plain rubric"
 
 
 def test_recovery_cli_arguments_are_manifested_and_reconstructed() -> None:
