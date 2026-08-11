@@ -9306,6 +9306,172 @@ def test_source_hash_recheck_detects_mutation(module, tmp_path: Path) -> None:
         module.verify_source_snapshots(snapshots)
 
 
+def test_source_shard_index_hashes_and_parses_in_one_file_open(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "rows.jsonl"
+    rows = [
+        module.seal_result_row(
+            {"group": "B0", "task_id": "task-1", "text": "before\u2028after"}
+        ),
+        module.seal_result_row(
+            {"group": "B1", "task_id": "task-2", "text": "第二行"}
+        ),
+    ]
+    payload = (
+        json.dumps(rows[0], ensure_ascii=False)
+        + "\r\n\r\n"
+        + json.dumps(rows[1], ensure_ascii=False)
+        + "\n"
+    ).encode()
+    source.write_bytes(payload)
+    source.chmod(0o600)
+    resolved_source = source.resolve()
+    original_open = Path.open
+    source_opens: list[tuple[object, ...]] = []
+
+    def tracking_open(path: Path, *args: object, **kwargs: object):
+        if path.resolve() == resolved_source:
+            source_opens.append(args)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    indexes = module.read_source_shard_indexes([source])
+
+    assert len(source_opens) == 1
+    assert indexes[0].sha256 == hashlib.sha256(payload).hexdigest()
+    assert [record.line for record in indexes[0].records] == [1, 3]
+    assert [record.row["text"] for record in indexes[0].records] == [
+        "before\u2028after",
+        "第二行",
+    ]
+
+
+def test_source_shard_index_rejects_bare_carriage_return_boundaries(
+    module,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "rows.jsonl"
+    rows = [
+        module.seal_result_row({"group": "B0", "task_id": "task-1"}),
+        module.seal_result_row({"group": "B1", "task_id": "task-2"}),
+    ]
+    source.write_text("\r".join(json.dumps(row) for row in rows))
+    source.chmod(0o600)
+
+    with pytest.raises(module.FinalizationError, match="invalid result JSONL"):
+        module.read_source_shard_indexes([source])
+
+
+def test_manifest_contracts_reuse_preloaded_result_index(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    try:
+        indexes = module.read_source_shard_indexes(args.result)
+        result_path = args.result[0].resolve()
+        original_hash = module.file_sha256
+        original_load = module.load_jsonl_rows
+
+        def guarded_hash(path: Path) -> str:
+            if path.resolve() == result_path:
+                raise AssertionError("preloaded result shard was hashed again")
+            return original_hash(path)
+
+        def guarded_load(
+            path: Path,
+            *,
+            owner_only: bool,
+            source_label: str,
+        ):
+            if path.resolve() == result_path:
+                raise AssertionError("preloaded result shard was parsed again")
+            return original_load(
+                path,
+                owner_only=owner_only,
+                source_label=source_label,
+            )
+
+        monkeypatch.setattr(module, "file_sha256", guarded_hash)
+        monkeypatch.setattr(module, "load_jsonl_rows", guarded_load)
+        _, _, _, sources = module.load_manifest_contracts(
+            args.manifest,
+            result_paths=args.result,
+            groups=module.GROUPS,
+            result_indexes=indexes,
+        )
+
+        assert sources[0]["result_sha256"] == indexes[0].sha256
+        assert sources[0]["rows_written"] == len(indexes[0].records)
+    finally:
+        os.close(lock_fd)
+
+
+def test_manifest_contracts_reject_preloaded_index_with_wrong_shard_ordinal(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    try:
+        indexes = module.read_source_shard_indexes(args.result)
+        first = indexes[0]
+        forged = module.SourceShardIndex(
+            path=first.path,
+            source_index=1,
+            sha256=first.sha256,
+            records=tuple(
+                module.SourceRecord(
+                    path=record.path,
+                    source_index=1,
+                    line=record.line,
+                    row=record.row,
+                )
+                for record in first.records
+            ),
+        )
+
+        with pytest.raises(module.FinalizationError, match="not bound"):
+            module.load_manifest_contracts(
+                args.manifest,
+                result_paths=args.result,
+                groups=module.GROUPS,
+                result_indexes=(forged, *indexes[1:]),
+            )
+    finally:
+        os.close(lock_fd)
+
+
+def test_finalization_rechecks_result_after_index_reuse(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=False)
+    original_load = module.load_manifest_contracts
+
+    def mutate_after_manifest_validation(*call_args: object, **call_kwargs: object):
+        result = original_load(*call_args, **call_kwargs)
+        source = args.result[0]
+        source.write_bytes(source.read_bytes() + b"\n")
+        return result
+
+    monkeypatch.setattr(
+        module,
+        "load_manifest_contracts",
+        mutate_after_manifest_validation,
+    )
+    try:
+        with pytest.raises(module.FinalizationError, match="changed during finalization"):
+            module.run_finalization(args)
+        assert not args.output_dir.exists()
+    finally:
+        os.close(lock_fd)
+
+
 def test_attempt_id_payload_conflict_and_legacy_mix_are_fatal(module, tmp_path: Path) -> None:
     args, _, lock_fd = _campaign(module, tmp_path)
     try:

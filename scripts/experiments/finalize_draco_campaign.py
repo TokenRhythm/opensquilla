@@ -16,6 +16,7 @@ import copy
 import fcntl
 import hashlib
 import hmac
+import io
 import json
 import math
 import os
@@ -812,6 +813,34 @@ class SourceRecord:
             "source_index": self.source_index,
             "line": self.line,
         }
+
+
+@dataclass(frozen=True)
+class SourceShardIndex:
+    """One-pass process-local index for a sealed result shard."""
+
+    path: Path
+    source_index: int
+    sha256: str
+    records: tuple[SourceRecord, ...]
+
+
+class _HashingRawReader(io.RawIOBase):
+    """Update a digest with the exact bytes consumed by a text reader."""
+
+    def __init__(self, raw: io.RawIOBase, digest: Any) -> None:
+        super().__init__()
+        self._raw = raw
+        self._digest = digest
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int | None:
+        count = self._raw.readinto(buffer)
+        if count:
+            self._digest.update(memoryview(buffer)[:count])
+        return count
 
 
 @dataclass
@@ -1729,36 +1758,71 @@ def seal_result_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return sealed
 
 
-def read_source_rows(paths: Sequence[Path]) -> tuple[list[SourceRecord], dict[str, str]]:
+def read_source_shard_indexes(paths: Sequence[Path]) -> tuple[SourceShardIndex, ...]:
     if not paths:
         raise FinalizationError("at least one --result source is required")
-    records: list[SourceRecord] = []
-    snapshots: dict[str, str] = {}
+    indexes: list[SourceShardIndex] = []
+    seen_paths: set[str] = set()
     for source_index, raw_path in enumerate(paths):
         path = require_regular_file(raw_path, owner_only=True)
         key = str(path)
-        if key in snapshots:
+        if key in seen_paths:
             raise FinalizationError(f"duplicate result source: {path}")
-        snapshots[key] = file_sha256(path)
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, raw in enumerate(handle, start=1):
-                if not raw.strip():
-                    continue
-                try:
-                    row = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise FinalizationError(
-                        f"invalid result JSONL at {path}:{line_number}"
-                    ) from exc
-                if not isinstance(row, dict):
-                    raise FinalizationError(f"result row is not an object at {path}:{line_number}")
-                if not verify_result_row_evidence(row):
-                    raise FinalizationError(
-                        f"result row is not sealed or was mutated: {path}:{line_number}"
-                    )
-                records.append(SourceRecord(path, source_index, line_number, row))
-    if not records:
+        seen_paths.add(key)
+        digest = hashlib.sha256()
+        shard_records: list[SourceRecord] = []
+        try:
+            with path.open("rb", buffering=0) as raw_handle:
+                hashing_reader = _HashingRawReader(raw_handle, digest)
+                with io.BufferedReader(
+                    hashing_reader,
+                    buffer_size=1024 * 1024,
+                ) as buffered_handle:
+                    with io.TextIOWrapper(
+                        buffered_handle,
+                        encoding="utf-8",
+                        newline="\n",
+                    ) as handle:
+                        for line_number, raw in enumerate(handle, start=1):
+                            if not raw.strip():
+                                continue
+                            try:
+                                row = json.loads(raw)
+                            except json.JSONDecodeError as exc:
+                                raise FinalizationError(
+                                    f"invalid result JSONL at {path}:{line_number}"
+                                ) from exc
+                            if not isinstance(row, dict):
+                                raise FinalizationError(
+                                    f"result row is not an object at {path}:{line_number}"
+                                )
+                            if not verify_result_row_evidence(row):
+                                raise FinalizationError(
+                                    "result row is not sealed or was mutated: "
+                                    f"{path}:{line_number}"
+                                )
+                            shard_records.append(
+                                SourceRecord(path, source_index, line_number, row)
+                            )
+        except (OSError, UnicodeError) as exc:
+            raise FinalizationError(f"unable to read result JSONL {path}: {exc}") from exc
+        indexes.append(
+            SourceShardIndex(
+                path=path,
+                source_index=source_index,
+                sha256=digest.hexdigest(),
+                records=tuple(shard_records),
+            )
+        )
+    if not any(index.records for index in indexes):
         raise FinalizationError("result sources contain no sealed rows")
+    return tuple(indexes)
+
+
+def read_source_rows(paths: Sequence[Path]) -> tuple[list[SourceRecord], dict[str, str]]:
+    indexes = read_source_shard_indexes(paths)
+    records = [record for index in indexes for record in index.records]
+    snapshots = {str(index.path): index.sha256 for index in indexes}
     return records, snapshots
 
 
@@ -1812,12 +1876,17 @@ def load_manifest_contracts(
     groups: Sequence[str],
     expected_task_concurrency: int = FORMAL_TASK_CONCURRENCY,
     expected_judge_concurrency: int = FORMAL_JUDGE_CONCURRENCY,
+    result_indexes: Sequence[SourceShardIndex] | None = None,
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]], str, list[dict[str, Any]]]:
     if not paths:
         raise FinalizationError("at least one --manifest source is required")
     if len(paths) != len(result_paths):
         raise FinalizationError(
             "each result shard must have exactly one manifest in matching order"
+        )
+    if result_indexes is not None and len(result_indexes) != len(result_paths):
+        raise FinalizationError(
+            "preloaded result indexes must match result shards in order"
         )
     allowed_statuses = {
         "complete",
@@ -1838,9 +1907,33 @@ def load_manifest_contracts(
     key_fingerprint = ""
     source_evidence: list[dict[str, Any]] = []
     prior_manifest_attempt_ids: set[str] = set()
-    for raw_path, raw_result_path in zip(paths, result_paths, strict=True):
+    aligned_result_indexes: Sequence[SourceShardIndex | None] = (
+        tuple(result_indexes)
+        if result_indexes is not None
+        else (None,) * len(result_paths)
+    )
+    for shard_index, (raw_path, raw_result_path, result_index) in enumerate(
+        zip(
+            paths,
+            result_paths,
+            aligned_result_indexes,
+            strict=True,
+        )
+    ):
         path = require_regular_file(raw_path, owner_only=True)
         result_path = require_regular_file(raw_result_path, owner_only=True)
+        if result_index is not None and (
+            result_index.path != result_path
+            or result_index.source_index != shard_index
+            or any(
+                record.path != result_path
+                or record.source_index != result_index.source_index
+                for record in result_index.records
+            )
+        ):
+            raise FinalizationError(
+                f"preloaded result index is not bound to its result shard: {result_path}"
+            )
         payload = load_json(path)
         execution_scheduling = validate_formal_manifest_command(
             payload,
@@ -2128,14 +2221,18 @@ def load_manifest_contracts(
                 seen_recovered_keys.add(key)
                 assert recovered_resume_scheduled_pairs is not None
                 recovered_resume_scheduled_pairs.append(normalized)
-        result_rows = [
-            value
-            for _, value in load_jsonl_rows(
-                result_path,
-                owner_only=True,
-                source_label="result JSONL",
-            )
-        ]
+        result_rows = (
+            [record.row for record in result_index.records]
+            if result_index is not None
+            else [
+                value
+                for _, value in load_jsonl_rows(
+                    result_path,
+                    owner_only=True,
+                    source_label="result JSONL",
+                )
+            ]
+        )
         durable_row_markers = [
             row.get(DRACO_DURABLE_RESULT_ROW_FIELD)
             for row in result_rows
@@ -2563,7 +2660,11 @@ def load_manifest_contracts(
             "started_at": payload.get("started_at"),
             "finished_at": payload.get("finished_at"),
             "result_path": str(result_path),
-            "result_sha256": file_sha256(result_path),
+            "result_sha256": (
+                result_index.sha256
+                if result_index is not None
+                else file_sha256(result_path)
+            ),
             "rows_written": len(result_rows),
             "execution_scheduling": execution_scheduling,
             "live_web_preflight": {
@@ -14955,7 +15056,13 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     input_path = require_regular_file(args.input, owner_only=False)
     tasks = read_tasks(input_path)
     frozen_input_sha256 = validate_frozen_draco_input(input_path, tasks)
-    source_records, source_snapshots = read_source_rows(args.result)
+    source_indexes = read_source_shard_indexes(args.result)
+    source_records = [
+        record for source_index in source_indexes for record in source_index.records
+    ]
+    source_snapshots = {
+        str(source_index.path): source_index.sha256 for source_index in source_indexes
+    }
     unexpected_source_groups = sorted(
         {record.key[0] for record in source_records if record.key[0] not in set(groups)}
     )
@@ -14998,6 +15105,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         groups=groups,
         expected_task_concurrency=expected_task_concurrency,
         expected_judge_concurrency=expected_judge_concurrency,
+        result_indexes=source_indexes,
     )
     finalization_warnings.extend(
         {
