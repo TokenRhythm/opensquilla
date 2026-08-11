@@ -22,7 +22,7 @@ const webServer = managedServer === 'gateway'
     }
   : managedServer === '1'
     ? {
-        command: 'npm run dev -- --host 127.0.0.1 --port 4173 --strictPort',
+        command: `npm run dev -- --host 127.0.0.1 --port ${gatewayPort} --strictPort`,
         url: `${baseURL.replace(/\/$/, '')}/control/`,
         reuseExistingServer: false,
         timeout: 120_000,

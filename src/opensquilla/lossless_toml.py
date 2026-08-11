@@ -11,6 +11,7 @@ from typing import Any
 import tomli_w
 
 _BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+_MULTILINE_QUOTES = ('"""', "'''")
 
 
 class LosslessTomlPatchError(ValueError):
@@ -99,20 +100,133 @@ def _split_newline(line: str) -> tuple[str, str]:
     return line, ""
 
 
+def _skip_quoted(text: str, index: int) -> int:
+    """Return the index just past the single-line string opening at *index*."""
+    quote = text[index]
+    index += 1
+    while index < len(text):
+        character = text[index]
+        if quote == '"' and character == "\\":
+            index += 2
+            continue
+        if character == quote:
+            return index + 1
+        index += 1
+    return index
+
+
+def _find_multiline_close(text: str, delimiter: str, start: int) -> int:
+    """Return the end of the closing quote run, or ``-1`` when still open.
+
+    TOML permits one or two quote characters immediately inside a multi-line
+    string delimiter.  A terminal run can therefore contain three, four, or
+    five quotes: the last three close the string and any preceding quotes are
+    content.  Consuming the complete run also keeps a fourth quote from being
+    mistaken for a new single-line string that hides a following ``]``/``}``.
+    """
+    literal = delimiter == "'''"
+    quote = delimiter[0]
+    index = start
+    while index < len(text):
+        if not literal and text[index] == "\\":
+            index += 2
+            continue
+        if text[index] != quote:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(text) and text[end] == quote:
+            end += 1
+        if end - index >= len(delimiter):
+            return end
+        index = end
+    return -1
+
+
+def _scan_value(text: str, depth: int, pending: str | None) -> tuple[int, str | None]:
+    """Advance the value scanner across one physical line of a TOML value.
+
+    Returns the collection depth after the line plus the multi-line string
+    delimiter the value is still inside, if any. Either being non-zero/non-None
+    means the value continues on the following line.
+    """
+    index = 0
+    if pending is not None:
+        closing = _find_multiline_close(text, pending, 0)
+        if closing < 0:
+            return depth, pending
+        index = closing
+        pending = None
+    while index < len(text):
+        character = text[index]
+        if character == "#":
+            break
+        if character in {'"', "'"}:
+            delimiter = text[index : index + 3]
+            if delimiter in _MULTILINE_QUOTES:
+                closing = _find_multiline_close(text, delimiter, index + 3)
+                if closing < 0:
+                    return depth, delimiter
+                index = closing
+                continue
+            index = _skip_quoted(text, index)
+            continue
+        if character in "[{":
+            depth += 1
+        elif character in "]}":
+            depth -= 1
+        index += 1
+    return depth, pending
+
+
+def _value_last_line(lines: list[str], start: int, suffix: str) -> int:
+    """Return the index of the physical line on which the value ends."""
+    depth, pending = _scan_value(suffix, 0, None)
+    last = start
+    while (depth > 0 or pending is not None) and last + 1 < len(lines):
+        last += 1
+        continuation, _newline = _split_newline(lines[last])
+        depth, pending = _scan_value(continuation, depth, pending)
+    return last
+
+
+def _physical_lines(text: str) -> list[str]:
+    """Split on TOML physical newlines while preserving their exact bytes.
+
+    TOML defines a newline as LF or CRLF.  ``str.splitlines`` additionally
+    treats several legal Unicode string characters (for example U+2028) as
+    line boundaries, which can make the scanner splice an assignment inside a
+    quoted value.
+    """
+    lines: list[str] = []
+    start = 0
+    while start < len(text):
+        end = text.find("\n", start)
+        if end < 0:
+            lines.append(text[start:])
+            break
+        lines.append(text[start : end + 1])
+        start = end + 1
+    return lines
+
+
 def _scan(
     lines: list[str],
 ) -> tuple[
     dict[tuple[str | int, ...], _Assignment],
     dict[tuple[str | int, ...], int],
+    set[tuple[str | int, ...]],
 ]:
     assignments: dict[tuple[str | int, ...], _Assignment] = {}
     insertion_points: dict[tuple[str | int, ...], int] = {(): len(lines)}
+    spanning: set[tuple[str | int, ...]] = set()
     current: tuple[str | int, ...] = ()
     array_counts: dict[tuple[str, ...], int] = {}
     first_header = len(lines)
 
-    for index, raw_line in enumerate(lines):
-        line, newline = _split_newline(raw_line)
+    index = 0
+    while index < len(lines):
+        line, newline = _split_newline(lines[index])
         stripped = line.strip()
         if stripped.startswith("["):
             comment = _comment_start(stripped)
@@ -131,18 +245,33 @@ def _scan(
                 current = table
             insertion_points[current] = index + 1
             first_header = min(first_header, index)
+            index += 1
             continue
 
         equals = _assignment_equals(line)
         if equals is None:
+            index += 1
             continue
         key_expression = line[:equals].strip()
         if not key_expression:
             raise LosslessTomlPatchError("empty TOML assignment key")
         path = (*current, *_key_path(key_expression))
-        if path in assignments:
+        if path in assignments or path in spanning:
             raise LosslessTomlPatchError(f"duplicate semantic TOML assignment: {path}")
         suffix = line[equals + 1 :]
+
+        # A value may run past this line — an array of inline tables, a nested
+        # array, a triple-quoted string. Such a value cannot be patched in place,
+        # but the scan must still step over its remaining lines: they hold no
+        # assignments of their own, and a bracketed array row is not a table
+        # header. Reading one as either used to abort the whole patch.
+        last = _value_last_line(lines, index, suffix)
+        if last != index:
+            spanning.add(path)
+            insertion_points[current] = last + 1
+            index = last + 1
+            continue
+
         leading = len(suffix) - len(suffix.lstrip())
         comment_relative = _comment_start(suffix)
         value_region = suffix if comment_relative is None else suffix[:comment_relative]
@@ -163,9 +292,22 @@ def _scan(
             indent=indent,
         )
         insertion_points[current] = index + 1
+        index += 1
 
     insertion_points[()] = min(insertion_points.get((), first_header), first_header)
-    return assignments, insertion_points
+    return assignments, insertion_points, spanning
+
+
+def _spanning_owner(
+    path: tuple[str | int, ...],
+    spanning: set[tuple[str | int, ...]],
+) -> tuple[str | int, ...] | None:
+    """Return the multi-line value *path* lives inside, if any."""
+    for length in range(len(path), 0, -1):
+        prefix = path[:length]
+        if prefix in spanning:
+            return prefix
+    return None
 
 
 def _leaves(value: object, path: tuple[str | int, ...] = ()) -> dict[tuple[str | int, ...], Any]:
@@ -213,8 +355,8 @@ def patch_import_config(
     if original == transformed:
         return raw
 
-    lines = text.splitlines(keepends=True)
-    assignments, insertion_points = _scan(lines)
+    lines = _physical_lines(text)
+    assignments, insertion_points, spanning = _scan(lines)
     original_leaves = _leaves(original)
     transformed_leaves = _leaves(transformed)
     removed = set(original_leaves) - set(transformed_leaves)
@@ -228,6 +370,11 @@ def patch_import_config(
     for path in sorted(removed, key=repr):
         assignment = assignments.get(path)
         if assignment is None:
+            owner = _spanning_owner(path, spanning)
+            if owner is not None:
+                raise LosslessTomlPatchError(
+                    f"cannot remove {path} inside the multi-line TOML value at {owner}"
+                )
             raise LosslessTomlPatchError(f"cannot remove non-scalar TOML path losslessly: {path}")
         line, _newline = _split_newline(lines[assignment.line_index])
         comment = line[assignment.comment_start :] if assignment.comment_start is not None else ""
@@ -238,6 +385,11 @@ def patch_import_config(
     for path in sorted(changed, key=repr):
         assignment = assignments.get(path)
         if assignment is None:
+            owner = _spanning_owner(path, spanning)
+            if owner is not None:
+                raise LosslessTomlPatchError(
+                    f"cannot replace {path} inside the multi-line TOML value at {owner}"
+                )
             raise LosslessTomlPatchError(f"cannot replace non-scalar TOML path: {path}")
         line, _newline = _split_newline(lines[assignment.line_index])
         replacements[assignment.line_index] = (
@@ -251,6 +403,11 @@ def patch_import_config(
     newline = "\r\n" if "\r\n" in text else "\n"
     contexts = tuple(insertion_points)
     for path in sorted(added, key=repr):
+        owner = _spanning_owner(path, spanning)
+        if owner is not None:
+            raise LosslessTomlPatchError(
+                f"cannot add {path} inside the multi-line TOML value at {owner}"
+            )
         compatible = [
             context
             for context in contexts
@@ -267,10 +424,31 @@ def patch_import_config(
         insertions.setdefault(insertion_points[context], []).append(insertion)
 
     output: list[str] = []
+    has_output = False
+    ends_with_newline = True
     for index in range(len(lines) + 1):
-        output.extend(insertions.get(index, ()))
+        pending_insertions = insertions.get(index, ())
+        if pending_insertions and has_output and not ends_with_newline:
+            output.append(newline)
+            ends_with_newline = True
+        for insertion_index, insertion in enumerate(pending_insertions):
+            fragment = insertion
+            if (
+                index == len(lines)
+                and insertion_index == len(pending_insertions) - 1
+                and text
+                and not text.endswith("\n")
+            ):
+                fragment = insertion[: -len(newline)]
+            output.append(fragment)
+            has_output = True
+            ends_with_newline = fragment.endswith("\n")
         if index < len(lines):
-            output.append(replacements.get(index, lines[index]))
+            fragment = replacements.get(index, lines[index])
+            if fragment:
+                output.append(fragment)
+                has_output = True
+                ends_with_newline = fragment.endswith("\n")
     patched = "".join(output)
     try:
         parsed = tomllib.loads(patched)

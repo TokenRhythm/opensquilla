@@ -11,7 +11,11 @@
           <input v-model="cronJobs.searchText.value" class="cron-search-input" type="search" :placeholder="t('cronSkills.view.searchPlaceholder')" autocomplete="off">
         </div>
         <button class="btn btn--ghost cron-toolbar__refresh" :title="t('cronSkills.view.refresh')" :disabled="refreshing" @click="refreshCron">
-          <Icon name="refresh" :size="16" /><span>{{ refreshing ? t('cronSkills.view.refreshing') : t('cronSkills.view.refresh') }}</span>
+          <Icon name="refresh" :size="16" />
+          <span class="cron-toolbar__refresh-label" aria-live="polite">
+            <span :class="{ 'is-hidden': refreshing }">{{ t('cronSkills.view.refresh') }}</span>
+            <span :class="{ 'is-hidden': !refreshing }">{{ t('cronSkills.view.refreshing') }}</span>
+          </span>
         </button>
         <button class="btn btn--ghost" :class="{ 'is-active': bulkMode }" type="button" @click="toggleBulkMode">
           <Icon name="listChecks" :size="16" /><span>{{ bulkMode ? t('cronSkills.view.exitBulk') : t('cronSkills.view.bulkManage') }}</span>
@@ -117,8 +121,8 @@
       @toggle-selection="toggleBulkSelection"
       @create="cronForm.openPanel(null)"
       @preset="cronForm.openPanel(null, $event)"
-      @select="toggleSelected"
-      @run="cronJobs.runJob"
+      @select="showRunHistory"
+      @run="runJobAndShowHistory"
       @toggle="cronJobs.toggleJob"
       @edit="cronForm.openPanel"
       @delete="deleteJob"
@@ -462,8 +466,16 @@ async function bulkDeleteSelected() {
   }
 }
 
-function toggleSelected(id: string) {
-  selectedId.value = selectedId.value === id ? null : id
+function showRunHistory(id: string) {
+  selectedId.value = id
+}
+
+async function runJobAndShowHistory(id: string) {
+  // Make the execution observable immediately instead of asking users to
+  // discover that the job name doubles as a hidden history control.
+  selectedId.value = id
+  await cronJobs.runJob(id)
+  if (selectedId.value === id) await cronRuns.loadRuns(id)
 }
 
 function onHorizonClick(id: string) {
@@ -527,6 +539,19 @@ async function confirmDelete() {
 
 .cron-toolbar__actions {
   flex-wrap: wrap;
+}
+
+.cron-toolbar__refresh-label {
+  display: grid;
+}
+
+.cron-toolbar__refresh-label > span {
+  grid-area: 1 / 1;
+  white-space: nowrap;
+}
+
+.cron-toolbar__refresh-label > .is-hidden {
+  visibility: hidden;
 }
 
 .cron-toolbar .btn.is-active {
@@ -654,19 +679,25 @@ async function confirmDelete() {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   box-shadow: var(--elev-3);
+  display: flex;
+  flex-direction: column;
   max-height: min(760px, calc(100vh - 56px));
   max-width: 980px;
-  overflow: auto;
-  padding: 22px;
+  overflow: hidden;
   width: 100%;
 }
 
 .automation-template-modal__head {
   align-items: flex-start;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
   display: flex;
+  flex: 0 0 auto;
   gap: 20px;
   justify-content: space-between;
-  margin-bottom: 18px;
+  padding: 22px;
+  position: relative;
+  z-index: 1;
 }
 
 .automation-template-modal__head h2 {
@@ -682,15 +713,23 @@ async function confirmDelete() {
 
 .automation-template-grid--modal {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 18px 22px 22px;
+  scrollbar-gutter: stable;
 }
 .cron-search-wrap {
   align-items: center;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+  box-sizing: border-box;
   display: flex;
+  flex: 0 0 232px;
   gap: 8px;
   padding: 0 12px;
+  width: 232px;
 }
 
 .cron-search-icon {
@@ -717,8 +756,11 @@ async function confirmDelete() {
     box-shadow var(--dur-fast) var(--ease-standard);
 }
 .cron-search-wrap:focus-within {
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--border));
+  box-shadow: none;
+}
+.cron-search-wrap:focus-within .cron-search-icon {
+  color: var(--accent);
 }
 .cron-search-icon {
   align-items: center;
@@ -729,19 +771,27 @@ async function confirmDelete() {
   line-height: 0;
   width: 18px;
 }
-.cron-search-input:not([type="radio"]):not([type="checkbox"]) {
-  background: transparent;
+#app .cron-search-wrap > input.cron-search-input,
+#app .cron-search-wrap > input.cron-search-input:focus {
+  appearance: none;
+  background: transparent !important;
   border: 0;
   border-radius: 0;
-  box-shadow: none;
+  box-shadow: none !important;
+  box-sizing: border-box;
+  flex: 1 1 auto;
   height: 36px;
   line-height: 20px;
-  padding: 8px 0;
-}
-.cron-search-input:not([type="radio"]):not([type="checkbox"]):focus {
-  border: 0;
-  box-shadow: none;
+  min-height: 0;
+  min-width: 0;
   outline: 0;
+  padding: 8px 0;
+  width: 100%;
+}
+
+#app .cron-search-wrap > input.cron-search-input::-webkit-search-decoration,
+#app .cron-search-wrap > input.cron-search-input::-webkit-search-cancel-button {
+  appearance: none;
 }
 
 .stat--hero {
@@ -2046,6 +2096,28 @@ async function confirmDelete() {
   gap: 6px;
 }
 
+.cron-time-picker {
+  align-items: center;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  transition: border-color var(--dur-fast), box-shadow var(--dur-fast);
+}
+
+.cron-time-picker:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.cron-time-selects__separator {
+  color: var(--text-muted);
+  font-size: var(--fs-md);
+  font-weight: 650;
+  padding: 0 2px;
+}
+
 .cron-friendly-time-input {
   font-family: var(--font-sans);
   font-variant-numeric: tabular-nums;
@@ -2344,7 +2416,9 @@ async function confirmDelete() {
   }
 
   .cron-search-wrap {
+    flex-basis: auto;
     grid-column: 1 / -1;
+    width: 100%;
   }
 
   .cron-toolbar__refresh {
@@ -2375,7 +2449,15 @@ async function confirmDelete() {
     border-bottom-left-radius: 0;
     border-bottom-right-radius: 0;
     max-height: 88vh;
+    padding: 0;
+  }
+
+  .automation-template-modal__head {
     padding: 18px;
+  }
+
+  .automation-template-grid--modal {
+    padding: 14px 18px 18px;
   }
 
   .automation-template-grid--modal {

@@ -18,7 +18,7 @@
           <span v-if="s.proposal_id" class="sk-prop-hash" :title="t('cronSkills.autoEnabled.proposalId')">{{ s.proposal_id }}</span>
         </div>
         <div class="sk-proposal-row__actions">
-          <button class="btn btn--ghost btn--sm" type="button" @click="emit('disable', s.name)">{{ t('cronSkills.autoEnabled.disable') }}</button>
+          <button class="btn btn--ghost btn--sm" type="button" :disabled="mutationDisabled" @click="emit('disable', s.name)">{{ t('cronSkills.autoEnabled.disable') }}</button>
         </div>
       </div>
     </div>
@@ -33,6 +33,7 @@ const { t } = useI18n()
 
 defineProps<{
   skills: AutoEnabledSkill[]
+  mutationDisabled?: boolean
 }>()
 
 const emit = defineEmits<{

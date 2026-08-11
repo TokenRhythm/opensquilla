@@ -62,6 +62,41 @@ describe('useChatCompaction replay compatibility', () => {
     }
   })
 
+  it('distinguishes within-budget skips from compaction vetoes', () => {
+    const benign = createHarness()
+    const vetoed = createHarness()
+    try {
+      benign.api.showCompactionToast({
+        status: 'skipped',
+        source: 'manual',
+        reason: 'within_compaction_budget',
+      })
+      vetoed.api.showCompactionToast({
+        status: 'skipped',
+        source: 'manual',
+        reason: 'no_safe_turn_boundary',
+      })
+
+      expect(benign.api.compactStatus.value).toMatchObject({
+        status: 'skipped',
+        tone: 'info',
+        message: 'No organization needed; context has enough space',
+        reason: 'within_compaction_budget',
+      })
+      expect(vetoed.api.compactStatus.value).toMatchObject({
+        status: 'skipped',
+        tone: 'warn',
+        message: 'Context organization was not applied',
+        reason: 'no_safe_turn_boundary',
+      })
+    } finally {
+      benign.api.cleanup()
+      benign.stop()
+      vetoed.api.cleanup()
+      vetoed.stop()
+    }
+  })
+
   it('settles optimistic busy from a replayed terminal before the id acknowledgement', () => {
     const h = createHarness()
     try {

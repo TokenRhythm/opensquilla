@@ -60,6 +60,53 @@ afterEach(() => {
 })
 
 describe('useSkillDetailController', () => {
+  it('passes the selected lifecycle identity and fences same-name candidate responses', async () => {
+    const managed = deferred<Skill>()
+    const workspace = deferred<Skill>()
+    const call = vi.fn((_method: string, params?: Record<string, unknown>) => {
+      return params?.instanceId === 'managed:1' ? managed.promise : workspace.promise
+    })
+    const installDeps = vi.fn(async () => completeOutcome())
+    const { controller, unmount } = mountController({ rpc: { call }, installDeps })
+
+    const openManaged = controller.openSkill({
+      name: 'shared',
+      layer: 'managed',
+      instance_id: 'managed:1',
+      install_id: 'install-managed',
+    })
+    const openWorkspace = controller.openSkill({
+      name: 'shared',
+      layer: 'workspace',
+      instance_id: 'workspace:2',
+    })
+    workspace.resolve({
+      name: 'shared',
+      layer: 'workspace',
+      instance_id: 'workspace:2',
+      content: '# workspace',
+    })
+    await openWorkspace
+    managed.resolve({
+      name: 'shared',
+      layer: 'managed',
+      instance_id: 'managed:1',
+      install_id: 'install-managed',
+      content: '# managed',
+    })
+    await openManaged
+
+    expect(call).toHaveBeenCalledWith('skills.get', {
+      name: 'shared',
+      includeLifecycle: true,
+      instanceId: 'managed:1',
+      installId: 'install-managed',
+    })
+    expect(controller.selectedSkill.value?.instance_id).toBe('workspace:2')
+    expect(controller.selectedSkill.value?.content).toBe('# workspace')
+    unmount()
+  })
+
   it('ignores an older skills.get response after another skill is opened', async () => {
     const first = deferred<Skill>()
     const second = deferred<Skill>()
@@ -96,6 +143,40 @@ describe('useSkillDetailController', () => {
     const installed = await controller.installCurrentDependencies('render', 'ffmpeg')
 
     expect(installed).toBe(false)
+    expect(installDeps).not.toHaveBeenCalled()
+    expect(controller.selectedSkillError.value).not.toBe('')
+    unmount()
+  })
+
+  it('never sends a name-only dependency mutation for a shadowed exact candidate', async () => {
+    const shadowed: Skill = {
+      ...missingBinaryDetail('shared'),
+      layer: 'managed',
+      instance_id: 'managed:shared',
+      install_id: 'install-shared',
+      active: false,
+      lifecycle: {
+        install_state: 'tracked',
+        load_state: 'loaded',
+        selection_state: 'shadowed',
+        compatibility_state: 'instruction_only',
+        readiness_state: 'needs_setup',
+      },
+    }
+    const call = vi.fn(async () => shadowed)
+    const installDeps = vi.fn(async () => completeOutcome())
+    const { controller, unmount } = mountController({ rpc: { call }, installDeps })
+
+    await controller.openSkill(shadowed)
+    const installed = await controller.installCurrentDependencies('shared', 'ffmpeg')
+
+    expect(installed).toBe(false)
+    expect(call).toHaveBeenLastCalledWith('skills.get', {
+      name: 'shared',
+      includeLifecycle: true,
+      instanceId: 'managed:shared',
+      installId: 'install-shared',
+    })
     expect(installDeps).not.toHaveBeenCalled()
     expect(controller.selectedSkillError.value).not.toBe('')
     unmount()

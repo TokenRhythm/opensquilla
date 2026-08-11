@@ -1,0 +1,70 @@
+name: Live Skill Hub Canary
+
+"on":
+  schedule:
+    - cron: "23 5 * * 2,5"
+  workflow_dispatch:
+    inputs:
+      fixture_revision:
+        description: 40-character commit SHA for the repository-owned canary fixture; defaults to this workflow revision
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-skill-hub-canary
+  cancel-in-progress: false
+
+jobs:
+  live-skill-hub:
+    name: Fetch, publish, view, verify immutable no-op, and uninstall
+    if: github.repository == 'opensquilla/opensquilla'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      OPENSQUILLA_RUN_LIVE_SKILL_HUB: "1"
+      OPENSQUILLA_LIVE_SKILL_FIXTURE_REVISION: ${{ inputs.fixture_revision || github.sha }}
+      OPENSQUILLA_LIVE_SKILL_INSTALL_REFERENCE: ${{ format('{0}@{1}:tests/fixtures/live_skill_hub/opensquilla-live-skill-hub-canary', github.repository, inputs.fixture_revision || github.sha) }}
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install test dependencies
+        run: uv sync --extra dev --frozen
+
+      - name: Validate the exact fixture revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${OPENSQUILLA_LIVE_SKILL_FIXTURE_REVISION}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "fixture_revision must be a full 40-character commit SHA" >&2
+            exit 2
+          fi
+
+      - name: Run the opt-in live delivery canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 300s uv run pytest \
+            tests/live/test_skill_hub_canary_live.py \
+            -m live_skill_hub \
+            --strict-markers \
+            -q -s

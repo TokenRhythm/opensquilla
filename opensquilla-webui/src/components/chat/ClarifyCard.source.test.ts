@@ -56,7 +56,9 @@ describe('ClarifyCard submit feedback', () => {
     expect(chatViewSource).toContain(':docked="true"')
     expect(chatViewSource).toContain(':submitted="clarifySubmitted"')
     expect(chatViewSource).not.toContain("&& !clarifySubmitted.value")
-    expect(chatViewSource).toContain(':input-disabled="Boolean(dockedPlanQuestionnaire)"')
+    expect(chatViewSource).toContain(
+      ':input-disabled="Boolean(dockedPlanQuestionnaire) || Boolean(forkTransition)"',
+    )
     expect(composerSource).toContain(':disabled="inputDisabled"')
   })
 

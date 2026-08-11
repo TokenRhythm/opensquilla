@@ -336,7 +336,7 @@ def artifact_status_line(artifact: dict[str, Any]) -> str:
 
 
 async def stream_response_gateway(
-    client: _slash_bridge.GatewayClientLike,
+    client: Any,
     session_key: str,
     message: str,
     elevated_state: dict[str, str | None] | None = None,

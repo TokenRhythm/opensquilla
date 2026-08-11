@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -80,6 +81,198 @@ def test_external_add_modify_delete_publish_on_next_probe(tmp_path: Path) -> Non
     removed = loader.refresh_if_changed("test")
     assert removed.removed == ("alpha",)
     assert loader.get_by_name("alpha") is None
+
+
+def test_supporting_resource_change_publishes_new_tree_digest(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    skill_file = _write_skill(root, "alpha")
+    resource = skill_file.parent / "references" / "guide.md"
+    resource.parent.mkdir()
+    resource.write_text("first\n", encoding="utf-8")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+    old_digest = old.get_by_name("alpha").tree_digest  # type: ignore[union-attr]
+
+    resource.write_text("second and longer\n", encoding="utf-8")
+    result = loader.refresh_if_changed("resource update")
+
+    assert result.modified == ("alpha",)
+    assert result.generation == old.generation + 1
+    assert loader.get_by_name("alpha").tree_digest != old_digest  # type: ignore[union-attr]
+
+
+def test_verified_reload_stays_hidden_until_durable_barrier_commit(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "old")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+
+    with loader.catalog_publication_barrier("test") as publication:
+        with loader.mutation_guard("test"):
+            _write_skill(root, "alpha", "new")
+        result = loader.reload_verified(lambda candidate: None, reason="test")
+
+        assert result.success is True
+        assert result.generation == old.generation + 1
+        assert loader.snapshot() is old
+        assert loader.get_by_name("alpha").description == "old"  # type: ignore[union-attr]
+        assert loader.refresh_if_changed("concurrent-turn").generation == old.generation
+        publication.commit()
+
+    assert loader.snapshot().generation == old.generation + 1
+    assert loader.get_by_name("alpha").description == "new"  # type: ignore[union-attr]
+
+
+def test_same_layer_symlinked_manifests_keep_distinct_candidate_identity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    shared = root / "shared.md"
+    shared.write_text(
+        "---\nname: shared\ndescription: shared internal manifest\n---\nBody.\n",
+        encoding="utf-8",
+    )
+    try:
+        for directory_name in ("a", "b"):
+            directory = root / directory_name
+            directory.mkdir()
+            (directory / "SKILL.md").symlink_to(shared)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are unavailable on this platform")
+
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    snapshot = loader.snapshot()
+
+    assert len(snapshot.candidates) == 2
+    assert len(snapshot.shadowed) == 1
+    assert len({candidate.instance_id for candidate in snapshot.candidates}) == 2
+    assert len({candidate.file_path for candidate in snapshot.candidates}) == 2
+
+
+def test_symlinked_manifest_outside_layer_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    directory = root / "escaped"
+    directory.mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text(
+        "---\nname: escaped\ndescription: outside manifest\n---\nBody.\n",
+        encoding="utf-8",
+    )
+    try:
+        (directory / "SKILL.md").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are unavailable on this platform")
+
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+
+    assert loader.snapshot().skills == ()
+    assert any("manifest escapes layer root" in error.message for error in loader.snapshot().errors)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux permits byte-oriented filenames that macOS and Windows reject",
+)
+def test_local_non_utf8_supporting_filename_does_not_break_catalog(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    skill_file = _write_skill(root, "byte-name")
+    raw_path = os.fsencode(skill_file.parent) + b"/asset-\xff.bin"
+    descriptor = os.open(raw_path, os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, b"payload")
+    finally:
+        os.close(descriptor)
+
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+
+    assert loader.get_by_name("byte-name") is not None
+    assert loader.snapshot().errors == ()
+
+
+def test_rejected_verified_reload_never_replaces_visible_catalog(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "old")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+
+    def reject(_candidate) -> None:
+        raise RuntimeError("synthetic postflight rejection")
+
+    with loader.catalog_publication_barrier("test"):
+        with loader.mutation_guard("test"):
+            _write_skill(root, "alpha", "rejected")
+        result = loader.reload_verified(reject, reason="test")
+        assert result.success is False
+        assert result.generation == old.generation
+        assert loader.snapshot() is old
+
+    assert loader.snapshot() is old
+    assert loader.get_by_name("alpha").description == "old"  # type: ignore[union-attr]
+
+
+def test_concurrent_reload_cannot_report_provisional_generation(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "old")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+    verifier_entered = threading.Event()
+    release_verifier = threading.Event()
+    verified_results = []
+    reader_results = []
+
+    def blocked_verifier(_candidate) -> None:
+        verifier_entered.set()
+        assert release_verifier.wait(timeout=5)
+
+    with loader.catalog_publication_barrier("test") as publication:
+        with loader.mutation_guard("test"):
+            _write_skill(root, "alpha", "new")
+        verified_thread = threading.Thread(
+            target=lambda: verified_results.append(
+                loader.reload_verified(blocked_verifier, reason="test")
+            )
+        )
+        verified_thread.start()
+        assert verifier_entered.wait(timeout=5)
+        reader_thread = threading.Thread(
+            target=lambda: reader_results.append(loader.reload(reason="concurrent-rpc"))
+        )
+        reader_thread.start()
+        release_verifier.set()
+        verified_thread.join(timeout=5)
+        reader_thread.join(timeout=5)
+
+        assert verified_results[0].generation == old.generation + 1
+        assert reader_results[0].changed is False
+        assert reader_results[0].generation == old.generation
+        assert loader.snapshot() is old
+        publication.commit()
+
+    assert loader.snapshot().generation == old.generation + 1
+
+
+def test_hidden_resource_change_is_part_of_catalog_tree_digest(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    skill_file = _write_skill(root, "alpha")
+    hidden = skill_file.parent / ".runtime-policy"
+    hidden.write_text("first\n", encoding="utf-8")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    generation = loader.snapshot().generation
+
+    hidden.write_text("changed\n", encoding="utf-8")
+    result = loader.refresh_if_changed("hidden resource update")
+
+    assert result.modified == ("alpha",)
+    assert result.generation == generation + 1
 
 
 def test_invalid_new_is_ignored_and_invalid_existing_keeps_last_good(tmp_path: Path) -> None:
@@ -169,6 +362,38 @@ def test_new_override_and_removal_restore_lower_layer(tmp_path: Path) -> None:
     result = loader.refresh_if_changed("test")
     assert result.modified == ("alpha",)
     assert loader.get_by_name("alpha").description == "low"  # type: ignore[union-attr]
+
+
+def test_managed_recovery_quarantine_keeps_lkg_but_refreshes_other_layers(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "managed"
+    workspace = tmp_path / "workspace"
+    _write_skill(managed, "managed-skill", "managed old")
+    _write_skill(workspace, "workspace-skill", "workspace old")
+    loader = SkillLoader(
+        managed_dir=managed,
+        workspace_dir=workspace,
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+    loader.load_all()
+
+    _write_skill(managed, "managed-skill", "managed uncommitted")
+    _write_skill(managed, "managed-new", "managed uncommitted")
+    _write_skill(workspace, "workspace-skill", "workspace new")
+    loader.freeze_catalog_for_recovery(reason="test.recovery")
+
+    refreshed = loader.refresh_if_changed("test.non-managed-refresh")
+
+    assert refreshed.modified == ("workspace-skill",)
+    assert loader.get_by_name("managed-skill").description == "managed old"  # type: ignore[union-attr]
+    assert loader.get_by_name("managed-new") is None
+    assert loader.get_by_name("workspace-skill").description == "workspace new"  # type: ignore[union-attr]
+
+    loader.clear_catalog_recovery_freeze()
+    loader.refresh_if_changed("test.recovery-cleared")
+    assert loader.get_by_name("managed-skill").description == "managed uncommitted"  # type: ignore[union-attr]
+    assert loader.get_by_name("managed-new") is not None
 
 
 def test_missing_root_created_after_start_is_discovered(tmp_path: Path) -> None:
@@ -448,7 +673,7 @@ def test_publish_writes_snapshot_without_reentering_loader(
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
 
 
-def test_snapshot_v12_is_invalid_and_v13_round_trips_atomically(tmp_path: Path) -> None:
+def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     snapshot_path = tmp_path / "snapshot.json"
@@ -459,12 +684,16 @@ def test_snapshot_v12_is_invalid_and_v13_round_trips_atomically(tmp_path: Path) 
     loader.load_all()
     loader.save_snapshot()
     data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert data["version"] == 13
+    assert data["version"] == 15
     assert all("mtime_ns" in entry for entry in data["manifest"].values())
+    assert all("tree_state" in entry for entry in data["manifest"].values())
+    assert data["skills"][0]["tree_digest"]
     assert not list(tmp_path.glob(".snapshot.json.*.tmp"))
 
     restored = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
-    assert [skill.name for skill in restored.load_snapshot() or []] == ["alpha"]
+    restored_skills = restored.load_snapshot() or []
+    assert [skill.name for skill in restored_skills] == ["alpha"]
+    assert restored_skills[0].tree_digest == data["skills"][0]["tree_digest"]
 
 
 def test_description_zh_is_parsed_and_survives_snapshot_round_trip(tmp_path: Path) -> None:

@@ -7,6 +7,9 @@ preserved) rather than silently dropping the tail of the list.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from opensquilla.skills.filter import build_skills_prompt
 from opensquilla.skills.injector import (
     DEFAULT_DESCRIPTION_LIMIT,
     SkillInjector,
@@ -78,6 +81,22 @@ def test_inject_full_truncates_long_descriptions() -> None:
     # Default inject_full (no desc_limit) keeps the description verbatim.
     out_full = inj.inject_full("", [_skill("verbose", long_desc)])
     assert "word word word" in out_full
+
+
+def test_prompt_renderers_hide_locations_by_default_with_explicit_opt_in() -> None:
+    skill = _skill("portable")
+    skill.path = Path("/synthetic/host/skills/portable/SKILL.md")
+    skill.file_path = str(skill.path)
+
+    injector = SkillInjector()
+    assert "<location>" not in injector.inject_full("", [skill])
+    assert "<location>" not in injector.inject_compact("", [skill])
+    assert "<location>" not in build_skills_prompt([skill])
+
+    expected = f"<location>{skill.path}</location>"
+    assert expected in injector.inject_full("", [skill], include_location=True)
+    assert expected in injector.inject_compact("", [skill], include_location=True)
+    assert expected in build_skills_prompt([skill], include_location=True)
 
 
 # ── graceful degradation ─────────────────────────────────────────────────────

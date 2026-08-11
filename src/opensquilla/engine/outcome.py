@@ -71,6 +71,7 @@ class TurnOutcome:
     reason: str
     error_class: str | None = None
     error_message: str | None = None
+    failure_kind: str | None = None
     retryable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -86,6 +87,7 @@ def outcome_from_error(
     code: str | None,
     message: str | None = None,
     error_class: str | None = None,
+    failure_kind: str | None = None,
 ) -> TurnOutcome:
     normalized = _normalize_code(code)
     text = message or None
@@ -95,6 +97,7 @@ def outcome_from_error(
             reason=normalized,
             error_class=error_class or normalized,
             error_message=text,
+            failure_kind=failure_kind or None,
             retryable=True,
         )
     if normalized in _PARTIAL_CODES:
@@ -103,6 +106,7 @@ def outcome_from_error(
             reason=normalized,
             error_class=error_class or normalized,
             error_message=text,
+            failure_kind=failure_kind or None,
             retryable=normalized == "provider_output_truncated",
         )
     if normalized in _INTERRUPTED_CODES:
@@ -111,6 +115,7 @@ def outcome_from_error(
             reason=normalized,
             error_class=error_class or normalized,
             error_message=text,
+            failure_kind=failure_kind or None,
             retryable=True,
         )
     if normalized in _BLOCKED_CODES:
@@ -119,6 +124,7 @@ def outcome_from_error(
             reason=normalized,
             error_class=error_class or normalized,
             error_message=text,
+            failure_kind=failure_kind or None,
             retryable=True,
         )
     return TurnOutcome(
@@ -126,6 +132,7 @@ def outcome_from_error(
         reason=normalized or "error",
         error_class=error_class or normalized or "error",
         error_message=text,
+        failure_kind=failure_kind or None,
     )
 
 

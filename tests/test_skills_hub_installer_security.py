@@ -35,6 +35,21 @@ def _bundle(
     )
 
 
+def test_legacy_quarantine_argument_does_not_fork_transaction_journal(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "managed"
+    quarantine = tmp_path / "quarantine"
+    installer = SkillInstaller(
+        router=FakeRouter(None),
+        managed_dir=managed,
+        quarantine_dir=quarantine,
+        lockfile_path=tmp_path / "lock.json",
+    )
+
+    assert installer.journal_path != quarantine / "skill-transaction.json"
+
+
 @pytest.mark.asyncio
 async def test_install_blocks_path_traversal(tmp_path: Path) -> None:
     outside = tmp_path / "outside.txt"
@@ -54,8 +69,10 @@ async def test_install_blocks_path_traversal(tmp_path: Path) -> None:
 
     result = await installer.install("demo", "clawhub")
 
-    assert result.success is True
+    assert result.success is False
+    assert any(d.code == "CANDIDATE_PREPARATION_FAILED" for d in result.diagnostics)
     assert not outside.exists()
+    assert not (tmp_path / "managed" / "demo").exists()
 
 
 @pytest.mark.asyncio
@@ -159,8 +176,9 @@ async def test_uninstall_does_not_delete_lockfile_path_outside_managed(
 
     result = await installer.uninstall("demo")
 
-    assert result.success is True
+    assert result.success is False
     assert outside.exists()
+    assert Lockfile.load(lock_path).get("demo") is not None
 
 
 @pytest.mark.asyncio

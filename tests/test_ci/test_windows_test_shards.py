@@ -50,6 +50,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/integration/cli/tui_real_terminal/test_source_gateway_bootstrap_startup.py",
     "tests/integration/cli/tui_real_terminal/test_terminal_changes.py",
     "tests/live/test_search_api_matrix_live.py",
+    "tests/live/test_skill_hub_canary_live.py",
     "tests/live/test_multi_provider_matrix_live.py",
     "tests/live/test_search_retrieval_live.py",
     "tests/live/test_tokenrhythm_catalog_live.py",
@@ -62,6 +63,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/unit/cli/tui/test_keys_cheatsheet.py",
     "tests/unit/cli/tui/test_opentui_prefs.py",
     "tests/test_cli/test_gateway_client_steer.py",
+    "tests/test_cli/test_skills_search_cmd.py",
     "tests/test_channels/test_admission_reason_persistence.py",
     "tests/test_channels/test_channel_admission.py",
     "tests/test_channels/test_channel_certification.py",
@@ -192,6 +194,13 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_tools/test_shell_self_kill_policy.py",
     "tests/test_tools/test_run_mode_full_host_fallback.py",
     "tests/test_tools/test_workspace_write_deny_effects.py",
+    "tests/test_engine/test_goal_context_prompt.py",
+    "tests/test_engine/test_goal_routing_hint.py",
+    "tests/test_gateway/test_goal_rpc.py",
+    "tests/test_migrations/test_v033_goal_runs.py",
+    "tests/test_migrations/test_v034_goal_message_anchor.py",
+    "tests/test_session/test_goal_storage.py",
+    "tests/test_session/test_goals.py",
 }
 
 

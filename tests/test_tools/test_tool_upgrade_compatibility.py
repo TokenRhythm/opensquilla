@@ -90,4 +90,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "user_input_provider",
         "plan_revision",
         "plan_run",
+        "goal_run",
+        "goal_context",
+        "goal_service",
     ]

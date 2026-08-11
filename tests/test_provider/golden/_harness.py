@@ -58,8 +58,9 @@ _NEUTRAL_MODEL = "test-chat-model"
 # kind -> (model id, reasoning dialect resolved when thinking is requested).
 # Model ids are derived from the code paths that trigger each dialect —
 # ModelCatalog.get_capabilities prefix ladders and compat_policy model-id
-# sets — never invented. "none" kinds freeze the omission: a thinking
-# request must serialize with no reasoning field at all.
+# sets — never invented. "none" normally freezes omission; an exact
+# endpoint/model compat rule may deliberately override neutral catalog
+# metadata, which its request golden then freezes explicitly.
 COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     # api.openai.com host + gpt-5 prefix ladder (model_catalog) -> "openai";
     # gpt-5.4 is also in max_completion_tokens and omit-temperature-when-
@@ -104,11 +105,9 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     # "tencent_tokenhub" dialect; the policy also requires assistant
     # reasoning_content replay for the hy3 ids, frozen by the tools golden.
     "tencent_tokenhub": ("hy3", "tencent_tokenhub"),
-    # [tokenrhythm."deepseek-v4-flash"] corrections row pins
-    # reasoning_format="none": the relay streams reasoning_content on its
-    # own but 400s on any thinking payload, so the thinking golden freezes
-    # the omission. The id is also in require_reasoning_content_model_ids,
-    # so the tools golden freezes assistant reasoning_content replay.
+    # The mixed-family catalog remains neutral, while the exact official V4
+    # request rule supplies DeepSeek-shaped thinking control and tool-call-only
+    # bounded reasoning replay. The request goldens freeze that override.
     "tokenrhythm": ("deepseek-v4-flash", "none"),
     "lm_studio": (_NEUTRAL_MODEL, "none"),
     "ovms": (_NEUTRAL_MODEL, "none"),

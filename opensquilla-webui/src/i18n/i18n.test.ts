@@ -282,6 +282,11 @@ describe('catalog parity', () => {
     }
   })
 
+  it('warns that removing a goal does not recall current-task work', () => {
+    expect(en.chat.goal.removeConfirmBody).toContain('use Stop')
+    expect(zhHans.chat.goal.removeConfirmBody).toContain('请使用“停止”')
+  })
+
   it('no zh-Hans value is left as the English source', () => {
     const enFlat = flatten(en as Record<string, unknown>)
     const zhFlat = flatten(zhHans as Record<string, unknown>)

@@ -33,6 +33,9 @@ class TaskLifecycleEvent:
     terminal_reason: str | None = None
     error_class: str | None = None
     error_message: str | None = None
+    # False only when TaskRuntime had to fall back to an in-memory terminal
+    # projection because the authoritative AgentTask update failed.
+    terminal_persisted: bool = True
 
 
 TaskLifecycleListener = Callable[[TaskLifecycleEvent], Awaitable[None]]
@@ -65,6 +68,13 @@ async def apply_task_lifecycle_to_session(
     Returns True when the persisted session lifecycle or recents-visible
     activity changed.
     """
+
+    # A terminal lifecycle callback can be emitted after TaskRuntime failed
+    # to persist the authoritative AgentTask terminal row. Projecting that
+    # in-memory fallback onto the session would make the session look done
+    # while recovery still has to abandon the task and pause any owning Goal.
+    if event.phase == "terminal" and not event.terminal_persisted:
+        return False
 
     get_session = getattr(session_manager, "get_session", None)
     if not callable(get_session):

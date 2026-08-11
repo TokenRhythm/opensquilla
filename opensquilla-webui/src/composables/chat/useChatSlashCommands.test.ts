@@ -32,6 +32,13 @@ function harness(
   const dispatchHidden = vi.fn()
   const dispatchPlanPrompt = vi.fn()
   const notify = vi.fn()
+  const armGoal = vi.fn(async () => true)
+  const startGoal = vi.fn(async () => true)
+  const goalStatus = vi.fn(async () => null)
+  const goalEdit = vi.fn(async () => true)
+  const goalPause = vi.fn(async () => true)
+  const goalResume = vi.fn(async () => true)
+  const goalClear = vi.fn(async () => true)
   const api = useChatSlashCommands({
     rpc,
     catalogCallOptions,
@@ -50,14 +57,28 @@ function harness(
     planModeAvailable: () => planModeAvailable,
     codingModeEnabled,
     setCodingModeEnabled,
+    armGoal,
+    startGoal,
+    goalStatus,
+    goalEdit,
+    goalPause,
+    goalResume,
+    goalClear,
   })
   return {
     activatePlanMode,
     api,
+    armGoal,
+    startGoal,
     codingModeEnabled,
     dispatchHidden,
     dispatchPlanPrompt,
     inputText,
+    goalStatus,
+    goalEdit,
+    goalPause,
+    goalResume,
+    goalClear,
     notify,
     rpc,
     setCodingModeEnabled,
@@ -370,5 +391,141 @@ describe('useChatSlashCommands recovery', () => {
     expect(inputText.value).toBe('/codng')
     expect(notify).toHaveBeenCalledWith(expect.stringContaining('/codng'))
     expect(notify).toHaveBeenCalledWith(expect.stringContaining('//'))
+  })
+})
+
+describe('useChatSlashCommands goal', () => {
+  const goalCommand = {
+    name: '/goal',
+    cmd: '/goal',
+    label: '/goal',
+    desc: 'Set a long-running goal for the agent to pursue.',
+    aliases: [],
+    execution: { action: 'goal.set' },
+  }
+
+  it('keeps menu selection as a Goal composer shortcut', async () => {
+    const { api, inputText, armGoal } = harness(false, [goalCommand])
+    inputText.value = '/go'
+
+    api.completeSlashCmd(goalCommand)
+    await Promise.resolve()
+
+    expect(armGoal).toHaveBeenCalledTimes(1)
+    expect(inputText.value).toBe('')
+  })
+
+  it('preserves the slash draft when Goal mode cannot be armed', async () => {
+    const { api, inputText, armGoal } = harness(false, [goalCommand])
+    armGoal.mockResolvedValueOnce(false)
+    inputText.value = '/go'
+
+    api.completeSlashCmd(goalCommand)
+    await Promise.resolve()
+
+    expect(armGoal).toHaveBeenCalledTimes(1)
+    expect(inputText.value).toBe('/go')
+  })
+
+  it('starts a fully specified /goal command immediately', async () => {
+    const { api, inputText, armGoal, startGoal, rpc } = harness(false, [goalCommand])
+    inputText.value = '/goal 完成迁移文档'
+
+    await api.executeSlashCommand(inputText.value)
+    await Promise.resolve()
+
+    expect(startGoal).toHaveBeenCalledWith('完成迁移文档')
+    expect(armGoal).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('')
+    expect(rpc.call).not.toHaveBeenCalledWith('goals.set', expect.anything())
+  })
+
+  it('accepts the explicit /goal set spelling without keeping set in the objective', async () => {
+    const { api, inputText, armGoal, startGoal } = harness(false, [goalCommand])
+    inputText.value = '/goal set 完成迁移文档'
+
+    await api.executeSlashCommand(inputText.value)
+    await Promise.resolve()
+
+    expect(startGoal).toHaveBeenCalledWith('完成迁移文档')
+    expect(armGoal).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('')
+  })
+
+  it('arms Goal mode when bare /goal has no current Goal', async () => {
+    const { api, inputText, armGoal, goalStatus, notify } = harness(false, [goalCommand])
+    inputText.value = '/goal'
+
+    await api.executeSlashCommand(inputText.value)
+    await Promise.resolve()
+
+    expect(goalStatus).toHaveBeenCalledTimes(1)
+    expect(armGoal).toHaveBeenCalledTimes(1)
+    expect(notify).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('')
+  })
+
+  it('reports the current Goal instead of arming a replacement for bare /goal', async () => {
+    const { api, inputText, armGoal, goalStatus, notify } = harness(false, [goalCommand])
+    goalStatus.mockResolvedValue({
+      objective: '完成迁移文档',
+      status: 'active',
+      turnsSettled: 3,
+    } as never)
+    inputText.value = '/goal'
+
+    await api.executeSlashCommand(inputText.value)
+    await Promise.resolve()
+
+    expect(goalStatus).toHaveBeenCalledTimes(1)
+    expect(armGoal).not.toHaveBeenCalled()
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('active'))
+  })
+
+  it('reports the active goal for /goal status', async () => {
+    const { api, inputText, notify, goalStatus } = harness(false, [goalCommand])
+    goalStatus.mockResolvedValue({
+      objective: '完成迁移文档',
+      status: 'active',
+      turnsSettled: 3,
+    } as never)
+    inputText.value = '/goal status'
+
+    await api.executeSlashCommand(inputText.value)
+
+    expect(goalStatus).toHaveBeenCalledTimes(1)
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('active'))
+  })
+
+  it('clears the active goal for /goal clear', async () => {
+    const { api, inputText, notify, goalClear } = harness(false, [goalCommand])
+    inputText.value = '/goal clear'
+
+    await api.executeSlashCommand(inputText.value)
+
+    expect(goalClear).toHaveBeenCalledTimes(1)
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('cleared'))
+  })
+
+  it('pauses and resumes via /goal pause and /goal resume', async () => {
+    const { api, inputText, notify, goalPause, goalResume } = harness(false, [goalCommand])
+    inputText.value = '/goal pause'
+    await api.executeSlashCommand(inputText.value)
+    expect(goalPause).toHaveBeenCalledTimes(1)
+
+    inputText.value = '/goal resume'
+    await api.executeSlashCommand(inputText.value)
+    expect(goalResume).toHaveBeenCalledTimes(1)
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('resumed'))
+  })
+
+  it('edits the current Goal through the authoritative Goal composable', async () => {
+    const { api, inputText, goalEdit, notify } = harness(false, [goalCommand])
+    inputText.value = '/goal edit 更新迁移目标'
+
+    await api.executeSlashCommand(inputText.value)
+
+    expect(goalEdit).toHaveBeenCalledWith('更新迁移目标')
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('next safe boundary'))
   })
 })

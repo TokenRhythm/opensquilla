@@ -21,7 +21,6 @@ type RpcClient = {
   call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
   on: (event: string, handler: (...args: unknown[]) => void) => () => void
 }
-
 interface PlanMutationResponse extends Record<string, unknown> {
   sessionKey?: string
   session_key?: string
@@ -307,7 +306,9 @@ export function useChatPlans(options: UseChatPlansOptions) {
       ?? source.snapshot
     if (rawPlan !== undefined) {
       if (rawPlan !== null) {
-        if (!staleEnvelope) applyPlanRevision(rawPlan, source)
+        if (!staleEnvelope) {
+          applyPlanRevision(rawPlan, source)
+        }
       } else if (!staleEnvelope) {
         currentPlan.value = null
         activePlanRun.value = null
@@ -320,7 +321,9 @@ export function useChatPlans(options: UseChatPlansOptions) {
       ?? source.run
     if (rawRun !== undefined) {
       if (rawRun !== null) {
-        if (!staleEnvelope) applyPlanRun(rawRun)
+        if (!staleEnvelope) {
+          applyPlanRun(rawRun)
+        }
       } else if (!staleEnvelope) {
         activePlanRun.value = null
       }

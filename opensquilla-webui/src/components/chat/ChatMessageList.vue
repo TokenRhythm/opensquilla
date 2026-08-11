@@ -20,6 +20,7 @@
       :download-attachment="downloadAttachment"
       :show-turn-outcome="isTurnTip(index)"
       :is-streaming="isStreaming"
+      :is-goal-source="isGoalSource(message)"
       @edit="$emit('editMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
     />
@@ -47,12 +48,14 @@
       :workbench-enabled="workbenchEnabled"
       :artifact-navigation-items="artifactNavigationItems"
       :copy-message="copyMessage"
-      :is-tip="index === lastAssistantIndex"
+      :is-tip="isForkableAssistant(index)"
       :fork-busy="forkBusy"
       :plan-action-pending="planActionPending"
       :plan-actions-disabled="planActionsDisabled"
       :show-turn-outcome="isTurnTip(index)"
-      @fork="$emit('forkConversation')"
+      :goal-outcome="goalOutcomeFor(message, index)"
+      :goal-elapsed="goalElapsed"
+      @fork="$emit('forkConversation', forkThroughTurnId(index))"
       @regenerate="$emit('regenerateMessage', $event)"
       @toggle-share="$emit('toggleShareMessage', $event)"
       @download-artifact="$emit('downloadArtifact', $event)"
@@ -92,6 +95,10 @@ import type {
   ToolResultContext,
 } from '@/types/chat'
 import type { ArtifactPayload } from '@/types/rpc'
+import {
+  goalHasSettledTerminalOutcome,
+  type GoalSnapshot,
+} from '@/composables/chat/useChatGoals'
 import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 
@@ -120,6 +127,8 @@ const props = defineProps<{
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
   isStreaming?: boolean
+  goal?: GoalSnapshot | null
+  goalElapsed?: string
 }>()
 
 defineEmits<{
@@ -131,7 +140,7 @@ defineEmits<{
   toggleToolGroup: [groupId: string]
   toggleToolItem: [renderKey: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
-  forkConversation: []
+  forkConversation: [throughTurnId?: string]
   resolveInterrupt: [id: string, decision: 'allow-once' | 'allow-always' | 'deny']
   extendInterrupt: [id: string]
   clarifySubmit: [fields: Record<string, string>, request?: NonNullable<Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>['clarify']>]
@@ -142,14 +151,34 @@ defineEmits<{
   planReplan: [target: PlanCardActionTarget]
 }>()
 
-// The conversation tip: forking is whole-conversation in this release, so the
-// fork action only renders on the thread's last assistant message.
+// Legacy transcripts can only use the whole-conversation fallback at the
+// current tip. Historical branches require a durable terminal turn identity so
+// the server, rather than a DOM/message index, owns the inclusive boundary.
 const lastAssistantIndex = computed(() => {
   for (let i = props.messages.length - 1; i >= 0; i--) {
     if (props.messages[i].displayRole === 'assistant' && !props.messages[i].stopNotice) return i
   }
   return -1
 })
+
+function forkThroughTurnId(index: number): string | undefined {
+  const turnId = props.messages[index]?.turnOutcome?.turnId?.trim()
+  return turnId || undefined
+}
+
+function isForkableAssistant(index: number): boolean {
+  const message = props.messages[index]
+  if (
+    props.isStreaming
+    || message?.displayRole !== 'assistant'
+    || message.stopNotice
+  ) return false
+  if (forkThroughTurnId(index)) return isTurnTip(index)
+  if (index !== lastAssistantIndex.value) return false
+  return !props.messages.slice(index + 1).some(next => (
+    next.displayRole === 'user' || next.displayRole === 'assistant'
+  ))
+}
 
 function isTurnTip(index: number): boolean {
   const message = props.messages[index]
@@ -163,5 +192,34 @@ function isTurnTip(index: number): boolean {
     if (next.displayRole === 'user') break
   }
   return true
+}
+
+function isGoalSource(message: ChatRenderedMessage): boolean {
+  const sourceMessageId = String(props.goal?.sourceMessageId || '').trim()
+  return Boolean(sourceMessageId && message.messageId === sourceMessageId)
+}
+
+function goalOutcomeFor(message: ChatRenderedMessage, index: number): GoalSnapshot | null {
+  const goal = props.goal
+  const terminalTurnId = String(goal?.terminalTurnId || '').trim()
+  if (
+    !goalHasSettledTerminalOutcome(goal)
+    || !terminalTurnId
+    || message.stopNotice
+    || message.turnId !== terminalTurnId
+  ) return null
+
+  // A turn may persist more than one assistant row while tools execute. Bind
+  // the durable outcome to the final visible assistant row in that turn so it
+  // is rendered exactly once beside the actual final response.
+  for (let nextIndex = index + 1; nextIndex < props.messages.length; nextIndex += 1) {
+    const next = props.messages[nextIndex]
+    if (
+      next.displayRole === 'assistant'
+      && !next.stopNotice
+      && next.turnId === terminalTurnId
+    ) return null
+  }
+  return goal ?? null
 }
 </script>
