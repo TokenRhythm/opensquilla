@@ -11572,6 +11572,7 @@ def test_agent_done_envelope_does_not_create_request_after_explicit_zero(
 
 def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     from opensquilla.eval import (
+        draco_agent_result,
         draco_ensemble_call_validation,
         draco_experiment_artifacts,
         draco_generation_recovery,
@@ -11594,6 +11595,19 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     assert resume_runner.publish_experiment_config_artifacts is (
         draco_experiment_artifacts.publish_experiment_config_artifacts
     )
+    for runner_module in (runner, resume_runner):
+        assert runner_module.IGNORED_AGENT_DONE_POLICY_EVIDENCE_KEY is (
+            draco_agent_result.IGNORED_AGENT_DONE_POLICY_EVIDENCE_KEY
+        )
+        assert runner_module.diagnostic_done_from_error_event is (
+            draco_agent_result.diagnostic_done_from_error_event
+        )
+        assert runner_module._shared_provider_done_from_agent_done is (
+            draco_agent_result.provider_done_from_agent_done_core
+        )
+        assert runner_module._shared_ignored_policy_evidence is (
+            draco_agent_result.ignored_agent_done_summary_policy_evidence_core
+        )
     for runner_module in (runner, resume_runner):
         assert runner_module._shared_g1_registry_contract_reasons is (
             draco_ensemble_call_validation.g1_registry_contract_reasons_core
@@ -11886,6 +11900,55 @@ def test_generation_retry_wrapper_binds_runner_callbacks_dynamically(
     assert observed["single_generation_identity_reason_fn"] is (
         module.single_generation_identity_reason
     )
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_agent_result_wrappers_bind_runner_callbacks_dynamically(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    def shared_provider(done: object, **kwargs: Any) -> object:
+        observed["done"] = done
+        observed.update(kwargs)
+        return done
+
+    recorder = object()
+    terminal = object()
+    monkeypatch.setattr(module, "_shared_provider_done_from_agent_done", shared_provider)
+    assert (
+        module.provider_done_from_agent_done(
+            terminal,
+            recorder=recorder,
+            fallback_model="fallback",
+        )
+        is terminal
+    )
+    assert observed["recorder"] is recorder
+    assert observed["ignored_agent_done_summary_policy_evidence_fn"] is (
+        module.ignored_agent_done_summary_policy_evidence
+    )
+
+    def shared_policy(summary: object, **kwargs: Any) -> object:
+        observed["summary"] = summary
+        observed.update(kwargs)
+        return summary
+
+    summary: dict[str, Any] = {}
+    monkeypatch.setattr(
+        module,
+        "_shared_ignored_policy_evidence",
+        shared_policy,
+    )
+    assert (
+        module.ignored_agent_done_summary_policy_evidence(
+            summary,
+            physical_rows=[],
+        )
+        is summary
+    )
+    assert observed["models_equivalent"] is module._formal_openrouter_models_equivalent
 
 
 def test_shared_criterion_scoring_preserves_partial_and_negative_semantics() -> None:
