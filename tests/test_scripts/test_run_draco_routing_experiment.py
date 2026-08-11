@@ -11449,9 +11449,15 @@ def test_agent_done_envelope_does_not_create_request_after_explicit_zero(
 
 
 def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
-    from opensquilla.eval import draco_usage_evidence
+    from opensquilla.eval import draco_experiment_artifacts, draco_usage_evidence
 
     resume_runner = _load_resume_runner()
+    assert runner.publish_experiment_config_artifacts is (
+        draco_experiment_artifacts.publish_experiment_config_artifacts
+    )
+    assert resume_runner.publish_experiment_config_artifacts is (
+        draco_experiment_artifacts.publish_experiment_config_artifacts
+    )
     shared_usage_functions = (
         "build_stable_receipt_evidence",
         "deduplicate_stable_usage_receipts",
@@ -11550,6 +11556,7 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         "run_one",
         "trace_row",
         "render_markdown",
+        "write_experiment_config_artifacts",
     )
 
     for name in critical:
@@ -22252,6 +22259,122 @@ def test_experiment_config_artifacts_publish_only_private_effective_and_safe_res
     assert not list(tmp_path.glob("*.experiment-config.base.json"))
     assert not list(tmp_path.glob("*.experiment-config.override-*.json"))
     assert not list(tmp_path.glob("*.experiment-config.inline-*.json"))
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_experiment_config_artifacts_publish_private_ranking_effective_config(
+    module,
+    tmp_path: Path,
+) -> None:
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            "tasks.jsonl",
+            "--groups",
+            "B2",
+        ]
+    )
+    module.apply_b2_g12_argument_alignment(args, ["B2"])
+    ranking_effective = {
+        "ranking": {"cost_weight": 0.25, "quality_weight": 0.75},
+        "模型": ["alpha", "beta"],
+    }
+    args._g1_registry_contract = {
+        "ranking_config_resolution": {
+            "effective_config": ranking_effective,
+            "reference_sha256": "sha256:" + "1" * 64,
+            "effective_config_sha256": "sha256:" + "2" * 64,
+            "digest": "sha256:" + "3" * 64,
+            "ignored_sha256_number": 4,
+        }
+    }
+
+    artifacts = module.write_experiment_config_artifacts(
+        tmp_path,
+        args=args,
+        stamp=f"ranking-{module.__name__.rsplit('_', 1)[-1]}",
+    )
+
+    assert set(artifacts) == {
+        "experiment_config_effective_json",
+        "experiment_config_resolution_json",
+        "ranking_config_effective_json",
+    }
+    ranking_path = Path(artifacts["ranking_config_effective_json"])
+    expected_ranking_document = (
+        json.dumps(
+            ranking_effective,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    assert ranking_path.read_text(encoding="utf-8") == expected_ranking_document
+    resolution = json.loads(
+        Path(artifacts["experiment_config_resolution_json"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert resolution["ranking_config_hashes"] == {
+        "effective_config_sha256": "sha256:" + "2" * 64,
+        "reference_sha256": "sha256:" + "1" * 64,
+    }
+    assert resolution["artifact_keys"] == sorted(artifacts)
+    for path in map(Path, artifacts.values()):
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.read_bytes().endswith(b"\n")
+
+
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_experiment_config_artifact_wrapper_uses_dynamic_contract_callbacks(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    args = module.build_parser().parse_args(
+        [
+            "--input",
+            "tasks.jsonl",
+            "--groups",
+            "B2",
+        ]
+    )
+    module.apply_b2_g12_argument_alignment(args, ["B2"])
+    expected_digest = "sha256:" + "a" * 64
+    expected_replay_validation = {
+        "replay_scope": "test-dynamic-contract",
+        "contract_fields": ["test"],
+    }
+    hashed_values: list[object] = []
+
+    def fake_canonical_json_sha256(value: object) -> str:
+        hashed_values.append(value)
+        return expected_digest
+
+    monkeypatch.setattr(module, "canonical_json_sha256", fake_canonical_json_sha256)
+    monkeypatch.setattr(
+        module,
+        "gateway_replay_validation_contract",
+        lambda: expected_replay_validation,
+    )
+
+    artifacts = module.write_experiment_config_artifacts(
+        tmp_path,
+        args=args,
+        stamp=f"callbacks-{module.__name__.rsplit('_', 1)[-1]}",
+    )
+
+    resolution = json.loads(
+        Path(artifacts["experiment_config_resolution_json"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert hashed_values == [
+        args._draco_experiment_config_bundle.config.model_dump(mode="json")
+    ]
+    assert resolution["effective_config"]["sha256"] == expected_digest
+    assert resolution["replay_validation"] == expected_replay_validation
 
 
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
