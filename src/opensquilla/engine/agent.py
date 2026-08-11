@@ -113,6 +113,9 @@ from opensquilla.execution_status import (
     mark_execution_status_truncated,
     runtime_execution_status,
 )
+from opensquilla.observability.ensemble_execution_metrics import (
+    log_ensemble_execution_metrics_once,
+)
 from opensquilla.observability.turn_call_log import TurnCallLogger
 from opensquilla.provider import (
     ChatConfig,
@@ -5344,17 +5347,19 @@ class Agent:
         def _record_ensemble_trace(
             trace: Any,
             *,
+            terminal_outcome: str,
+            metrics_already_emitted: bool,
             agent_call_index: int,
             agent_call_id: str,
             requested_model: str,
             requested_provider: str,
-        ) -> int | None:
+        ) -> tuple[int | None, bool]:
             nonlocal last_ensemble_trace
             nonlocal turn_ensemble_request_count
             nonlocal turn_ensemble_physical_request_count
             nonlocal turn_ensemble_usage_missing_count
             if not isinstance(trace, dict):
-                return None
+                return None, metrics_already_emitted
             trace_snapshot = copy.deepcopy(trace)
             ensemble_call_index = len(turn_ensemble_traces)
             turn_ensemble_traces.append(trace_snapshot)
@@ -5387,7 +5392,12 @@ class Agent:
                     "model_usage_ledger": [],
                 }
             )
-            return ensemble_call_index
+            metrics_emitted = log_ensemble_execution_metrics_once(
+                trace_snapshot,
+                terminal_outcome=terminal_outcome,
+                already_emitted=metrics_already_emitted,
+            )
+            return ensemble_call_index, metrics_emitted
 
         def _append_model_usage_ledger(
             rows: list[dict[str, Any]],
@@ -6580,6 +6590,7 @@ class Agent:
                         )
 
                     _got_done_event = False
+                    ensemble_metrics_emitted = False
                     attempt_user_visible_emitted = False
                     # Time-to-first-event for this provider call, stamped once
                     # at the first streamed event (diagnostics only).
@@ -7149,8 +7160,15 @@ class Agent:
                                     if isinstance(usage_breakdown, list)
                                     else []
                                 )
-                                ensemble_call_index = _record_ensemble_trace(
+                                (
+                                    ensemble_call_index,
+                                    ensemble_metrics_emitted,
+                                ) = _record_ensemble_trace(
                                     getattr(raw_ev, "ensemble_trace", None),
+                                    terminal_outcome="completed",
+                                    metrics_already_emitted=(
+                                        ensemble_metrics_emitted
+                                    ),
                                     agent_call_index=max(0, turn_llm_calls - 1),
                                     agent_call_id=call_id,
                                     requested_model=requested_model_id,
@@ -7380,8 +7398,15 @@ class Agent:
                                     error_ensemble_trace = getattr(
                                         diagnostic_done, "ensemble_trace", None
                                     )
-                                error_ensemble_call_index = _record_ensemble_trace(
+                                (
+                                    error_ensemble_call_index,
+                                    ensemble_metrics_emitted,
+                                ) = _record_ensemble_trace(
                                     error_ensemble_trace,
+                                    terminal_outcome="failed",
+                                    metrics_already_emitted=(
+                                        ensemble_metrics_emitted
+                                    ),
                                     agent_call_index=max(0, turn_llm_calls - 1),
                                     agent_call_id=call_id,
                                     requested_model=last_requested_model,

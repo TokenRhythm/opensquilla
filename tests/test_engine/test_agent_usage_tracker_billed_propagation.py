@@ -26,6 +26,9 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+import structlog.testing
+
 from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine.agent import (
     _model_usage_ledger,
@@ -37,6 +40,7 @@ from opensquilla.engine.types import ToolCall
 from opensquilla.engine.usage import UsageTracker
 from opensquilla.provider import ChatConfig, Message, ToolDefinition, ToolInputSchema
 from opensquilla.provider import DoneEvent as ProviderDoneEvent
+from opensquilla.provider import ErrorEvent as ProviderErrorEvent
 from opensquilla.provider import TextDeltaEvent as ProviderTextDeltaEvent
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEndEvent
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStartEvent
@@ -446,6 +450,85 @@ class _TwoStepEnsembleBreakdownProvider:
         return []
 
 
+class _TerminalSequenceEnsembleProvider:
+    provider_name = "fake"
+
+    def __init__(self, events: list[Any]) -> None:
+        self.events = events
+        self.calls = 0
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls += 1
+        return self._stream()
+
+    async def _stream(self) -> AsyncIterator[Any]:
+        for event in self.events:
+            yield event
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+@pytest.mark.parametrize(
+    ("event_order", "expected_outcome"),
+    [
+        ("error", "failed"),
+        ("done_then_error", "completed"),
+    ],
+)
+def test_agent_emits_one_ensemble_metric_per_provider_call(
+    event_order: str,
+    expected_outcome: str,
+) -> None:
+    trace = {
+        "fallback_used": False,
+        "physical_request_count": 1,
+        "candidates": [],
+    }
+    done = ProviderDoneEvent(
+        stop_reason="end_turn",
+        model="test-model",
+        ensemble_trace=trace,
+    )
+    error = ProviderErrorEvent(
+        message="synthetic terminal error",
+        code="invalid_request",
+        request_started=False,
+        physical_request_count=0,
+        ensemble_trace=trace,
+    )
+    provider = _TerminalSequenceEnsembleProvider(
+        [error] if event_order == "error" else [done, error]
+    )
+
+    async def run() -> None:
+        agent = Agent(
+            provider=provider,
+            config=AgentConfig(
+                max_iterations=1,
+                max_provider_retries=0,
+            ),
+        )
+        _ = [event async for event in agent.run_turn("hi")]
+
+    with structlog.testing.capture_logs() as captured:
+        asyncio.run(run())
+
+    rows = [
+        row
+        for row in captured
+        if row.get("event") == "llm_ensemble.execution.metrics"
+    ]
+    assert provider.calls == 1
+    assert len(rows) == 1
+    assert rows[0]["terminal_outcome"] == expected_outcome
+
+
 def test_agent_final_done_summarizes_ensemble_breakdown_across_tool_iterations() -> None:
     async def tool_handler(call: ToolCall) -> ToolResult:
         return ToolResult(
@@ -472,7 +555,40 @@ def test_agent_final_done_summarizes_ensemble_breakdown_across_tool_iterations()
         assert done_events
         return done_events[-1]
 
-    done = asyncio.run(run())
+    with structlog.testing.capture_logs() as captured:
+        done = asyncio.run(run())
+
+    execution_metrics = [
+        row
+        for row in captured
+        if row.get("event") == "llm_ensemble.execution.metrics"
+    ]
+    assert len(execution_metrics) == 2
+    assert [row["terminal_outcome"] for row in execution_metrics] == [
+        "completed",
+        "completed",
+    ]
+    assert all(
+        row["schema"] == "opensquilla.ensemble-execution-metrics/v1"
+        for row in execution_metrics
+    )
+    assert all(
+        row["physical_request_count_observed"] is False
+        for row in execution_metrics
+    )
+    assert all(
+        row["fallback_used_observed"] is False
+        for row in execution_metrics
+    )
+    assert all("fallback_used" not in row for row in execution_metrics)
+    assert all(
+        row["proposer_candidates_observed"] is False
+        for row in execution_metrics
+    )
+    assert all(
+        "proposer_candidate_count" not in row
+        for row in execution_metrics
+    )
 
     assert [row["model"] for row in done.model_usage_breakdown] == [
         "deepseek/deepseek-v4-pro",
