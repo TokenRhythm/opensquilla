@@ -99,6 +99,9 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "selection_family": "router_dynamic",
         "fallback_used_observed": True,
         "fallback_used": False,
+        "task_analyzer_observed": False,
+        "aggregator_recovery_observed": False,
+        "aggregator_stage_observed": False,
         "trace_size_observed": True,
         "trace_compact_json_bytes": len(
             json.dumps(
@@ -144,6 +147,307 @@ def test_terminal_trace_projects_content_free_bounded_stage_metrics() -> None:
         "unknown_usage_count_observed": True,
         "unknown_usage_count": 1,
     }
+    assert private_text not in json.dumps(metrics, sort_keys=True)
+
+
+def test_terminal_trace_projects_analyzer_and_aggregator_recovery() -> None:
+    private_text = "sk-private model/user/reasoning/error text"
+    trace: dict[str, Any] = {
+        "selection_plan": {
+            "task_analyzer": {
+                "source": "llm_provider",
+                "schema_valid": True,
+                "provider": private_text,
+                "model": private_text,
+                "fallback_reason": private_text,
+                "chain": {
+                    "attempt_outcomes": [
+                        {
+                            "outcome": "failed",
+                            "physical_request_count": 1,
+                            "reason": private_text,
+                        },
+                        {
+                            "outcome": "success",
+                            "physical_request_count": 1,
+                            "model": private_text,
+                        },
+                    ],
+                    "selected_index": 1,
+                    "exhausted": False,
+                    "deadline": {
+                        "configured_seconds": 2.0,
+                        "elapsed_seconds": 0.1254,
+                        "remaining_seconds": 1.8746,
+                        "expired": False,
+                    },
+                },
+            }
+        },
+        "aggregator_recovery": {
+            "attempts": [
+                {
+                    "kind": "primary",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "outcome": "failed",
+                    "code": private_text,
+                },
+                {
+                    "kind": "continuation",
+                    "request_started": True,
+                    "physical_request_count": 1,
+                    "outcome": "succeeded",
+                    "trigger": private_text,
+                },
+            ],
+            "success": True,
+            "selected_kind": "continuation",
+            "fallback_index": 0,
+            "continuation_count": 1,
+            "same_model_recovery_count": 0,
+            "exhausted": False,
+            "degraded": False,
+        },
+    }
+    before = deepcopy(trace)
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert trace == before
+    assert metrics["task_analyzer_observed"] is True
+    assert metrics["task_analyzer_source_family"] == "live_provider"
+    assert metrics["task_analyzer_schema_valid"] is True
+    assert metrics["task_analyzer_chain_attempt_count"] == 2
+    assert metrics["task_analyzer_chain_attempt_scan_count"] == 2
+    assert metrics["task_analyzer_chain_attempt_scan_capped"] is False
+    assert metrics["task_analyzer_chain_success_count"] == 1
+    assert metrics["task_analyzer_chain_failed_count"] == 1
+    assert metrics["task_analyzer_chain_physical_request_count"] == 2
+    assert metrics["task_analyzer_selected"] is True
+    assert metrics["task_analyzer_selected_index"] == 1
+    assert metrics["task_analyzer_exhausted"] is False
+    assert metrics["task_analyzer_deadline_configured_ms"] == 2_000
+    assert metrics["task_analyzer_elapsed_ms"] == 125
+    assert metrics["task_analyzer_deadline_remaining_ms"] == 1_875
+    assert metrics["task_analyzer_deadline_expired"] is False
+    assert metrics["aggregator_recovery_observed"] is True
+    assert metrics["aggregator_stage_observed"] is True
+    assert metrics["aggregator_recovery_attempt_count"] == 2
+    assert metrics["aggregator_recovery_attempt_scan_capped"] is False
+    assert metrics["aggregator_primary_attempt_count"] == 1
+    assert metrics["aggregator_continuation_attempt_count"] == 1
+    assert metrics["aggregator_request_started_count"] == 2
+    assert metrics["aggregator_physical_request_count"] == 2
+    assert metrics["aggregator_succeeded_attempt_count"] == 1
+    assert metrics["aggregator_failed_attempt_count"] == 1
+    assert metrics["aggregator_abandoned_attempt_count"] == 0
+    assert metrics["aggregator_unsuccessful_attempt_count"] == 1
+    assert metrics["aggregator_unavailable_attempt_count"] == 0
+    assert metrics["aggregator_unknown_outcome_attempt_count"] == 0
+    assert metrics["aggregator_selected_kind"] == "continuation"
+    assert metrics["aggregator_fallback_index"] == 0
+    assert metrics["aggregator_recovery_success"] is True
+    assert metrics["aggregator_recovery_exhausted"] is False
+    assert metrics["aggregator_recovery_degraded"] is False
+    assert metrics["aggregator_continuation_count"] == 1
+    assert metrics["aggregator_same_model_recovery_count"] == 0
+    assert private_text not in json.dumps(metrics, sort_keys=True)
+
+
+def test_preinitialized_recovery_block_does_not_enter_aggregator_denominator() -> None:
+    private_text = "private/provider:model"
+    trace = {
+        "aggregator_recovery": {
+            "schema": "opensquilla.ensemble-aggregator-recovery/v1",
+            "mode": "serving",
+            "candidate_count": 3,
+            "candidate_ids": [private_text],
+            "max_tokens_cap": 8_192,
+            "visible_answer_reserve_tokens": 1_024,
+            "attempts": [],
+            "proposer_reused": True,
+            "success": False,
+        },
+        "run_outcome": "proposer_quorum_failed",
+    }
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="failed",
+    )
+
+    assert metrics["aggregator_recovery_observed"] is True
+    assert metrics["aggregator_recovery_attempts_observed"] is True
+    assert metrics["aggregator_recovery_attempt_count"] == 0
+    assert metrics["aggregator_stage_observed"] is False
+    assert metrics["aggregator_recovery_success_observed"] is False
+    assert "aggregator_recovery_success" not in metrics
+    assert metrics["aggregator_recovery_exhausted_observed"] is False
+    assert metrics["aggregator_recovery_degraded_observed"] is False
+    assert metrics["aggregator_continuation_count_observed"] is False
+    assert metrics["aggregator_same_model_recovery_count_observed"] is False
+    assert private_text not in json.dumps(metrics, sort_keys=True)
+
+
+def test_abandoned_and_unknown_aggregator_outcomes_are_not_hidden() -> None:
+    private_text = "private failure code and model"
+    metrics = build_ensemble_execution_metrics(
+        {
+            "aggregator_recovery": {
+                "attempts": [
+                    {
+                        "kind": "primary",
+                        "request_started": True,
+                        "physical_request_count": 1,
+                        "outcome": "abandoned",
+                        "code": private_text,
+                    },
+                    {
+                        "kind": "future_recovery_kind",
+                        "request_started": True,
+                        "physical_request_count": 1,
+                        "outcome": "future_terminal_outcome",
+                        "requested_model": private_text,
+                    },
+                    {
+                        "kind": "model_fallback",
+                        "request_started": True,
+                        "physical_request_count": 1,
+                        "outcome": "member_unavailable",
+                    },
+                    {
+                        "kind": "model_fallback",
+                        "physical_request_count": 0,
+                        "outcome": "provider_build_failed",
+                    },
+                    {
+                        "kind": "model_fallback",
+                        "request_started": False,
+                        "physical_request_count": 0,
+                        "outcome": "runtime_health_deferred",
+                    },
+                ],
+                "success": False,
+                "exhausted": True,
+            }
+        },
+        terminal_outcome="failed",
+    )
+
+    assert metrics["aggregator_stage_observed"] is True
+    assert metrics["aggregator_failed_attempt_count"] == 0
+    assert metrics["aggregator_abandoned_attempt_count"] == 1
+    assert metrics["aggregator_unsuccessful_attempt_count"] == 1
+    assert metrics["aggregator_unavailable_attempt_count"] == 1
+    assert metrics["aggregator_unknown_outcome_attempt_count"] == 3
+    assert metrics["aggregator_unknown_kind_attempt_count"] == 1
+    assert (
+        metrics["aggregator_succeeded_attempt_count"]
+        + metrics["aggregator_failed_attempt_count"]
+        + metrics["aggregator_abandoned_attempt_count"]
+        + metrics["aggregator_unavailable_attempt_count"]
+        + metrics["aggregator_unknown_outcome_attempt_count"]
+        == metrics["aggregator_recovery_attempt_scan_count"]
+    )
+    assert metrics["aggregator_recovery_success"] is False
+    assert metrics["aggregator_recovery_exhausted"] is True
+    assert private_text not in json.dumps(metrics, sort_keys=True)
+
+
+def test_stage_projection_is_bounded_and_malformed_values_are_omitted() -> None:
+    private_text = "private model, provider, code, prompt, and reasoning"
+    analyzer_attempts = [
+        {
+            "outcome": "failed",
+            "physical_request_count": 1,
+            "reason": private_text,
+        }
+        for _ in range(10)
+    ]
+    aggregator_attempts = [
+        {
+            "kind": "model_fallback",
+            "request_started": False,
+            "physical_request_count": 0,
+            "outcome": "member_unavailable",
+            "requested_model": private_text,
+        }
+        for _ in range(18)
+    ]
+    trace: dict[str, Any] = {
+        "selection_plan": {
+            "task_analyzer": {
+                "source": private_text,
+                "schema_valid": 1,
+                "chain": {
+                    "attempt_outcomes": analyzer_attempts,
+                    "selected_index": None,
+                    "exhausted": True,
+                    "deadline": {
+                        "configured_seconds": 10**1000,
+                        "elapsed_seconds": -1.0,
+                        "remaining_seconds": True,
+                        "expired": True,
+                    },
+                },
+            }
+        },
+        "aggregator_recovery": {
+            "attempts": aggregator_attempts,
+            "success": False,
+            "selected_kind": private_text,
+            "fallback_index": True,
+            "continuation_count": -1,
+            "same_model_recovery_count": float("nan"),
+            "exhausted": True,
+            "degraded": True,
+        },
+    }
+    before = deepcopy(trace)
+
+    metrics = build_ensemble_execution_metrics(
+        trace,
+        terminal_outcome="completed",
+    )
+
+    assert trace == before
+    assert metrics["execution_status"] == "degraded"
+    assert metrics["task_analyzer_source_family"] == "unknown"
+    assert metrics["task_analyzer_schema_valid_observed"] is False
+    assert metrics["task_analyzer_chain_attempt_count"] == 10
+    assert metrics["task_analyzer_chain_attempt_scan_count"] == 8
+    assert metrics["task_analyzer_chain_attempt_scan_capped"] is True
+    assert metrics["task_analyzer_chain_failed_count"] == 8
+    assert metrics["task_analyzer_chain_physical_request_count"] == 8
+    assert metrics["task_analyzer_selected"] is False
+    assert "task_analyzer_selected_index" not in metrics
+    assert metrics["task_analyzer_exhausted"] is True
+    assert "task_analyzer_deadline_configured_ms" not in metrics
+    assert "task_analyzer_elapsed_ms" not in metrics
+    assert "task_analyzer_deadline_remaining_ms" not in metrics
+    assert metrics["task_analyzer_deadline_expired"] is True
+    assert metrics["aggregator_recovery_attempt_count"] == 18
+    assert metrics["aggregator_recovery_attempt_scan_count"] == 16
+    assert metrics["aggregator_recovery_attempt_scan_capped"] is True
+    assert metrics["aggregator_model_fallback_attempt_count"] == 16
+    assert metrics["aggregator_stage_observed"] is True
+    assert metrics["aggregator_abandoned_attempt_count"] == 0
+    assert metrics["aggregator_unsuccessful_attempt_count"] == 0
+    assert metrics["aggregator_unavailable_attempt_count"] == 16
+    assert metrics["aggregator_unknown_outcome_attempt_count"] == 0
+    assert metrics["aggregator_request_started_count"] == 0
+    assert metrics["aggregator_physical_request_count"] == 0
+    assert metrics["aggregator_selected_kind"] == "unknown"
+    assert metrics["aggregator_fallback_index_observed"] is False
+    assert "aggregator_fallback_index" not in metrics
+    assert metrics["aggregator_continuation_count_observed"] is False
+    assert "aggregator_continuation_count" not in metrics
+    assert metrics["aggregator_same_model_recovery_count_observed"] is False
+    assert "aggregator_same_model_recovery_count" not in metrics
     assert private_text not in json.dumps(metrics, sort_keys=True)
 
 
