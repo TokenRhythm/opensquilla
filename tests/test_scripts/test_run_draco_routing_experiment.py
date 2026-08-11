@@ -11572,6 +11572,7 @@ def test_agent_done_envelope_does_not_create_request_after_explicit_zero(
 def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     from opensquilla.eval import (
         draco_experiment_artifacts,
+        draco_judge_scoring,
         draco_runtime_contract,
         draco_usage_evidence,
     )
@@ -11616,6 +11617,10 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
     )
     for name in shared_usage_functions:
         shared = getattr(draco_usage_evidence, name)
+        assert getattr(runner, name) is shared
+        assert getattr(resume_runner, name) is shared
+    for name in ("clamp_percent", "coerce_weight", "score_criterion_judgments"):
+        shared = getattr(draco_judge_scoring, name)
         assert getattr(runner, name) is shared
         assert getattr(resume_runner, name) is shared
     critical = (
@@ -11713,6 +11718,91 @@ def test_main_and_resume_share_identical_critical_runtime_functions() -> None:
         runner._ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
         == resume_runner._ADMISSIBLE_NONTERMINAL_FALLBACK_CORE_REASONS
     )
+
+
+def test_shared_criterion_scoring_preserves_partial_and_negative_semantics() -> None:
+    from opensquilla.eval.draco_judge_scoring import score_criterion_judgments
+
+    judgments = [
+        {
+            "section_id": "facts",
+            "section_title": "Facts",
+            "weight": 3,
+            "met": True,
+        },
+        {
+            "section_id": "facts",
+            "section_title": "Facts",
+            "weight": 1,
+            "met": None,
+            "error": "judge_failed",
+        },
+        {
+            "section_id": "safety",
+            "section_title": "Safety",
+            "weight": -2,
+            "met": False,
+        },
+        {
+            "section_id": "safety",
+            "section_title": "Safety",
+            "weight": 2,
+            "met": False,
+        },
+    ]
+    original = deepcopy(judgments)
+
+    result = score_criterion_judgments(
+        rubric_id="rubric-v1",
+        judgments=judgments,
+        judge_model="judge-a",
+        judge_repeats=2,
+    )
+
+    assert judgments == original
+    assert result["criterion_judgments"] is judgments
+    assert result["rubric_criteria_count"] == 2
+    assert result["valid_criteria_count"] == 3
+    assert result["invalid_criteria_count"] == 1
+    assert result["score_status"] == "partial"
+    assert result["raw_score"] == 3
+    assert result["positive_weight_total"] == 6
+    assert result["valid_positive_weight_total"] == 5
+    assert result["valid_normalized_score"] == pytest.approx(60.0)
+    assert result["valid_pass_rate"] == pytest.approx(200.0 / 3.0)
+    assert result["normalized_score"] is None
+    assert result["pass_rate"] is None
+    assert result["judge_error_count"] == 1
+    assert result["section_scores"]["facts"] == {
+        "title": "Facts",
+        "criteria_count": 2,
+        "valid_criteria_count": 1,
+        "invalid_criteria_count": 1,
+        "raw_score": 3,
+        "positive_weight_total": 4,
+        "valid_positive_weight_total": 3,
+        "passed_count": 1,
+        "score_status": "partial",
+        "valid_normalized_score": 100.0,
+        "valid_pass_rate": 100.0,
+        "normalized_score": None,
+        "pass_rate": None,
+    }
+    assert result["section_scores"]["safety"] == {
+        "title": "Safety",
+        "criteria_count": 2,
+        "valid_criteria_count": 2,
+        "invalid_criteria_count": 0,
+        "raw_score": 0,
+        "positive_weight_total": 2,
+        "valid_positive_weight_total": 2,
+        "passed_count": 1,
+        "score_status": "complete",
+        "valid_normalized_score": 0.0,
+        "valid_pass_rate": 50.0,
+        "normalized_score": 0.0,
+        "pass_rate": 50.0,
+    }
 
 
 def test_shared_gateway_replay_validation_contract_returns_fresh_payload() -> None:
