@@ -1352,7 +1352,6 @@ pre {
   z-index: 320;
   box-sizing: border-box;
   width: 272px;
-  min-height: 72px;
   max-height: calc(100vh - 24px);
   overflow-y: auto;
   padding: 12px;

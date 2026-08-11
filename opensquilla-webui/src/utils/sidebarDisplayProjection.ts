@@ -77,6 +77,7 @@ export function buildSidebarDisplayProjection(
           : 'recents'
       const displayRow: SidebarDisplayRow = {
         ...row,
+        depth: displayZone === 'pinned' ? 0 : row.depth,
         displayZone,
         displayFamily: section.family,
         displayProjectName,

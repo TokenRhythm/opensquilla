@@ -1074,7 +1074,6 @@ function onSelectRow(row: SidebarConversationItem) {
               v-else-if="row.rowKind === 'session'"
               class="sidebar-history-item"
               :class="{ 'is-current': row.key === currentKey }"
-              :title="row.title"
               :aria-pressed="selectionMode && !row.provisional ? isRowSelected(row.key) : undefined"
               :aria-describedby="sessionPreview?.row.key === row.key ? 'sidebar-session-preview' : undefined"
               @click="onSelectRow(row)"

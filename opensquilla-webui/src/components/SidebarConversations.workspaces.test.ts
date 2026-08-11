@@ -242,6 +242,12 @@ describe('SidebarConversations project workspaces', () => {
       host.querySelector('[data-session-key="project-pin"]')?.getAttribute('data-sidebar-zone'),
     ).toBe('pinned')
     expect(
+      host.querySelector('[data-session-key="project-pin"]')?.getAttribute('data-depth'),
+    ).toBe('0')
+    expect(
+      host.querySelector('[data-session-key="project-pin"] .sidebar-history-rail'),
+    ).toBeNull()
+    expect(
       host.querySelector('[data-session-key="recent-pin"]')?.getAttribute('data-sidebar-zone'),
     ).toBe('pinned')
     expect(
@@ -353,6 +359,7 @@ describe('SidebarConversations project workspaces', () => {
     expect(preview?.querySelector('[data-testid="sidebar-session-project"]')?.textContent)
       .toContain('Project A')
     expect(host.querySelector('.sidebar-session-preview')).toBeNull()
+    expect(row?.querySelector('.sidebar-history-item')?.getAttribute('title')).toBeNull()
   })
 
   it('keeps the hover card but omits the project row for an unbound session', async () => {

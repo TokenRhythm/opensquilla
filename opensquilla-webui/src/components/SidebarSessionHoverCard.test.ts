@@ -88,4 +88,10 @@ describe('SidebarSessionHoverCard', () => {
     expect(baseCss).toContain('.sidebar-session-preview {')
     expect(baseCss).not.toContain('.sidebar-history-row--recent-start::before')
   })
+
+  it('does not reserve project-row height when no project is rendered', () => {
+    const previewRule = baseCss.match(/\.sidebar-session-preview\s*\{([^}]*)\}/)?.[1]
+    expect(previewRule).toBeDefined()
+    expect(previewRule).not.toContain('min-height')
+  })
 })
