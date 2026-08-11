@@ -24,7 +24,9 @@ import type {
   BusySendMode,
   PendingQueueOwner,
   PendingQueueOwnerContext,
+  PendingSteerPayload,
 } from '@/composables/chat/useChatPendingQueue'
+import type { ChatSteerDeliveryApi } from '@/composables/chat/useChatSteerDelivery'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
 import {
   hasSendableModelInputImageAttachment,
@@ -34,7 +36,6 @@ import {
   type SendableAttachment,
 } from '@/utils/chat/attachments'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
-import { rehomePromotedSteerRows } from '@/utils/chat/historyMerge'
 import { isControlInput } from '@/utils/chat/inputSemantics'
 import { createClientMessageId, createClientRequestId } from '@/utils/chat/messageIdentity'
 import {
@@ -58,14 +59,6 @@ import {
 
 type RpcClient = {
   call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-}
-
-interface SteerAttempt {
-  clientRequestId: string
-  clientMessageId: string
-  expectedTurnId: string
-  text: string
-  visibleCommitted: boolean
 }
 
 interface SendAttempt {
@@ -355,13 +348,11 @@ export interface UseChatSendOptions {
     },
     owner?: PendingQueueOwner,
   ) => boolean
-  enqueuePendingSteerRetry?: (item: {
-    text: string
-    clientRequestId: string
-    clientMessageId: string
-    expectedTurnId: string
-    visibleCommitted: boolean
-  }) => boolean
+  enqueuePendingSteerAttempt?: (
+    payload: PendingSteerPayload,
+    owner?: PendingQueueOwner,
+  ) => ChatPendingItem | null
+  steerDelivery: ChatSteerDeliveryApi
   restoreSteerIntoComposer?: (text: string) => void
   popAllPendingIntoComposer: () => boolean
   hiddenControlStorage?: HiddenControlStorage | null
@@ -386,7 +377,6 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   const recoveredQueuedAttempts = new WeakMap<ChatPendingItem, SendAttempt>()
-  const recoveredQueuedSteers = new WeakMap<ChatPendingItem, SteerAttempt>()
 
   function pendingWorkspaceForIntent(intent: string | null): string | null {
     return intent === 'new_chat'
@@ -804,167 +794,6 @@ export function useChatSend(options: UseChatSendOptions) {
     })
   }
 
-  function steerMessage(attempt: SteerAttempt): ChatMessage | undefined {
-    return options.messages.value.find(message =>
-      message.clientId === attempt.clientMessageId
-      || message.steerClientRequestId === attempt.clientRequestId,
-    )
-  }
-
-  function pushSteerMessage(attempt: SteerAttempt) {
-    if (attempt.visibleCommitted || steerMessage(attempt)) return
-    options.stream.checkpointForUserMessage?.(attempt.expectedTurnId)
-    options.messages.value.push({
-      role: 'user',
-      text: attempt.text,
-      ts: new Date().toISOString(),
-      clientId: attempt.clientMessageId,
-      turnId: attempt.expectedTurnId,
-      inputDisposition: 'steering',
-      steerClientRequestId: attempt.clientRequestId,
-      steerClientMessageId: attempt.clientMessageId,
-    })
-    attempt.visibleCommitted = true
-    options.autoScroll.value = true
-    options.scrollToBottom()
-  }
-
-  function removeSteerMessage(attempt: SteerAttempt) {
-    const index = options.messages.value.findIndex(message =>
-      message.clientId === attempt.clientMessageId
-      || message.steerClientRequestId === attempt.clientRequestId,
-    )
-    if (index >= 0) options.messages.value.splice(index, 1)
-  }
-
-  function restoreSteerMessage(attempt: SteerAttempt) {
-    const message = steerMessage(attempt)
-    if (message?.steerRestored) return
-    options.restoreSteerIntoComposer?.(attempt.text)
-    if (message) message.steerRestored = true
-  }
-
-  function cancelStoppedSteerAttempt(
-    attempt: SteerAttempt,
-    queuedItem?: ChatPendingItem,
-  ): ChatSendOutcome {
-    const message = steerMessage(attempt)
-    if (message) {
-      message.inputDisposition = 'cancelled'
-      message.steerStopRequested = false
-    }
-    restoreSteerMessage(attempt)
-    if (queuedItem) recoveredQueuedSteers.delete(queuedItem)
-    // The queue item has been resolved locally as not admitted; reporting an
-    // accepted delivery outcome removes that transport lease instead of
-    // retaining a second copy beside the restored composer text.
-    return 'accepted'
-  }
-
-  function bindSteerResponse(
-    attempt: SteerAttempt,
-    response: SessionSteerV2Response,
-  ) {
-    const message = steerMessage(attempt)
-    if (!message) return
-    const messageId = String(response.user_message_id || '').trim()
-    const turnId = String(
-      response.disposition === 'promoted'
-        ? response.promoted_turn_id || response.turn_id || attempt.expectedTurnId
-        : response.turn_id || attempt.expectedTurnId,
-    ).trim()
-    const disposition = response.disposition || 'steering'
-    const rawRevision = Number(response.revision)
-    const revision = Number.isInteger(rawRevision) && rawRevision >= 0
-      ? rawRevision
-      : undefined
-    if (messageId) message.messageId = messageId
-    const currentRevision = message.inputDispositionRevision
-    const responseIsCurrent = currentRevision === undefined
-      || (revision !== undefined && revision >= currentRevision)
-    if (turnId && responseIsCurrent) message.turnId = turnId
-    // Stop may win locally while the acceptance response is still in flight.
-    // The later typed disposition event remains authoritative; never repaint a
-    // locally-cancelled adjustment as waiting in the meantime.
-    if (
-      responseIsCurrent
-      && (
-        !message.inputDisposition
-        || message.inputDisposition === 'steering'
-      )
-    ) {
-      message.inputDisposition = disposition
-      if (revision !== undefined) message.inputDispositionRevision = revision
-    }
-    if (
-      responseIsCurrent
-      && disposition === 'promoted'
-      && message.inputDisposition === 'promoted'
-    ) {
-      message.promotedFromTurnId = String(
-        response.promoted_from_turn_id || attempt.expectedTurnId,
-      ).trim()
-      options.messages.value = rehomePromotedSteerRows(options.messages.value)
-    }
-    if (
-      responseIsCurrent
-      && ['applied', 'promoted', 'cancelled', 'rejected'].includes(disposition)
-    ) {
-      message.steerStopRequested = false
-    }
-    if (responseIsCurrent && disposition === 'cancelled') {
-      restoreSteerMessage(attempt)
-    }
-  }
-
-  function enqueueSafeSteerFallback(
-    attempt: SteerAttempt,
-    queuedItem?: ChatPendingItem,
-  ): ChatSendOutcome {
-    removeSteerMessage(attempt)
-    if (queuedItem) {
-      recoveredQueuedSteers.delete(queuedItem)
-      queuedItem.steerClientRequestId = undefined
-      queuedItem.steerClientMessageId = undefined
-      queuedItem.steerExpectedTurnId = undefined
-      queuedItem.steerVisibleCommitted = undefined
-      return 'deferred'
-    }
-    const queued = options.enqueuePendingPayload?.({
-      text: attempt.text,
-      attachments: [],
-      intent: null,
-    }, pendingQueueOwner()) ?? false
-    if (!queued) restoreSteerMessage(attempt)
-    return queued ? 'accepted' : 'not_sent'
-  }
-
-  function rememberSteerRetry(
-    attempt: SteerAttempt,
-    queuedItem?: ChatPendingItem,
-  ): ChatSendOutcome {
-    if (queuedItem) {
-      recoveredQueuedSteers.set(queuedItem, attempt)
-      queuedItem.steerClientRequestId = attempt.clientRequestId
-      queuedItem.steerClientMessageId = attempt.clientMessageId
-      queuedItem.steerExpectedTurnId = attempt.expectedTurnId
-      queuedItem.steerVisibleCommitted = attempt.visibleCommitted
-      return 'retryable_failure'
-    }
-    const queued = options.enqueuePendingSteerRetry?.({
-      text: attempt.text,
-      clientRequestId: attempt.clientRequestId,
-      clientMessageId: attempt.clientMessageId,
-      expectedTurnId: attempt.expectedTurnId,
-      visibleCommitted: attempt.visibleCommitted,
-    }) ?? false
-    if (!queued) {
-      const message = steerMessage(attempt)
-      if (message) message.inputDisposition = 'rejected'
-    }
-    return queued ? 'accepted' : 'retryable_failure'
-  }
-
   async function dispatchSteerV2(
     text: string,
     optionsForSteer: {
@@ -973,22 +802,9 @@ export function useChatSend(options: UseChatSendOptions) {
     } = {},
   ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
-    const queuedItem = optionsForSteer.queuedItem
-    const recovered = queuedItem
-      ? recoveredQueuedSteers.get(queuedItem)
-        || (
-          queuedItem.steerClientRequestId
-          && queuedItem.steerClientMessageId
-          && queuedItem.steerExpectedTurnId
-            ? {
-                clientRequestId: queuedItem.steerClientRequestId,
-                clientMessageId: queuedItem.steerClientMessageId,
-                expectedTurnId: queuedItem.steerExpectedTurnId,
-                text: queuedItem.text,
-                visibleCommitted: queuedItem.steerVisibleCommitted === true,
-              }
-            : null
-        )
+    let pendingItem = optionsForSteer.queuedItem
+    const recovered = pendingItem
+      ? options.steerDelivery.attemptForItem(pendingItem)
       : null
     if (!requestSessionKey || !text.trim()) return 'not_sent'
     if (!options.supportsMethod?.('sessions.steer.v2')) {
@@ -998,9 +814,9 @@ export function useChatSend(options: UseChatSendOptions) {
       !recovered
       && !canSteerPayload(
         text,
-        queuedItem ? queuedItem.attachments : options.pendingAttachments.value,
-        queuedItem ? queuedItem.intent : options.pendingSessionIntent.value,
-        queuedItem ? null : options.pendingForkBeforeMessageId.value,
+        pendingItem ? pendingItem.attachments : options.pendingAttachments.value,
+        pendingItem ? pendingItem.intent : options.pendingSessionIntent.value,
+        pendingItem ? null : options.pendingForkBeforeMessageId.value,
       )
     ) return 'not_sent'
     if (options.sendBlockedReason?.value || options.hasPendingAttachmentWork()) {
@@ -1011,88 +827,167 @@ export function useChatSend(options: UseChatSendOptions) {
       && !composerMatchesSnapshot(optionsForSteer.composerSnapshot)
     ) return 'not_sent'
 
-    const expectedTurnId = recovered?.expectedTurnId || capabilityExpectedTurnId()
+    const expectedTurnId = recovered?.request.expected_turn_id || capabilityExpectedTurnId()
     if (!expectedTurnId) return 'not_sent'
-    const attempt: SteerAttempt = recovered || {
-      clientRequestId: createClientRequestId(),
-      clientMessageId: createClientMessageId(),
-      expectedTurnId,
-      text: text.trim(),
-      visibleCommitted: false,
+    const freshParams: SessionSteerV2Params = {
+      key: requestSessionKey,
+      message: text.trim(),
+      expected_turn_id: expectedTurnId,
+      client_request_id: createClientRequestId(),
+      client_message_id: createClientMessageId(),
+      surface_id: 'webui',
+      _source: chatSourceMetadata(options),
     }
-    pushSteerMessage(attempt)
-    if (queuedItem) {
-      queuedItem.steerClientRequestId = attempt.clientRequestId
-      queuedItem.steerClientMessageId = attempt.clientMessageId
-      queuedItem.steerExpectedTurnId = attempt.expectedTurnId
-      queuedItem.steerVisibleCommitted = true
-    } else {
+    if (recovered && recovered.request.key !== requestSessionKey) {
+      return 'retryable_failure'
+    }
+    const attempt = pendingItem
+      ? options.steerDelivery.begin(pendingItem, recovered ? undefined : freshParams)
+      : null
+    if (!pendingItem) {
+      pendingItem = options.enqueuePendingSteerAttempt?.({
+        request: freshParams,
+        phase: 'submitting',
+      }, pendingQueueOwner()) || undefined
+      if (!pendingItem) return 'not_sent'
+    }
+    const activeAttempt = attempt || options.steerDelivery.begin(pendingItem)
+    if (!activeAttempt) return 'not_sent'
+    const params = activeAttempt.request
+    if (!optionsForSteer.queuedItem) {
+      // The transport-owned pending row exists before the composer is
+      // consumed, so every non-durable outcome remains visible and retryable.
+      if (
+        optionsForSteer.composerSnapshot
+        && !composerMatchesSnapshot(optionsForSteer.composerSnapshot)
+      ) {
+        options.steerDelivery.reject(pendingItem, false)
+        return 'not_sent'
+      }
       options.inputText.value = ''
       options.pendingSessionIntent.value = null
       options.pendingForkBeforeMessageId.value = null
       options.autoResizeTextarea()
-    }
-
-    const params: SessionSteerV2Params = {
-      key: requestSessionKey,
-      message: attempt.text,
-      expected_turn_id: attempt.expectedTurnId,
-      client_request_id: attempt.clientRequestId,
-      client_message_id: attempt.clientMessageId,
-      surface_id: 'webui',
-      _source: chatSourceMetadata(options),
+    } else {
+      // Manual retry must replay the complete immutable request snapshot,
+      // including source policy and original session/turn identities.
+      pendingItem.steerAttempt = activeAttempt
     }
     try {
       const response = await options.rpc.call<SessionSteerV2Response>(
         'sessions.steer.v2',
         params as unknown as Record<string, unknown>,
       )
-      if (options.sessionKey.value !== requestSessionKey) {
-        return response.accepted === false ? 'not_sent' : 'accepted'
+      const sessionChanged = options.sessionKey.value !== requestSessionKey
+      if (sessionChanged && response.accepted === true) {
+        options.steerDelivery.acknowledgeAcceptedOffscreen(pendingItem)
+        return 'accepted'
       }
       if (response.accepted === false) {
-        if (steerMessage(attempt)?.steerStopRequested) {
-          return cancelStoppedSteerAttempt(attempt, queuedItem)
+        if (!sessionChanged && pendingItem.steerAttempt?.stopRequested) {
+          options.steerDelivery.reject(pendingItem)
+          return 'accepted'
         }
         if (response.fallback_safe === true) {
-          return enqueueSafeSteerFallback(attempt, queuedItem)
+          options.steerDelivery.fallback(pendingItem)
+          return 'deferred'
         }
-        const message = steerMessage(attempt)
-        if (message) message.inputDisposition = response.disposition || 'rejected'
-        restoreSteerMessage(attempt)
+        if (
+          response.retryable === true
+          || (
+            response.retryable !== false
+            && /retry|resend/i.test(response.recovery || '')
+          )
+        ) {
+          options.steerDelivery.markRetryable(pendingItem, 'retryable_rejected', {
+            code: response.failure_code,
+          })
+          return 'retryable_failure'
+        }
+        if (sessionChanged) {
+          // Navigation parks transport-owned Steers with their source chat.
+          // A permanent non-admission turns that parked row back into an
+          // ordinary draft; never restore it into the newly selected composer.
+          options.steerDelivery.fallback(pendingItem)
+          return 'deferred'
+        }
+        options.steerDelivery.reject(pendingItem)
         return 'not_sent'
       }
-      bindSteerResponse(attempt, response)
-      if (queuedItem) recoveredQueuedSteers.delete(queuedItem)
-      options.scheduleHistorySync()
+      // The v2 RPC contract has one explicit admission bit. A fulfilled but
+      // malformed/mixed-version response is still unknown; only a typed event
+      // or matching history row may independently prove durability.
+      if (response.accepted !== true) {
+        options.steerDelivery.markRetryable(pendingItem, 'acceptance_unknown', {
+          code: response.failure_code,
+        })
+        if (!sessionChanged) options.scheduleHistorySync()
+        return 'retryable_failure'
+      }
+      options.steerDelivery.accept({
+        clientRequestId: params.client_request_id,
+        clientMessageId: params.client_message_id,
+        expectedTurnId: params.expected_turn_id,
+        userMessageId: String(response.user_message_id || ''),
+        disposition: response.disposition || 'steering',
+        revision: response.revision,
+        turnId: response.turn_id,
+        promotedTurnId: response.promoted_turn_id,
+        promotedFromTurnId: response.promoted_from_turn_id,
+        appliedIteration: response.applied_iteration,
+        modelCallId: response.model_call_id,
+      }, pendingItem)
       return 'accepted'
     } catch (error: unknown) {
-      if ((error as RpcClientError | null | undefined)?.accepted === true) {
-        const message = steerMessage(attempt)
-        const acceptedMessageId = String(
+      const accepted = (error as RpcClientError | null | undefined)?.accepted
+      const sessionChanged = options.sessionKey.value !== requestSessionKey
+      if (accepted === true) {
+        if (sessionChanged) {
+          options.steerDelivery.acknowledgeAcceptedOffscreen(pendingItem)
+          return 'accepted'
+        }
+        options.steerDelivery.accept({
+          clientRequestId: params.client_request_id,
+          clientMessageId: params.client_message_id,
+          expectedTurnId: params.expected_turn_id,
+          userMessageId: String(
           rpcErrorDetail(error, 'user_message_id')
           || rpcErrorDetail(error, 'message_id')
           || '',
-        )
-        if (message && acceptedMessageId) message.messageId = acceptedMessageId
-        options.scheduleHistorySync()
+          ),
+          disposition: (rpcErrorDetail(error, 'disposition') || 'steering') as ChatMessage['inputDisposition'],
+          turnId: String(rpcErrorDetail(error, 'turn_id') || params.expected_turn_id),
+        }, pendingItem)
         return 'accepted'
       }
-      if (steerFallbackSafe(error)) {
-        if (steerMessage(attempt)?.steerStopRequested) {
-          return cancelStoppedSteerAttempt(attempt, queuedItem)
+      if (accepted === false && steerFallbackSafe(error)) {
+        if (!sessionChanged && pendingItem.steerAttempt?.stopRequested) {
+          options.steerDelivery.reject(pendingItem)
+          return 'accepted'
         }
-        return enqueueSafeSteerFallback(attempt, queuedItem)
+        options.steerDelivery.fallback(pendingItem)
+        return 'deferred'
       }
-      if (
-        hasUnknownAcceptance(error)
-        || rpcErrorDetail(error, 'retryable') === true
-      ) {
-        return rememberSteerRetry(attempt, queuedItem)
+      if (accepted !== false) {
+        options.steerDelivery.markRetryable(pendingItem, 'acceptance_unknown', {
+          code: errorCode(error),
+          retryAfterMs: Number(rpcErrorDetail(error, 'retry_after_ms')) || undefined,
+        })
+        if (!sessionChanged) options.scheduleHistorySync()
+        return 'retryable_failure'
       }
-      const message = steerMessage(attempt)
-      if (message) message.inputDisposition = 'rejected'
-      restoreSteerMessage(attempt)
+      if (rpcErrorDetail(error, 'retryable') === true) {
+        options.steerDelivery.markRetryable(pendingItem, 'retryable_rejected', {
+          code: errorCode(error),
+          retryAfterMs: Number(rpcErrorDetail(error, 'retry_after_ms')) || undefined,
+        })
+        return 'retryable_failure'
+      }
+      if (sessionChanged) {
+        options.steerDelivery.fallback(pendingItem)
+        return 'deferred'
+      }
+      options.steerDelivery.reject(pendingItem)
       return 'not_sent'
     }
   }
@@ -1263,14 +1158,7 @@ export function useChatSend(options: UseChatSendOptions) {
       || item.ownerSessionKey
       || options.sessionKey.value
     const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
-    const steerRetryAttempt = recoveredQueuedSteers.get(item)
-      || (
-        item.steerClientRequestId
-        && item.steerClientMessageId
-        && item.steerExpectedTurnId
-          ? item
-          : null
-      )
+    const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
     const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
       (retryAttempt || steerRetryAttempt)
       && (outcome === 'deferred' || outcome === 'not_sent')
@@ -1818,6 +1706,7 @@ export function useChatSend(options: UseChatSendOptions) {
       ].includes(rawStoppedTurnId)
       ? rawStoppedTurnId
       : ''
+    options.steerDelivery.markStopRequested(stoppedTurnId)
     const latestUserMessage = [...options.messages.value]
       .reverse()
       .find(message => message.role === 'user')

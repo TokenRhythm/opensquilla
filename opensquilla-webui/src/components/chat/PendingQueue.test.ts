@@ -2,9 +2,9 @@
 
 import { afterEach, describe, expect, it } from 'vitest'
 import { createApp, nextTick } from 'vue'
-import i18n from '@/i18n'
+import i18n, { loadLocaleMessages } from '@/i18n'
 import PendingQueue from './PendingQueue.vue'
-import type { Attachment } from '@/types/chat'
+import type { Attachment, PendingSteerAttempt } from '@/types/chat'
 
 afterEach(() => {
   document.body.innerHTML = ''
@@ -16,6 +16,7 @@ async function mountQueue(
   items: Array<{
     text: string
     deliveryState?: 'steering' | 'retryable'
+    steerAttempt?: PendingSteerAttempt
     attachments?: Attachment[]
     hiddenControl?: boolean
     displayTextOverride?: string
@@ -44,6 +45,16 @@ async function mountQueue(
 }
 
 describe('PendingQueue', () => {
+  const steerRequest = {
+    key: 'agent:main:webchat:test',
+    message: 'Make it longer',
+    expected_turn_id: 'turn-current',
+    client_request_id: 'request-steer',
+    client_message_id: 'client-steer',
+    surface_id: 'webui',
+    _source: { runMode: 'safe' as const },
+  }
+
   it('keeps the original steer affordance visible but disabled when capability is unavailable', async () => {
     const reason = 'Steer unavailable: the active task identity has not synchronized yet.'
     const { app, el } = await mountQueue({}, undefined, {
@@ -112,6 +123,51 @@ describe('PendingQueue', () => {
     expect(steered).toBe(0)
     expect(removed).toBe(0)
     expect(el.querySelector('[role="menu"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('derives submitting UI only from the canonical steer attempt phase', async () => {
+    const { app, el } = await mountQueue({}, [{
+      text: steerRequest.message,
+      steerAttempt: { phase: 'submitting', request: steerRequest },
+    }])
+
+    expect(el.querySelector('.chat-pending-card')?.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('.chat-pending')?.getAttribute('aria-label')).toBe('Pending 1/6')
+    expect(el.querySelector('.chat-pending-action--steer')?.textContent)
+      .toContain('Submitting guidance…')
+    const actions = [...el.querySelectorAll<HTMLButtonElement>('.chat-pending-actions button')]
+    expect(actions.every(button => button.disabled)).toBe(true)
+    app.unmount()
+  })
+
+  it.each([
+    {
+      locale: 'en' as const,
+      action: 'Delivery status unknown · Retry confirmation',
+      remove: 'Discard local retry for pending message 1; this does not mean the server did not receive it',
+    },
+    {
+      locale: 'zh-Hans' as const,
+      action: '发送状态未知 · 重试确认',
+      remove: '放弃待发送消息 1 在本设备上的重试；这不代表服务端未接收',
+    },
+  ])('explains acceptance-unknown retry and local discard in $locale', async ({
+    locale,
+    action,
+    remove,
+  }) => {
+    await loadLocaleMessages(locale)
+    i18n.global.locale.value = locale
+    const { app, el } = await mountQueue({}, [{
+      text: steerRequest.message,
+      steerAttempt: { phase: 'acceptance_unknown', request: steerRequest },
+    }], { steerAvailable: false })
+
+    const retry = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+    expect(retry?.textContent).toContain(action)
+    expect(retry?.disabled).toBe(false)
+    expect(el.querySelector<HTMLButtonElement>(`[aria-label="${remove}"]`)).not.toBeNull()
     app.unmount()
   })
 

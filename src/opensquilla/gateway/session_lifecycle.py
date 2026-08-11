@@ -36,6 +36,9 @@ class TaskLifecycleEvent:
     # False only when TaskRuntime had to fall back to an in-memory terminal
     # projection because the authoritative AgentTask update failed.
     terminal_persisted: bool = True
+    # Durable queued owner created while settling accepted steer input. The
+    # predecessor is terminal, but the session itself must remain active.
+    continuation_task_id: str | None = None
 
 
 TaskLifecycleListener = Callable[[TaskLifecycleEvent], Awaitable[None]]
@@ -126,6 +129,17 @@ async def apply_task_lifecycle_to_session(
     update = getattr(session_manager, "update", None)
     if not callable(update):
         return False
+    if event.continuation_task_id:
+        try:
+            await update(
+                event.session_key,
+                status=SessionStatus.RUNNING,
+                ended_at=None,
+                runtime_ms=None,
+            )
+        except Exception:
+            return False
+        return True
     now = _now_ms()
     started_at = getattr(node, "started_at", None)
     runtime_ms = None

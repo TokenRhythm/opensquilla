@@ -49,7 +49,10 @@ import {
   taskTerminalStatus as eventTaskTerminalStatus,
 } from '@/utils/chat/streamEvents'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
-import { rehomePromotedSteerRows } from '@/utils/chat/historyMerge'
+import {
+  useChatSteerDelivery,
+  type ChatSteerDeliveryApi,
+} from './useChatSteerDelivery'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -125,6 +128,7 @@ export interface UseChatRpcEventHandlersOptions {
   schedulePendingDrainAfterTerminal: () => void
   popAllPendingIntoComposer: () => boolean
   restoreSteerIntoComposer?: (text: string) => void
+  steerDelivery?: ChatSteerDeliveryApi
   saveWidgetState: () => void
   subscribeSession?: () =>
     | boolean
@@ -281,6 +285,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     usageModel,
     stream,
   } = options
+  const steerDelivery = options.steerDelivery || useChatSteerDelivery({
+    messages,
+    pendingQueue,
+    checkpointForUserMessage: stream.checkpointForUserMessage,
+    scheduleHistorySync: options.scheduleHistorySync,
+    restoreSteerIntoComposer: options.restoreSteerIntoComposer,
+  })
 
   // Live thinking deltas for the current turn (session.event.thinking).
   const streamThinking = ref<LiveThinking | null>(null)
@@ -288,7 +299,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   const pendingTerminalEvents = new Map<string, BufferedTerminalEvent>()
   const pendingStreamEvents = new Map<string, BufferedPendingStreamEvent[]>()
   const settledTaskIds = new Set<string>()
-  const restoredSteerRequestIds = new Set<string>()
 
   function compactionStatus(payload: CompactionPayload): string {
     const status = String(payload.status || '').toLowerCase()
@@ -997,108 +1007,32 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const clientRequestId = String(payload.client_request_id || '')
     const clientMessageId = String(payload.client_message_id || '')
     const userMessageId = String(payload.user_message_id || '')
-    const message = messages.value.find(candidate =>
-      (clientMessageId && (
-        candidate.clientId === clientMessageId
-        || candidate.steerClientMessageId === clientMessageId
-      ))
-      || (clientRequestId && candidate.steerClientRequestId === clientRequestId)
-      || (userMessageId && candidate.messageId === userMessageId),
-    )
-    const pendingIndex = pendingQueue.value.findIndex(candidate =>
-      (clientRequestId && candidate.steerClientRequestId === clientRequestId)
-      || (clientMessageId && candidate.steerClientMessageId === clientMessageId),
-    )
-    const pending = pendingIndex >= 0 ? pendingQueue.value[pendingIndex] : undefined
     const rawRevision = Number(payload.revision)
     const incomingRevision = Number.isInteger(rawRevision) && rawRevision >= 0
       ? rawRevision
       : undefined
-    const currentRevision = message?.inputDispositionRevision
-    const currentTerminal = message?.inputDisposition
-      ? ['applied', 'promoted', 'cancelled', 'rejected'].includes(message.inputDisposition)
-      : false
-    const staleDisposition = Boolean(message) && (
-      (
-        currentRevision !== undefined
-        && (
-          incomingRevision === undefined
-          || incomingRevision < currentRevision
-        )
-      )
-      || (
-        currentTerminal
-        && disposition !== message?.inputDisposition
-        && (
-          incomingRevision === undefined
-          || (
-            currentRevision !== undefined
-            && incomingRevision <= currentRevision
-          )
-        )
-      )
-    )
-    if (staleDisposition) return
     const promotedTurnId = String(payload.promoted_turn_id || '').trim()
-    const targetTurnId = String(
-      promotedTurnId
-      || payload.turn_id
-      || payload.target_turn_id
-      || payload.task_id
-      || '',
-    ).trim()
-    if (message) {
-      message.inputDisposition = disposition
-      if (['applied', 'promoted', 'cancelled', 'rejected'].includes(disposition)) {
-        message.steerStopRequested = false
-      }
-      if (incomingRevision !== undefined) {
-        message.inputDispositionRevision = incomingRevision
-      }
-      if (userMessageId) message.messageId = userMessageId
-      if (clientRequestId) message.steerClientRequestId = clientRequestId
-      if (clientMessageId) message.steerClientMessageId = clientMessageId
-      if (targetTurnId) message.turnId = targetTurnId
-      if (disposition === 'promoted') {
-        const promotedFromTurnId = String(
-          payload.promoted_from_turn_id
-          || payload.target_turn_id
-          || payload.turn_id
-          || '',
-        ).trim()
-        if (promotedFromTurnId) message.promotedFromTurnId = promotedFromTurnId
-        messages.value = rehomePromotedSteerRows(messages.value)
-      }
-    }
-    if (
-      pendingIndex >= 0
-      && ['applied', 'promoted', 'cancelled', 'rejected'].includes(disposition)
-    ) {
-      pendingQueue.value.splice(pendingIndex, 1)
-    }
     const recovery = String(payload.recovery || '').trim().toLowerCase()
-    const shouldRestore = disposition === 'cancelled'
-      || (
-        disposition === 'rejected'
-        && (
-          payload.retryable === true
-          || recovery.includes('retry')
-          || recovery.includes('resend')
-          || recovery.includes('restore')
-        )
-      )
-    const restoreKey = clientRequestId || clientMessageId || userMessageId
-    if (shouldRestore && restoreKey) {
-      const alreadyRestored = restoredSteerRequestIds.has(restoreKey)
-        || message?.steerRestored === true
-      if (!alreadyRestored) {
-        const text = message?.text || pending?.text || ''
-        if (text) options.restoreSteerIntoComposer?.(text)
-        restoredSteerRequestIds.add(restoreKey)
-        if (message) message.steerRestored = true
-      }
-    }
-    options.scheduleHistorySync()
+    steerDelivery.disposition({
+      clientRequestId,
+      clientMessageId,
+      userMessageId,
+      disposition,
+      revision: incomingRevision,
+      turnId: String(payload.turn_id || payload.target_turn_id || payload.task_id || ''),
+      promotedTurnId,
+      promotedFromTurnId: String(
+        payload.promoted_from_turn_id
+        || payload.target_turn_id
+        || payload.turn_id
+        || '',
+      ),
+      appliedIteration: payload.applied_iteration,
+      modelCallId: String(payload.model_call_id || ''),
+    }, {
+      retryable: payload.retryable === true,
+      hint: recovery,
+    })
   }
 
   function messageAlreadyPresent(candidate: ChatMessage): boolean {

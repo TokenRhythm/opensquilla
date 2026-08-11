@@ -58,6 +58,7 @@ from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.permissions import configured_default_elevated
+from opensquilla.session.models import SessionStatus
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
@@ -1581,6 +1582,8 @@ def _task_run_status_for_session_change(event: TaskLifecycleEvent) -> str:
         return "queued"
     if event.phase == "running":
         return "running"
+    if event.continuation_task_id:
+        return "queued"
     if status == "succeeded":
         return "idle"
     if status == "abandoned":
@@ -1633,7 +1636,20 @@ def _make_task_session_lifecycle_listener(
         )
         session_status = session_status_for_task_status(event.task_status)
         task_state = _task_state_for_session_change(event)
-        state_field = "active_task" if event.phase in {"queued", "running"} else "last_task"
+        if event.phase == "terminal" and event.continuation_task_id:
+            session_status = SessionStatus.RUNNING
+            task_projection = {
+                "last_task": task_state,
+                "active_task": {
+                    "task_id": event.continuation_task_id,
+                    "status": "queued",
+                },
+            }
+        else:
+            state_field = (
+                "active_task" if event.phase in {"queued", "running"} else "last_task"
+            )
+            task_projection = {state_field: task_state}
         await event_emitter(
             event.session_key,
             "sessions.changed",
@@ -1642,7 +1658,7 @@ def _make_task_session_lifecycle_listener(
                 reason,
                 status=getattr(session_status, "value", session_status),
                 run_status=_task_run_status_for_session_change(event),
-                **{state_field: task_state},
+                **task_projection,
             ),
         )
 

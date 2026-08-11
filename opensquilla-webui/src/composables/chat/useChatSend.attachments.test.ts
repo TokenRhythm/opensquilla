@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { nextTick, ref, watch } from 'vue'
 
 import { useChatSend, type UseChatSendOptions } from './useChatSend'
+import {
+  snapshotSteerRequest,
+  useChatSteerDelivery,
+} from './useChatSteerDelivery'
 import { useChatMessageActions } from './useChatMessageActions'
 import type { FoldLiveTurnMode } from './useChatTurnLog'
 import type {
@@ -67,10 +71,35 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     appendFrame: vi.fn(),
     useReducer: ref<FoldLiveTurnMode>(false),
   }
+  const messages = overrides.messages ?? ref<ChatMessage[]>([])
+  const pendingQueue = ref<ChatPendingItem[]>([])
+  const scheduleHistorySync = overrides.scheduleHistorySync ?? vi.fn()
+  const steerDelivery = overrides.steerDelivery ?? useChatSteerDelivery({
+    messages,
+    pendingQueue,
+    checkpointForUserMessage: stream.checkpointForUserMessage,
+    scheduleHistorySync,
+    restoreSteerIntoComposer: overrides.restoreSteerIntoComposer,
+  })
+  const enqueuePendingSteerAttempt = overrides.enqueuePendingSteerAttempt
+    ?? ((payload) => {
+      const item: ChatPendingItem = {
+        text: payload.request.message,
+        attachments: [],
+        intent: null,
+        ownerSessionKey: payload.request.key,
+        steerAttempt: {
+          phase: payload.phase || 'submitting',
+          request: snapshotSteerRequest(payload.request),
+        },
+      }
+      pendingQueue.value.push(item)
+      return item
+    })
   const options: UseChatSendOptions = {
     rpc,
     inputText: ref('hello'),
-    messages: ref<ChatMessage[]>([]),
+    messages,
     sessionKey: ref('agent:main:webchat:test'),
     pendingQueueOwnerContext: ref(null),
     busySendMode: ref<BusySendMode>('queue'),
@@ -89,12 +118,14 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     stream,
     normalizeElevatedMode: mode => mode,
     adoptResponseSession: vi.fn(),
-    scheduleHistorySync: vi.fn(),
+    scheduleHistorySync,
     schedulePendingDrainAfterTerminal: vi.fn(),
     flushDeferredPendingDrain: vi.fn(),
     isCompactInFlightForCurrentSession: () => false,
     hasPendingAttachmentWork: () => false,
     enqueuePendingInput: vi.fn(() => true),
+    enqueuePendingSteerAttempt,
+    steerDelivery,
     popAllPendingIntoComposer: vi.fn(() => false),
     hiddenControlStorage: memoryStorage(),
     executeSlashCommand: vi.fn(async () => false),
@@ -103,7 +134,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     scrollToBottom: vi.fn(),
     ...overrides,
   }
-  return { api: useChatSend(options), options, rpc, stream }
+  return { api: useChatSend(options), options, rpc, stream, pendingQueue }
 }
 
 function sameTurnSteerOptions(
@@ -659,7 +690,6 @@ describe('useChatSend attachment payloads', () => {
   )
 
   it('falls back safely to the visible pending queue when v2 rejects before admission', async () => {
-    const enqueuePendingPayload = vi.fn(() => true)
     const rpc = {
       call: vi.fn().mockResolvedValue({
         accepted: false,
@@ -667,21 +697,21 @@ describe('useChatSend attachment payloads', () => {
         failure_code: 'turn_mismatch',
       }),
     }
-    const { api, options, stream } = makeOptions({
+    const { api, options, stream, pendingQueue } = makeOptions({
       ...sameTurnSteerOptions(),
       rpc,
       busySendMode: ref<BusySendMode>('steer'),
-      enqueuePendingPayload,
     })
     stream.isStreaming.value = true
 
     await api.onSend()
 
-    expect(enqueuePendingPayload).toHaveBeenCalledWith({
+    expect(pendingQueue.value).toMatchObject([{
       text: 'hello',
       attachments: [],
       intent: null,
-    }, undefined)
+    }])
+    expect(pendingQueue.value[0]).not.toHaveProperty('steerAttempt')
     expect(options.messages.value).toEqual([])
     expect(rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
   })
@@ -1241,7 +1271,7 @@ describe('useChatSend attachment payloads', () => {
         }))
         .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test' }),
     }
-    const { api, stream } = makeOptions({
+    const { api, stream, pendingQueue } = makeOptions({
       ...sameTurnSteerOptions(),
       rpc,
       busySendMode: ref<BusySendMode>('steer'),
@@ -1252,16 +1282,7 @@ describe('useChatSend attachment payloads', () => {
 
     await api.onSend()
     const firstParams = rpc.call.mock.calls[0]?.[1]
-    const retry = {
-      text: 'hello',
-      attachments: [],
-      intent: null,
-      steerClientRequestId: String(firstParams?.client_request_id || ''),
-      steerClientMessageId: String(firstParams?.client_message_id || ''),
-      steerExpectedTurnId: 'turn-current',
-      steerVisibleCommitted: true,
-      deliveryState: 'retryable' as const,
-    }
+    const retry = pendingQueue.value[0]!
     await api.sendQueuedSteer(retry)
 
     expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
@@ -1866,30 +1887,9 @@ describe('useChatSend attachment payloads', () => {
 
   it('moves an ambiguous v2 steer into an exact-id retry instead of resending as follow-up', async () => {
     const inputText = ref('steer this exact turn')
-    let retryItem: ChatPendingItem | null = null
-    const enqueuePendingSteerRetry = vi.fn((item: {
-      text: string
-      clientRequestId: string
-      clientMessageId: string
-      expectedTurnId: string
-      visibleCommitted: boolean
-    }) => {
-      retryItem = {
-        text: item.text,
-        attachments: [],
-        intent: null,
-        deliveryState: 'retryable',
-        steerClientRequestId: item.clientRequestId,
-        steerClientMessageId: item.clientMessageId,
-        steerExpectedTurnId: item.expectedTurnId,
-        steerVisibleCommitted: item.visibleCommitted,
-      }
-      return true
-    })
     const rpc = {
       call: vi.fn()
         .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
-          accepted: false,
           retryable: true,
         }))
         .mockResolvedValueOnce({
@@ -1898,12 +1898,11 @@ describe('useChatSend attachment payloads', () => {
           disposition: 'steering',
         }),
     }
-    const { api, options, stream } = makeOptions({
+    const { api, options, stream, pendingQueue } = makeOptions({
       ...sameTurnSteerOptions(),
       rpc,
       inputText,
       busySendMode: ref<BusySendMode>('steer'),
-      enqueuePendingSteerRetry,
     })
     stream.isStreaming.value = true
 
@@ -1918,12 +1917,13 @@ describe('useChatSend attachment payloads', () => {
     })
     expect(firstParams).not.toHaveProperty('queueMode')
     expect(inputText.value).toBe('')
-    expect(enqueuePendingSteerRetry).toHaveBeenCalledOnce()
+    expect(pendingQueue.value).toHaveLength(1)
+    expect(pendingQueue.value[0]?.steerAttempt?.phase).toBe('acceptance_unknown')
 
     // Even if the active task settles before the retry, the original target
     // and request id are replayed; this must never become chat.send follow-up.
     stream.isStreaming.value = false
-    await api.sendQueuedSteer(retryItem!)
+    await api.sendQueuedSteer(pendingQueue.value[0]!)
 
     expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
     expect(rpc.call.mock.calls.map(call => call[0])).toEqual([
@@ -1931,6 +1931,72 @@ describe('useChatSend attachment payloads', () => {
       'sessions.steer.v2',
     ])
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  it('treats a fulfilled steer response without accepted as unknown despite tempting fields', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        turn_id: 'turn-current',
+        user_message_id: 'user-unproven',
+        disposition: 'steering',
+        revision: 1,
+      }),
+    }
+    const { api, options, stream, pendingQueue } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      busySendMode: ref<BusySendMode>('steer'),
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(options.messages.value).toEqual([])
+    expect(pendingQueue.value).toHaveLength(1)
+    expect(pendingQueue.value[0]?.steerAttempt?.phase).toBe('acceptance_unknown')
+    expect(pendingQueue.value[0]?.steerAttempt?.request).toMatchObject(
+      rpc.call.mock.calls[0]?.[1],
+    )
+    expect(options.scheduleHistorySync).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { accepted: true, expectedLength: 0, expectedPhase: undefined },
+    { accepted: false, expectedLength: 1, expectedPhase: undefined },
+  ])('settles accepted=$accepted against the source item after navigating away', async ({
+    accepted,
+    expectedLength,
+    expectedPhase,
+  }) => {
+    let resolveSteer!: (value: unknown) => void
+    const rpc = {
+      call: vi.fn(<T = unknown>() => new Promise<T>((resolve) => {
+        resolveSteer = resolve as (value: unknown) => void
+      })) as UseChatSendOptions['rpc']['call'],
+    }
+    const sessionKey = ref('agent:main:webchat:source')
+    const restoreSteerIntoComposer = vi.fn()
+    const { api, options, stream, pendingQueue } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      sessionKey,
+      busySendMode: ref<BusySendMode>('steer'),
+      restoreSteerIntoComposer,
+    })
+    stream.isStreaming.value = true
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    sessionKey.value = 'agent:main:webchat:other'
+    resolveSteer(accepted
+      ? { accepted: true, disposition: 'steering', turn_id: 'turn-current' }
+      : { accepted: false, retryable: false, fallback_safe: false })
+    await send
+
+    expect(options.messages.value).toEqual([])
+    expect(pendingQueue.value).toHaveLength(expectedLength)
+    expect(pendingQueue.value[0]?.steerAttempt?.phase).toBe(expectedPhase)
+    expect(restoreSteerIntoComposer).not.toHaveBeenCalled()
   })
 
   it('re-homes a replayed promoted steer without waiting for its disposition event', async () => {
@@ -1972,11 +2038,18 @@ describe('useChatSend attachment payloads', () => {
       text: 'late adjustment',
       attachments: [],
       intent: null,
-      deliveryState: 'retryable',
-      steerClientRequestId: 'request-steer',
-      steerClientMessageId: 'client-steer',
-      steerExpectedTurnId: 'turn-current',
-      steerVisibleCommitted: true,
+      steerAttempt: {
+        phase: 'acceptance_unknown',
+        request: {
+          key: 'agent:main:webchat:test',
+          message: 'late adjustment',
+          expected_turn_id: 'turn-current',
+          client_request_id: 'request-steer',
+          client_message_id: 'client-steer',
+          surface_id: 'webui',
+          _source: { runMode: 'safe' },
+        },
+      },
     }
     const rpc = {
       call: vi.fn().mockResolvedValue({
@@ -2151,8 +2224,10 @@ describe('useChatSend attachment payloads', () => {
           retryable: true,
         }))
         .mockResolvedValueOnce({
+          accepted: true,
           sessionKey: 'agent:main:webchat:test',
           task_id: 'task-steer',
+          disposition: 'steering',
         }),
     }
     const inputText = ref('unrelated draft')
@@ -3401,12 +3476,7 @@ describe('useChatSend attachment payloads', () => {
     expect(stream.endStreaming).not.toHaveBeenCalled()
     expect(activeStreamTaskId.value).toBe('task-current')
     expect(activeStreamSessionKey.value).toBe('agent:main:webchat:test')
-    expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
-      role: 'user',
-      text: 'hello',
-      inputDisposition: 'rejected',
-      turnId: 'task-current',
-    })
+    expect(options.messages.value).toEqual([])
     expect(restoreSteerIntoComposer).toHaveBeenCalledWith('hello')
     expect(options.scheduleHistorySync).not.toHaveBeenCalled()
   })

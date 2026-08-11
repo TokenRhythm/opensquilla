@@ -257,12 +257,13 @@ jobs:
         working-directory: opensquilla-webui
         run: npx playwright install --with-deps chromium
 
-      - name: Run production-dist chat and Goal recovery browser contracts
+      - name: Run production-dist chat, Goal, and queue/steer recovery browser contracts
         working-directory: opensquilla-webui
         run: >-
           npm run test:e2e --
           history-hydration.spec.ts
           goal-mode.spec.ts
+          queue-steer.spec.ts
           --project=chromium
           --workers=1
 

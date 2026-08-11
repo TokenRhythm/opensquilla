@@ -801,10 +801,17 @@ describe('useChatRpcEventHandlers steer disposition', () => {
       text: steer.text,
       attachments: [],
       intent: null,
-      deliveryState: 'retryable',
-      steerClientRequestId: 'request-1',
-      steerClientMessageId: 'client-1',
-      steerExpectedTurnId: 'turn-old',
+      steerAttempt: {
+        phase: 'acceptance_unknown',
+        request: {
+          key: 'agent:main:test',
+          message: steer.text,
+          expected_turn_id: 'turn-old',
+          client_request_id: 'request-1',
+          client_message_id: 'client-1',
+          surface_id: 'webui',
+        },
+      },
     }
     const { api, messages, pendingQueue, scheduleHistorySync, stop } = createHarness({
       messages: [
