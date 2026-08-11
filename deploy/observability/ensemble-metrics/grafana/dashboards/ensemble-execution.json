@@ -1,0 +1,296 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Low-cardinality OpenSquilla ensemble execution metrics. Missing evidence is never coerced to zero.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(count_over_time({job=\"opensquilla-ensemble\"}[$__range]))", "queryType": "instant", "refId": "A"}],
+      "title": "Observed terminal events",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"max": 100, "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 99}]}, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(count_over_time({job=\"opensquilla-ensemble\", execution_status=\"success\"}[$__range])) / sum(count_over_time({job=\"opensquilla-ensemble\"}[$__range]))", "queryType": "instant", "refId": "A"}],
+      "title": "Success rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"max": 100, "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green"}, {"color": "red", "value": 2}]}, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(count_over_time({job=\"opensquilla-ensemble\", execution_status=\"failed\"}[$__range])) / sum(count_over_time({job=\"opensquilla-ensemble\"}[$__range]))", "queryType": "instant", "refId": "A"}],
+      "title": "Failure rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"max": 100, "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 95}]}, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(count_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_usage_projection_complete = \"true\" | __error__=\"\" [$__range])) / sum(count_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_usage_observed = \"true\" | __error__=\"\" [$__range]))", "queryType": "instant", "refId": "A"}],
+      "title": "Aggregator usage coverage",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "id": 5,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | ranking_snapshot_build_ms_observed = \"true\" | unwrap ranking_snapshot_build_ms | __error__=\"\" [$__interval]))", "legendFormat": "snapshot build p95", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | ranking_hard_filter_ms_observed = \"true\" | unwrap ranking_hard_filter_ms | __error__=\"\" [$__interval]))", "legendFormat": "hard filter p95", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | ranking_score_ms_observed = \"true\" | unwrap ranking_score_ms | __error__=\"\" [$__interval]))", "legendFormat": "score p95", "queryType": "range", "refId": "C"}
+      ],
+      "title": "Router-dynamic ranking stages p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"max": 100, "min": 0, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+      "id": 6,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(count_over_time({job=\"opensquilla-ensemble\"} | json | ranking_packaged_template_cache_hit = \"true\" | __error__=\"\" [$__interval])) / sum(count_over_time({job=\"opensquilla-ensemble\"} | json | ranking_packaged_template_cache_hit_observed = \"true\" | __error__=\"\" [$__interval]))", "legendFormat": "packaged cache hit", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_usage_accounting_observed = \"true\" | unwrap aggregator_usage_missing_count | __error__=\"\" [$__interval])) / sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_usage_accounting_observed = \"true\" | unwrap aggregator_usage_physical_request_count | __error__=\"\" [$__interval]))", "legendFormat": "aggregator unknown usage", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(count_over_time({job=\"opensquilla-ensemble\"} | json | trace_compact_json_bytes_capped = \"true\" | __error__=\"\" [$__interval])) / sum(count_over_time({job=\"opensquilla-ensemble\"}[$__interval]))", "legendFormat": "trace evidence capped", "queryType": "range", "refId": "C"}
+      ],
+      "title": "Coverage, cache, and evidence risk",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"decimals": 6, "unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 13},
+      "id": 7,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_cost_projection_complete = \"true\" | unwrap aggregator_billed_cost_usd | __error__=\"\" [$__range]))", "queryType": "instant", "refId": "A"}],
+      "title": "Exact aggregator billed cost",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 13},
+      "id": 8,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum by (aggregator_selected_kind) (count_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_selected_kind_observed = \"true\" | __error__=\"\" [$__interval]))", "legendFormat": "{{aggregator_selected_kind}}", "queryType": "range", "refId": "A"}],
+      "title": "Aggregator selected kind",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green"}, {"color": "red", "value": 1}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 13},
+      "id": 9,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | unwrap cleanup_lingering_task_count | __error__=\"\" [$__range])) + sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | unwrap cleanup_stream_close_unproven_count | __error__=\"\" [$__range]))", "queryType": "instant", "refId": "A"}],
+      "title": "Unsafe cleanup evidence",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green"}, {"color": "red", "value": 1}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 19},
+      "id": 10,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | unwrap canary_persistent_rollout_admission_unavailable_count | __error__=\"\" [$__range])) + sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | unwrap canary_persistent_rollout_mutation_unavailable_count | __error__=\"\" [$__range]))", "queryType": "instant", "refId": "A"}],
+      "title": "Persistent canary ledger unavailable",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"max": 100, "min": 0, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 19},
+      "id": 13,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(count_over_time({job=\"opensquilla-ensemble\"} | json | task_analyzer_schema_valid_observed = \"true\" | task_analyzer_schema_valid = \"false\" | __error__=\"\" [$__interval])) / sum(count_over_time({job=\"opensquilla-ensemble\"} | json | task_analyzer_schema_valid_observed = \"true\" | __error__=\"\" [$__interval]))", "legendFormat": "schema invalid", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(count_over_time({job=\"opensquilla-ensemble\"} | json | task_analyzer_deadline_expired_observed = \"true\" | task_analyzer_deadline_expired = \"true\" | __error__=\"\" [$__interval])) / sum(count_over_time({job=\"opensquilla-ensemble\"} | json | task_analyzer_deadline_expired_observed = \"true\" | __error__=\"\" [$__interval]))", "legendFormat": "deadline expired", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(count_over_time({job=\"opensquilla-ensemble\"} | json | task_analyzer_exhausted_observed = \"true\" | task_analyzer_exhausted = \"true\" | __error__=\"\" [$__interval])) / sum(count_over_time({job=\"opensquilla-ensemble\"} | json | task_analyzer_exhausted_observed = \"true\" | __error__=\"\" [$__interval]))", "legendFormat": "chain exhausted", "queryType": "range", "refId": "C"}
+      ],
+      "title": "Analyzer reliability",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 19},
+      "id": 14,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | proposer_admission_projection_complete = \"true\" | unwrap proposer_admission_timeout_count | __error__=\"\" [$__interval]))", "legendFormat": "proposer timeout", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | proposer_admission_projection_complete = \"true\" | unwrap proposer_admission_rejected_count | __error__=\"\" [$__interval]))", "legendFormat": "proposer rejected", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_admission_projection_complete = \"true\" | unwrap aggregator_admission_timeout_count | __error__=\"\" [$__interval]))", "legendFormat": "aggregator timeout", "queryType": "range", "refId": "C"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_admission_projection_complete = \"true\" | unwrap aggregator_admission_rejected_count | __error__=\"\" [$__interval]))", "legendFormat": "aggregator rejected", "queryType": "range", "refId": "D"}
+      ],
+      "title": "Exact admission pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 25},
+      "id": 15,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | runtime_health_filter_observed = \"true\" | unwrap runtime_health_proposer_filtered_count | __error__=\"\" [$__interval]))", "legendFormat": "proposer filtered", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | runtime_health_filter_observed = \"true\" | unwrap runtime_health_proposer_half_open_count | __error__=\"\" [$__interval]))", "legendFormat": "proposer half-open", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(count_over_time({job=\"opensquilla-ensemble\"} | json | runtime_health_never_strand_observed = \"true\" | runtime_health_never_strand = \"true\" | __error__=\"\" [$__interval]))", "legendFormat": "never-strand activations", "queryType": "range", "refId": "C"}
+      ],
+      "title": "Runtime health pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 25},
+      "id": 16,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | proposer_logical_terminal_http_status_observed = \"true\" | unwrap proposer_logical_terminal_rate_limited_count | __error__=\"\" [$__interval]))", "legendFormat": "proposer 429", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | proposer_logical_terminal_http_status_observed = \"true\" | unwrap proposer_logical_terminal_upstream_5xx_count | __error__=\"\" [$__interval]))", "legendFormat": "proposer 5xx", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_logical_terminal_http_status_observed = \"true\" | unwrap aggregator_logical_terminal_rate_limited_count | __error__=\"\" [$__interval]))", "legendFormat": "aggregator 429", "queryType": "range", "refId": "C"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_logical_terminal_http_status_observed = \"true\" | unwrap aggregator_logical_terminal_upstream_5xx_count | __error__=\"\" [$__interval]))", "legendFormat": "aggregator 5xx", "queryType": "range", "refId": "D"}
+      ],
+      "title": "Observed logical terminal HTTP",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 25},
+      "id": 17,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(count_over_time({job=\"opensquilla-ensemble\"} | json | quorum_reached_observed = \"true\" | quorum_reached = \"false\" | __error__=\"\" [$__interval]))", "legendFormat": "quorum not reached", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | proposer_recovery_observed = \"true\" | unwrap proposer_recovery_calls | __error__=\"\" [$__interval]))", "legendFormat": "proposer recovery calls", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | unwrap time_to_quorum_ms | __error__=\"\" [$__interval]))", "legendFormat": "time-to-quorum p95 ms", "queryType": "range", "refId": "C"}
+      ],
+      "title": "Quorum and proposer recovery",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 31},
+      "id": 18,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_recovery_attempts_observed = \"true\" | aggregator_recovery_attempt_scan_capped = \"false\" | unwrap aggregator_succeeded_attempt_count | __error__=\"\" [$__interval]))", "legendFormat": "succeeded", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_recovery_attempts_observed = \"true\" | aggregator_recovery_attempt_scan_capped = \"false\" | unwrap aggregator_failed_attempt_count | __error__=\"\" [$__interval]))", "legendFormat": "failed", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_recovery_attempts_observed = \"true\" | aggregator_recovery_attempt_scan_capped = \"false\" | unwrap aggregator_abandoned_attempt_count | __error__=\"\" [$__interval]))", "legendFormat": "abandoned", "queryType": "range", "refId": "C"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_recovery_attempts_observed = \"true\" | aggregator_recovery_attempt_scan_capped = \"false\" | unwrap aggregator_unavailable_attempt_count | __error__=\"\" [$__interval]))", "legendFormat": "unavailable", "queryType": "range", "refId": "D"}
+      ],
+      "title": "Aggregator attempt outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"max": 100, "min": 0, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 31},
+      "id": 19,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(count_over_time({job=\"opensquilla-ensemble\"} | json | proposer_usage_projection_complete = \"true\" | __error__=\"\" [$__interval])) / sum(count_over_time({job=\"opensquilla-ensemble\"} | json | proposer_usage_observed = \"true\" | __error__=\"\" [$__interval]))", "legendFormat": "usage evidence coverage", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | proposer_unknown_usage_count_observed = \"true\" | proposer_physical_request_count_observed = \"true\" | unwrap proposer_unknown_usage_count | __error__=\"\" [$__interval])) / sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | proposer_unknown_usage_count_observed = \"true\" | proposer_physical_request_count_observed = \"true\" | unwrap proposer_physical_request_count | __error__=\"\" [$__interval]))", "legendFormat": "unknown usage", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | proposer_usage_projection_complete = \"true\" | unwrap proposer_cache_hit_request_count | __error__=\"\" [$__interval])) / sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | proposer_usage_projection_complete = \"true\" | unwrap proposer_physical_request_count | __error__=\"\" [$__interval]))", "legendFormat": "proposer cache-hit share", "queryType": "range", "refId": "C"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "100 * sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_usage_projection_complete = \"true\" | unwrap aggregator_cache_hit_request_count | __error__=\"\" [$__interval])) / sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | aggregator_usage_projection_complete = \"true\" | unwrap aggregator_usage_physical_request_count | __error__=\"\" [$__interval]))", "legendFormat": "aggregator cache-hit share", "queryType": "range", "refId": "D"}
+      ],
+      "title": "Role usage and cache evidence",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 31},
+      "id": 20,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(count_over_time({job=\"opensquilla-ensemble\"} | json | canary_rollout_projection_complete = \"true\" | __error__=\"\" [$__interval]))", "legendFormat": "complete rollout receipts", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(count_over_time({job=\"opensquilla-ensemble\"} | json | canary_physical_budget_exhausted_observed = \"true\" | canary_physical_budget_exhausted = \"true\" | __error__=\"\" [$__interval]))", "legendFormat": "budget exhausted", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | canary_persistent_rollout_projection_complete = \"true\" | unwrap canary_persistent_rollout_rollback_transition_count | __error__=\"\" [$__interval]))", "legendFormat": "persistent rollback transitions", "queryType": "range", "refId": "C"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "sum(sum_over_time({job=\"opensquilla-ensemble\"} | json | canary_persistent_rollout_projection_complete = \"true\" | unwrap canary_persistent_rollout_recovery_transition_count | __error__=\"\" [$__interval]))", "legendFormat": "persistent recovery transitions", "queryType": "range", "refId": "D"}
+      ],
+      "title": "Canary rollout and budget",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 37},
+      "id": 21,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | unwrap task_analyzer_elapsed_ms | __error__=\"\" [$__interval]))", "legendFormat": "analyzer p95", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | unwrap time_to_quorum_ms | __error__=\"\" [$__interval]))", "legendFormat": "time-to-quorum p95", "queryType": "range", "refId": "B"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | proposer_candidate_scan_capped = \"false\" | unwrap proposer_candidate_elapsed_ms_max | __error__=\"\" [$__interval]))", "legendFormat": "proposer candidate max p95", "queryType": "range", "refId": "C"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | proposer_admission_projection_complete = \"true\" | unwrap proposer_admission_wait_ms_max | __error__=\"\" [$__interval]))", "legendFormat": "proposer admission p95", "queryType": "range", "refId": "D"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | aggregator_admission_projection_complete = \"true\" | unwrap aggregator_admission_wait_ms_max | __error__=\"\" [$__interval]))", "legendFormat": "aggregator admission p95", "queryType": "range", "refId": "E"}
+      ],
+      "title": "Core latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 37},
+      "id": 22,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | trace_size_observed = \"true\" | trace_compact_json_bytes_capped = \"false\" | unwrap trace_compact_json_bytes | __error__=\"\" [$__interval]))", "legendFormat": "exact compact bytes p95", "queryType": "range", "refId": "A"},
+        {"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "max(quantile_over_time(0.95, {job=\"opensquilla-ensemble\"} | json | trace_size_observed = \"true\" | trace_compact_json_bytes_capped = \"true\" | unwrap trace_compact_json_bytes_lower_bound | __error__=\"\" [$__interval]))", "legendFormat": "capped lower-bound p95", "queryType": "range", "refId": "B"}
+      ],
+      "title": "Trace size evidence p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "opensquilla-loki"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 45},
+      "id": 11,
+      "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": true, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": false},
+      "targets": [{"datasource": {"type": "loki", "uid": "opensquilla-loki"}, "editorMode": "code", "expr": "{job=\"opensquilla-ensemble\"} | json", "queryType": "range", "refId": "A"}],
+      "title": "Recent validated scalar receipts",
+      "type": "logs"
+    },
+    {
+      "gridPos": {"h": 5, "w": 24, "x": 0, "y": 53},
+      "id": 12,
+      "options": {"content": "### Intentionally unavailable\nDelivery coverage, analyzer cost/cache/status, full physical HTTP denominator, cross-host canary consensus, and trusted quality rollback remain unavailable. Missing fields are not zero. This reference stack is single-host evaluation infrastructure; use object storage and an authenticated ingress before production.", "mode": "markdown"},
+      "title": "Evidence boundary",
+      "type": "text"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": ["opensquilla", "ensemble", "slo"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "OpenSquilla Ensemble Execution",
+  "uid": "opensquilla-ensemble-execution-v1",
+  "version": 1,
+  "weekStart": ""
+}

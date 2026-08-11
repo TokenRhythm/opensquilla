@@ -1,0 +1,96 @@
+groups:
+  - name: opensquilla-ensemble-safety
+    interval: 1m
+    rules:
+      - alert: OpenSquillaEnsembleFailureRateHigh
+        expr: |
+          (
+            sum(count_over_time({job="opensquilla-ensemble", execution_status="failed"}[15m]))
+            /
+            sum(count_over_time({job="opensquilla-ensemble"}[15m]))
+          ) > 0.02
+          and
+          sum(count_over_time({job="opensquilla-ensemble"}[15m])) >= 100
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: OpenSquilla ensemble failure rate exceeds 2%
+          description: The 15 minute exact terminal failure rate stayed above 2% with at least 100 observed events.
+
+      - alert: OpenSquillaAggregatorUsageCoverageLow
+        expr: |
+          (
+            1 -
+            sum(count_over_time({job="opensquilla-ensemble"} | json | aggregator_usage_projection_complete = "true" | __error__="" [30m]))
+            /
+            sum(count_over_time({job="opensquilla-ensemble"} | json | aggregator_usage_observed = "true" | __error__="" [30m]))
+          ) > 0.05
+          and
+          sum(count_over_time({job="opensquilla-ensemble"} | json | aggregator_usage_observed = "true" | __error__="" [30m])) >= 100
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: OpenSquilla aggregator usage evidence coverage is below 95%
+          description: Missing or malformed all-attempt usage receipts can make token, cache, and cost panels incomplete.
+
+      - alert: OpenSquillaAggregatorUnknownUsageHigh
+        expr: |
+          (
+            sum(sum_over_time({job="opensquilla-ensemble"} | json | aggregator_usage_accounting_observed = "true" | unwrap aggregator_usage_missing_count | __error__="" [15m]))
+            /
+            sum(sum_over_time({job="opensquilla-ensemble"} | json | aggregator_usage_accounting_observed = "true" | unwrap aggregator_usage_physical_request_count | __error__="" [15m]))
+          ) > 0.01
+          and
+          sum(sum_over_time({job="opensquilla-ensemble"} | json | aggregator_usage_accounting_observed = "true" | unwrap aggregator_usage_physical_request_count | __error__="" [15m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: OpenSquilla aggregator unknown usage exceeds 1%
+          description: More than 1% of exactly accounted aggregator physical requests lack usage evidence.
+
+      - alert: OpenSquillaCleanupEvidenceUnsafe
+        expr: |
+          (
+            sum(sum_over_time({job="opensquilla-ensemble"} | json | unwrap cleanup_lingering_task_count | __error__="" [10m]))
+            +
+            sum(sum_over_time({job="opensquilla-ensemble"} | json | unwrap cleanup_stream_close_unproven_count | __error__="" [10m]))
+          ) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: OpenSquilla has lingering work or an unproven stream close
+          description: At least one terminal receipt reports lingering cleanup or an unproven provider stream close.
+
+      - alert: OpenSquillaPersistentCanaryLedgerUnavailable
+        expr: |
+          (
+            sum(sum_over_time({job="opensquilla-ensemble"} | json | unwrap canary_persistent_rollout_admission_unavailable_count | __error__="" [5m]))
+            +
+            sum(sum_over_time({job="opensquilla-ensemble"} | json | unwrap canary_persistent_rollout_mutation_unavailable_count | __error__="" [5m]))
+          ) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: OpenSquilla persistent canary safety ledger is unavailable
+          description: A canary admission or settlement could not be proven by the same-host persistent ledger.
+
+      - alert: OpenSquillaTraceEvidenceCapRateHigh
+        expr: |
+          (
+            sum(count_over_time({job="opensquilla-ensemble"} | json | trace_compact_json_bytes_capped = "true" | __error__="" [30m]))
+            /
+            sum(count_over_time({job="opensquilla-ensemble"}[30m]))
+          ) > 0.01
+          and
+          sum(count_over_time({job="opensquilla-ensemble"}[30m])) >= 100
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: OpenSquilla trace evidence cap rate exceeds 1%
+          description: More than 1% of terminal metric events hit the bounded trace-size evidence cap.

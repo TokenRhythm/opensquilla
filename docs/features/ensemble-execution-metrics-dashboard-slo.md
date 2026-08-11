@@ -1,10 +1,14 @@
 # Ensemble execution metrics dashboard 与 SLO 契约（v1）
 
-状态：v1 producer 已实现；有默认关闭的本地结构化 JSONL transport；dashboard
-与 SLO 仍是建议契约，仓库尚无 collector、指标后端、datasource、ruler 或
-dashboard provisioning。
+状态：v1 producer、默认关闭的本地结构化 JSONL transport，以及可选的单机
+reference observability stack 均已实现。reference stack 已包含 Alloy collector、
+Loki backend/ruler、Alertmanager、Grafana datasource 与 dashboard provisioning，
+并有真实启动、摄取、查询与 provisioning smoke test；它仍不是 production HA
+观测平台，也不能证明 metrics delivery coverage。
 
-证据基线：`69cb3088` 中的 `src/opensquilla/observability/ensemble_execution_metrics.py` 及 `tests/test_observability/test_ensemble_execution_metrics.py`。
+证据基线：`69cb3088` 的 v1 projector、`aeff2d30` 的 secure JSONL transport、
+`f8077fd4` 的 persistent-canary projection、`82951551` 的 ranking-stage evidence，
+以及 `ddf4f07c` 的 all-attempt aggregator usage accounting。
 
 事件名：`llm_ensemble.execution.metrics`。
 Schema：`opensquilla.ensemble-execution-metrics/v1`。
@@ -47,12 +51,15 @@ fail closed，但不影响普通 structlog event 或模型 turn。
 best-effort transport，不 `fsync`、不重试，也没有 delivery acknowledgement；
 轮转后的本地文件不能证明 metrics delivery coverage。
 
-这项 transport **不是 dashboard backend**：仓库仍没有 collector、
-Prometheus/OpenTelemetry exporter、Loki/时序数据库、Grafana datasource、
-alert ruler、通知目标或可加载 dashboard。因此不能把 JSONL 文件本身称为
-“已部署 dashboard/SLO”，也不能新增孤立 dashboard JSON/rules YAML。后续选择
-并接入真实 backend 时，collector 只能消费通过 `transport_schema`、`event` 和
-`schema` 三重过滤且通过同一 allowlist 的 rows。
+这项 transport 本身仍不是 dashboard backend；是否启动下节的 reference stack
+不会改变 gateway 的 fail-open、best-effort 或无 delivery receipt 语义。collector
+只能消费通过 `transport_schema`、`event`、`schema` 三重过滤和固定枚举检查的
+rows；任何 malformed 或未知-domain row 都不会进入 Loki。
+
+完整字段 allowlist/type/privacy gate 仍由 owner-only Python transport sink 执行；
+Alloy 保留原始的已验证 scalar JSON line 以便查询，只额外做 schema 与固定枚举过滤，
+不是第二个任意 JSON allowlist。因此 reference stack 只能挂载该受信 transport 的
+专用 `0700` 目录，禁止指向其他 producer 可写的通用日志目录。
 
 router-dynamic snapshot build、hard filter、score latency 与本次 packaged-template
 lookup 的 cache hit 已有独立 producer evidence 和固定 projector；metrics delivery
@@ -61,8 +68,44 @@ coverage 仍保持 unavailable。本 transport 只承运已通过 contract 的�
 receipt projection，仍不代表 multi-host coordination、quality rollback 或整体请求
 latency evidence。
 
-主要解决：为后续真实采集器提供可解析、低基数、空间有界的本地交接面，同时
-明确它没有越级完成 dashboard、告警或缺失 producer 的观测能力。
+主要解决：为采集器提供可解析、低基数、空间有界的本地交接面，同时明确它不
+会凭空补齐缺失 producer evidence 或 delivery coverage。
+
+### 1.2 可选单机 reference observability stack
+
+`deploy/observability/ensemble-metrics/` 提供一个默认不启动、镜像版本固定的
+Docker Compose reference stack：Alloy 只读挂载 JSONL 目录并执行上述三重 schema
+和固定 label-domain 过滤；Loki 以 single-binary filesystem/TSDB 模式保存 14 天，
+本地 ruler 加载六条 evidence-gated safety alerts；Alertmanager 默认只提供本地 UI
+receiver；Grafana 自动 provision Loki datasource 和 22-panel dashboard。所有宿主
+端口默认只绑定 `127.0.0.1`，Grafana admin password 必须显式提供。
+
+静态验证使用：
+
+```bash
+python deploy/observability/ensemble-metrics/verify_reference_stack.py
+```
+
+真实 smoke 使用：
+
+```bash
+python deploy/observability/ensemble-metrics/verify_reference_stack.py --live
+```
+
+后者建立唯一 Compose project 与临时 `0700` transport directory，启动四个服务，
+写入通过 runtime contract 的无 identity 合成 rows，验证 Alloy→Loki 摄取、LogQL
+queries、Loki ruler、Alertmanager readiness，以及 Grafana datasource/dashboard API，
+最后在 `finally` 删除该 project 和 volumes。
+
+该 stack 的准确边界是 **single-host evaluation/reference deployment**。它没有
+authenticated remote ingestion、object storage、跨 host replication、production
+HA、外部告警通知或 delivery acknowledgement。生产化必须另行配置 durable object
+storage/HA topology、认证入口、外部 Alertmanager receiver 和 stack 自身监控。在这些
+条件完成前，dashboard 能用于本机 evidence 验证和趋势检查，但不能被描述为完整
+production SLO deployment；缺失字段仍显示 unavailable，不能回填 0。
+
+主要解决：将既有 projector/transport 连接到真正可加载、可查询、可告警、可重复
+smoke 的参考部署，同时保留 production 与证据完整性的明确边界。
 
 ## 2. 证据语义
 
@@ -387,9 +430,17 @@ ensemble_unknown_usage_rate =
 proposer_unknown_usage_rate =
   sum(proposer_unknown_usage_count | proposer_unknown_usage_count_observed and proposer_physical_request_count_observed)
   / sum(proposer_physical_request_count | same events)
+
+aggregator_unknown_usage_rate =
+  sum(aggregator_usage_missing_count | aggregator_usage_accounting_observed)
+  / sum(aggregator_usage_physical_request_count | same events)
 ```
 
-建议：warning `>0.1%` 持续 15 分钟，critical `>1.0%` 持续 10 分钟。Aggregator 全 attempts 的 unknown usage rate unavailable；final-request usage incomplete 只能进入 coverage 告警。
+建议：warning `>0.1%` 持续 15 分钟，critical `>1.0%` 持续 10 分钟。
+Aggregator 公式只消费完成逐 attempt join 且满足
+`usage_rows + usage_missing == physical_requests` 的 accounting evidence；
+`aggregator_usage_projection_complete=false` 的事件只进入 coverage 告警，不能把
+final-request usage 当作全 attempts denominator。
 
 主要解决：避免未知 usage 被默认 0 token/0 cost 稀释，从而暴露费用与容量盲区。
 

@@ -1,0 +1,92 @@
+loki.source.file "ensemble_metrics" {
+  targets = [
+    {
+      __path__ = "/var/lib/opensquilla-metrics/ensemble-execution-metrics-v1.jsonl",
+      job      = "opensquilla-ensemble",
+    },
+  ]
+  forward_to = [loki.process.ensemble_metrics.receiver]
+  file_match {
+    enabled     = true
+    sync_period = "2s"
+  }
+}
+
+loki.process "ensemble_metrics" {
+  forward_to = [loki.write.local.receiver]
+
+  stage.json {
+    expressions = {
+      emitted_at      = "emitted_at",
+      event           = "event",
+      execution_status = "execution_status",
+      schema          = "schema",
+      selection_family = "selection_family",
+      terminal_outcome = "terminal_outcome",
+      transport_schema = "transport_schema",
+    }
+  }
+
+  stage.labels {
+    values = {
+      event            = "event",
+      execution_status = "execution_status",
+      schema           = "schema",
+      selection_family = "selection_family",
+      terminal_outcome = "terminal_outcome",
+      transport_schema = "transport_schema",
+    }
+  }
+
+  stage.match {
+    selector            = "{transport_schema!=\"opensquilla.ensemble-execution-metrics-jsonl/v1\"}"
+    action              = "drop"
+    drop_counter_reason = "invalid_transport_schema"
+  }
+
+  stage.match {
+    selector            = "{event!=\"llm_ensemble.execution.metrics\"}"
+    action              = "drop"
+    drop_counter_reason = "invalid_event"
+  }
+
+  stage.match {
+    selector            = "{schema!=\"opensquilla.ensemble-execution-metrics/v1\"}"
+    action              = "drop"
+    drop_counter_reason = "invalid_metrics_schema"
+  }
+
+  stage.match {
+    selector            = "{terminal_outcome!~\"completed|failed\"}"
+    action              = "drop"
+    drop_counter_reason = "invalid_terminal_outcome"
+  }
+
+  stage.match {
+    selector            = "{execution_status!~\"success|degraded|failed\"}"
+    action              = "drop"
+    drop_counter_reason = "invalid_execution_status"
+  }
+
+  stage.match {
+    selector            = "{selection_family!~\"router_dynamic|router_tree_baseline|fixed|unknown\"}"
+    action              = "drop"
+    drop_counter_reason = "invalid_selection_family"
+  }
+
+  stage.timestamp {
+    source            = "emitted_at"
+    format            = "RFC3339Nano"
+    action_on_failure = "skip"
+  }
+
+  stage.label_drop {
+    values = ["event", "filename", "schema", "transport_schema"]
+  }
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

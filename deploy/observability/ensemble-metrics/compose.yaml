@@ -1,0 +1,69 @@
+name: opensquilla-ensemble-observability
+
+services:
+  loki:
+    image: grafana/loki:3.7.3
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki/config.yaml:/etc/loki/config.yaml:ro
+      - ./loki/rules:/etc/loki/rules:ro
+      - loki-data:/loki
+    ports:
+      - "127.0.0.1:${OPENSQUILLA_LOKI_PORT:-3100}:3100"
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.32.1
+    command:
+      - --config.file=/etc/alertmanager/config.yaml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager/config.yaml:/etc/alertmanager/config.yaml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "127.0.0.1:${OPENSQUILLA_ALERTMANAGER_PORT:-9093}:9093"
+    restart: unless-stopped
+
+  alloy:
+    image: grafana/alloy:v1.18.0
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    depends_on:
+      - loki
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ${OPENSQUILLA_ENSEMBLE_METRICS_JSONL_DIR:?set an absolute owner-only metrics directory}:/var/lib/opensquilla-metrics:ro
+      - alloy-data:/var/lib/alloy/data
+    ports:
+      - "127.0.0.1:${OPENSQUILLA_ALLOY_PORT:-12345}:12345"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.4.0
+    depends_on:
+      - loki
+    environment:
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_AUTO_UPDATE: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_SECURITY_ADMIN_USER: ${OPENSQUILLA_GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${OPENSQUILLA_GRAFANA_ADMIN_PASSWORD:?set a non-default Grafana admin password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${OPENSQUILLA_GRAFANA_PORT:-3000}:3000"
+    restart: unless-stopped
+
+volumes:
+  alertmanager-data:
+  alloy-data:
+  grafana-data:
+  loki-data:

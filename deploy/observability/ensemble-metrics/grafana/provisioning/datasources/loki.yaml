@@ -1,0 +1,14 @@
+apiVersion: 1
+
+prune: true
+
+datasources:
+  - name: OpenSquilla Loki
+    uid: opensquilla-loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: true
+    editable: false
+    jsonData:
+      maxLines: 1000
