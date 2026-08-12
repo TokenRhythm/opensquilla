@@ -45,8 +45,21 @@
         @citation="onCitation"
       />
       <template v-if="activityProjection.canSeparateActivity">
+        <div
+          v-if="activityProjection.answerPart && !hasPlan && showSettledReceiptAfterAnswer"
+          class="assistant-answer"
+        >
+          <TextPart
+            :part="activityProjection.answerPart"
+            :sources="message.sources ?? []"
+            @citation="onCitation"
+          />
+        </div>
         <ActivityDisclosure
           v-if="showActivityDisclosure"
+          :class="{
+            'assistant-activity--after-answer': showSettledReceiptAfterAnswer,
+          }"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
           :failure-count="0"
@@ -103,7 +116,7 @@
           </AssistantActivityTimeline>
         </ActivityDisclosure>
         <div
-          v-if="activityProjection.answerPart && !hasPlan"
+          v-if="activityProjection.answerPart && !hasPlan && !showSettledReceiptAfterAnswer"
           class="assistant-answer"
           :class="{ 'assistant-answer--separated': showActivityDisclosure }"
         >
@@ -821,6 +834,12 @@ const showActivityDisclosure = computed(() =>
 const showReceiptUsage = computed(() =>
   hasMetaDetails.value && showActivityDisclosure.value,
 )
+const showSettledReceiptAfterAnswer = computed(() =>
+  showActivityDisclosure.value
+  && activityCompletionConfirmed.value
+  && !!activityProjection.value.answerPart
+  && !hasPlan.value,
+)
 const showUsageOnlyReceipt = computed(() =>
   !activityProjection.value.canSeparateActivity
   && hasMetaDetails.value
@@ -1107,6 +1126,12 @@ function ensembleRole(role: string, label: string): string {
 
 .assistant-answer--separated {
   margin-top: 0;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--hairline);
+}
+
+.assistant-activity--after-answer {
+  margin-top: 0.75rem;
   padding-top: 0.75rem;
   border-top: 1px solid var(--hairline);
 }

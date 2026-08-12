@@ -8,6 +8,7 @@
       v-for="(item, index) in items"
       :key="index"
       class="chat-pending-card"
+      :data-delivery-state="pendingCardState(item)"
       :aria-busy="isSteering(item) ? 'true' : undefined"
       :aria-describedby="attachmentBlockMessage(item) ? attachmentStatusId(index) : undefined"
     >
@@ -37,7 +38,9 @@
           @click="emit('steer', index)"
         >
           <span aria-hidden="true">↪</span>
-          <span>{{ steerActionLabel(item) }}</span>
+          <span :aria-live="pendingCardState(item) !== 'queued' ? 'polite' : undefined">
+            {{ steerActionLabel(item) }}
+          </span>
         </button>
         <button
           type="button"
@@ -154,6 +157,12 @@ function isSteering(item: PendingQueueItem): boolean {
 function isSteerRetry(item: PendingQueueItem): boolean {
   return item.steerAttempt?.phase === 'retryable_rejected'
     || item.steerAttempt?.phase === 'acceptance_unknown'
+}
+
+function pendingCardState(item: PendingQueueItem): 'queued' | 'busy' | 'attention' {
+  if (isSteering(item)) return 'busy'
+  if (item.deliveryState === 'retryable' || isSteerRetry(item)) return 'attention'
+  return 'queued'
 }
 
 function steerActionLabel(item: PendingQueueItem): string {
@@ -275,9 +284,9 @@ useDocumentEvent('keydown', (event) => {
   position: relative;
   z-index: 1;
   display: grid;
-  gap: 6px;
-  width: min(calc(100% - 3rem), var(--composer-col, 820px));
-  margin: 0 auto -10px;
+  gap: 8px;
+  width: min(calc(100% - 3rem), calc(var(--composer-col, 820px) - 1rem));
+  margin: 0 auto 10px;
   padding: 0;
 }
 
@@ -285,15 +294,47 @@ useDocumentEvent('keydown', (event) => {
   position: relative;
   display: flex;
   align-items: center;
-  min-height: 48px;
-  gap: 8px;
-  padding: 8px 12px 13px;
-  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
-  border-radius: var(--radius-lg) var(--radius-lg) var(--radius-md) var(--radius-md);
-  background: color-mix(in srgb, var(--bg-surface) 98%, var(--bg-surface-2));
+  min-height: 50px;
+  gap: 10px;
+  padding: 9px 10px 9px 15px;
+  border: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--bg-surface) 98%, var(--accent) 2%),
+    color-mix(in srgb, var(--bg-surface) 96%, var(--bg-surface-2))
+  );
   box-shadow:
     inset 0 1px 0 var(--elev-highlight),
-    0 10px 26px -22px color-mix(in srgb, var(--text) 34%, transparent);
+    0 12px 30px -25px color-mix(in srgb, var(--text) 38%, transparent);
+}
+
+.chat-pending-card::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 82%, var(--text));
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.chat-pending-card[data-delivery-state="attention"] {
+  border-color: color-mix(in srgb, var(--warn) 24%, var(--border));
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--bg-surface) 95%, var(--warn-fill)),
+    var(--bg-surface)
+  );
+}
+
+.chat-pending-card[data-delivery-state="attention"]::before {
+  background: var(--warn);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 11%, transparent);
+}
+
+.chat-pending-card[data-delivery-state="busy"]::before {
+  animation: chat-pending-pulse 1.8s var(--ease-standard) infinite;
 }
 
 .chat-pending-text {
@@ -328,7 +369,7 @@ useDocumentEvent('keydown', (event) => {
   display: inline-flex;
   align-items: center;
   flex: 0 0 auto;
-  gap: 2px;
+  gap: 3px;
 }
 
 .chat-pending-action {
@@ -357,7 +398,19 @@ useDocumentEvent('keydown', (event) => {
 
 .chat-pending-action--steer {
   gap: 3px;
+  min-height: 28px;
+  padding-inline: 8px;
   font-size: var(--fs-xs);
+}
+
+.chat-pending-card[data-delivery-state="attention"] .chat-pending-action--steer {
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  color: color-mix(in srgb, var(--warn) 84%, var(--text));
+}
+
+.chat-pending-card[data-delivery-state="attention"] .chat-pending-action--steer:hover,
+.chat-pending-card[data-delivery-state="attention"] .chat-pending-action--steer:focus-visible {
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
 }
 
 .chat-pending-action:hover,
@@ -425,13 +478,47 @@ useDocumentEvent('keydown', (event) => {
   opacity: 0.5;
 }
 
+@keyframes chat-pending-pulse {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+}
+
 @media (max-width: 640px) {
   .chat-pending {
     width: calc(100% - 2rem);
   }
 
   .chat-pending-card {
+    flex-wrap: wrap;
+    gap: 7px 9px;
     padding-inline: 10px;
+  }
+
+  .chat-pending-text {
+    flex-basis: calc(100% - 18px);
+  }
+
+  .chat-pending-actions {
+    width: 100%;
+    justify-content: flex-end;
+    padding-top: 7px;
+    border-top: 1px solid color-mix(in srgb, var(--text) 7%, transparent);
+  }
+
+  .chat-pending-action {
+    min-height: 36px;
+  }
+
+  .chat-pending-action--icon {
+    width: 36px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-pending-card[data-delivery-state="busy"]::before {
+    animation: none;
   }
 }
 </style>

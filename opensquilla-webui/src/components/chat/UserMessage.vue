@@ -1,7 +1,11 @@
 <template>
   <div
     class="msg-user"
-    :class="{ 'msg-user--share-mode': shareMode, 'msg-user--share-selected': shareSelected }"
+    :class="{
+      'msg-user--share-mode': shareMode,
+      'msg-user--share-selected': shareSelected,
+      'msg-user--steer': !!message.inputDisposition,
+    }"
     :data-message-id="message.messageId"
     :data-share-message-id="shareMessageId"
     :data-share-selected="shareSelected ? 'true' : undefined"
@@ -346,11 +350,34 @@ function attachmentMeta(attachment: DisplayAttachment): string {
 .msg-user-steer-status {
   display: inline-flex;
   align-items: center;
+  gap: 0.375rem;
   min-height: 1.25rem;
-  padding-inline: 0.25rem;
+  margin-top: -0.0625rem;
+  padding: 0.125rem 0.4375rem;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
   color: var(--text-dim);
   font-size: var(--fs-xs);
   line-height: 1.3;
+}
+
+.msg-user-steer-status::before {
+  width: 0.3125rem;
+  height: 0.3125rem;
+  flex: 0 0 auto;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 78%, var(--text));
+  content: "";
+}
+
+.msg-user-steer-status--cancelled,
+.msg-user-steer-status--rejected {
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+
+.msg-user-steer-status--cancelled::before,
+.msg-user-steer-status--rejected::before {
+  background: var(--warn);
 }
 
 .msg-user-goal-origin {
@@ -425,6 +452,16 @@ function attachmentMeta(attachment: DisplayAttachment): string {
   max-width: 82%;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.msg-user--steer .msg-user-bubble {
+  border: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border));
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--msg-bubble) 94%, var(--accent) 6%),
+    var(--msg-bubble)
+  );
+  box-shadow: 0 8px 24px -22px color-mix(in srgb, var(--accent) 54%, transparent);
 }
 
 .msg-user-actions {

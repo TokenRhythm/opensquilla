@@ -38,7 +38,7 @@ from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.session_streams import SessionStreamRegistry, get_session_streams
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
-from opensquilla.project_workspaces import ProjectWorkspaceStateError
+from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.sandbox.capability_service import CapabilityReport
@@ -3951,6 +3951,15 @@ class TestSessionsSteer:
         key = "agent:main:webchat:steer-v2"
         store = SessionStorage(str(tmp_path / "steer-v2.db"))
         await store.connect()
+        project = tmp_path / "steer-v2-project"
+        project.mkdir()
+        workspace = await store.create_or_restore_project_workspace(
+            path=str(project.resolve()),
+            path_key=project_path_key(project, strict=True),
+            display_name="steer-v2-project",
+            trusted_at=100,
+            now_ms=100,
+        )
         await store.upsert_session(
             SessionNode(
                 session_key=key,
@@ -3958,6 +3967,7 @@ class TestSessionsSteer:
                 agent_id="main",
                 created_at=100,
                 updated_at=100,
+                workspace_id=workspace.workspace_id,
             )
         )
         manager = SessionManager(store, inject_time_prefix=False)
@@ -3996,12 +4006,6 @@ class TestSessionsSteer:
                 params,
                 ctx,
             )
-            replayed = await dispatcher.dispatch(
-                "r-steer-v2-replay",
-                "sessions.steer.v2",
-                params,
-                ctx,
-            )
             mismatch = await dispatcher.dispatch(
                 "r-steer-v2-mismatch",
                 "sessions.steer.v2",
@@ -4010,6 +4014,40 @@ class TestSessionsSteer:
                     "client_request_id": "request-steer-v2-mismatch",
                     "client_message_id": "client-steer-v2-mismatch",
                     "expected_turn_id": "another-turn",
+                },
+                ctx,
+            )
+            original_accept_turn = store.accept_turn
+            store.accept_turn = AsyncMock(  # type: ignore[method-assign]
+                side_effect=ProjectWorkspaceStateError("binding_changed")
+            )
+            try:
+                raced = await dispatcher.dispatch(
+                    "r-steer-v2-workspace-race",
+                    "sessions.steer.v2",
+                    {
+                        **params,
+                        "client_request_id": "request-steer-v2-workspace-race",
+                        "client_message_id": "client-steer-v2-workspace-race",
+                    },
+                    ctx,
+                )
+            finally:
+                store.accept_turn = original_accept_turn  # type: ignore[method-assign]
+            await store.remove_project_workspace(workspace.workspace_id, now_ms=200)
+            replayed = await dispatcher.dispatch(
+                "r-steer-v2-replay",
+                "sessions.steer.v2",
+                params,
+                ctx,
+            )
+            unavailable = await dispatcher.dispatch(
+                "r-steer-v2-workspace-unavailable",
+                "sessions.steer.v2",
+                {
+                    **params,
+                    "client_request_id": "request-steer-v2-workspace-unavailable",
+                    "client_message_id": "client-steer-v2-workspace-unavailable",
                 },
                 ctx,
             )
@@ -4025,10 +4063,23 @@ class TestSessionsSteer:
             assert replayed.payload["replayed"] is True
             assert replayed.payload["revision"] == 1
             assert replayed.payload["user_message_id"] == accepted.payload["user_message_id"]
+            assert unavailable.ok is False
+            assert unavailable.error.accepted is False
+            assert unavailable.error.details == {
+                "reason": "removed",
+                "fallback_safe": True,
+            }
             assert mismatch.ok is True
             assert mismatch.payload["accepted"] is False
             assert mismatch.payload["failure_code"] == "EXPECTED_TURN_MISMATCH"
             assert mismatch.payload["fallback_safe"] is True
+            assert raced.ok is False
+            assert raced.error.accepted is False
+            assert raced.error.retryable is False
+            assert raced.error.details == {
+                "reason": "binding_changed",
+                "fallback_safe": True,
+            }
 
             transcript = await store.get_transcript("session-steer-v2")
             assert len(transcript) == 1

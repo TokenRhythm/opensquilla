@@ -5188,6 +5188,24 @@ async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dic
     if session is None:
         raise KeyError(f"Session not found: {key}")
 
+    def _project_workspace_failure(
+        exc: ProjectWorkspaceStateError,
+    ) -> RpcHandlerError:
+        mapped = map_project_workspace_error(
+            exc,
+            owner=ctx.principal.is_owner,
+        )
+        details = dict(mapped.details) if isinstance(mapped.details, dict) else {}
+        details["fallback_safe"] = True
+        return RpcHandlerError(
+            mapped.code,
+            mapped.message,
+            details=details,
+            retryable=mapped.retryable,
+            retry_after_ms=mapped.retry_after_ms,
+            accepted=False,
+        )
+
     task_runtime = getattr(ctx, "task_runtime", None)
     admit_steer = getattr(task_runtime, "admit_steer", None)
     if not callable(admit_steer):
@@ -5288,6 +5306,18 @@ async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dic
                 storage=storage,
             )
 
+    workspace_guard = None
+    bound_workspace_id = getattr(session, "workspace_id", None)
+    if isinstance(bound_workspace_id, str) and bound_workspace_id:
+        try:
+            validated_workspace = await resolve_validated_project_workspace(
+                storage,
+                bound_workspace_id,
+            )
+        except ProjectWorkspaceStateError as exc:
+            raise _project_workspace_failure(exc) from exc
+        workspace_guard = validated_workspace.guard
+
     prepare_message = getattr(ctx.session_manager, "prepare_message", None)
     accept_turn = getattr(storage, "accept_turn", None)
     if not callable(prepare_message) or not callable(accept_turn):
@@ -5329,6 +5359,7 @@ async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dic
                 request_session_key=ingress_identity.request_session_key,
                 client_request_id=ingress_identity.client_request_id,
                 request_fingerprint=ingress_identity.request_fingerprint,
+                workspace_guard=workspace_guard,
             ),
         )
 
@@ -5374,6 +5405,8 @@ async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dic
             retryable=False,
             accepted=False,
         ) from exc
+    except ProjectWorkspaceStateError as exc:
+        raise _project_workspace_failure(exc) from exc
 
     if not admission.accepted:
         # A concurrent duplicate may have committed before this admission

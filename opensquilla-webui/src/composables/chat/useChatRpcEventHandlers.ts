@@ -1467,6 +1467,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       } else {
         options.applySessionRunState({ run_status: 'failed', last_task: { ...(payload || {}), status: 'failed' } })
       }
+      if (pendingQueue.value.length > 0 && activeTaskGroups.value.size === 0) {
+        options.schedulePendingDrainAfterTerminal()
+      }
       activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
     }
   }

@@ -265,6 +265,7 @@ describe('AssistantMessage activity disclosure', () => {
     await nextTick()
 
     const receipt = el.querySelector<HTMLElement>('.assistant-activity')
+    const answer = el.querySelector<HTMLElement>('.assistant-answer')
     const summary = receipt?.querySelector<HTMLButtonElement>('.assistant-activity__summary')
     expect(receipt).not.toBeNull()
     expect(summary?.textContent).toContain('Completed · 5s')
@@ -273,6 +274,11 @@ describe('AssistantMessage activity disclosure', () => {
     expect(receipt?.querySelector('.turn-usage-details')?.textContent).toContain('kimi-k2.7-code')
     expect(receipt?.querySelector('.turn-usage-details')?.textContent).toContain('4096')
     expect(receipt?.querySelector('.turn-usage-details')?.textContent).toContain('128')
+    expect(
+      Boolean(
+        (answer?.compareDocumentPosition(receipt!) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true)
   })
 
   it('keeps usage inside the same disclosure as tools and reasoning', async () => {
@@ -516,7 +522,14 @@ describe('AssistantMessage activity disclosure', () => {
     expect(summary?.textContent).not.toContain('Activity ·')
     expect(el.querySelector('.assistant-activity')?.getAttribute('data-share-expanded')).toBe('false')
     expect(el.querySelector('.tool-row')).not.toBeNull()
-    expect(el.querySelector('.assistant-answer--separated')).not.toBeNull()
+    const answer = el.querySelector<HTMLElement>('.assistant-answer')
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    expect(el.querySelector('.assistant-answer--separated')).toBeNull()
+    expect(
+      Boolean(
+        (answer?.compareDocumentPosition(activity!) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true)
   })
 
   it('does not add an answer divider when the message has no activity', async () => {
@@ -920,6 +933,7 @@ describe('AssistantMessage activity disclosure', () => {
     const message = reactive(baseMessage({
       isStreaming: true,
       timelineItems: successfulTimeline(),
+      meta: usageMeta(),
     }))
     const el = mountMessage(message)
     await nextTick()
@@ -928,6 +942,14 @@ describe('AssistantMessage activity disclosure', () => {
       .toBe('true')
     expect(el.querySelector('.assistant-activity__body')?.getAttribute('aria-hidden'))
       .toBe('false')
+    const liveAnswer = el.querySelector<HTMLElement>('.assistant-answer')
+    const liveActivity = el.querySelector<HTMLElement>('.assistant-activity')
+    expect(
+      Boolean(
+        (liveActivity?.compareDocumentPosition(liveAnswer!) ?? 0)
+        & Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true)
 
     message.isStreaming = false
     await nextTick()
@@ -936,6 +958,14 @@ describe('AssistantMessage activity disclosure', () => {
       .toBe('false')
     expect(el.querySelector('.assistant-activity__body')?.getAttribute('aria-hidden'))
       .toBe('true')
+    const settledAnswer = el.querySelector<HTMLElement>('.assistant-answer')
+    const settledActivity = el.querySelector<HTMLElement>('.assistant-activity')
+    expect(
+      Boolean(
+        (settledAnswer?.compareDocumentPosition(settledActivity!) ?? 0)
+        & Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true)
   })
 
   it('does not let the tool-detail preference force the outer activity open', async () => {

@@ -395,6 +395,32 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
     }
   })
 
+  it.each(['task.failed', 'task.timeout'])(
+    'schedules queued follow-up delivery after %s settles the active task',
+    (event) => {
+      const {
+        api,
+        activeStreamTaskId,
+        schedulePendingDrainAfterTerminal,
+        stop,
+      } = createHarness({
+        pendingQueue: [{ text: 'Follow up', attachments: [], intent: null }],
+      })
+      try {
+        activeStreamTaskId.value = 'task-failed'
+        api.handlers.onAny(event, {
+          session_key: 'agent:main:test',
+          task_id: 'task-failed',
+          message: 'Provider failed',
+        })
+
+        expect(schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      } finally {
+        stop()
+      }
+    },
+  )
+
   it('lets a terminal own a stream sequence shared with an earlier visible frame', () => {
     const {
       api,

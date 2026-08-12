@@ -114,6 +114,7 @@ describe('PendingQueue', () => {
     }, [{ text: 'Already steering', deliveryState: 'steering' }])
 
     expect(el.querySelector('.chat-pending-card')?.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('.chat-pending-card')?.getAttribute('data-delivery-state')).toBe('busy')
     const actions = [...el.querySelectorAll<HTMLButtonElement>('.chat-pending-actions button')]
     expect(actions).toHaveLength(3)
     expect(actions.every(button => button.disabled)).toBe(true)
@@ -165,6 +166,8 @@ describe('PendingQueue', () => {
     }], { steerAvailable: false })
 
     const retry = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+    expect(el.querySelector('.chat-pending-card')?.getAttribute('data-delivery-state'))
+      .toBe('attention')
     expect(retry?.textContent).toContain(action)
     expect(retry?.disabled).toBe(false)
     expect(el.querySelector<HTMLButtonElement>(`[aria-label="${remove}"]`)).not.toBeNull()
