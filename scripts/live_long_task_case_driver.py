@@ -641,7 +641,32 @@ class GatewayProcess:
         proc = self.proc
         if proc is not None and proc.poll() is None:
             if force:
-                proc.kill()
+                if os.name == "nt":
+                    # ``Popen.kill`` terminates only the direct process on
+                    # Windows.  A child which inherited a Gateway log or
+                    # SQLite handle can otherwise outlive it and make the
+                    # privacy cleanup permanently fail.  The PID is the exact
+                    # process created above; suppress command output so no
+                    # machine-local path or process detail reaches reports.
+                    try:
+                        subprocess.run(  # noqa: S603 - fixed OS command and owned PID.
+                            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                            check=False,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=10,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                    except (OSError, subprocess.TimeoutExpired):
+                        # Fall through to the direct-process kill below. The
+                        # bounded artifact deletion remains the final proof
+                        # that no inherited handle survived.
+                        pass
+                    if proc.poll() is None:
+                        proc.kill()
+                else:
+                    proc.kill()
             else:
                 proc.terminate()
             try:

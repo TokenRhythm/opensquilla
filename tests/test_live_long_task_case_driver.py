@@ -285,6 +285,52 @@ def test_gateway_cleanup_does_not_retry_security_failure(
     real_cleanup(gateway.root, ())
 
 
+def test_gateway_force_stop_terminates_owned_windows_process_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = driver.LiveCase(
+        case_id="deepseek-direct-stop-synthetic-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        scenario="direct",
+        repeat_index=1,
+        fallback_provider=None,
+        remaining_budget=driver.CaseBudget(
+            wall_ms=60_000,
+            billed_cost_usd=1,
+            physical_requests=1,
+            billed_tokens=1_000,
+        ),
+    )
+    gateway = driver.GatewayProcess(case, secret_values=())
+    process_calls: list[str] = []
+    poll_results = iter((None, 0))
+    proc = SimpleNamespace(
+        pid=4312,
+        poll=lambda: next(poll_results, 0),
+        kill=lambda: process_calls.append("kill"),
+        wait=lambda **_kwargs: 0,
+    )
+    gateway.proc = proc
+    calls: list[tuple[object, ...]] = []
+    original_os_name = driver.os.name
+    monkeypatch.setattr(driver.os, "name", "nt")
+    monkeypatch.setattr(
+        driver.subprocess,
+        "run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    gateway.stop(force=True)
+
+    assert calls[0][0] == (["taskkill", "/PID", "4312", "/T", "/F"],)
+    assert calls[0][1]["timeout"] == 10
+    assert process_calls == []
+    assert gateway.proc is None
+    monkeypatch.setattr(driver.os, "name", original_os_name)
+    driver.scan_and_remove_temporary_tree(gateway.root, ())
+
+
 @pytest.mark.parametrize(
     ("error", "stage"),
     [

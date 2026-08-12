@@ -410,13 +410,41 @@ def test_temporary_tree_cleanup_never_suppresses_scan_or_delete_failures(
     delete_root.mkdir()
     monkeypatch.setattr(security, "_temporary_tree_contains_secret", lambda *_args: False)
     monkeypatch.setattr(
-        security.shutil,
-        "rmtree",
+        security,
+        "_remove_owned_temporary_tree",
         lambda _path: (_ for _ in ()).throw(OSError("synthetic delete failure")),
     )
     with pytest.raises(OSError, match="synthetic delete failure"):
         security.scan_and_remove_temporary_tree(delete_root, {})
     assert delete_root.is_dir()
+
+
+def test_windows_temporary_tree_cleanup_retries_readonly_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "opensquilla-readonly-live-artifacts"
+    root.mkdir()
+    entry = root / "gateway.log"
+    entry.write_text("synthetic public output", encoding="utf-8")
+    calls: list[tuple[object, ...]] = []
+
+    def fake_rmtree(path: Path, *, onexc: object | None = None) -> None:
+        assert path == root.resolve()
+        assert callable(onexc)
+        calls.append((path, onexc))
+        onexc(entry.unlink, str(entry), PermissionError("synthetic read-only entry"))
+        root.rmdir()
+
+    monkeypatch.setattr(security, "_windows_temporary_cleanup_enabled", lambda: True)
+    monkeypatch.setattr(security.os, "chmod", lambda *args: calls.append(args))
+    monkeypatch.setattr(security.shutil, "rmtree", fake_rmtree)
+
+    security._remove_owned_temporary_tree(root.resolve())
+
+    assert len(calls) == 2
+    assert calls[1] == (entry, security.stat.S_IWRITE)
+    assert not root.exists()
 
 
 def test_temporary_tree_cleanup_retries_transient_scan_failures(

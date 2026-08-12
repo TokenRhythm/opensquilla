@@ -560,6 +560,45 @@ def _temporary_tree_scan_attempts() -> int:
     return _WINDOWS_TEMP_SCAN_ATTEMPTS if os.name == "nt" else 1
 
 
+def _windows_temporary_cleanup_enabled() -> bool:
+    return os.name == "nt"
+
+
+def _remove_owned_temporary_tree(resolved: Path) -> None:
+    """Remove one already-validated tree, including Windows read-only entries.
+
+    Windows maps the read-only DOS attribute onto the write bits exposed by
+    ``stat``.  ``shutil.rmtree`` deliberately refuses those entries unless its
+    error callback makes them writable first.  Only do that for an ordinary
+    entry still below the validated harness root; never chmod a link or
+    junction, because that could affect a target outside the owned tree.
+    """
+
+    if not _windows_temporary_cleanup_enabled():
+        shutil.rmtree(resolved)
+        return
+
+    def remove_readonly(
+        function: Any,
+        path: str,
+        error: BaseException,
+    ) -> None:
+        if not isinstance(error, PermissionError):
+            raise error
+        entry = Path(path)
+        try:
+            entry.relative_to(resolved)
+            mode = entry.lstat().st_mode
+        except (OSError, ValueError):
+            raise error from None
+        if _is_link_or_junction(entry, mode):
+            raise error
+        os.chmod(entry, stat.S_IWRITE)
+        function(path)
+
+    shutil.rmtree(resolved, onexc=remove_readonly)
+
+
 def scan_and_remove_temporary_tree(
     path: Path | str,
     secrets: Mapping[str, str] | Iterable[str],
@@ -606,7 +645,7 @@ def scan_and_remove_temporary_tree(
             scan_error = exc
             break
 
-    shutil.rmtree(resolved)
+    _remove_owned_temporary_tree(resolved)
     if scan_error is not None:
         raise RuntimeError(
             "unable to scan temporary live artifacts before deletion"
