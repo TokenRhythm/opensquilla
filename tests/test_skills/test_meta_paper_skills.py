@@ -1837,8 +1837,18 @@ def test_meta_compile_pdf_bounds_each_child_process_within_outer_timeout(
         "PAPER_CONTRACT",
         "PAPER_MODE: FULL_MANUSCRIPT\nTARGET_PAGES: 1\n",
     )
+    # Reproduce the floating-point overshoot observed with the monotonic clock
+    # on Windows runners: (clock + 110) - clock can be slightly greater than 110.
+    clock_value = 166.8240289381027
+    monkeypatch.setattr(
+        PAPER_ARTIFACT_RUNTIME,
+        "time",
+        type("FixedClock", (), {"monotonic": staticmethod(lambda: clock_value)}),
+    )
+    observed_timeouts: list[float] = []
 
     def time_out(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        observed_timeouts.append(kwargs["timeout"])
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
     monkeypatch.setattr(subprocess, "run", time_out)
@@ -1848,6 +1858,7 @@ def test_meta_compile_pdf_bounds_each_child_process_within_outer_timeout(
 
     assert "xelatex" in str(exc_info.value)
     assert "timed out within the 110-second compile budget" in str(exc_info.value)
+    assert observed_timeouts == [110.0]
     assert not (_paper_run_dir(tmp_path) / "paper.pdf").exists()
 
 
