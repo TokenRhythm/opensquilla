@@ -121,7 +121,8 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     if (pendingQueuePolicy.kind === 'response_handoff') {
       await options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
     } else {
-      await options.switchPendingQueue(key)
+      const pendingQueueSwitch = options.switchPendingQueue(key)
+      if (pendingQueueSwitch) await pendingQueueSwitch
     }
     options.persistSession(key, { source: 'runtime.switchToSession' })
     resetSessionRuntimeState()
@@ -170,7 +171,8 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     }
 
     resetCompactState()
-    options.switchPendingQueue(key)
+    const pendingQueueSwitch = options.switchPendingQueue(key)
+    if (pendingQueueSwitch) await pendingQueueSwitch
     // A recovered provisional draft remains a draft: do not write it to the URL
     // or active-session storage before the first accepted send.
     options.sessionKey.value = key
@@ -184,11 +186,12 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
 
   // Drafts keep their provisional key out of the URL and local storage; it
   // only persists once the first message actually goes out.
-  function startDraftSession(agentId?: string) {
+  async function startDraftSession(agentId?: string) {
     options.cancelSessionBootstrap()
     const key = options.createSessionKey(agentId)
     resetCompactState()
-    options.switchPendingQueue(key)
+    const pendingQueueSwitch = options.switchPendingQueue(key)
+    if (pendingQueueSwitch) await pendingQueueSwitch
     options.sessionKey.value = key
     resetSessionRuntimeState()
     options.pendingSessionIntent.value = 'new_chat'

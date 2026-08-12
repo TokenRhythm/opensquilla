@@ -1297,7 +1297,7 @@ test.describe('0.5.0 long-task resilience', () => {
     await expect(page.locator('body')).not.toContainText(ephemeralUploadId)
     await expect(page.locator('body')).not.toContainText(syntheticAttachmentBytes)
     await expect.poll(() => page.evaluate(async () => {
-      const request = indexedDB.open('opensquilla-chat-pending-inputs', 1)
+      const request = indexedDB.open('opensquilla-chat-pending-inputs')
       const database = await new Promise<IDBDatabase>((resolve, reject) => {
         request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)

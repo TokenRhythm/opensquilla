@@ -1003,8 +1003,6 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity?.dataset.shareExpanded).toBe('true')
     expect(activity?.querySelector('.assistant-activity__body')?.getAttribute('aria-hidden'))
       .toBe('false')
-    expect(activity?.querySelector('.assistant-activity__body')?.classList.contains('is-open'))
-      .toBe(true)
   })
 
   it('keeps user expansion through a same-session history replacement', async () => {

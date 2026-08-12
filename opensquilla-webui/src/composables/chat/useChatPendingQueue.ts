@@ -1198,9 +1198,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return result !== false
   }
 
-  async function switchPendingQueue(targetSessionKey: string) {
-    if (reorderCommitPromise) await reorderCommitPromise
-    else cancelPendingReorder()
+  function switchPendingQueue(targetSessionKey: string): void | Promise<void> {
+    if (reorderCommitPromise) {
+      return reorderCommitPromise.then(() => switchPendingQueue(targetSessionKey))
+    }
+    cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
     if (sourceSessionKey && pendingQueue.value.length > 0) {
