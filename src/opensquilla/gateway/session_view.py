@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any
 
 from opensquilla.session.keys import derive_chat_type, parse_agent_id
@@ -433,6 +434,64 @@ def _humanize(value: str) -> str:
     return cleaned[:1].upper() + cleaned[1:] if cleaned else ""
 
 
+def _is_regional_indicator(char: str) -> bool:
+    return 0x1F1E6 <= ord(char) <= 0x1F1FF
+
+
+def _is_grapheme_extend(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        unicodedata.category(char) in {"Mn", "Mc", "Me"}
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or 0xE0100 <= codepoint <= 0xE01EF
+        or 0x1F3FB <= codepoint <= 0x1F3FF
+        or 0xE0020 <= codepoint <= 0xE007F
+    )
+
+
+def _title_grapheme_clusters(text: str) -> list[str]:
+    """Group display-title text without splitting common user graphemes."""
+
+    clusters: list[str] = []
+    cluster = ""
+    join_next = False
+    regional_indicators = 0
+    for char in text:
+        regional = _is_regional_indicator(char)
+        extends_cluster = (
+            bool(cluster)
+            and (
+                join_next
+                or char == "\u200d"
+                or _is_grapheme_extend(char)
+                or (regional and regional_indicators == 1)
+            )
+        )
+        if cluster and not extends_cluster:
+            clusters.append(cluster)
+            cluster = ""
+            regional_indicators = 0
+        cluster += char
+        regional_indicators = regional_indicators + 1 if regional else 0
+        join_next = char == "\u200d" or "VIRAMA" in unicodedata.name(char, "")
+    if cluster:
+        clusters.append(cluster)
+    return clusters
+
+
+def _truncate_title_graphemes(text: str, max_chars: int) -> str:
+    suffix = "..."
+    prefix_budget = max(0, max_chars - len(suffix))
+    prefix: list[str] = []
+    prefix_chars = 0
+    for cluster in _title_grapheme_clusters(text):
+        if prefix_chars + len(cluster) > prefix_budget:
+            break
+        prefix.append(cluster)
+        prefix_chars += len(cluster)
+    return "".join(prefix).rstrip() + suffix
+
+
 def derive_transcript_title(content: Any, *, max_chars: int = 34) -> str:
     text = _content_text(content)
     if not text:
@@ -444,7 +503,7 @@ def derive_transcript_title(content: Any, *, max_chars: int = 34) -> str:
         return ""
     if len(cleaned) <= max_chars:
         return cleaned
-    return cleaned[: max_chars - 3].rstrip() + "..."
+    return _truncate_title_graphemes(cleaned, max_chars)
 
 
 def _content_text(content: Any) -> str:

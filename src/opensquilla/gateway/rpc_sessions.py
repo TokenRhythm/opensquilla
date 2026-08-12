@@ -6291,6 +6291,39 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
     return result
 
 
+@_d.method("sessions.rename", scope="operator.write")
+async def _handle_sessions_rename(params: dict | None, ctx: RpcContext) -> dict:
+    """Rename one session without exposing admin-only deployment fields."""
+
+    key = _require_key(params)
+    assert isinstance(params, dict)
+    unexpected = sorted(set(params) - {"key", "displayName"})
+    if unexpected:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="sessions.rename accepts only key and displayName.",
+            details={"unexpected_fields": unexpected},
+        )
+    display_name = params.get("displayName")
+    if not isinstance(display_name, str) or not display_name.strip():
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="displayName must be a non-empty string.",
+            details={"field": "displayName"},
+        )
+    if ctx.session_manager is None:
+        raise KeyError("No session manager available")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise KeyError("No session storage available")
+    return await _apply_sessions_patch(
+        {"key": key, "displayName": display_name.strip()},
+        ctx,
+        key=key,
+        storage=storage,
+    )
+
+
 @_d.method("sessions.reset", scope="operator.write")
 async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Synchronous session reset with FlushReceipt.

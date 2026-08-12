@@ -5225,6 +5225,58 @@ class TestSessionsPatch:
         assert res.error.code == "NOT_FOUND"
 
 
+class TestSessionsRename:
+    @pytest.mark.asyncio
+    async def test_rename_is_available_to_operator_write(
+        self,
+        dispatcher,
+        session,
+    ):
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            scopes=["operator.read", "operator.write"],
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.rename",
+            {"key": session.session_key, "displayName": "  Renamed task  "},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload == {
+            "key": session.session_key,
+            "updated": ["displayName"],
+        }
+        assert session.display_name == "Renamed task"
+
+    @pytest.mark.asyncio
+    async def test_rename_rejects_admin_patch_fields(self, dispatcher, session):
+        session.model = "original-model"
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            scopes=["operator.read", "operator.write"],
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.rename",
+            {
+                "key": session.session_key,
+                "displayName": "Renamed task",
+                "model": "unauthorized-model",
+            },
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {"unexpected_fields": ["model"]}
+        assert session.display_name is None
+        assert session.model == "original-model"
+
+
 class TestSessionsReset:
     @pytest.mark.asyncio
     async def test_reset_valid(self, dispatcher, ctx_with_sessions, session):

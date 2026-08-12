@@ -1400,7 +1400,7 @@ function switchToSession(key: string, source = 'app.switchToSession') {
 }
 
 // Optimistic rename: show the new title immediately, then persist via
-// sessions.patch (display_name is the top-precedence title) and reload so the
+// sessions.rename (display_name is the top-precedence title) and reload so the
 // backend's canonical title wins. The override clears once the reload lands.
 async function onRenameSession({ key, title }: { key: string; title: string }) {
   const next = title.trim()
@@ -1409,10 +1409,10 @@ async function onRenameSession({ key, title }: { key: string; title: string }) {
   const local = localChatSessions.value[key]
   if (local) localChatSessions.value[key] = { ...local, title: next }
   try {
-    await rpcStore.call('sessions.patch', { key, displayName: next })
+    await rpcStore.call('sessions.rename', { key, displayName: next })
     pushToast('Session renamed', { tone: 'ok' })
   } catch (err: unknown) {
-    console.warn('[App] sessions.patch error:', errorMessage(err))
+    console.warn('[App] sessions.rename error:', errorMessage(err))
     pushToast('Failed to rename session', { tone: 'danger' })
   } finally {
     await loadSessions()

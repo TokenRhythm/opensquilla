@@ -256,6 +256,22 @@ def test_sessions_spawn_exposes_optional_bounded_title_schema() -> None:
     assert sessions_tool._normalize_spawn_title("界" * 512, "unused") == "界" * 512
 
 
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        ("👨‍👩‍👧‍👦" * 6, "👨‍👩‍👧‍👦" * 4 + "..."),
+        ("🇨🇳" * 20, "🇨🇳" * 15 + "..."),
+        ("e\u0301" * 20, "e\u0301" * 15 + "..."),
+    ],
+)
+def test_sessions_spawn_task_fallback_preserves_grapheme_clusters(
+    task: str,
+    expected: str,
+) -> None:
+    assert sessions_tool._normalize_spawn_title(None, task) == expected
+    assert len(expected) <= 34
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("title", "task", "expected"),

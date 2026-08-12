@@ -90,7 +90,7 @@ implemented runtime, not to provider features that the adapter does not expose.
 
 Channel sessions appear in the desktop session list (WebUI sidebar) with the
 same rename and delete actions as chat/cron sessions. Renaming calls
-`sessions.patch` (sets `display_name`), deleting calls `sessions.delete` and
+`sessions.rename` (sets only `display_name`), deleting calls `sessions.delete` and
 quiesces every writer before removing the row. A channel that sends a new
 message after deletion gets a fresh session, as expected.
 

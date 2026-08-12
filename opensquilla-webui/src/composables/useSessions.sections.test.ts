@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import i18n from '@/i18n'
+import zhHans from '@/locales/zh-Hans.json'
 import {
   arrangeSidebarSections,
   normalizeSessionItem,
@@ -35,6 +37,21 @@ describe('normalizeSessionItem subagent titles', () => {
       sessionKind: 'task',
       title: 'You are a subagent. Execute the delegated task',
     }).title).toBe('Subagent task')
+  })
+
+  it('localizes the generic title returned for legacy task rows', () => {
+    i18n.global.setLocaleMessage('zh-Hans', zhHans)
+    i18n.global.locale.value = 'zh-Hans'
+    try {
+      expect(session({
+        key: 'agent:main:subagent:legacy-generic',
+        sessionKind: 'task',
+        title: 'Subagent task',
+      }).title).toBe('子智能体任务')
+    }
+    finally {
+      i18n.global.locale.value = 'en'
+    }
   })
 })
 
