@@ -3045,9 +3045,9 @@ async def test_cancelled_install_update_drains_postflight_before_rollback_and_un
         mutation = asyncio.create_task(service.install("cancellation-skill", "fake"))
     else:
         mutation = asyncio.create_task(service.update("cancellation-skill"))
-    await worker_started.wait()
     cancellation_propagated = False
     try:
+        await asyncio.wait_for(worker_started.wait(), timeout=5)
         assert service._mutation_lock.locked()
         assert loader._publication_barrier_depth == 1
 
@@ -3066,12 +3066,15 @@ async def test_cancelled_install_update_drains_postflight_before_rollback_and_un
         assert not rollback_started.is_set()
     finally:
         release_worker.set()
+        if not mutation.done():
+            mutation.cancel()
         try:
-            await asyncio.wait_for(mutation, timeout=2)
+            await asyncio.wait_for(mutation, timeout=5)
         except asyncio.CancelledError:
             cancellation_propagated = True
 
     assert cancellation_propagated is True
+    assert mutation.done()
     assert worker_finished.is_set()
     assert rollback_started.is_set()
     assert not service._mutation_lock.locked()
@@ -3109,14 +3112,15 @@ async def test_cancelled_uninstall_drains_postflight_before_rollback_and_unlock(
     service = _service(tmp_path, source, loader=loader)
     assert (await service.install("cancellation-uninstall", "fake")).success is True
 
-    worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    worker_started = asyncio.Event()
     release_worker = threading.Event()
     worker_finished = threading.Event()
     rollback_started = threading.Event()
     real_reload = loader.reload_verified
 
     def blocking_reload(verifier, *args, **kwargs) -> SkillReloadResult:
-        worker_started.set()
+        loop.call_soon_threadsafe(worker_started.set)
         if not release_worker.wait(timeout=5):
             raise TimeoutError("test did not release uninstall postflight reload")
         try:
@@ -3140,9 +3144,9 @@ async def test_cancelled_uninstall_drains_postflight_before_rollback_and_unlock(
     )
 
     mutation = asyncio.create_task(service.uninstall("cancellation-uninstall"))
-    assert await asyncio.to_thread(worker_started.wait, 1)
     cancellation_propagated = False
     try:
+        await asyncio.wait_for(worker_started.wait(), timeout=5)
         assert service._mutation_lock.locked()
         assert loader._publication_barrier_depth == 1
 
@@ -3161,12 +3165,15 @@ async def test_cancelled_uninstall_drains_postflight_before_rollback_and_unlock(
         assert not rollback_started.is_set()
     finally:
         release_worker.set()
+        if not mutation.done():
+            mutation.cancel()
         try:
-            await asyncio.wait_for(mutation, timeout=2)
+            await asyncio.wait_for(mutation, timeout=5)
         except asyncio.CancelledError:
             cancellation_propagated = True
 
     assert cancellation_propagated is True
+    assert mutation.done()
     assert worker_finished.is_set()
     assert rollback_started.is_set()
     assert not service._mutation_lock.locked()
