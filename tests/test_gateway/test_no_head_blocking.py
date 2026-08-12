@@ -161,7 +161,6 @@ async def test_staggered_fourth_session_fills_last_idle_slot() -> None:
         max_pending_per_session=None,
     )
     handles = []
-    d_started_before_release = False
     try:
         for label in ("A", "B", "C"):
             env = _make_envelope(agent_id, f"{agent_id}::sess-{label}")
@@ -174,9 +173,10 @@ async def test_staggered_fourth_session_fills_last_idle_slot() -> None:
         handles.append(await runtime.enqueue(d_env, "start D later"))
         try:
             await asyncio.wait_for(started["D"].wait(), timeout=0.5)
-            d_started_before_release = True
         except TimeoutError:
-            pass
+            d_started_before_release = False
+        else:
+            d_started_before_release = True
     finally:
         release_handlers.set()
         await asyncio.gather(

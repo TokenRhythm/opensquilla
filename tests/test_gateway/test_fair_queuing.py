@@ -490,11 +490,11 @@ async def test_max_eight_staggered_waiters_preserve_capacity_fairness_and_cancel
         release_by_label["base-0"].set()
         await asyncio.wait_for(started_by_label["W1"].wait(), timeout=1.0)
         assert not started_by_label["W3"].is_set()
-        assert current_in_flight == max_concurrency
+        assert runtime._global_in_flight == max_concurrency
 
         release_by_label["base-1"].set()
         await asyncio.wait_for(started_by_label["W3"].wait(), timeout=1.0)
-        assert current_in_flight == max_concurrency
+        assert runtime._global_in_flight == max_concurrency
         assert start_order[-2:] == ["W1", "W3"]
     finally:
         for event in release_by_label.values():
