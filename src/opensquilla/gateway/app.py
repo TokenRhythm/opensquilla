@@ -73,6 +73,7 @@ def create_gateway_app(
     usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
+    skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
@@ -87,6 +88,7 @@ def create_gateway_app(
     memory_retrievers: dict[str, Any] | None = None,
     extra_routes: list[Route] | None = None,
     prompt_cache_keepalive_service: Any = None,
+    skill_management_service: Any = None,
 ) -> Starlette:
     """Build and return the Starlette ASGI application."""
     if diagnostics_state is None:
@@ -478,6 +480,8 @@ def create_gateway_app(
             usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
+            skill_management_service=skill_management_service,
+            skill_management_state=skill_management_state or {},
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,
@@ -741,6 +745,7 @@ def create_gateway_app(
             usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
+            skill_management_state=skill_management_state or {},
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,
@@ -754,6 +759,7 @@ def create_gateway_app(
             memory_stores=memory_stores,
             memory_retrievers=memory_retrievers,
             prompt_cache_keepalive_service=prompt_cache_keepalive_service,
+            skill_management_service=skill_management_service,
         )
 
     # ── Routes ───────────────────────────────────────────────────────────────

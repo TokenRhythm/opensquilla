@@ -423,6 +423,107 @@ describe('reconcileHistoryWindow', () => {
 })
 
 describe('reconcileRunningHistoryMessages', () => {
+  it('replaces a canonical live assistant with its durable row by turn identity', () => {
+    const previous = [
+      msg({
+        role: 'user',
+        text: 'Run the Goal',
+        messageId: 'goal-user',
+        turnId: 'goal-root-turn',
+      }),
+      msg({
+        role: 'assistant',
+        text: 'Initial Goal reply',
+        ts: 'live-initial-time',
+        turnId: 'goal-root-turn',
+      }),
+      msg({
+        role: 'assistant',
+        text: 'Canonical continuation body',
+        ts: 'live-time',
+        turnId: 'goal-continuation-turn',
+        turnInputMode: 'system_event',
+        turnRunKind: 'goal',
+      }),
+    ]
+    const incoming = [
+      msg({
+        role: 'user',
+        text: 'Run the Goal',
+        messageId: 'goal-user',
+        turnId: 'goal-root-turn',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'Initial Goal reply',
+        ts: 'server-initial-time',
+        messageId: 'goal-initial-answer',
+        turnId: 'goal-root-turn',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'Canonical continuation body',
+        ts: 'server-time',
+        messageId: 'goal-answer',
+        turnId: 'goal-continuation-turn',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(previous, incoming)
+
+    expect(out).toHaveLength(3)
+    expect(out[2]).toMatchObject({
+      messageId: 'goal-answer',
+      text: 'Canonical continuation body',
+      turnId: 'goal-continuation-turn',
+      turnInputMode: 'system_event',
+      turnRunKind: 'goal',
+      restoredFromHistory: true,
+    })
+  })
+
+  it('keeps identical assistant text from distinct turns as distinct rows', () => {
+    const previous = [
+      msg({ role: 'user', text: 'Run the Goal', messageId: 'goal-user' }),
+      msg({ role: 'assistant', text: 'Still working', ts: 'live-1', turnId: 'turn-1' }),
+      msg({ role: 'assistant', text: 'Still working', ts: 'live-2', turnId: 'turn-2' }),
+    ]
+    const incoming = [
+      msg({
+        role: 'user',
+        text: 'Run the Goal',
+        messageId: 'goal-user',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'Still working',
+        messageId: 'answer-1',
+        turnId: 'turn-1',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'Still working',
+        messageId: 'answer-2',
+        turnId: 'turn-2',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(previous, incoming)
+
+    expect(out.map(message => message.messageId)).toEqual([
+      'goal-user',
+      'answer-1',
+      'answer-2',
+    ])
+    expect(out.filter(message => message.text === 'Still working')).toHaveLength(2)
+  })
+
   it('preserves the live tail after the last user when a running history snapshot is colder', () => {
     const prev = [
       msg({ role: 'user', text: 'build it', messageId: 'u1' }),
@@ -481,6 +582,179 @@ describe('reconcileRunningHistoryMessages', () => {
 
     expect(out.map(message => message.messageId)).toEqual(['u1', 'a1'])
     expect(out[1].routerSettled).toBe(true)
+  })
+
+  it('retains a mutation-confirmed user row across an older non-empty history response', () => {
+    const confirmedGoal = msg({
+      role: 'user',
+      text: 'Ship the Goal',
+      messageId: 'goal-user-1',
+      clientId: 'goal-client-1',
+      turnId: 'goal-task-1',
+    })
+    const prev = [
+      msg({
+        role: 'user',
+        text: 'Earlier request',
+        messageId: 'u1',
+        restoredFromHistory: true,
+      }),
+      confirmedGoal,
+    ]
+    const staleIncoming = [
+      msg({
+        role: 'user',
+        text: 'Earlier request',
+        messageId: 'u1',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const preserved = reconcileRunningHistoryMessages(prev, staleIncoming)
+
+    expect(preserved.map(message => message.messageId)).toEqual(['u1', 'goal-user-1'])
+    expect(preserved[1]).toBe(confirmedGoal)
+
+    const canonical = reconcileRunningHistoryMessages(preserved, [
+      ...staleIncoming,
+      msg({
+        role: 'user',
+        text: 'Ship the Goal',
+        messageId: 'goal-user-1',
+        turnId: 'goal-task-1',
+        restoredFromHistory: true,
+      }),
+    ])
+
+    expect(canonical.map(message => message.messageId)).toEqual(['u1', 'goal-user-1'])
+    expect(canonical[1]).toMatchObject({
+      clientId: 'goal-client-1',
+      restoredFromHistory: true,
+      turnId: 'goal-task-1',
+    })
+  })
+
+  it('retains a mutation-confirmed user anchor and its live tail across stale history', () => {
+    const prev = [
+      msg({
+        role: 'user',
+        text: 'Earlier request',
+        messageId: 'u1',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'Earlier response',
+        messageId: 'a1',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'user',
+        text: 'Ship the Goal',
+        messageId: 'goal-user-1',
+        clientId: 'goal-client-1',
+        turnId: 'goal-task-1',
+      }),
+      msg({ role: 'router', text: '', turnId: 'goal-task-1' }),
+      msg({ role: 'assistant', text: 'Working on it', turnId: 'goal-task-1' }),
+    ]
+    const staleIncoming = [
+      msg({
+        role: 'user',
+        text: 'Earlier request',
+        messageId: 'u1',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'Earlier response',
+        messageId: 'a1',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const preserved = reconcileRunningHistoryMessages(prev, staleIncoming)
+
+    expect(preserved.map(message => [message.role, message.messageId, message.text])).toEqual([
+      ['user', 'u1', 'Earlier request'],
+      ['assistant', 'a1', 'Earlier response'],
+      ['user', 'goal-user-1', 'Ship the Goal'],
+      ['router', undefined, ''],
+      ['assistant', undefined, 'Working on it'],
+    ])
+
+    const canonical = reconcileRunningHistoryMessages(preserved, [
+      ...staleIncoming,
+      msg({
+        role: 'user',
+        text: 'Ship the Goal',
+        messageId: 'goal-user-1',
+        turnId: 'goal-task-1',
+        restoredFromHistory: true,
+      }),
+    ])
+
+    expect(canonical.map(message => [message.role, message.messageId])).toEqual([
+      ['user', 'u1'],
+      ['assistant', 'a1'],
+      ['user', 'goal-user-1'],
+      ['router', undefined],
+      ['assistant', undefined],
+    ])
+    expect(canonical[2]).toMatchObject({
+      clientId: 'goal-client-1',
+      restoredFromHistory: true,
+    })
+  })
+
+  it('replaces the unique optimistic assistant owned by the same durable user turn', () => {
+    const statusHistory = [{ action: 'answer', label: 'Answering', at: 2_000 }]
+    const prev = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        ts: 'live-user',
+        messageId: 'u1',
+        clientId: 'local-u1',
+      }),
+      msg({
+        role: 'assistant',
+        text: 'verified answer',
+        ts: 'live-assistant',
+        statusHistory,
+      }),
+    ]
+    const incoming = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        ts: 'server-user',
+        messageId: 'u1',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'verified answer',
+        ts: 'server-assistant',
+        messageId: 'a1',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(prev, incoming)
+
+    expect(out).toHaveLength(2)
+    expect(out[0]).toMatchObject({
+      messageId: 'u1',
+      clientId: 'local-u1',
+      restoredFromHistory: true,
+    })
+    expect(out[1]).toMatchObject({
+      messageId: 'a1',
+      text: 'verified answer',
+      statusHistory,
+      restoredFromHistory: true,
+    })
   })
 
   it('preserves the full live tail when the last user row is a same-turn steer', () => {

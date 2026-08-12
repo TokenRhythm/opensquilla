@@ -84,6 +84,8 @@ class RpcContext:
     usage_event_sink: Any = None  # Durable per-provider-call accounting sink.
     meta_run_writer: Any = None  # MetaRunWriter instance (injected at boot)
     skill_loader: Any = None  # SkillLoader instance (injected at boot)
+    skill_management_service: Any = None  # Shared Community Skill mutation service
+    skill_management_state: dict[str, Any] = field(default_factory=dict)
     cron_scheduler: Any = None  # SchedulerEngine instance (injected at boot)
     turn_runner: TurnRunner | None = None  # TurnRunner instance (injected at boot)
     task_runtime: Any = None  # TaskRuntime instance (injected at boot)

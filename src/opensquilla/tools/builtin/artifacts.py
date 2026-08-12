@@ -39,6 +39,7 @@ from opensquilla.tools.types import (
     ToolContext,
     ToolError,
     current_tool_context,
+    is_goal_owned_main_default_turn,
 )
 
 _MAX_MISSING_FILE_CANDIDATES = 5
@@ -131,10 +132,24 @@ def _llm_artifact_payload(
 
 
 def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
-    final_response = (
-        "Do not run more tools for this deliverable unless the user explicitly "
-        "asked for another file or a specific verification step. Send the final response now."
-    )
+    if is_goal_owned_main_default_turn(ctx):
+        final_response = (
+            "Do not call publish_artifact again for this unchanged file. Follow the "
+            "Active Goal instructions: re-evaluate the entire objective and continue "
+            "any remaining work with the ordinary tools available for this turn. "
+            "update_goal_progress remains optional; use it only when a concise current-state "
+            "view helps, and replace that view when reality changes rather than treating it "
+            "as fixed phases or turn boundaries. Call "
+            "update_goal only when the entire objective is complete or genuinely blocked. "
+            "If a terminal Goal update already succeeded in this tool batch, run no more "
+            "tools and give one concise final summary."
+        )
+    else:
+        final_response = (
+            "Do not run more tools for this deliverable unless the user explicitly "
+            "asked for another file or a specific verification step. Send the final "
+            "response now."
+        )
     if _should_expose_local_path(ctx):
         prefix = (
             "This file is already registered for the current surface in this turn. "
@@ -148,6 +163,11 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
             + f"the generated file on this machine. {final_response}"
         )
     if already_published:
+        if is_goal_owned_main_default_turn(ctx):
+            return (
+                "This file is already registered for the current surface in this turn. "
+                + final_response
+            )
         return (
             "This file is already registered for the current surface in this turn. "
             "Do not call publish_artifact again for the same file; just confirm it is ready. "

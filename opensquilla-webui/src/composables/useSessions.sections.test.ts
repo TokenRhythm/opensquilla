@@ -154,22 +154,31 @@ describe('arrangeSidebarSections — subagent nesting', () => {
     expect(rows[0].depth).toBe(1)
   })
 
-  it('keeps a forked chat flat even when its parent is visible', () => {
+  it('keeps a numbered fork title flat while preserving the parent title', () => {
     const parentKey = 'agent:main:webchat:parent'
+    const parentTitle = 'Release planning notes'
     const sections = arrangeSidebarSections([
-      session({ key: parentKey, title: 'Parent chat', updatedAt: 100 }),
+      session({ key: parentKey, title: parentTitle, updatedAt: 100 }),
       session({
         key: 'agent:main:webchat:fork',
-        title: 'Forked chat',
+        title: `${parentTitle} (2)`,
         updatedAt: 200,
         forked_from_parent: true,
-        parent: { key: parentKey, title: 'Parent chat' },
+        parent: { key: parentKey, title: parentTitle },
+      }),
+      session({
+        key: 'agent:main:webchat:fork-2',
+        title: `${parentTitle} (3)`,
+        updatedAt: 300,
+        forked_from_parent: true,
+        parent: { key: parentKey, title: parentTitle },
       }),
     ])
 
     expect(sectionFor(sections, 'chats').rows.map(row => ({ title: row.title, depth: row.depth }))).toEqual([
-      { title: 'Forked chat', depth: 0 },
-      { title: 'Parent chat', depth: 0 },
+      { title: `${parentTitle} (3)`, depth: 0 },
+      { title: `${parentTitle} (2)`, depth: 0 },
+      { title: parentTitle, depth: 0 },
     ])
   })
 })

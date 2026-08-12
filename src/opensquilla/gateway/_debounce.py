@@ -4,8 +4,9 @@ from __future__ import annotations
 # ruff: noqa: E501
 import asyncio
 import contextlib
+from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import structlog
 
@@ -15,41 +16,75 @@ log = structlog.get_logger(__name__)
 
 
 class DebounceCoordinator(Protocol):
-    async def schedule(self, session_key: str, message: IncomingMessage, *, window_s: float, on_fire: Any) -> None: ...
+    async def schedule(self, session_key: str, message: IncomingMessage, *, window_s: float, on_fire: Any, on_settled: Any = None) -> None:
+        pass
+
+
+@dataclass
+class _DebounceState:
+    buffer: list[IncomingMessage]
+    on_fire: Any
+    on_settled: list[Any] = field(default_factory=list)
+    task: asyncio.Task[None] | None = None
+    settled: bool = False
+    settle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class _DefaultDebounceCoordinator:
     def __init__(self) -> None:
-        self._pending: dict[str, Any] = {}
+        self._pending: dict[str, _DebounceState] = {}
         self._lock = asyncio.Lock()
 
-    async def schedule(self, session_key: str, message: IncomingMessage, *, window_s: float, on_fire: Any) -> None:
+    async def schedule(self, session_key: str, message: IncomingMessage, *, window_s: float, on_fire: Any, on_settled: Any = None) -> None:
         async with self._lock:
-            if state := self._pending.get(session_key):
-                state.buffer.append(message)
+            existing = self._pending.get(session_key)
+            if existing is not None:
+                existing.buffer.append(message)
+                if on_settled is not None:
+                    existing.on_settled.append(on_settled)
                 return
-            task = asyncio.create_task(self._fire(session_key, window_s), name=f"channel-debounce:{session_key}")
-            self._pending[session_key] = SimpleNamespace(buffer=[message], on_fire=on_fire, task=task)
+            state = _DebounceState(
+                buffer=[message],
+                on_fire=on_fire,
+                on_settled=([on_settled] if on_settled is not None else []),
+            )
+            self._pending[session_key] = state
+            state.task = asyncio.create_task(
+                self._fire(session_key, window_s, state),
+                name=f"channel-debounce:{session_key}",
+            )
 
     async def cancel(self, session_key: str) -> None:
         async with self._lock:
             state = self._pending.pop(session_key, None)
-        if state is None or state.task.done():
+        if state is None:
             return
-        log.info("channel.debounce_cancelled", session_key=session_key)
-        state.task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await state.task
+        task = state.task
+        if task is not None and not task.done():
+            log.info("channel.debounce_cancelled", session_key=session_key)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                _ = await cast(Any, task)
+        # A task cancelled before its coroutine takes the first step does not
+        # execute ``finally``. Settle here as the exactly-once fallback.
+        await self._settle(session_key, state)
 
     async def cancel_all(self) -> None:
         await asyncio.gather(*(self.cancel(k) for k in list(self._pending)), return_exceptions=True)
 
-    async def _fire(self, session_key: str, window_s: float) -> None:
+    async def _fire(
+        self,
+        session_key: str,
+        window_s: float,
+        state: _DebounceState,
+    ) -> None:
         try:
             await asyncio.sleep(window_s)
             async with self._lock:
-                state = self._pending.pop(session_key, None)
-            if state is None:
+                if self._pending.get(session_key) is not state:
+                    return
+                self._pending.pop(session_key, None)
+            if not state.buffer:
                 return
             first = state.buffer[0]
             content = "\n".join(m.content for m in state.buffer)
@@ -81,3 +116,25 @@ class _DefaultDebounceCoordinator:
             raise
         except Exception:
             log.exception("channel_dispatch.debounce_enqueue_failed", reason="unexpected")
+        finally:
+            async with self._lock:
+                if self._pending.get(session_key) is state:
+                    self._pending.pop(session_key, None)
+            await self._settle(session_key, state)
+
+    async def _settle(self, session_key: str, state: _DebounceState) -> None:
+        async with state.settle_lock:
+            if state.settled:
+                return
+            state.settled = True
+            # Each scheduled user message contributes one intent lease.  The
+            # batch owns them until its durable acceptance completes, or until
+            # cancellation/error proves no task will be accepted.
+            for settle in state.on_settled:
+                try:
+                    await settle()
+                except Exception:
+                    log.exception(
+                        "channel_dispatch.debounce_intent_release_failed",
+                        session_key=session_key,
+                    )

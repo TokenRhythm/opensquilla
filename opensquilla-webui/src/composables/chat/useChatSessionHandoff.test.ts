@@ -13,6 +13,7 @@ import {
   type UseChatSendOptions,
 } from './useChatSend'
 import { useChatSessionRuntime } from './useChatSessionRuntime'
+import { useChatSteerDelivery } from './useChatSteerDelivery'
 
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast: vi.fn() }),
@@ -228,6 +229,13 @@ describe('chat send session handoff', () => {
         resolveSend = resolve as (value: unknown) => void
       })) as UseChatSendOptions['rpc']['call'],
     }
+    const scheduleHistorySync = vi.fn()
+    const steerDelivery = useChatSteerDelivery({
+      messages,
+      pendingQueue: pendingQueueRuntime.pendingQueue,
+      checkpointForUserMessage: stream.checkpointForUserMessage,
+      scheduleHistorySync,
+    })
     const send = useChatSend({
       rpc,
       inputText,
@@ -250,13 +258,15 @@ describe('chat send session handoff', () => {
       stream,
       normalizeElevatedMode: mode => mode,
       adoptResponseSession: sessionRuntime.adoptResponseSession,
-      scheduleHistorySync: vi.fn(),
+      scheduleHistorySync,
       schedulePendingDrainAfterTerminal: pendingQueueRuntime.schedulePendingDrainAfterTerminal,
       flushDeferredPendingDrain: pendingQueueRuntime.flushDeferredPendingDrain,
       isCompactInFlightForCurrentSession: () => false,
       hasPendingAttachmentWork: () => false,
       enqueuePendingInput: pendingQueueRuntime.enqueuePendingInput,
       enqueueHiddenControl: pendingQueueRuntime.enqueueHiddenControl,
+      enqueuePendingSteerAttempt: pendingQueueRuntime.enqueuePendingSteerAttempt,
+      steerDelivery,
       popAllPendingIntoComposer: pendingQueueRuntime.popAllPendingIntoComposer,
       executeSlashCommand: vi.fn(async () => false),
       closeSlashMenu: vi.fn(),

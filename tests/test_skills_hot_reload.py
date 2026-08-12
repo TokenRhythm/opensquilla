@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.skills import file_hash
+from opensquilla.skills import loader as skill_loader_module
+from opensquilla.skills.file_hash import _TreeChangedDuringHashError
 from opensquilla.skills.loader import MAX_SKILL_FILE_BYTES, SkillLoader
 
 
@@ -25,6 +30,24 @@ def _write_skill(root: Path, name: str, description: str = "description") -> Pat
 
 def _loader(root: Path, tmp_path: Path) -> SkillLoader:
     return SkillLoader(workspace_dir=root, snapshot_path=tmp_path / "snapshot.json")
+
+
+def _inject_transient_tree_hash_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[int]:
+    original_compute_tree_sha256 = skill_loader_module.compute_tree_sha256
+    calls = [0]
+
+    def fail_first_tree_hash(path: Path) -> str:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise _TreeChangedDuringHashError(
+                f"Skill tree entry changed while hashing {path}: metadata changed"
+            )
+        return original_compute_tree_sha256(path)
+
+    monkeypatch.setattr(skill_loader_module, "compute_tree_sha256", fail_first_tree_hash)
+    return calls
 
 
 def test_loader_normalizes_crlf_before_parsing_yaml_block_scalars(tmp_path: Path) -> None:
@@ -82,6 +105,198 @@ def test_external_add_modify_delete_publish_on_next_probe(tmp_path: Path) -> Non
     assert loader.get_by_name("alpha") is None
 
 
+def test_supporting_resource_change_publishes_new_tree_digest(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    skill_file = _write_skill(root, "alpha")
+    resource = skill_file.parent / "references" / "guide.md"
+    resource.parent.mkdir()
+    resource.write_text("first\n", encoding="utf-8")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+    old_digest = old.get_by_name("alpha").tree_digest  # type: ignore[union-attr]
+
+    resource.write_text("second and longer\n", encoding="utf-8")
+    result = loader.refresh_if_changed("resource update")
+
+    assert result.modified == ("alpha",)
+    assert result.generation == old.generation + 1
+    assert loader.get_by_name("alpha").tree_digest != old_digest  # type: ignore[union-attr]
+
+
+def test_verified_reload_stays_hidden_until_durable_barrier_commit(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "old")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+
+    with loader.catalog_publication_barrier("test") as publication:
+        with loader.mutation_guard("test"):
+            _write_skill(root, "alpha", "new")
+        result = loader.reload_verified(lambda candidate: None, reason="test")
+
+        assert result.success is True
+        assert result.generation == old.generation + 1
+        assert loader.snapshot() is old
+        assert loader.get_by_name("alpha").description == "old"  # type: ignore[union-attr]
+        assert loader.refresh_if_changed("concurrent-turn").generation == old.generation
+        publication.commit()
+
+    assert loader.snapshot().generation == old.generation + 1
+    assert loader.get_by_name("alpha").description == "new"  # type: ignore[union-attr]
+
+
+def test_same_layer_symlinked_manifests_keep_distinct_candidate_identity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    shared = root / "shared.md"
+    shared.write_text(
+        "---\nname: shared\ndescription: shared internal manifest\n---\nBody.\n",
+        encoding="utf-8",
+    )
+    try:
+        for directory_name in ("a", "b"):
+            directory = root / directory_name
+            directory.mkdir()
+            (directory / "SKILL.md").symlink_to(shared)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are unavailable on this platform")
+
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    snapshot = loader.snapshot()
+
+    assert len(snapshot.candidates) == 2
+    assert len(snapshot.shadowed) == 1
+    assert len({candidate.instance_id for candidate in snapshot.candidates}) == 2
+    assert len({candidate.file_path for candidate in snapshot.candidates}) == 2
+
+
+def test_symlinked_manifest_outside_layer_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    directory = root / "escaped"
+    directory.mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text(
+        "---\nname: escaped\ndescription: outside manifest\n---\nBody.\n",
+        encoding="utf-8",
+    )
+    try:
+        (directory / "SKILL.md").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are unavailable on this platform")
+
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+
+    assert loader.snapshot().skills == ()
+    assert any("manifest escapes layer root" in error.message for error in loader.snapshot().errors)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux permits byte-oriented filenames that macOS and Windows reject",
+)
+def test_local_non_utf8_supporting_filename_does_not_break_catalog(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    skill_file = _write_skill(root, "byte-name")
+    raw_path = os.fsencode(skill_file.parent) + b"/asset-\xff.bin"
+    descriptor = os.open(raw_path, os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, b"payload")
+    finally:
+        os.close(descriptor)
+
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+
+    assert loader.get_by_name("byte-name") is not None
+    assert loader.snapshot().errors == ()
+
+
+def test_rejected_verified_reload_never_replaces_visible_catalog(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "old")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+
+    def reject(_candidate) -> None:
+        raise RuntimeError("synthetic postflight rejection")
+
+    with loader.catalog_publication_barrier("test"):
+        with loader.mutation_guard("test"):
+            _write_skill(root, "alpha", "rejected")
+        result = loader.reload_verified(reject, reason="test")
+        assert result.success is False
+        assert result.generation == old.generation
+        assert loader.snapshot() is old
+
+    assert loader.snapshot() is old
+    assert loader.get_by_name("alpha").description == "old"  # type: ignore[union-attr]
+
+
+def test_concurrent_reload_cannot_report_provisional_generation(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "old")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+    verifier_entered = threading.Event()
+    release_verifier = threading.Event()
+    verified_results = []
+    reader_results = []
+
+    def blocked_verifier(_candidate) -> None:
+        verifier_entered.set()
+        assert release_verifier.wait(timeout=5)
+
+    with loader.catalog_publication_barrier("test") as publication:
+        with loader.mutation_guard("test"):
+            _write_skill(root, "alpha", "new")
+        verified_thread = threading.Thread(
+            target=lambda: verified_results.append(
+                loader.reload_verified(blocked_verifier, reason="test")
+            )
+        )
+        verified_thread.start()
+        assert verifier_entered.wait(timeout=5)
+        reader_thread = threading.Thread(
+            target=lambda: reader_results.append(loader.reload(reason="concurrent-rpc"))
+        )
+        reader_thread.start()
+        release_verifier.set()
+        verified_thread.join(timeout=5)
+        reader_thread.join(timeout=5)
+
+        assert verified_results[0].generation == old.generation + 1
+        assert reader_results[0].changed is False
+        assert reader_results[0].generation == old.generation
+        assert loader.snapshot() is old
+        publication.commit()
+
+    assert loader.snapshot().generation == old.generation + 1
+
+
+def test_hidden_resource_change_is_part_of_catalog_tree_digest(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    skill_file = _write_skill(root, "alpha")
+    hidden = skill_file.parent / ".runtime-policy"
+    hidden.write_text("first\n", encoding="utf-8")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    generation = loader.snapshot().generation
+
+    hidden.write_text("changed\n", encoding="utf-8")
+    result = loader.refresh_if_changed("hidden resource update")
+
+    assert result.modified == ("alpha",)
+    assert result.generation == generation + 1
+
+
 def test_invalid_new_is_ignored_and_invalid_existing_keeps_last_good(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     alpha_file = _write_skill(root, "alpha", "good")
@@ -108,6 +323,45 @@ def test_invalid_new_is_ignored_and_invalid_existing_keeps_last_good(tmp_path: P
     repaired = loader.refresh_if_changed("test")
     assert repaired.partial is True  # the unrelated broken source remains
     assert loader.get_by_name("alpha").description == "repaired"  # type: ignore[union-attr]
+
+
+def test_unreadable_payload_is_a_per_skill_partial_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    blocked_skill = _write_skill(root, "blocked").parent
+    blocked_payload = blocked_skill / "payload.bin"
+    blocked_payload.write_bytes(b"unreadable payload")
+    _write_skill(root, "valid")
+    original_open = file_hash.os.open
+    original_read_chunk = file_hash._read_chunk
+    denied_descriptors: set[int] = set()
+
+    def track_payload_descriptor(path: Path, flags: int) -> int:
+        descriptor = original_open(path, flags)
+        if Path(path) == blocked_payload:
+            denied_descriptors.add(descriptor)
+        return descriptor
+
+    def deny_payload_read(descriptor: int, size: int) -> bytes:
+        if descriptor in denied_descriptors:
+            denied_descriptors.remove(descriptor)
+            raise PermissionError("stable payload denial")
+        return original_read_chunk(descriptor, size)
+
+    monkeypatch.setattr(file_hash.os, "open", track_payload_descriptor)
+    monkeypatch.setattr(file_hash, "_read_chunk", deny_payload_read)
+    loader = _loader(root, tmp_path)
+
+    result = loader.refresh_if_changed("cold start")
+
+    assert result.success is True
+    assert result.partial is True
+    assert [skill.name for skill in loader.snapshot().skills] == ["valid"]
+    assert len(result.errors) == 1
+    assert result.errors[0].name == "blocked"
+    assert result.errors[0].kept_previous is False
 
 
 @pytest.mark.parametrize("invalid_name", ["[bad]", "{bad: value}", "null", "123", "''"])
@@ -169,6 +423,38 @@ def test_new_override_and_removal_restore_lower_layer(tmp_path: Path) -> None:
     result = loader.refresh_if_changed("test")
     assert result.modified == ("alpha",)
     assert loader.get_by_name("alpha").description == "low"  # type: ignore[union-attr]
+
+
+def test_managed_recovery_quarantine_keeps_lkg_but_refreshes_other_layers(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "managed"
+    workspace = tmp_path / "workspace"
+    _write_skill(managed, "managed-skill", "managed old")
+    _write_skill(workspace, "workspace-skill", "workspace old")
+    loader = SkillLoader(
+        managed_dir=managed,
+        workspace_dir=workspace,
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+    loader.load_all()
+
+    _write_skill(managed, "managed-skill", "managed uncommitted")
+    _write_skill(managed, "managed-new", "managed uncommitted")
+    _write_skill(workspace, "workspace-skill", "workspace new")
+    loader.freeze_catalog_for_recovery(reason="test.recovery")
+
+    refreshed = loader.refresh_if_changed("test.non-managed-refresh")
+
+    assert refreshed.modified == ("workspace-skill",)
+    assert loader.get_by_name("managed-skill").description == "managed old"  # type: ignore[union-attr]
+    assert loader.get_by_name("managed-new") is None
+    assert loader.get_by_name("workspace-skill").description == "workspace new"  # type: ignore[union-attr]
+
+    loader.clear_catalog_recovery_freeze()
+    loader.refresh_if_changed("test.recovery-cleared")
+    assert loader.get_by_name("managed-skill").description == "managed uncommitted"  # type: ignore[union-attr]
+    assert loader.get_by_name("managed-new") is not None
 
 
 def test_missing_root_created_after_start_is_discovered(tmp_path: Path) -> None:
@@ -367,6 +653,12 @@ def test_mutation_guard_hides_in_progress_write_until_next_access(tmp_path: Path
 def test_load_all_compatibility_probe_is_monotonic_throttled(
     tmp_path: Path, monkeypatch
 ) -> None:
+    monotonic_now = 10.0
+    monkeypatch.setattr(
+        skill_loader_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: monotonic_now),
+    )
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     loader = _loader(root, tmp_path)
@@ -385,7 +677,7 @@ def test_load_all_compatibility_probe_is_monotonic_throttled(
     loader.load_all()
     assert calls == 0
 
-    loader._last_probe_at = 0.0
+    monotonic_now += skill_loader_module._COMPAT_PROBE_INTERVAL_SECONDS
     loader.load_all()
     assert calls == 1
 
@@ -430,6 +722,69 @@ def test_global_scan_failure_keeps_last_known_good(tmp_path: Path, monkeypatch) 
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
 
 
+def test_cold_start_tree_hash_race_retries_without_manifest_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha")
+    snapshot_path = tmp_path / "snapshot.json"
+    loader = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+    calls = _inject_transient_tree_hash_race(monkeypatch)
+
+    failed = loader.refresh_if_changed("metadata-only race")
+
+    assert failed.success is False
+    assert failed.generation == 0
+    assert failed.errors[0].kept_previous is False
+    assert loader.snapshot().generation == 0
+    assert loader.snapshot().skills == ()
+    assert loader._initialized is False
+    assert not snapshot_path.exists()
+
+    recovered = loader.refresh_if_changed("next ordinary access")
+
+    assert recovered.success is True
+    assert recovered.added == ("alpha",)
+    assert loader.snapshot().generation == 1
+    assert loader.get_by_name("alpha") is not None
+    assert loader._initialized is True
+    assert calls == [2]
+
+
+def test_warm_tree_hash_race_keeps_lkg_until_next_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "last known good")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+    _write_skill(root, "alpha", "new candidate")
+    calls = _inject_transient_tree_hash_race(monkeypatch)
+
+    failed = loader.refresh_if_changed("metadata-only race")
+
+    assert failed.success is False
+    assert failed.generation == old.generation
+    assert failed.errors[0].kept_previous is True
+    assert loader.snapshot() is old
+    old_skill = loader.snapshot().get_by_name("alpha")
+    assert old_skill is not None
+    assert old_skill.description == "last known good"
+
+    recovered = loader.refresh_if_changed("next ordinary access")
+
+    assert recovered.success is True
+    assert recovered.modified == ("alpha",)
+    assert loader.snapshot().generation == old.generation + 1
+    recovered_skill = loader.snapshot().get_by_name("alpha")
+    assert recovered_skill is not None
+    assert recovered_skill.description == "new candidate"
+    assert calls == [2]
+
+
 def test_publish_writes_snapshot_without_reentering_loader(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -448,7 +803,7 @@ def test_publish_writes_snapshot_without_reentering_loader(
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
 
 
-def test_snapshot_v12_is_invalid_and_v13_round_trips_atomically(tmp_path: Path) -> None:
+def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     snapshot_path = tmp_path / "snapshot.json"
@@ -459,12 +814,16 @@ def test_snapshot_v12_is_invalid_and_v13_round_trips_atomically(tmp_path: Path) 
     loader.load_all()
     loader.save_snapshot()
     data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert data["version"] == 13
+    assert data["version"] == 15
     assert all("mtime_ns" in entry for entry in data["manifest"].values())
+    assert all("tree_state" in entry for entry in data["manifest"].values())
+    assert data["skills"][0]["tree_digest"]
     assert not list(tmp_path.glob(".snapshot.json.*.tmp"))
 
     restored = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
-    assert [skill.name for skill in restored.load_snapshot() or []] == ["alpha"]
+    restored_skills = restored.load_snapshot() or []
+    assert [skill.name for skill in restored_skills] == ["alpha"]
+    assert restored_skills[0].tree_digest == data["skills"][0]["tree_digest"]
 
 
 def test_description_zh_is_parsed_and_survives_snapshot_round_trip(tmp_path: Path) -> None:

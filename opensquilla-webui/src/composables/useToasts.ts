@@ -2,10 +2,16 @@ import { ref } from 'vue'
 
 export type ToastTone = 'info' | 'ok' | 'warn' | 'danger'
 
+export interface ToastAction {
+  label: string
+  onClick: () => void
+}
+
 export interface ToastItem {
   id: number
   message: string
   tone: ToastTone
+  action?: ToastAction
 }
 
 const TOAST_DURATION_MS = 5000
@@ -26,14 +32,19 @@ function dismissToast(id: number) {
   toasts.value = toasts.value.filter(toast => toast.id !== id)
 }
 
-function pushToast(message: string, options: { tone?: ToastTone; duration?: number } = {}) {
+function pushToast(message: string, options: { tone?: ToastTone; duration?: number; action?: ToastAction } = {}) {
   const text = message.trim()
   if (!text) return
   while (toasts.value.length >= MAX_TOASTS) {
     dismissToast(toasts.value[0].id)
   }
   const id = ++nextId
-  toasts.value = [...toasts.value, { id, message: text, tone: options.tone ?? 'info' }]
+  toasts.value = [...toasts.value, {
+    id,
+    message: text,
+    tone: options.tone ?? 'info',
+    action: options.action,
+  }]
   timers.set(id, setTimeout(() => dismissToast(id), options.duration ?? TOAST_DURATION_MS))
 }
 

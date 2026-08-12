@@ -58,6 +58,18 @@ def test_system_prompt_routes_profile_to_user_md() -> None:
     assert "prior work, decisions, dated history, todos" in prompt
 
 
+def test_system_prompt_requires_bare_single_token_silent_replies() -> None:
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode="full"),
+        tools=None,
+    )
+
+    assert "output that single bare token and nothing else" in prompt
+    assert "Do not wrap it in Markdown" in prompt
+    assert "Goal continuation has user-visible information" in prompt
+    assert "Never use `NO_REPLY` for messages from a human user" in prompt
+
+
 def test_system_prompt_disambiguates_session_memory_results() -> None:
     prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),

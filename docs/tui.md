@@ -211,6 +211,8 @@ Gateway-backed chat also supports session and operations commands:
 
 | Command | Purpose |
 | --- | --- |
+| `/goal <objective>` or `/goal set <objective>` | Start a durable multi-turn Goal. |
+| `/goal [status\|edit\|pause\|resume\|clear]` | Inspect or manage the current Goal; see [`goal-mode.md`](goal-mode.md). |
 | `/sessions [limit]` | Open a searchable recent-session picker in TUI (table in plain mode). |
 | `/resume [id]` | Open the picker, or resume a specific session. |
 | `/delete <id>` | Delete a session. |

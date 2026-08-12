@@ -135,6 +135,12 @@ export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): Cha
     if (prev.turnId) merged.turnId = prev.turnId
   }
   if (!server.turnOutcome && prev.turnOutcome) merged.turnOutcome = prev.turnOutcome
+  if (!server.turnInputMode && prev.turnInputMode) {
+    merged.turnInputMode = prev.turnInputMode
+  }
+  if (!server.turnRunKind && prev.turnRunKind) {
+    merged.turnRunKind = prev.turnRunKind
+  }
   if (!server.steerClientRequestId && prev.steerClientRequestId) {
     merged.steerClientRequestId = prev.steerClientRequestId
   }
@@ -227,6 +233,7 @@ function assistantIndexesForTurn(messages: ChatMessage[], userIndex: number): nu
 function reconcileOptimisticTurnFields(
   prev: ChatMessage[],
   incoming: ChatMessage[],
+  consumedOptimisticRows?: Set<ChatMessage>,
 ): ChatMessage[] {
   const reconciled = reconcileHistoryMessages(prev, incoming)
   const merged = reconciled === incoming ? incoming.slice() : reconciled
@@ -259,6 +266,53 @@ function reconcileOptimisticTurnFields(
     const incomingAssistantIndex = incomingAssistants[0]
     const serverAssistant = merged[incomingAssistantIndex]
     merged[incomingAssistantIndex] = mergeLiveOnlyFields(previousAssistant, serverAssistant)
+    consumedOptimisticRows?.add(previousAssistant)
+  })
+
+  // Automatic Goal/heartbeat turns have no durable user row of their own, so
+  // the user-owned turn heuristic above cannot associate their completed live
+  // assistant with the canonical history row. Done and history both carry the
+  // same server-issued turn id: use that identity plus exact role/text, but
+  // only for a unique one-to-one match. The uniqueness fence deliberately
+  // keeps repeated same-text rows within one turn rather than guessing, while
+  // distinct turn ids remain independent even when their text is identical.
+  const optimisticBySignature = new Map<string, ChatMessage[]>()
+  const incomingSignatureCounts = new Map<string, number>()
+  const assistantSignature = (message: ChatMessage): string | null => {
+    if (message.role !== 'assistant' || !message.turnId) return null
+    return `${message.turnId}\u0000${message.role}\u0000${message.text}`
+  }
+
+  for (const message of prev) {
+    if (
+      message.messageId
+      || message.restoredFromHistory === true
+      || consumedOptimisticRows?.has(message)
+    ) continue
+    const signature = assistantSignature(message)
+    if (!signature) continue
+    const candidates = optimisticBySignature.get(signature) ?? []
+    candidates.push(message)
+    optimisticBySignature.set(signature, candidates)
+  }
+  for (const message of incoming) {
+    if (!message.messageId || message.restoredFromHistory !== true) continue
+    const signature = assistantSignature(message)
+    if (!signature) continue
+    incomingSignatureCounts.set(
+      signature,
+      (incomingSignatureCounts.get(signature) ?? 0) + 1,
+    )
+  }
+  incoming.forEach((message, index) => {
+    if (!message.messageId || message.restoredFromHistory !== true) return
+    const signature = assistantSignature(message)
+    if (!signature || incomingSignatureCounts.get(signature) !== 1) return
+    const candidates = optimisticBySignature.get(signature) ?? []
+    if (candidates.length !== 1) return
+    const optimistic = candidates[0]
+    merged[index] = mergeLiveOnlyFields(optimistic, merged[index])
+    consumedOptimisticRows?.add(optimistic)
   })
 
   return merged
@@ -478,17 +532,48 @@ export function reconcileRunningHistoryMessages(
     }
   }
 
+  const liveAnchor = prev[liveAnchorUserIndex]
+  const incomingIds = new Set(incoming.map(message => message.messageId).filter(Boolean))
+  const preserveConfirmedAnchor = Boolean(
+    liveAnchor?.role === 'user'
+    && liveAnchor.restoredFromHistory !== true
+    && liveAnchor.messageId
+    && !incomingIds.has(liveAnchor.messageId),
+  )
   const liveTail = prev.slice(liveAnchorUserIndex + 1)
-  if (liveTail.length === 0) return reconcileHistoryMessages(prev, incoming)
+  if (liveTail.length === 0) {
+    const merged = reconcileHistoryMessages(prev, incoming)
+    // A mutation-confirmed user row can arrive locally after an older,
+    // non-empty history request was already in flight. Its durable message id
+    // proves that it is not an optimistic draft, so retain it until a later
+    // canonical snapshot contains the same row.
+    if (preserveConfirmedAnchor) {
+      return [...merged, liveAnchor]
+    }
+    return merged
+  }
 
-  const merged = reconcileHistoryMessages(prev, incoming)
+  const consumedOptimisticRows = new Set<ChatMessage>()
+  const merged = reconcileOptimisticTurnFields(prev, incoming, consumedOptimisticRows)
   const existingIds = new Set(merged.map(msg => msg.messageId).filter(Boolean))
   const existingFallbackKeys = new Set(merged.map(fallbackMessageKey))
-  const tailToPreserve = liveTail.filter(msg => {
+  const confirmedAnchorToPreserve = (
+    preserveConfirmedAnchor
+    && liveAnchor.messageId
+    && !existingIds.has(liveAnchor.messageId)
+  ) ? [liveAnchor] : []
+  const tailToPreserve = [...confirmedAnchorToPreserve, ...liveTail.filter(msg => {
+    if (consumedOptimisticRows.has(msg)) return false
     if (msg.messageId) return !existingIds.has(msg.messageId)
     return !existingFallbackKeys.has(fallbackMessageKey(msg))
-  })
+  })]
   if (tailToPreserve.length === 0) return merged
+  if (confirmedAnchorToPreserve.length > 0) {
+    // The incoming snapshot predates this server-confirmed input. Keep the
+    // complete older transcript in place, then append the confirmed input and
+    // its live tail in causal order.
+    return [...merged, ...tailToPreserve]
+  }
 
   const insertAfter = insertionIndexForLiveTail(merged, prev[liveAnchorUserIndex])
   if (insertAfter < 0) return [...merged, ...tailToPreserve]

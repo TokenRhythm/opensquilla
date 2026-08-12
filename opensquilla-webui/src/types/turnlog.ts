@@ -61,6 +61,7 @@ export type Frame =
       source?: string
       durability?: string
       detail?: string
+      reason?: string
     }
 
 /** A frame as emitted by a mutator; `appendFrame` stamps the `seq` index. */

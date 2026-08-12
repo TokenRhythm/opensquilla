@@ -5,6 +5,7 @@ import { useChatRenderedMessages } from './useChatRenderedMessages'
 import type { ChatMessage, ChatRouterTierConfig } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
+import type { TimeTranslator } from '@/utils/messageTime'
 
 function renderedMessagesForRouterVisualMode(
   visualMode: 'real_candidates' | 'legacy_grid',
@@ -36,6 +37,7 @@ function renderedMessagesFor(
   messages: ChatMessage[],
   interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map()),
   routerVisualEffectsEnabled = false,
+  timeTranslator?: TimeTranslator,
 ) {
   return useChatRenderedMessages({
     messages: ref<ChatMessage[]>(messages),
@@ -50,10 +52,24 @@ function renderedMessagesFor(
     stripGeneratedArtifactMarkers: text => text,
     stripTimePrefix: text => text,
     isSubagentCompletionMessage: () => false,
+    timeTranslator,
   })
 }
 
 describe('useChatRenderedMessages maintenance events', () => {
+  it('localizes projected relative times for shared chat consumers', () => {
+    const api = renderedMessagesFor(
+      [{ role: 'user', text: 'hello', ts: Date.now() - 5 * 60_000 }],
+      undefined,
+      false,
+      (key, named) => `localized:${key}:${named?.n ?? ''}`,
+    )
+
+    expect(api.renderedMessages.value[0]?.timeStr).toBe(
+      'localized:chat.time.minutesAgo:5',
+    )
+  })
+
   it('preserves the dedicated compaction payload for ChatMessageList', () => {
     const api = renderedMessagesFor([{
       role: 'maintenance',
@@ -184,6 +200,96 @@ describe('useChatRenderedMessages internal control turns', () => {
 
     expect(api.renderedMessages.value).toHaveLength(1)
     expect(api.renderedMessages.value[0]?.hasAttachments).toBe(true)
+  })
+})
+
+describe('useChatRenderedMessages silent sentinel compatibility', () => {
+  it('projects mixed legacy text and explicit timeline markers without mutating history', () => {
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: 'NO_REPLY\nVisible answer.\nHEARTBEAT_OK',
+      ts: 1,
+      turnRunKind: 'goal',
+      timeline: [
+        { type: 'text', raw: 'NO_REPLY\nFirst' },
+        { type: 'text', raw: 'NO_REPLY' },
+        { type: 'text', raw: 'Last\nHEARTBEAT_OK' },
+      ],
+    }
+    const api = renderedMessagesFor([source])
+    const message = api.renderedMessages.value[0]!
+
+    expect(message.text).toBe('Visible answer.')
+    expect(message.turnRunKind).toBe('goal')
+    expect(message.timelineItems?.map(item => item.type === 'text' ? item.rawText : item.type))
+      .toEqual(['First', 'NO_REPLY', 'Last'])
+    expect(message.parts?.filter(part => part.type === 'text').map(part => part.rawText))
+      .toEqual(['First', 'NO_REPLY', 'Last'])
+    expect(source.text).toBe('NO_REPLY\nVisible answer.\nHEARTBEAT_OK')
+    expect(source.timeline?.[0]?.raw).toBe('NO_REPLY\nFirst')
+  })
+
+  it('projects persisted text segments while preserving their tool group', () => {
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: 'HEARTBEAT_OK\nDone.',
+      ts: 1,
+      turnInputMode: 'system_event',
+      tool_calls: [
+        { type: 'text', text: 'HEARTBEAT_OK' },
+        { type: 'tool_use', tool_use_id: 'tool-1', name: 'web_search', input: '{}' },
+        { type: 'tool_result', tool_use_id: 'tool-1', name: 'web_search', result: 'found' },
+        { type: 'text', text: 'Done.' },
+      ],
+    }
+    const api = renderedMessagesFor([source])
+    const message = api.renderedMessages.value[0]!
+
+    expect(message.text).toBe('Done.')
+    expect(message.timelineItems?.map(item => item.type === 'text' ? item.rawText : item.type))
+      .toEqual(['tool-group', 'Done.'])
+    expect(message.parts?.some(part => part.type === 'tool')).toBe(true)
+    expect(source.tool_calls?.[0]?.text).toBe('HEARTBEAT_OK')
+  })
+
+  it('preserves mixed sentinel-looking text on an ordinary direct-user turn', () => {
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: 'NO_REPLY\nThis is a literal explanation.',
+      ts: 1,
+      turnInputMode: 'user',
+      turnRunKind: 'default',
+      timeline: [
+        { type: 'text', raw: 'NO_REPLY' },
+        { type: 'text', raw: 'This is a literal explanation.' },
+      ],
+    }
+
+    const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+
+    expect(message.text).toBe('NO_REPLY\nThis is a literal explanation.')
+    expect(message.timelineItems?.map(item => item.type === 'text' ? item.rawText : item.type))
+      .toEqual(['NO_REPLY', 'This is a literal explanation.'])
+    expect(message.turnInputMode).toBe('user')
+    expect(message.turnRunKind).toBe('default')
+  })
+
+  it('omits an exact legacy sentinel row but keeps rows with durable output', () => {
+    const api = renderedMessagesFor([
+      { role: 'assistant', text: 'NO_REPLY', ts: 1 },
+      {
+        role: 'assistant',
+        text: 'HEARTBEAT_OK',
+        ts: 2,
+        artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+      },
+    ])
+
+    expect(api.renderedMessages.value).toHaveLength(1)
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      text: '',
+      artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+    })
   })
 })
 
@@ -1058,6 +1164,60 @@ describe('useChatRenderedMessages per-turn usage', () => {
     )
     expect(assistantMessages.map(message => message.meta?.input)).toEqual([11, 22])
     expect(assistantMessages.map(message => message.meta?.output)).toEqual([3, 5])
+  })
+
+  it('normalizes additive per-turn coverage while older usage remains exact', () => {
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: 'known subtotal',
+        ts: 1,
+        usage: {
+          input_tokens: 11,
+          output_tokens: 3,
+          cost_usd: 0.001,
+          coverage_status: 'usage_unknown',
+          usage_unknown: true,
+          unknown_usage_events: 1,
+        },
+      },
+      {
+        role: 'assistant',
+        text: 'unknown only',
+        ts: 2,
+        usage: {
+          coverageStatus: 'usage_unknown',
+          usageUnknown: true,
+          unknownUsageEvents: 2,
+        },
+      },
+      {
+        role: 'assistant',
+        text: 'legacy exact usage',
+        ts: 3,
+        usage: { input_tokens: 7, output_tokens: 2 },
+      },
+    ])
+
+    const [partial, unknownOnly, legacy] = api.renderedMessages.value
+    expect(partial?.meta).toMatchObject({
+      coverageStatus: 'usage_unknown',
+      usageUnknown: true,
+      unknownUsageEvents: 1,
+      hasKnownUsage: true,
+    })
+    expect(unknownOnly?.meta).toMatchObject({
+      coverageStatus: 'usage_unknown',
+      usageUnknown: true,
+      unknownUsageEvents: 2,
+      hasKnownUsage: false,
+    })
+    expect(legacy?.meta).toMatchObject({
+      usageUnknown: false,
+      unknownUsageEvents: 0,
+      hasKnownUsage: true,
+    })
+    expect(legacy?.meta?.coverageStatus).toBeUndefined()
   })
 })
 

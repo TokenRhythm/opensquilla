@@ -15,6 +15,14 @@
     >
       <span class="toast__message">{{ toast.message }}</span>
       <button
+        v-if="toast.action"
+        type="button"
+        class="toast__action"
+        @click="runAction(toast)"
+      >
+        {{ toast.action.label }}
+      </button>
+      <button
         type="button"
         class="toast__dismiss"
         :aria-label="t('shared.toast.dismiss')"
@@ -29,10 +37,18 @@
 <script setup lang="ts">
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import { useToasts } from '@/composables/useToasts'
+import { useToasts, type ToastItem } from '@/composables/useToasts'
 
 const { t } = useI18n()
 const { toasts, dismissToast } = useToasts()
+
+function runAction(toast: ToastItem) {
+  try {
+    toast.action?.onClick()
+  } finally {
+    dismissToast(toast.id)
+  }
+}
 </script>
 
 <style scoped>
@@ -104,8 +120,32 @@ const { toasts, dismissToast } = useToasts()
 }
 
 .toast__message {
+  flex: 1 1 auto;
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.toast__action {
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  cursor: pointer;
+  flex: 0 0 auto;
+  font: inherit;
+  font-weight: 650;
+  padding: var(--sp-1) var(--sp-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.toast__action:hover {
+  background: var(--bg-hover);
+}
+
+.toast__action:focus-visible {
+  box-shadow: var(--focus-ring);
+  outline: none;
 }
 
 .toast__dismiss {

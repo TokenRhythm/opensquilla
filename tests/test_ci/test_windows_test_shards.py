@@ -50,6 +50,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/integration/cli/tui_real_terminal/test_source_gateway_bootstrap_startup.py",
     "tests/integration/cli/tui_real_terminal/test_terminal_changes.py",
     "tests/live/test_search_api_matrix_live.py",
+    "tests/live/test_skill_hub_canary_live.py",
     "tests/live/test_multi_provider_matrix_live.py",
     "tests/live/test_search_retrieval_live.py",
     "tests/live/test_tokenrhythm_catalog_live.py",
@@ -58,10 +59,14 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    "tests/test_scripts/test_bench_skill_integrity.py",
+    "tests/test_skills_hash_consumers.py",
+    "tests/test_skills_tree.py",
     "tests/test_recovery/test_config_recovery.py",
     "tests/unit/cli/tui/test_keys_cheatsheet.py",
     "tests/unit/cli/tui/test_opentui_prefs.py",
     "tests/test_cli/test_gateway_client_steer.py",
+    "tests/test_cli/test_skills_search_cmd.py",
     "tests/test_channels/test_admission_reason_persistence.py",
     "tests/test_channels/test_channel_admission.py",
     "tests/test_channels/test_channel_certification.py",
@@ -192,6 +197,13 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_tools/test_shell_self_kill_policy.py",
     "tests/test_tools/test_run_mode_full_host_fallback.py",
     "tests/test_tools/test_workspace_write_deny_effects.py",
+    "tests/test_engine/test_goal_context_prompt.py",
+    "tests/test_engine/test_goal_routing_hint.py",
+    "tests/test_gateway/test_goal_rpc.py",
+    "tests/test_migrations/test_v033_goal_runs.py",
+    "tests/test_migrations/test_v034_goal_message_anchor.py",
+    "tests/test_session/test_goal_storage.py",
+    "tests/test_session/test_goals.py",
 }
 
 
@@ -230,6 +242,9 @@ def test_windows_shard_responsibilities_cover_high_risk_surfaces() -> None:
         ),
         "tests/test_uninstall/test_safety.py": "desktop-installer-contracts",
         "tests/test_install_scripts.py": "desktop-installer-contracts",
+        "tests/test_scripts/test_bench_skill_integrity.py": "recovery-migration",
+        "tests/test_skills_hash_consumers.py": "recovery-migration",
+        "tests/test_skills_tree.py": "recovery-migration",
     }
 
     assert {path: shard_for_test(path) for path in expected} == expected

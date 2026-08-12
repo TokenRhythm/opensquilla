@@ -13,6 +13,7 @@ the runtime wrapper.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -665,6 +666,156 @@ async def test_heartbeat_empty_clears_text_and_segments() -> None:
     assert out.memory_captured is False
     assert recs["transcript_append"].calls == []
     assert recs["turn_memory_capture"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_goal_mixed_sentinel_is_removed_from_text_segments_and_done_event() -> None:
+    stage, recs = _make_stage()
+    model_output = "NO_REPLY\nStill waiting for the external operation."
+    done = DoneEvent(text=model_output, text_snapshot=model_output)
+    inp = _make_input(
+        final_text_parts=[model_output],
+        turn_segments=[{"type": "text", "text": model_output}],
+        done_event=done,
+        input_mode="system_event",
+        run_kind="goal",
+    )
+
+    outcome = await stage.run(inp)
+
+    assert outcome.output.final_text == "Still waiting for the external operation."
+    assert outcome.output.turn_segments == [
+        {"type": "text", "text": "Still waiting for the external operation."}
+    ]
+    assert recs["transcript_append"].calls[0]["content"] == outcome.output.final_text
+    assert "NO_REPLY" not in str(recs["transcript_append"].calls[0])
+    assert outcome.output.done_event is not done
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.text == outcome.output.final_text
+    assert outcome.output.done_event.text_snapshot == outcome.output.final_text
+    assert outcome.output.done_event.delivery == "visible"
+    assert outcome.output.done_event.suppression_reason is None
+    assert done.text == model_output
+
+
+@pytest.mark.asyncio
+async def test_goal_exact_sentinel_done_event_is_suppressed_without_persistence() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(text="**NO_REPLY**", text_snapshot="**NO_REPLY**")
+    inp = _make_input(
+        final_text_parts=["**NO_REPLY**"],
+        turn_segments=[{"type": "text", "text": "**NO_REPLY**"}],
+        done_event=done,
+        input_mode="system_event",
+        run_kind="goal",
+    )
+
+    outcome = await stage.run(inp)
+
+    assert outcome.output.final_text == ""
+    assert outcome.output.turn_segments == []
+    assert outcome.output.transcript_appended is False
+    assert recs["transcript_append"].calls == []
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.text == ""
+    assert outcome.output.done_event.text_snapshot == ""
+    assert outcome.output.done_event.delivery == "suppressed"
+    assert outcome.output.done_event.suppression_reason == "no_reply"
+    assert recs["session_totals"].calls[0]["done_event"] is outcome.output.done_event
+
+
+@pytest.mark.asyncio
+async def test_suppressed_text_keeps_tool_lifecycle_segments_for_audit() -> None:
+    stage, recs = _make_stage()
+    tools = [
+        {"type": "tool_use", "tool_use_id": "call-1", "name": "status"},
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-1",
+            "name": "status",
+            "result": "waiting",
+        },
+    ]
+    done = DoneEvent(text="NO_REPLY", text_snapshot="NO_REPLY")
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=["NO_REPLY"],
+            turn_segments=[{"type": "text", "text": "NO_REPLY"}, *tools],
+            done_event=done,
+            input_mode="system_event",
+            run_kind="goal",
+            no_memory_capture=True,
+        )
+    )
+
+    assert outcome.output.final_text == ""
+    assert outcome.output.turn_segments == tools
+    assert recs["transcript_append"].calls[0]["content"] == ""
+    assert recs["transcript_append"].calls[0]["tool_calls"] == tools
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.delivery == "suppressed"
+    assert outcome.output.done_event.suppression_reason == "no_reply"
+
+
+@pytest.mark.asyncio
+async def test_suppressed_text_keeps_artifact_envelope_without_text() -> None:
+    stage, recs = _make_stage()
+    artifact = {
+        "artifact_id": "artifact-1",
+        "name": "report.txt",
+        "mime": "text/plain",
+    }
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=["NO_REPLY"],
+            turn_segments=[{"type": "text", "text": "NO_REPLY"}],
+            turn_artifacts=[artifact],
+            done_event=DoneEvent(text="NO_REPLY", text_snapshot="NO_REPLY"),
+            input_mode="system_event",
+            run_kind="goal",
+            no_memory_capture=True,
+        )
+    )
+
+    assert outcome.output.final_text == ""
+    assert outcome.output.turn_segments == []
+    persisted = json.loads(recs["transcript_append"].calls[0]["content"])
+    assert persisted == {"text": "", "artifacts": [artifact]}
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.delivery == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_runtime_confirmation_notice_makes_suppressed_model_payload_visible() -> None:
+    stage, _ = _make_stage()
+    background_result = {
+        "type": "tool_result",
+        "tool_use_id": "call-1",
+        "name": "background_process",
+        "result": "status: running",
+        "execution_status": {
+            "status": "unknown",
+            "reason": "background_running",
+        },
+    }
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=["NO_REPLY"],
+            turn_segments=[
+                {"type": "text", "text": "NO_REPLY"},
+                background_result,
+            ],
+            done_event=DoneEvent(text="NO_REPLY", text_snapshot="NO_REPLY"),
+            input_mode="system_event",
+            run_kind="goal",
+        )
+    )
+
+    assert "could not confirm" in outcome.output.final_text
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.text == outcome.output.final_text
+    assert outcome.output.done_event.delivery == "visible"
+    assert outcome.output.done_event.suppression_reason is None
 
 
 @pytest.mark.asyncio

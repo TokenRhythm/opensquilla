@@ -52,6 +52,8 @@ const SHARE_CLONE_STRIP_SELECTORS = [
   '.chat-share-checkbox',
   '[data-share-checkbox]',
   '[data-share-control]',
+  '.turn-usage-details',
+  '[data-turn-usage-details]',
   '.msg-meta__more',
   '.msg-meta__cost',
   '.step-view-btn',

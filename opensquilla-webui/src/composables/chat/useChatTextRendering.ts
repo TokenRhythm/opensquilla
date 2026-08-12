@@ -2,6 +2,9 @@ import { marked, type Tokens } from 'marked'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
 import katex from 'katex'
+import { sanitizeAssistantPresentationText } from '@/utils/chat/silentSentinels'
+import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
+import { strictStrikethrough } from '@/utils/markdown/strikethrough'
 
 const DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g
 const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*/gi
@@ -39,7 +42,7 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
-marked.use({
+marked.use(strictStrikethrough, {
   renderer: {
     code({ text, lang }: Tokens.Code): string {
       const language = (lang || '').trim().split(/\s+/)[0].toLowerCase()
@@ -260,10 +263,19 @@ export function useChatTextRendering() {
     return html
   }
 
-  function sanitizeCopyText(text: string): string {
-    return stripDirectiveTags(
+  function sanitizeCopyText(
+    text: string,
+    opts?: {
+      assistantBoundary?: boolean
+      provenance?: AssistantPresentationProvenance
+    },
+  ): string {
+    const sanitized = stripDirectiveTags(
       stripGeneratedArtifactMarkers(stripTimePrefix(String(text || ''))),
-    ).trim()
+    )
+    return (opts?.assistantBoundary === false
+      ? sanitized
+      : sanitizeAssistantPresentationText(sanitized, opts?.provenance)).trim()
   }
 
   return {

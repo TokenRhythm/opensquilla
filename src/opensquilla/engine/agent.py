@@ -128,6 +128,7 @@ from opensquilla.engine.tool_token_estimate import estimate_tokens as get_approx
 from opensquilla.engine.usage import model_usage_cost_fields
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
+    UsageCallResult,
     UsageCallStart,
     UsageEventSink,
     UsageExecutionContext,
@@ -246,7 +247,11 @@ from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
-from opensquilla.tools.types import ToolContext, current_tool_context
+from opensquilla.tools.types import (
+    ToolContext,
+    current_tool_context,
+    is_goal_owned_main_default_turn,
+)
 from opensquilla.tools.write_policy import match_workspace_write_deny
 from opensquilla.tools.write_tracking import classify_workspace_path
 from opensquilla.usage_reasons import (
@@ -843,6 +848,51 @@ def _usage_float(value: Any) -> float:
         return max(0.0, float(value or 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _normalized_usage_breakdown_rows(
+    event: object,
+    usage: UsageCallResult,
+) -> list[dict[str, Any]]:
+    """Preserve provider metadata while replacing additive usage with canonical values."""
+
+    raw_breakdown = getattr(event, "model_usage_breakdown", None)
+    raw_rows = raw_breakdown if isinstance(raw_breakdown, list) else []
+    rows: list[dict[str, Any]] = []
+    for item in usage.items:
+        row = (
+            dict(raw_rows[item.ordinal])
+            if item.ordinal < len(raw_rows) and isinstance(raw_rows[item.ordinal], dict)
+            else {}
+        )
+        billed_cost = item.billed_cost_nanos / 1_000_000_000
+        model = item.model or "unknown"
+        row.update(
+            {
+                "provider": item.provider,
+                "model": model,
+                "input_tokens": item.input_tokens,
+                "inputTokens": item.input_tokens,
+                "output_tokens": item.output_tokens,
+                "outputTokens": item.output_tokens,
+                "reasoning_tokens": item.reasoning_tokens,
+                "reasoningTokens": item.reasoning_tokens,
+                "cache_read_tokens": item.cache_read_tokens,
+                "cacheReadTokens": item.cache_read_tokens,
+                "cached_tokens": item.cache_read_tokens,
+                "cachedTokens": item.cache_read_tokens,
+                "cache_write_tokens": item.cache_write_tokens,
+                "cacheWriteTokens": item.cache_write_tokens,
+                "billed_cost": billed_cost,
+                "billedCost": billed_cost,
+                "billed_cost_usd": billed_cost,
+                "billedCostUsd": billed_cost,
+                "cost_source": item.cost_source,
+                "costSource": item.cost_source,
+            }
+        )
+        rows.append(row)
+    return rows
 
 
 def _subagent_usage_breakdown_rows(usage: SubagentUsage) -> list[dict[str, Any]]:
@@ -1986,6 +2036,7 @@ _SYNTHETIC_USER_CONTEXT_PREFIXES = (
     "[Request context for this turn]",
     "[Runtime context for this turn]",
     "[Current user request reminder]",
+    "[Current Goal objective reminder]",
     "Runtime state capsule:",
 )
 
@@ -2392,7 +2443,7 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         output_json_schema=chat_cfg.output_json_schema,
         output_json_schema_strict=chat_cfg.output_json_schema_strict,
         model_capabilities=chat_cfg.model_capabilities,
-        thinking_level=None,
+        thinking_level=ThinkingLevel.OFF,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
         context_window_tokens_global_override=(
             chat_cfg.context_window_tokens_global_override
@@ -3211,6 +3262,11 @@ class Agent:
                     entry.get("content") or "",
                     entry.get("tool_calls"),
                     entry.get("reasoning_content"),
+                    turn_context=(
+                        entry.get("turn_context")
+                        if isinstance(entry.get("turn_context"), dict)
+                        else None
+                    ),
                 )
             )
 
@@ -5878,17 +5934,21 @@ class Agent:
         self,
         call: UsageCallStart,
         provider_done: object,
+        *,
+        normalized_result: UsageCallResult | None = None,
     ) -> None:
         scope = current_usage_accounting_scope()
         sink = scope.sink if scope is not None else self._usage_event_sink
         if sink is None:
             return
-        result = normalize_provider_usage(
-            provider_done,
-            default_provider=call.provider,
-            default_model=call.model,
-            completed_at_ms=time.time_ns() // 1_000_000,
-        )
+        result = normalized_result
+        if result is None:
+            result = normalize_provider_usage(
+                provider_done,
+                default_provider=call.provider,
+                default_model=call.model,
+                completed_at_ms=time.time_ns() // 1_000_000,
+            )
         finalize_task = asyncio.create_task(sink.finalize(call, result))
         try:
             await asyncio.shield(finalize_task)
@@ -6252,6 +6312,7 @@ class Agent:
         total_provider_billed_entries = 0
         total_unbilled_entries = 0
         total_missing_cost_entries = 0
+        turn_has_error_usage_receipt = False
         # Estimate-backed accumulator for max_turn_cost_usd: billed cost when a
         # call reported one, otherwise the layered-resolver estimate — unlike
         # total_billed_cost, this never sits at 0.0 for a cost-blind provider.
@@ -6331,6 +6392,8 @@ class Agent:
         artifact_delivery_final_response_pending = False
         artifact_delivery_degraded_final_response = False
         artifact_delivery_final_response_artifacts: list[dict[str, Any]] = []
+        goal_terminal_final_response_pending = False
+        goal_terminal_final_status: str | None = None
         max_iterations_finalization_attempted = False
         max_iterations_finalization_pending = False
         max_iterations_finalization_message: Message | None = None
@@ -6683,6 +6746,7 @@ class Agent:
 
         pending_input_batch_staged = False
         staged_pending_input_message: Message | None = None
+        staged_claimed_goal_context: dict[str, Any] | None = None
 
         def _continuation_capabilities() -> tuple[int, bool, bool, str] | None:
             """Resolve capabilities for the physical leg that just completed."""
@@ -6832,11 +6896,12 @@ class Agent:
                 return False
             return True
 
-        def _claim_pending_inputs_for_next_call() -> bool:
+        async def _claim_pending_inputs_for_next_call() -> bool:
             """Claim one FIFO steer batch when another model call has headroom."""
 
             nonlocal pending_input_batch_staged
             nonlocal staged_pending_input_message
+            nonlocal staged_claimed_goal_context
             if pending_input_provider is None or pending_input_batch_staged:
                 return False
             if _turn_budget_error() is not None:
@@ -6862,10 +6927,62 @@ class Agent:
             )
             if not _continuation_request_fits(pending_message):
                 return False
-            pending_inputs = pending_input_provider.drain_pending()
+            claim_pending = getattr(pending_input_provider, "claim_pending", None)
+            if callable(claim_pending):
+                prepared_claim = claim_pending()
+                if inspect.isawaitable(prepared_claim):
+                    prepared_claim = await prepared_claim
+                pending_inputs = list(getattr(prepared_claim, "texts", ()) or ())
+                claimed_goal_context = getattr(prepared_claim, "goal_context", None)
+            else:
+                pending_inputs = pending_input_provider.drain_pending()
+                claimed_goal_context = None
+            goal_context_accepted = claimed_goal_context is None
+            if isinstance(claimed_goal_context, Mapping):
+                from opensquilla.session.goals import GoalTurnContext
+
+                current_goal_context = GoalTurnContext.from_task_detail(
+                    getattr(self._tool_context, "goal_context", None)
+                )
+                next_goal_context = GoalTurnContext.from_task_detail(
+                    claimed_goal_context
+                )
+                if (
+                    self._tool_context is not None
+                    and current_goal_context is not None
+                    and next_goal_context is not None
+                    and next_goal_context.session_id == current_goal_context.session_id
+                    and next_goal_context.epoch == current_goal_context.epoch
+                    and next_goal_context.goal_id == current_goal_context.goal_id
+                    and next_goal_context.task_id == current_goal_context.task_id
+                    and next_goal_context.objective_revision
+                    >= current_goal_context.objective_revision
+                ):
+                    staged_claimed_goal_context = dict(claimed_goal_context)
+                    goal_context_accepted = True
+            if claimed_goal_context is not None and not goal_context_accepted:
+                # The internal Goal control is always the first claimed text.
+                # Drop it fail-closed if the Agent's own immutable task
+                # identity cannot adopt the validated durable context.
+                pending_inputs = pending_inputs[1:]
+                reject_goal_context = getattr(
+                    pending_input_provider,
+                    "reject_claimed_goal_context",
+                    None,
+                )
+                if callable(reject_goal_context):
+                    rejected = reject_goal_context()
+                    if inspect.isawaitable(rejected):
+                        _ = await rejected
             if not pending_inputs:
                 return False
-            staged_pending_input_message = pending_message
+            staged_pending_input_message = Message(
+                role="user",
+                content=[
+                    ContentBlockText(text=pending_input)
+                    for pending_input in pending_inputs
+                ],
+            )
             turn_messages.append(staged_pending_input_message)
             pending_input_batch_staged = True
             return True
@@ -6879,6 +6996,8 @@ class Agent:
 
             nonlocal pending_input_batch_staged
             nonlocal staged_pending_input_message
+            nonlocal staged_claimed_goal_context
+            nonlocal turn_objective_message
             if not pending_input_batch_staged or pending_input_provider is None:
                 return
             mark_applied = getattr(pending_input_provider, "mark_applied", None)
@@ -6889,6 +7008,49 @@ class Agent:
                 )
                 if inspect.isawaitable(result):
                     await result
+            take_applied_goal_context = getattr(
+                pending_input_provider,
+                "take_applied_goal_context",
+                None,
+            )
+            applied_goal_context = (
+                take_applied_goal_context()
+                if callable(take_applied_goal_context)
+                else None
+            )
+            if (
+                staged_claimed_goal_context is not None
+                and isinstance(applied_goal_context, Mapping)
+            ):
+                from opensquilla.session.goals import GoalTurnContext
+
+                staged_context = GoalTurnContext.from_task_detail(
+                    staged_claimed_goal_context
+                )
+                applied_context = GoalTurnContext.from_task_detail(
+                    applied_goal_context
+                )
+                current_context = GoalTurnContext.from_task_detail(
+                    getattr(self._tool_context, "goal_context", None)
+                )
+                if (
+                    self._tool_context is not None
+                    and staged_context is not None
+                    and applied_context == staged_context
+                    and current_context is not None
+                    and applied_context.session_id == current_context.session_id
+                    and applied_context.epoch == current_context.epoch
+                    and applied_context.goal_id == current_context.goal_id
+                    and applied_context.task_id == current_context.task_id
+                    and applied_context.objective_revision
+                    >= current_context.objective_revision
+                ):
+                    self._tool_context.goal_context = dict(applied_goal_context)
+                    turn_objective_message = self._goal_objective_message(
+                        applied_context.objective_snapshot,
+                        enabled=self._turn_objective_reminder_enabled,
+                        max_chars=self._turn_objective_reminder_max_chars,
+                    )
             applied_model_call_boundaries.append(
                 {
                     "model_call_id": model_call_id,
@@ -6901,6 +7063,7 @@ class Agent:
             )
             pending_input_batch_staged = False
             staged_pending_input_message = None
+            staged_claimed_goal_context = None
 
         def _finish_artifact_delivery_degraded(
             *,
@@ -6946,11 +7109,67 @@ class Agent:
                 artifact_count=len(artifact_delivery_final_response_artifacts),
             )
 
+        def _goal_terminal_final_response_text() -> str:
+            return (
+                "The Goal is complete."
+                if goal_terminal_final_status == "complete"
+                else "The Goal is blocked."
+            )
+
+        def _record_goal_terminal_synthesized_response(
+            *,
+            reason: str,
+            code: str,
+        ) -> str:
+            final_response_text = _goal_terminal_final_response_text()
+            self._write_turn_call_log(
+                "goal_terminal_final_response_synthesized",
+                reason=reason,
+                code=code,
+                status=goal_terminal_final_status,
+            )
+            return final_response_text
+
+        def _finish_goal_terminal_without_provider(*, reason: str, code: str) -> None:
+            """Finish an already-durable Goal when no summary call has headroom."""
+
+            nonlocal goal_terminal_final_response_pending
+            nonlocal goal_terminal_final_status
+            final_response_text = _record_goal_terminal_synthesized_response(
+                reason=reason,
+                code=code,
+            )
+            current_text = "".join(final_text_parts)
+            if final_response_text not in current_text:
+                prefix = "\n\n" if current_text.strip() else ""
+                final_text_parts.append(prefix + final_response_text)
+            goal_terminal_final_response_pending = False
+            goal_terminal_final_status = None
+
         try:
             while True:
+                if goal_terminal_final_response_pending:
+                    terminal_headroom_error = _turn_budget_error()
+                    if terminal_headroom_error is None:
+                        terminal_headroom_error = _turn_llm_call_budget_error(
+                            turn_llm_calls + 1
+                        )
+                    if terminal_headroom_error is not None:
+                        _finish_goal_terminal_without_provider(
+                            reason=terminal_headroom_error.message,
+                            code=terminal_headroom_error.code,
+                        )
+                        break
+                    if _total_deadline is not None and _loop.time() > _total_deadline:
+                        _finish_goal_terminal_without_provider(
+                            reason="The total turn deadline expired after Goal terminalization.",
+                            code="total_timeout",
+                        )
+                        break
                 if (
                     self.config.max_iterations > 0
                     and iterations >= self.config.max_iterations
+                    and not goal_terminal_final_response_pending
                     and not _defer_max_iterations_cap()
                 ):
                     max_iterations_source = str(
@@ -7185,6 +7404,7 @@ class Agent:
                         None
                         if (
                             artifact_delivery_final_response_pending
+                            or goal_terminal_final_response_pending
                             or max_iterations_finalization_pending
                             or post_write_convergence_finalization_pending
                         )
@@ -7207,6 +7427,7 @@ class Agent:
                     tools_supported_for_call = (
                         tools_supported
                         and not artifact_delivery_final_response_pending
+                        and not goal_terminal_final_response_pending
                         and not max_iterations_finalization_pending
                         and not post_write_convergence_finalization_pending
                     )
@@ -7231,7 +7452,12 @@ class Agent:
                         active_protected_turn_start_index = current_turn_start_index
 
                     request_suffix_messages: list[Message] = []
-                    if (
+                    if goal_terminal_final_response_pending:
+                        # The terminal Goal ToolResult is sufficient context for
+                        # one ordinary summary. Do not splice work/recovery
+                        # directives after the durable terminal decision.
+                        request_suffix_messages = []
+                    elif (
                         post_write_convergence_finalization_pending
                         and post_write_convergence_finalization_message is not None
                     ):
@@ -7263,17 +7489,35 @@ class Agent:
                         *base_request_turn_messages,
                         *request_suffix_messages,
                     ]
-                    (
-                        request_messages,
-                        request_sanitize_result,
-                    ) = await self._provider_request_messages_with_sanitize_async(
-                        request_turn_messages,
-                        request_context_message=request_context_message,
-                        request_context_insert_index=active_request_context_insert_index,
-                        runtime_context_message=runtime_context_message,
-                        runtime_context_insert_index=active_runtime_context_insert_index,
-                        turn_objective_message=turn_objective_message,
-                    )
+                    try:
+                        (
+                            request_messages,
+                            request_sanitize_result,
+                        ) = await self._provider_request_messages_with_sanitize_async(
+                            request_turn_messages,
+                            request_context_message=request_context_message,
+                            request_context_insert_index=active_request_context_insert_index,
+                            runtime_context_message=runtime_context_message,
+                            runtime_context_insert_index=active_runtime_context_insert_index,
+                            turn_objective_message=turn_objective_message,
+                        )
+                    except Exception as exc:
+                        if not goal_terminal_final_response_pending:
+                            raise
+                        response_text = _record_goal_terminal_synthesized_response(
+                            reason=(
+                                "Goal terminal summary request assembly failed after "
+                                f"terminalization ({type(exc).__name__})."
+                            ),
+                            code="goal_terminal_summary_request_assembly_failed",
+                        )
+                        assistant_text_parts.append(response_text)
+                        provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                        _got_done_event = True
+                        _got_error = False
+                        terminal_error = None
+                        yield TextDeltaEvent(text=response_text)
+                        break
                     validation_error = validate_provider_chat_request(
                         self.provider,
                         request_messages,
@@ -7283,16 +7527,28 @@ class Agent:
                             message=validation_error.message,
                             code=validation_error.code,
                         )
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action="stop",
-                            reason=terminal_error.message,
-                            code=terminal_error.code,
-                            iteration=iterations,
-                            attempt=_call_attempt,
-                        )
-                        yield self._transition(AgentState.ERROR)
-                        yield terminal_error
+                        if goal_terminal_final_response_pending:
+                            response_text = _record_goal_terminal_synthesized_response(
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                            )
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            terminal_error = None
+                            yield TextDeltaEvent(text=response_text)
+                        else:
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="stop",
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
                         break
                     identical_request_action = self._identical_request_loop_break_action(
                         request_messages,
@@ -7328,6 +7584,17 @@ class Agent:
                                 code=terminal_error.code,
                             )
                             terminal_error = None
+                        elif goal_terminal_final_response_pending:
+                            response_text = _record_goal_terminal_synthesized_response(
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                            )
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            terminal_error = None
+                            yield TextDeltaEvent(text=response_text)
                         else:
                             yield self._transition(AgentState.ERROR)
                             yield terminal_error
@@ -7379,6 +7646,20 @@ class Agent:
                                 code=terminal_error.code,
                             )
                             terminal_error = None
+                        elif goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            terminal_error = None
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_without_summary_retry_headroom",
+                                reason="goal_terminal",
+                                code="turn_llm_call_budget_exceeded",
+                            )
+                            yield TextDeltaEvent(text=response_text)
                         else:
                             yield self._transition(AgentState.ERROR)
                             yield terminal_error
@@ -7393,6 +7674,10 @@ class Agent:
                             workspace_edit_gate_recovery_reads_remaining
                         ),
                     )
+                    if goal_terminal_final_response_pending:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={"tool_choice": None}
+                        )
                     forced_tool_choice = self.config.metadata.get("meta_match_tool_choice")
                     if (
                         forced_tool_choice is not None
@@ -7464,8 +7749,13 @@ class Agent:
                     # Time-to-first-event for this provider call, stamped once
                     # at the first streamed event (diagnostics only).
                     first_event_at: float | None = None
+                    call_outcome_notified = False
 
                     def _notify_call_outcome(*, ok: bool, failure_kind: str = "") -> None:
+                        nonlocal call_outcome_notified
+                        if call_outcome_notified:
+                            return
+                        call_outcome_notified = True
                         self._notify_provider_call_observer(
                             ttft_ms=(
                                 int((first_event_at - call_started_at) * 1000)
@@ -7604,6 +7894,7 @@ class Agent:
                                     # discards reasoning for a directive-free,
                                     # otherwise identical request.
                                     and not artifact_delivery_final_response_pending
+                                    and not goal_terminal_final_response_pending
                                     and not max_iterations_finalization_pending
                                     and not post_write_convergence_finalization_pending
                                     and (
@@ -7700,6 +7991,7 @@ class Agent:
                                 if (
                                     _reasoning_stream_char_cap > 0
                                     and not _reasoning_cap_preempt_done
+                                    and not goal_terminal_final_response_pending
                                 ):
                                     attempt_reasoning_stream_chars += len(
                                         raw_ev.text or ""
@@ -7779,6 +8071,7 @@ class Agent:
                                 if not tools_supported_for_call:
                                     if (
                                         artifact_delivery_final_response_pending
+                                        or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
                                         or post_write_convergence_finalization_pending
                                     ):
@@ -7877,6 +8170,7 @@ class Agent:
                                 if not tools_supported_for_call:
                                     if (
                                         artifact_delivery_final_response_pending
+                                        or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
                                         or post_write_convergence_finalization_pending
                                     ):
@@ -8209,42 +8503,113 @@ class Agent:
                                     raw_ev.code
                                 )
                                 known_usage_receipt = has_known_provider_usage_receipt(raw_ev)
+                                error_usage: UsageCallResult | None = None
+                                if known_usage_receipt and not cost_receipt_counted:
+                                    usage_default_provider = (
+                                        usage_call.provider
+                                        if usage_call is not None
+                                        else str(
+                                            self.config.provider_id
+                                            or getattr(
+                                                self.provider,
+                                                "provider_name",
+                                                "",
+                                            )
+                                            or ""
+                                        )
+                                    )
+                                    usage_default_model = (
+                                        usage_call.model
+                                        if usage_call is not None
+                                        else str(self.config.model_id or "")
+                                    )
+                                    error_usage = normalize_provider_usage(
+                                        raw_ev,
+                                        default_provider=usage_default_provider,
+                                        default_model=usage_default_model,
+                                        completed_at_ms=time.time_ns() // 1_000_000,
+                                        resolve_estimates=False,
+                                    )
                                 if (
                                     usage_call is not None
                                     and not usage_call_terminal
                                     and known_usage_receipt
                                 ):
                                     usage_call_terminal = True
-                                    await self._usage_call_finalize(usage_call, raw_ev)
-                                if known_usage_receipt and not cost_receipt_counted:
+                                    await self._usage_call_finalize(
+                                        usage_call,
+                                        raw_ev,
+                                        normalized_result=error_usage,
+                                    )
+                                if error_usage is not None:
+                                    total_billed_cost += (
+                                        error_usage.billed_cost_nanos / 1_000_000_000
+                                    )
+                                    total_input_tokens += error_usage.input_tokens
+                                    total_output_tokens += error_usage.output_tokens
+                                    total_reasoning_tokens += error_usage.reasoning_tokens
+                                    total_cached_tokens += error_usage.cache_read_tokens
+                                    total_cache_write_tokens += (
+                                        error_usage.cache_write_tokens
+                                    )
+                                    total_missing_cost_entries += (
+                                        error_usage.missing_usage_entries
+                                    )
+                                    canonical_error_rows = (
+                                        _normalized_usage_breakdown_rows(
+                                            raw_ev,
+                                            error_usage,
+                                        )
+                                    )
+                                    turn_model_usage_breakdown.extend(
+                                        canonical_error_rows
+                                    )
+                                    for usage_item in error_usage.items:
+                                        usage_model = usage_item.model or "unknown"
+                                        if usage_item.cost_source == "mixed":
+                                            total_provider_billed_entries += 1
+                                            total_unbilled_entries += 1
+                                        elif usage_item.cost_source == "provider_billed":
+                                            total_provider_billed_entries += 1
+                                        else:
+                                            total_unbilled_entries += 1
+                                        if self._usage_tracker and self._session_key:
+                                            self._usage_tracker.add(
+                                                self._session_key,
+                                                input_tokens=usage_item.input_tokens,
+                                                output_tokens=usage_item.output_tokens,
+                                                model_id=usage_model,
+                                                cache_read_tokens=(
+                                                    usage_item.cache_read_tokens
+                                                ),
+                                                cache_write_tokens=(
+                                                    usage_item.cache_write_tokens
+                                                ),
+                                                billed_cost=(
+                                                    usage_item.billed_cost_nanos
+                                                    / 1_000_000_000
+                                                ),
+                                                provider=usage_item.provider,
+                                                cost_source=usage_item.cost_source,
+                                            )
                                     _accumulate_turn_cost(
                                         raw_ev,
-                                        default_provider=(
-                                            usage_call.provider
-                                            if usage_call is not None
-                                            else str(
-                                                self.config.provider_id
-                                                or getattr(
-                                                    self.provider,
-                                                    "provider_name",
-                                                    "",
-                                                )
-                                                or ""
-                                            )
-                                        ),
-                                        default_model=(
-                                            usage_call.model
-                                            if usage_call is not None
-                                            else str(self.config.model_id or "")
-                                        ),
+                                        default_provider=usage_default_provider,
+                                        default_model=usage_default_model,
                                     )
+                                    if usage_default_model:
+                                        last_actual_model = usage_default_model
+                                    if usage_default_provider:
+                                        last_actual_provider = usage_default_provider
                                     cost_receipt_counted = True
+                                    turn_has_error_usage_receipt = True
                                 # One-shot thinking/reasoning fallback
                                 _err_lower = raw_ev.message.lower()
                                 if (
                                     thinking_enabled
                                     and not _thinking_fallback_done
                                     and self.config.provider_error_thinking_fallback
+                                    and not goal_terminal_final_response_pending
                                     and ("thinking" in _err_lower or "reasoning" in _err_lower)
                                 ):
                                     _thinking_fallback_done = True
@@ -8287,6 +8652,20 @@ class Agent:
                                 ),
                                 code="iteration_timeout",
                             )
+                            break
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_timeout",
+                                reason="goal_terminal",
+                                code="iteration_timeout",
+                            )
+                            yield TextDeltaEvent(text=response_text)
                             break
                         yield self._transition(AgentState.ERROR)
                         terminal_error = ErrorEvent(
@@ -8344,6 +8723,20 @@ class Agent:
                         # record the failed call, then propagate unchanged.
                         usage_unknown_reason = "total_timeout"
                         _notify_call_outcome(ok=False, failure_kind="total_timeout")
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_timeout",
+                                reason="goal_terminal",
+                                code="total_timeout",
+                            )
+                            yield TextDeltaEvent(text=response_text)
+                            break
                         raise
                     except Exception:
                         # A provider stream that raises (instead of yielding a
@@ -8351,6 +8744,20 @@ class Agent:
                         # the exception propagates unchanged.
                         usage_unknown_reason = "provider_exception"
                         _notify_call_outcome(ok=False, failure_kind="raised")
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_provider_error",
+                                reason="goal_terminal",
+                                code="provider_exception",
+                            )
+                            yield TextDeltaEvent(text=response_text)
+                            break
                         raise
                     finally:
                         if usage_call is not None and not usage_call_terminal:
@@ -8425,7 +8832,11 @@ class Agent:
                         self._write_turn_call_log("llm_response", **response_payload)
 
                     # -- after async for (retry loop level) --
-                    terminal_error = _turn_budget_error()
+                    terminal_error = (
+                        None
+                        if goal_terminal_final_response_pending
+                        else _turn_budget_error()
+                    )
                     if terminal_error is not None:
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
@@ -8449,6 +8860,12 @@ class Agent:
                         if artifact_delivery_final_response_pending:
                             response_text = self._artifact_delivery_final_response_text(
                                 artifact_delivery_final_response_artifacts
+                            )
+                        elif goal_terminal_final_response_pending:
+                            response_text = (
+                                "The Goal is complete."
+                                if goal_terminal_final_status == "complete"
+                                else "The Goal is blocked."
                             )
                         elif max_iterations_finalization_pending:
                             response_text = (
@@ -8553,6 +8970,23 @@ class Agent:
                             output_tokens=iter_output_tokens,
                         )
                     if not _got_error and attempt_classification.kind != _ProviderAttemptKind.OK:
+                        if goal_terminal_final_response_pending:
+                            fallback_text = _goal_terminal_final_response_text()
+                            if fallback_text not in response_text:
+                                prefix = "\n\n" if response_text.strip() else ""
+                                appended_text = prefix + fallback_text
+                                assistant_text_parts.append(appended_text)
+                                yield TextDeltaEvent(text=appended_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_invalid_summary_response",
+                                reason="goal_terminal",
+                                code=attempt_classification.kind.value,
+                            )
+                            break
                         logger.warning(
                             "provider.invalid_response",
                             session_key=self._session_key,
@@ -9175,6 +9609,21 @@ class Agent:
                             status_code=provider_error_status_code,
                             raw_code=provider_error.code,
                         )
+                        if goal_terminal_final_response_pending:
+                            response_text = _goal_terminal_final_response_text()
+                            assistant_text_parts.append(response_text)
+                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            _got_done_event = True
+                            _got_error = False
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="terminal_after_summary_provider_error",
+                                reason="goal_terminal",
+                                code=goal_terminal_final_status or "goal_terminal",
+                                provider_error_code=provider_error.code,
+                            )
+                            yield TextDeltaEvent(text=response_text)
+                            break
                         message_limit_proof = provider_error.message_limit_proof
                         if message_limit_proof is not None:
                             proof_log = {
@@ -10270,6 +10719,7 @@ class Agent:
                             terminal_error = ErrorEvent(
                                 message=provider_error.message,
                                 code=provider_error.code,
+                                failure_kind=failure_kind.value,
                             )
                             yield terminal_error
                             break
@@ -10640,7 +11090,11 @@ class Agent:
 
                 # No tool calls → we're done
                 if not tool_calls:
-                    if _claim_pending_inputs_for_next_call():
+                    if goal_terminal_final_response_pending:
+                        goal_terminal_final_response_pending = False
+                        goal_terminal_final_status = None
+                        break
+                    if await _claim_pending_inputs_for_next_call():
                         # A plain response is also a safe same-turn boundary.
                         # Keep the assistant output already emitted above, then
                         # continue with the claimed steer in this turn.
@@ -11913,9 +12367,27 @@ class Agent:
                         # the same response (notably submit_plan) race past it.
                         if mutex_result is not None and (
                             mutex_result.terminates_turn
+                            or self._is_turn_yield_result(mutex_result)
                             or tc.tool_name == "request_user_input"
                             or _pending_approval_payload(mutex_result.content) is not None
                         ):
+                            dispatch_boundary = mutex_result
+                        if (
+                            mutex_result is not None
+                            and tc.tool_name == "update_goal"
+                            and is_goal_owned_main_default_turn(
+                                self._tool_context or current_tool_context.get()
+                            )
+                            and self._accepted_goal_terminal_status(
+                                [tc],
+                                [mutex_result],
+                            )
+                            is not None
+                        ):
+                            # A durable Goal terminal decision owns the rest of
+                            # this provider batch. Pair every later tool call
+                            # with a not-executed result, then perform exactly
+                            # one tool-free final-summary model call.
                             dispatch_boundary = mutex_result
                         if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
                             plan_run_delivery_only = True
@@ -12191,10 +12663,23 @@ class Agent:
                 terminal_artifacts = self._terminal_artifact_delivery_artifacts(executed_results)
                 if terminal_artifacts:
                     artifact_delivery_final_response_artifacts = terminal_artifacts
+                accepted_goal_terminal_status = (
+                    self._accepted_goal_terminal_status(tool_calls, executed_results)
+                    if is_goal_owned_main_default_turn(
+                        self._tool_context or current_tool_context.get()
+                    )
+                    else None
+                )
 
-                turn_tool_errors += sum(1 for result in executed_results if result.is_error)
+                actual_tool_errors = [
+                    result
+                    for result in executed_results
+                    if result.is_error
+                    and not self._is_not_executed_after_dispatch_boundary(result)
+                ]
+                turn_tool_errors += len(actual_tool_errors)
                 first_tool_error = next(
-                    (result for result in executed_results if result.is_error),
+                    iter(actual_tool_errors),
                     None,
                 )
                 workspace_write_count = len(self._effective_workspace_write_records())
@@ -12370,7 +12855,10 @@ class Agent:
                         runtime_diagnostic_events.append(runtime_event)
                         append_runtime_event(self.config.runtime_events_path, runtime_event)
                 post_write_convergence_guidance: str | None = None
-                if post_write_convergence_tracker is not None:
+                if (
+                    accepted_goal_terminal_status is None
+                    and post_write_convergence_tracker is not None
+                ):
                     continued_activity_after_verification = bool(
                         (
                             focused_verification_success_before_results
@@ -12467,7 +12955,11 @@ class Agent:
                             )
                 progress_watchdog_guidance: str | None = None
                 watchdog_decision = None
-                if progress_watchdog_mode != "off" and post_write_convergence_guidance is None:
+                if (
+                    accepted_goal_terminal_status is None
+                    and progress_watchdog_mode != "off"
+                    and post_write_convergence_guidance is None
+                ):
                     watchdog_decision = progress_watchdog.observe(
                         ProgressObservation(
                             iteration=iterations,
@@ -12569,7 +13061,10 @@ class Agent:
                             code="progress_watchdog_blocked",
                         )
                 source_loop_recovery_guidance: str | None = None
-                if progress_watchdog_guidance is None:
+                if (
+                    accepted_goal_terminal_status is None
+                    and progress_watchdog_guidance is None
+                ):
                     source_loop_recovery = source_loop_recovery_decision(
                         global_mode=runtime_recovery_mode,
                         diagnostic_events=runtime_diagnostic_events,
@@ -12617,7 +13112,11 @@ class Agent:
                                     "asking the model to reassess the current patch once."
                                 ),
                             )
-                budget_error = _turn_budget_error()
+                budget_error = (
+                    None
+                    if accepted_goal_terminal_status is not None
+                    else _turn_budget_error()
+                )
                 if terminal_error is None:
                     terminal_error = budget_error
                 if terminal_error is not None:
@@ -12632,7 +13131,9 @@ class Agent:
                         yield terminal_error
                     break
 
-                if any(_is_threshold_denial(result) for result in executed_results):
+                if accepted_goal_terminal_status is None and any(
+                    _is_threshold_denial(result) for result in executed_results
+                ):
                     yield self._transition(AgentState.ERROR)
                     terminal_error = ErrorEvent(
                         message=(
@@ -12645,7 +13146,10 @@ class Agent:
                     break
 
                 # Per-iteration deadline check after tool execution
-                if _loop.time() > tool_deadline:
+                if (
+                    accepted_goal_terminal_status is None
+                    and _loop.time() > tool_deadline
+                ):
                     yield self._transition(AgentState.ERROR)
                     terminal_error = ErrorEvent(
                         message=(
@@ -12661,7 +13165,18 @@ class Agent:
                 turn_messages.append(
                     Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
                 )
-                _claim_pending_inputs_for_next_call()
+                if accepted_goal_terminal_status is not None:
+                    last_executed_results = list(executed_results)
+                    if turn_yielded:
+                        break
+                    workspace_edit_gate_details = None
+                    workspace_edit_gate_recovery_read_paths.clear()
+                    workspace_edit_gate_recovery_reads_remaining = 0
+                    goal_terminal_final_response_pending = True
+                    goal_terminal_final_status = accepted_goal_terminal_status
+                    yield self._transition(AgentState.THINKING)
+                    continue
+                await _claim_pending_inputs_for_next_call()
                 if progress_watchdog_guidance is not None:
                     turn_messages.append(Message(role="user", content=progress_watchdog_guidance))
                 if (
@@ -12849,11 +13364,13 @@ class Agent:
                         iteration=iterations,
                         tool_use_ids=sorted(preflight_tool_results),
                     )
-                if terminal_artifacts:
-                    _finish_artifact_delivery_without_provider()
-                    break
                 last_executed_results = list(executed_results)
                 if turn_yielded:
+                    break
+                if terminal_artifacts and not is_goal_owned_main_default_turn(
+                    self._tool_context or current_tool_context.get()
+                ):
+                    _finish_artifact_delivery_without_provider()
                     break
 
                 # ------ TOOL_CALLING → THINKING ------
@@ -12899,6 +13416,15 @@ class Agent:
                 done_model = su.model_id
         if not done_model:
             done_model = self.config.model_id or ""
+        if not done_model and turn_has_error_usage_receipt:
+            done_model = next(
+                (
+                    str(row.get("model") or "")
+                    for row in turn_model_usage_breakdown
+                    if isinstance(row, dict) and row.get("model")
+                ),
+                "",
+            )
         done_provider = (
             last_actual_provider
             or self.config.provider_id
@@ -12943,6 +13469,18 @@ class Agent:
             )
             estimate_basis = "free" if turn_estimate.basis == "free" and has_turn_tokens else None
 
+        error_usage_report_rows: list[dict[str, Any]] = []
+        if turn_has_error_usage_receipt and turn_model_usage_breakdown:
+            error_usage_report_rows = _with_model_usage_cost_fields(
+                turn_model_usage_breakdown
+            )
+            # Reuse the per-member price resolution below instead of resolving
+            # the same rows again during final summarization.
+            turn_model_usage_breakdown = [
+                {**row, "_opensquilla_reported_cost": True}
+                for row in error_usage_report_rows
+            ]
+
         turn_usage_delta = (
             self._usage_tracker.session_delta_snapshot(self._session_key, usage_turn_baseline)
             if self._usage_tracker and self._session_key
@@ -12981,6 +13519,55 @@ class Agent:
             elif estimate_basis != "free":
                 # "unavailable": no estimated dollars in the reported cost.
                 estimate_basis = None
+        elif error_usage_report_rows:
+            # UsageTracker is optional.  Error receipts still retain their
+            # member deployment identities, so estimate any unbilled rows with
+            # those models instead of pricing the whole turn as the outer
+            # ensemble/default model.
+            report_components: list[tuple[bool, bool, int]] = []
+            report_estimated_cost = 0.0
+            report_estimate_bases: set[str] = set()
+            for row in error_usage_report_rows:
+                row_cost = _usage_float(row.get("cost_usd") or row.get("costUsd"))
+                row_billed = _usage_float(
+                    row.get("billed_cost_usd")
+                    or row.get("billedCostUsd")
+                    or row.get("billed_cost")
+                    or row.get("billedCost")
+                )
+                report_estimated_cost += max(0.0, row_cost - row_billed)
+                row_basis = str(
+                    row.get("estimate_basis") or row.get("estimateBasis") or ""
+                ).strip()
+                if row_basis:
+                    report_estimate_bases.add(row_basis)
+                report_components.append(
+                    _cost_component_flags(
+                        cost_source=str(
+                            row.get("cost_source") or row.get("costSource") or "none"
+                        ),
+                        cost_usd=row_cost,
+                        billed_cost=row_billed,
+                        missing_cost_entries=_usage_int(
+                            row.get("missing_cost_entries") or 0
+                        ),
+                        estimate_basis=row_basis or None,
+                    )
+                )
+            if total_missing_cost_entries:
+                report_components.append((False, False, total_missing_cost_entries))
+            done_cost = total_billed_cost + report_estimated_cost
+            done_billed_cost = total_billed_cost
+            cost_source = _model_usage_row_cost_source(report_components)
+            estimate_basis = (
+                "cache_blind"
+                if "cache_blind" in report_estimate_bases
+                else "cache_aware"
+                if "cache_aware" in report_estimate_bases
+                else "free"
+                if "free" in report_estimate_bases
+                else None
+            )
 
         # Freeze the parent delta before any completed child usage is added to
         # the shared tracker. This keeps the current turn from counting its own
@@ -16400,6 +16987,30 @@ class Agent:
         return Message(role="user", content="\n".join(lines))
 
     @staticmethod
+    def _goal_objective_message(
+        objective_snapshot: str | None,
+        *,
+        enabled: bool = True,
+        max_chars: int = _TURN_OBJECTIVE_REMINDER_MAX_CHARS,
+    ) -> Message | None:
+        """Build a request-only reminder for an adopted durable Goal edit."""
+
+        if not enabled:
+            return None
+        if not objective_snapshot or not objective_snapshot.strip():
+            return None
+        objective = objective_snapshot.strip()
+        if len(objective) > max_chars:
+            objective = objective[:max_chars].rstrip() + "..."
+        lines = [
+            "[Current Goal objective reminder]",
+            "This is the active durable Goal objective for this task, not a new user request.",
+            "Continue using the tool results above to make progress on:",
+            objective,
+        ]
+        return Message(role="user", content="\n".join(lines))
+
+    @staticmethod
     def _with_request_context_messages(
         messages: list[Message],
         request_context_message: Message | None,
@@ -16506,6 +17117,53 @@ class Agent:
         if not isinstance(payload, dict):
             return False
         return payload.get("status") == "yielded"
+
+    @staticmethod
+    def _is_not_executed_after_dispatch_boundary(result: ToolResult) -> bool:
+        """Return whether an error-shaped result represents an undispatched tail."""
+
+        if not result.is_error:
+            return False
+        try:
+            payload = json.loads(result.content)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(payload, Mapping)
+            and payload.get("status") == "not_executed"
+            and payload.get("reason") == "prior_tool_dispatch_boundary"
+        )
+
+    @staticmethod
+    def _accepted_goal_terminal_status(
+        tool_calls: list[ToolCall],
+        results: list[ToolResult],
+    ) -> str | None:
+        """Return the durably accepted Goal terminal status from one tool batch."""
+
+        for tool_call, result in zip(tool_calls, results, strict=False):
+            if (
+                tool_call.tool_name != "update_goal"
+                or result.tool_name != "update_goal"
+                or result.is_error
+            ):
+                continue
+            requested_status = str(tool_call.arguments.get("status") or "").strip().lower()
+            if requested_status not in {"complete", "blocked"}:
+                continue
+            try:
+                payload = json.loads(result.content)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, Mapping) or payload.get("status") != "accepted":
+                continue
+            goal = payload.get("goal")
+            if not isinstance(goal, Mapping):
+                continue
+            persisted_status = str(goal.get("status") or "").strip().lower()
+            if persisted_status == requested_status:
+                return requested_status
+        return None
 
     @staticmethod
     def _terminal_artifact_delivery_artifacts(

@@ -208,6 +208,50 @@ pre {
   border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
 }
 
+/* ── Chat topbar semantic state contract ───────────────────────────────────
+   Domain classes say WHAT a control represents; data-state says HOW urgent it
+   is. Components consume these variables while value themes may add a restrained
+   halo for non-normal states. Keeping the four severity values here prevents
+   connection/update lifecycle names from leaking into theme-specific CSS. */
+.topbar .topbar-state {
+  --topbar-state-channel: var(--text-muted);
+  --topbar-state-fill: color-mix(in srgb, var(--text-muted) 7%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--text-muted) 24%, var(--border));
+}
+
+.topbar .topbar-state[data-state="normal"] {
+  --topbar-state-channel: var(--text-muted);
+  --topbar-state-fill: var(--bg-surface);
+  --topbar-state-border: var(--border);
+}
+
+/* A healthy connection remains recognizable as healthy without becoming an
+   attention surface. World themes intentionally do not add a glow to normal. */
+.topbar .topbar-state--connection[data-state="normal"],
+.topbar .topbar-state--system[data-state="normal"] {
+  --topbar-state-channel: var(--ok);
+  --topbar-state-fill: color-mix(in srgb, var(--ok) 10%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--ok) 28%, var(--border));
+}
+
+.topbar .topbar-state[data-state="info"] {
+  --topbar-state-channel: var(--accent);
+  --topbar-state-fill: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--accent) 32%, var(--border));
+}
+
+.topbar .topbar-state[data-state="warning"] {
+  --topbar-state-channel: var(--warn);
+  --topbar-state-fill: color-mix(in srgb, var(--warn) 12%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--warn) 34%, var(--border));
+}
+
+.topbar .topbar-state[data-state="danger"] {
+  --topbar-state-channel: var(--danger);
+  --topbar-state-fill: color-mix(in srgb, var(--danger) 12%, var(--bg-surface));
+  --topbar-state-border: color-mix(in srgb, var(--danger) 34%, var(--border));
+}
+
 /* The one ambient "alive/working" pulse — opacity only (compositor-cheap, no
    paint), reused by the connection pill, the sidebar running dot, the work-card
    dots and the meta-skill chip so the whole running view breathes together. */
@@ -1874,8 +1918,7 @@ pre {
     width: 44px;
   }
 
-  .topbar--chat .topbar-right--attention .conn-pill,
-  .topbar--chat .topbar-right--attention .bgm-menu-wrap,
+  .topbar--chat .topbar-right--attention > .conn-pill,
   .topbar--chat .topbar-right--attention .lang-menu-wrap,
   .topbar--chat .topbar-right--attention > .theme-menu-wrap:not(.bgm-menu-wrap):not(.lang-menu-wrap) {
     display: none;
@@ -2075,6 +2118,15 @@ pre {
     transition-duration: 0.01ms !important; /* motion-allow: reduced-motion kill-switch, not a token */
     scroll-behavior: auto !important;
   }
+
+  /* State changes must remain immediate and stable even when a value theme
+     supplies its own topbar halo or pseudo-element. */
+  .topbar .topbar-state,
+  .topbar .topbar-state::before,
+  .topbar .topbar-state::after {
+    animation: none !important; /* motion-allow: explicit topbar state freeze */
+    transition: none !important; /* motion-allow: explicit topbar state freeze */
+  }
 }
 
 /* ── Forced colors (Windows High Contrast) ───────────────────────────────
@@ -2099,4 +2151,17 @@ pre {
     outline: 2px solid CanvasText !important;
     outline-offset: 2px;
   }
+
+  /* Do not rely on token colour alone for concurrent topbar states. Border
+     patterns preserve the severity distinction in Windows High Contrast. */
+  .topbar .topbar-state {
+    background: Canvas !important;
+    border-color: CanvasText !important;
+    box-shadow: none !important;
+    color: CanvasText !important;
+    forced-color-adjust: none;
+  }
+  .topbar .topbar-state[data-state="info"] { border-style: dotted !important; }
+  .topbar .topbar-state[data-state="warning"] { border-style: dashed !important; }
+  .topbar .topbar-state[data-state="danger"] { border-width: 2px !important; }
 }

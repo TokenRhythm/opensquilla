@@ -266,3 +266,67 @@ def test_transcript_entries_to_chat_messages_keeps_plain_confirmed_fields_text()
     assert messages[0]["tool_calls"][0]["text"] == (
         "Confirmed request fields:\n- this is a visible note"
     )
+
+
+def test_transcript_entries_to_chat_messages_cleans_goal_sentinels_without_mutation() -> None:
+    raw_content = (
+        '{"text": "HEARTBEAT_OK\\nraw status", '
+        '"display_text": "NO_REPLY\\nvisible status\\nHEARTBEAT_OK", '
+        '"artifacts": [{"id": "art-status"}]}'
+    )
+    raw_tool_calls = [
+        {"type": "text", "text": "NO_REPLY\nchecking the external state"},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+        {"type": "text", "text": "HEARTBEAT_OK"},
+    ]
+    entry = _assistant_entry(
+        content=raw_content,
+        tool_calls=raw_tool_calls,
+        turn_context={"intent": "goal_continuation"},
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == "visible status"
+    assert messages[0]["artifacts"][0]["id"] == "art-status"
+    assert messages[0]["tool_calls"] == [
+        {"type": "text", "text": "checking the external state"},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+    ]
+    assert entry.content == raw_content
+    assert entry.tool_calls == raw_tool_calls
+
+
+def test_transcript_entries_to_chat_messages_keeps_unattributed_mixed_sentinel_text() -> None:
+    entry = _assistant_entry(
+        content="NO_REPLY\nThis is quoted historical prose.",
+        tool_calls=[
+            {
+                "type": "text",
+                "text": "HEARTBEAT_OK\nThis segment has no system-event provenance.",
+            }
+        ],
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == "NO_REPLY\nThis is quoted historical prose."
+    assert messages[0]["tool_calls"][0]["text"] == (
+        "HEARTBEAT_OK\nThis segment has no system-event provenance."
+    )
+
+
+def test_transcript_entries_to_chat_messages_hides_exact_assistant_sentinel() -> None:
+    entry = _assistant_entry(content="  NO_REPLY\n", tool_calls=None)
+
+    assert transcript_entries_to_chat_messages([entry]) == []

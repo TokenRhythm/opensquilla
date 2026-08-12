@@ -1265,6 +1265,11 @@ def _manual_consumer_messages(
                 entry.get("content") or "",
                 entry.get("tool_calls"),
                 entry.get("reasoning_content"),
+                turn_context=(
+                    entry.get("turn_context")
+                    if isinstance(entry.get("turn_context"), dict)
+                    else None
+                ),
             )
         )
     history, _ = sanitize_session_messages(history)

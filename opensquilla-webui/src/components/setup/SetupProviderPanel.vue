@@ -743,6 +743,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
     <ul
       v-if="panel.configuredProviders.length > 0"
       class="setup-provider-list"
+      :class="{ 'is-expanded': listExpanded }"
       data-testid="configured-provider-list"
     >
       <li
@@ -1318,11 +1319,23 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-list {
+  background: color-mix(in srgb, var(--bg-surface-2) 76%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
+  border-radius: var(--radius-card);
   display: grid;
   gap: 0;
   list-style: none;
   margin: var(--sp-3) 0 0;
+  overflow: hidden;
   padding: 0;
+}
+
+.setup-provider-list.is-expanded {
+  max-height: min(28rem, 52vh);
+  overscroll-behavior: contain;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .setup-provider-overview {
@@ -1398,9 +1411,13 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
-  min-height: 60px;
-  padding: var(--sp-3) var(--sp-2);
+  min-height: 58px;
+  padding: var(--sp-2) var(--sp-3);
   transition: background var(--dur-base) var(--ease-out);
+}
+
+.setup-provider-card:first-child {
+  border-top: 0;
 }
 
 .setup-provider-card:hover {
@@ -1439,7 +1456,24 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
 .setup-provider-card__actions {
   flex: 0 0 auto;
+  flex-wrap: nowrap;
+  gap: var(--sp-1);
   justify-content: flex-end;
+}
+
+.setup-provider-card__test {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  border-color: transparent;
+  color: var(--text-secondary);
+  min-height: 32px;
+  padding: var(--sp-1) var(--sp-2);
+  white-space: nowrap;
+}
+
+.setup-provider-card__test:hover:not(:disabled),
+.setup-provider-card__test:focus-visible {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--text);
 }
 
 .setup-provider-card__action {
@@ -1493,7 +1527,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 }
 
 .setup-provider-list__toggle {
-  margin-top: calc(var(--sp-2) * -1);
+  margin-top: var(--sp-2);
 }
 
 .setup-provider-list__empty {
@@ -2001,7 +2035,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   }
 }
 
-@container provider-panel (max-width: 560px) {
+@container provider-panel (max-width: 640px) {
   .setup-provider-card {
     align-items: stretch;
     display: grid;
@@ -2010,6 +2044,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
 
   .setup-provider-card__actions {
     align-self: start;
+    flex-wrap: wrap;
     justify-content: flex-start;
   }
 

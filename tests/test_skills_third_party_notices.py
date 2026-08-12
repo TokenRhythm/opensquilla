@@ -16,7 +16,6 @@ ORIGINALS = {
     "awesome-webpage-research",
     "code-task",
     "deep-research",
-    "swe-bench",
     "docx",
     "git-diff",
     "github",

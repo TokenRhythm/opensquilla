@@ -2,7 +2,7 @@
 #
 # Loaded by LocalAdapter via OPENSQUILLA_GATEWAY_CONFIG_PATH (which REPLACES
 # the normal config chain) so the code-task agent runs with a focused tool
-# set: coding-irrelevant tools are denied (like the SWE-bench adapter) BUT
+# set: coding-irrelevant tools are denied, but
 # network stays enabled — code-task legitimately reads docs and installs
 # dependencies.
 #

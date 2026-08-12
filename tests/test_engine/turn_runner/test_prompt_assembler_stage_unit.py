@@ -28,7 +28,8 @@ from opensquilla.engine.turn_runner.prompt_assembler_stage import (
     SessionIdResolverPort,
 )
 from opensquilla.observability.prompt_report import PromptReport
-from opensquilla.tools.types import ToolContext
+from opensquilla.session.goals import GoalTurnContext
+from opensquilla.tools.types import CallerKind, ToolContext
 
 # ---------------------------------------------------------------------------
 # Recording fakes (one per port)
@@ -377,6 +378,108 @@ async def test_case02_with_tool_ctx_threads_into_pipeline() -> None:
     )
     await stage.run(inp)
     assert executor.requests[0].tool_context is sentinel
+
+
+@pytest.mark.asyncio
+async def test_automatic_goal_objective_is_only_an_ephemeral_routing_hint() -> None:
+    objective = "Inspect the database migration and repair every failing contract."
+    goal_context = GoalTurnContext(
+        session_id="session-id",
+        epoch=3,
+        goal_id="goal-id",
+        objective_revision=2,
+        objective_snapshot=objective,
+        task_id="task-id",
+        continuation_seq=4,
+        automatic=True,
+    )
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+    assembler = _RecordingPromptAssembler()
+    stage = _make_stage(executor=executor, assembler=assembler)
+
+    await stage.run(
+        _make_input(
+            runtime_message="Continue working on the active Goal.",
+            semantic_input="Continue working on the active Goal.",
+            effective_tool_context=ToolContext(
+                agent_id="worker",
+                goal_context=goal_context.as_task_detail(),
+            ),
+        )
+    )
+
+    request = executor.requests[0]
+    assert request.routing_hint == objective
+    assert request.semantic_message == "Continue working on the active Goal."
+    assert request.flags_text_override == "Continue working on the active Goal."
+    assert assembler.last_kwargs["semantic_message"] == "Continue working on the active Goal."
+    assert objective not in repr(request)
+
+
+@pytest.mark.parametrize(
+    "context_overrides",
+    [
+        {"collaboration_mode": "review"},
+        {"caller_kind": CallerKind.SUBAGENT, "subagent_depth": 1},
+        {"caller_kind": CallerKind.CRON},
+    ],
+)
+@pytest.mark.asyncio
+async def test_non_root_or_non_default_goal_context_cannot_change_routing_hint(
+    context_overrides: dict[str, object],
+) -> None:
+    goal_context = GoalTurnContext(
+        session_id="session-id",
+        epoch=3,
+        goal_id="goal-id",
+        objective_revision=2,
+        objective_snapshot="Do not use this leaked routing hint.",
+        task_id="task-id",
+        continuation_seq=4,
+        automatic=True,
+    )
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+    tool_context_values: dict[str, object] = {
+        "goal_context": goal_context.as_task_detail(),
+        **context_overrides,
+    }
+
+    await _make_stage(executor=executor).run(
+        _make_input(
+            runtime_message="Continue the ordinary task.",
+            semantic_input="Continue the ordinary task.",
+            effective_tool_context=ToolContext(**tool_context_values),  # type: ignore[arg-type]
+        )
+    )
+
+    assert executor.requests[0].routing_hint is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_goal_turn_does_not_override_user_routing_text() -> None:
+    goal_context = GoalTurnContext(
+        session_id="session-id",
+        epoch=0,
+        goal_id="goal-id",
+        objective_revision=1,
+        objective_snapshot="Frozen Goal objective",
+        task_id="task-id",
+        automatic=False,
+    )
+    executor = _RecordingPipelineExecutor(turn=_make_turn(), provider=_StubProvider())
+
+    await _make_stage(executor=executor).run(
+        _make_input(
+            semantic_input="Newest explicit user follow-up",
+            effective_tool_context=ToolContext(
+                goal_context=goal_context.as_task_detail(),
+            ),
+        )
+    )
+
+    request = executor.requests[0]
+    assert request.routing_hint is None
+    assert request.semantic_message == "Newest explicit user follow-up"
 
 
 @pytest.mark.asyncio

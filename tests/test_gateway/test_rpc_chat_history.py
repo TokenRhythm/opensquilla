@@ -16,6 +16,7 @@ from opensquilla.session.models import (
 )
 from opensquilla.session.storage import SessionStorage, StorageBusyError
 from opensquilla.session.turn_context import turn_context_scope
+from opensquilla.session.usage_ledger import UsageEventCompletion, UsageEventStart
 
 
 class _FakeSessionManager:
@@ -100,6 +101,96 @@ async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -
     assert result["page_size"] == 2
     assert result["canonical_available"] is True
     assert result["canonical_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_history_batch_projects_missing_turn_usage_from_ledger(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-projection.db"))
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-projection"
+    session = await manager.create(session_key)
+    try:
+        with turn_context_scope({"turn_id": "legacy-cancelled-turn"}):
+            await manager.append_message(session_key, "assistant", "partial answer")
+        await storage.start_usage_event(
+            UsageEventStart(
+                event_id="usage-1",
+                execution_id="legacy-cancelled-turn",
+                call_index=0,
+                session_id=session.session_id,
+                started_at_ms=10,
+                turn_id="legacy-cancelled-turn",
+                provider="test-provider",
+                model="test-model",
+            )
+        )
+        await storage.finalize_usage_event(
+            "usage-1",
+            UsageEventCompletion(
+                completed_at_ms=20,
+                input_tokens=7,
+                output_tokens=3,
+                total_tokens=10,
+                cost_source="none",
+                provider="test-provider",
+                model="test-model",
+                coverage_status="complete",
+            ),
+        )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert len(result["messages"]) == 1
+        message = result["messages"][0]
+        assert message["usage"]["input_tokens"] == 7
+        assert message["usage"]["output_tokens"] == 3
+        assert message["usage"]["coverage_status"] == "complete"
+        durable = await manager.get_transcript(session_key)
+        assert durable[0].turn_usage is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_usage_projection_failure_does_not_hide_history(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-failure.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-projection-failure"
+    await manager.create(session_key)
+    try:
+        with turn_context_scope({"turn_id": "legacy-turn"}):
+            await manager.append_message(session_key, "assistant", "still visible")
+
+        async def fail_projection(**_kwargs):
+            raise RuntimeError("projection unavailable")
+
+        monkeypatch.setattr(storage, "get_turn_usage_projections", fail_projection)
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert [message["text"] for message in result["messages"]] == ["still visible"]
+        assert "usage" not in result["messages"][0]
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio

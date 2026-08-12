@@ -3,8 +3,9 @@
 # tokenrhythm id never becomes a squilla_router.tier_profile value (the
 # accepted set stays pinned to the legacy nine — downgrade contract), so
 # provider saves and boot defaults apply these tiers inline instead.
-# No thinking_level on purpose: the endpoint rejects thinking-toggle request
-# fields, and every served model streams reasoning unconditionally.
+# No thinking_level on purpose: packaged routes preserve the provider-declared
+# default. Explicit turn settings may control exact official V4 models without
+# assigning the same reasoning dialect to the other families in this ladder.
 [preset]
 id = "tokenrhythm"
 provider = "tokenrhythm"

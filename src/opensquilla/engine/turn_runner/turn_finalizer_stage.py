@@ -34,8 +34,8 @@ No ``TurnHook.after_turn`` fan-out today.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import structlog
 
@@ -49,45 +49,6 @@ if TYPE_CHECKING:
     from opensquilla.tools.types import ToolContext
 
 log = structlog.get_logger(__name__)
-
-_UNCONFIRMED_BACKGROUND_TOOL_NAMES = frozenset({"background_process", "process"})
-
-
-def _unconfirmed_background_tool_names(turn_segments: list[dict]) -> list[str]:
-    names: list[str] = []
-    for segment in turn_segments:
-        if not isinstance(segment, dict) or segment.get("type") != "tool_result":
-            continue
-        name = segment.get("name")
-        if not isinstance(name, str):
-            continue
-        if name not in _UNCONFIRMED_BACKGROUND_TOOL_NAMES:
-            continue
-        execution_status = segment.get("execution_status")
-        if not isinstance(execution_status, dict):
-            continue
-        if (
-            execution_status.get("status") == "unknown"
-            and execution_status.get("reason") == "background_running"
-        ):
-            names.append(name)
-    return names
-
-
-def _with_unconfirmed_action_notice(final_text: str, turn_segments: list[dict]) -> str:
-    tool_names = _unconfirmed_background_tool_names(turn_segments)
-    if not tool_names:
-        return final_text
-    if "could not confirm" in final_text.lower():
-        return final_text
-    tools = ", ".join(dict.fromkeys(tool_names))
-    notice = (
-        f"Note: I started {tools}, but the tool reported that it was still "
-        "running, so I could not confirm the action completed."
-    )
-    if final_text.strip():
-        return f"{final_text.rstrip()}\n\n{notice}"
-    return notice
 
 
 # ---------------------------------------------------------------------------
@@ -724,44 +685,76 @@ class TurnFinalizerStage:
         # Late imports keep the module import-cycle-free.
         import json as _json
 
-        from opensquilla.engine.runtime import (
-            _is_deepseek_model_id,
-            _normalize_heartbeat_text,
+        from opensquilla.engine.runtime import _is_deepseek_model_id
+        from opensquilla.engine.silent_reply import (
+            normalize_silent_reply,
+            sanitize_silent_reply_segments,
         )
         from opensquilla.engine.turn_runner.outcome import StageOutcome
+        from opensquilla.engine.turn_runner.runtime_notices import (
+            with_unconfirmed_action_notice,
+        )
 
-        # 1. Heartbeat-normalize.
+        # 1. Normalize the shared silent-reply protocol.
         final_text = _readable_tool_boundary_text(
             "".join(inp.final_text_parts),
             inp.turn_segments,
         )
-        original_final_text = final_text
-        final_text = _normalize_heartbeat_text(
+        normalization = normalize_silent_reply(
             final_text,
             run_kind=inp.run_kind,
+            input_mode=inp.input_mode,
             heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
         )
+        final_text = normalization.text
         turn_segments = inp.turn_segments
-        if inp.run_kind == "heartbeat" and original_final_text != final_text:
-            turn_segments = [
-                segment
-                for segment in turn_segments
-                if not (isinstance(segment, dict) and segment.get("type") == "text")
-            ]
-            if final_text:
-                turn_segments.append({"type": "text", "text": final_text})
-        elif (
-            original_final_text
-            and not final_text
-            and turn_segments
-            and all(
-                isinstance(segment, dict) and segment.get("type") == "text"
-                for segment in turn_segments
+        if normalization.changed:
+            segment_normalization = sanitize_silent_reply_segments(
+                turn_segments,
+                run_kind=inp.run_kind,
+                input_mode=inp.input_mode,
+                heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
             )
-        ):
-            turn_segments = []
+            turn_segments = segment_normalization.segments
+            remaining_segment_text = _readable_tool_boundary_text(
+                "".join(
+                    str(segment.get("text") or "")
+                    for segment in turn_segments
+                    if isinstance(segment, dict) and segment.get("type") == "text"
+                ),
+                turn_segments,
+            )
+            if remaining_segment_text != final_text:
+                # A sentinel may be split across provider iterations or a
+                # heartbeat wrapper may span text segments. Preserve tool
+                # lifecycle records and fall back to one canonical text block.
+                turn_segments = [
+                    segment
+                    for segment in turn_segments
+                    if not (isinstance(segment, dict) and segment.get("type") == "text")
+                ]
+                if final_text:
+                    turn_segments.append({"type": "text", "text": final_text})
 
-        final_text = _with_unconfirmed_action_notice(final_text, turn_segments)
+        final_text = with_unconfirmed_action_notice(final_text, turn_segments)
+
+        done_event = inp.done_event
+        runtime_notice_added = final_text != normalization.text
+        if done_event is not None and (normalization.changed or runtime_notice_added):
+            # A runtime-authored confirmation guard is visible even when the
+            # model payload itself was a silent sentinel.
+            delivery: Literal["visible", "suppressed"] = (
+                "suppressed" if normalization.suppressed and not final_text else "visible"
+            )
+            done_event = replace(
+                done_event,
+                text=final_text,
+                text_snapshot=final_text,
+                delivery=delivery,
+                suppression_reason=(
+                    normalization.suppression_reason if delivery == "suppressed" else None
+                ),
+            )
 
         transcript_appended = False
         assistant_message_id: str | None = None
@@ -781,24 +774,24 @@ class TurnFinalizerStage:
             )
             reasoning_content: str | None = None
             if (
-                inp.done_event is not None
-                and inp.done_event.reasoning_content
+                done_event is not None
+                and done_event.reasoning_content
                 and _is_deepseek_model_id(
-                    inp.done_event.model or inp.resolved_model or ""
+                    done_event.model or inp.resolved_model or ""
                 )
             ):
-                reasoning_content = inp.done_event.reasoning_content
+                reasoning_content = done_event.reasoning_content
             token_count = None
-            if inp.done_event is not None:
+            if done_event is not None:
                 message_output_tokens = getattr(
-                    inp.done_event,
+                    done_event,
                     "message_output_tokens",
                     None,
                 )
                 token_count = (
                     message_output_tokens
                     if message_output_tokens is not None
-                    else inp.done_event.output_tokens
+                    else done_event.output_tokens
                 )
             append_result = await self._transcript_append.append_message(
                 inp.session_key,
@@ -807,7 +800,7 @@ class TurnFinalizerStage:
                 tool_calls=turn_segments if turn_segments else None,
                 reasoning_content=reasoning_content,
                 turn_usage=_turn_usage_payload(
-                    inp.done_event,
+                    done_event,
                     resolved_model=inp.resolved_model,
                     persisted_text=final_text,
                 ),
@@ -857,11 +850,11 @@ class TurnFinalizerStage:
         # adapter folds the session-manager-None and
         # current_session-None guards).
         cost_rollup: CostRollupResult | None = None
-        if inp.done_event is not None:
+        if done_event is not None:
             try:
                 cost_rollup = await self._session_totals.rollup(
                     session_key=inp.session_key,
-                    done_event=inp.done_event,
+                    done_event=done_event,
                     resolved_model=inp.resolved_model,
                 )
             except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
@@ -876,7 +869,7 @@ class TurnFinalizerStage:
         try:
             await self._usage_telemetry.record_turn(
                 run_kind=inp.run_kind,
-                done_event=inp.done_event,
+                done_event=done_event,
             )
         except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
             log.warning("turn_runner.usage_telemetry_persist_failed", error=str(exc))
@@ -888,7 +881,7 @@ class TurnFinalizerStage:
                 turn_artifacts=inp.turn_artifacts,
                 error_message=inp.error_message,
                 pending_error_event=inp.pending_error_event,
-                done_event=inp.done_event,
+                done_event=done_event,
                 cost_rollup=cost_rollup,
                 transcript_appended=transcript_appended,
                 assistant_message_id=assistant_message_id,

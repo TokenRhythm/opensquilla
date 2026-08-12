@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from typing import Any, cast
 from urllib.parse import quote
@@ -32,6 +33,11 @@ from opensquilla.session.keys import build_webchat_key, canonicalize_session_key
 from opensquilla.session.storage import (
     StorageBusyError,
     bounded_interactive_storage_reads,
+)
+from opensquilla.turn_outcome_projection import (
+    extract_fork_terminal_outcome_projection,
+    terminal_turn_outcome,
+    turn_id_from_context,
 )
 
 _d = get_dispatcher()
@@ -136,41 +142,81 @@ async def _chat_history_turn_outcomes(
 ) -> list[dict[str, Any]]:
     """Return typed outcomes only for explicit turn ids present in this page."""
 
-    turn_ids = {
-        str(turn_id)
+    entry_turns = [
+        (entry, turn_id)
         for entry in entries
-        if isinstance((turn_context := getattr(entry, "turn_context", None)), dict)
-        and isinstance((turn_id := turn_context.get("turn_id")), str)
-        and turn_id
-    }
+        if (turn_id := turn_id_from_context(getattr(entry, "turn_context", None)))
+        is not None
+    ]
+    turn_ids = {turn_id for _entry, turn_id in entry_turns}
     if not turn_ids:
         return []
+
+    outcomes_by_turn: dict[str, dict[str, Any]] = {}
+    conflicting_projections: set[str] = set()
+    for entry, turn_id in entry_turns:
+        entry_session_id = getattr(entry, "session_id", None)
+        entry_session_key = getattr(entry, "session_key", None)
+        if (
+            not isinstance(entry_session_id, str)
+            or entry_session_key != session_key
+            or turn_id in conflicting_projections
+        ):
+            continue
+        projection = extract_fork_terminal_outcome_projection(
+            getattr(entry, "turn_context", None),
+            session_id=entry_session_id,
+            session_key=session_key,
+            turn_id=turn_id,
+        )
+        if projection is None:
+            continue
+        previous = outcomes_by_turn.get(turn_id)
+        if previous is not None and previous != projection:
+            outcomes_by_turn.pop(turn_id, None)
+            conflicting_projections.add(turn_id)
+            continue
+        outcomes_by_turn[turn_id] = projection
+
+    def _sorted_outcomes() -> list[dict[str, Any]]:
+        outcomes = list(outcomes_by_turn.values())
+        outcomes.sort(
+            key=lambda item: (
+                int(item.get("started_at") or 0),
+                str(item.get("task_id") or ""),
+            )
+        )
+        return outcomes
+
+    missing_turn_ids = turn_ids - outcomes_by_turn.keys()
+    if not missing_turn_ids:
+        return _sorted_outcomes()
+
     storage = get_session_storage(getattr(ctx, "session_manager", None))
     exact_tasks = getattr(storage, "get_agent_tasks_by_ids", None)
     get_task = getattr(storage, "get_agent_task", None)
     list_tasks = getattr(storage, "list_agent_tasks", None)
     try:
         if callable(exact_tasks):
-            rows = await exact_tasks(sorted(turn_ids))
+            rows = await exact_tasks(sorted(missing_turn_ids))
         elif callable(get_task):
             rows = [
                 row
-                for turn_id in sorted(turn_ids)
+                for turn_id in sorted(missing_turn_ids)
                 if (row := await get_task(turn_id)) is not None
             ]
         elif callable(list_tasks):
             rows = await list_tasks(session_key=session_key)
         else:
-            return []
+            return _sorted_outcomes()
     except Exception:  # noqa: BLE001 - history remains readable without outcomes.
         log.warning(
             "chat.history.turn_outcomes_failed",
             session_key=session_key,
             exc_info=True,
         )
-        return []
+        return _sorted_outcomes()
 
-    outcomes: list[dict[str, Any]] = []
     for row in rows:
         task_id = getattr(row, "task_id", None)
         details = getattr(row, "details", None)
@@ -178,46 +224,23 @@ async def _chat_history_turn_outcomes(
         turn_id = details.get("turn_id") or task_id
         status = getattr(row, "status", None)
         status = str(getattr(status, "value", status) or "")
-        outcome = details.get("turn_outcome")
-        if not isinstance(outcome, dict):
-            # Upgrade compatibility: older task rows predate typed outcomes.
-            # Derive only from that row's own explicit terminal status; never
-            # inspect neighboring transcript roles or repeated user messages.
-            legacy_kind = {
-                "succeeded": "completed",
-                "failed": "failed",
-                "cancelled": "interrupted",
-                "timeout": "interrupted",
-                "abandoned": "interrupted",
-            }.get(status)
-            if legacy_kind is None:
-                continue
-            outcome = {
-                "kind": legacy_kind,
-                "reason": status,
-            }
+        outcome = terminal_turn_outcome(status, details.get("turn_outcome"))
+        if outcome is None:
+            continue
         if (
             not isinstance(turn_id, str)
-            or turn_id not in turn_ids
+            or turn_id not in missing_turn_ids
         ):
             continue
-        outcomes.append(
-            {
-                "turn_id": turn_id,
-                "task_id": task_id,
-                "status": status,
-                "started_at": getattr(row, "started_at", None),
-                "finished_at": getattr(row, "finished_at", None),
-                "outcome": dict(outcome),
-            }
-        )
-    outcomes.sort(
-        key=lambda item: (
-            int(item.get("started_at") or 0),
-            str(item.get("task_id") or ""),
-        )
-    )
-    return outcomes
+        outcomes_by_turn[turn_id] = {
+            "turn_id": turn_id,
+            "task_id": task_id,
+            "status": status,
+            "started_at": getattr(row, "started_at", None),
+            "finished_at": getattr(row, "finished_at", None),
+            "outcome": outcome,
+        }
+    return _sorted_outcomes()
 
 
 def _chat_history_cursor(entry: object | None) -> str | None:
@@ -390,6 +413,70 @@ async def _load_chat_history_page(
         after=after,
     )
     return entries, has_more, False, False
+
+
+async def _project_missing_history_usage(
+    mgr: object,
+    session_key: str,
+    entries: list[object],
+) -> list[object]:
+    """Read-time repair for pre-fix assistant rows missing turn usage."""
+
+    missing_by_turn: dict[str, list[int]] = {}
+    turns_with_usage: set[str] = set()
+    for index, entry in enumerate(entries):
+        if getattr(entry, "role", None) != "assistant":
+            continue
+        turn_id = turn_id_from_context(getattr(entry, "turn_context", None))
+        if not turn_id:
+            continue
+        if isinstance(getattr(entry, "turn_usage", None), dict):
+            turns_with_usage.add(turn_id)
+        else:
+            missing_by_turn.setdefault(turn_id, []).append(index)
+    for turn_id in turns_with_usage:
+        missing_by_turn.pop(turn_id, None)
+    if not missing_by_turn:
+        return entries
+
+    storage = getattr(mgr, "storage", None)
+    batch_project = getattr(storage, "get_turn_usage_projections", None)
+    get_session = getattr(mgr, "get_session", None)
+    if not callable(batch_project) or not callable(get_session):
+        return entries
+    try:
+        session = await get_session(session_key)
+        if session is None:
+            return entries
+        projections = await batch_project(
+            session_id=str(getattr(session, "session_id", "") or ""),
+            session_epoch=max(0, int(getattr(session, "epoch", 0) or 0)),
+            turn_ids=list(missing_by_turn),
+        )
+    except Exception:  # noqa: BLE001 - usage fallback must not hide transcript history
+        log.warning(
+            "chat.history.usage_projection_failed",
+            session_key=session_key,
+            entry_count=len(entries),
+            exc_info=True,
+        )
+        return entries
+    if not projections:
+        return entries
+
+    projected = list(entries)
+    for turn_id, indexes in missing_by_turn.items():
+        usage = projections.get(turn_id)
+        if usage is None:
+            continue
+        # A well-formed turn has one assistant row. If damaged legacy history
+        # contains duplicates, attach usage only to its terminal row so the UI
+        # cannot present the same provider spend more than once.
+        index = indexes[-1]
+        entry = copy.copy(projected[index])
+        setattr(entry, "turn_usage", usage)
+        projected[index] = entry
+    return projected
 
 
 async def _chat_history_summaries(
@@ -709,10 +796,18 @@ async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
         "key": session_key,
         "source": raw_params.get("source") or "webui_abort",
     }
+    task_id_present = "taskId" in raw_params or "task_id" in raw_params
     task_id = raw_params.get("taskId") or raw_params.get("task_id")
-    source = str(abort_params["source"])
-    if source != "webui_stop" and isinstance(task_id, str) and task_id.strip():
+    if isinstance(task_id, str) and task_id.strip():
         abort_params["task_id"] = task_id.strip()
+        # chat.abort task ids are always session-bound, even for clients that
+        # predate the explicit scope marker.
+        abort_params["scope"] = "task"
+    elif (
+        task_id_present
+        or str(raw_params.get("scope") or "").strip().lower() == "task"
+    ):
+        abort_params["scope"] = "task"
     result = await _handle_sessions_abort(
         abort_params,
         ctx,
@@ -739,14 +834,18 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
     mgr = _require_chat_session_manager(ctx)
 
     async def _load_page() -> tuple[list[object], bool, bool, bool]:
-        return await _load_chat_history_page(
+        entries, has_more, canonical_available, canonical_complete = (
+            await _load_chat_history_page(
             mgr,
             session_key,
             limit=limit,
             before=before,
             after=after,
             include_canonical=include_canonical,
+            )
         )
+        entries = await _project_missing_history_usage(mgr, session_key, entries)
+        return entries, has_more, canonical_available, canonical_complete
 
     try:
         with bounded_interactive_storage_reads():

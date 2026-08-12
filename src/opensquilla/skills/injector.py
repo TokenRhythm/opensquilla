@@ -169,9 +169,14 @@ class SkillInjector:
         skills: list[SkillSpec],
         *,
         desc_limit: int = 0,
-        include_location: bool = True,
+        include_location: bool = False,
     ) -> str:
-        """Full mode: name + (truncated) description for each skill."""
+        """Full mode: name + description, without host paths by default.
+
+        ``include_location=True`` remains an explicit compatibility/debug
+        opt-in. Production prompt assembly must keep the default so absolute
+        host paths are disclosed only when ``skill_view`` loads the body.
+        """
         return self._render(
             system_prompt,
             skills,
@@ -185,9 +190,9 @@ class SkillInjector:
         system_prompt: str,
         skills: list[SkillSpec],
         *,
-        include_location: bool = True,
+        include_location: bool = False,
     ) -> str:
-        """Compact mode: name only (saves tokens). Use skill_view to read full content."""
+        """Compact name-only mode, without host paths by default."""
         return self._render(
             system_prompt,
             skills,

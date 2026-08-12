@@ -71,3 +71,37 @@ describe('useChatTextRendering protocol-shaped literals', () => {
     })
   }
 })
+
+describe('useChatTextRendering goal status markers', () => {
+  it('renders and copies a literal goal-looking line as ordinary user-visible text', () => {
+    const { renderMarkdown, sanitizeCopyText, stripGeneratedArtifactMarkers } = useChatTextRendering()
+    const text = 'The work is complete.\n[goal:complete]\n'
+
+    expect(renderMarkdown(text)).toContain('[goal:complete]')
+    expect(sanitizeCopyText(text)).toBe('The work is complete.\n[goal:complete]')
+    expect(stripGeneratedArtifactMarkers(text)).toBe(text)
+  })
+
+  it('does not remove a goal-looking line from the middle of a transcript', () => {
+    const { stripGeneratedArtifactMarkers } = useChatTextRendering()
+    const text = 'Example:\n[goal:complete]\nThen continue.'
+
+    expect(stripGeneratedArtifactMarkers(text)).toBe(text)
+  })
+})
+
+describe('useChatTextRendering silent sentinel copy projection', () => {
+  it('removes only assistant boundary marker lines from copied text', () => {
+    const { sanitizeCopyText } = useChatTextRendering()
+
+    expect(sanitizeCopyText('NO_REPLY\nVisible answer.\nHEARTBEAT_OK', {
+      provenance: { runKind: 'goal' },
+    }))
+      .toBe('Visible answer.')
+    expect(sanitizeCopyText('NO_REPLY\nVisible answer.\nHEARTBEAT_OK'))
+      .toBe('NO_REPLY\nVisible answer.\nHEARTBEAT_OK')
+    expect(sanitizeCopyText('Before\nNO_REPLY\nAfter')).toBe('Before\nNO_REPLY\nAfter')
+    expect(sanitizeCopyText(['```text', 'NO_REPLY', '```'].join('\n')))
+      .toBe(['```text', 'NO_REPLY', '```'].join('\n'))
+  })
+})

@@ -9,6 +9,11 @@ interface ActivityFixture {
   failed?: boolean
 }
 
+interface ControlledActivityLifecycleFixture {
+  donePayload?: Record<string, unknown>
+  settledMessages?: (acceptedUserMessageId: string) => Array<Record<string, unknown>>
+}
+
 function wsResponse(id: string | number | undefined, payload: unknown) {
   return JSON.stringify({ type: 'res', id, ok: true, payload })
 }
@@ -69,7 +74,128 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
   })
 }
 
-async function mockControlledActivityLifecycle(page: Page) {
+async function mockUnifiedTurnReceiptHistory(page: Page) {
+  const now = Math.floor(Date.now() / 1000)
+  const kinds = ['default', 'plan', 'goal', 'cron'] as const
+  const messages = kinds.flatMap((kind, index) => {
+    const turnId = `turn-unified-receipt-${kind}`
+    const messageId = `assistant-unified-receipt-${kind}`
+    return [{
+      role: 'user',
+      text: `Trigger the ${kind} turn.`,
+      id: `user-unified-receipt-${kind}`,
+      message_id: `user-unified-receipt-${kind}`,
+      timestamp: now - 120 + index * 20,
+      turn_context: { turn_id: turnId },
+    }, {
+      role: 'assistant',
+      text: `The ${kind} turn completed.`,
+      id: messageId,
+      message_id: messageId,
+      timestamp: now - 115 + index * 20,
+      turn_context: {
+        turn_id: turnId,
+        input_mode: kind === 'goal' ? 'system_event' : 'user',
+        run_kind: kind,
+      },
+      ...(kind === 'cron'
+        ? { provenance_kind: 'cron', provenance_source_tool: 'cron.run' }
+        : {}),
+      ...(kind === 'plan'
+        ? {
+            tool_calls: [{
+              type: 'plan',
+              snapshot: {
+                revision_id: 'revision-unified-receipt',
+                plan_id: 'plan-unified-receipt',
+                title: 'Unified receipt plan',
+                markdown: 'Verify the shared completion receipt.',
+                steps: [{ step_id: 'step-1', title: 'Inspect the receipt' }],
+                current: true,
+              },
+            }],
+          }
+        : {}),
+      usage: {
+        model: `fixture/${kind}-e2e`,
+        input_tokens: 100 + index,
+        output_tokens: 10 + index,
+        cached_tokens: 3 + index,
+        reasoning_tokens: 2 + index,
+        cost_usd: 0.001 + index * 0.001,
+      },
+    }]
+  })
+  const turnOutcomes = kinds.map((kind, index) => ({
+    turn_id: `turn-unified-receipt-${kind}`,
+    task_id: `task-unified-receipt-${kind}`,
+    status: 'succeeded',
+    started_at: now - 118 + index * 20,
+    finished_at: now - 115 + index * 20,
+    outcome: { kind: 'completed' },
+  }))
+
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
+  await page.route('**/api/approvals', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ pending: [] }),
+  }))
+  await page.routeWebSocket(/\/ws$/, ws => {
+    ws.send(wsEvent('connect.challenge', {}))
+    ws.onMessage(message => {
+      let frame: Record<string, unknown>
+      try {
+        frame = JSON.parse(String(message)) as Record<string, unknown>
+      } catch {
+        return
+      }
+      if (frame.type !== 'req' || frame.id === undefined) return
+      if (frame.method === 'connect') {
+        ws.send(JSON.stringify({ protocol: 3, policy: {} }))
+        return
+      }
+      if (frame.method === 'chat.history') {
+        ws.send(wsResponse(frame.id as string | number, {
+          messages,
+          turn_outcomes: turnOutcomes,
+          has_more: false,
+          canonical_complete: true,
+        }))
+        return
+      }
+      const payloads: Record<string, unknown> = {
+        'agents.list': { agents: [] },
+        'commands.list_for_surface': { commands: [] },
+        'config.get': {
+          squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
+          permissions: {},
+          skills: {},
+        },
+        'onboarding.status': { audioConfigured: false },
+        'sessions.list': { sessions: [], has_more: false },
+        'sessions.messages.subscribe': {
+          subscribed: true,
+          replay_complete: true,
+          current_stream_seq: 0,
+          run_status: 'idle',
+        },
+        'usage.status': { sessions: [] },
+      }
+      ws.send(wsResponse(
+        frame.id as string | number,
+        payloads[String(frame.method || '')] ?? {},
+      ))
+    })
+  })
+}
+
+async function mockControlledActivityLifecycle(
+  page: Page,
+  fixture: ControlledActivityLifecycleFixture = {},
+) {
   let sendFrame: ((frame: string) => void) | null = null
   let streamSeq = 3
   let settled = false
@@ -141,41 +267,42 @@ async function mockControlledActivityLifecycle(page: Page) {
         }))
         return
       }
+      const defaultSettledMessages = (): Array<Record<string, unknown>> => [{
+        role: 'user',
+        text: 'Inspect, draft, verify, and answer.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000) - 30,
+      }, {
+        role: 'assistant',
+        text: 'Final verified answer.',
+        id: 'activity-lifecycle-assistant',
+        message_id: 'activity-lifecycle-assistant',
+        timestamp: Math.floor(Date.now() / 1000),
+        tool_calls: [{
+          tool_use_id: 'activity-inspect',
+          name: 'read_file',
+          groupId: 'activity-inspect-group',
+          input: { path: '/private/project/chat.ts' },
+          result: 'read',
+          execution_status: { status: 'success' },
+        }, {
+          tool_use_id: 'activity-verify',
+          name: 'bash_exec',
+          groupId: 'activity-verify-group',
+          input: { command: 'npm test' },
+          result: 'verified',
+          execution_status: { status: 'success' },
+        }],
+        timeline: [
+          { type: 'tool-group', groupId: 'activity-inspect-group' },
+          { type: 'text', raw: 'Draft candidate.' },
+          { type: 'tool-group', groupId: 'activity-verify-group' },
+          { type: 'text', raw: 'Final verified answer.' },
+        ],
+      }]
       const messages = settled
-        ? [{
-            role: 'user',
-            text: 'Inspect, draft, verify, and answer.',
-            id: acceptedUserMessageId,
-            message_id: acceptedUserMessageId,
-            timestamp: Math.floor(Date.now() / 1000) - 30,
-          }, {
-            role: 'assistant',
-            text: 'Final verified answer.',
-            id: 'activity-lifecycle-assistant',
-            message_id: 'activity-lifecycle-assistant',
-            timestamp: Math.floor(Date.now() / 1000),
-            tool_calls: [{
-              tool_use_id: 'activity-inspect',
-              name: 'read_file',
-              groupId: 'activity-inspect-group',
-              input: { path: '/private/project/chat.ts' },
-              result: 'read',
-              execution_status: { status: 'success' },
-            }, {
-              tool_use_id: 'activity-verify',
-              name: 'bash_exec',
-              groupId: 'activity-verify-group',
-              input: { command: 'npm test' },
-              result: 'verified',
-              execution_status: { status: 'success' },
-            }],
-            timeline: [
-              { type: 'tool-group', groupId: 'activity-inspect-group' },
-              { type: 'text', raw: 'Draft candidate.' },
-              { type: 'tool-group', groupId: 'activity-verify-group' },
-              { type: 'text', raw: 'Final verified answer.' },
-            ],
-          }]
+        ? fixture.settledMessages?.(acceptedUserMessageId) ?? defaultSettledMessages()
         : []
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
@@ -212,12 +339,52 @@ async function mockControlledActivityLifecycle(page: Page) {
         model: 'test/activity',
         input_tokens: 12,
         output_tokens: 4,
+        ...fixture.donePayload,
       })
     },
   }
 }
 
 test.describe('Completed assistant activity disclosure', () => {
+  test('uses one completion receipt for Default, Plan, Goal, and Cron turns', async ({
+    page,
+  }) => {
+    await mockUnifiedTurnReceiptHistory(page)
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-unified-receipts`),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+
+    const kinds = ['default', 'plan', 'goal', 'cron'] as const
+    await expect(page.locator('.msg-ai .assistant-activity')).toHaveCount(kinds.length)
+    await expect(page.locator('.msg-ai .msg-meta__more-btn')).toHaveCount(0)
+
+    for (const kind of kinds) {
+      const message = page.locator(
+        `.msg-ai[data-message-id="assistant-unified-receipt-${kind}"]`,
+      )
+      await expect(message).toBeVisible()
+      const receipt = message.getByTestId('assistant-activity')
+      await expect(receipt).toHaveCount(1)
+      const trigger = receipt.locator('.assistant-activity__summary')
+      await expect(trigger).toContainText(kind === 'plan' ? 'Planning process' : 'Completed')
+      await expect(trigger).toHaveAttribute('aria-expanded', 'false')
+      await trigger.click()
+      await expect(trigger).toHaveAttribute('aria-expanded', 'true')
+      const usage = receipt.locator('[data-turn-usage-details]')
+      await expect(usage).toBeVisible()
+      await expect(usage).toContainText(`${kind}-e2e`)
+      await expect(usage).toContainText(/tokens/i)
+    }
+
+    await expect(
+      page.locator('.msg-ai[data-message-id="assistant-unified-receipt-plan"] .plan-card'),
+    ).toBeVisible()
+    await expect(
+      page.locator('.msg-ai[data-message-id="assistant-unified-receipt-cron"] .msg-provenance-chip'),
+    ).toContainText('Scheduled')
+  })
+
   test('keeps the canonical answer visible and supports keyboard disclosure', async ({ page }) => {
     await mockActivityHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
@@ -414,8 +581,6 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveActivity).toBeVisible()
     await expect(page.locator('.work-card')).toHaveCount(0)
     const liveSummary = liveActivity.locator('.assistant-activity__live-head')
-    await expect(liveSummary).toHaveAttribute('aria-expanded', 'false')
-    await liveSummary.click()
     await expect(liveSummary).toHaveAttribute('aria-expanded', 'true')
     const liveStatus = liveActivity.locator('.assistant-activity__live-label')
     await expect(liveStatus).toHaveText('Working')
@@ -467,9 +632,11 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveActivity.getByText('Inspected files', { exact: true })).toHaveCount(1)
     lifecycle.emit('session.event.text_delta', { text: 'Draft candidate.' })
 
-    const answerCandidate = page.locator('.live-answer-candidate')
-    await expect(answerCandidate).toHaveText('Draft candidate.')
-    await expect(liveActivity.getByText('Draft candidate.', { exact: true })).toHaveCount(0)
+    const draftCandidate = page.getByText('Draft candidate.', { exact: true })
+    await expect(draftCandidate).toBeVisible()
+    expect(await draftCandidate.evaluate(element =>
+      element.closest('.assistant-activity') === null,
+    )).toBe(true)
     await expect(liveStatus).toHaveText('Writing the answer')
     await expect(
       liveActivity.getByText('Writing the answer', { exact: true }),
@@ -481,7 +648,6 @@ test.describe('Live assistant activity lifecycle', () => {
       name: 'bash_exec',
       input: { command: 'npm test' },
     })
-    await expect(answerCandidate).toHaveCount(0)
     await expect(liveActivity.getByText('Draft candidate.', { exact: true })).toBeVisible()
     await expect(liveActivity.locator('.tool-row[data-op="command.run"]')).toBeVisible()
     await expect(liveStatus).toHaveText('Working')
@@ -495,7 +661,11 @@ test.describe('Live assistant activity lifecycle', () => {
       execution_status: { status: 'success' },
     })
     lifecycle.emit('session.event.text_delta', { text: 'Final verified answer.' })
-    await expect(answerCandidate).toHaveText('Final verified answer.')
+    const finalCandidate = page.getByText('Final verified answer.', { exact: true })
+    await expect(finalCandidate).toBeVisible()
+    expect(await finalCandidate.evaluate(element =>
+      element.closest('.assistant-activity') === null,
+    )).toBe(true)
     await expect(liveActivity).toBeVisible()
 
     lifecycle.finish()
@@ -540,5 +710,187 @@ test.describe('Live assistant activity lifecycle', () => {
       ).animationName,
     }))
     expect(liveMotion).toEqual({ dot: 'none', label: 'none' })
+  })
+})
+
+test.describe('Silent assistant delivery lifecycle', () => {
+  test('removes a visible sentinel delta after an authoritative suppressed Done', async ({
+    page,
+  }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page, {
+      donePayload: {
+        text: '',
+        text_snapshot: '',
+        delivery: 'suppressed',
+        suppression_reason: 'no_reply',
+      },
+      settledMessages: acceptedUserMessageId => [{
+        role: 'user',
+        text: 'Run silently.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000),
+      }],
+    })
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await page.locator('.chat-textarea').fill('Run silently.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    lifecycle.emit('session.event.text_delta', { text: 'NO_REPLY' })
+    await expect(page.locator('.live-answer .msg-ai-text')).toHaveText('NO_REPLY')
+
+    lifecycle.finish()
+
+    await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
+    await expect(page.locator('.msg-ai')).toHaveCount(0)
+    await expect(page.getByText('NO_REPLY', { exact: true })).toHaveCount(0)
+  })
+
+  test('keeps a normalized Goal answer sentinel-free before and after visible Done', async ({
+    page,
+  }) => {
+    const answer = 'The Goal is waiting for your Desktop confirmation.'
+    const lifecycle = await mockControlledActivityLifecycle(page, {
+      donePayload: {
+        text: answer,
+        text_snapshot: answer,
+        delivery: 'visible',
+        suppression_reason: null,
+      },
+      settledMessages: acceptedUserMessageId => [{
+        role: 'user',
+        text: 'Continue the Goal.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000) - 1,
+      }, {
+        role: 'assistant',
+        text: answer,
+        id: 'normalized-goal-answer',
+        message_id: 'normalized-goal-answer',
+        timestamp: Math.floor(Date.now() / 1000),
+      }],
+    })
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await page.locator('.chat-textarea').fill('Continue the Goal.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    lifecycle.emit('session.event.goal', {
+      goalId: 'silent-delivery-goal',
+      sessionKey: LIFECYCLE_SESSION_KEY,
+      sessionId: 'silent-delivery-session',
+      epoch: 1,
+      objective: 'Continue the Goal without leaking internal sentinels',
+      status: 'active',
+      stateRevision: 1,
+      objectiveRevision: 1,
+      progressRevision: 0,
+      progress: null,
+      continuationSeq: 0,
+      activeTaskId: LIFECYCLE_TASK_ID,
+      executionState: 'working',
+      continuationDeferredReason: null,
+      turnsStarted: 1,
+      turnsSettled: 0,
+      windowTurnsStarted: 1,
+      activeTimeMs: 0,
+      windowActiveTimeMs: 0,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 0,
+      },
+      pauseReason: null,
+      blockedReason: null,
+      terminalReason: null,
+      createdAt: 1_000,
+      updatedAt: 1_000,
+      finishedAt: null,
+    })
+    await expect(page.locator('.goal-ribbon')).toHaveAttribute('data-status', 'active')
+    lifecycle.emit('session.event.text_delta', { text: answer })
+    await expect(page.locator('.live-answer .msg-ai-text')).toHaveText(answer)
+    await expect(page.getByText('NO_REPLY', { exact: true })).toHaveCount(0)
+    await expect(page.getByText('HEARTBEAT_OK', { exact: true })).toHaveCount(0)
+
+    lifecycle.finish()
+
+    await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
+    await expect(page.locator('.msg-ai-text')).toHaveText(answer)
+    await expect(page.getByText(answer, { exact: true })).toHaveCount(1)
+    await expect(page.getByText('NO_REPLY', { exact: true })).toHaveCount(0)
+    await expect(page.getByText('HEARTBEAT_OK', { exact: true })).toHaveCount(0)
+  })
+
+  test('retains a completed tool row when suppressed Done removes its text', async ({ page }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page, {
+      donePayload: {
+        text: '',
+        text_snapshot: '',
+        delivery: 'suppressed',
+        suppression_reason: 'heartbeat_ack',
+      },
+      settledMessages: acceptedUserMessageId => [{
+        role: 'user',
+        text: 'Inspect silently.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000) - 1,
+      }, {
+        role: 'assistant',
+        text: '',
+        id: 'suppressed-tool-answer',
+        message_id: 'suppressed-tool-answer',
+        timestamp: Math.floor(Date.now() / 1000),
+        tool_calls: [{
+          tool_use_id: 'silent-inspect',
+          name: 'read_file',
+          groupId: 'silent-inspect-group',
+          input: { path: '/private/project/status.txt' },
+          result: 'ready',
+          execution_status: { status: 'success' },
+        }],
+        timeline: [{ type: 'tool-group', groupId: 'silent-inspect-group' }],
+      }],
+    })
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+    await page.locator('.chat-textarea').fill('Inspect silently.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    lifecycle.emit('session.event.tool_use_start', {
+      tool_use_id: 'silent-inspect',
+      name: 'read_file',
+      input: { path: '/private/project/status.txt' },
+    })
+    lifecycle.emit('session.event.tool_result', {
+      tool_use_id: 'silent-inspect',
+      name: 'read_file',
+      input: { path: '/private/project/status.txt' },
+      result: 'ready',
+      execution_status: { status: 'success' },
+    })
+    lifecycle.emit('session.event.text_delta', { text: 'HEARTBEAT_OK' })
+    await expect(page.locator('.live-answer .msg-ai-text')).toHaveText('HEARTBEAT_OK')
+
+    lifecycle.finish()
+
+    await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
+    const settledActivity = page.locator('.msg-ai .assistant-activity')
+    await expect(settledActivity).toBeVisible()
+    await settledActivity.locator('.assistant-activity__summary').click()
+    await expect(settledActivity.locator('.tool-row[data-op="file.inspect"]')).toBeVisible()
+    await expect(page.getByText('HEARTBEAT_OK', { exact: true })).toHaveCount(0)
   })
 })
