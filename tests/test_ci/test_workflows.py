@@ -1403,6 +1403,10 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "test-desktop-gateway-ownership.mjs" in run["run"]
     assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
     assert 'case "${{ matrix.shard }}" in' in run["run"]
+    assert 'local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"' in run["run"]
+    assert '[[ "${RUNNER_OS}" == "Windows" ]]' in run["run"]
+    assert "grep -Fq 'Gateway did not become healthy'" in run["run"]
+    assert 'run_case "${name}" "${script}" 2' in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
     assert upload["with"]["name"] == (

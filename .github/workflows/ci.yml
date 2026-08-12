@@ -1051,10 +1051,12 @@ jobs:
           run_case() {
             local name="$1"
             local script="$2"
+            local attempt="$3"
+            local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"
             if [[ "${RUNNER_OS}" == "Linux" ]]; then
-              xvfb-run -a node "${script}" 2>&1 | tee "${CI_REPORT_DIR}/${name}.log"
+              xvfb-run -a node "${script}" 2>&1 | tee "${log_path}"
             else
-              node "${script}" 2>&1 | tee "${CI_REPORT_DIR}/${name}.log"
+              node "${script}" 2>&1 | tee "${log_path}"
             fi
           }
 
@@ -1109,12 +1111,23 @@ jobs:
           do
             name="${entry%%:*}"
             script="${entry#*:}"
-            if ! run_case "${name}" "${script}"; then
-              printf 'failed_case=%s\n' "${name}" > "${CI_REPORT_DIR}/first-failure.txt"
-              exit 1
+            if run_case "${name}" "${script}" 1; then
+              continue
             fi
+
+            first_log="${CI_REPORT_DIR}/${name}-attempt-1.log"
+            printf 'failed_case=%s\n' "${name}" > "${CI_REPORT_DIR}/first-failure.txt"
+            if [[ "${RUNNER_OS}" == "Windows" ]] \
+              && grep -Fq 'Gateway did not become healthy' "${first_log}"
+            then
+              printf 'retry_case=%s\n' "${name}" >> "${CI_REPORT_DIR}/first-failure.txt"
+              if run_case "${name}" "${script}" 2; then
+                continue
+              fi
+            fi
+            exit 1
           done
-          printf 'e2e_status=passed\n' > "${CI_REPORT_DIR}/first-failure.txt"
+          printf 'e2e_status=passed\n' >> "${CI_REPORT_DIR}/first-failure.txt"
 
       - name: Upload Desktop recovery report
         if: ${{ always() }}

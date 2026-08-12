@@ -3010,14 +3010,15 @@ async def test_cancelled_install_update_drains_postflight_before_rollback_and_un
         }
         source.revision = "b" * 40
 
-    worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    worker_started = asyncio.Event()
     release_worker = threading.Event()
     worker_finished = threading.Event()
     rollback_started = threading.Event()
     real_reload = loader.reload_verified
 
     def blocking_reload(verifier, *args, **kwargs) -> SkillReloadResult:
-        worker_started.set()
+        loop.call_soon_threadsafe(worker_started.set)
         if not release_worker.wait(timeout=5):
             raise TimeoutError("test did not release postflight reload")
         try:
@@ -3044,7 +3045,7 @@ async def test_cancelled_install_update_drains_postflight_before_rollback_and_un
         mutation = asyncio.create_task(service.install("cancellation-skill", "fake"))
     else:
         mutation = asyncio.create_task(service.update("cancellation-skill"))
-    assert await asyncio.to_thread(worker_started.wait, 1)
+    await worker_started.wait()
     cancellation_propagated = False
     try:
         assert service._mutation_lock.locked()
