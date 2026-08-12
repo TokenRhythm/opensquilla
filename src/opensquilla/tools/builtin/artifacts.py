@@ -220,6 +220,23 @@ def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
     )
 
 
+def _plan_run_allows_delivery(ctx: ToolContext, run: Any) -> bool:
+    """Return whether the current task may deliver from this PlanRun state."""
+
+    status = str(getattr(run, "status", "") or "")
+    if status == "completed":
+        return True
+    if status != "running":
+        return False
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
+    return (
+        bool(task_id)
+        and active_task_id == task_id
+        and _plan_run_steps_ready_for_delivery(run)
+    )
+
+
 def _plan_run_final_step_ready_for_publish(run: Any) -> str | None:
     """Return the sole unfinished current step that publication can finalize."""
 
@@ -277,7 +294,7 @@ async def _checkpoint_final_plan_step_for_publish(
         )
     except PlanRunConflictError:
         refreshed = await storage.get_plan_run(run_id)
-        if refreshed is not None and _plan_run_steps_ready_for_delivery(refreshed):
+        if refreshed is not None and _plan_run_allows_delivery(ctx, refreshed):
             return refreshed
         raise RetryableToolInputError(
             "publish_artifact was not executed because the attached PlanRun "
@@ -302,7 +319,7 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> Any | None:
     status = str(getattr(run, "status", "") or "")
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
-    if status == "completed":
+    if _plan_run_allows_delivery(ctx, run):
         return None
     if status == "running":
         if not task_id or active_task_id != task_id:
