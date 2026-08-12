@@ -7,6 +7,12 @@ import re
 from typing import Any
 
 from opensquilla.artifacts import artifact_payload, strip_artifact_markers_from_text
+from opensquilla.chat.flattened_tool_markers import (
+    has_flattened_used_tool_line,
+    is_flattened_tool_result_dump,
+    strip_confirmed_flattened_tool_result,
+    strip_flattened_used_tool_lines,
+)
 from opensquilla.meta_preflight_protocol import (
     display_text_from_preflight_confirmation,
     strip_preflight_confirmation_protocol_text,
@@ -55,36 +61,31 @@ def _is_legacy_generated_plan_implementation(
     return _LEGACY_PLAN_IMPLEMENTATION_PROMPT.fullmatch(visible) is not None
 
 
-# Compaction collapses structured tool_use/tool_result content blocks into
-# plain-text markers so a summarized turn still names what ran; see
-# engine.agent._flatten_content_blocks ("[Used tool: <name>]" and
-# "[Tool result (<id>): <snippet>]"). Those markers are an internal transcript
-# representation, not conversation, so a compacted turn that is later loaded for
-# display must not render them as raw chat text.
-_FLATTENED_USED_TOOL_LINE = re.compile(r"^\[Used tool: [^\]]*\]$")
+def _legacy_flattened_tool_result_indexes(entries: list[object]) -> set[int]:
+    """Identify metadata-poor result rows from an adjacent flattened tool call.
 
-
-def _strip_flattened_tool_markers(content: str) -> str:
-    """Drop flattened tool-call markers from a compacted turn's display text.
-
-    Returns the human-readable remainder. A turn whose content is a
-    ``[Tool result (...)]`` dump collapses to an empty string (the caller then
-    drops the entry, mirroring the ``[ContentBlock ...]`` handling); an
-    assistant turn keeps its narration with any ``[Used tool: ...]`` lines
-    removed. Content without these markers is returned unchanged.
+    Modern rows carry ``tool_call_id`` or role ``tool``. Older compaction
+    projections sometimes persisted Anthropic-style tool results as role
+    ``user`` with no structured identity, so recognize only the adjacent
+    assistant-marker/result pair. An isolated user message that merely quotes
+    the legacy syntax must remain ordinary conversation text.
     """
 
-    text = content or ""
-    if text.lstrip().startswith("[Tool result ("):
-        return ""
-    if "[Used tool: " not in text:
-        return text
-    kept = [
-        line
-        for line in text.split("\n")
-        if not _FLATTENED_USED_TOOL_LINE.match(line.strip())
-    ]
-    return "\n".join(kept).strip()
+    indexes: set[int] = set()
+    previous_was_flattened_call = False
+    for index, entry in enumerate(entries):
+        role = str(getattr(entry, "role", "unknown") or "unknown").lower()
+        content = str(getattr(entry, "content", "") or "")
+        if (
+            previous_was_flattened_call
+            and role in {"tool", "user"}
+            and is_flattened_tool_result_dump(content)
+        ):
+            indexes.add(index)
+        previous_was_flattened_call = (
+            role == "assistant" and has_flattened_used_tool_line(content)
+        )
+    return indexes
 
 
 def transcript_entries_to_chat_messages(
@@ -93,8 +94,9 @@ def transcript_entries_to_chat_messages(
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
     selected = entries[-limit:] if limit is not None else entries
+    legacy_tool_result_indexes = _legacy_flattened_tool_result_indexes(selected)
     messages: list[dict[str, Any]] = []
-    for entry in selected:
+    for entry_index, entry in enumerate(selected):
         role = getattr(entry, "role", "unknown")
         turn_context = getattr(entry, "turn_context", None)
         silent_reply = sanitize_historical_silent_reply(
@@ -133,7 +135,16 @@ def transcript_entries_to_chat_messages(
             if not content.strip():
                 continue
         if content:
-            cleaned = _strip_flattened_tool_markers(content)
+            cleaned = content
+            if role == "assistant" and has_flattened_used_tool_line(cleaned):
+                cleaned = strip_flattened_used_tool_lines(cleaned)
+            confirmed_tool_result = (
+                role == "tool"
+                or bool(getattr(entry, "tool_call_id", None))
+                or entry_index in legacy_tool_result_indexes
+            )
+            if confirmed_tool_result:
+                cleaned = strip_confirmed_flattened_tool_result(cleaned)
             if cleaned != content:
                 # The entry carried OpenSquilla's flattened tool serialization.
                 # Drop it when nothing but internal tool transcript remains and

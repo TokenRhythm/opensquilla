@@ -6,6 +6,7 @@ import json
 import re
 from typing import Any
 
+from opensquilla.chat.flattened_tool_markers import is_flattened_tool_result_dump
 from opensquilla.session.keys import derive_chat_type, parse_agent_id
 
 _CHANNEL_SURFACES = frozenset(
@@ -438,6 +439,8 @@ def derive_transcript_title(content: Any, *, max_chars: int = 34) -> str:
     if not text:
         return ""
     text = _TIME_PREFIX_RE.sub("", text, count=1)
+    if is_flattened_tool_result_dump(text):
+        return ""
     cleaned = re.sub(r"\s+", " ", text).strip()
     cleaned = cleaned.strip("\"'` ")
     if not cleaned:

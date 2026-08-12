@@ -1391,6 +1391,27 @@ class TestSessionsList:
         assert res.payload["sessions"][0]["title"] == "Agent PM面试清单"
 
     @pytest.mark.asyncio
+    async def test_list_webchat_title_skips_flattened_tool_result(self, dispatcher):
+        session = FakeSession(
+            session_key="agent:main:webchat:tool-result-title",
+            display_name="WebChat",
+        )
+        manager = FakeSessionManager([session])
+        manager._storage._transcripts[session.session_id] = [
+            SimpleNamespace(
+                role="user",
+                content="[Tool result (call-1): internal result projection]",
+            ),
+            SimpleNamespace(role="user", content="Keep the visible request as the title"),
+        ]
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        assert res.payload["sessions"][0]["title"] == "Keep the visible request as the..."
+
+    @pytest.mark.asyncio
     async def test_list_contract_cli_current_tui_compatible_row(self, dispatcher):
         session = FakeSession(session_key="agent:main:cli:a1b2c3d4")
         ctx = make_ctx(session_manager=FakeSessionManager([session]))

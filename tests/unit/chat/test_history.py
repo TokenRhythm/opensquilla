@@ -356,16 +356,47 @@ def test_transcript_entries_to_chat_messages_strips_flattened_used_tool_markers(
 def test_transcript_entries_to_chat_messages_drops_flattened_tool_result_dump() -> None:
     # A "[Tool result (...)]" dump is pure internal transcript; with no
     # structured segments to render it is dropped rather than shown as a bubble.
-    entry = _assistant_entry(
-        message_id="m-flat-toolresult",
-        role="user",
-        content=(
-            '[Tool result (call_00_TUIq7hPsIGaww7lcUiuc8669): 1  """Proposal '
-            'generation and management API routes."""\n2  \n3  import json]'
+    entries = [
+        _assistant_entry(
+            message_id="m-flat-tooluse",
+            content="[Used tool: read_file]",
         ),
+        _assistant_entry(
+            message_id="m-flat-toolresult",
+            role="user",
+            content=(
+                '[Tool result (call_00_TUIq7hPsIGaww7lcUiuc8669): 1  """Proposal '
+                'generation and management API routes."""\n2  \n3  import json]'
+            ),
+        ),
+    ]
+
+    assert transcript_entries_to_chat_messages(entries) == []
+
+
+def test_transcript_entries_to_chat_messages_keeps_unattributed_tool_result_text() -> None:
+    entry = _assistant_entry(
+        message_id="m-user-toolresult-doc",
+        role="user",
+        content="[Tool result (example): this is documentation, not a tool event]",
     )
 
-    assert transcript_entries_to_chat_messages([entry]) == []
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == entry.content
+
+
+def test_transcript_entries_to_chat_messages_keeps_text_after_confirmed_tool_result() -> None:
+    entry = _assistant_entry(
+        message_id="m-toolresult-with-request",
+        role="user",
+        tool_call_id="call-1",
+        content="[Tool result (call-1): ok]\nPlease also update README.md",
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == "Please also update README.md"
 
 
 def test_transcript_entries_to_chat_messages_drops_tool_only_flattened_turn() -> None:
