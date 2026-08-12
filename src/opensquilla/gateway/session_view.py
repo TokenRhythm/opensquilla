@@ -449,6 +449,31 @@ def _is_grapheme_extend(char: str) -> bool:
     )
 
 
+def _hangul_syllable_type(char: str) -> str | None:
+    """Return the UAX #29 Hangul class used by grapheme rules GB6-GB8."""
+
+    codepoint = ord(char)
+    if 0x1100 <= codepoint <= 0x115F or 0xA960 <= codepoint <= 0xA97C:
+        return "L"
+    if 0x1160 <= codepoint <= 0x11A7 or 0xD7B0 <= codepoint <= 0xD7C6:
+        return "V"
+    if 0x11A8 <= codepoint <= 0x11FF or 0xD7CB <= codepoint <= 0xD7FB:
+        return "T"
+    if 0xAC00 <= codepoint <= 0xD7A3:
+        return "LV" if (codepoint - 0xAC00) % 28 == 0 else "LVT"
+    return None
+
+
+def _hangul_extends_cluster(previous: str, current: str) -> bool:
+    previous_type = _hangul_syllable_type(previous)
+    current_type = _hangul_syllable_type(current)
+    return bool(
+        (previous_type == "L" and current_type in {"L", "V", "LV", "LVT"})
+        or (previous_type in {"LV", "V"} and current_type in {"V", "T"})
+        or (previous_type in {"LVT", "T"} and current_type == "T")
+    )
+
+
 def _title_grapheme_clusters(text: str) -> list[str]:
     """Group display-title text without splitting common user graphemes."""
 
@@ -464,6 +489,7 @@ def _title_grapheme_clusters(text: str) -> list[str]:
                 join_next
                 or char == "\u200d"
                 or _is_grapheme_extend(char)
+                or _hangul_extends_cluster(cluster[-1], char)
                 or (regional and regional_indicators == 1)
             )
         )

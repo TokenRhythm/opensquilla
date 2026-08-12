@@ -262,6 +262,7 @@ def test_sessions_spawn_exposes_optional_bounded_title_schema() -> None:
         ("👨‍👩‍👧‍👦" * 6, "👨‍👩‍👧‍👦" * 4 + "..."),
         ("🇨🇳" * 20, "🇨🇳" * 15 + "..."),
         ("e\u0301" * 20, "e\u0301" * 15 + "..."),
+        ("각" * 12, "각" * 10 + "..."),
     ],
 )
 def test_sessions_spawn_task_fallback_preserves_grapheme_clusters(

@@ -5252,6 +5252,42 @@ class TestSessionsRename:
         assert session.display_name == "Renamed task"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("display_name", "expected_ok"),
+        [
+            ("界" * 512, True),
+            ("界" * 513, False),
+            ("界" * 100_000, False),
+        ],
+    )
+    async def test_rename_enforces_bounded_display_name(
+        self,
+        dispatcher,
+        session,
+        display_name: str,
+        expected_ok: bool,
+    ):
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            scopes=["operator.read", "operator.write"],
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.rename",
+            {"key": session.session_key, "displayName": display_name},
+            ctx,
+        )
+
+        assert res.ok is expected_ok
+        if expected_ok:
+            assert session.display_name == display_name
+        else:
+            assert res.error.code == "INVALID_PARAMS"
+            assert res.error.details == {"field": "displayName", "maxLength": 512}
+            assert session.display_name is None
+
+    @pytest.mark.asyncio
     async def test_rename_rejects_admin_patch_fields(self, dispatcher, session):
         session.model = "original-model"
         ctx = make_ctx(

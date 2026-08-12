@@ -20,6 +20,8 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "artifacts.list",
         "artifacts.get",
         "sessions.list",
+        "sessions.rename",
+        "sessions.delete",
         "sessions.bootstrap",
         "sessions.messages.subscribe",
         "sessions.messages.hydrate",
@@ -35,6 +37,7 @@ _SESSION_KEY_FIELDS = {
     "chat.abort": ("sessionKey", "key"),
     "chat.clarify_submit": ("sessionKey", "key"),
     "sessions.bootstrap": ("key", "sessionKey"),
+    "sessions.rename": ("key", "sessionKey"),
     "sessions.messages.subscribe": ("key", "sessionKey"),
     "sessions.messages.hydrate": ("key", "sessionKey"),
     "sessions.messages.snapshot": ("key", "sessionKey"),
@@ -145,6 +148,21 @@ class GuestRpcPolicy:
             normalized_source["noMemoryCapture"] = True
             normalized_source["no_memory_capture"] = True
             normalized["_source"] = normalized_source
+            return normalized
+
+        if method == "sessions.delete":
+            if not isinstance(params, dict):
+                raise GuestRpcPolicyError("Guest session key is required")
+            raw_keys = params.get("keys")
+            if raw_keys is None:
+                raw_keys = [params.get("key")]
+            if not isinstance(raw_keys, list) or not raw_keys:
+                raise GuestRpcPolicyError("Guest session key is required")
+            if not all(guest_owns_session_key(owner_id, key) for key in raw_keys):
+                raise GuestRpcPolicyError("Guest session is not owned by this browser")
+            normalized = dict(params)
+            normalized["keys"] = raw_keys
+            normalized.pop("key", None)
             return normalized
 
         if not isinstance(params, dict):
