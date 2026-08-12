@@ -27,6 +27,15 @@ export interface SidebarDisplayProjection {
   allRows: SidebarDisplayRow[]
 }
 
+export function isSidebarSessionOrderable(row: SidebarSectionRow): boolean {
+  if (row.rowKind !== 'session' || row.provisional) return false
+  if (row.sessionKind === 'chat') return true
+  return Boolean(
+    row.pinned
+    && (row.sessionKind === 'cron' || row.sessionKind === 'channel'),
+  )
+}
+
 function belongsToProject(
   row: SidebarSectionRow,
   project: SidebarSectionRow | null,
@@ -122,4 +131,14 @@ export function buildSidebarDisplayProjection(
       ...recents.flatMap(section => section.rows),
     ],
   }
+}
+
+export function sidebarSessionOrderKeys(
+  sections: readonly SidebarSection[],
+  sessionOrder: readonly string[] = [],
+): string[] {
+  return buildSidebarDisplayProjection(sections, sessionOrder)
+    .allRows
+    .filter(isSidebarSessionOrderable)
+    .map(row => row.key)
 }

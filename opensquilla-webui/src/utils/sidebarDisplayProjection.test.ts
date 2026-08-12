@@ -4,7 +4,11 @@ import type {
   SidebarSectionFamily,
   SidebarSectionRow,
 } from '@/composables/useSessions'
-import { buildSidebarDisplayProjection } from './sidebarDisplayProjection'
+import {
+  buildSidebarDisplayProjection,
+  isSidebarSessionOrderable,
+  sidebarSessionOrderKeys,
+} from './sidebarDisplayProjection'
 
 function session(
   key: string,
@@ -121,6 +125,37 @@ describe('buildSidebarDisplayProjection', () => {
       'automations',
       'chats',
     ])
+  })
+
+  it('orders pinned sessions across every pinnable family without enabling regular non-chat drag', () => {
+    const sections = [
+      section('chats', [
+        session('chat-pin', { pinned: true }),
+        session('chat-live'),
+      ]),
+      section('channels', [
+        session('channel-pin', { sessionKind: 'channel', pinned: true }),
+        session('channel-live', { sessionKind: 'channel' }),
+      ]),
+      section('automations', [
+        session('cron-pin', { sessionKind: 'cron', pinned: true }),
+        session('cron-live', { sessionKind: 'cron' }),
+      ]),
+    ]
+
+    expect(sidebarSessionOrderKeys(
+      sections,
+      ['cron-pin', 'channel-pin', 'chat-pin', 'chat-live'],
+    )).toEqual([
+      'cron-pin',
+      'channel-pin',
+      'chat-pin',
+      'chat-live',
+    ])
+    expect(isSidebarSessionOrderable(sections[1]!.rows[0]!)).toBe(true)
+    expect(isSidebarSessionOrderable(sections[1]!.rows[1]!)).toBe(false)
+    expect(isSidebarSessionOrderable(sections[2]!.rows[0]!)).toBe(true)
+    expect(isSidebarSessionOrderable(sections[2]!.rows[1]!)).toBe(false)
   })
 
   it('does not infer a project name from an ordinary session workspace path', () => {

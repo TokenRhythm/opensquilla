@@ -481,6 +481,7 @@ import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
 import { bindingMatches, formatBinding } from './utils/keychord'
 import { SIDEBAR_MIN_WIDTH, type SidebarWidthPreference } from './utils/sidebarLayout'
+import { sidebarSessionOrderKeys } from './utils/sidebarDisplayProjection'
 import {
   dispatchLocalSessionsDeleted,
   localSessionsDeletedDetail,
@@ -1043,14 +1044,10 @@ function onReorderSidebarSession(payload: {
   targetKey: string
   position: 'before' | 'after'
 }) {
-  const orderedKeys = sidebarSections.value
-    .flatMap(section => section.rows)
-    .filter(row =>
-      row.rowKind === 'session'
-      && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
-      && !row.provisional,
-    )
-    .map(row => row.key)
+  const orderedKeys = sidebarSessionOrderKeys(
+    sidebarSections.value,
+    sidebarSessionOrder.value,
+  )
   const from = orderedKeys.indexOf(payload.draggedKey)
   if (from < 0 || !orderedKeys.includes(payload.targetKey) || payload.draggedKey === payload.targetKey) return
 
@@ -1069,14 +1066,10 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
   writeStoredSessionKeys(SIDEBAR_PINNED_SESSIONS_KEY, sidebarPinnedSessionKeys.value)
 
   if (!payload.pinned) return
-  const currentOrder = sidebarSections.value
-    .flatMap(section => section.rows)
-    .filter(row =>
-      row.rowKind === 'session'
-      && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
-      && !row.provisional,
-    )
-    .map(row => row.key)
+  const currentOrder = sidebarSessionOrderKeys(
+    sidebarSections.value,
+    sidebarSessionOrder.value,
+  )
     .filter(key => key !== payload.key)
   currentOrder.unshift(payload.key)
   sidebarSessionOrder.value = currentOrder

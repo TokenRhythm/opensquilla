@@ -341,6 +341,40 @@ describe('SidebarConversations project workspaces', () => {
     })
   })
 
+  it('only enables non-chat drag after a channel or automation is pinned', async () => {
+    const { host } = await mountSidebar([
+      taskRow({
+        key: 'channel-pin',
+        workspaceId: undefined,
+        depth: 0,
+        sessionKind: 'channel',
+        pinned: true,
+      }),
+      taskRow({
+        key: 'channel-live',
+        workspaceId: undefined,
+        depth: 0,
+        sessionKind: 'channel',
+      }),
+      taskRow({
+        key: 'cron-live',
+        workspaceId: undefined,
+        depth: 0,
+        sessionKind: 'cron',
+      }),
+    ])
+
+    expect(
+      host.querySelector('[data-session-key="channel-pin"]')?.classList.contains('is-reorderable'),
+    ).toBe(true)
+    expect(
+      host.querySelector('[data-session-key="channel-live"]')?.classList.contains('is-reorderable'),
+    ).toBe(false)
+    expect(
+      host.querySelector('[data-session-key="cron-live"]')?.classList.contains('is-reorderable'),
+    ).toBe(false)
+  })
+
   it('shows a project session hover card outside the sidebar with its project name', async () => {
     const { host } = await mountSidebar([projectRow(), taskRow()])
     const row = host.querySelector<HTMLElement>(

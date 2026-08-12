@@ -59,6 +59,7 @@ import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
 import {
   buildSidebarDisplayProjection,
+  isSidebarSessionOrderable,
   type SidebarDisplayRow,
   type SidebarDisplayZone,
 } from '@/utils/sidebarDisplayProjection'
@@ -348,9 +349,7 @@ function reorderScope(row: SidebarDisplayRow): string {
 }
 
 function canDragRow(row: SidebarDisplayRow): boolean {
-  return row.rowKind === 'session'
-    && (row.sessionKind === 'chat' || row.sessionKind === 'cron')
-    && !row.provisional
+  return isSidebarSessionOrderable(row)
     && !selectionMode.value
     && !agentFilter.value
     && renamingKey.value !== row.key
