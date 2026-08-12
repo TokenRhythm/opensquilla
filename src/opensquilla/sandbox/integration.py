@@ -1862,24 +1862,32 @@ def effective_network_mode(
     the configured run mode, so deriving it from configuration alone gets the
     answer wrong exactly when grading has promoted or demoted an action.
 
-    ``None`` means no runtime is configured yet and the question has no answer.
+    ``None`` means the question has no answer here — no runtime is configured, or
+    resolution did not complete. This is a reporting path feeding status surfaces,
+    so it degrades to "unknown" rather than raising: a probe that cannot describe
+    the posture must not take down the endpoint that asked, and answering "no
+    answer" leaves the caller exactly where it was before the probe existed.
     """
     rt = runtime or get_runtime()
     if rt is None:
         return None
-    level = (
-        select_level(action_kind, hints)
-        if rt.effective.grading_enabled
-        else rt.effective.default_level
-    )
-    policy = build_policy(
-        level,
-        action_kind,
-        rt.workspace,
-        rt.settings,
-        trusted=(hints is None or hints.trusted_source),
-        hints=hints,
-    )
+    try:
+        level = (
+            select_level(action_kind, hints)
+            if rt.effective.grading_enabled
+            else rt.effective.default_level
+        )
+        policy = build_policy(
+            level,
+            action_kind,
+            rt.workspace,
+            rt.settings,
+            trusted=(hints is None or hints.trusted_source),
+            hints=hints,
+        )
+    except Exception:  # noqa: BLE001 - a status probe never fails its caller
+        log.debug("sandbox.effective_network_mode_unavailable", exc_info=True)
+        return None
     return policy.network
 
 

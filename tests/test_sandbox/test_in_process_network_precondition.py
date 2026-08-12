@@ -148,3 +148,23 @@ def test_a_non_network_action_is_not_reported_as_network_blocked(tmp_path: Path)
     configure_runtime(_POSTURES["no-managed-network"], workspace=tmp_path)
 
     assert in_process_network_precondition("fs.read") is None
+
+
+def test_a_probe_that_cannot_resolve_reports_no_answer_instead_of_raising(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # This runs inside `search.status`, which the CLI table and the Control UI
+    # Overview both reach. A posture probe that raises would turn a readiness
+    # request into an error response — strictly worse than the wrong-but-quiet
+    # readiness this change set out to fix.
+    from opensquilla.sandbox import integration
+
+    configure_runtime(_POSTURES["recommended"], workspace=tmp_path)
+
+    def _explode(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("posture resolution unavailable on this host")
+
+    monkeypatch.setattr(integration, "build_policy", _explode)
+
+    assert effective_network_mode("web.fetch") is None
+    assert in_process_network_precondition() is None
