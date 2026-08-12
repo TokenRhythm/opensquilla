@@ -632,6 +632,7 @@ class GatewayProcess:
                     if response.status == 200:
                         return
             except (urllib.error.URLError, TimeoutError, OSError):
+                # The Gateway may still be binding; retry until the bounded deadline.
                 pass
             time.sleep(0.25)
         raise DriverConfigurationError("Gateway did not become healthy")
@@ -951,7 +952,6 @@ async def _durable_accounting_evidence(
     client = GatewayRPCClient(scopes=["operator.admin"], request_timeout_s=30.0)
     await client.connect(gateway.ws_url)
     deadline = time.monotonic() + 5.0
-    latest = DurableAccountingEvidence()
     try:
         while True:
             payload = await client.call(
@@ -1832,7 +1832,6 @@ def execute_case(case: LiveCase) -> tuple[dict[str, Any], int]:
     proxy: DeterministicFaultProxy | None = None
     retry_proxy: DeterministicFaultProxy | None = None
     result: dict[str, Any] | None = None
-    exit_code = EXIT_FAILED
     gateway_started = False
     performance_evidence: PerformanceGateEvidence | None = None
     started_monotonic = time.monotonic()
@@ -1985,7 +1984,6 @@ def main(argv: list[str] | None = None) -> int:
     output_path: Path | None = None
     secret_values: tuple[str, ...] = ()
     result: dict[str, Any]
-    exit_code = EXIT_FAILED
     try:
         case_path = _safe_case_path(args.case_file)
         output_path = _safe_output_path(args.output, case_path=case_path)

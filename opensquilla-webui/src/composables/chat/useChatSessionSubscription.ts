@@ -248,10 +248,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       }
       options.loadHistory()
     } else if (current !== null) {
-      options.lastStreamSeq.value = generationReset
-        && options.lastStreamSeq.value === 0
-        ? current
-        : Math.max(options.lastStreamSeq.value, current)
+      options.lastStreamSeq.value = Math.max(options.lastStreamSeq.value, current)
     }
   }
 

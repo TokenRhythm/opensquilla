@@ -507,6 +507,7 @@ def cleanup_pending_chat_input_material(
     try:
         parent.rmdir()
     except OSError:
+        # Best-effort cleanup: the parent may be non-empty or concurrently managed.
         pass
     return True
 

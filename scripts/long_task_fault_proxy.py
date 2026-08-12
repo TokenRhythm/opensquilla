@@ -301,6 +301,7 @@ class _FaultHandler(BaseHTTPRequestHandler):
         try:
             self.connection.shutdown(socket.SHUT_RDWR)
         except OSError:
+            # The peer may already have reset the stream; close still follows.
             pass
         self.connection.close()
 
@@ -454,24 +455,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ready-file", type=Path)
     args = parser.parse_args(argv)
     scenarios = args.scenario or [FaultScenario.OK.value]
-    proxy = DeterministicFaultProxy(
-        scenarios,
-        host=args.host,
-        port=args.port,
-        late_terminal_delay_seconds=args.late_terminal_delay_seconds,
-    )
     try:
-        proxy.start()
-        if args.ready_file is not None:
-            _write_ready_file(args.ready_file, proxy)
-        else:
-            print(json.dumps({"base_url": proxy.base_url}))
-        while True:
-            time.sleep(1)
+        with DeterministicFaultProxy(
+            scenarios,
+            host=args.host,
+            port=args.port,
+            late_terminal_delay_seconds=args.late_terminal_delay_seconds,
+        ) as proxy:
+            if args.ready_file is not None:
+                _write_ready_file(args.ready_file, proxy)
+            else:
+                print(json.dumps({"base_url": proxy.base_url}))
+            while True:
+                time.sleep(1)
     except KeyboardInterrupt:
         return 130
-    finally:
-        proxy.close()
 
 
 if __name__ == "__main__":

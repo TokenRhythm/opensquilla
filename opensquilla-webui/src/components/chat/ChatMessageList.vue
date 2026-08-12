@@ -325,11 +325,11 @@ function spacerStyle(height: number): Record<string, string> {
   return { height: `${Math.max(0, height)}px` }
 }
 
-function frame(callback: FrameRequestCallback): number {
+function frame(callback: () => void): number {
   if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
-    return window.requestAnimationFrame(callback)
+    return window.requestAnimationFrame(() => callback())
   }
-  return globalThis.setTimeout(() => callback(performance.now()), 0) as unknown as number
+  return globalThis.setTimeout(callback, 0) as unknown as number
 }
 
 function cancelScheduledFrame(id: number) {
